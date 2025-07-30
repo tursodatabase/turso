@@ -1,0 +1,28 @@
+
+[package]
+name = "turso_sync_javascript"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+turso_sync_protocol = { workspace = true }
+turso_core = { workspace = true }
+napi = { version = "3.0.0", features = ["async"] }
+napi-derive = "3.0.0"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
+bytes = "1.10.1"
+tokio = { version = "1.47.0", default-features = false, features = ["time", "net"] }
+hyper = { version = "1.6.0", features = ["client", "http1"] }
+hyper-util = { version = "0.1.16", features = ["tokio"] }
+http-body-util = "0.1.3"
+http = "1.3.1"
+genawaiter = { version = "0.99.1", default-features = false }
+
+[build-dependencies]
+napi-build = "2"

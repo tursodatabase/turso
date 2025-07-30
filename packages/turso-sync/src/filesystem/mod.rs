@@ -2,8 +2,8 @@
 pub mod test;
 pub mod tokio;
 
-use crate::Result;
 use std::path::Path;
+use turso_sync_protocol::Result;
 
 pub trait Filesystem {
     type File;

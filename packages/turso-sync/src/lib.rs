@@ -1,14 +1,9 @@
 pub mod database;
-pub mod database_tape;
-pub mod errors;
-pub mod types;
 
-pub type Result<T> = std::result::Result<T, errors::Error>;
+pub mod filesystem;
+pub mod sync_server;
 
-mod database_inner;
-mod filesystem;
 mod metadata;
-mod sync_server;
 #[cfg(test)]
 mod test_context;
 mod wal_session;

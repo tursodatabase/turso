@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html>
+
+<body>
+    <script type="module">
+        // Import the default export and named export
+        import { Database } from './turso-sync-javascript.wasi-browser.js';
+
+        var files = new Map();
+
+        function authToken() {
+            const queryString = window.location.search;
+            const urlParams = new URLSearchParams(queryString);
+            return urlParams.get('authToken');
+        }
+
+        function url() {
+            const queryString = window.location.search;
+            const urlParams = new URLSearchParams(queryString);
+            return urlParams.get('url');
+        }
+
+        async function dbInfo() {
+            const data = await fetch(`${url()}/info`, { headers: { "Authorization": authToken() } });
+            const result = await data.json();
+            return result.current_generation;
+        }
+
+        async function dbBootstrap(generation) {
+            const data = await fetch(`${url()}/export/${generation}`, { headers: { "Authorization": authToken() } });
+            return await data.body.getReader();
+        }
+
+        async function walPull(generation, start, end) {
+            const data = await fetch(`${url()}/sync/${generation}/${start}/${end}`, { headers: { "Authorization": authToken() } });
+            if (data.status == 200) {
+                return { reader: await data.body.getReader() };
+            } else {
+                return { status: await data.json() };
+            }
+        }
+
+        async function walPush(generation, start, end, data) {
+            const result = await fetch(
+                `${url()}/sync/${generation}/${start}/${end}`,
+                {
+                    method: 'POST',
+                    headers: { "Authorization": authToken() },
+                    body: data
+                }
+            );
+            return await result.json();
+        }
+
+        async function run(protocol) {
+            let resume = { type: 'None' };
+            let stream = null;
+            while (true) {
+                let yield_result = protocol.next(resume);
+                console.info(yield_result);
+                if (yield_result == null) {
+                    break;
+                }
+                if (yield_result.type == "ReadFile") {
+                    if (!files.has(yield_result.path)) {
+                        resume = { type: 'Content' };
+                    } else {
+                        resume = { type: 'Content', field0: files.get(yield_result.path) };
+                    }
+                } else if (yield_result.type == "WriteFile") {
+                    files.set(yield_result.path, yield_result.data);
+                    resume = { type: 'None' };
+                } else if (yield_result.type == "ExistsFile") {
+                    resume = { type: 'Exists', field0: files.has(yield_result.path) };
+                } else if (yield_result.type == "DbInfo") {
+                    resume = { type: 'DbInfo', generation: await dbInfo() };
+                } else if (yield_result.type == "DbBootstrap") {
+                    stream = await dbBootstrap(yield_result.generation);
+                    const { done, value } = await stream.read();
+                    if (done) {
+                        stream = null;
+                        resume = { type: 'Content' }
+                        continue;
+                    }
+                    resume = { type: 'Content', field0: Array.from(value) };
+                } else if (yield_result.type == "WalPull") {
+                    const result = await walPull(yield_result.generation, yield_result.startFrame, yield_result.startFrame + 100);
+                    if (result.status != null) {
+                        resume = { type: 'DbStatus', status: result.status.status, generation: result.status.generation, maxFrameNo: result.status.max_frame_no };
+                        continue;
+                    }
+                    stream = result.reader;
+                    const { done, value } = await stream.read();
+                    if (done) {
+                        stream = null;
+                        resume = { type: 'Content' }
+                        continue;
+                    }
+                    resume = { type: 'Content', field0: Array.from(value) };
+                } else if (yield_result.type == "WalPush") {
+                    const result = await walPush(yield_result.generation, yield_result.startFrame, yield_result.endFrame, new Uint8Array(yield_result.frames));
+                    console.info(result);
+                    resume = { type: 'None' };
+                } else if (yield_result.type == "Continue") {
+                    const { done, value } = await stream.read();
+                    if (done) {
+                        stream = null;
+                        resume = { type: 'Content' }
+                        continue;
+                    }
+                    resume = { type: 'Content', field0: Array.from(value) };
+                } else {
+                    throw Error(`unexected yield_result: ${yield_result}`);
+                }
+            }
+        }
+
+        for (const element of document.getElementsByClassName('control')) {
+            element.disabled = true;
+        }
+
+        var db = new Database("local.db");
+        let initializer = db.init();
+        await run(initializer);
+
+        for (const element of document.getElementsByClassName('control')) {
+            element.disabled = false;
+        }
+
+        document.getElementById("exec").onclick = function () {
+            const sql = document.getElementById("sql").value;
+            const result = db.execute(sql);
+            document.getElementById("response").textContent = result.map(l => JSON.stringify(l)).join("\n");
+        }
+        document.getElementById("push").onclick = async function () {
+            let pusher = db.push();
+            await run(pusher);
+        }
+        document.getElementById("pull").onclick = async function () {
+            let puller = db.pull();
+            await run(puller);
+        }
+        document.getElementById("sync").onclick = async function () {
+            let syncer = db.sync();
+            await run(syncer);
+        }
+    </script>
+
+
+    <h1>browser sync</h1>
+
+    <div style="margin: 10px">
+        <button disabled id="push" class="control">push</button>
+        <button disabled id="pull" class="control">pull</button>
+        <button disabled id="sync" class="control">sync</button>
+    </div>
+
+    <form style="margin: 10px" onsubmit="return false">
+        <input disabled id="sql" type="text" class="control" />
+        <button disabled type="submit" id="exec" class="control">exec</button>
+    </form>
+
+    <pre style="margin: 10px" id="response">
+    </pre>
+
+</body>
+
+</html>

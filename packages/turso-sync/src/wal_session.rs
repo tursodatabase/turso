@@ -1,16 +1,19 @@
-use crate::Result;
+use turso_sync_protocol::Result;
 
-pub struct WalSession<'a> {
-    conn: &'a turso::Connection,
+pub struct WalSession {
+    conn: turso::Connection,
     in_txn: bool,
 }
 
-impl<'a> WalSession<'a> {
-    pub fn new(conn: &'a turso::Connection) -> Self {
+impl WalSession {
+    pub fn new(conn: turso::Connection) -> Self {
         Self {
             conn,
             in_txn: false,
         }
+    }
+    pub fn conn(&self) -> &turso::Connection {
+        &self.conn
     }
     pub fn begin(&mut self) -> Result<()> {
         assert!(!self.in_txn);
@@ -29,7 +32,7 @@ impl<'a> WalSession<'a> {
     }
 }
 
-impl<'a> Drop for WalSession<'a> {
+impl Drop for WalSession {
     fn drop(&mut self) {
         if self.in_txn {
             let _ = self

@@ -1,25 +1,29 @@
 [package]
-name = "turso-sync"
-version.workspace = true
-authors.workspace = true
-edition.workspace = true
-license.workspace = true
-repository.workspace = true
+name = "turso_sync"
+
+[workspace]
 
 [dependencies]
 turso_core = { workspace = true }
-turso = { workspace = true }
+turso_sync_protocol = { workspace = true }
+turso = { workspace = true, features = ["conn_raw_api"] }
 thiserror = "2.0.12"
 tracing = "0.1.41"
-hyper = { version = "1.6.0", features = ["client", "http1"] }
 serde_json.workspace = true
-http-body-util = "0.1.3"
-http = "1.3.1"
-hyper-util = { version = "0.1.16", features = ["tokio", "http1", "client"] }
 serde = { workspace = true, features = ["derive"] }
-tokio = { version = "1.46.1", features = ["fs", "io-util"] }
-hyper-rustls = "0.27.7"
-rustls = "0.23.31"
+tokio = { version = "1.46.1", features = ["fs", "io-util", "time"] }
+bytes = "1.10.1"
+http-body-util = { version = "0.1.3", optional = true }
+http = { version = "1.3.1", optional = true }
+rustls = { version = "0.23.31", default-features = false, features = ["log", "logging", "ring", "std", "tls12"], optional = true }
+hyper = { version = "1.6.0", features = ["client", "http1"], optional = true }
+hyper-util = { version = "0.1.16", features = ["tokio", "http1", "client"], optional = true }
+hyper-rustls = { version = "0.27.7", default-features = false, features = ["http1", "log", "logging", "native-tokio", "ring", "rustls-native-certs", "tls12"], optional = true }
+genawaiter = { version = "0.99.1", default-features = false }
+
+[features]
+default = []
+hyper = ["dep:hyper", "dep:http-body-util", "dep:http", "dep:hyper-util", "dep:rustls", "dep:hyper-rustls"]
 
 [dev-dependencies]
 ctor = "0.4.2"

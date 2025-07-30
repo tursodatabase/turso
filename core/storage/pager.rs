@@ -6,7 +6,7 @@ use crate::storage::sqlite3_ondisk::{
     self, parse_wal_frame_header, DatabaseHeader, PageContent, PageSize, PageType,
 };
 use crate::storage::wal::{CheckpointResult, Wal};
-use crate::types::{IOResult, WalInsertInfo};
+use crate::types::{IOResult, WalFrameInfo};
 use crate::util::IOExt as _;
 use crate::{return_if_io, Completion, TransactionState};
 use crate::{turso_assert, Buffer, Connection, LimboError, Result};
@@ -929,6 +929,42 @@ impl Pager {
         Ok(())
     }
 
+    #[tracing::instrument(skip_all, level = Level::DEBUG)]
+    pub fn read_page_no_cache(
+        &self,
+        frame_watermark: Option<u64>,
+        page_idx: usize,
+    ) -> Result<(PageRef, Completion)> {
+        tracing::trace!("read_page_no_cache(page_idx = {})", page_idx);
+        let page = Arc::new(Page::new(page_idx));
+        page.set_locked();
+
+        let Some(wal) = self.wal.as_ref() else {
+            let c = self.begin_read_disk_page(page_idx, page.clone())?;
+            return Ok((page, c));
+        };
+
+        let wal_frame_id = {
+            let max_frame = frame_watermark.unwrap_or_else(|| wal.borrow().get_max_frame());
+            wal.borrow().find_frame(max_frame, page_idx as u64)?
+        };
+
+        if let Some(frame_id) = wal_frame_id {
+            let c = wal
+                .borrow()
+                .read_frame(frame_id, page.clone(), self.buffer_pool.clone())?;
+            {
+                page.set_uptodate();
+            }
+            // TODO(pere) should probably first insert to page cache, and if successful,
+            // read frame or page
+            return Ok((page, c));
+        }
+
+        let c = self.begin_read_disk_page(page_idx, page.clone())?;
+        Ok((page, c))
+    }
+
     /// Reads a page from the database.
     #[tracing::instrument(skip_all, level = Level::DEBUG)]
     pub fn read_page(&self, page_idx: usize) -> Result<(PageRef, Completion)> {
@@ -940,29 +976,9 @@ impl Pager {
             // Dummy completion being passed, as we do not need to read from database or wal
             return Ok((page.clone(), Completion::new_write(|_| {})));
         }
-        let page = Arc::new(Page::new(page_idx));
-        page.set_locked();
-
-        let Some(wal) = self.wal.as_ref() else {
-            let c = self.begin_read_disk_page(page_idx, page.clone())?;
-            self.cache_insert(page_idx, page.clone(), &mut page_cache)?;
-            return Ok((page, c));
-        };
-
-        if let Some(frame_id) = wal.borrow().find_frame(page_idx as u64)? {
-            let c = wal
-                .borrow()
-                .read_frame(frame_id, page.clone(), self.buffer_pool.clone())?;
-            {
-                page.set_uptodate();
-            }
-            // TODO(pere) should probably first insert to page cache, and if successful,
-            // read frame or page
-            self.cache_insert(page_idx, page.clone(), &mut page_cache)?;
-            return Ok((page, c));
-        }
-
-        let c = self.begin_read_disk_page(page_idx, page.clone())?;
+        let (page, c) = self.read_page_no_cache(None, page_idx)?;
+        // TODO(pere) should probably first insert to page cache, and if successful,
+        // read frame or page
         self.cache_insert(page_idx, page.clone(), &mut page_cache)?;
         Ok((page, c))
     }
@@ -1025,7 +1041,7 @@ impl Pager {
                 "wal_frame_count() called on database without WAL".to_string(),
             ));
         };
-        Ok(wal.borrow().get_max_frame_in_wal())
+        Ok(wal.borrow().get_max_frame())
     }
 
     /// Flush all dirty pages to disk.
@@ -1279,6 +1295,12 @@ impl Pager {
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
+    pub fn wal_changed_pages_after(&self, frame_watermark: u32) -> Result<Vec<u32>> {
+        let wal = self.wal.as_ref().unwrap().borrow();
+        wal.changed_pages_after(frame_watermark)
+    }
+
+    #[instrument(skip_all, level = Level::DEBUG)]
     pub fn wal_get_frame(&self, frame_no: u32, frame: &mut [u8]) -> Result<Completion> {
         let Some(wal) = self.wal.as_ref() else {
             return Err(LimboError::InternalError(
@@ -1290,7 +1312,7 @@ impl Pager {
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
-    pub fn wal_insert_frame(&self, frame_no: u32, frame: &[u8]) -> Result<WalInsertInfo> {
+    pub fn wal_insert_frame(&self, frame_no: u32, frame: &[u8]) -> Result<WalFrameInfo> {
         let Some(wal) = self.wal.as_ref() else {
             return Err(LimboError::InternalError(
                 "wal_insert_frame() called on database without WAL".to_string(),
@@ -1323,9 +1345,9 @@ impl Pager {
             }
             self.dirty_pages.borrow_mut().clear();
         }
-        Ok(WalInsertInfo {
-            page_no: header.page_number as usize,
-            is_commit: header.is_commit_frame(),
+        Ok(WalFrameInfo {
+            page_no: header.page_number,
+            db_size: header.db_size,
         })
     }
 

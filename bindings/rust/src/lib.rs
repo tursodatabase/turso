@@ -38,7 +38,8 @@ pub mod transaction;
 pub mod value;
 
 use transaction::TransactionBehavior;
-use turso_core::types::WalInsertInfo;
+#[cfg(feature = "conn_raw_api")]
+use turso_core::types::WalFrameInfo;
 pub use value::Value;
 
 pub use params::params_from_iter;
@@ -141,12 +142,7 @@ impl Database {
     /// Connect to the database.
     pub fn connect(&self) -> Result<Connection> {
         let conn = self.inner.connect()?;
-        #[allow(clippy::arc_with_non_send_sync)]
-        let connection = Connection {
-            inner: Arc::new(Mutex::new(conn)),
-            transaction_behavior: TransactionBehavior::Deferred,
-        };
-        Ok(connection)
+        Ok(Connection::create(conn))
     }
 }
 
@@ -169,6 +165,13 @@ unsafe impl Send for Connection {}
 unsafe impl Sync for Connection {}
 
 impl Connection {
+    pub fn create(conn: Arc<turso_core::Connection>) -> Self {
+        #[allow(clippy::arc_with_non_send_sync)]
+        Connection {
+            inner: Arc::new(Mutex::new(conn)),
+            transaction_behavior: TransactionBehavior::Deferred,
+        }
+    }
     /// Query the database with SQL.
     pub async fn query(&self, sql: &str, params: impl IntoParams) -> Result<Rows> {
         let mut stmt = self.prepare(sql).await?;
@@ -181,6 +184,32 @@ impl Connection {
         stmt.execute(params).await
     }
 
+    #[cfg(feature = "conn_raw_api")]
+    pub fn wal_watermark_read_page(
+        &self,
+        frame_watermark: u32,
+        page_idx: u32,
+        page: &mut [u8],
+    ) -> Result<bool> {
+        let conn = self
+            .inner
+            .lock()
+            .map_err(|e| Error::MutexError(e.to_string()))?;
+        conn.wal_watermark_read_page(frame_watermark, page_idx, page)
+            .map_err(|e| Error::WalOperationError(format!("read_page failed: {e}")))
+    }
+
+    #[cfg(feature = "conn_raw_api")]
+    pub fn wal_changed_pages_after(&self, frame_watermark: u32) -> Result<Vec<u32>> {
+        let conn = self
+            .inner
+            .lock()
+            .map_err(|e| Error::MutexError(e.to_string()))?;
+        conn.wal_changed_pages_after(frame_watermark)
+            .map_err(|e| Error::WalOperationError(format!("wal_changed_pages_after failed: {e}")))
+    }
+
+    #[cfg(feature = "conn_raw_api")]
     pub fn wal_frame_count(&self) -> Result<u64> {
         let conn = self
             .inner
@@ -190,6 +219,7 @@ impl Connection {
             .map_err(|e| Error::WalOperationError(format!("wal_insert_begin failed: {e}")))
     }
 
+    #[cfg(feature = "conn_raw_api")]
     pub fn wal_insert_begin(&self) -> Result<()> {
         let conn = self
             .inner
@@ -199,6 +229,7 @@ impl Connection {
             .map_err(|e| Error::WalOperationError(format!("wal_insert_begin failed: {e}")))
     }
 
+    #[cfg(feature = "conn_raw_api")]
     pub fn wal_insert_end(&self) -> Result<()> {
         let conn = self
             .inner
@@ -208,7 +239,8 @@ impl Connection {
             .map_err(|e| Error::WalOperationError(format!("wal_insert_end failed: {e}")))
     }
 
-    pub fn wal_insert_frame(&self, frame_no: u32, frame: &[u8]) -> Result<WalInsertInfo> {
+    #[cfg(feature = "conn_raw_api")]
+    pub fn wal_insert_frame(&self, frame_no: u32, frame: &[u8]) -> Result<WalFrameInfo> {
         let conn = self
             .inner
             .lock()
@@ -217,13 +249,14 @@ impl Connection {
             .map_err(|e| Error::WalOperationError(format!("wal_insert_frame failed: {e}")))
     }
 
-    pub fn wal_get_frame(&self, frame_no: u32, frame: &mut [u8]) -> Result<()> {
+    #[cfg(feature = "conn_raw_api")]
+    pub fn wal_get_frame(&self, frame_no: u32, frame: &mut [u8]) -> Result<WalFrameInfo> {
         let conn = self
             .inner
             .lock()
             .map_err(|e| Error::MutexError(e.to_string()))?;
         conn.wal_get_frame(frame_no, frame)
-            .map_err(|e| Error::WalOperationError(format!("wal_insert_frame failed: {e}")))
+            .map_err(|e| Error::WalOperationError(format!("wal_get_frame failed: {e}")))
     }
 
     /// Execute a batch of SQL statements on the database.
@@ -300,6 +333,30 @@ impl Connection {
             .map_err(|e| Error::MutexError(e.to_string()))?;
 
         Ok(conn.get_auto_commit())
+    }
+
+    pub fn total_changes(&self) -> Result<i64> {
+        let conn = self
+            .inner
+            .lock()
+            .map_err(|e| Error::MutexError(e.to_string()))?;
+        Ok(conn.total_changes())
+    }
+
+    pub fn changes(&self) -> Result<i64> {
+        let conn = self
+            .inner
+            .lock()
+            .map_err(|e| Error::MutexError(e.to_string()))?;
+        Ok(conn.changes())
+    }
+
+    pub fn last_insert_rowid(&self) -> Result<i64> {
+        let conn = self
+            .inner
+            .lock()
+            .map_err(|e| Error::MutexError(e.to_string()))?;
+        Ok(conn.last_insert_rowid())
     }
 }
 

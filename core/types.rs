@@ -2590,9 +2590,19 @@ pub struct DatabaseChange {
 }
 
 #[derive(Debug)]
-pub struct WalInsertInfo {
-    pub page_no: usize,
-    pub is_commit: bool,
+pub struct WalFrameInfo {
+    pub page_no: u32,
+    pub db_size: u32,
+}
+
+impl WalFrameInfo {
+    pub fn is_commit_frame(&self) -> bool {
+        self.db_size > 0
+    }
+    pub fn put_to_frame_header(&self, frame: &mut [u8]) {
+        frame[0..4].copy_from_slice(&self.page_no.to_be_bytes());
+        frame[4..8].copy_from_slice(&self.db_size.to_be_bytes());
+    }
 }
 
 #[cfg(test)]

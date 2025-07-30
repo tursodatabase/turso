@@ -1,0 +1,24 @@
+[package]
+name = "turso_sync_protocol"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+turso_core = { workspace = true }
+turso = { workspace = true, features = ["conn_raw_api"] }
+thiserror = "2.0.12"
+tracing = "0.1.41"
+serde_json.workspace = true
+serde = { workspace = true, features = ["derive"] }
+tokio = { version = "1.46.1", features = ["fs", "io-util", "time"] }
+bytes = "1.10.1"
+http-body-util = { version = "0.1.3", default-features = false }
+http = { version = "1.3.1", default-features = false }
+hyper = { version = "1.6.0", default-features = false }
+genawaiter = { version = "0.99.1", default-features = false }
+
+[dev-dependencies]
+tempfile = "3.20.0"

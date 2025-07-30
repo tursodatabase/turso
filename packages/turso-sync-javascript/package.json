@@ -1,0 +1,117 @@
+{
+  "name": "turso-sync-javascript",
+  "version": "1.0.0",
+  "description": "Template project for writing node package with napi-rs",
+  "main": "index.js",
+  "repository": "git@github.com:napi-rs/package-template.git",
+  "license": "MIT",
+  "keywords": [
+    "napi-rs",
+    "NAPI",
+    "N-API",
+    "Rust",
+    "node-addon",
+    "node-addon-api"
+  ],
+  "files": [
+    "index.d.ts",
+    "index.js"
+  ],
+  "napi": {
+    "binaryName": "turso-sync-javascript",
+    "targets": [
+      "x86_64-pc-windows-msvc",
+      "x86_64-apple-darwin",
+      "x86_64-unknown-linux-gnu",
+      "x86_64-unknown-linux-musl",
+      "aarch64-unknown-linux-gnu",
+      "i686-pc-windows-msvc",
+      "armv7-unknown-linux-gnueabihf",
+      "aarch64-apple-darwin",
+      "aarch64-linux-android",
+      "x86_64-unknown-freebsd",
+      "aarch64-unknown-linux-musl",
+      "aarch64-pc-windows-msvc",
+      "armv7-linux-androideabi",
+      "wasm32-wasip1-threads"
+    ]
+  },
+  "engines": {
+    "node": ">= 6.14.2 < 7 || >= 8.11.2 < 9 || >= 9.11.0 < 10 || >= 10.0.0"
+  },
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
+  },
+  "scripts": {
+    "vite-dev": "vite",
+    "vite-build": "vite build",
+    "artifacts": "napi artifacts",
+    "bench": "node --import @oxc-node/core/register benchmark/bench.ts",
+    "build": "napi build --platform --release",
+    "build:debug": "napi build --platform",
+    "format": "run-p format:prettier format:rs format:toml",
+    "format:prettier": "prettier . -w",
+    "format:toml": "taplo format",
+    "format:rs": "cargo fmt",
+    "lint": "oxlint .",
+    "prepublishOnly": "napi prepublish -t npm",
+    "test": "ava",
+    "version": "napi version",
+    "prepare": "husky"
+  },
+  "devDependencies": {
+    "@emnapi/core": "^1.4.5",
+    "@emnapi/runtime": "^1.4.5",
+    "@napi-rs/cli": "^3.0.3",
+    "@oxc-node/core": "^0.0.30",
+    "@taplo/cli": "^0.7.0",
+    "@tybys/wasm-util": "^0.10.0",
+    "ava": "^6.4.1",
+    "chalk": "^5.4.1",
+    "husky": "^9.1.7",
+    "lint-staged": "^16.1.2",
+    "npm-run-all2": "^8.0.4",
+    "oxlint": "^1.8.0",
+    "prettier": "^3.6.2",
+    "tinybench": "^4.0.1",
+    "typescript": "^5.8.3",
+    "vite": "^7.0.6"
+  },
+  "lint-staged": {
+    "*.@(js|ts|tsx)": [
+      "oxlint --fix"
+    ],
+    "*.@(js|ts|tsx|yml|yaml|md|json)": [
+      "prettier --write"
+    ],
+    "*.toml": [
+      "taplo format"
+    ]
+  },
+  "ava": {
+    "extensions": {
+      "ts": "module"
+    },
+    "timeout": "2m",
+    "workerThreads": false,
+    "environmentVariables": {
+      "OXC_TSCONFIG_PATH": "./__test__/tsconfig.json"
+    },
+    "nodeArguments": [
+      "--import",
+      "@oxc-node/core/register"
+    ]
+  },
+  "prettier": {
+    "printWidth": 120,
+    "semi": false,
+    "trailingComma": "all",
+    "singleQuote": true,
+    "arrowParens": "always"
+  },
+  "packageManager": "yarn@4.9.2",
+  "dependencies": {
+    "@napi-rs/wasm-runtime": "^1.0.1"
+  }
+}

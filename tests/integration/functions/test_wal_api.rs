@@ -140,7 +140,7 @@ fn test_wal_frame_transfer_schema_changes() {
     for frame_id in 1..=conn1.wal_frame_count().unwrap() as u32 {
         conn1.wal_get_frame(frame_id, &mut frame).unwrap();
         let info = conn2.wal_insert_frame(frame_id, &frame).unwrap();
-        if info.is_commit {
+        if info.is_commit_frame() {
             commits += 1;
         }
     }

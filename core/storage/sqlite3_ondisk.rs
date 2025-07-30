@@ -795,11 +795,10 @@ pub fn begin_read_page(
     let complete = Box::new(move |buf: Arc<RefCell<Buffer>>, bytes_read: i32| {
         let buf_len = buf.borrow().len();
         turso_assert!(
-            bytes_read == buf_len as i32,
+            bytes_read == 0 || bytes_read == buf_len as i32,
             "read({bytes_read}) != expected({buf_len})"
         );
-        let page = page.clone();
-        if finish_read_page(page_idx, buf, page.clone()).is_err() {
+        if bytes_read == 0 || finish_read_page(page_idx, buf, page.clone()).is_err() {
             page.set_error();
         }
     });

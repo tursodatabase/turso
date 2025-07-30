@@ -12,6 +12,7 @@ description = "Turso Rust API"
 [features]
 default = ["experimental_indexes"]
 experimental_indexes = []
+conn_raw_api = ["turso_core/conn_raw_api"]
 antithesis = ["turso_core/antithesis"]
 
 [dependencies]

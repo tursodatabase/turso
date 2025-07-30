@@ -44,8 +44,10 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use crate::translate::optimizer::optimize_plan;
 use crate::translate::pragma::TURSO_CDC_DEFAULT_TABLE_NAME;
-#[cfg(feature = "fs")]
-use crate::types::WalInsertInfo;
+#[cfg(all(feature = "fs", feature = "conn_raw_api"))]
+use crate::types::WalFrameInfo;
+#[cfg(all(feature = "fs", feature = "conn_raw_api"))]
+use crate::util::IOExt;
 #[cfg(feature = "fs")]
 use crate::util::{OpenMode, OpenOptions};
 use crate::vtab::VirtualTable;
@@ -1140,27 +1142,59 @@ impl Connection {
         Ok(())
     }
 
-    #[cfg(feature = "fs")]
+    #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
+    pub fn wal_watermark_read_page(
+        &self,
+        frame_watermark: u32,
+        page_idx: u32,
+        page: &mut [u8],
+    ) -> Result<bool> {
+        let pager = self.pager.borrow();
+        let (page_ref, c) =
+            pager.read_page_no_cache(Some(frame_watermark as u64), page_idx as usize)?;
+        pager.io.wait_for_completion(c)?;
+
+        if page_ref.is_error() {
+            return Ok(false);
+        }
+        let content = page_ref.get_contents();
+        page.copy_from_slice(content.as_ptr());
+        Ok(true)
+    }
+
+    #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
     pub fn wal_frame_count(&self) -> Result<u64> {
         self.pager.borrow().wal_frame_count()
     }
 
-    #[cfg(feature = "fs")]
-    pub fn wal_get_frame(&self, frame_no: u32, frame: &mut [u8]) -> Result<()> {
+    #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
+    pub fn wal_changed_pages_after(&self, frame_watermark: u32) -> Result<Vec<u32>> {
+        self.pager.borrow().wal_changed_pages_after(frame_watermark)
+    }
+
+    #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
+    pub fn wal_get_frame(&self, frame_no: u32, frame: &mut [u8]) -> Result<WalFrameInfo> {
+        use crate::storage::sqlite3_ondisk::parse_wal_frame_header;
+
         let c = self.pager.borrow().wal_get_frame(frame_no, frame)?;
-        self._db.io.wait_for_completion(c)
+        self._db.io.wait_for_completion(c)?;
+        let (header, _) = parse_wal_frame_header(frame);
+        Ok(WalFrameInfo {
+            page_no: header.page_number,
+            db_size: header.db_size,
+        })
     }
 
     /// Insert `frame` (header included) at the position `frame_no` in the WAL
     /// If WAL already has frame at that position - turso-db will compare content of the page and either report conflict or return OK
     /// If attempt to write frame at the position `frame_no` will create gap in the WAL - method will return error
-    #[cfg(feature = "fs")]
-    pub fn wal_insert_frame(&self, frame_no: u32, frame: &[u8]) -> Result<WalInsertInfo> {
+    #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
+    pub fn wal_insert_frame(&self, frame_no: u32, frame: &[u8]) -> Result<WalFrameInfo> {
         self.pager.borrow().wal_insert_frame(frame_no, frame)
     }
 
     /// Start WAL session by initiating read+write transaction for this connection
-    #[cfg(feature = "fs")]
+    #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
     pub fn wal_insert_begin(&self) -> Result<()> {
         let pager = self.pager.borrow();
         match pager.begin_read_tx()? {
@@ -1181,7 +1215,7 @@ impl Connection {
 
     /// Finish WAL session by ending read+write transaction taken in the [Self::wal_insert_begin] method
     /// All frames written after last commit frame (db_size > 0) within the session will be rolled back
-    #[cfg(feature = "fs")]
+    #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
     pub fn wal_insert_end(self: &Arc<Connection>) -> Result<()> {
         {
             let pager = self.pager.borrow();

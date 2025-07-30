@@ -3,12 +3,9 @@ use std::io::Read;
 use http::request;
 use http_body_util::BodyExt;
 use hyper::body::{Buf, Bytes};
+use turso_sync_protocol::{errors::Error, Result};
 
-use crate::{
-    errors::Error,
-    sync_server::{DbSyncInfo, DbSyncStatus, Stream, SyncServer},
-    Result,
-};
+use crate::sync_server::{DbSyncInfo, DbSyncStatus, Stream, SyncServer};
 
 pub type Client = hyper_util::client::legacy::Client<
     hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
@@ -50,7 +47,7 @@ pub struct HyperStream {
 }
 
 impl Stream for HyperStream {
-    async fn read_chunk(&mut self) -> Result<Option<hyper::body::Bytes>> {
+    async fn read_chunk(&mut self) -> Result<Option<bytes::Bytes>> {
         let Some(frame) = self.body.frame().await else {
             return Ok(None);
         };
@@ -92,7 +89,8 @@ impl TursoSyncServer {
         }
         let request = request.body(body).map_err(Error::Http)?;
         let response = self.client.request(request).await;
-        let response = response.map_err(Error::HyperRequest)?;
+        let response = response
+            .map_err(|e| Error::DatabaseSyncError(format!("hyper response failed: {e}")))?;
         let status = response.status();
         Ok((status, response.into_body()))
     }

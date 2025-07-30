@@ -1,0 +1,25 @@
+{
+  "name": "@tursodatabase/turso-linux-arm64-gnu",
+  "version": "0.1.3-pre.5",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/tursodatabase/turso"
+  },
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "main": "turso.linux-arm64-gnu.node",
+  "files": [
+    "turso.linux-arm64-gnu.node"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">= 10"
+  },
+  "libc": [
+    "glibc"
+  ]
+}

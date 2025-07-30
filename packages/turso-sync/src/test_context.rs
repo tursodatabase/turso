@@ -8,8 +8,7 @@ use std::{
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use tokio::sync::Mutex;
-
-use crate::{errors::Error, Result};
+use turso_sync_protocol::Result;
 
 type PinnedFuture = Pin<Box<dyn Future<Output = bool> + Send>>;
 
@@ -114,7 +113,6 @@ impl TestContext {
         plans
     }
     pub async fn faulty_call(&self, name: &str) -> Result<()> {
-        tracing::trace!("faulty_call: {}", name);
         tokio::task::yield_now().await;
         if let FaultInjectionStrategy::Disabled = &*self.fault_injection.lock().await {
             return Ok(());
@@ -128,7 +126,9 @@ impl TestContext {
             }
             FaultInjectionStrategy::Enabled { plan } => {
                 if plan.is_fault.as_ref()(name.to_string(), bt.clone()).await {
-                    Err(Error::DatabaseSyncError("injected fault".to_string()))
+                    Err(turso_sync_protocol::errors::Error::DatabaseSyncError(
+                        "injected fault".to_string(),
+                    ))
                 } else {
                     Ok(())
                 }

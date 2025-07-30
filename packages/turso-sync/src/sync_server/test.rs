@@ -2,12 +2,15 @@ use std::{collections::HashMap, path::Path, sync::Arc};
 
 use tokio::sync::Mutex;
 use turso::{IntoParams, Value};
+use turso_sync_protocol::{
+    errors::Error,
+    types::{DbSyncInfo, DbSyncStatus},
+    Result,
+};
 
 use crate::{
-    errors::Error,
-    sync_server::{DbSyncInfo, DbSyncStatus, Stream, SyncServer},
+    sync_server::{Stream, SyncServer},
     test_context::TestContext,
-    Result,
 };
 
 struct Generation {
@@ -58,7 +61,7 @@ impl TestStream {
 }
 
 impl Stream for TestStream {
-    async fn read_chunk(&mut self) -> Result<Option<hyper::body::Bytes>> {
+    async fn read_chunk(&mut self) -> Result<Option<bytes::Bytes>> {
         self.ctx
             .faulty_call(if self.position == 0 {
                 "read_chunk_first"
@@ -187,7 +190,7 @@ impl SyncServer for TestSyncServer {
             let frame = &frames[offset..offset + FRAME_SIZE];
             match session.conn.wal_insert_frame(frame_no as u32, frame) {
                 Ok(info) => {
-                    if info.is_commit {
+                    if info.is_commit_frame() {
                         if session.in_txn {
                             session.conn.wal_insert_end()?;
                             session.in_txn = false;

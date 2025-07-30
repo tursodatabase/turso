@@ -17,7 +17,7 @@ path = "integration/mod.rs"
 [dependencies]
 anyhow.workspace = true
 env_logger = "0.10.1"
-turso_core = { path = "../core" }
+turso_core = { path = "../core", features = ["conn_raw_api"] }
 turso = { path = "../bindings/rust" }
 tokio = { version = "1.47", features = ["full"] }
 rusqlite = { version = "0.34", features = ["bundled"] }

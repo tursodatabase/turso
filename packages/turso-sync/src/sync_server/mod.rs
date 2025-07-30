@@ -1,26 +1,16 @@
-use crate::Result;
+use turso_sync_protocol::{
+    types::{DbSyncInfo, DbSyncStatus},
+    Result,
+};
 
 #[cfg(test)]
 pub mod test;
 pub mod turso;
 
-#[derive(Debug, serde::Deserialize)]
-pub struct DbSyncInfo {
-    pub current_generation: usize,
-}
-
-#[derive(Debug, serde::Deserialize)]
-pub struct DbSyncStatus {
-    pub baton: Option<String>,
-    pub status: String,
-    pub generation: usize,
-    pub max_frame_no: usize,
-}
-
 pub trait Stream {
     fn read_chunk(
         &mut self,
-    ) -> impl std::future::Future<Output = Result<Option<hyper::body::Bytes>>> + Send;
+    ) -> impl std::future::Future<Output = Result<Option<bytes::Bytes>>> + Send;
 }
 
 pub trait SyncServer {

@@ -1,8 +1,9 @@
 use std::path::Path;
 
 use tokio::io::AsyncWriteExt;
+use turso_sync_protocol::Result;
 
-use crate::{filesystem::Filesystem, Result};
+use crate::filesystem::Filesystem;
 
 pub struct TokioFilesystem();
 

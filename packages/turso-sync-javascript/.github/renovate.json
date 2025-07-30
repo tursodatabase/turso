@@ -1,0 +1,20 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:base", "group:allNonMajor", ":preserveSemverRanges", ":disablePeerDependencies"],
+  "labels": ["dependencies"],
+  "packageRules": [
+    {
+      "matchPackageNames": ["@napi/cli", "napi", "napi-build", "napi-derive"],
+      "addLabels": ["napi-rs"],
+      "groupName": "napi-rs"
+    },
+    {
+      "matchPackagePatterns": ["^eslint", "^@typescript-eslint"],
+      "groupName": "linter"
+    }
+  ],
+  "commitMessagePrefix": "chore: ",
+  "commitMessageAction": "bump up",
+  "commitMessageTopic": "{{depName}} version",
+  "ignoreDeps": []
+}

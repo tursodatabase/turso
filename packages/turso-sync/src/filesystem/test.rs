@@ -1,6 +1,8 @@
 use std::{io::Write, sync::Arc};
 
-use crate::{filesystem::Filesystem, test_context::TestContext, Result};
+use turso_sync_protocol::Result;
+
+use crate::{filesystem::Filesystem, test_context::TestContext};
 
 pub struct TestFilesystem {
     ctx: Arc<TestContext>,

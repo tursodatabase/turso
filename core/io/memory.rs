@@ -1,15 +1,17 @@
 use super::{Buffer, Clock, Completion, File, OpenFlags, IO};
-use crate::Result;
+use crate::{LimboError, Result};
 
 use crate::io::clock::Instant;
 use std::{
     cell::{Cell, RefCell, UnsafeCell},
-    collections::BTreeMap,
-    sync::Arc,
+    collections::{BTreeMap, HashMap},
+    sync::{Arc, Mutex},
 };
 use tracing::debug;
 
-pub struct MemoryIO {}
+pub struct MemoryIO {
+    files: Arc<Mutex<HashMap<String, Arc<MemoryFile>>>>,
+}
 unsafe impl Send for MemoryIO {}
 
 // TODO: page size flag
@@ -20,7 +22,9 @@ impl MemoryIO {
     #[allow(clippy::arc_with_non_send_sync)]
     pub fn new() -> Self {
         debug!("Using IO backend 'memory'");
-        Self {}
+        Self {
+            files: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 }
 
@@ -41,11 +45,21 @@ impl Clock for MemoryIO {
 }
 
 impl IO for MemoryIO {
-    fn open_file(&self, _path: &str, _flags: OpenFlags, _direct: bool) -> Result<Arc<dyn File>> {
-        Ok(Arc::new(MemoryFile {
-            pages: BTreeMap::new().into(),
-            size: 0.into(),
-        }))
+    fn open_file(&self, path: &str, flags: OpenFlags, _direct: bool) -> Result<Arc<dyn File>> {
+        let mut files = self.files.lock().unwrap();
+        if !files.contains_key(path) && !flags.contains(OpenFlags::Create) {
+            return Err(LimboError::InternalError("file not found".to_string()));
+        }
+        if !files.contains_key(path) {
+            files.insert(
+                path.to_string(),
+                Arc::new(MemoryFile {
+                    pages: BTreeMap::new().into(),
+                    size: 0.into(),
+                }),
+            );
+        }
+        Ok(files.get(path).unwrap().clone())
     }
 
     fn run_once(&self) -> Result<()> {
@@ -87,6 +101,7 @@ impl File for MemoryFile {
     }
 
     fn pread(&self, pos: usize, c: Completion) -> Result<Completion> {
+        tracing::debug!("pread: pos={}, size={}", pos, self.size.get());
         let r = c.as_read();
         let buf_len = r.buf().len();
         if buf_len == 0 {
@@ -135,6 +150,12 @@ impl File for MemoryFile {
     ) -> Result<Completion> {
         let buf = buffer.borrow();
         let buf_len = buf.len();
+        tracing::debug!(
+            "pwrite: pos={}, len={}, size={}",
+            pos,
+            buf_len,
+            self.size.get()
+        );
         if buf_len == 0 {
             c.complete(0);
             return Ok(c);
@@ -175,6 +196,7 @@ impl File for MemoryFile {
     }
 
     fn truncate(&self, len: usize, c: Completion) -> Result<Completion> {
+        tracing::debug!("truncate: len={}, size={}", len, self.size.get());
         if len < self.size.get() {
             // Truncate pages
             unsafe {
@@ -193,6 +215,7 @@ impl File for MemoryFile {
         buffers: Vec<Arc<RefCell<Buffer>>>,
         c: Completion,
     ) -> Result<Completion> {
+        tracing::debug!("pwritev: pos={}, size={}", pos, self.size.get());
         let mut offset = pos;
         let mut total_written = 0;
 
