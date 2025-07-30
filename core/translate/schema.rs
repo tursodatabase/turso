@@ -472,7 +472,7 @@ fn create_table_body_to_str(tbl_name: &ast::QualifiedName, body: &ast::CreateTab
     sql
 }
 
-fn create_vtable_body_to_str(vtab: &CreateVirtualTable, module: Rc<VTabImpl>) -> String {
+fn create_vtable_body_to_str(vtab: &CreateVirtualTable, module: Arc<VTabImpl>) -> String {
     let args = if let Some(args) = &vtab.args {
         args.iter()
             .map(|arg| arg.to_string())

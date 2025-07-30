@@ -282,7 +282,7 @@ impl ExtVirtualTable {
     /// takes ownership of the provided Args
     fn create(
         module_name: &str,
-        module: Option<&Rc<crate::ext::VTabImpl>>,
+        module: Option<&Arc<crate::ext::VTabImpl>>,
         args: Vec<turso_ext::Value>,
         kind: VTabKind,
     ) -> crate::Result<(Self, String)> {

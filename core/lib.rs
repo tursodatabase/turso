@@ -1790,7 +1790,7 @@ pub type StepResult = vdbe::StepResult;
 pub struct SymbolTable {
     pub functions: HashMap<String, Arc<function::ExternalFunc>>,
     pub vtabs: HashMap<String, Arc<VirtualTable>>,
-    pub vtab_modules: HashMap<String, Rc<crate::ext::VTabImpl>>,
+    pub vtab_modules: HashMap<String, Arc<crate::ext::VTabImpl>>,
 }
 
 impl std::fmt::Debug for SymbolTable {
