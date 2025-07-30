@@ -913,7 +913,7 @@ pub fn op_open_read(
         Some(tx_id) => {
             let table_id = *root_page as u64;
             let mv_store = mv_store.unwrap().clone();
-            let mv_cursor = Rc::new(RefCell::new(
+            let mv_cursor = Arc::new(RwLock::new(
                 MvCursor::new(mv_store.clone(), tx_id, table_id).unwrap(),
             ));
             Some(mv_cursor)
@@ -5818,7 +5818,7 @@ pub fn op_open_write(
         Some(tx_id) => {
             let table_id = root_page;
             let mv_store = mv_store.unwrap().clone();
-            let mv_cursor = Rc::new(RefCell::new(
+            let mv_cursor = Arc::new(RwLock::new(
                 MvCursor::new(mv_store.clone(), tx_id, table_id).unwrap(),
             ));
             Some(mv_cursor)
@@ -6374,7 +6374,7 @@ pub fn op_open_ephemeral(
                 Some(tx_id) => {
                     let table_id = root_page as u64;
                     let mv_store = mv_store.unwrap().clone();
-                    let mv_cursor = Rc::new(RefCell::new(
+                    let mv_cursor = Arc::new(RwLock::new(
                         MvCursor::new(mv_store.clone(), tx_id, table_id).unwrap(),
                     ));
                     Some(mv_cursor)

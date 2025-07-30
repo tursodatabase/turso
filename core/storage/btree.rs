@@ -43,7 +43,6 @@ use std::{
     fmt::Debug,
     ops::DerefMut,
     pin::Pin,
-    rc::Rc,
     sync::Arc,
 };
 
@@ -520,7 +519,7 @@ pub enum CursorSeekState {
 
 pub struct BTreeCursor {
     /// The multi-version cursor that is used to read and write to the database file.
-    mv_cursor: Option<Rc<RefCell<MvCursor>>>,
+    mv_cursor: Option<Arc<RwLock<MvCursor>>>,
     /// The pager that is used to read and write to the database file.
     pager: Arc<Pager>,
     /// Page id of the root page used to go back up fast.
@@ -597,7 +596,7 @@ impl BTreeNodeState {
 
 impl BTreeCursor {
     pub fn new(
-        mv_cursor: Option<Rc<RefCell<MvCursor>>>,
+        mv_cursor: Option<Arc<RwLock<MvCursor>>>,
         pager: Arc<Pager>,
         root_page: usize,
         num_columns: usize,
@@ -629,7 +628,7 @@ impl BTreeCursor {
     }
 
     pub fn new_table(
-        mv_cursor: Option<Rc<RefCell<MvCursor>>>,
+        mv_cursor: Option<Arc<RwLock<MvCursor>>>,
         pager: Arc<Pager>,
         root_page: usize,
         num_columns: usize,
@@ -638,7 +637,7 @@ impl BTreeCursor {
     }
 
     pub fn new_index(
-        mv_cursor: Option<Rc<RefCell<MvCursor>>>,
+        mv_cursor: Option<Arc<RwLock<MvCursor>>>,
         pager: Arc<Pager>,
         root_page: usize,
         index: &Index,
@@ -681,7 +680,7 @@ impl BTreeCursor {
     #[instrument(skip_all, level = Level::DEBUG)]
     fn is_empty_table(&self) -> Result<IOResult<bool>> {
         if let Some(mv_cursor) = &self.mv_cursor {
-            let mv_cursor = mv_cursor.borrow();
+            let mv_cursor = mv_cursor.read();
             return Ok(IOResult::Done(mv_cursor.is_empty()));
         }
         let (page, c) = self.pager.read_page(self.root_page)?;
@@ -1217,7 +1216,7 @@ impl BTreeCursor {
     #[instrument(skip(self), level = Level::DEBUG, name = "next")]
     fn get_next_record(&mut self) -> Result<IOResult<bool>> {
         if let Some(mv_cursor) = &self.mv_cursor {
-            let mut mv_cursor = mv_cursor.borrow_mut();
+            let mut mv_cursor = mv_cursor.write();
             mv_cursor.forward();
             let rowid = mv_cursor.current_row_id();
             match rowid {
@@ -4212,7 +4211,7 @@ impl BTreeCursor {
     pub fn rewind(&mut self) -> Result<IOResult<()>> {
         if let Some(mv_cursor) = &self.mv_cursor {
             {
-                let mut mv_cursor = mv_cursor.borrow_mut();
+                let mut mv_cursor = mv_cursor.write();
                 mv_cursor.rewind();
             }
             let cursor_has_record = return_if_io!(self.get_next_record());
@@ -4268,7 +4267,7 @@ impl BTreeCursor {
     pub fn rowid(&mut self) -> Result<IOResult<Option<i64>>> {
         if let Some(mv_cursor) = &self.mv_cursor {
             if self.has_record.get() {
-                let mv_cursor = mv_cursor.borrow();
+                let mv_cursor = mv_cursor.read();
                 return Ok(IOResult::Done(
                     mv_cursor.current_row_id().map(|rowid| rowid.row_id),
                 ));
@@ -4340,7 +4339,7 @@ impl BTreeCursor {
             return Ok(IOResult::Done(Some(record_ref)));
         }
         if self.mv_cursor.is_some() {
-            let mv_cursor = self.mv_cursor.as_ref().unwrap().borrow();
+            let mv_cursor = self.mv_cursor.as_ref().unwrap().read();
             let row = mv_cursor.current_row().unwrap().unwrap();
             self.get_immutable_record_or_create()
                 .as_mut()
@@ -4424,7 +4423,7 @@ impl BTreeCursor {
                     let row_id = crate::mvcc::database::RowID::new(self.table_id() as u64, rowid);
                     let record_buf = key.get_record().unwrap().get_payload().to_vec();
                     let row = crate::mvcc::database::Row::new(row_id, record_buf);
-                    mv_cursor.borrow_mut().insert(row).unwrap();
+                    mv_cursor.write().insert(row).unwrap();
                 }
                 None => todo!("Support mvcc inserts with index btrees"),
             },
@@ -7034,7 +7033,6 @@ mod tests {
         collections::HashSet,
         mem::transmute,
         ops::Deref,
-        rc::Rc,
         sync::{Arc, Mutex},
     };
 
