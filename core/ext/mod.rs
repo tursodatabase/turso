@@ -12,7 +12,6 @@ use crate::{LimboError, IO};
 pub use dynamic::{add_builtin_vfs_extensions, add_vfs_module, list_vfs_modules, VfsMod};
 use std::{
     ffi::{c_char, c_void, CStr, CString},
-    rc::Rc,
     sync::{Arc, Mutex},
 };
 use turso_ext::{
@@ -46,7 +45,7 @@ pub(crate) unsafe extern "C" fn register_vtab_module(
     };
 
     let ext_ctx = unsafe { &mut *(ctx as *mut ExtensionCtx) };
-    let module = Rc::new(module);
+    let module = Arc::new(module);
     let vmodule = VTabImpl {
         module_kind: kind,
         implementation: module,
@@ -77,7 +76,7 @@ pub(crate) unsafe extern "C" fn register_vtab_module(
 #[derive(Clone)]
 pub struct VTabImpl {
     pub module_kind: VTabKind,
-    pub implementation: Rc<VTabModuleImpl>,
+    pub implementation: Arc<VTabModuleImpl>,
 }
 
 pub(crate) unsafe extern "C" fn register_scalar_function(

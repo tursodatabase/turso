@@ -181,7 +181,7 @@ impl VirtualTableCursor {
 
 #[derive(Clone, Debug)]
 pub(crate) struct ExtVirtualTable {
-    implementation: Rc<VTabModuleImpl>,
+    implementation: Arc<VTabModuleImpl>,
     table_ptr: *const c_void,
     connection_ptr: RefCell<Option<*mut turso_ext::Conn>>,
 }
@@ -297,11 +297,11 @@ impl ExtVirtualTable {
 
 pub struct ExtVirtualTableCursor {
     cursor: *const c_void,
-    implementation: Rc<VTabModuleImpl>,
+    implementation: Arc<VTabModuleImpl>,
 }
 
 impl ExtVirtualTableCursor {
-    fn new(cursor: *const c_void, implementation: Rc<VTabModuleImpl>) -> crate::Result<Self> {
+    fn new(cursor: *const c_void, implementation: Arc<VTabModuleImpl>) -> crate::Result<Self> {
         if cursor.is_null() {
             return Err(LimboError::InternalError(
                 "VirtualTableCursor: cursor is null".into(),
