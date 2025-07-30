@@ -10,6 +10,27 @@ use std::sync::Arc;
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind, VTabModuleImpl};
 use turso_sqlite3_parser::{ast, lexer::sql::Parser};
 
+/// Wrapper for *mut turso_ext::Conn to make it Send/Sync
+#[derive(Debug, Clone)]
+struct SafeConnPtr(*mut turso_ext::Conn);
+
+unsafe impl Send for SafeConnPtr {}
+unsafe impl Sync for SafeConnPtr {}
+
+impl SafeConnPtr {
+    fn new(ptr: *mut turso_ext::Conn) -> Self {
+        Self(ptr)
+    }
+
+    fn as_ptr(&self) -> *mut turso_ext::Conn {
+        self.0
+    }
+
+    fn is_null(&self) -> bool {
+        self.0.is_null()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) enum VirtualTableType {
     Pragma(PragmaVirtualTable),
@@ -183,7 +204,7 @@ impl VirtualTableCursor {
 pub(crate) struct ExtVirtualTable {
     implementation: Arc<VTabModuleImpl>,
     table_ptr: *const c_void,
-    connection_ptr: RefCell<Option<*mut turso_ext::Conn>>,
+    connection_ptr: RefCell<Option<SafeConnPtr>>,
 }
 
 impl Drop for ExtVirtualTable {
@@ -193,7 +214,7 @@ impl Drop for ExtVirtualTable {
                 return;
             }
             // free the memory for the turso_ext::Conn itself
-            let mut conn = unsafe { Box::from_raw(conn) };
+            let mut conn = unsafe { Box::from_raw(conn.as_ptr()) };
             // frees the boxed Weak pointer
             conn.close();
         }
@@ -257,7 +278,7 @@ impl ExtVirtualTable {
         );
         let ext_conn_ptr = Box::into_raw(Box::new(conn));
         // store the leaked connection pointer on the table so it can be freed on drop
-        *self.connection_ptr.borrow_mut() = Some(ext_conn_ptr);
+        *self.connection_ptr.borrow_mut() = Some(SafeConnPtr::new(ext_conn_ptr));
         let cursor = unsafe { (self.implementation.open)(self.table_ptr, ext_conn_ptr) };
         ExtVirtualTableCursor::new(cursor, self.implementation.clone())
     }
