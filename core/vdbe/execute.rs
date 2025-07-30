@@ -1920,7 +1920,7 @@ pub fn op_halt(
             )));
         }
     }
-    let auto_commit = program.connection.auto_commit.get();
+    let auto_commit = program.connection.get_auto_commit();
     tracing::trace!("op_halt(auto_commit={})", auto_commit);
     if auto_commit {
         match program.commit_txn(pager.clone(), state, mv_store, false)? {
@@ -1988,7 +1988,7 @@ pub fn op_transaction(
         let (new_transaction_state, updated) = match (current_state, write) {
             // pending state means that we tried beginning a tx and the method returned IO.
             // instead of ending the read tx, just update the state to pending.
-            (TransactionState::PendingUpgrade, write) => {
+            (TransactionState::PendingUpgrade { auto_commit }, write) => {
                 turso_assert!(
                     *write,
                     "pending upgrade should only be set for write transactions"
@@ -1996,30 +1996,60 @@ pub fn op_transaction(
                 (
                     TransactionState::Write {
                         schema_did_change: false,
+                        auto_commit,
                     },
                     true,
                 )
             }
-            (TransactionState::Write { schema_did_change }, true) => {
-                (TransactionState::Write { schema_did_change }, false)
-            }
-            (TransactionState::Write { schema_did_change }, false) => {
-                (TransactionState::Write { schema_did_change }, false)
-            }
-            (TransactionState::Read, true) => (
+            (
+                TransactionState::Write {
+                    schema_did_change,
+                    auto_commit,
+                },
+                true,
+            ) => (
+                TransactionState::Write {
+                    schema_did_change,
+                    auto_commit,
+                },
+                false,
+            ),
+            (
+                TransactionState::Write {
+                    schema_did_change,
+                    auto_commit,
+                },
+                false,
+            ) => (
+                TransactionState::Write {
+                    schema_did_change,
+                    auto_commit,
+                },
+                false,
+            ),
+            (TransactionState::Read { auto_commit }, true) => (
                 TransactionState::Write {
                     schema_did_change: false,
+                    auto_commit,
                 },
                 true,
             ),
-            (TransactionState::Read, false) => (TransactionState::Read, false),
+            (TransactionState::Read { auto_commit }, false) => {
+                (TransactionState::Read { auto_commit }, false)
+            }
             (TransactionState::None, true) => (
                 TransactionState::Write {
                     schema_did_change: false,
+                    auto_commit: conn.get_auto_commit(),
                 },
                 true,
             ),
-            (TransactionState::None, false) => (TransactionState::Read, true),
+            (TransactionState::None, false) => (
+                TransactionState::Read {
+                    auto_commit: conn.get_auto_commit(),
+                },
+                true,
+            ),
         };
         if updated && matches!(current_state, TransactionState::None) {
             if let LimboResult::Busy = pager.begin_read_tx()? {
@@ -2033,17 +2063,17 @@ pub fn op_transaction(
                     if let LimboResult::Busy = r {
                         pager.end_read_tx()?;
                         conn.transaction_state.replace(TransactionState::None);
-                        conn.auto_commit.replace(true);
                         return Ok(InsnFunctionStepResult::Busy);
                     }
                 }
                 IOResult::IO => {
                     // set the transaction state to pending so we don't have to
                     // end the read transaction.
-                    program
-                        .connection
-                        .transaction_state
-                        .replace(TransactionState::PendingUpgrade);
+                    program.connection.transaction_state.replace(
+                        TransactionState::PendingUpgrade {
+                            auto_commit: conn.get_auto_commit(),
+                        },
+                    );
                     return Ok(InsnFunctionStepResult::IO);
                 }
             }
@@ -2076,21 +2106,22 @@ pub fn op_auto_commit(
             .commit_txn(pager.clone(), state, mv_store, *rollback)
             .map(Into::into);
     }
-    let schema_did_change =
-        if let TransactionState::Write { schema_did_change } = conn.transaction_state.get() {
-            schema_did_change
-        } else {
-            false
-        };
+    let schema_did_change = if let TransactionState::Write {
+        schema_did_change, ..
+    } = conn.transaction_state.get()
+    {
+        schema_did_change
+    } else {
+        false
+    };
 
-    if *auto_commit != conn.auto_commit.get() {
+    if *auto_commit != conn.get_auto_commit() {
         if *rollback {
             // TODO(pere): add rollback I/O logic once we implement rollback journal
             return_if_io!(pager.end_tx(true, schema_did_change, &conn, false));
             conn.transaction_state.replace(TransactionState::None);
-            conn.auto_commit.replace(true);
         } else {
-            conn.auto_commit.replace(*auto_commit);
+            conn.set_auto_commit(*auto_commit);
         }
     } else if !*auto_commit {
         return Err(LimboError::TxError(
@@ -6034,8 +6065,8 @@ pub fn op_parse_schema(
     let conn = program.connection.clone();
     // set auto commit to false in order for parse schema to not commit changes as transaction state is stored in connection,
     // and we use the same connection for nested query.
-    let previous_auto_commit = conn.auto_commit.get();
-    conn.auto_commit.set(false);
+    let previous_auto_commit = conn.get_auto_commit();
+    conn.set_auto_commit(false);
 
     if let Some(where_clause) = where_clause {
         let stmt = conn.prepare(format!("SELECT * FROM sqlite_schema WHERE {where_clause}"))?;
@@ -6052,7 +6083,7 @@ pub fn op_parse_schema(
             parse_schema_rows(stmt, schema, &conn.syms.borrow(), state.mv_tx_id)
         })?;
     }
-    conn.auto_commit.set(previous_auto_commit);
+    conn.set_auto_commit(previous_auto_commit);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -6121,12 +6152,12 @@ pub fn op_set_cookie(
             if mv_store.is_none() {
                 // we update transaction state to indicate that the schema has changed
                 match program.connection.transaction_state.get() {
-                    TransactionState::Write { schema_did_change } => {
-                        program.connection.transaction_state.set(TransactionState::Write { schema_did_change: true });
+                    TransactionState::Write { auto_commit, .. } => {
+                        program.connection.transaction_state.set(TransactionState::Write { schema_did_change: true, auto_commit });
                     },
-                    TransactionState::Read => unreachable!("invalid transaction state for SetCookie: TransactionState::Read, should be write"),
+                    TransactionState::Read { .. } => unreachable!("invalid transaction state for SetCookie: TransactionState::Read, should be write"),
                     TransactionState::None => unreachable!("invalid transaction state for SetCookie: TransactionState::None, should be write"),
-                    TransactionState::PendingUpgrade => unreachable!("invalid transaction state for SetCookie: TransactionState::PendingUpgrade, should be write"),
+                    TransactionState::PendingUpgrade { .. } => unreachable!("invalid transaction state for SetCookie: TransactionState::PendingUpgrade, should be write"),
                 }
             }
             program

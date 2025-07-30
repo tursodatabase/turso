@@ -397,7 +397,10 @@ impl Program {
             if self.connection.closed.get() {
                 // Connection is closed for whatever reason, rollback the transaction.
                 let state = self.connection.transaction_state.get();
-                if let TransactionState::Write { schema_did_change } = state {
+                if let TransactionState::Write {
+                    schema_did_change, ..
+                } = state
+                {
                     match pager.end_tx(true, schema_did_change, &self.connection, false)? {
                         IOResult::IO => return Ok(StepResult::IO),
                         IOResult::Done(_) => {}
@@ -437,7 +440,7 @@ impl Program {
     ) -> Result<StepResult> {
         if let Some(mv_store) = mv_store {
             let conn = self.connection.clone();
-            let auto_commit = conn.auto_commit.get();
+            let auto_commit = conn.get_auto_commit();
             if auto_commit {
                 let mut mv_transactions = conn.mv_transactions.borrow_mut();
                 for tx_id in mv_transactions.iter() {
@@ -448,15 +451,16 @@ impl Program {
             Ok(StepResult::Done)
         } else {
             let connection = self.connection.clone();
-            let auto_commit = connection.auto_commit.get();
+            let auto_commit = connection.get_auto_commit();
             tracing::trace!(
                 "Halt auto_commit {}, state={:?}",
                 auto_commit,
                 program_state.commit_state
             );
             if program_state.commit_state == CommitState::Committing {
-                let TransactionState::Write { schema_did_change } =
-                    connection.transaction_state.get()
+                let TransactionState::Write {
+                    schema_did_change, ..
+                } = connection.transaction_state.get()
                 else {
                     unreachable!("invalid state for write commit step")
                 };
@@ -471,20 +475,22 @@ impl Program {
                 let current_state = connection.transaction_state.get();
                 tracing::trace!("Auto-commit state: {:?}", current_state);
                 match current_state {
-                    TransactionState::Write { schema_did_change } => self.step_end_write_txn(
+                    TransactionState::Write {
+                        schema_did_change, ..
+                    } => self.step_end_write_txn(
                         &pager,
                         &mut program_state.commit_state,
                         &connection,
                         rollback,
                         schema_did_change,
                     ),
-                    TransactionState::Read => {
+                    TransactionState::Read { .. } => {
                         connection.transaction_state.replace(TransactionState::None);
                         pager.end_read_tx()?;
                         Ok(StepResult::Done)
                     }
                     TransactionState::None => Ok(StepResult::Done),
-                    TransactionState::PendingUpgrade => {
+                    TransactionState::PendingUpgrade { .. } => {
                         panic!("Unexpected transaction state: {current_state:?} during auto-commit",)
                     }
                 }
@@ -760,7 +766,10 @@ pub fn handle_program_error(
         LimboError::TxError(_) => {}
         _ => {
             let state = connection.transaction_state.get();
-            if let TransactionState::Write { schema_did_change } = state {
+            if let TransactionState::Write {
+                schema_did_change, ..
+            } = state
+            {
                 loop {
                     match pager.end_tx(true, schema_did_change, connection, false) {
                         Ok(IOResult::IO) => connection.run_once()?,

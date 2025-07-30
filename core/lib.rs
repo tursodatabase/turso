@@ -101,10 +101,32 @@ pub type Result<T, E = LimboError> = std::result::Result<T, E>;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum TransactionState {
-    Write { schema_did_change: bool },
-    Read,
-    PendingUpgrade,
+    Write {
+        /// Whether to automatically commit transaction
+        auto_commit: bool,
+        /// Whether this transaction has modified the schema
+        schema_did_change: bool,
+    },
+    Read {
+        /// Whether to automatically commit transaction
+        auto_commit: bool,
+    },
+    PendingUpgrade {
+        /// Whether to automatically commit transaction
+        auto_commit: bool,
+    },
     None,
+}
+
+impl TransactionState {
+    fn is_auto_commit(&self) -> bool {
+        match self {
+            TransactionState::Write { auto_commit, .. } => *auto_commit,
+            TransactionState::Read { auto_commit, .. } => *auto_commit,
+            TransactionState::PendingUpgrade { auto_commit, .. } => *auto_commit,
+            TransactionState::None => true,
+        }
+    }
 }
 
 pub(crate) type MvStore = mvcc::MvStore<mvcc::LocalClock>;
@@ -348,7 +370,6 @@ impl Database {
                     .clone(),
             ),
             database_schemas: RefCell::new(std::collections::HashMap::new()),
-            auto_commit: Cell::new(true),
             mv_transactions: RefCell::new(Vec::new()),
             transaction_state: Cell::new(TransactionState::None),
             last_insert_rowid: Cell::new(0),
@@ -739,8 +760,6 @@ pub struct Connection {
     /// Per-database schema cache (database_index -> schema)
     /// Loaded lazily to avoid copying all schemas on connection open
     database_schemas: RefCell<std::collections::HashMap<usize, Arc<Schema>>>,
-    /// Whether to automatically commit transaction
-    auto_commit: Cell<bool>,
     mv_transactions: RefCell<Vec<crate::mvcc::database::TxID>>,
     transaction_state: Cell<TransactionState>,
     last_insert_rowid: Cell<i64>,
@@ -857,18 +876,23 @@ impl Connection {
         // from now on we must be very careful with errors propagation
         // in order to not accidentally keep read transaction opened
         pager.begin_read_tx()?;
-        self.transaction_state.replace(TransactionState::Read);
+        self.transaction_state.replace(TransactionState::Read {
+            auto_commit: self.get_auto_commit(),
+        });
 
         let reparse_result = reparse();
 
         let previous = self.transaction_state.replace(TransactionState::None);
         turso_assert!(
-            matches!(previous, TransactionState::None | TransactionState::Read),
+            matches!(
+                previous,
+                TransactionState::None | TransactionState::Read { .. }
+            ),
             "unexpected end transaction state"
         );
         // close opened transaction if it was kept open
         // (in most cases, it will be automatically closed if stmt was executed properly)
-        if previous == TransactionState::Read {
+        if matches!(previous, TransactionState::Read { .. }) {
             pager.end_read_tx().expect("read txn must be finished");
         }
         // now we can safely propagate error after ensured that transaction state is reset
@@ -1213,7 +1237,9 @@ impl Connection {
         self.closed.set(true);
 
         match self.transaction_state.get() {
-            TransactionState::Write { schema_did_change } => {
+            TransactionState::Write {
+                schema_did_change, ..
+            } => {
                 while let IOResult::IO = self.pager.borrow().end_tx(
                     true, // rollback = true for close
                     schema_did_change,
@@ -1224,7 +1250,7 @@ impl Connection {
                 }
                 self.transaction_state.set(TransactionState::None);
             }
-            TransactionState::PendingUpgrade | TransactionState::Read => {
+            TransactionState::PendingUpgrade { .. } | TransactionState::Read { .. } => {
                 self.pager.borrow().end_read_tx()?;
                 self.transaction_state.set(TransactionState::None);
             }
@@ -1356,7 +1382,28 @@ impl Connection {
     }
 
     pub fn get_auto_commit(&self) -> bool {
-        self.auto_commit.get()
+        self.transaction_state.get().is_auto_commit()
+    }
+
+    pub fn set_auto_commit(&self, auto_commit: bool) {
+        self.transaction_state.update(|old| match old {
+            TransactionState::Write {
+                schema_did_change, ..
+            } => TransactionState::Write {
+                auto_commit,
+                schema_did_change,
+            },
+            TransactionState::Read { .. } => TransactionState::Read { auto_commit },
+            TransactionState::PendingUpgrade { .. } => {
+                TransactionState::PendingUpgrade { auto_commit }
+            }
+            TransactionState::None => {
+                if !auto_commit {
+                    panic!("Setting auto_commit to false when there is no active transaction");
+                }
+                TransactionState::None
+            }
+        });
     }
 
     pub fn parse_schema_rows(self: &Arc<Connection>) -> Result<()> {
@@ -1728,7 +1775,10 @@ impl Statement {
         let res = self.pager.io.run_once();
         if res.is_err() {
             let state = self.program.connection.transaction_state.get();
-            if let TransactionState::Write { schema_did_change } = state {
+            if let TransactionState::Write {
+                schema_did_change, ..
+            } = state
+            {
                 let end_tx_res =
                     self.pager
                         .end_tx(true, schema_did_change, &self.program.connection, true)?;
