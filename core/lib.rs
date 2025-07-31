@@ -774,55 +774,77 @@ impl Connection {
     /// This function must be called outside of any transaction because internally it will start transaction session by itself
     fn maybe_reparse_schema(self: &Arc<Connection>) -> Result<()> {
         let pager = self.pager.borrow().clone();
+        let conn_schema_version = self.schema.borrow().schema_version;
 
         // first, quickly read schema_version from the root page in order to check if schema changed
         pager.begin_read_tx()?;
         let db_schema_version = pager
             .io
             .block(|| pager.with_header(|header| header.schema_cookie));
-        pager.end_read_tx().expect("read txn must be finished");
 
-        let db_schema_version = db_schema_version?.get();
-        let conn_schema_version = self.schema.borrow().schema_version;
+        let db_schema_version = match db_schema_version {
+            Ok(db_schema_version) => db_schema_version.get(),
+            Err(LimboError::Page1NotAlloc) => {
+                // this means this is a fresh db, so return a schema version of 0
+                0
+            }
+            Err(err) => {
+                pager.end_read_tx().expect("read txn must be finished");
+                return Err(err);
+            }
+        };
         turso_assert!(
             conn_schema_version <= db_schema_version,
             "connection schema_version can't be larger than db schema_version: {} vs {}",
             conn_schema_version,
             db_schema_version
         );
+        pager.end_read_tx().expect("read txn must be finished");
 
         // if schema_versions matches - exit early
         if conn_schema_version == db_schema_version {
             return Ok(());
         }
-
         // maybe_reparse_schema must be called outside of any transaction
         turso_assert!(
             self.transaction_state.get() == TransactionState::None,
             "unexpected start transaction"
         );
+        self.reparse_schema()
+    }
+
+    fn reparse_schema(self: &Arc<Connection>) -> Result<()> {
+        let pager = self.pager.borrow().clone();
 
         // reparse logic extracted to the function in order to not accidentally propagate error from it before closing transaction
         let reparse = || -> Result<()> {
+            // read cookie before consuming statement program - otherwise we can end up reading cookie with closed transaction state
+            let cookie = pager
+                .io
+                .block(|| pager.with_header(|header| header.schema_cookie))?
+                .get();
+
+            // create fresh schema as some objects can be deleted
+            let mut fresh = Schema::new(self.schema.borrow().indexes_enabled);
+            fresh.schema_version = cookie;
+
+            // TODO: this is hack to avoid a cyclical problem with schema reprepare
+            // The problem here is that we prepare a statement here, but when the statement tries
+            // to execute it, it first checks the schema cookie to see if it needs to reprepare the statement.
+            // But in this occasion it will always reprepare, and we get an error. So we trick the statement by swapping our schema
+            // with a new clean schema that has the same header cookie.
+            self.with_schema_mut(|schema| {
+                *schema = fresh.clone();
+            });
+
             let stmt = self.prepare("SELECT * FROM sqlite_schema")?;
-            self.with_schema_mut(|schema| -> Result<()> {
-                // create fresh schema as some objects can be deleted
-                let mut fresh = Schema::new(false); // todo: indices!
 
-                // read cookie before consuming statement program - otherwise we can end up reading cookie with closed transaction state
-                let cookie = pager
-                    .io
-                    .block(|| pager.with_header(|header| header.schema_cookie))?
-                    .get();
+            // TODO: This function below is synchronous, make it async
+            parse_schema_rows(stmt, &mut fresh, &self.syms.borrow(), None)?;
 
-                // TODO: This function below is synchronous, make it async
-                parse_schema_rows(stmt, &mut fresh, &self.syms.borrow(), None)?;
-
+            self.with_schema_mut(|schema| {
                 *schema = fresh;
-                schema.schema_version = cookie;
-
-                Result::Ok(())
-            })?;
+            });
             Result::Ok(())
         };
 
@@ -1091,7 +1113,7 @@ impl Connection {
             .lock()
             .map_err(|_| LimboError::SchemaLocked)?;
         if matches!(self.transaction_state.get(), TransactionState::None)
-            && current_schema_version < schema.schema_version
+            && current_schema_version != schema.schema_version
         {
             self.schema.replace(schema.clone());
         }
@@ -1161,7 +1183,8 @@ impl Connection {
         }
 
         // let's re-parse schema from scratch if schema cookie changed compared to the our in-memory view of schema
-        self.maybe_reparse_schema()
+        self.maybe_reparse_schema()?;
+        Ok(())
     }
 
     /// Flush dirty pages to disk.

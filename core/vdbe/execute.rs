@@ -2072,7 +2072,6 @@ pub fn op_transaction(
             .block(|| pager.with_header(|header| header.schema_cookie.get()));
         match res {
             Ok(header_schema_cookie) => {
-                dbg!(header_schema_cookie, *schema_cookie);
                 if header_schema_cookie != *schema_cookie {
                     return Err(LimboError::SchemaUpdated);
                 }
