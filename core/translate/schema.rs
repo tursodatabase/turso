@@ -518,6 +518,10 @@ fn create_vtable_body_to_str(vtab: &CreateVirtualTable, module: Rc<VTabImpl>) ->
     )
 }
 
+pub fn translate_create_trigger() -> Result<ProgramBuilder> {
+    unimplemented!();
+}
+
 pub fn translate_create_virtual_table(
     vtab: CreateVirtualTable,
     schema: &Schema,
