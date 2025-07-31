@@ -208,6 +208,49 @@ impl LimboRwLock {
     }
 }
 
+/// Represents a batch of WAL frames to be written
+struct WalFrameBatch {
+    /// Frames to be written (non-commit frames first, commit frame last)
+    frames: Vec<WalFrameInfo>,
+}
+
+#[derive(Clone)]
+struct WalFrameInfo {
+    page: PageRef,
+    db_size: u32,
+    frame_id: u64,
+    offset: usize,
+    frame_data: Option<Arc<RefCell<Buffer>>>,
+    checksums: Option<(u32, u32)>,
+}
+
+impl WalFrameBatch {
+    fn new() -> Self {
+        Self { frames: Vec::new() }
+    }
+
+    pub fn add_frame(&mut self, frame_info: WalFrameInfo) {
+        turso_assert!(
+            frame_info.db_size == 0,
+            "Commit frames cannot be batched, they are always individually written last"
+        );
+        if !self.frames.is_empty()
+            && self.frames.last().unwrap().frame_id != frame_info.frame_id - 1
+        {
+            turso_assert!(
+                false,
+                "Frames must be added in order of frame_id, tried to insert frame_id={} after frame_id={}",
+                frame_info.frame_id,
+                self.frames.last().unwrap().frame_id
+            );
+        }
+
+        self.frames.push(frame_info);
+    }
+}
+
+pub const WAL_BATCH_SIZE: usize = 16; // Number of frames to batch
+
 /// Write-ahead log (WAL).
 pub trait Wal {
     /// Begin a read transaction.
@@ -247,17 +290,12 @@ pub trait Wal {
         page: &[u8],
     ) -> Result<()>;
 
-    /// Write a frame to the WAL.
-    /// db_size is the database size in pages after the transaction finishes.
-    /// db_size > 0    -> last frame written in transaction
-    /// db_size == 0   -> non-last frame written in transaction
-    /// write_counter is the counter we use to track when the I/O operation starts and completes
-    fn append_frame(
-        &mut self,
-        page: PageRef,
-        db_size: u32,
-        write_counter: Rc<RefCell<usize>>,
-    ) -> Result<Completion>;
+    /// Write a non-commit frame to the WAL.
+    fn append_noncommit_frame(&mut self, page: PageRef) -> Result<()>;
+
+    /// Write a commit frame to the WAL.
+    /// db_size is the database size in pages after the transaction finishes and signifies that the frame is a commit.
+    fn append_commit_frame(&mut self, page: PageRef, db_size: u32) -> Result<Completion>;
 
     /// Complete append of frames by updating shared wal state. Before this
     /// all changes were stored locally.
@@ -275,6 +313,9 @@ pub trait Wal {
     fn get_max_frame(&self) -> u64;
     fn get_min_frame(&self) -> u64;
     fn rollback(&mut self) -> Result<()>;
+
+    /// Flush any pending frames in the batch
+    fn flush_batch(&mut self) -> Result<Completion>;
 
     #[cfg(debug_assertions)]
     fn as_any(&self) -> &dyn std::any::Any;
@@ -328,13 +369,12 @@ impl Wal for DummyWAL {
         todo!();
     }
 
-    fn append_frame(
-        &mut self,
-        _page: crate::PageRef,
-        _db_size: u32,
-        _write_counter: Rc<RefCell<usize>>,
-    ) -> Result<Completion> {
-        Ok(Completion::new_write(|_| {}))
+    fn append_noncommit_frame(&mut self, _page: crate::PageRef) -> Result<()> {
+        Ok(())
+    }
+
+    fn append_commit_frame(&mut self, _page: crate::PageRef, _db_size: u32) -> Result<Completion> {
+        todo!();
     }
 
     fn should_checkpoint(&self) -> bool {
@@ -374,6 +414,11 @@ impl Wal for DummyWAL {
     fn rollback(&mut self) -> Result<()> {
         Ok(())
     }
+
+    fn flush_batch(&mut self) -> Result<Completion> {
+        Ok(Completion::new_write(|_| {}))
+    }
+
     #[cfg(debug_assertions)]
     fn as_any(&self) -> &dyn std::any::Any {
         self
@@ -548,6 +593,9 @@ pub struct WalFile {
 
     /// Manages locks needed for checkpointing
     checkpoint_guard: Option<CheckpointLocks>,
+
+    /// Batching state for WAL frame writes
+    frame_batch: RefCell<WalFrameBatch>,
 }
 
 impl fmt::Debug for WalFile {
@@ -1101,12 +1149,38 @@ impl Wal for WalFile {
 
     /// Write a frame to the WAL.
     #[instrument(skip_all, level = Level::DEBUG)]
-    fn append_frame(
-        &mut self,
-        page: PageRef,
-        db_size: u32,
-        write_counter: Rc<RefCell<usize>>,
-    ) -> Result<Completion> {
+    fn append_noncommit_frame(&mut self, page: PageRef) -> Result<()> {
+        let shared = self.get_shared();
+        if shared.max_frame.load(Ordering::SeqCst).eq(&0) {
+            self.ensure_header_if_needed()?;
+        }
+
+        let frame_id = self.max_frame + 1;
+        tracing::debug!("append_noncommit_frame(frame_id={frame_id}, page_id={})", page.get().id);
+        let offset = self.frame_offset(frame_id);
+
+        // Create frame info (checksum will be calculated later in batch)
+        let frame_info = WalFrameInfo {
+            page: page.clone(),
+            db_size: 0,
+            frame_id,
+            offset,
+            frame_data: None,
+            checksums: None,
+        };
+
+        // Add frame to batch
+        {
+            let mut batch = self.frame_batch.borrow_mut();
+            batch.add_frame(frame_info);
+        }
+
+        self.max_frame = frame_id;
+
+        Ok(())
+    }
+
+    fn append_commit_frame(&mut self, page: PageRef, db_size: u32) -> Result<Completion> {
         let shared = self.get_shared();
         if shared.max_frame.load(Ordering::SeqCst).eq(&0) {
             self.ensure_header_if_needed()?;
@@ -1131,28 +1205,20 @@ impl Wal for WalFile {
                 page_buf,
             );
 
-            *write_counter.borrow_mut() += 1;
             let c = Completion::new_write({
                 let frame_bytes = frame_bytes.clone();
-                let write_counter = write_counter.clone();
                 move |bytes_written| {
                     let frame_len = frame_bytes.borrow().len();
                     turso_assert!(
                         bytes_written == frame_len as i32,
                         "wrote({bytes_written}) != expected({frame_len})"
                     );
-
-                    page.clear_dirty();
-                    *write_counter.borrow_mut() -= 1;
                 }
             });
-            let result = shared.file.pwrite(offset, frame_bytes.clone(), c);
-            if let Err(err) = result {
-                *write_counter.borrow_mut() -= 1;
-                return Err(err);
-            }
-            (result.unwrap(), frame_checksums)
+            let c = shared.file.pwrite(offset, frame_bytes.clone(), c)?;
+            (c, frame_checksums)
         };
+        self.max_frame = frame_id;
         self.complete_append_frame(page_id as u64, frame_id, checksums);
         Ok(c)
     }
@@ -1265,6 +1331,73 @@ impl Wal for WalFile {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
+
+    fn flush_batch(&mut self) -> Result<Completion> {
+        let mut frame_batch = self.frame_batch.borrow_mut();
+        turso_assert!(!frame_batch.frames.is_empty(), "Cannot flush empty batch");
+        turso_assert!(
+            frame_batch.frames.iter().all(|frame| frame.db_size == 0),
+            "Commit frames cannot be batched, they are always individually written last"
+        );
+
+        // Prepare all frames with sequential checksums
+        let mut current_checksum = self.last_checksum;
+
+        for frame in &mut frame_batch.frames {
+            // Recalculate frame with correct previous checksum
+            let (checksums, frame_data) = {
+                let shared = self.get_shared();
+                let header = shared.wal_header.clone();
+                let header = header.lock();
+                let page_content = frame.page.get_contents();
+                let page_buf = page_content.as_ptr();
+
+                prepare_wal_frame(
+                    &header,
+                    current_checksum, // Use sequential checksum
+                    header.page_size,
+                    frame.page.get().id as u32,
+                    frame.db_size,
+                    page_buf,
+                )
+            };
+
+            // Update frame data and checksum
+            frame.frame_data = Some(frame_data);
+            frame.checksums = Some(checksums);
+            current_checksum = checksums;
+        }
+
+        // Update WAL's last checksum
+        if let Some(last_frame) = frame_batch.frames.last() {
+            self.last_checksum = last_frame.checksums.unwrap();
+        }
+        // WAL frames are written sequentially! Use pwritev with separate buffers
+        let first_offset = frame_batch.frames[0].offset;
+
+        let mut frame_buffers = Vec::with_capacity(frame_batch.frames.len());
+        drop(frame_batch);
+        {
+            let frame_batch = self
+                .frame_batch
+                .borrow_mut()
+                .frames
+                .drain(..)
+                .collect::<Vec<_>>();
+            for frame in frame_batch {
+                frame_buffers.push(frame.frame_data.unwrap());
+                self.complete_append_frame(frame.page.get().id as u64, frame.frame_id, frame.checksums.unwrap());
+            }
+        }
+
+        let c = Completion::new_write(move |_| {});
+
+        let shared = self.get_shared();
+        // Use pwritev to write all frame buffers at once starting from first offset
+        let completion = shared.file.pwritev(first_offset, frame_buffers, c)?;
+
+        Ok(completion)
+    }
 }
 
 impl WalFile {
@@ -1313,6 +1446,7 @@ impl WalFile {
             checkpoint_guard: None,
             start_pages_in_frames: 0,
             header: *header,
+            frame_batch: RefCell::new(WalFrameBatch::new()),
         }
     }
 
@@ -1334,7 +1468,6 @@ impl WalFile {
 
     fn complete_append_frame(&mut self, page_id: u64, frame_id: u64, checksums: (u32, u32)) {
         self.last_checksum = checksums;
-        self.max_frame = frame_id;
         let shared = self.get_shared();
         {
             let mut frame_cache = shared.frame_cache.lock();

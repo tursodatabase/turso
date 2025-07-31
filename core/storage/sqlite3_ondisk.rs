@@ -796,7 +796,7 @@ pub fn begin_read_page(
         let buf_len = buf.borrow().len();
         turso_assert!(
             bytes_read == buf_len as i32,
-            "read({bytes_read}) != expected({buf_len})"
+            "begin_read_page(page_idx={page_idx}) read({bytes_read}) != expected({buf_len})"
         );
         let page = page.clone();
         if finish_read_page(page_idx, buf, page.clone()).is_err() {

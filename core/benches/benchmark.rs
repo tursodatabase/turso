@@ -374,6 +374,6 @@ fn bench_insert_rows(criterion: &mut Criterion) {
 criterion_group! {
     name = benches;
     config = Criterion::default().with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
-    targets = bench_open, bench_prepare_query, bench_execute_select_1, bench_execute_select_rows, bench_execute_select_count, bench_insert_rows
+    targets = bench_insert_rows
 }
 criterion_main!(benches);
