@@ -266,7 +266,8 @@ impl Connection {
             .inner
             .lock()
             .map_err(|e| Error::MutexError(e.to_string()))?;
-        let res = conn.cacheflush()?;
+        // FIXME: deal with IO
+        let _ = conn.cacheflush()?;
         Ok(())
     }
 

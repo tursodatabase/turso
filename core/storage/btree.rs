@@ -2443,7 +2443,10 @@ impl BTreeCursor {
                     }
 
                     if !self.stack.has_parent() {
-                        let res = self.balance_root()?;
+                        assert!(
+                            matches!(self.balance_root()?, IOResult::Done(())),
+                            "balance_root should return Done(())"
+                        );
                     }
 
                     let write_info = self.state.mut_write_info().unwrap();
@@ -5258,6 +5261,10 @@ impl BTreeCursor {
                     if new_payload.len() == *old_local_size {
                         let res =
                             self.overwrite_content(page_ref.clone(), *old_offset, new_payload)?;
+                        assert!(
+                            matches!(res, IOResult::Done(())),
+                            "overwrite_content should return Done(())"
+                        );
                         return Ok(IOResult::Done(()));
                     }
 
@@ -7752,7 +7759,10 @@ mod tests {
             tracing::info!("seed: {seed}");
             for i in 0..inserts {
                 pager.begin_read_tx().unwrap();
-                let res = pager.begin_write_tx().unwrap();
+                assert!(
+                    matches!(pager.begin_write_tx().unwrap(), IOResult::Done(_)),
+                    "begin_write_tx should return Done(())"
+                );
                 let key = {
                     let result;
                     loop {
@@ -7922,7 +7932,10 @@ mod tests {
             for i in 0..operations {
                 let print_progress = i % 100 == 0;
                 pager.begin_read_tx().unwrap();
-                let res = pager.begin_write_tx().unwrap();
+                assert!(
+                    matches!(pager.begin_write_tx().unwrap(), IOResult::Done(_)),
+                    "begin_write_tx should return Done(())"
+                );
 
                 // Decide whether to insert or delete (80% chance of insert)
                 let is_insert = rng.next_u64() % 100 < (insert_chance * 100.0) as u64;

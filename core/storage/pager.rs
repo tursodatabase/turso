@@ -881,7 +881,7 @@ impl Pager {
             return Ok(page);
         }
 
-        let c = sqlite3_ondisk::begin_read_page(
+        let _c = sqlite3_ondisk::begin_read_page(
             self.db_file.clone(),
             self.buffer_pool.clone(),
             page.clone(),
@@ -1464,7 +1464,7 @@ impl Pager {
                     (default_header.get_page_size() - default_header.reserved_space as u32) as u16,
                 );
                 let write_counter = Rc::new(RefCell::new(0));
-                let c = begin_write_btree_page(self, &page1.get(), write_counter.clone())?;
+                let _c = begin_write_btree_page(self, &page1.get(), write_counter.clone())?;
 
                 self.allocate_page1_state
                     .replace(AllocatePage1State::Writing {

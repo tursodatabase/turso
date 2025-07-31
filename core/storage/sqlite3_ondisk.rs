@@ -860,7 +860,7 @@ pub fn begin_sync(db_file: Arc<dyn DatabaseStorage>, syncing: Rc<RefCell<bool>>)
         *syncing.borrow_mut() = false;
     });
     #[allow(clippy::arc_with_non_send_sync)]
-    let c = db_file.sync(completion)?;
+    let _c = db_file.sync(completion)?;
     Ok(())
 }
 
@@ -1565,7 +1565,7 @@ pub fn read_entire_wal_dumb(file: &Arc<dyn File>) -> Result<Arc<UnsafeCell<WalFi
         wfs_data.loaded.store(true, Ordering::SeqCst);
     });
     let c = Completion::new_read(buf_for_pread, complete);
-    let c = file.pread(0, c)?;
+    let _c = file.pread(0, c)?;
 
     Ok(wal_file_shared_ret)
 }
@@ -1693,7 +1693,7 @@ pub fn begin_write_wal_header(io: &Arc<dyn File>, header: &WalHeader) -> Result<
     };
     #[allow(clippy::arc_with_non_send_sync)]
     let c = Completion::new_write(write_complete);
-    let c = io.pwrite(0, buffer.clone(), c)?;
+    let _c = io.pwrite(0, buffer.clone(), c)?;
     Ok(())
 }
 

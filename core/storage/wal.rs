@@ -626,7 +626,7 @@ impl Wal for WalFile {
             let frame = frame.clone();
             finish_read_page(page.get().id, buf, frame).unwrap();
         });
-        let c = begin_read_wal_frame(
+        let _c = begin_read_wal_frame(
             &self.get_shared().file,
             offset + WAL_FRAME_HEADER_SIZE,
             buffer_pool,
@@ -914,7 +914,7 @@ impl Wal for WalFile {
                 }
                 CheckpointState::WritePage => {
                     self.ongoing_checkpoint.page.set_dirty();
-                    let c = begin_write_btree_page(
+                    let _c = begin_write_btree_page(
                         pager,
                         &self.ongoing_checkpoint.page,
                         write_counter.clone(),
@@ -1001,7 +1001,7 @@ impl Wal for WalFile {
                     syncing.set(false);
                 });
                 let shared = self.get_shared();
-                let c = shared.file.sync(completion)?;
+                let _c = shared.file.sync(completion)?;
                 self.sync_state.set(SyncState::Syncing);
                 Ok(IOResult::IO)
             }

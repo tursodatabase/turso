@@ -402,7 +402,7 @@ impl SortedChunk {
             read_buffer_ref,
             read_complete,
         )));
-        let c = self.file.pread(self.total_bytes_read.get(), c)?;
+        let _c = self.file.pread(self.total_bytes_read.get(), c)?;
         Ok(())
     }
 
@@ -448,7 +448,7 @@ impl SortedChunk {
         });
 
         let c = Completion::new(CompletionType::Write(WriteCompletion::new(write_complete)));
-        let c = self.file.pwrite(0, buffer_ref, c)?;
+        let _c = self.file.pwrite(0, buffer_ref, c)?;
         Ok(())
     }
 }

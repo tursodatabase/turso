@@ -120,8 +120,7 @@ impl SimulatorFile {
         while i < queued_io.len() - end_items {
             if queued_io[i].time <= now {
                 let io = queued_io.remove(i);
-                // your code here
-                let c = (io.op)(self)?;
+                let _ = (io.op)(self)?;
             } else {
                 i += 1;
             }
