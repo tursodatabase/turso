@@ -324,8 +324,9 @@ cfg_block! {
         mod unix;
         #[cfg(feature = "fs")]
         pub use unix::UnixIO;
+        #[cfg(feature = "fs")]
+        pub use io_uring::UringIO as PlatformIO;
         pub use unix::UnixIO as SyscallIO;
-        pub use unix::UnixIO as PlatformIO;
     }
 
     #[cfg(any(all(target_os = "linux",not(feature = "io_uring")), target_os = "macos"))] {
