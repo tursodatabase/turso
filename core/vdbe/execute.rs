@@ -1989,12 +1989,13 @@ pub fn op_transaction(
         if state.mv_tx_id.is_none() {
             // We allocate the first page lazily in the first transaction.
             return_if_io!(pager.maybe_allocate_page1());
-            let header_schema_cookie = pager
-                .io
-                .block(|| pager.with_header(|header| header.schema_cookie.get()))?;
-            if header_schema_cookie != *schema_cookie {
-                return Err(LimboError::SchemaUpdated);
-            }
+            // TODO: when we fix MVCC enable schema cookie detection for reprepare statements
+            // let header_schema_cookie = pager
+            //     .io
+            //     .block(|| pager.with_header(|header| header.schema_cookie.get()))?;
+            // if header_schema_cookie != *schema_cookie {
+            //     return Err(LimboError::SchemaUpdated);
+            // }
             let tx_id = mv_store.begin_tx(pager.clone());
             conn.mv_transactions.borrow_mut().push(tx_id);
             state.mv_tx_id = Some(tx_id);
