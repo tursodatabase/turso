@@ -3,7 +3,7 @@ use std::{
     sync::Arc,
 };
 
-use turso_core::{types::WalFrameInfo, Wal};
+use turso_core::types::WalFrameInfo;
 
 use crate::{
     database_inner::WAL_FRAME_HEADER,
@@ -708,7 +708,7 @@ mod tests {
 
         {
             let mut wal_session = db1.start_wal_session().await.unwrap();
-            let frame_info = wal_session.rollback_changes_after(rollback4).unwrap();
+            wal_session.rollback_changes_after(rollback4).unwrap();
             wal_session.commit(wal_session.db_size().unwrap()).unwrap();
         }
         assert_eq!(
@@ -724,7 +724,7 @@ mod tests {
 
         {
             let mut wal_session = db1.start_wal_session().await.unwrap();
-            let frame_info = wal_session.rollback_changes_after(rollback3).unwrap();
+            wal_session.rollback_changes_after(rollback3).unwrap();
             wal_session.commit(wal_session.db_size().unwrap()).unwrap();
         }
         assert_eq!(
@@ -738,7 +738,7 @@ mod tests {
 
         {
             let mut wal_session = db1.start_wal_session().await.unwrap();
-            let frame_info = wal_session.rollback_changes_after(rollback2).unwrap();
+            wal_session.rollback_changes_after(rollback2).unwrap();
             wal_session.commit(wal_session.db_size().unwrap()).unwrap();
         }
         assert_eq!(

@@ -1,10 +1,7 @@
 use std::{
     io::ErrorKind,
     path::{Path, PathBuf},
-    sync::Arc,
 };
-
-use tokio::sync::{OwnedRwLockReadGuard, RwLock};
 
 use crate::{
     database_tape::{
