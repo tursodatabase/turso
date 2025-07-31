@@ -15,7 +15,7 @@ async fn main() {
         .build()
         .await
         .unwrap();
-
+    let conn = db.connect().await.unwrap();
     loop {
         print!("> ");
         io::stdout().flush().unwrap();
@@ -44,7 +44,7 @@ async fn main() {
             }
             _ => {}
         }
-        let mut rows = db.query(&input, ()).await.unwrap();
+        let mut rows = conn.query(&input, ()).await.unwrap();
         while let Some(row) = rows.next().await.unwrap() {
             let mut values = vec![];
             for i in 0..row.column_count() {

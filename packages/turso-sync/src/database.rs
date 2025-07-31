@@ -4,7 +4,7 @@ use hyper_rustls::{ConfigBuilderExt, HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::{client::legacy::connect::HttpConnector, rt::TokioExecutor};
 
 use crate::{
-    database_inner::{DatabaseInner, Rows},
+    database_inner::DatabaseInner,
     errors::Error,
     filesystem::tokio::TokioFilesystem,
     sync_server::turso::{TursoSyncServer, TursoSyncServerOpts},
@@ -77,11 +77,8 @@ impl Database {
     pub async fn push(&mut self) -> Result<()> {
         self.0.push().await
     }
-    pub async fn execute(&self, sql: &str, params: impl turso::IntoParams) -> Result<u64> {
-        self.0.execute(sql, params).await
-    }
-    pub async fn query(&self, sql: &str, params: impl turso::IntoParams) -> Result<Rows> {
-        self.0.query(sql, params).await
+    pub async fn connect(&self) -> Result<turso::Connection> {
+        self.0.connect().await
     }
 }
 

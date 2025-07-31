@@ -187,7 +187,7 @@ impl SyncServer for TestSyncServer {
             let frame = &frames[offset..offset + FRAME_SIZE];
             match session.conn.wal_insert_frame(frame_no as u32, frame) {
                 Ok(info) => {
-                    if info.is_commit {
+                    if info.is_commit_frame() {
                         if session.in_txn {
                             session.conn.wal_insert_end()?;
                             session.in_txn = false;

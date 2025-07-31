@@ -114,7 +114,6 @@ impl TestContext {
         plans
     }
     pub async fn faulty_call(&self, name: &str) -> Result<()> {
-        tracing::trace!("faulty_call: {}", name);
         tokio::task::yield_now().await;
         if let FaultInjectionStrategy::Disabled = &*self.fault_injection.lock().await {
             return Ok(());

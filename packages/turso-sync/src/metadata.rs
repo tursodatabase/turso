@@ -4,16 +4,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::{errors::Error, filesystem::Filesystem, Result};
 
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
-pub enum ActiveDatabase {
-    /// Draft database is the only one from the pair which can accept writes
-    /// It holds all local changes
-    Draft,
-    /// Synced database most of the time holds DB state from remote
-    /// We can temporary apply changes from Draft DB to it - but they will be reseted almost immediately
-    Synced,
-}
-
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct DatabaseMetadata {
     /// Latest generation from remote which was pulled locally to the Synced DB
@@ -27,8 +17,9 @@ pub struct DatabaseMetadata {
     ///
     /// This can happen if WAL push will abort in the middle due to network partition, application crash, etc
     pub transferred_change_id: Option<i64>,
-    /// Current active databasel
-    pub active_db: ActiveDatabase,
+    /// pair of frame_no for Draft and Synced DB such that content of the database file up to these frames is identical
+    pub draft_wal_match_watermark: u64,
+    pub synced_wal_match_watermark: u64,
 }
 
 impl DatabaseMetadata {
@@ -84,10 +75,7 @@ impl DatabaseMetadata {
 
 #[cfg(test)]
 mod tests {
-    use crate::{
-        filesystem::tokio::TokioFilesystem,
-        metadata::{ActiveDatabase, DatabaseMetadata},
-    };
+    use crate::{filesystem::tokio::TokioFilesystem, metadata::DatabaseMetadata};
 
     #[tokio::test]
     pub async fn metadata_simple_test() {
@@ -98,7 +86,8 @@ mod tests {
             synced_frame_no: 2,
             synced_change_id: Some(3),
             transferred_change_id: Some(4),
-            active_db: ActiveDatabase::Draft,
+            draft_wal_match_watermark: 5,
+            synced_wal_match_watermark: 6,
         };
         let fs = TokioFilesystem();
         meta.write_to(&fs, &path).await.unwrap();

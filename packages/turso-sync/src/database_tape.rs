@@ -132,6 +132,10 @@ impl DatabaseWalSession {
         })
     }
 
+    pub fn frames_count(&self) -> Result<u64> {
+        Ok(self.wal_session.conn().wal_frame_count()?)
+    }
+
     pub fn append_page(&mut self, page_no: u32, page: &[u8]) -> Result<()> {
         if page.len() != self.page_size {
             return Err(Error::DatabaseTapeError(format!(
@@ -155,27 +159,34 @@ impl DatabaseWalSession {
         let conn = self.wal_session.conn();
         let mut frame = vec![0u8; WAL_FRAME_HEADER + self.page_size];
         if conn.wal_watermark_read_page(frame_watermark, page_no, &mut frame[WAL_FRAME_HEADER..])? {
+            tracing::trace!("rollback page {}", page_no);
             self.prepared_frame = Some((page_no, frame));
+        } else {
+            tracing::trace!(
+                "skip rollback page {} as no page existed with given watermark",
+                page_no
+            );
         }
 
         Ok(())
     }
 
-    pub fn rollback_changes_after(&mut self, frame_watermark: u32) -> Result<WalFrameInfo> {
+    pub fn rollback_changes_after(&mut self, frame_watermark: u32) -> Result<()> {
         let conn = self.wal_session.conn();
-        let mut frame = vec![0u8; WAL_FRAME_HEADER + self.page_size];
-        let frame_info = conn.wal_get_frame(frame_watermark, &mut frame)?;
-        if !frame_info.is_commit_frame() {
-            return Err(Error::DatabaseTapeError(
-                "rollback_changes_after only possible with commit frame as frame_watermark"
-                    .to_string(),
-            ));
-        }
         let pages = conn.wal_changed_pages_after(frame_watermark)?;
         for page_no in pages {
             self.rollback_page(page_no, frame_watermark)?;
         }
-        Ok(frame_info)
+        Ok(())
+    }
+
+    pub fn db_size(&self) -> Result<u32> {
+        let frames_count = self.frames_count()?;
+        let conn = self.wal_session.conn();
+        let mut page = vec![0u8; self.page_size];
+        assert!(conn.wal_watermark_read_page(frames_count as u32, 1, &mut page)?);
+        let db_size = u32::from_be_bytes(page[28..32].try_into().unwrap());
+        Ok(db_size)
     }
 
     pub fn commit(&mut self, db_size: u32) -> Result<()> {
@@ -191,6 +202,11 @@ impl DatabaseWalSession {
         frame_info.put_to_frame_header(&mut frame);
 
         let frame_no = self.next_wal_frame_no as u32;
+        tracing::trace!(
+            "flush prepared frame {:?} as frame_no {}",
+            frame_info,
+            frame_no
+        );
         self.wal_session.conn().wal_insert_frame(frame_no, &frame)?;
         self.next_wal_frame_no += 1;
 
@@ -693,7 +709,7 @@ mod tests {
         {
             let mut wal_session = db1.start_wal_session().await.unwrap();
             let frame_info = wal_session.rollback_changes_after(rollback4).unwrap();
-            wal_session.commit(frame_info.db_size).unwrap();
+            wal_session.commit(wal_session.db_size().unwrap()).unwrap();
         }
         assert_eq!(
             fetch_rows(&conn1, "SELECT * FROM t").await,
@@ -709,7 +725,7 @@ mod tests {
         {
             let mut wal_session = db1.start_wal_session().await.unwrap();
             let frame_info = wal_session.rollback_changes_after(rollback3).unwrap();
-            wal_session.commit(frame_info.db_size).unwrap();
+            wal_session.commit(wal_session.db_size().unwrap()).unwrap();
         }
         assert_eq!(
             fetch_rows(&conn1, "SELECT * FROM t").await,
@@ -723,7 +739,7 @@ mod tests {
         {
             let mut wal_session = db1.start_wal_session().await.unwrap();
             let frame_info = wal_session.rollback_changes_after(rollback2).unwrap();
-            wal_session.commit(frame_info.db_size).unwrap();
+            wal_session.commit(wal_session.db_size().unwrap()).unwrap();
         }
         assert_eq!(
             fetch_rows(&conn1, "SELECT * FROM t").await,
