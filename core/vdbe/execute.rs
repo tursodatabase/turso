@@ -3,7 +3,6 @@ use crate::function::AlterTableFunc;
 use crate::numeric::{NullableInteger, Numeric};
 use crate::storage::btree::{integrity_check, IntegrityCheckError, IntegrityCheckState};
 use crate::storage::database::DatabaseFile;
-use crate::storage::header_accessor::HeaderRef;
 use crate::storage::page_cache::DumbLruPageCache;
 use crate::storage::pager::{AtomicDbState, CreateBTreeFlags, DbState};
 use crate::storage::sqlite3_ondisk::read_varint;
@@ -1990,9 +1989,9 @@ pub fn op_transaction(
         if state.mv_tx_id.is_none() {
             // We allocate the first page lazily in the first transaction.
             return_if_io!(pager.maybe_allocate_page1());
-            let header_ref = pager.io.block(|| HeaderRef::from_pager(&pager))?;
-            let header = header_ref.borrow();
-            let header_schema_cookie = header.schema_cookie.get();
+            let header_schema_cookie = pager
+                .io
+                .block(|| pager.with_header(|header| header.schema_cookie.get()))?;
             if header_schema_cookie != *schema_cookie {
                 return Err(LimboError::SchemaUpdated);
             }
@@ -2067,12 +2066,22 @@ pub fn op_transaction(
         }
 
         // Can only read header if page 1 has been allocated already
-        // begin_write_tx and begin_read_tx guarantee that happens
-        let header_ref = pager.io.block(|| HeaderRef::from_pager(&pager))?;
-        let header = header_ref.borrow();
-        let header_schema_cookie = header.schema_cookie.get();
-        if header_schema_cookie != *schema_cookie {
-            return Err(LimboError::SchemaUpdated);
+        // begin_write_tx that happens, but not begin_read_tx
+        let res = pager
+            .io
+            .block(|| pager.with_header(|header| header.schema_cookie.get()));
+        match res {
+            Ok(header_schema_cookie) => {
+                dbg!(header_schema_cookie, *schema_cookie);
+                if header_schema_cookie != *schema_cookie {
+                    return Err(LimboError::SchemaUpdated);
+                }
+            }
+            // This means we are starting a read_tx and we do not have a page 1 yet, so we just continue execution
+            Err(LimboError::Page1NotAlloc) => {}
+            Err(err) => {
+                return Err(err);
+            }
         }
 
         if updated {
