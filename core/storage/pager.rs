@@ -825,6 +825,7 @@ impl Pager {
                 self.wal.borrow().end_write_tx();
             }
             self.wal.borrow().end_read_tx();
+            connection.transaction_state.set(TransactionState::None);
             self.rollback(schema_did_change, connection)?;
             return Ok(IOResult::Done(PagerCommitResult::Rollback));
         }
