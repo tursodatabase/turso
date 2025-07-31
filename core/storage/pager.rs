@@ -930,7 +930,7 @@ impl Pager {
     }
 
     pub fn wal_frame_count(&self) -> Result<u64> {
-        Ok(self.wal.borrow().get_max_frame_in_wal())
+        Ok(self.wal.borrow().get_max_frame())
     }
 
     /// Flush all dirty pages to disk.
