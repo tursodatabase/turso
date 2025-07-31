@@ -55,7 +55,6 @@ use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
     num::NonZero,
-    rc::Rc,
     sync::Arc,
 };
 use tracing::{instrument, Level};
@@ -382,7 +381,7 @@ pub struct Program {
 }
 
 impl Program {
-    fn get_pager_from_database_index(&self, idx: &usize) -> Rc<Pager> {
+    fn get_pager_from_database_index(&self, idx: &usize) -> Arc<Pager> {
         self.connection.get_pager_from_database_index(idx)
     }
 
@@ -390,8 +389,8 @@ impl Program {
     pub fn step(
         &self,
         state: &mut ProgramState,
-        mv_store: Option<Rc<MvStore>>,
-        pager: Rc<Pager>,
+        mv_store: Option<Arc<MvStore>>,
+        pager: Arc<Pager>,
     ) -> Result<StepResult> {
         loop {
             if self.connection.closed.get() {
@@ -430,9 +429,9 @@ impl Program {
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn commit_txn(
         &self,
-        pager: Rc<Pager>,
+        pager: Arc<Pager>,
         program_state: &mut ProgramState,
-        mv_store: Option<&Rc<MvStore>>,
+        mv_store: Option<&Arc<MvStore>>,
         rollback: bool,
     ) -> Result<StepResult> {
         if let Some(mv_store) = mv_store {
@@ -500,7 +499,7 @@ impl Program {
     #[instrument(skip(self, pager, connection), level = Level::DEBUG)]
     fn step_end_write_txn(
         &self,
-        pager: &Rc<Pager>,
+        pager: &Arc<Pager>,
         commit_state: &mut CommitState,
         connection: &Connection,
         rollback: bool,
@@ -752,7 +751,7 @@ impl Row {
 
 /// Handle a program error by rolling back the transaction
 pub fn handle_program_error(
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     connection: &Connection,
     err: &LimboError,
 ) -> Result<()> {

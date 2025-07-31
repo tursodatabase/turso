@@ -1,5 +1,6 @@
 use crate::error::LimboError;
 use crate::{io::Completion, Buffer, Result};
+use parking_lot::RwLock;
 use std::{cell::RefCell, sync::Arc};
 use tracing::{instrument, Level};
 
@@ -13,7 +14,7 @@ pub trait DatabaseStorage: Send + Sync {
     fn write_page(
         &self,
         page_idx: usize,
-        buffer: Arc<RefCell<Buffer>>,
+        buffer: Arc<parking_lot::RwLock<Buffer>>,
         c: Completion,
     ) -> Result<Completion>;
     fn sync(&self, c: Completion) -> Result<Completion>;
@@ -49,10 +50,10 @@ impl DatabaseStorage for DatabaseFile {
     fn write_page(
         &self,
         page_idx: usize,
-        buffer: Arc<RefCell<Buffer>>,
+        buffer: Arc<parking_lot::RwLock<Buffer>>,
         c: Completion,
     ) -> Result<Completion> {
-        let buffer_size = buffer.borrow().len();
+        let buffer_size = buffer.read().len();
         assert!(page_idx > 0);
         assert!(buffer_size >= 512);
         assert!(buffer_size <= 65536);
@@ -109,10 +110,10 @@ impl DatabaseStorage for FileMemoryStorage {
     fn write_page(
         &self,
         page_idx: usize,
-        buffer: Arc<RefCell<Buffer>>,
+        buffer: Arc<parking_lot::RwLock<Buffer>>,
         c: Completion,
     ) -> Result<Completion> {
-        let buffer_size = buffer.borrow().len();
+        let buffer_size = buffer.read().len();
         assert!(buffer_size >= 512);
         assert!(buffer_size <= 65536);
         assert_eq!(buffer_size & (buffer_size - 1), 0);

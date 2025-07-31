@@ -1,14 +1,12 @@
 #![deny(clippy::all)]
 
-use std::cell::{RefCell, RefMut};
 use std::num::{NonZero, NonZeroUsize};
-
-use std::rc::Rc;
-use std::sync::{Arc, OnceLock};
 
 use napi::bindgen_prelude::{JsObjectValue, Null, Object, ToNapiValue};
 use napi::{bindgen_prelude::ObjectFinalize, Env, JsValue, Unknown};
 use napi_derive::napi;
+use parking_lot::{RwLock, RwLockWriteGuard};
+use std::sync::{Arc, OnceLock};
 use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::EnvFilter;
 use turso_core::{LimboError, StepResult};
@@ -119,7 +117,7 @@ impl Database {
     #[napi]
     pub fn prepare(&self, sql: String) -> napi::Result<Statement> {
         let stmt = self.conn.prepare(&sql).map_err(into_napi_error)?;
-        Ok(Statement::new(RefCell::new(stmt), self.clone(), sql))
+        Ok(Statement::new(RwLock::new(stmt), self.clone(), sql))
     }
 
     #[napi]
@@ -133,7 +131,7 @@ impl Database {
         let stmt = self.prepare(sql)?;
         match options {
             Some(PragmaOptions { simple: true, .. }) => {
-                let mut stmt = stmt.inner.borrow_mut();
+                let mut stmt = stmt.inner.write();
                 loop {
                     match stmt.step().map_err(into_napi_error)? {
                         turso_core::StepResult::Row => {
@@ -270,14 +268,14 @@ pub struct Statement {
     database: Database,
     presentation_mode: PresentationMode,
     binded: bool,
-    inner: Rc<RefCell<turso_core::Statement>>,
+    inner: Arc<RwLock<turso_core::Statement>>,
 }
 
 #[napi]
 impl Statement {
-    pub fn new(inner: RefCell<turso_core::Statement>, database: Database, source: String) -> Self {
+    pub fn new(inner: RwLock<turso_core::Statement>, database: Database, source: String) -> Self {
         Self {
-            inner: Rc::new(inner),
+            inner: Arc::new(inner),
             database,
             source,
             presentation_mode: PresentationMode::None,
@@ -398,7 +396,7 @@ impl Statement {
     fn internal_all<'env>(
         &self,
         env: &'env Env,
-        mut stmt: RefMut<'_, turso_core::Statement>,
+        mut stmt: RwLockWriteGuard<'_, turso_core::Statement>,
     ) -> napi::Result<Unknown<'env>> {
         let mut results = env.create_array(1)?;
         let mut index = 0;
@@ -487,7 +485,8 @@ impl Statement {
 
     #[napi]
     pub fn bind(&mut self, env: Env, args: Option<Vec<Unknown>>) -> napi::Result<Self, String> {
-        self.check_and_bind(&env, args)
+        let _ = self
+            .check_and_bind(&env, args)
             .map_err(with_sqlite_error_message)?;
         self.binded = true;
 
@@ -500,8 +499,8 @@ impl Statement {
         &self,
         env: &Env,
         args: Option<Vec<Unknown>>,
-    ) -> napi::Result<RefMut<'_, turso_core::Statement>> {
-        let mut stmt = self.inner.borrow_mut();
+    ) -> napi::Result<RwLockWriteGuard<'_, turso_core::Statement>> {
+        let mut stmt = self.inner.write();
         stmt.reset();
         if let Some(args) = args {
             if self.binded {
@@ -538,7 +537,7 @@ impl Statement {
 }
 
 fn bind_positional_params(
-    stmt: &mut RefMut<'_, turso_core::Statement>,
+    stmt: &mut RwLockWriteGuard<'_, turso_core::Statement>,
     args: Vec<Unknown>,
 ) -> Result<(), napi::Error> {
     for (i, elem) in args.into_iter().enumerate() {
@@ -549,7 +548,7 @@ fn bind_positional_params(
 }
 
 fn bind_host_params(
-    stmt: &mut RefMut<'_, turso_core::Statement>,
+    stmt: &mut RwLockWriteGuard<'_, turso_core::Statement>,
     obj: &Object,
 ) -> Result<(), napi::Error> {
     if first_key_is_number(obj) {
@@ -571,7 +570,7 @@ fn first_key_is_number(obj: &Object) -> bool {
 }
 
 fn bind_numbered_params(
-    stmt: &mut RefMut<'_, turso_core::Statement>,
+    stmt: &mut RwLockWriteGuard<'_, turso_core::Statement>,
     obj: &Object,
 ) -> Result<(), napi::Error> {
     for key in Object::keys(obj)?.iter() {
@@ -594,7 +593,7 @@ fn bind_numbered_params(
 }
 
 fn bind_named_params(
-    stmt: &mut RefMut<'_, turso_core::Statement>,
+    stmt: &mut RwLockWriteGuard<'_, turso_core::Statement>,
     obj: &Object,
 ) -> Result<(), napi::Error> {
     for idx in 1..stmt.parameters_count() + 1 {
@@ -615,7 +614,7 @@ fn bind_named_params(
 }
 
 fn bind_positional_param_array(
-    stmt: &mut RefMut<'_, turso_core::Statement>,
+    stmt: &mut RwLockWriteGuard<'_, turso_core::Statement>,
     obj: &Object,
 ) -> Result<(), napi::Error> {
     assert!(obj.is_array()?, "bind_array can only be called with arrays");
@@ -631,7 +630,7 @@ fn bind_positional_param_array(
 }
 
 fn bind_single_param(
-    stmt: &mut RefMut<'_, turso_core::Statement>,
+    stmt: &mut RwLockWriteGuard<'_, turso_core::Statement>,
     obj: napi::Unknown,
 ) -> Result<(), napi::Error> {
     stmt.bind_at(NonZero::new(1).unwrap(), from_js_value(obj)?);
@@ -711,10 +710,10 @@ impl turso_core::DatabaseStorage for DatabaseFile {
     fn write_page(
         &self,
         page_idx: usize,
-        buffer: Arc<std::cell::RefCell<turso_core::Buffer>>,
+        buffer: Arc<parking_lot::RwLock<turso_core::Buffer>>,
         c: turso_core::Completion,
     ) -> turso_core::Result<turso_core::Completion> {
-        let size = buffer.borrow().len();
+        let size = buffer.read().len();
         let pos = (page_idx - 1) * size;
         self.file.pwrite(pos, buffer, c)
     }

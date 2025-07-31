@@ -1,7 +1,7 @@
 use std::{
     cell::{Cell, RefCell},
     fmt::Debug,
-    sync::Arc,
+    sync::{Arc, RwLock},
 };
 
 use rand::Rng as _;
@@ -173,7 +173,7 @@ impl File for SimulatorFile {
     fn pwrite(
         &self,
         pos: usize,
-        buffer: Arc<RefCell<turso_core::Buffer>>,
+        buffer: Arc<RwLock<turso_core::Buffer>>,
         c: turso_core::Completion,
     ) -> Result<turso_core::Completion> {
         self.nr_pwrite_calls.set(self.nr_pwrite_calls.get() + 1);

@@ -1,4 +1,4 @@
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use tracing::{instrument, Level};
 
 use crate::{
@@ -43,7 +43,6 @@ use std::{
     fmt::Debug,
     ops::DerefMut,
     pin::Pin,
-    rc::Rc,
     sync::Arc,
 };
 
@@ -520,9 +519,9 @@ pub enum CursorSeekState {
 
 pub struct BTreeCursor {
     /// The multi-version cursor that is used to read and write to the database file.
-    mv_cursor: Option<Rc<RefCell<MvCursor>>>,
+    mv_cursor: Option<Arc<RwLock<MvCursor>>>,
     /// The pager that is used to read and write to the database file.
-    pager: Rc<Pager>,
+    pager: Arc<Pager>,
     /// Page id of the root page used to go back up fast.
     root_page: usize,
     /// Rowid and record are stored before being consumed.
@@ -597,8 +596,8 @@ impl BTreeNodeState {
 
 impl BTreeCursor {
     pub fn new(
-        mv_cursor: Option<Rc<RefCell<MvCursor>>>,
-        pager: Rc<Pager>,
+        mv_cursor: Option<Arc<RwLock<MvCursor>>>,
+        pager: Arc<Pager>,
         root_page: usize,
         num_columns: usize,
     ) -> Self {
@@ -629,8 +628,8 @@ impl BTreeCursor {
     }
 
     pub fn new_table(
-        mv_cursor: Option<Rc<RefCell<MvCursor>>>,
-        pager: Rc<Pager>,
+        mv_cursor: Option<Arc<RwLock<MvCursor>>>,
+        pager: Arc<Pager>,
         root_page: usize,
         num_columns: usize,
     ) -> Self {
@@ -638,8 +637,8 @@ impl BTreeCursor {
     }
 
     pub fn new_index(
-        mv_cursor: Option<Rc<RefCell<MvCursor>>>,
-        pager: Rc<Pager>,
+        mv_cursor: Option<Arc<RwLock<MvCursor>>>,
+        pager: Arc<Pager>,
         root_page: usize,
         index: &Index,
         num_columns: usize,
@@ -681,7 +680,7 @@ impl BTreeCursor {
     #[instrument(skip_all, level = Level::DEBUG)]
     fn is_empty_table(&self) -> Result<IOResult<bool>> {
         if let Some(mv_cursor) = &self.mv_cursor {
-            let mv_cursor = mv_cursor.borrow();
+            let mv_cursor = mv_cursor.read();
             return Ok(IOResult::Done(mv_cursor.is_empty()));
         }
         let (page, c) = self.pager.read_page(self.root_page)?;
@@ -1217,7 +1216,7 @@ impl BTreeCursor {
     #[instrument(skip(self), level = Level::DEBUG, name = "next")]
     fn get_next_record(&mut self) -> Result<IOResult<bool>> {
         if let Some(mv_cursor) = &self.mv_cursor {
-            let mut mv_cursor = mv_cursor.borrow_mut();
+            let mut mv_cursor = mv_cursor.write();
             mv_cursor.forward();
             let rowid = mv_cursor.current_row_id();
             match rowid {
@@ -4212,7 +4211,7 @@ impl BTreeCursor {
     pub fn rewind(&mut self) -> Result<IOResult<()>> {
         if let Some(mv_cursor) = &self.mv_cursor {
             {
-                let mut mv_cursor = mv_cursor.borrow_mut();
+                let mut mv_cursor = mv_cursor.write();
                 mv_cursor.rewind();
             }
             let cursor_has_record = return_if_io!(self.get_next_record());
@@ -4268,7 +4267,7 @@ impl BTreeCursor {
     pub fn rowid(&mut self) -> Result<IOResult<Option<i64>>> {
         if let Some(mv_cursor) = &self.mv_cursor {
             if self.has_record.get() {
-                let mv_cursor = mv_cursor.borrow();
+                let mv_cursor = mv_cursor.read();
                 return Ok(IOResult::Done(
                     mv_cursor.current_row_id().map(|rowid| rowid.row_id),
                 ));
@@ -4340,7 +4339,7 @@ impl BTreeCursor {
             return Ok(IOResult::Done(Some(record_ref)));
         }
         if self.mv_cursor.is_some() {
-            let mv_cursor = self.mv_cursor.as_ref().unwrap().borrow();
+            let mv_cursor = self.mv_cursor.as_ref().unwrap().read();
             let row = mv_cursor.current_row().unwrap().unwrap();
             self.get_immutable_record_or_create()
                 .as_mut()
@@ -4424,7 +4423,7 @@ impl BTreeCursor {
                     let row_id = crate::mvcc::database::RowID::new(self.table_id() as u64, rowid);
                     let record_buf = key.get_record().unwrap().get_payload().to_vec();
                     let row = crate::mvcc::database::Row::new(row_id, record_buf);
-                    mv_cursor.borrow_mut().insert(row).unwrap();
+                    mv_cursor.write().insert(row).unwrap();
                 }
                 None => todo!("Support mvcc inserts with index btrees"),
             },
@@ -5566,7 +5565,7 @@ impl std::fmt::Debug for IntegrityCheckState {
 pub fn integrity_check(
     state: &mut IntegrityCheckState,
     errors: &mut Vec<IntegrityCheckError>,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
 ) -> Result<IOResult<()>> {
     let Some(IntegrityCheckPageEntry {
         page_idx,
@@ -5723,7 +5722,7 @@ pub fn integrity_check(
     Ok(IOResult::Done(()))
 }
 
-pub fn btree_read_page(pager: &Rc<Pager>, page_idx: usize) -> Result<(BTreePage, Completion)> {
+pub fn btree_read_page(pager: &Arc<Pager>, page_idx: usize) -> Result<(BTreePage, Completion)> {
     pager.read_page(page_idx).map(|(page, c)| {
         (
             Arc::new(BTreePageInner {
@@ -6795,7 +6794,7 @@ fn fill_cell_payload(
     cell_idx: usize,
     record: &ImmutableRecord,
     usable_space: usize,
-    pager: Rc<Pager>,
+    pager: Arc<Pager>,
     state: &mut FillCellPayloadState,
 ) -> Result<IOResult<()>> {
     loop {
@@ -7034,7 +7033,6 @@ mod tests {
         collections::HashSet,
         mem::transmute,
         ops::Deref,
-        rc::Rc,
         sync::{Arc, Mutex},
     };
 
@@ -7056,7 +7054,7 @@ mod tests {
     fn get_page(id: usize) -> BTreePage {
         let page = Arc::new(Page::new(id));
 
-        let drop_fn = Rc::new(|_| {});
+        let drop_fn = Arc::new(|_| {});
         let inner = PageContent::new(
             0,
             Arc::new(RefCell::new(Buffer::new(
@@ -7185,7 +7183,7 @@ mod tests {
         }
     }
 
-    fn validate_btree(pager: Rc<Pager>, page_idx: usize) -> (usize, bool) {
+    fn validate_btree(pager: Arc<Pager>, page_idx: usize) -> (usize, bool) {
         let num_columns = 5;
         let cursor = BTreeCursor::new_table(None, pager.clone(), page_idx, num_columns);
         let (page, c) = cursor.read_page(page_idx).unwrap();
@@ -7295,7 +7293,7 @@ mod tests {
         (depth.unwrap(), valid)
     }
 
-    fn format_btree(pager: Rc<Pager>, page_idx: usize, depth: usize) -> String {
+    fn format_btree(pager: Arc<Pager>, page_idx: usize, depth: usize) -> String {
         let num_columns = 5;
 
         let cursor = BTreeCursor::new_table(None, pager.clone(), page_idx, num_columns);
@@ -7353,7 +7351,7 @@ mod tests {
         }
     }
 
-    fn empty_btree() -> (Rc<Pager>, usize, Arc<Database>, Arc<Connection>) {
+    fn empty_btree() -> (Arc<Pager>, usize, Arc<Database>, Arc<Connection>) {
         #[allow(clippy::arc_with_non_send_sync)]
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db = Database::open_file(io.clone(), ":memory:", false, false).unwrap();
@@ -8041,7 +8039,7 @@ mod tests {
     }
 
     fn validate_expected_keys(
-        pager: &Rc<Pager>,
+        pager: &Arc<Pager>,
         cursor: &mut BTreeCursor,
         expected_keys: &[Vec<u8>],
         seed: u64,
@@ -8269,7 +8267,7 @@ mod tests {
     }
 
     #[allow(clippy::arc_with_non_send_sync)]
-    fn setup_test_env(database_size: u32) -> Rc<Pager> {
+    fn setup_test_env(database_size: u32) -> Arc<Pager> {
         let page_size = 512;
 
         let buffer_pool = Arc::new(BufferPool::new(Some(page_size as usize)));
@@ -8334,7 +8332,7 @@ mod tests {
         // Setup overflow pages (2, 3, 4) with linking
         let mut current_page = 2u32;
         while current_page <= 4 {
-            let drop_fn = Rc::new(|_buf| {});
+            let drop_fn = Arc::new(|_buf| {});
             #[allow(clippy::arc_with_non_send_sync)]
             let buf = Arc::new(RefCell::new(Buffer::allocate(
                 header_accessor::get_page_size(&pager)? as usize,
@@ -9617,7 +9615,7 @@ mod tests {
         }
     }
 
-    fn insert_cell(cell_idx: u64, size: u16, contents: &mut PageContent, pager: Rc<Pager>) {
+    fn insert_cell(cell_idx: u64, size: u16, contents: &mut PageContent, pager: Arc<Pager>) {
         let mut payload = Vec::new();
         let regs = &[Register::Value(Value::Blob(vec![0; size as usize]))];
         let record = ImmutableRecord::from_registers(regs, regs.len());

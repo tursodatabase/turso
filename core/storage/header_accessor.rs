@@ -116,7 +116,7 @@ macro_rules! impl_header_field_accessor {
                 };
                 let page_inner = page.get();
                 let page_content = page_inner.contents.as_ref().unwrap();
-                let buf = page_content.buffer.borrow();
+                let buf = page_content.buffer.read();
                 let buf_slice = buf.as_slice();
                 let mut bytes = [0; std::mem::size_of::<$type>()];
                 bytes.copy_from_slice(&buf_slice[$offset..$offset + std::mem::size_of::<$type>()]);
@@ -144,7 +144,7 @@ macro_rules! impl_header_field_accessor {
                 };
                 let page_inner = page.get();
                 let page_content = page_inner.contents.as_ref().unwrap();
-                let mut buf = page_content.buffer.borrow_mut();
+                let mut buf = page_content.buffer.write();
                 let buf_slice = buf.as_mut_slice();
                 buf_slice[$offset..$offset + std::mem::size_of::<$type>()].copy_from_slice(&value.to_be_bytes());
                 turso_assert!(page.get().id == 1, "page must have number 1");

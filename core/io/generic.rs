@@ -4,6 +4,7 @@ use std::cell::RefCell;
 use std::io::{Read, Seek, Write};
 use std::sync::Arc;
 use tracing::{debug, trace};
+use parking_lot::RwLock;
 
 pub struct GenericIO {}
 
@@ -102,12 +103,12 @@ impl File for GenericFile {
     fn pwrite(
         &self,
         pos: usize,
-        buffer: Arc<RefCell<crate::Buffer>>,
+        buffer: Arc<RwLock<crate::Buffer>>,
         c: Completion,
     ) -> Result<Completion> {
         let mut file = self.file.borrow_mut();
         file.seek(std::io::SeekFrom::Start(pos as u64))?;
-        let buf = buffer.borrow();
+        let buf = buffer.read();
         let buf = buf.as_slice();
         file.write_all(buf)?;
         c.complete(buf.len() as i32);

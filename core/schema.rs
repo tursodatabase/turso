@@ -7,11 +7,10 @@ use crate::{util::normalize_ident, Result};
 use crate::{LimboError, MvCursor, Pager, RefValue, SymbolTable, VirtualTable};
 use core::fmt;
 use fallible_iterator::FallibleIterator;
-use std::cell::RefCell;
+use parking_lot::RwLock;
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeSet, HashMap};
 use std::ops::Deref;
-use std::rc::Rc;
 use std::sync::Arc;
 use tracing::trace;
 use turso_sqlite3_parser::ast::{self, ColumnDefinition, Expr, Literal, SortOrder, TableOptions};
@@ -150,8 +149,8 @@ impl Schema {
     /// Update [Schema] by scanning the first root page (sqlite_schema)
     pub fn make_from_btree(
         &mut self,
-        mv_cursor: Option<Rc<RefCell<MvCursor>>>,
-        pager: Rc<Pager>,
+        mv_cursor: Option<Arc<RwLock<MvCursor>>>,
+        pager: Arc<Pager>,
         syms: &SymbolTable,
     ) -> Result<()> {
         let mut cursor = BTreeCursor::new_table(mv_cursor, pager.clone(), 1, 10);

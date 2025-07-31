@@ -121,7 +121,7 @@ static DATABASE_MANAGER: LazyLock<Mutex<HashMap<String, Weak<Database>>>> =
 /// The `Database` object contains per database file state that is shared
 /// between multiple connections.
 pub struct Database {
-    mv_store: Option<Rc<MvStore>>,
+    mv_store: Option<Arc<MvStore>>,
     schema: Mutex<Arc<Schema>>,
     db_file: Arc<dyn DatabaseStorage>,
     path: String,
@@ -269,7 +269,7 @@ impl Database {
         let maybe_shared_wal = WalFileShared::open_shared_if_exists(&io, wal_path.as_str())?;
 
         let mv_store = if enable_mvcc {
-            Some(Rc::new(MvStore::new(
+            Some(Arc::new(MvStore::new(
                 mvcc::LocalClock::new(),
                 mvcc::persistent_storage::Storage::new_noop(),
             )))
@@ -340,7 +340,7 @@ impl Database {
 
         let conn = Arc::new(Connection {
             _db: self.clone(),
-            pager: RefCell::new(Rc::new(pager)),
+            pager: RefCell::new(Arc::new(pager)),
             schema: RefCell::new(
                 self.schema
                     .lock()
@@ -629,7 +629,7 @@ impl CaptureDataChangesMode {
 struct DatabaseCatalog {
     name_to_index: HashMap<String, usize>,
     allocated: Vec<u64>,
-    index_to_data: HashMap<usize, (Arc<Database>, Rc<Pager>)>,
+    index_to_data: HashMap<usize, (Arc<Database>, Arc<Pager>)>,
 }
 
 #[allow(unused)]
@@ -658,7 +658,7 @@ impl DatabaseCatalog {
         }
     }
 
-    fn get_pager_by_index(&self, idx: &usize) -> Rc<Pager> {
+    fn get_pager_by_index(&self, idx: &usize) -> Arc<Pager> {
         let (_db, pager) = self
             .index_to_data
             .get(idx)
@@ -674,7 +674,7 @@ impl DatabaseCatalog {
         index
     }
 
-    fn insert(&mut self, s: &str, data: (Arc<Database>, Rc<Pager>)) -> usize {
+    fn insert(&mut self, s: &str, data: (Arc<Database>, Arc<Pager>)) -> usize {
         let idx = self.add(s);
         self.index_to_data.insert(idx, data);
         idx
@@ -734,7 +734,7 @@ impl DatabaseCatalog {
 
 pub struct Connection {
     _db: Arc<Database>,
-    pager: RefCell<Rc<Pager>>,
+    pager: RefCell<Arc<Pager>>,
     schema: RefCell<Arc<Schema>>,
     /// Per-database schema cache (database_index -> schema)
     /// Loaded lazily to avoid copying all schemas on connection open
@@ -1326,7 +1326,7 @@ impl Connection {
 
         *self._db.maybe_shared_wal.write() = None;
         let pager = self._db.init_pager(Some(size as usize))?;
-        self.pager.replace(Rc::new(pager));
+        self.pager.replace(Arc::new(pager));
         self.pager.borrow().set_initial_page_size(size);
 
         Ok(())
@@ -1478,7 +1478,7 @@ impl Connection {
         self._db.db_state.is_initialized()
     }
 
-    fn get_pager_from_database_index(&self, index: &usize) -> Rc<Pager> {
+    fn get_pager_from_database_index(&self, index: &usize) -> Arc<Pager> {
         if *index < 2 {
             self.pager.borrow().clone()
         } else {
@@ -1531,7 +1531,7 @@ impl Connection {
         let use_mvcc = self._db.mv_store.is_some();
 
         let db = Self::from_uri_attached(path, use_indexes, use_mvcc)?;
-        let pager = Rc::new(db.init_pager(None)?);
+        let pager = Arc::new(db.init_pager(None)?);
 
         self.attached_databases
             .borrow_mut()
@@ -1688,15 +1688,15 @@ impl Connection {
 pub struct Statement {
     program: Rc<vdbe::Program>,
     state: vdbe::ProgramState,
-    mv_store: Option<Rc<MvStore>>,
-    pager: Rc<Pager>,
+    mv_store: Option<Arc<MvStore>>,
+    pager: Arc<Pager>,
 }
 
 impl Statement {
     pub fn new(
         program: Rc<vdbe::Program>,
-        mv_store: Option<Rc<MvStore>>,
-        pager: Rc<Pager>,
+        mv_store: Option<Arc<MvStore>>,
+        pager: Arc<Pager>,
     ) -> Self {
         let state = vdbe::ProgramState::new(program.max_registers, program.cursor_ref.len());
         Self {
@@ -1790,7 +1790,7 @@ pub type StepResult = vdbe::StepResult;
 pub struct SymbolTable {
     pub functions: HashMap<String, Arc<function::ExternalFunc>>,
     pub vtabs: HashMap<String, Arc<VirtualTable>>,
-    pub vtab_modules: HashMap<String, Rc<crate::ext::VTabImpl>>,
+    pub vtab_modules: HashMap<String, Arc<crate::ext::VTabImpl>>,
 }
 
 impl std::fmt::Debug for SymbolTable {

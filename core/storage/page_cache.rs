@@ -642,7 +642,7 @@ mod tests {
     pub fn page_with_content(page_id: usize) -> PageRef {
         let page = Arc::new(Page::new(page_id));
         {
-            let buffer_drop_fn = Rc::new(|_data: BufferData| {});
+            let buffer_drop_fn = Arc::new(|_data: BufferData| {});
             let buffer = Buffer::new(Pin::new(vec![0; 4096]), buffer_drop_fn);
             let page_content = PageContent {
                 offset: 0,

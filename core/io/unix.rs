@@ -17,6 +17,7 @@ use std::{
 };
 
 use std::{io::ErrorKind, sync::Arc};
+use parking_lot::RwLock;
 #[cfg(feature = "fs")]
 use tracing::debug;
 use tracing::{instrument, trace, Level};
@@ -258,8 +259,8 @@ impl IO for UnixIO {
                     }
                     CompletionCallback::Write(ref file, _, ref buf, pos) => {
                         let file = file.lock().unwrap();
-                        let buf = buf.borrow();
-                        rustix::io::pwrite(file.as_fd(), buf.as_slice(), *pos as u64)
+                        let buf_guard = buf.read();
+                        rustix::io::pwrite(file.as_fd(), buf_guard.as_slice(), *pos as u64)
                     }
                 };
                 match result {
@@ -309,7 +310,7 @@ enum CompletionCallback {
     Write(
         Arc<Mutex<std::fs::File>>,
         Completion,
-        Arc<RefCell<crate::Buffer>>,
+        Arc<parking_lot::RwLock<crate::Buffer>>,
         usize,
     ),
 }
@@ -400,12 +401,12 @@ impl File for UnixFile<'_> {
     fn pwrite(
         &self,
         pos: usize,
-        buffer: Arc<RefCell<crate::Buffer>>,
+        buffer: Arc<parking_lot::RwLock<crate::Buffer>>,
         c: Completion,
     ) -> Result<Completion> {
         let file = self.file.lock().unwrap();
         let result = {
-            let buf = buffer.borrow();
+            let buf = buffer.read();
             rustix::io::pwrite(file.as_fd(), buf.as_slice(), pos as u64)
         };
         match result {
