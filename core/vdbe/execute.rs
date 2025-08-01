@@ -5996,6 +5996,38 @@ pub fn op_create_btree(
     Ok(InsnFunctionStepResult::Step)
 }
 
+pub fn op_clear(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Rc<Pager>,
+    mv_store: Option<&Arc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    let Insn::Clear {
+        root_page,
+        db,
+        change_count_reg,
+        table_name,
+    } = insn
+    else {
+        unreachable!("unexpected Insn {:?}", insn)
+    };
+
+    let pager = program.get_pager_from_database_index(db);
+    let mut cursor = BTreeCursor::new(None, pager.clone(), *root_page, 0);
+    let nchanges = cursor.clear_btree()?;
+
+    if let IOResult::Done(nchanges) = nchanges {
+        if let Some(cnt) = change_count_reg {
+            state.registers[*cnt] = Register::Value(Value::Integer(nchanges as i64));
+            let prev_changes = program.n_change.get();
+            program.n_change.set(prev_changes + nchanges as i64);
+        }
+    }
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
 pub fn op_destroy(
     program: &Program,
     state: &mut ProgramState,

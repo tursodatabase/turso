@@ -407,8 +407,48 @@ fn emit_program_for_delete(
         plan.result_columns.len(),
     );
 
+    let mut early_no_loop = false;
     // exit early if LIMIT 0
     if let Some(0) = plan.limit {
+        early_no_loop = true;
+    }
+
+    // Deleting the whole table uses the Clear opcode, which doesn't have to go through
+    // individual rows.
+    if plan.where_clause.is_empty() && plan.limit.is_none() && plan.offset.is_none() {
+        if let Some(joined_table) = plan.table_references.joined_tables().first() {
+            if let Table::BTree(btree_table) = &joined_table.table {
+                // First, clear all indexes associated with this table
+                if let Some(indexes) = schema.indexes.get(btree_table.name.as_str()) {
+                    for index in indexes {
+                        program.emit_insn(Insn::Clear {
+                            root_page: index.root_page,
+                            db: 0,
+                            change_count_reg: None,
+                            table_name: Some(index.name.clone()),
+                        });
+                    }
+                }
+
+                // actual accumulation of changes is done in execute.rs itself, for all
+                // instructions. We just need to pass Some() here to indicate we'll accumulate (we
+                // don't accumulate the index). This could be a boolean, but we'll keep a usize
+                // register for compat with SQLite.
+                let count = program.alloc_register();
+                // Then clear the main table
+                program.emit_insn(Insn::Clear {
+                    root_page: btree_table.root_page,
+                    db: 0, // Main database - fixed for now, will be patched when we do write
+                    // ATTACH
+                    change_count_reg: Some(count),
+                    table_name: Some(joined_table.identifier.clone()),
+                });
+                early_no_loop = true;
+            }
+        }
+    }
+
+    if early_no_loop {
         program.result_columns = plan.result_columns;
         program.table_references.extend(plan.table_references);
         return Ok(());

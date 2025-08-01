@@ -1118,6 +1118,23 @@ pub fn insn_to_str(
                 0,
                 "".to_string(),
             ),
+            Insn::Clear { root_page, db, change_count_reg, table_name } => {
+                let table_desc = table_name.as_deref().unwrap_or("");
+                let comment = if let Some(reg) = change_count_reg {
+                    format!("root={root_page} db={db} count=r[{reg}] table={table_desc}")
+                } else {
+                    format!("root={root_page} db={db} table={table_desc}")
+                };
+                (
+                    "Clear",
+                    *root_page as i32,
+                    *db as i32,
+                    change_count_reg.unwrap_or(0) as i32,
+                    Value::build_text(table_desc),
+                    0,
+                    comment,
+                )
+            },
             Insn::IdxDelete {
                 cursor_id,
                 start_reg,

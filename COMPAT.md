@@ -429,7 +429,7 @@ Modifiers:
 | BeginSubrtn    | Yes    |         |
 | Cast           | Yes    |         |
 | Checkpoint     | Yes    |         |
-| Clear          | No     |         |
+| Clear          | Yes    |         |
 | Close          | Yes    |         |
 | CollSeq        | No     |         |
 | Column         | Yes    |         |

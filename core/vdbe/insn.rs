@@ -747,6 +747,16 @@ pub enum Insn {
         cursor_id: CursorID,
     },
 
+    /// Clear a B-Tree table or index by deleting all entries.
+    /// This is the truncate optimization used by DELETE FROM table without WHERE clause.
+    /// P1 is the root page number, P2 is the database index, P3 is optional change counter register.
+    Clear {
+        root_page: usize,                // P1: root page number
+        db: usize,                       // P2: database index
+        change_count_reg: Option<usize>, // P3: optional register to increment with row count
+        table_name: Option<String>,      // P4: table name for debugging
+    },
+
     /// If P5 is not zero, then raise an SQLITE_CORRUPT_INDEX error if no matching index entry
     /// is found. This happens when running an UPDATE or DELETE statement and the index entry to
     /// be updated or deleted is not found. For some uses of IdxDelete (example: the EXCEPT operator)
@@ -1107,6 +1117,7 @@ impl Insn {
             Insn::Int64 { .. } => execute::op_int_64,
             Insn::IdxInsert { .. } => execute::op_idx_insert,
             Insn::Delete { .. } => execute::op_delete,
+            Insn::Clear { .. } => execute::op_clear,
             Insn::NewRowid { .. } => execute::op_new_rowid,
             Insn::MustBeInt { .. } => execute::op_must_be_int,
             Insn::SoftNull { .. } => execute::op_soft_null,
