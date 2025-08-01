@@ -45,7 +45,10 @@ use alter::translate_alter_table;
 use index::{translate_create_index, translate_drop_index};
 use insert::translate_insert;
 use rollback::translate_rollback;
-use schema::{translate_create_table, translate_create_virtual_table, translate_drop_table};
+use schema::{
+    translate_create_table, translate_create_trigger, translate_create_virtual_table,
+    translate_drop_table,
+};
 use select::translate_select;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -146,7 +149,7 @@ pub fn translate_inner(
             tbl_name,
             body,
         } => translate_create_table(tbl_name, temporary, *body, if_not_exists, schema, program)?,
-        ast::Stmt::CreateTrigger { .. } => bail_parse_error!("CREATE TRIGGER not supported yet"),
+        ast::Stmt::CreateTrigger { .. } => translate_create_trigger()?,
         ast::Stmt::CreateView { .. } => bail_parse_error!("CREATE VIEW not supported yet"),
         ast::Stmt::CreateVirtualTable(vtab) => {
             translate_create_virtual_table(*vtab, schema, syms, program)?
