@@ -50,6 +50,12 @@ use std::{
     sync::Arc,
 };
 
+#[derive(Debug, PartialEq)]
+enum DestroyBTreeRootPage {
+    Keep,
+    Free,
+}
+
 /// The B-Tree page header is 12 bytes for interior pages and 8 bytes for leaf pages.
 ///
 /// +--------+-----------------+-----------------+-----------------+--------+----- ..... ----+
@@ -168,8 +174,18 @@ enum DestroyState {
     FreePage,
 }
 
+/// Result of B-tree operations
+#[derive(Debug)]
+struct BTreeOperationResult {
+    /// Number of cells counted (always counted)
+    cells_count: u64,
+    /// Number of pages freed (Some if applicable, will be used for AUTO_VACUUM)
+    pages_freed: Option<usize>,
+}
+
 struct DestroyInfo {
     state: DestroyState,
+    cell_count: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -5091,6 +5107,59 @@ impl BTreeCursor {
     /// 4' <- 4     5    6     7
     /// ```
     ///
+    /// Clear all cells in the B-tree, leaving only an empty root page.
+    /// This is equivalent to SQLite's clearDatabasePage function.
+    /// Returns the number of index cells that were cleared.
+    #[instrument(skip(self), level = Level::DEBUG)]
+    pub fn clear_btree(&mut self) -> Result<IOResult<u64>> {
+        // Re-Initialize the root page as a leaf page
+        // After clearing all data, the root should always be a leaf page
+        let original_page_type = {
+            let _c = self.move_to_root()?;
+            let page = self.stack.top();
+            page.get().get().contents.as_ref().unwrap().page_type()
+        };
+
+        let original_page_type = match original_page_type {
+            PageType::IndexInterior => PageType::IndexLeaf,
+            PageType::TableInterior => PageType::TableLeaf,
+            PageType::IndexLeaf => PageType::IndexLeaf,
+            PageType::TableLeaf => PageType::TableLeaf,
+        };
+
+        // First, destroy the entire tree (including root) while counting cells
+        if let CursorState::None = &self.state {
+            self.state = CursorState::Destroy(DestroyInfo {
+                state: DestroyState::Start,
+                cell_count: 0,
+            });
+        }
+
+        match self.destroy_btree_contents(DestroyBTreeRootPage::Keep)? {
+            IOResult::Done(result) => {
+                // Reinitialize the root page in-place to avoid stale cursor references
+                let (root_page, _c) = self.pager.read_page(self.root_page)?;
+
+                // Wrap the page in BTreePageInner for initialization
+                let btree_page = Arc::new(BTreePageInner {
+                    page: RefCell::new(root_page),
+                });
+
+                btree_init_page(
+                    &btree_page,
+                    original_page_type,
+                    0,
+                    self.usable_space() as u16,
+                );
+                self.pager.add_dirty(&btree_page.get());
+                let _c = self.move_to_root()?;
+
+                Ok(IOResult::Done(result.cells_count))
+            }
+            IOResult::IO => Ok(IOResult::IO),
+        }
+    }
+
     /// The destruction order would be: [4',4,5,2,6,7,3,1]
     #[instrument(skip(self), level = Level::DEBUG)]
     pub fn btree_destroy(&mut self) -> Result<IOResult<Option<usize>>> {
@@ -5098,10 +5167,26 @@ impl BTreeCursor {
             let _c = self.move_to_root()?;
             self.state = CursorState::Destroy(DestroyInfo {
                 state: DestroyState::Start,
+                cell_count: 0,
             });
             return Ok(IOResult::IO);
         }
 
+        match self.destroy_btree_contents(DestroyBTreeRootPage::Free)? {
+            IOResult::Done(result) => {
+                // For destroy operations, we return pages_freed (currently always None)
+                Ok(IOResult::Done(result.pages_freed))
+            }
+            IOResult::IO => Ok(IOResult::IO),
+        }
+    }
+
+    /// Unified operation handler for both clear and destroy operations
+    #[instrument(skip(self), level = Level::DEBUG)]
+    fn destroy_btree_contents(
+        &mut self,
+        root_page_action: DestroyBTreeRootPage,
+    ) -> Result<IOResult<BTreeOperationResult>> {
         loop {
             let destroy_state = {
                 let destroy_info = self
@@ -5183,6 +5268,25 @@ impl BTreeCursor {
                     //  Get the current cell
                     let cell = contents.cell_get(cell_idx as usize, self.usable_space())?;
 
+                    // Count cells according to page type:
+                    // - Table btrees: Only count leaf page cells (SQLite behavior: intKey pages set pnChange=0)
+                    // - Index btrees: Count all page cells (both leaf and interior, as they contain data)
+                    // Only count once per page when we start processing it (cell_idx == 0)
+                    if cell_idx == 0 {
+                        let should_count_cells = match contents.page_type() {
+                            PageType::TableLeaf => true,
+                            PageType::TableInterior => false,
+                            PageType::IndexLeaf | PageType::IndexInterior => true,
+                        };
+                        if should_count_cells {
+                            let destroy_info = self
+                                .state
+                                .mut_destroy_info()
+                                .expect("unable to get mut destroy state in cursor");
+                            destroy_info.cell_count += contents.cell_count() as u64;
+                        }
+                    }
+
                     match contents.is_leaf() {
                         //  For a leaf cell, clear the overflow pages associated with this cell
                         true => {
@@ -5250,8 +5354,11 @@ impl BTreeCursor {
                 DestroyState::FreePage => {
                     let page = self.stack.top();
                     let page_id = page.get().get().id;
+                    let is_root = page_id == self.root_page;
 
-                    return_if_io!(self.pager.free_page(Some(page.get()), page_id));
+                    if !is_root || root_page_action == DestroyBTreeRootPage::Free {
+                        return_if_io!(self.pager.free_page(Some(page.get()), page_id));
+                    }
 
                     if self.stack.has_parent() {
                         self.stack.pop();
@@ -5261,10 +5368,20 @@ impl BTreeCursor {
                             .expect("unable to get a mut reference to destroy state in cursor");
                         destroy_info.state = DestroyState::ProcessPage;
                     } else {
+                        let destroy_info = self
+                            .state
+                            .destroy_info()
+                            .expect("unable to get destroy state in cursor");
+                        let cell_count = destroy_info.cell_count;
                         self.state = CursorState::None;
-                        //  TODO: For now, no-op the result return None always. This will change once [AUTO_VACUUM](https://www.sqlite.org/lang_vacuum.html) is introduced
-                        //  At that point, the last root page(call this x) will be moved into the position of the root page of this table and the value returned will be x
-                        return Ok(IOResult::Done(None));
+                        return Ok(IOResult::Done(BTreeOperationResult {
+                            cells_count: cell_count,
+                            pages_freed: {
+                                // TODO: For now, no-op the result return None always. This will change once [AUTO_VACUUM](https://www.sqlite.org/lang_vacuum.html) is introduced
+                                // At that point, the last root page(call this x) will be moved into the position of the root page of this table and the value returned will be x
+                                None
+                            },
+                        }));
                     }
                 }
             }
@@ -9991,5 +10108,348 @@ mod tests {
             pager.usable_space() as u16,
         )
         .unwrap();
+    }
+
+    #[test]
+    pub fn test_clear_btree_empty_table() {
+        let (pager, root_page, _, _) = empty_btree();
+        let num_columns = 5;
+        let mut cursor = BTreeCursor::new_table(None, pager.clone(), root_page, num_columns);
+
+        // Clear empty table
+        let cell_count = run_until_done(|| cursor.clear_btree(), &pager).unwrap();
+        assert_eq!(cell_count, 0, "Empty table should have 0 cells cleared");
+
+        let _c = cursor.move_to_root().unwrap();
+        let found_record = run_until_done(|| cursor.next(), &pager).unwrap();
+        assert!(!found_record, "btree should be empty");
+    }
+
+    #[test]
+    pub fn test_clear_btree_single_page_table() {
+        let (pager, root_page, _, _) = empty_btree();
+        let num_columns = 5;
+        let mut cursor = BTreeCursor::new_table(None, pager.clone(), root_page, num_columns);
+
+        // Insert 10 records
+        let num_records = 10;
+        for i in 1..=num_records {
+            let regs = &[Register::Value(Value::Integer(i))];
+            let record = ImmutableRecord::from_registers(regs, regs.len());
+            let key = BTreeKey::new_table_rowid(i, Some(&record));
+            run_until_done(|| cursor.insert(&key, false), &pager).unwrap();
+        }
+
+        let cell_count = run_until_done(|| cursor.clear_btree(), &pager).unwrap();
+        assert_eq!(
+            cell_count, num_records as u64,
+            "Should return number of table leaf cells cleared"
+        );
+
+        let _c = cursor.move_to_root().unwrap();
+        let found_record = run_until_done(|| cursor.next(), &pager).unwrap();
+        assert!(!found_record, "btree should be empty");
+    }
+
+    #[test]
+    pub fn test_clear_btree_multi_page_table() {
+        let (pager, root_page, _, _) = empty_btree();
+        let num_columns = 5;
+        let mut cursor = BTreeCursor::new_table(None, pager.clone(), root_page, num_columns);
+
+        // Insert enough records to create multiple pages (interior + leaf pages)
+        let num_records = 1000;
+        for i in 1..=num_records {
+            let regs = &[Register::Value(Value::Integer(i))];
+            let record = ImmutableRecord::from_registers(regs, regs.len());
+            let key = BTreeKey::new_table_rowid(i, Some(&record));
+            run_until_done(|| cursor.insert(&key, false), &pager).unwrap();
+        }
+
+        let cell_count = run_until_done(|| cursor.clear_btree(), &pager).unwrap();
+        assert_eq!(
+            cell_count, num_records as u64,
+            "Should return number of table leaf cells cleared"
+        );
+
+        let _c = cursor.move_to_root().unwrap();
+        let found_record = run_until_done(|| cursor.next(), &pager).unwrap();
+        assert!(!found_record, "btree should be empty");
+    }
+
+    #[test]
+    pub fn test_clear_btree_with_overflow_pages() {
+        let (pager, root_page, _, _) = empty_btree();
+        let num_columns = 5;
+        let mut cursor = BTreeCursor::new_table(None, pager.clone(), root_page, num_columns);
+
+        // Insert records with large payloads that will create overflow pages
+        let large_size = 8192; // Larger than page size to force overflow
+        let num_records = 5;
+
+        for i in 1..=num_records {
+            let large_blob = vec![b'A' + (i as u8 % 26); large_size];
+            let regs = &[Register::Value(Value::Blob(large_blob))];
+            let record = ImmutableRecord::from_registers(regs, regs.len());
+            let key = BTreeKey::new_table_rowid(i, Some(&record));
+            run_until_done(|| cursor.insert(&key, false), &pager).unwrap();
+        }
+
+        let cell_count = run_until_done(|| cursor.clear_btree(), &pager).unwrap();
+        assert_eq!(
+            cell_count, num_records as u64,
+            "Should return number of table leaf cells cleared"
+        );
+
+        let _c = cursor.move_to_root().unwrap();
+        let found_record = run_until_done(|| cursor.next(), &pager).unwrap();
+        assert!(!found_record, "btree should be empty");
+    }
+
+    #[test]
+    pub fn test_clear_btree_reinsertion_works() {
+        let (pager, root_page, _, _) = empty_btree();
+        let num_columns = 5;
+        let mut cursor = BTreeCursor::new_table(None, pager.clone(), root_page, num_columns);
+
+        // Insert records
+        let num_records = 50;
+        for i in 1..=num_records {
+            let regs = &[Register::Value(Value::Integer(i))];
+            let record = ImmutableRecord::from_registers(regs, regs.len());
+            let key = BTreeKey::new_table_rowid(i, Some(&record));
+            run_until_done(|| cursor.insert(&key, false), &pager).unwrap();
+        }
+
+        // Clear the table
+        let cell_count = run_until_done(|| cursor.clear_btree(), &pager).unwrap();
+        assert_eq!(
+            cell_count, num_records as u64,
+            "Should return number of table leaf cells cleared"
+        );
+
+        // Re-insert records after clearing
+        for i in 1..=num_records {
+            let regs = &[Register::Value(Value::Integer(i * 10))]; // Different values
+            let record = ImmutableRecord::from_registers(regs, regs.len());
+            let key = BTreeKey::new_table_rowid(i, Some(&record));
+            run_until_done(|| cursor.insert(&key, false), &pager).unwrap();
+        }
+
+        let _c = cursor.move_to_root().unwrap();
+        // Verify re-inserted records exist and have correct values
+        for i in 1..=num_records {
+            let exists = run_until_done(|| cursor.next(), &pager).unwrap();
+            assert!(exists, "Re-inserted record {i} should exist");
+
+            let record = run_until_done(|| cursor.record(), &pager).unwrap();
+            let value = record.unwrap().get_value(0).unwrap();
+            assert_eq!(
+                value,
+                RefValue::Integer(i * 10),
+                "Re-inserted record {i} should have correct value",
+            );
+        }
+    }
+
+    #[test]
+    pub fn test_clear_btree_reinsertion_works_large() {
+        let (pager, root_page, _, _) = empty_btree();
+        let num_columns = 1;
+        let mut cursor = BTreeCursor::new_table(None, pager.clone(), root_page, num_columns);
+
+        // Insert initial data, triggering the use of overflow pages
+        let large_blob = vec![b'X'; 10000];
+        let regs = &[Register::Value(Value::Blob(large_blob.clone()))];
+        let record = ImmutableRecord::from_registers(regs, regs.len());
+        let key1 = BTreeKey::new_table_rowid(1, Some(&record));
+        run_until_done(|| cursor.insert(&key1, false), &pager).unwrap();
+
+        // Clear the table
+        run_until_done(|| cursor.clear_btree(), &pager).unwrap();
+
+        // Try to insert new data
+        let key2 = BTreeKey::new_table_rowid(2, Some(&record));
+        run_until_done(|| cursor.insert(&key2, false), &pager).unwrap();
+
+        let _c = cursor.move_to_root().unwrap();
+        let exists = run_until_done(|| cursor.next(), &pager).unwrap();
+        assert!(exists, "Re-inserted record should exist");
+
+        let ret = run_until_done(|| cursor.record(), &pager).unwrap().unwrap();
+        assert_eq!(*ret, record, "Re-inserted record should have correct value",);
+    }
+
+    #[test]
+    pub fn test_clear_btree_cell_count_accuracy() {
+        let (pager, root_page, _, _) = empty_btree();
+        let num_columns = 5;
+        let mut cursor = BTreeCursor::new_table(None, pager.clone(), root_page, num_columns);
+
+        let test_counts = [0, 1, 5, 10, 50, 100, 1000, 5000];
+
+        for &expected_count in &test_counts {
+            for i in 1..=expected_count {
+                let regs = &[Register::Value(Value::Integer(i))];
+                let record = ImmutableRecord::from_registers(regs, regs.len());
+                let key = BTreeKey::new_table_rowid(i, Some(&record));
+                run_until_done(|| cursor.insert(&key, false), &pager).unwrap();
+            }
+
+            let actual_count = run_until_done(|| cursor.clear_btree(), &pager).unwrap();
+            assert_eq!(
+                actual_count, expected_count as u64,
+                "Should return number of table leaf cells cleared"
+            );
+
+            let _c = cursor.move_to_root().unwrap();
+            let has_record = run_until_done(|| cursor.next(), &pager).unwrap();
+            assert!(!has_record, "btree should have no records");
+        }
+    }
+
+    #[test]
+    pub fn test_clear_btree_cell_count_accuracy_for_index() {
+        use crate::storage::pager::CreateBTreeFlags;
+
+        let (pager, _, _, _) = empty_btree();
+        let index_root_page_result = pager.btree_create(&CreateBTreeFlags::new_index()).unwrap();
+        let index_root_page = match index_root_page_result {
+            crate::types::IOResult::Done(id) => id as usize,
+            crate::types::IOResult::IO => {
+                panic!("btree_create returned IO in test, unexpected")
+            }
+        };
+
+        let test_counts = [0, 1, 5, 10, 50, 100, 1000, 5000];
+
+        let num_columns = 1;
+        let index_def = Index {
+            name: "testindex".to_string(),
+            columns: vec![IndexColumn {
+                name: "testcol".to_string(),
+                order: SortOrder::Asc,
+                collation: None,
+                pos_in_table: 0,
+                default: None,
+            }],
+            table_name: "test".to_string(),
+            root_page: index_root_page,
+            unique: false,
+            ephemeral: false,
+            has_rowid: false,
+        };
+        let mut cursor = BTreeCursor::new_index(
+            None,
+            pager.clone(),
+            index_root_page,
+            &index_def,
+            num_columns,
+        );
+
+        for &expected_count in &test_counts {
+            for i in 1..=expected_count {
+                let regs = &[Register::Value(Value::Integer(i))];
+                let record = ImmutableRecord::from_registers(regs, regs.len());
+                run_until_done(
+                    || cursor.insert(&BTreeKey::new_index_key(&record), false),
+                    &pager,
+                )
+                .unwrap();
+            }
+
+            let actual_count = run_until_done(|| cursor.clear_btree(), &pager).unwrap();
+            assert_eq!(
+                actual_count, expected_count as u64,
+                "Should return number of table cells cleared"
+            );
+
+            let _c = cursor.move_to_root().unwrap();
+            let has_record = run_until_done(|| cursor.next(), &pager).unwrap();
+            assert!(!has_record, "btree should have no records");
+        }
+    }
+
+    #[test]
+    pub fn test_clear_btree_cursor_state_after_clear() {
+        let (pager, root_page, _, _) = empty_btree();
+        let num_columns = 5;
+        let mut cursor = BTreeCursor::new_table(None, pager.clone(), root_page, num_columns);
+
+        for i in 1..=10 {
+            let regs = &[Register::Value(Value::Integer(i))];
+            let record = ImmutableRecord::from_registers(regs, regs.len());
+            let key = BTreeKey::new_table_rowid(i, Some(&record));
+            run_until_done(|| cursor.insert(&key, false), &pager).unwrap();
+        }
+
+        let cells_count = run_until_done(|| cursor.clear_btree(), &pager).unwrap();
+        assert_eq!(cells_count, 10);
+
+        let result = run_until_done(|| cursor.seek_to_last(), &pager);
+        match result {
+            Ok(()) => {
+                // If we got here without panicking, the cursor state is correct
+                println!("Successfully sought to last after clear_btree");
+            }
+            Err(e) => {
+                panic!("seek_to_last failed after clear_btree: {e:?}");
+            }
+        }
+
+        // Try to insert new data (this should work)
+        let regs = &[Register::Value(Value::Integer(42))];
+        let record = ImmutableRecord::from_registers(regs, regs.len());
+        let key = BTreeKey::new_table_rowid(42, Some(&record));
+        let result = run_until_done(|| cursor.insert(&key, false), &pager);
+        match result {
+            Ok(()) => {
+                // Success - if we got here without panicking, the cursor state is correct
+                println!("Successfully inserted data after clear_btree");
+            }
+            Err(e) => {
+                panic!("Insert failed after clear_btree: {e:?}");
+            }
+        }
+    }
+
+    #[test]
+    pub fn test_clear_btree_multiple_cursors_stale_references() {
+        let (pager, root_page, _, _) = empty_btree();
+        let num_columns = 5;
+
+        // Create two cursors pointing to the same table
+        let mut cursor1 = BTreeCursor::new_table(None, pager.clone(), root_page, num_columns);
+        let mut cursor2 = BTreeCursor::new_table(None, pager.clone(), root_page, num_columns);
+
+        // Insert some data using cursor1
+        for i in 1..=5 {
+            let regs = &[Register::Value(Value::Integer(i))];
+            let record = ImmutableRecord::from_registers(regs, regs.len());
+            let key = BTreeKey::new_table_rowid(i, Some(&record));
+            run_until_done(|| cursor1.insert(&key, false), &pager).unwrap();
+        }
+
+        // Clear the table using cursor1 - this changes the root page
+        let cells_count = run_until_done(|| cursor1.clear_btree(), &pager).unwrap();
+        assert_eq!(cells_count, 5); // Should count the 5 table leaf cells that were cleared
+
+        // Now test that cursor2 still works correctly after cursor1 cleared the table
+        let _c = cursor2.move_to_root().unwrap();
+        let is_empty = !run_until_done(|| cursor2.next(), &pager).unwrap();
+        assert!(is_empty, "Table should be empty after clear");
+
+        // Test that we can insert new records with cursor2
+        let regs = &[Register::Value(Value::Integer(999))];
+        let record = ImmutableRecord::from_registers(regs, regs.len());
+        let key = BTreeKey::new_table_rowid(999, Some(&record));
+        run_until_done(|| cursor2.insert(&key, false), &pager).unwrap();
+
+        // Verify the insertion worked with cursor1
+        let exists = run_until_done(|| cursor1.exists(&Value::Integer(999)), &pager).unwrap();
+        assert!(
+            exists,
+            "New record should exist after insertion with cursor2"
+        );
     }
 }
