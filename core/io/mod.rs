@@ -82,7 +82,7 @@ impl Default for OpenFlags {
 pub trait IO: Clock + Send + Sync {
     fn open_file(&self, path: &str, flags: OpenFlags, direct: bool) -> Result<Arc<dyn File>>;
 
-    fn run_once(&self) -> Result<()>;
+    fn step(&self) -> Result<()>;
 
     fn wait_for_completion(&self, c: Completion) -> Result<()>;
 

@@ -76,7 +76,7 @@ pub extern "system" fn Java_tech_turso_core_TursoStatement_step<'local>(
                 };
             }
             StepResult::IO => {
-                if let Err(e) = stmt.stmt.run_once() {
+                if let Err(e) = stmt.stmt.step() {
                     set_err_msg_and_throw_exception(&mut env, obj, TURSO_ETC, e.to_string());
                     return to_turso_step_result(&mut env, STEP_RESULT_ID_ERROR, None);
                 }

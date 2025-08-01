@@ -15,7 +15,7 @@ pub trait VfsExtension: Default + Send + Sync {
     const NAME: &'static str;
     type File: VfsFile;
     fn open_file(&self, path: &str, flags: i32, direct: bool) -> ExtResult<Self::File>;
-    fn run_once(&self) -> ExtResult<()> {
+    fn step(&self) -> ExtResult<()> {
         Ok(())
     }
     fn close(&self, _file: Self::File) -> ExtResult<()> {
@@ -57,7 +57,7 @@ pub struct VfsImpl {
     pub lock: VfsLock,
     pub unlock: VfsUnlock,
     pub size: VfsSize,
-    pub run_once: VfsRunOnce,
+    pub step: VfsRunOnce,
     pub current_time: VfsGetCurrentTime,
     pub gen_random_number: VfsGenerateRandomNumber,
     pub truncate: VfsTruncate,

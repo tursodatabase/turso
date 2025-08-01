@@ -253,13 +253,13 @@ impl IO for UnixIO {
     }
 
     #[instrument(err, skip_all, level = Level::TRACE)]
-    fn run_once(&self) -> Result<()> {
+    fn step(&self) -> Result<()> {
         if self.callbacks.is_empty() {
             return Ok(());
         }
 
         self.events.clear();
-        trace!("run_once() waits for events");
+        trace!("step() waits for events");
         self.poller.wait(self.events.as_mut(), None)?;
 
         for event in self.events.iter() {
@@ -385,7 +385,7 @@ impl IO for UnixIO {
 
     fn wait_for_completion(&self, c: Completion) -> Result<()> {
         while !c.is_completed() {
-            self.run_once()?;
+            self.step()?;
         }
         Ok(())
     }

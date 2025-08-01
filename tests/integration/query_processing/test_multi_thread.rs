@@ -22,7 +22,7 @@ fn test_schema_change() {
                 break row;
             }
             Ok(turso_core::StepResult::IO) => {
-                stmt.run_once().unwrap();
+                stmt.step().unwrap();
             }
             _ => panic!("unexpected step result"),
         }
@@ -58,7 +58,7 @@ fn test_create_multiple_connections() -> anyhow::Result<()> {
                                 panic!("unexpected row result");
                             }
                             StepResult::IO => {
-                                stmt.run_once().unwrap();
+                                stmt.step().unwrap();
                             }
                             StepResult::Done => {
                                 tracing::info!("inserted row {}", i);
@@ -91,7 +91,7 @@ fn test_create_multiple_connections() -> anyhow::Result<()> {
                     rows.push(row.get::<i64>(0).unwrap());
                 }
                 StepResult::IO => {
-                    stmt.run_once().unwrap();
+                    stmt.step().unwrap();
                 }
                 StepResult::Done => {
                     break;
@@ -156,7 +156,7 @@ fn test_reader_writer() -> anyhow::Result<()> {
                                 rows.push(x);
                             }
                             StepResult::IO => {
-                                stmt.run_once().unwrap();
+                                stmt.step().unwrap();
                             }
                             StepResult::Done => {
                                 rows.sort();

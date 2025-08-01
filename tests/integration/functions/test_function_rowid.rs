@@ -16,7 +16,7 @@ fn test_last_insert_rowid_basic() -> anyhow::Result<()> {
         loop {
             match rows.step()? {
                 StepResult::IO => {
-                    rows.run_once()?;
+                    rows.step()?;
                 }
                 StepResult::Done => break,
                 _ => unreachable!(),
@@ -36,7 +36,7 @@ fn test_last_insert_rowid_basic() -> anyhow::Result<()> {
                     }
                 }
                 StepResult::IO => {
-                    rows.run_once()?;
+                    rows.step()?;
                 }
                 StepResult::Interrupt => break,
                 StepResult::Done => break,
@@ -50,7 +50,7 @@ fn test_last_insert_rowid_basic() -> anyhow::Result<()> {
         Ok(Some(ref mut rows)) => loop {
             match rows.step()? {
                 StepResult::IO => {
-                    rows.run_once()?;
+                    rows.step()?;
                 }
                 StepResult::Done => break,
                 _ => unreachable!(),
@@ -72,7 +72,7 @@ fn test_last_insert_rowid_basic() -> anyhow::Result<()> {
                     }
                 }
                 StepResult::IO => {
-                    rows.run_once()?;
+                    rows.step()?;
                 }
                 StepResult::Interrupt => break,
                 StepResult::Done => break,
@@ -101,7 +101,7 @@ fn test_integer_primary_key() -> anyhow::Result<()> {
         let mut insert_query = conn.query(query)?.unwrap();
         loop {
             match insert_query.step()? {
-                StepResult::IO => insert_query.run_once()?,
+                StepResult::IO => insert_query.step()?,
                 StepResult::Done => break,
                 _ => unreachable!(),
             }
@@ -117,7 +117,7 @@ fn test_integer_primary_key() -> anyhow::Result<()> {
                     rowids.push(*id);
                 }
             }
-            StepResult::IO => select_query.run_once()?,
+            StepResult::IO => select_query.step()?,
             StepResult::Interrupt | StepResult::Done => break,
             StepResult::Busy => panic!("Database is busy"),
         }

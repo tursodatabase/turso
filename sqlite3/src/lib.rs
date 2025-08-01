@@ -257,7 +257,7 @@ pub unsafe extern "C" fn sqlite3_step(stmt: *mut sqlite3_stmt) -> ffi::c_int {
         if let Ok(result) = stmt.stmt.step() {
             match result {
                 turso_core::StepResult::IO => {
-                    stmt.stmt.run_once().unwrap();
+                    stmt.stmt.step().unwrap();
                     continue;
                 }
                 turso_core::StepResult::Done => return SQLITE_DONE,

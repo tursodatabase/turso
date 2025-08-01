@@ -19,7 +19,7 @@ fn test_statement_reset_bind() -> anyhow::Result<()> {
                     turso_core::Value::Integer(1)
                 );
             }
-            StepResult::IO => stmt.run_once()?,
+            StepResult::IO => stmt.step()?,
             _ => break,
         }
     }
@@ -37,7 +37,7 @@ fn test_statement_reset_bind() -> anyhow::Result<()> {
                     turso_core::Value::Integer(2)
                 );
             }
-            StepResult::IO => stmt.run_once()?,
+            StepResult::IO => stmt.step()?,
             _ => break,
         }
     }
@@ -88,7 +88,7 @@ fn test_statement_bind() -> anyhow::Result<()> {
                 }
             }
             StepResult::IO => {
-                stmt.run_once()?;
+                stmt.step()?;
             }
             StepResult::Interrupt => break,
             StepResult::Done => break,
@@ -125,7 +125,7 @@ fn test_insert_parameter_remap() -> anyhow::Result<()> {
     }
     loop {
         match ins.step()? {
-            StepResult::IO => ins.run_once()?,
+            StepResult::IO => ins.step()?,
             StepResult::Done | StepResult::Interrupt => break,
             StepResult::Busy => panic!("database busy"),
             _ => {}
@@ -150,7 +150,7 @@ fn test_insert_parameter_remap() -> anyhow::Result<()> {
                 // D = 22
                 assert_eq!(row.get::<&Value>(3).unwrap(), &Value::Integer(22));
             }
-            StepResult::IO => sel.run_once()?,
+            StepResult::IO => sel.step()?,
             StepResult::Done | StepResult::Interrupt => break,
             StepResult::Busy => panic!("database busy"),
         }
@@ -196,7 +196,7 @@ fn test_insert_parameter_remap_all_params() -> anyhow::Result<()> {
     // execute the insert (no rows returned)
     loop {
         match ins.step()? {
-            StepResult::IO => ins.run_once()?,
+            StepResult::IO => ins.step()?,
             StepResult::Done | StepResult::Interrupt => break,
             StepResult::Busy => panic!("database busy"),
             _ => {}
@@ -222,7 +222,7 @@ fn test_insert_parameter_remap_all_params() -> anyhow::Result<()> {
                 // D = 999
                 assert_eq!(row.get::<&Value>(3).unwrap(), &Value::Integer(999));
             }
-            StepResult::IO => sel.run_once()?,
+            StepResult::IO => sel.step()?,
             StepResult::Done | StepResult::Interrupt => break,
             StepResult::Busy => panic!("database busy"),
         }
@@ -264,7 +264,7 @@ fn test_insert_parameter_multiple_remap_backwards() -> anyhow::Result<()> {
     // execute the insert (no rows returned)
     loop {
         match ins.step()? {
-            StepResult::IO => ins.run_once()?,
+            StepResult::IO => ins.step()?,
             StepResult::Done | StepResult::Interrupt => break,
             StepResult::Busy => panic!("database busy"),
             _ => {}
@@ -290,7 +290,7 @@ fn test_insert_parameter_multiple_remap_backwards() -> anyhow::Result<()> {
                 // D = 999
                 assert_eq!(row.get::<&Value>(3).unwrap(), &Value::Integer(444));
             }
-            StepResult::IO => sel.run_once()?,
+            StepResult::IO => sel.step()?,
             StepResult::Done | StepResult::Interrupt => break,
             StepResult::Busy => panic!("database busy"),
         }
@@ -331,7 +331,7 @@ fn test_insert_parameter_multiple_no_remap() -> anyhow::Result<()> {
     // execute the insert (no rows returned)
     loop {
         match ins.step()? {
-            StepResult::IO => ins.run_once()?,
+            StepResult::IO => ins.step()?,
             StepResult::Done | StepResult::Interrupt => break,
             StepResult::Busy => panic!("database busy"),
             _ => {}
@@ -357,7 +357,7 @@ fn test_insert_parameter_multiple_no_remap() -> anyhow::Result<()> {
                 // D = 999
                 assert_eq!(row.get::<&Value>(3).unwrap(), &Value::Integer(444));
             }
-            StepResult::IO => sel.run_once()?,
+            StepResult::IO => sel.step()?,
             StepResult::Done | StepResult::Interrupt => break,
             StepResult::Busy => panic!("database busy"),
         }
@@ -402,7 +402,7 @@ fn test_insert_parameter_multiple_row() -> anyhow::Result<()> {
     // execute the insert (no rows returned)
     loop {
         match ins.step()? {
-            StepResult::IO => ins.run_once()?,
+            StepResult::IO => ins.step()?,
             StepResult::Done | StepResult::Interrupt => break,
             StepResult::Busy => panic!("database busy"),
             _ => {}
@@ -434,7 +434,7 @@ fn test_insert_parameter_multiple_row() -> anyhow::Result<()> {
                 );
                 i += 1;
             }
-            StepResult::IO => sel.run_once()?,
+            StepResult::IO => sel.step()?,
             StepResult::Done | StepResult::Interrupt => break,
             StepResult::Busy => panic!("database busy"),
         }
@@ -450,7 +450,7 @@ fn test_bind_parameters_update_query() -> anyhow::Result<()> {
     let mut ins = conn.prepare("insert into test (a, b) values (3, 'test1');")?;
     loop {
         match ins.step()? {
-            StepResult::IO => ins.run_once()?,
+            StepResult::IO => ins.step()?,
             StepResult::Done | StepResult::Interrupt => break,
             StepResult::Busy => panic!("database busy"),
             _ => {}
@@ -461,7 +461,7 @@ fn test_bind_parameters_update_query() -> anyhow::Result<()> {
     ins.bind_at(2.try_into()?, Value::build_text("test1"));
     loop {
         match ins.step()? {
-            StepResult::IO => ins.run_once()?,
+            StepResult::IO => ins.step()?,
             StepResult::Done | StepResult::Interrupt => break,
             StepResult::Busy => panic!("database busy"),
             _ => {}
@@ -476,7 +476,7 @@ fn test_bind_parameters_update_query() -> anyhow::Result<()> {
                 assert_eq!(row.get::<&Value>(0).unwrap(), &Value::Integer(222));
                 assert_eq!(row.get::<&Value>(1).unwrap(), &Value::build_text("test1"),);
             }
-            StepResult::IO => sel.run_once()?,
+            StepResult::IO => sel.step()?,
             StepResult::Done | StepResult::Interrupt => break,
             StepResult::Busy => panic!("database busy"),
         }
@@ -495,7 +495,7 @@ fn test_bind_parameters_update_query_multiple_where() -> anyhow::Result<()> {
     let mut ins = conn.prepare("insert into test (a, b, c, d) values (3, 'test1', 4, 5);")?;
     loop {
         match ins.step()? {
-            StepResult::IO => ins.run_once()?,
+            StepResult::IO => ins.step()?,
             StepResult::Done | StepResult::Interrupt => break,
             StepResult::Busy => panic!("database busy"),
             _ => {}
@@ -507,7 +507,7 @@ fn test_bind_parameters_update_query_multiple_where() -> anyhow::Result<()> {
     ins.bind_at(3.try_into()?, Value::Integer(5));
     loop {
         match ins.step()? {
-            StepResult::IO => ins.run_once()?,
+            StepResult::IO => ins.step()?,
             StepResult::Done | StepResult::Interrupt => break,
             StepResult::Busy => panic!("database busy"),
             _ => {}
@@ -524,7 +524,7 @@ fn test_bind_parameters_update_query_multiple_where() -> anyhow::Result<()> {
                 assert_eq!(row.get::<&Value>(2).unwrap(), &Value::Integer(4));
                 assert_eq!(row.get::<&Value>(3).unwrap(), &Value::Integer(5));
             }
-            StepResult::IO => sel.run_once()?,
+            StepResult::IO => sel.step()?,
             StepResult::Done | StepResult::Interrupt => break,
             StepResult::Busy => panic!("database busy"),
         }
@@ -543,7 +543,7 @@ fn test_bind_parameters_update_rowid_alias() -> anyhow::Result<()> {
     let mut ins = conn.prepare("insert into test (id, name) values (1, 'test');")?;
     loop {
         match ins.step()? {
-            StepResult::IO => ins.run_once()?,
+            StepResult::IO => ins.step()?,
             StepResult::Done | StepResult::Interrupt => break,
             StepResult::Busy => panic!("database busy"),
             _ => {}
@@ -558,7 +558,7 @@ fn test_bind_parameters_update_rowid_alias() -> anyhow::Result<()> {
                 assert_eq!(row.get::<&Value>(0).unwrap(), &Value::Integer(1));
                 assert_eq!(row.get::<&Value>(1).unwrap(), &Value::build_text("test"),);
             }
-            StepResult::IO => sel.run_once()?,
+            StepResult::IO => sel.step()?,
             StepResult::Done | StepResult::Interrupt => break,
             StepResult::Busy => panic!("database busy"),
         }
@@ -568,7 +568,7 @@ fn test_bind_parameters_update_rowid_alias() -> anyhow::Result<()> {
     ins.bind_at(2.try_into()?, Value::Integer(1));
     loop {
         match ins.step()? {
-            StepResult::IO => ins.run_once()?,
+            StepResult::IO => ins.step()?,
             StepResult::Done | StepResult::Interrupt => break,
             StepResult::Busy => panic!("database busy"),
             _ => {}
@@ -583,7 +583,7 @@ fn test_bind_parameters_update_rowid_alias() -> anyhow::Result<()> {
                 assert_eq!(row.get::<&Value>(0).unwrap(), &Value::Integer(1));
                 assert_eq!(row.get::<&Value>(1).unwrap(), &Value::build_text("updated"),);
             }
-            StepResult::IO => sel.run_once()?,
+            StepResult::IO => sel.step()?,
             StepResult::Done | StepResult::Interrupt => break,
             StepResult::Busy => panic!("database busy"),
         }
@@ -618,7 +618,7 @@ fn test_bind_parameters_update_rowid_alias_seek_rowid() -> anyhow::Result<()> {
                     &Value::Integer(if i == 0 { 4 } else { 11 })
                 );
             }
-            StepResult::IO => sel.run_once()?,
+            StepResult::IO => sel.step()?,
             StepResult::Done | StepResult::Interrupt => break,
             StepResult::Busy => panic!("database busy"),
         }
@@ -631,7 +631,7 @@ fn test_bind_parameters_update_rowid_alias_seek_rowid() -> anyhow::Result<()> {
     ins.bind_at(4.try_into()?, Value::Integer(5));
     loop {
         match ins.step()? {
-            StepResult::IO => ins.run_once()?,
+            StepResult::IO => ins.step()?,
             StepResult::Done | StepResult::Interrupt => break,
             StepResult::Busy => panic!("database busy"),
             _ => {}
@@ -649,7 +649,7 @@ fn test_bind_parameters_update_rowid_alias_seek_rowid() -> anyhow::Result<()> {
                     &Value::build_text(if i == 0 { "updated" } else { "test" }),
                 );
             }
-            StepResult::IO => sel.run_once()?,
+            StepResult::IO => sel.step()?,
             StepResult::Done | StepResult::Interrupt => break,
             StepResult::Busy => panic!("database busy"),
         }
@@ -678,7 +678,7 @@ fn test_bind_parameters_delete_rowid_alias_seek_out_of_order() -> anyhow::Result
     ins.bind_at(4.try_into()?, Value::build_text("test"));
     loop {
         match ins.step()? {
-            StepResult::IO => ins.run_once()?,
+            StepResult::IO => ins.step()?,
             StepResult::Done | StepResult::Interrupt => break,
             StepResult::Busy => panic!("database busy"),
             _ => {}
@@ -693,7 +693,7 @@ fn test_bind_parameters_delete_rowid_alias_seek_out_of_order() -> anyhow::Result
                 let row = sel.row().unwrap();
                 assert_eq!(row.get::<&Value>(0).unwrap(), &Value::build_text("correct"),);
             }
-            StepResult::IO => sel.run_once()?,
+            StepResult::IO => sel.step()?,
             StepResult::Done | StepResult::Interrupt => break,
             StepResult::Busy => panic!("database busy"),
         }

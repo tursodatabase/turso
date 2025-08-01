@@ -621,7 +621,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 }
                 Ok(crate::types::IOResult::IO) => {
                     // FIXME: this is a hack to make the pager run the IO loop
-                    pager.io.run_once().unwrap();
+                    pager.io.step().unwrap();
                     continue;
                 }
                 Err(e) => {
@@ -917,7 +917,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             {
                 Ok(IOResult::Done(())) => break,
                 Ok(IOResult::IO) => {
-                    pager.io.run_once().unwrap();
+                    pager.io.step().unwrap();
                     continue;
                 }
                 Err(e) => {
@@ -975,7 +975,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             {
                 IOResult::Done(()) => break,
                 IOResult::IO => {
-                    pager.io.run_once().unwrap();
+                    pager.io.step().unwrap();
                     continue;
                 }
             }
@@ -988,7 +988,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 IOResult::Done(Some(row_id)) => row_id,
                 IOResult::Done(None) => break,
                 IOResult::IO => {
-                    pager.io.run_once().unwrap();
+                    pager.io.step().unwrap();
                     continue;
                 }
             };

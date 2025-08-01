@@ -376,7 +376,7 @@ pub fn derive_vtab_module(input: TokenStream) -> TokenStream {
 ///        Ok(TestFile { file })
 ///    }
 ///
-///    fn run_once(&self) -> Result<()> {
+///    fn step(&self) -> Result<()> {
 ///    // (optional) method to cycle/advance IO, if your extension is asynchronous
 ///        Ok(())
 ///    }

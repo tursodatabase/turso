@@ -452,7 +452,7 @@ fn bench(criterion: &mut Criterion) {
                     match stmt.step().unwrap() {
                         turso_core::StepResult::Row => {}
                         turso_core::StepResult::IO => {
-                            stmt.run_once().unwrap();
+                            stmt.step().unwrap();
                         }
                         turso_core::StepResult::Done => {
                             break;
@@ -610,7 +610,7 @@ fn bench_sequential_jsonb(criterion: &mut Criterion) {
                 match stmt.step().unwrap() {
                     turso_core::StepResult::Row => {}
                     turso_core::StepResult::IO => {
-                        stmt.run_once().unwrap();
+                        stmt.step().unwrap();
                     }
                     turso_core::StepResult::Done => {
                         break;
@@ -902,7 +902,7 @@ fn bench_json_patch(criterion: &mut Criterion) {
                     match stmt.step().unwrap() {
                         turso_core::StepResult::Row => {}
                         turso_core::StepResult::IO => {
-                            stmt.run_once().unwrap();
+                            stmt.step().unwrap();
                         }
                         turso_core::StepResult::Done => {
                             break;

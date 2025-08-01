@@ -418,13 +418,13 @@ impl IO for UringIO {
 
     fn wait_for_completion(&self, c: Completion) -> Result<()> {
         while !c.is_completed() {
-            self.run_once()?;
+            self.step()?;
         }
         Ok(())
     }
 
-    fn run_once(&self) -> Result<()> {
-        trace!("run_once()");
+    fn step(&self) -> Result<()> {
+        trace!("step()");
         let mut inner = self.inner.borrow_mut();
         let ring = &mut inner.ring;
         if ring.empty() {

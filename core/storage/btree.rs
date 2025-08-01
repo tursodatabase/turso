@@ -3181,7 +3181,7 @@ impl BTreeCursor {
                         let mut page = self.allocate_page(page_type, 0)?;
                         // FIXME: add new state machine state instead of this sync IO hack
                         while matches!(page, IOResult::IO) {
-                            self.pager.io.run_once()?;
+                            self.pager.io.step()?;
                             page = self.allocate_page(page_type, 0)?;
                         }
                         let IOResult::Done(page) = page else {
@@ -4085,7 +4085,7 @@ impl BTreeCursor {
                 BtreePageAllocMode::Any,
             )? {
                 IOResult::IO => {
-                    self.pager.io.run_once()?;
+                    self.pager.io.step()?;
                 }
                 IOResult::Done(page) => break page,
             }
@@ -7204,7 +7204,7 @@ mod tests {
         let cursor = BTreeCursor::new_table(None, pager.clone(), page_idx, num_columns);
         let (page, _c) = cursor.read_page(page_idx).unwrap();
         while page.get().is_locked() {
-            pager.io.run_once().unwrap();
+            pager.io.step().unwrap();
         }
         let page = page.get();
         // Pin page in order to not drop it in between
@@ -7224,7 +7224,7 @@ mod tests {
                 }) => {
                     let (child_page, _c) = cursor.read_page(left_child_page as usize).unwrap();
                     while child_page.get().is_locked() {
-                        pager.io.run_once().unwrap();
+                        pager.io.step().unwrap();
                     }
                     child_pages.push(child_page);
                     if left_child_page == page.get().id as u32 {
@@ -7283,7 +7283,7 @@ mod tests {
                 p.page.replace(new_page);
             }
             while p.get().is_locked() {
-                pager.io.run_once().unwrap();
+                pager.io.step().unwrap();
             }
             p.get().get_contents().page_type()
         });
@@ -7294,7 +7294,7 @@ mod tests {
                     page.page.replace(new_page);
                 }
                 while page.get().is_locked() {
-                    pager.io.run_once().unwrap();
+                    pager.io.step().unwrap();
                 }
                 if page.get().get_contents().page_type() != child_type {
                     tracing::error!("child pages have different types");
@@ -7315,7 +7315,7 @@ mod tests {
         let cursor = BTreeCursor::new_table(None, pager.clone(), page_idx, num_columns);
         let (page, _c) = cursor.read_page(page_idx).unwrap();
         while page.get().is_locked() {
-            pager.io.run_once().unwrap();
+            pager.io.step().unwrap();
         }
         let page = page.get();
         // Pin page in order to not drop it in between loading of different pages. If not contents will be a dangling reference.
@@ -7675,7 +7675,7 @@ mod tests {
                     match pager.end_tx(false, false, &conn, false).unwrap() {
                         IOResult::Done(_) => break,
                         IOResult::IO => {
-                            pager.io.run_once().unwrap();
+                            pager.io.step().unwrap();
                         }
                     }
                 }
@@ -7833,7 +7833,7 @@ mod tests {
                     match pager.end_tx(false, false, &conn, false).unwrap() {
                         IOResult::Done(_) => break,
                         IOResult::IO => {
-                            pager.io.run_once().unwrap();
+                            pager.io.step().unwrap();
                         }
                     }
                 }
@@ -8051,7 +8051,7 @@ mod tests {
                     match pager.end_tx(false, false, &conn, false).unwrap() {
                         IOResult::Done(_) => break,
                         IOResult::IO => {
-                            pager.io.run_once().unwrap();
+                            pager.io.step().unwrap();
                         }
                     }
                 }
@@ -8332,7 +8332,7 @@ mod tests {
             .unwrap(),
         );
 
-        pager.io.run_once().unwrap();
+        pager.io.step().unwrap();
 
         let _ = run_until_done(|| pager.allocate_page1(), &pager);
         for _ in 0..(database_size - 1) {
@@ -8379,11 +8379,11 @@ mod tests {
             let _c = pager
                 .db_file
                 .write_page(current_page as usize, buf.clone(), c)?;
-            pager.io.run_once()?;
+            pager.io.step()?;
 
             let (page, _c) = cursor.read_page(current_page as usize)?;
             while page.get().is_locked() {
-                cursor.pager.io.run_once()?;
+                cursor.pager.io.step()?;
             }
 
             {
@@ -8403,7 +8403,7 @@ mod tests {
 
             current_page += 1;
         }
-        pager.io.run_once()?;
+        pager.io.step()?;
 
         // Create leaf cell pointing to start of overflow chain
         let leaf_cell = BTreeCell::TableLeafCell(TableLeafCell {
@@ -8461,7 +8461,7 @@ mod tests {
                 }
             }
             IOResult::IO => {
-                cursor.pager.io.run_once()?;
+                cursor.pager.io.step()?;
             }
         }
 
@@ -8516,7 +8516,7 @@ mod tests {
                 );
             }
             IOResult::IO => {
-                cursor.pager.io.run_once()?;
+                cursor.pager.io.step()?;
             }
         }
 

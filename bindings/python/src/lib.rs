@@ -109,7 +109,7 @@ impl Cursor {
                 .step()
                 .map_err(|e| PyErr::new::<OperationalError, _>(format!("Step error: {e:?}")))?
             {
-                stmt.run_once()
+                stmt.step()
                     .map_err(|e| PyErr::new::<OperationalError, _>(format!("IO error: {e:?}")))?;
             }
         }
@@ -139,7 +139,7 @@ impl Cursor {
                         return Ok(Some(py_row));
                     }
                     turso_core::StepResult::IO => {
-                        stmt.run_once().map_err(|e| {
+                        stmt.step().map_err(|e| {
                             PyErr::new::<OperationalError, _>(format!("IO error: {e:?}"))
                         })?;
                     }
@@ -176,7 +176,7 @@ impl Cursor {
                         results.push(py_row);
                     }
                     turso_core::StepResult::IO => {
-                        stmt.run_once().map_err(|e| {
+                        stmt.step().map_err(|e| {
                             PyErr::new::<OperationalError, _>(format!("IO error: {e:?}"))
                         })?;
                     }

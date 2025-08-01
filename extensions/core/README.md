@@ -344,7 +344,7 @@ impl VfsExtension for ExampleFS {
         Ok(TestFile { file })
     }
 
-    fn run_once(&self) -> Result<()> {
+    fn step(&self) -> Result<()> {
     // (optional) method to cycle/advance IO, if your extension is asynchronous
         Ok(())
     }

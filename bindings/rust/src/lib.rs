@@ -381,7 +381,7 @@ impl Statement {
                     return Ok(changes as u64);
                 }
                 Ok(turso_core::StepResult::IO) => {
-                    stmt.run_once()?;
+                    stmt.step()?;
                 }
                 Ok(turso_core::StepResult::Busy) => {
                     return Err(Error::SqlExecutionFailure("database is locked".to_string()));
@@ -486,7 +486,7 @@ impl Rows {
                 }
                 turso_core::StepResult::Done => return Ok(None),
                 turso_core::StepResult::IO => {
-                    if let Err(e) = stmt.run_once() {
+                    if let Err(e) = stmt.step() {
                         return Err(e.into());
                     }
                     continue;

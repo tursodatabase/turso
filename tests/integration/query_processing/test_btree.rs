@@ -435,7 +435,7 @@ fn write_at(io: &impl IO, file: Arc<dyn File>, offset: usize, data: &[u8]) {
     let buffer = Arc::new(RefCell::new(Buffer::new(Pin::new(data.to_vec()), drop_fn)));
     let result = file.pwrite(offset, buffer, completion).unwrap();
     while !result.is_completed() {
-        io.run_once().unwrap();
+        io.step().unwrap();
     }
 }
 

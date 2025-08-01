@@ -97,7 +97,7 @@ fn bench_tpc_h_queries(criterion: &mut Criterion) {
                                 black_box(stmt.row());
                             }
                             turso_core::StepResult::IO => {
-                                stmt.run_once().unwrap();
+                                stmt.step().unwrap();
                             }
                             turso_core::StepResult::Done => {
                                 break;

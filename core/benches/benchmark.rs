@@ -129,7 +129,7 @@ fn bench_execute_select_rows(criterion: &mut Criterion) {
                                 black_box(stmt.row());
                             }
                             turso_core::StepResult::IO => {
-                                stmt.run_once().unwrap();
+                                stmt.step().unwrap();
                             }
                             turso_core::StepResult::Done => {
                                 break;
@@ -190,7 +190,7 @@ fn bench_execute_select_1(criterion: &mut Criterion) {
                         black_box(stmt.row());
                     }
                     turso_core::StepResult::IO => {
-                        stmt.run_once().unwrap();
+                        stmt.step().unwrap();
                     }
                     turso_core::StepResult::Done => {
                         break;
@@ -242,7 +242,7 @@ fn bench_execute_select_count(criterion: &mut Criterion) {
                         black_box(stmt.row());
                     }
                     turso_core::StepResult::IO => {
-                        stmt.run_once().unwrap();
+                        stmt.step().unwrap();
                     }
                     turso_core::StepResult::Done => {
                         break;
@@ -297,7 +297,7 @@ fn bench_insert_rows(criterion: &mut Criterion) {
         loop {
             match stmt.step().unwrap() {
                 turso_core::StepResult::IO => {
-                    stmt.run_once().unwrap();
+                    stmt.step().unwrap();
                 }
                 turso_core::StepResult::Done => {
                     break;
@@ -324,7 +324,7 @@ fn bench_insert_rows(criterion: &mut Criterion) {
                 loop {
                     match stmt.step().unwrap() {
                         turso_core::StepResult::IO => {
-                            stmt.run_once().unwrap();
+                            stmt.step().unwrap();
                         }
                         turso_core::StepResult::Done => {
                             break;

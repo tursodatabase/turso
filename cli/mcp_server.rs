@@ -358,7 +358,7 @@ impl TursoMcpServer {
                             }
                         }
                         Ok(StepResult::IO) => {
-                            if rows.run_once().is_err() {
+                            if rows.step().is_err() {
                                 break;
                             }
                         }
@@ -445,7 +445,7 @@ impl TursoMcpServer {
                             }
                         }
                         Ok(StepResult::IO) => {
-                            if rows.run_once().is_err() {
+                            if rows.step().is_err() {
                                 break;
                             }
                         }
@@ -509,7 +509,7 @@ impl TursoMcpServer {
                             results.push(row_data);
                         }
                         Ok(StepResult::IO) => {
-                            if rows.run_once().is_err() {
+                            if rows.step().is_err() {
                                 break;
                             }
                         }

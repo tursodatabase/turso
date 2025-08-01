@@ -469,7 +469,7 @@ impl Interaction {
                         out.push(r);
                     }
                     StepResult::IO => {
-                        rows.run_once().unwrap();
+                        rows.step().unwrap();
                     }
                     StepResult::Interrupt => {}
                     StepResult::Done => {
@@ -606,7 +606,7 @@ impl Interaction {
                         if syncing {
                             reopen_database(env);
                         } else {
-                            rows.run_once().unwrap();
+                            rows.step().unwrap();
                         }
                     }
                     StepResult::Done => {
@@ -671,7 +671,7 @@ impl Interaction {
                         out.push(r);
                     }
                     StepResult::IO => {
-                        rows.run_once()?;
+                        rows.step()?;
                         current_prob += incr;
                         if current_prob > 1.0 {
                             current_prob = 1.0;

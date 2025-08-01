@@ -44,7 +44,7 @@ fn test_simple_overflow_page() -> anyhow::Result<()> {
         Ok(Some(ref mut rows)) => loop {
             match rows.step()? {
                 StepResult::IO => {
-                    rows.run_once()?;
+                    rows.step()?;
                 }
                 StepResult::Done => break,
                 _ => unreachable!(),
@@ -70,7 +70,7 @@ fn test_simple_overflow_page() -> anyhow::Result<()> {
                     compare_string(&huge_text, text);
                 }
                 StepResult::IO => {
-                    rows.run_once()?;
+                    rows.step()?;
                 }
                 StepResult::Interrupt => break,
                 StepResult::Done => break,
@@ -112,7 +112,7 @@ fn test_sequential_overflow_page() -> anyhow::Result<()> {
             Ok(Some(ref mut rows)) => loop {
                 match rows.step()? {
                     StepResult::IO => {
-                        rows.run_once()?;
+                        rows.step()?;
                     }
                     StepResult::Done => break,
                     _ => unreachable!(),
@@ -140,7 +140,7 @@ fn test_sequential_overflow_page() -> anyhow::Result<()> {
                     current_index += 1;
                 }
                 StepResult::IO => {
-                    rows.run_once()?;
+                    rows.step()?;
                 }
                 StepResult::Interrupt => break,
                 StepResult::Done => break,
@@ -249,7 +249,7 @@ fn test_statement_reset() -> anyhow::Result<()> {
                 );
                 break;
             }
-            StepResult::IO => stmt.run_once()?,
+            StepResult::IO => stmt.step()?,
             _ => break,
         }
     }
@@ -266,7 +266,7 @@ fn test_statement_reset() -> anyhow::Result<()> {
                 );
                 break;
             }
-            StepResult::IO => stmt.run_once()?,
+            StepResult::IO => stmt.step()?,
             _ => break,
         }
     }
@@ -315,7 +315,7 @@ fn test_wal_restart() -> anyhow::Result<()> {
         let insert_query = format!("INSERT INTO test VALUES ({i})");
         run_query(tmp_db, conn, &insert_query)?;
         debug!("inserted {i}");
-        tmp_db.io.run_once()?;
+        tmp_db.io.step()?;
         Ok(())
     }
 
@@ -791,7 +791,7 @@ pub fn run_query_core(
         loop {
             match rows.step()? {
                 StepResult::IO => {
-                    rows.run_once()?;
+                    rows.step()?;
                 }
                 StepResult::Done => break,
                 StepResult::Row => {

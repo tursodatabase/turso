@@ -1349,7 +1349,7 @@ impl Pager {
                 //         "Failed to fsync WAL before final checkpoint, fd likely closed".into(),
                 //     ));
                 // }
-                self.io.run_once()?;
+                self.io.step()?;
                 _attempts += 1;
             }
         }
@@ -2202,7 +2202,7 @@ mod ptrmap_tests {
                 IOResult::Done(res) => {
                     return Ok(res);
                 }
-                IOResult::IO => pager.io.run_once().unwrap(),
+                IOResult::IO => pager.io.step().unwrap(),
             }
         }
     }

@@ -46,7 +46,7 @@ fn test_wal_1_writer_1_reader() -> Result<()> {
                 match rows.step().unwrap() {
                     StepResult::Row => {}
                     StepResult::IO => {
-                        rows.run_once().unwrap();
+                        rows.step().unwrap();
                     }
                     StepResult::Interrupt => break,
                     StepResult::Done => break,
@@ -86,7 +86,7 @@ fn test_wal_1_writer_1_reader() -> Result<()> {
                             i += 1;
                         }
                         StepResult::IO => {
-                            rows.run_once().unwrap();
+                            rows.step().unwrap();
                         }
                         StepResult::Interrupt => break,
                         StepResult::Done => break,
@@ -126,8 +126,8 @@ pub(crate) fn execute_and_get_strings(conn: &Arc<Connection>, sql: &str) -> Resu
             }
             StepResult::Done => break,
             StepResult::Interrupt => break,
-            StepResult::IO => stmt.run_once()?,
-            StepResult::Busy => stmt.run_once()?,
+            StepResult::IO => stmt.step()?,
+            StepResult::Busy => stmt.step()?,
         }
     }
     Ok(result)
@@ -158,8 +158,8 @@ pub(crate) fn execute_and_get_ints(conn: &Arc<Connection>, sql: &str) -> Result<
             }
             StepResult::Done => break,
             StepResult::Interrupt => break,
-            StepResult::IO => stmt.run_once()?,
-            StepResult::Busy => stmt.run_once()?,
+            StepResult::IO => stmt.step()?,
+            StepResult::Busy => stmt.step()?,
         }
     }
     Ok(result)

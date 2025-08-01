@@ -23,7 +23,7 @@ impl<I: ?Sized + IO> IOExt for I {
         Ok(loop {
             match f()? {
                 IOResult::Done(v) => break v,
-                IOResult::IO => self.run_once()?,
+                IOResult::IO => self.step()?,
             }
         })
     }
@@ -147,7 +147,7 @@ pub fn parse_schema_rows(
             StepResult::IO => {
                 // TODO: How do we ensure that the I/O we submitted to
                 // read the schema is actually complete?
-                rows.run_once()?;
+                rows.step()?;
             }
             StepResult::Interrupt => break,
             StepResult::Done => break,

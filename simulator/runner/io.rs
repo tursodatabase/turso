@@ -17,7 +17,7 @@ pub(crate) struct SimulatorIO {
     pub(crate) fault: Cell<bool>,
     pub(crate) files: RefCell<Vec<Arc<SimulatorFile>>>,
     pub(crate) rng: RefCell<ChaCha8Rng>,
-    pub(crate) nr_run_once_faults: Cell<usize>,
+    pub(crate) nr_step_faults: Cell<usize>,
     pub(crate) page_size: usize,
     seed: u64,
     latency_probability: usize,
@@ -39,7 +39,7 @@ impl SimulatorIO {
         let fault = Cell::new(false);
         let files = RefCell::new(Vec::new());
         let rng = RefCell::new(ChaCha8Rng::seed_from_u64(seed));
-        let nr_run_once_faults = Cell::new(0);
+        let nr_step_faults = Cell::new(0);
         let clock = SimulatorClock::new(ChaCha8Rng::seed_from_u64(seed), min_tick, max_tick);
 
         Ok(Self {
@@ -47,7 +47,7 @@ impl SimulatorIO {
             fault,
             files,
             rng,
-            nr_run_once_faults,
+            nr_step_faults,
             page_size,
             seed,
             latency_probability,
@@ -63,7 +63,7 @@ impl SimulatorIO {
     }
 
     pub(crate) fn print_stats(&self) {
-        tracing::info!("run_once faults: {}", self.nr_run_once_faults.get());
+        tracing::info!("step faults: {}", self.nr_step_faults.get());
         for file in self.files.borrow().iter() {
             tracing::info!("\n===========================\n{}", file.stats_table());
         }
@@ -106,15 +106,15 @@ impl IO for SimulatorIO {
 
     fn wait_for_completion(&self, c: turso_core::Completion) -> Result<()> {
         while !c.is_completed() {
-            self.run_once()?;
+            self.step()?;
         }
         Ok(())
     }
 
-    fn run_once(&self) -> Result<()> {
+    fn step(&self) -> Result<()> {
         if self.fault.get() {
-            self.nr_run_once_faults
-                .replace(self.nr_run_once_faults.get() + 1);
+            self.nr_step_faults
+                .replace(self.nr_step_faults.get() + 1);
             return Err(turso_core::LimboError::InternalError(
                 FAULT_ERROR_MSG.into(),
             ));
@@ -123,7 +123,7 @@ impl IO for SimulatorIO {
         for file in self.files.borrow().iter() {
             file.run_queued_io(now)?;
         }
-        self.inner.run_once()?;
+        self.inner.step()?;
         Ok(())
     }
 

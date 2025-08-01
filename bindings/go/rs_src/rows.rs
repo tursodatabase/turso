@@ -55,7 +55,7 @@ pub extern "C" fn rows_next(ctx: *mut c_void) -> ResultCode {
         Ok(StepResult::Row) => ResultCode::Row,
         Ok(StepResult::Done) => ResultCode::Done,
         Ok(StepResult::IO) => {
-            let res = ctx.stmt.run_once();
+            let res = ctx.stmt.step();
             if res.is_err() {
                 ResultCode::Error
             } else {

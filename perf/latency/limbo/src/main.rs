@@ -75,7 +75,7 @@ fn main() {
                 }
             }
         }
-        io.run_once().unwrap();
+        io.step().unwrap();
     }
     hist.refresh();
     println!("count,p50,p90,p95,p99,p999,p9999,p99999");

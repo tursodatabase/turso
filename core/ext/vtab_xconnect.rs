@@ -65,7 +65,7 @@ pub unsafe extern "C" fn execute(
                         return ResultCode::OK;
                     }
                     Ok(StepResult::IO) => {
-                        let res = stmt.run_once();
+                        let res = stmt.step();
                         if res.is_err() {
                             return ResultCode::Error;
                         }
@@ -147,7 +147,7 @@ pub unsafe extern "C" fn stmt_bind_args_fn(ctx: *mut Stmt, idx: i32, arg: ExtVal
 
 /// Wraps the functionality of the core Statement::step function,
 /// preferring to handle the IO step result internally to prevent having to expose
-/// run_once. Returns the equivalent ResultCode which then maps to an external StepResult.
+/// step. Returns the equivalent ResultCode which then maps to an external StepResult.
 pub unsafe extern "C" fn stmt_step(stmt: *mut Stmt) -> ResultCode {
     let Ok(stmt) = Stmt::from_ptr(stmt) else {
         tracing::error!("stmt_step: failed to convert stmt to Stmt");
@@ -164,7 +164,7 @@ pub unsafe extern "C" fn stmt_step(stmt: *mut Stmt) -> ResultCode {
             StepResult::Done => return ResultCode::EOF,
             StepResult::IO => {
                 // always handle IO step result internally.
-                let res = stmt_ctx.run_once();
+                let res = stmt_ctx.step();
                 if res.is_err() {
                     return ResultCode::Error;
                 }

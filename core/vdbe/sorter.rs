@@ -636,7 +636,7 @@ mod tests {
 
             loop {
                 if let IOResult::IO = sorter.sort().expect("Failed to sort the records") {
-                    io.run_once().expect("Failed to run the IO");
+                    io.step().expect("Failed to run the IO");
                     continue;
                 }
                 break;
@@ -654,7 +654,7 @@ mod tests {
 
                 loop {
                     if let IOResult::IO = sorter.next().expect("Failed to get the next record") {
-                        io.run_once().expect("Failed to run the IO");
+                        io.step().expect("Failed to run the IO");
                         continue;
                     }
                     break;
