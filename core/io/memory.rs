@@ -48,14 +48,14 @@ impl IO for MemoryIO {
         }))
     }
 
-    fn run_once(&self) -> Result<()> {
+    fn step(&self) -> Result<()> {
         // nop
         Ok(())
     }
 
     fn wait_for_completion(&self, c: Completion) -> Result<()> {
         while !c.is_completed() {
-            self.run_once()?;
+            self.step()?;
         }
         Ok(())
     }

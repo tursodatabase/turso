@@ -118,7 +118,7 @@ pub(crate) fn do_flush(conn: &Arc<Connection>, tmp_db: &TempDatabase) -> anyhow:
                 break;
             }
             IOResult::IO => {
-                tmp_db.io.run_once()?;
+                tmp_db.io.step()?;
             }
         }
     }
@@ -197,7 +197,7 @@ pub(crate) fn limbo_exec_rows(
                     break row;
                 }
                 turso_core::StepResult::IO => {
-                    stmt.run_once().unwrap();
+                    stmt.step().unwrap();
                     continue;
                 }
 
@@ -230,7 +230,7 @@ pub(crate) fn limbo_exec_rows_error(
         let result = stmt.step()?;
         match result {
             turso_core::StepResult::IO => {
-                stmt.run_once()?;
+                stmt.step()?;
                 continue;
             }
             turso_core::StepResult::Done => return Ok(()),
@@ -415,7 +415,7 @@ mod tests {
         let _ = limbo_exec_rows(&db, &conn1, "BEGIN");
         let _ = limbo_exec_rows(&db, &conn1, "INSERT INTO t VALUES (42)");
         while matches!(conn1.cacheflush().unwrap(), IOResult::IO) {
-            db.io.run_once().unwrap();
+            db.io.step().unwrap();
         }
 
         // Second connection should not see uncommitted changes
@@ -484,7 +484,7 @@ mod tests {
         let _ = limbo_exec_rows(&db, &conn, "BEGIN");
         let _ = limbo_exec_rows(&db, &conn, "INSERT INTO t VALUES (42)");
         while matches!(conn.cacheflush().unwrap(), IOResult::IO) {
-            db.io.run_once().unwrap();
+            db.io.step().unwrap();
         }
 
         // Rollback the transaction
@@ -528,7 +528,7 @@ mod tests {
 
         // Flush to WAL but don't commit
         while matches!(conn.cacheflush().unwrap(), IOResult::IO) {
-            db.io.run_once().unwrap();
+            db.io.step().unwrap();
         }
 
         // Reopen the database without committing

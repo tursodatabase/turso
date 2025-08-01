@@ -553,7 +553,7 @@ fn get_schema_version(conn: &Arc<Connection>) -> Result<u32> {
                 schema_version = Some(row.get::<i64>(0)? as u32);
             }
             StepResult::IO => {
-                rows.run_once()?;
+                rows.step()?;
             }
             StepResult::Interrupt => {
                 return Err(LimboError::InternalError(
@@ -934,7 +934,7 @@ impl Connection {
                         if matches!(res, StepResult::Done) {
                             break;
                         }
-                        self.run_once()?;
+                        self.step()?;
                     }
                 }
                 _ => unreachable!(),
@@ -1064,7 +1064,7 @@ impl Connection {
                         if matches!(res, StepResult::Done) {
                             break;
                         }
-                        self.run_once()?;
+                        self.step()?;
                     }
                 }
             }
@@ -1072,11 +1072,11 @@ impl Connection {
         Ok(())
     }
 
-    fn run_once(&self) -> Result<()> {
+    fn step(&self) -> Result<()> {
         if self.closed.get() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
-        let res = self._db.io.run_once();
+        let res = self._db.io.step();
         if let Err(ref e) = res {
             vdbe::handle_program_error(&self.pager.borrow(), self, e)?;
         }
@@ -1241,7 +1241,7 @@ impl Connection {
                     self,
                     self.wal_checkpoint_disabled.get(),
                 )? {
-                    self.run_once()?;
+                    self.step()?;
                 }
                 self.transaction_state.set(TransactionState::None);
             }
@@ -1749,8 +1749,8 @@ impl Statement {
             .step(&mut self.state, self.mv_store.clone(), self.pager.clone())
     }
 
-    pub fn run_once(&self) -> Result<()> {
-        let res = self.pager.io.run_once();
+    pub fn step(&self) -> Result<()> {
+        let res = self.pager.io.step();
         if res.is_err() {
             let state = self.program.connection.transaction_state.get();
             if let TransactionState::Write { schema_did_change } = state {

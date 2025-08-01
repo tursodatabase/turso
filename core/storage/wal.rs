@@ -1724,7 +1724,7 @@ impl WalFileShared {
                 .loaded
                 .load(Ordering::SeqCst)
             {
-                io.run_once()?;
+                io.step()?;
                 max_loops -= 1;
                 if max_loops == 0 {
                     panic!("WAL file not loaded");
@@ -1975,7 +1975,7 @@ pub mod test {
                     break;
                 }
                 Ok(StepResult::IO) => {
-                    stmt.run_once().unwrap();
+                    stmt.step().unwrap();
                 }
                 _ => {
                     panic!("Failed to step through the statement");
@@ -1996,7 +1996,7 @@ pub mod test {
             match wal.checkpoint(pager, wc.clone(), mode).unwrap() {
                 IOResult::Done(r) => return r,
                 IOResult::IO => {
-                    pager.io.run_once().unwrap();
+                    pager.io.step().unwrap();
                 }
             }
         }
@@ -2025,7 +2025,7 @@ pub mod test {
             .unwrap();
         bulk_inserts(&conn, 20, 3);
         while let IOResult::IO = conn.pager.borrow_mut().cacheflush().unwrap() {
-            conn.run_once().unwrap();
+            conn.step().unwrap();
         }
 
         // Snapshot header & counters before the RESTART checkpoint.
@@ -2119,7 +2119,7 @@ pub mod test {
             .unwrap();
         bulk_inserts(&conn1.clone(), 15, 2);
         while let IOResult::IO = conn1.pager.borrow_mut().cacheflush().unwrap() {
-            conn1.run_once().unwrap();
+            conn1.step().unwrap();
         }
 
         // Force a read transaction that will freeze a lower read mark
@@ -2133,7 +2133,7 @@ pub mod test {
         // generate more frames that the reader will not see.
         bulk_inserts(&conn1.clone(), 15, 2);
         while let IOResult::IO = conn1.pager.borrow_mut().cacheflush().unwrap() {
-            conn1.run_once().unwrap();
+            conn1.step().unwrap();
         }
 
         // Run passive checkpoint, expect partial
@@ -2200,7 +2200,7 @@ pub mod test {
         loop {
             match w.checkpoint(&p, Rc::new(RefCell::new(0)), CheckpointMode::Restart) {
                 Ok(IOResult::IO) => {
-                    conn1.run_once().unwrap();
+                    conn1.step().unwrap();
                 }
                 e => {
                     assert!(
@@ -2229,7 +2229,7 @@ pub mod test {
         loop {
             match w.checkpoint(&p, Rc::new(RefCell::new(0)), CheckpointMode::Restart) {
                 Ok(IOResult::IO) => {
-                    conn1.run_once().unwrap();
+                    conn1.step().unwrap();
                 }
                 Ok(IOResult::Done(_)) => {
                     panic!("Checkpoint should not have succeeded");
@@ -2532,13 +2532,13 @@ pub mod test {
         // verify visible rows
         let mut stmt = conn_r2.query("SELECT COUNT(*) FROM test").unwrap().unwrap();
         while !matches!(stmt.step().unwrap(), StepResult::Row) {
-            stmt.run_once().unwrap();
+            stmt.step().unwrap();
         }
         let r2_cnt: i64 = stmt.row().unwrap().get(0).unwrap();
 
         let mut stmt2 = conn_r3.query("SELECT COUNT(*) FROM test").unwrap().unwrap();
         while !matches!(stmt2.step().unwrap(), StepResult::Row) {
-            stmt2.run_once().unwrap();
+            stmt2.step().unwrap();
         }
         let r3_cnt: i64 = stmt2.row().unwrap().get(0).unwrap();
         assert_eq!(r2_cnt, 30);

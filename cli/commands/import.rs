@@ -53,7 +53,7 @@ impl<'a> ImportFile<'a> {
                                     }
                                     Ok(turso_core::StepResult::Done) => break 'check false,
                                     Ok(turso_core::StepResult::IO) => {
-                                        if let Err(e) = rows.run_once() {
+                                        if let Err(e) = rows.step() {
                                             let _ = self.writer.write_all(
                                                 format!("Error checking table existence: {e:?}\n")
                                                     .as_bytes(),
@@ -65,7 +65,7 @@ impl<'a> ImportFile<'a> {
                                         turso_core::StepResult::Interrupt
                                         | turso_core::StepResult::Busy,
                                     ) => {
-                                        if let Err(e) = rows.run_once() {
+                                        if let Err(e) = rows.step() {
                                             let _ = self.writer.write_all(
                                                 format!("Error checking table existence: {e:?}\n")
                                                     .as_bytes(),
@@ -138,7 +138,7 @@ impl<'a> ImportFile<'a> {
                 loop {
                     match rows.step() {
                         Ok(turso_core::StepResult::IO) => {
-                            if let Err(e) = rows.run_once() {
+                            if let Err(e) = rows.step() {
                                 let _ = self
                                     .writer
                                     .write_all(format!("Error creating table: {e:?}\n").as_bytes());
@@ -206,7 +206,7 @@ impl<'a> ImportFile<'a> {
                                 loop {
                                     match rows.step() {
                                         Ok(turso_core::StepResult::IO) => {
-                                            if let Err(e) = rows.run_once() {
+                                            if let Err(e) = rows.step() {
                                                 let _ = self.writer.write_all(
                                                     format!("Error executing query: {e:?}\n")
                                                         .as_bytes(),
@@ -268,7 +268,7 @@ impl<'a> ImportFile<'a> {
                         loop {
                             match rows.step() {
                                 Ok(turso_core::StepResult::IO) => {
-                                    if let Err(e) = rows.run_once() {
+                                    if let Err(e) = rows.step() {
                                         let _ = self.writer.write_all(
                                             format!("Error executing query: {e:?}\n").as_bytes(),
                                         );

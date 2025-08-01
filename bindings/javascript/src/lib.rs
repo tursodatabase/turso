@@ -170,7 +170,7 @@ impl Database {
     #[napi]
     pub fn io_loop_sync(&self) -> Result<()> {
         self.io
-            .run_once()
+            .step()
             .map_err(|e| Error::new(Status::GenericFailure, format!("IO error: {e}")))?;
         Ok(())
     }
@@ -413,7 +413,7 @@ impl Task for IoLoopTask {
     type JsValue = ();
 
     fn compute(&mut self) -> napi::Result<Self::Output> {
-        self.io.run_once().map_err(|e| {
+        self.io.step().map_err(|e| {
             napi::Error::new(napi::Status::GenericFailure, format!("IO error: {e}"))
         })?;
         Ok(())

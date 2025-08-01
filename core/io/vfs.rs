@@ -31,12 +31,12 @@ impl IO for VfsMod {
         Ok(Arc::new(turso_ext::VfsFileImpl::new(file, self.ctx)?))
     }
 
-    fn run_once(&self) -> Result<()> {
+    fn step(&self) -> Result<()> {
         if self.ctx.is_null() {
             return Err(LimboError::ExtensionError("VFS is null".to_string()));
         }
         let vfs = unsafe { &*self.ctx };
-        let result = unsafe { (vfs.run_once)(vfs.vfs) };
+        let result = unsafe { (vfs.step)(vfs.vfs) };
         if !result.is_ok() {
             return Err(LimboError::ExtensionError(result.to_string()));
         }

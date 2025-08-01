@@ -96,7 +96,7 @@ impl RustStatement {
                     break;
                 }
                 Ok(turso_core::StepResult::IO) => {
-                    self.inner.run_once().unwrap();
+                    self.inner.step().unwrap();
                 }
                 _ => break,
             };

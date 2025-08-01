@@ -222,7 +222,7 @@ impl<C: Parser + Send + Sync + 'static> SqlCompleter<C> {
                         candidates.push(pair);
                     }
                     StepResult::IO => {
-                        try_result!(rows.run_once(), (prefix_pos, candidates));
+                        try_result!(rows.step(), (prefix_pos, candidates));
                     }
                     StepResult::Interrupt => break,
                     StepResult::Done => break,

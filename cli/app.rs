@@ -98,7 +98,7 @@ macro_rules! query_internal {
                         $body(row)?;
                     }
                     StepResult::IO => {
-                        rows.run_once()?;
+                        rows.step()?;
                     }
                     StepResult::Interrupt => break,
                     StepResult::Done => break,
@@ -769,7 +769,7 @@ impl Limbo {
                             }
                             Ok(StepResult::IO) => {
                                 let start = Instant::now();
-                                rows.run_once()?;
+                                rows.step()?;
                                 if let Some(ref mut stats) = statistics {
                                     stats.io_time_elapsed_samples.push(start.elapsed());
                                 }
@@ -858,7 +858,7 @@ impl Limbo {
                             }
                             Ok(StepResult::IO) => {
                                 let start = Instant::now();
-                                rows.run_once()?;
+                                rows.step()?;
                                 if let Some(ref mut stats) = statistics {
                                     stats.io_time_elapsed_samples.push(start.elapsed());
                                 }
@@ -1001,7 +1001,7 @@ impl Limbo {
                         found |= self.print_schema_entry(db_display_name, row);
                     }
                     StepResult::IO => {
-                        rows.run_once()?;
+                        rows.step()?;
                     }
                     StepResult::Interrupt => break,
                     StepResult::Done => break,
@@ -1034,7 +1034,7 @@ impl Limbo {
                         self.print_schema_entry(db_display_name, row);
                     }
                     StepResult::IO => {
-                        rows.run_once()?;
+                        rows.step()?;
                     }
                     StepResult::Interrupt => break,
                     StepResult::Done => break,
@@ -1149,7 +1149,7 @@ impl Limbo {
                             }
                         }
                         StepResult::IO => {
-                            rows.run_once()?;
+                            rows.step()?;
                         }
                         StepResult::Interrupt => break,
                         StepResult::Done => break,
@@ -1210,7 +1210,7 @@ impl Limbo {
                             }
                         }
                         StepResult::IO => {
-                            rows.run_once()?;
+                            rows.step()?;
                         }
                         StepResult::Interrupt => break,
                         StepResult::Done => break,
@@ -1293,7 +1293,7 @@ impl Limbo {
                             }
                         }
                         StepResult::IO => {
-                            rows.run_once()?;
+                            rows.step()?;
                         }
                         StepResult::Interrupt => break,
                         StepResult::Done => break,

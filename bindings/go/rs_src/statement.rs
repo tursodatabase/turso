@@ -64,7 +64,7 @@ pub extern "C" fn stmt_execute(
                 return ResultCode::Done;
             }
             Ok(StepResult::IO) => {
-                let res = statement.run_once();
+                let res = statement.step();
                 if res.is_err() {
                     return ResultCode::Error;
                 }

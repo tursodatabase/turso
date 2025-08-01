@@ -261,7 +261,7 @@ fn limbo_integrity_check(conn: &Arc<Connection>) -> Result<()> {
                 result.push(val);
             }
             StepResult::IO => {
-                rows.run_once()?;
+                rows.step()?;
             }
             StepResult::Interrupt => {}
             StepResult::Done => {

@@ -767,7 +767,7 @@ pub fn handle_program_error(
             if let TransactionState::Write { schema_did_change } = state {
                 loop {
                     match pager.end_tx(true, schema_did_change, connection, false) {
-                        Ok(IOResult::IO) => connection.run_once()?,
+                        Ok(IOResult::IO) => connection.step()?,
                         Ok(IOResult::Done(_)) => break,
                         Err(e) => {
                             tracing::error!("end_tx failed: {e}");

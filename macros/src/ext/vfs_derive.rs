@@ -16,7 +16,7 @@ pub fn derive_vfs_module(input: TokenStream) -> TokenStream {
     let unlock_fn_name = format_ident!("{}_unlock", struct_name);
     let sync_fn_name = format_ident!("{}_sync", struct_name);
     let size_fn_name = format_ident!("{}_size", struct_name);
-    let run_once_fn_name = format_ident!("{}_run_once", struct_name);
+    let step_fn_name = format_ident!("{}_step", struct_name);
     let generate_random_number_fn_name = format_ident!("{}_generate_random_number", struct_name);
     let get_current_time_fn_name = format_ident!("{}_get_current_time", struct_name);
 
@@ -38,7 +38,7 @@ pub fn derive_vfs_module(input: TokenStream) -> TokenStream {
                 sync: #sync_fn_name,
                 size: #size_fn_name,
                 truncate: #trunc_fn_name,
-                run_once: #run_once_fn_name,
+                step: #step_fn_name,
                 gen_random_number: #generate_random_number_fn_name,
                 current_time: #get_current_time_fn_name,
             };
@@ -62,7 +62,7 @@ pub fn derive_vfs_module(input: TokenStream) -> TokenStream {
                 sync: #sync_fn_name,
                 size: #size_fn_name,
                 truncate: #trunc_fn_name,
-                run_once: #run_once_fn_name,
+                step: #step_fn_name,
                 gen_random_number: #generate_random_number_fn_name,
                 current_time: #get_current_time_fn_name,
             };
@@ -124,12 +124,12 @@ pub fn derive_vfs_module(input: TokenStream) -> TokenStream {
         }
 
         #[no_mangle]
-        pub unsafe extern "C" fn #run_once_fn_name(ctx: *const ::std::ffi::c_void) -> ::turso_ext::ResultCode {
+        pub unsafe extern "C" fn #step_fn_name(ctx: *const ::std::ffi::c_void) -> ::turso_ext::ResultCode {
             if ctx.is_null() {
                 return ::turso_ext::ResultCode::Error;
             }
             let ctx = &mut *(ctx as *mut #struct_name);
-            if let Err(e) = <#struct_name as ::turso_ext::VfsExtension>::run_once(ctx) {
+            if let Err(e) = <#struct_name as ::turso_ext::VfsExtension>::step(ctx) {
                 return e;
             }
             ::turso_ext::ResultCode::OK
