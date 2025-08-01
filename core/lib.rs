@@ -204,7 +204,7 @@ impl Database {
         enable_mvcc: bool,
         enable_indexes: bool,
     ) -> Result<Arc<Database>> {
-        let file = io.open_file(path, flags, true)?;
+        let file = io.open_file(path, flags, false)?;
         let db_file = Arc::new(DatabaseFile::new(file));
         Self::open_with_flags(io, path, db_file, flags, enable_mvcc, enable_indexes)
     }
