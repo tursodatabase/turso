@@ -1009,6 +1009,10 @@ pub enum Insn {
         roots: Vec<usize>,
         message_register: usize,
     },
+    RenameTable {
+        from: String,
+        to: String,
+    },
 }
 
 impl Insn {
@@ -1137,6 +1141,7 @@ impl Insn {
             Insn::IdxDelete { .. } => execute::op_idx_delete,
             Insn::Count { .. } => execute::op_count,
             Insn::IntegrityCk { .. } => execute::op_integrity_check,
+            Insn::RenameTable { .. } => execute::op_rename_table,
         }
     }
 }

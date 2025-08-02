@@ -1,6 +1,7 @@
 #![allow(unused_variables)]
 use crate::function::AlterTableFunc;
 use crate::numeric::{NullableInteger, Numeric};
+use crate::schema::Table;
 use crate::storage::btree::{integrity_check, IntegrityCheckError, IntegrityCheckState};
 use crate::storage::database::DatabaseFile;
 use crate::storage::page_cache::DumbLruPageCache;
@@ -6772,6 +6773,52 @@ pub fn op_cast(
     };
 
     state.registers[*reg] = Register::Value(result);
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_rename_table(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Rc<Pager>,
+    mv_store: Option<&Arc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    let Insn::RenameTable { from, to } = insn else {
+        unreachable!("unexpected Insn {:?}", insn)
+    };
+
+    let conn = program.connection.clone();
+
+    conn.with_schema_mut(|schema| {
+        if let Some(mut indexes) = schema.indexes.remove(from) {
+            indexes.iter_mut().for_each(|index| {
+                let index = Arc::make_mut(index);
+                index.table_name = to.to_owned();
+            });
+
+            schema.indexes.insert(to.to_owned(), indexes);
+        };
+
+        let mut table = schema
+            .tables
+            .remove(from)
+            .expect("table being renamed should be in schema");
+
+        {
+            let table = Arc::make_mut(&mut table);
+
+            let Table::BTree(btree) = table else {
+                panic!("only btree tables can be renamed");
+            };
+
+            let btree = Arc::make_mut(btree);
+            btree.name = to.to_owned();
+        }
+
+        schema.tables.insert(to.to_owned(), table);
+    });
+
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }

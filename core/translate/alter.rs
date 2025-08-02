@@ -7,7 +7,7 @@ use crate::{
     schema::{Column, Schema},
     util::normalize_ident,
     vdbe::{
-        builder::ProgramBuilder,
+        builder::{CursorType, ProgramBuilder},
         insn::{Cookie, Insn, RegisterOrLiteral},
     },
     LimboError, Result, SymbolTable,
@@ -106,9 +106,7 @@ pub fn translate_alter_table(
                     let root_page = btree.root_page;
                     let table_name = btree.name.clone();
 
-                    let cursor_id = program.alloc_cursor_id(
-                        crate::vdbe::builder::CursorType::BTreeTable(original_btree),
-                    );
+                    let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(original_btree));
 
                     program.emit_insn(Insn::OpenWrite {
                         cursor_id,
@@ -248,9 +246,7 @@ pub fn translate_alter_table(
                 .get_btree_table(SQLITE_TABLEID)
                 .expect("sqlite_schema should be on schema");
 
-            let cursor_id = program.alloc_cursor_id(crate::vdbe::builder::CursorType::BTreeTable(
-                sqlite_schema.clone(),
-            ));
+            let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(sqlite_schema.clone()));
 
             program.emit_insn(Insn::OpenWrite {
                 cursor_id,
@@ -335,9 +331,7 @@ pub fn translate_alter_table(
                 .get_btree_table(SQLITE_TABLEID)
                 .expect("sqlite_schema should be on schema");
 
-            let cursor_id = program.alloc_cursor_id(crate::vdbe::builder::CursorType::BTreeTable(
-                sqlite_schema.clone(),
-            ));
+            let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(sqlite_schema.clone()));
 
             program.emit_insn(Insn::OpenWrite {
                 cursor_id,
@@ -398,9 +392,9 @@ pub fn translate_alter_table(
                 p5: 0,
             });
 
-            program.emit_insn(Insn::ParseSchema {
-                db: usize::MAX, // TODO: This value is unused, change when we do something with it
-                where_clause: None,
+            program.emit_insn(Insn::RenameTable {
+                from: table_name.to_owned(),
+                to: new_name.to_owned(),
             });
 
             program.epilogue(TransactionMode::Write);

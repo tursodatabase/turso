@@ -1627,6 +1627,15 @@ pub fn insn_to_str(
                 0,
                 format!("affinity(r[{}]={:?})", *reg, affinity),
             ),
+            Insn::RenameTable { from, to } => (
+                "RenameTable",
+                0,
+                0,
+                0,
+                Value::build_text(""),
+                0,
+                format!("rename_table({from}, {to})"),
+            ),
         };
     format!(
         "{:<4}  {:<17}  {:<4}  {:<4}  {:<4}  {:<13}  {:<2}  {}",
