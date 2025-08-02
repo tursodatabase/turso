@@ -573,8 +573,9 @@ pub struct BTreeCursor {
     pub record_cursor: RefCell<RecordCursor>,
     /// State machine for [BTreeCursor::is_empty_table]
     is_empty_table_state: RefCell<EmptyTableState>,
-    /// State machine for [BTreeCursor::move_to_rightmost]
-    move_to_right_state: MoveToRightState,
+    /// State machine for [BTreeCursor::move_to_rightmost] and, optionally, the id of the rightmost page in the btree.
+    /// If we know the rightmost page id and are already on that page, we can skip a seek.
+    move_to_right_state: (MoveToRightState, Option<usize>),
     seek_to_last_state: SeekToLastState,
 }
 
@@ -631,7 +632,7 @@ impl BTreeCursor {
             parse_record_state: RefCell::new(ParseRecordState::Init),
             record_cursor: RefCell::new(RecordCursor::with_capacity(num_columns)),
             is_empty_table_state: RefCell::new(EmptyTableState::Start),
-            move_to_right_state: MoveToRightState::Start,
+            move_to_right_state: (MoveToRightState::Start, None),
             seek_to_last_state: SeekToLastState::Start,
         }
     }
@@ -1348,10 +1349,24 @@ impl BTreeCursor {
     /// Move the cursor to the rightmost record in the btree.
     #[instrument(skip(self), level = Level::DEBUG)]
     fn move_to_rightmost(&mut self) -> Result<IOResult<bool>> {
-        match self.move_to_right_state {
+        let (move_to_right_state, rightmost_page_id) = &self.move_to_right_state;
+        match *move_to_right_state {
             MoveToRightState::Start => {
+                if let Some(rightmost_page_id) = rightmost_page_id {
+                    // If we know the rightmost page and are already on it, we can skip a seek.
+                    let current_page = self.stack.top();
+                    return_if_locked_maybe_load!(self.pager, current_page);
+                    let current_page = current_page.get();
+                    if current_page.get().id == *rightmost_page_id {
+                        let contents = current_page.get_contents();
+                        let cell_count = contents.cell_count();
+                        self.stack.set_cell_index(cell_count as i32 - 1);
+                        return Ok(IOResult::Done(cell_count > 0));
+                    }
+                }
+                let rightmost_page_id = *rightmost_page_id;
                 let _c = self.move_to_root()?;
-                self.move_to_right_state = MoveToRightState::ProcessPage;
+                self.move_to_right_state = (MoveToRightState::ProcessPage, rightmost_page_id);
                 return Ok(IOResult::IO);
             }
             MoveToRightState::ProcessPage => {
@@ -1362,7 +1377,7 @@ impl BTreeCursor {
                 let page = page.get();
                 let contents = page.get().contents.as_ref().unwrap();
                 if contents.is_leaf() {
-                    self.move_to_right_state = MoveToRightState::Start;
+                    self.move_to_right_state = (MoveToRightState::Start, Some(page_idx));
                     if contents.cell_count() > 0 {
                         self.stack.set_cell_index(contents.cell_count() as i32 - 1);
                         return Ok(IOResult::Done(true));
@@ -2388,6 +2403,7 @@ impl BTreeCursor {
             matches!(self.state, CursorState::Write(_)),
             "Cursor must be in balancing state"
         );
+
         loop {
             let state = self
                 .state
@@ -2482,6 +2498,8 @@ impl BTreeCursor {
             | WriteState::BalanceStart
             | WriteState::Finish => panic!("balance_non_root: unexpected state {state:?}"),
             WriteState::BalanceNonRootPickSiblings => {
+                // Since we are going to change the btree structure, let's forget our cached knowledge of the rightmost page.
+                let _ = self.move_to_right_state.1.take();
                 let parent_page = self.stack.top();
                 return_if_locked_maybe_load!(self.pager, parent_page);
                 let parent_page = parent_page.get();
@@ -4065,6 +4083,9 @@ impl BTreeCursor {
     fn balance_root(&mut self) -> Result<IOResult<()>> {
         /* todo: balance deeper, create child and copy contents of root there. Then split root */
         /* if we are in root page then we just need to create a new root and push key there */
+
+        // Since we are going to change the btree structure, let's forget our cached knowledge of the rightmost page.
+        let _ = self.move_to_right_state.1.take();
 
         let is_page_1 = {
             let current_root = self.stack.top();

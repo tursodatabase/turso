@@ -5509,10 +5509,6 @@ pub fn op_new_rowid(
                 let current_max = {
                     let mut cursor = state.get_cursor(*cursor);
                     let cursor = cursor.as_btree_mut();
-
-                    // Move to last record
-                    return_if_io!(cursor.seek_to_last());
-
                     return_if_io!(cursor.rowid())
                 };
 
