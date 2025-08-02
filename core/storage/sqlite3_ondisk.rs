@@ -666,8 +666,14 @@ impl PageContent {
     /// - left-most cell (the cell with the smallest key) first and
     /// - the right-most cell (the cell with the largest key) last.
     pub fn cell_pointer_array_offset_and_size(&self) -> (usize, usize) {
-        let header_size = self.header_size();
-        (self.offset + header_size, self.cell_pointer_array_size())
+        (
+            self.cell_pointer_array_offset(),
+            self.cell_pointer_array_size(),
+        )
+    }
+
+    pub fn cell_pointer_array_offset(&self) -> usize {
+        self.offset + self.header_size()
     }
 
     /// Get region(start end length) of a cell's payload
