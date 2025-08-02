@@ -216,6 +216,12 @@ impl Page {
         self.get().flags.load(Ordering::SeqCst) & PAGE_DONT_WRITE != 0
     }
 
+    pub fn clear_dont_write(&self) {
+        self.get()
+            .flags
+            .fetch_and(!PAGE_DONT_WRITE, Ordering::SeqCst);
+    }
+
     pub fn is_index(&self) -> bool {
         match self.get_contents().page_type() {
             PageType::IndexLeaf | PageType::IndexInterior => true,
@@ -1936,7 +1942,7 @@ impl Pager {
                 }
             }
         };
-        assert!(page.is_dont_write(), "page should be marked as dont_write");
+        page.clear_dont_write();
         Ok(IOResult::Done(page))
     }
 
