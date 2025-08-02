@@ -62,7 +62,7 @@ use crate::storage::database::DatabaseStorage;
 use crate::storage::pager::Pager;
 use crate::storage::wal::PendingFlush;
 use crate::types::{RawSlice, RefValue, SerialType, SerialTypeKind, TextRef, TextSubtype};
-use crate::{turso_assert, File, Result, WalFileShared};
+use crate::{turso_assert, File, Page, Result, WalFileShared};
 use std::cell::{RefCell, UnsafeCell};
 use std::collections::{BTreeMap, HashMap};
 use std::mem::MaybeUninit;
@@ -1789,6 +1789,51 @@ pub fn prepare_wal_frame(
     frame[20..24].copy_from_slice(&final_checksum.1.to_be_bytes());
 
     (final_checksum, Arc::new(RefCell::new(buffer)))
+}
+
+pub fn prepare_contiguous_wal_frames(
+    wal_header: &WalHeader,
+    prev_checksums: (u32, u32),
+    page_size: u32,
+    // (page_number, db_size, page)
+    pages: &[(u32, u32, Arc<Page>)],
+) -> ((u32, u32), Arc<RefCell<Buffer>>) {
+    let drop_fn = Rc::new(|_buf| {});
+    let frame_size = page_size as usize + WAL_FRAME_HEADER_SIZE;
+    let mut buffer = Buffer::allocate(frame_size * pages.len(), drop_fn);
+    let frame = buffer.as_mut_slice();
+    for (i, (page_number, db_size, page)) in pages.iter().enumerate() {
+        let frame_offset = i * frame_size;
+        let page_data_offset = frame_offset + WAL_FRAME_HEADER_SIZE;
+        let page_content = page.get().contents.as_ref().unwrap().as_ptr();
+        frame[page_data_offset..page_data_offset + page_size as usize]
+            .copy_from_slice(page_content);
+        frame[frame_offset..frame_offset + 4].copy_from_slice(&page_number.to_be_bytes());
+        frame[frame_offset + 4..frame_offset + 8].copy_from_slice(&db_size.to_be_bytes());
+        frame[frame_offset + 8..frame_offset + 12]
+            .copy_from_slice(&wal_header.salt_1.to_be_bytes());
+        frame[frame_offset + 12..frame_offset + 16]
+            .copy_from_slice(&wal_header.salt_2.to_be_bytes());
+    }
+
+    let expects_be = wal_header.magic & 1;
+    let use_native_endian = cfg!(target_endian = "big") as u32 == expects_be;
+    let mut checksums = prev_checksums;
+    for i in 0..pages.len() {
+        let frame_offset = i * frame_size;
+        let frame = &mut frame[frame_offset..frame_offset + frame_size];
+        let header_checksum = checksum_wal(&frame[0..8], wal_header, checksums, use_native_endian);
+        let final_checksum = checksum_wal(
+            &frame[WAL_FRAME_HEADER_SIZE..WAL_FRAME_HEADER_SIZE + page_size as usize],
+            wal_header,
+            header_checksum,
+            use_native_endian,
+        );
+        checksums = final_checksum;
+        frame[16..20].copy_from_slice(&final_checksum.0.to_be_bytes());
+        frame[20..24].copy_from_slice(&final_checksum.1.to_be_bytes());
+    }
+    (checksums, Arc::new(RefCell::new(buffer)))
 }
 
 pub fn begin_write_wal_header(io: &Arc<dyn File>, header: &WalHeader) -> Result<Completion> {
