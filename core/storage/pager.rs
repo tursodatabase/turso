@@ -73,6 +73,7 @@ impl Page {
     }
 
     pub fn get_contents(&self) -> &mut PageContent {
+        self.check_poison();
         self.get().contents.as_mut().unwrap()
     }
 
@@ -180,6 +181,58 @@ impl Page {
     pub fn is_pinned(&self) -> bool {
         self.get().pin_count.load(Ordering::SeqCst) > 0
     }
+
+    #[cfg(feature = "page-poisoning")]
+    const POISON_MARKER: [u8; 8] = [0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE];
+
+    /// Poison a freed page by writing poison markers throughout its buffer.
+    /// This helps detect use-after-free bugs when page-poisoning feature is enabled.
+    #[cfg(feature = "page-poisoning")]
+    pub fn poison(&self) {
+        if !self.is_loaded() {
+            return;
+        }
+
+        let page_contents = self.get().contents.as_mut().unwrap();
+        let mut buffer_guard = page_contents.buffer.borrow_mut();
+        let buffer_slice = buffer_guard.as_mut_slice();
+
+        // Write poison marker at the beginning
+        if buffer_slice.len() >= Self::POISON_MARKER.len() {
+            buffer_slice[..Self::POISON_MARKER.len()].copy_from_slice(&Self::POISON_MARKER);
+        }
+    }
+
+    /// Check if a page has been poisoned (freed) and abort if so.
+    /// This helps detect use-after-free bugs when page-poisoning feature is enabled.
+    #[cfg(feature = "page-poisoning")]
+    pub(crate) fn check_poison(&self) {
+        if !self.is_loaded() {
+            return;
+        }
+
+        let page_contents = self.get().contents.as_ref().unwrap();
+        let buffer_guard = page_contents.buffer.borrow();
+        let buffer_slice = buffer_guard.as_slice();
+
+        // Check for poison marker at the beginning
+        if buffer_slice.len() >= Self::POISON_MARKER.len() {
+            if buffer_slice[..Self::POISON_MARKER.len()] == Self::POISON_MARKER {
+                panic!(
+                    "Use-after-free detected: Page {} has been poisoned (freed) but is being accessed",
+                    self.get().id
+                );
+            }
+        }
+    }
+
+    /// No-op version when page-poisoning feature is disabled
+    #[cfg(not(feature = "page-poisoning"))]
+    pub fn poison(&self) {}
+
+    /// No-op version when page-poisoning feature is disabled
+    #[cfg(not(feature = "page-poisoning"))]
+    pub(crate) fn check_poison(&self) {}
 }
 #[derive(Clone, Copy, Debug)]
 /// The state of the current pager cache flush.
@@ -870,6 +923,7 @@ impl Pager {
         let page_key = PageCacheKey::new(page_idx);
         if let Some(page) = page_cache.get(&page_key) {
             tracing::trace!("read_page(page_idx = {}) = cached", page_idx);
+            page.check_poison();
             // Dummy completion being passed, as we do not need to read from database or wal
             return Ok((page.clone(), Completion::new_write(|_| {})));
         }
@@ -879,6 +933,7 @@ impl Pager {
         let Some(wal) = self.wal.as_ref() else {
             let c = self.begin_read_disk_page(page_idx, page.clone())?;
             self.cache_insert(page_idx, page.clone(), &mut page_cache)?;
+            page.check_poison();
             return Ok((page, c));
         };
 
@@ -892,11 +947,13 @@ impl Pager {
             // TODO(pere) should probably first insert to page cache, and if successful,
             // read frame or page
             self.cache_insert(page_idx, page.clone(), &mut page_cache)?;
+            page.check_poison();
             return Ok((page, c));
         }
 
         let c = self.begin_read_disk_page(page_idx, page.clone())?;
         self.cache_insert(page_idx, page.clone(), &mut page_cache)?;
+        page.check_poison();
         Ok((page, c))
     }
 
@@ -1451,6 +1508,7 @@ impl Pager {
                             if page.is_loaded() {
                                 let page_contents = page.get_contents();
                                 page_contents.overflow_cells.clear();
+                                page.poison();
                             }
                             (page, None)
                         }

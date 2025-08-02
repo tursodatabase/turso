@@ -15,7 +15,7 @@ name = "limbo_sim"
 path = "main.rs"
 
 [dependencies]
-turso_core = { path = "../core", features = ["simulator"]}
+turso_core = { path = "../core", features = ["simulator", "page-poisoning"]}
 rand = "0.8.5"
 rand_chacha = "0.3.1"
 log = "0.4.20"

@@ -2,6 +2,15 @@ use std::fs;
 use std::path::PathBuf;
 
 fn main() {
+    // Enable page-poisoning by default ONLY in debug builds
+    #[cfg(debug_assertions)]
+    {
+        // Only enable if the feature is not explicitly set (either enabled or disabled)
+        if std::env::var("CARGO_FEATURE_PAGE_POISONING").is_err() {
+            println!("cargo:rustc-cfg=feature=\"page-poisoning\"");
+        }
+    }
+
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let built_file = out_dir.join("built.rs");
 

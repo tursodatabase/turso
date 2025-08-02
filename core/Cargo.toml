@@ -26,6 +26,7 @@ omit_autovacuum = []
 simulator = ["fuzz", "serde"]
 serde = ["dep:serde"]
 series = []
+page-poisoning = []
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = { version = "0.7.5", optional = true }
