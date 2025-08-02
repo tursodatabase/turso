@@ -3530,7 +3530,7 @@ impl BTreeCursor {
                     // copied into the parent, because if the parent is page 1 then it will
                     // by smaller than the child due to the database header, and so
                     // all the free space needs to be up front.
-                    defragment_page(first_child_contents, self.usable_space() as u16);
+                    defragment_page_full(first_child_contents, self.usable_space() as u16)?;
 
                     let child_top = first_child_contents.cell_content_area() as usize;
                     let parent_buf = parent_contents.as_ptr();
@@ -6220,7 +6220,7 @@ fn edit_page(
         debug_validate_cells!(page, usable_space);
     }
     // TODO: make page_free_array defragment, for now I'm lazy so this will work for now.
-    defragment_page(page, usable_space);
+    defragment_page(page, usable_space, 0)?;
     // TODO: add to start
     if start_new_cells < start_old_cells {
         let count = number_new_cells.min(start_old_cells - start_new_cells);
@@ -6500,10 +6500,129 @@ fn free_cell_range(
     Ok(())
 }
 
+/// This function handles pages with two or fewer freeblocks and max_frag_bytes (parameter to defragment_page())
+/// or fewer fragmented bytes. In this case it is faster to move the two (or one)
+/// blocks of cells using memmove() and add the required offsets to each pointer
+/// in the cell-pointer array than it is to reconstruct the entire page.
+/// Note that this function will leave max_frag_bytes as is, it will not try to reduce it.
+fn defragment_page_fast(
+    page: &PageContent,
+    usable_space: u16,
+    freeblock_1st: usize,
+    freeblock_2nd: usize,
+) -> Result<()> {
+    turso_assert!(freeblock_1st != 0, "no free blocks");
+    if freeblock_2nd > 0 {
+        turso_assert!(freeblock_1st < freeblock_2nd, "1st freeblock is not before 2nd freeblock: freeblock_1st={freeblock_1st} freeblock_2nd={freeblock_2nd}");
+    }
+    const FREEBLOCK_SIZE_MIN: usize = 4;
+    turso_assert!(freeblock_1st <= usable_space as usize - FREEBLOCK_SIZE_MIN, "1st freeblock beyond usable space: freeblock_1st={freeblock_1st} usable_space={usable_space}");
+    turso_assert!(freeblock_2nd <= usable_space as usize - FREEBLOCK_SIZE_MIN, "2nd freeblock beyond usable space: freeblock_2nd={freeblock_2nd} usable_space={usable_space}");
+
+    let freeblock_1st_size = page.read_u16(freeblock_1st + 2) as usize;
+    let freeblock_2nd_size = if freeblock_2nd > 0 {
+        page.read_u16(freeblock_2nd + 2) as usize
+    } else {
+        0
+    };
+    let freeblocks_total_size = freeblock_1st_size + freeblock_2nd_size;
+
+    let cell_content_area = page.cell_content_area() as usize;
+
+    if freeblock_2nd > 0 {
+        // If there's 2 freeblocks, merge them into one first.
+        turso_assert!(freeblock_1st + freeblock_1st_size <= freeblock_2nd, "overlapping freeblocks: freeblock_1st={freeblock_1st} freeblock_1st_size={freeblock_1st_size} freeblock_2nd={freeblock_2nd}");
+        if freeblock_2nd + freeblock_2nd_size > usable_space as usize {
+            turso_assert!(false, "Second freeblock extends beyond usable space: freeblock_2nd={freeblock_2nd} freeblock_2nd_size={freeblock_2nd_size} usable_space={usable_space}");
+        }
+        let buf = page.as_ptr();
+        // Effectively moves everything in between the two freeblocks rightwards by the length of the 2nd freeblock,
+        // so that the first freeblock size becomes `freeblocks_total_size` (merging the two freeblocks)
+        // and the second freeblock gets overwritten by non-free cell data.
+        let after_first_freeblock = freeblock_1st + freeblock_1st_size;
+        let copy_amount = freeblock_2nd - after_first_freeblock;
+        buf.copy_within(
+            after_first_freeblock..after_first_freeblock + copy_amount,
+            freeblock_1st + freeblocks_total_size,
+        );
+    } else if freeblock_1st + freeblock_1st_size > usable_space as usize {
+        turso_assert!(false, "First freeblock extends beyond usable space: freeblock_1st={freeblock_1st} freeblock_1st_size={freeblock_1st_size} usable_space={usable_space}");
+    }
+
+    // Now we have one freeblock somewhere in the middle of the content area, e.g.:
+    // content area start |-----------| merged freeblock |-----------|
+    // By moving the cells from the left of the merged free block to where the merged freeblock was, we effectively move the freeblock to the very left end of the content area,
+    // meaning, it's no longer a freeblock, it's just plain old free space.
+    // content area start | free space | ----------- cells ----------|
+    let new_cell_content_area = cell_content_area + freeblocks_total_size;
+    turso_assert!(new_cell_content_area + (freeblock_1st - cell_content_area) <= usable_space as usize, "new cell content area offset extends beyond usable space: new_cell_content_area={new_cell_content_area} freeblock_1st={freeblock_1st} cell_content_area={cell_content_area} usable_space={usable_space}");
+
+    let copy_amount = freeblock_1st - cell_content_area; // cells to the left of the first freeblock
+    let buf = page.as_ptr();
+    buf.copy_within(
+        cell_content_area..cell_content_area + copy_amount,
+        new_cell_content_area,
+    );
+
+    // Freeblocks are now erased since the free space is at the beginning, but we must update the cell pointer array to point to the right locations.
+    let cell_count = page.cell_count();
+    let cell_pointer_array_offset = page.cell_pointer_array_offset_and_size().0;
+    for i in 0..cell_count {
+        let ptr_offset = cell_pointer_array_offset + (i * CELL_PTR_SIZE_BYTES);
+        let cell_ptr = page.read_u16(ptr_offset) as usize;
+        if cell_ptr < freeblock_1st {
+            // If the cell pointer was located before the first freeblock, we need to shift it right by the size of the merged freeblock
+            // since the space occupied by both the 1st and 2nd freeblocks was now moved to its left.
+            let new_offset = cell_ptr + freeblocks_total_size;
+            turso_assert!(new_offset <= usable_space as usize, "new offset beyond usable space: new_offset={new_offset} usable_space={usable_space}");
+            page.write_u16(ptr_offset, (cell_ptr + freeblocks_total_size) as u16);
+        } else if freeblock_2nd > 0 && cell_ptr < freeblock_2nd {
+            // If the cell pointer was located between the first and second freeblock, we need to shift it right by the size of only the second freeblock,
+            // since the first one was already on its left.
+            let new_offset = cell_ptr + freeblock_2nd_size;
+            turso_assert!(new_offset <= usable_space as usize, "new offset beyond usable space: new_offset={new_offset} usable_space={usable_space}");
+            page.write_u16(ptr_offset, (cell_ptr + freeblock_2nd_size) as u16);
+        }
+    }
+
+    // Update page header
+    page.write_u16(
+        offset::BTREE_CELL_CONTENT_AREA,
+        new_cell_content_area as u16,
+    );
+    page.write_u16(offset::BTREE_FIRST_FREEBLOCK, 0);
+
+    debug_validate_cells!(page, usable_space);
+
+    Ok(())
+}
+
+/// Defragment a page, and never use the fast-path algorithm.
+fn defragment_page_full(page: &PageContent, usable_space: u16) -> Result<()> {
+    defragment_page(page, usable_space, -1)
+}
+
 /// Defragment a page. This means packing all the cells to the end of the page.
-fn defragment_page(page: &PageContent, usable_space: u16) {
+fn defragment_page(page: &PageContent, usable_space: u16, max_frag_bytes: isize) -> Result<()> {
     debug_validate_cells!(page, usable_space);
     tracing::debug!("defragment_page");
+    // Use fast algorithm if there are at most 2 freeblocks and the total fragmented free space is less than max_frag_bytes.
+    if page.num_frag_free_bytes() as isize <= max_frag_bytes {
+        let freeblock_1st = page.first_freeblock() as usize;
+        if freeblock_1st == 0 {
+            // No freeblocks and very little if any fragmented free bytes -> no need to defragment.
+            return Ok(());
+        }
+        let freeblock_2nd = page.read_u16(freeblock_1st) as usize;
+        if freeblock_2nd == 0 {
+            return defragment_page_fast(page, usable_space, freeblock_1st, 0);
+        }
+        let freeblock_3rd = page.read_u16(freeblock_2nd) as usize;
+        if freeblock_3rd == 0 {
+            return defragment_page_fast(page, usable_space, freeblock_1st, freeblock_2nd);
+        }
+    }
+
     let cloned_page = page.clone();
     // TODO(pere): usable space should include offset probably
     let mut cbrk = usable_space;
@@ -6555,6 +6674,7 @@ fn defragment_page(page: &PageContent, usable_space: u16) {
     page.write_u16(offset::BTREE_FIRST_FREEBLOCK, 0);
     page.write_u8(offset::BTREE_FRAGMENTED_BYTES_COUNT, 0);
     debug_validate_cells!(page, usable_space);
+    Ok(())
 }
 
 #[cfg(debug_assertions)]
@@ -6600,11 +6720,11 @@ fn _insert_into_cell(
         page.page_type()
     );
     let already_has_overflow = !page.overflow_cells.is_empty();
+    let free = compute_free_space(page, usable_space);
     let enough_space = if already_has_overflow && !allow_regular_insert_despite_overflow {
         false
     } else {
         // otherwise, we need to check if we have enough space
-        let free = compute_free_space(page, usable_space);
         payload.len() + CELL_PTR_SIZE_BYTES <= free as usize
     };
     if !enough_space {
@@ -6620,7 +6740,8 @@ fn _insert_into_cell(
         "cell_idx > page.cell_count() without overflow cells"
     );
 
-    let new_cell_data_pointer = allocate_cell_space(page, payload.len() as u16, usable_space)?;
+    let new_cell_data_pointer =
+        allocate_cell_space(page, payload.len() as u16, usable_space, free)?;
     tracing::debug!(
         "insert_into_cell(idx={}, pc={}, size={})",
         cell_idx,
@@ -6748,38 +6869,58 @@ fn compute_free_space(page: &PageContent, usable_space: u16) -> u16 {
 }
 
 /// Allocate space for a cell on a page.
-fn allocate_cell_space(page_ref: &PageContent, amount: u16, usable_space: u16) -> Result<u16> {
+fn allocate_cell_space(
+    page_ref: &PageContent,
+    amount: u16,
+    usable_space: u16,
+    free_space: u16,
+) -> Result<u16> {
     let mut amount = amount as usize;
     if amount < MINIMUM_CELL_SIZE {
         amount = MINIMUM_CELL_SIZE;
     }
 
-    let (cell_offset, _) = page_ref.cell_pointer_array_offset_and_size();
-    let gap = cell_offset + 2 * page_ref.cell_count();
-    let mut top = page_ref.cell_content_area() as usize;
+    let unallocated_region_start = page_ref.unallocated_region_start();
+    let mut cell_content_area_start = page_ref.cell_content_area() as usize;
 
-    // there are free blocks and enough space
-    if page_ref.first_freeblock() != 0 && gap + 2 <= top {
+    // there are free blocks and enough space to fit a new 2-byte cell pointer
+    if page_ref.first_freeblock() != 0
+        && unallocated_region_start + CELL_PTR_SIZE_BYTES <= cell_content_area_start
+    {
         // find slot
         let pc = find_free_cell(page_ref, usable_space, amount)?;
         if pc != 0 {
+            // we can fit the cell in a freeblock.
             return Ok(pc as u16);
         }
         /* fall through, we might need to defragment */
     }
 
-    if gap + 2 + amount > top {
-        // defragment
-        defragment_page(page_ref, usable_space);
-        top = page_ref.read_u16(offset::BTREE_CELL_CONTENT_AREA) as usize;
+    // We know at this point that we have no freeblocks in the middle of the cell content area
+    // that can fit the cell, but we do know we have enough space to _somehow_ fit it.
+    // The check below sees whether we can just put the cell in the unallocated region.
+    if unallocated_region_start + CELL_PTR_SIZE_BYTES + amount > cell_content_area_start {
+        // There's no room in the unallocated region, so we need to defragment.
+        // max_frag_bytes is a parameter to defragment_page() that controls whether we are able to use
+        // the fast-path defragmentation. The calculation here is done to see whether we can merge 1-2 freeblocks
+        // and move them to the unallocated region and fit the cell that way.
+        // Basically: if we have exactly enough space for the cell and the cell pointer on the page,
+        // we cannot have any fragmented space because then the freeblocks would not fit the cell.
+        let max_frag_bytes = 4.min(free_space as isize - (CELL_PTR_SIZE_BYTES + amount) as isize);
+        defragment_page(page_ref, usable_space, max_frag_bytes)?;
+        cell_content_area_start = page_ref.cell_content_area() as usize;
     }
 
-    top -= amount;
+    // insert the cell -> content area start moves left by that amount.
+    cell_content_area_start -= amount;
+    page_ref.write_u16(
+        offset::BTREE_CELL_CONTENT_AREA,
+        cell_content_area_start as u16,
+    );
 
-    page_ref.write_u16(offset::BTREE_CELL_CONTENT_AREA, top as u16);
-
-    assert!(top + amount <= usable_space as usize);
-    Ok(top as u16)
+    assert!(cell_content_area_start + amount <= usable_space as usize);
+    // we can just return the start of the cell content area, since the cell is inserted to the very left of the cell content area.
+    Ok(cell_content_area_start as u16)
 }
 
 #[derive(Debug, Clone)]
@@ -8652,7 +8793,7 @@ mod tests {
             ensure_cell(page, i, &cell.payload);
         }
 
-        defragment_page(page, usable_space);
+        defragment_page(page, usable_space, 4).unwrap();
 
         for (i, cell) in cells.iter().enumerate() {
             ensure_cell(page, i, &cell.payload);
@@ -8699,7 +8840,7 @@ mod tests {
             ensure_cell(page, i, &cell.payload);
         }
 
-        defragment_page(page, usable_space);
+        defragment_page(page, usable_space, 4).unwrap();
 
         for (i, cell) in cells.iter().enumerate() {
             ensure_cell(page, i, &cell.payload);
@@ -8770,7 +8911,7 @@ mod tests {
                     cells.remove(cell_idx);
                 }
                 2 => {
-                    defragment_page(page, usable_space);
+                    defragment_page(page, usable_space, 4).unwrap();
                 }
                 3 => {
                     // check cells
@@ -8855,7 +8996,7 @@ mod tests {
                         cells.remove(cell_idx);
                     }
                     2 => {
-                        defragment_page(page, usable_space);
+                        defragment_page(page, usable_space, 4).unwrap();
                     }
                     _ => unreachable!(),
                 }
@@ -8997,7 +9138,7 @@ mod tests {
         let payload = add_record(0, 0, page, record, &conn);
 
         assert_eq!(page.cell_count(), 1);
-        defragment_page(page, usable_space);
+        defragment_page(page, usable_space, 4).unwrap();
         assert_eq!(page.cell_count(), 1);
         let (start, len) = page.cell_get_raw_region(0, usable_space as usize);
         let buf = page.as_ptr();
@@ -9113,7 +9254,7 @@ mod tests {
         let _ = add_record(0, 0, page, record, &conn);
         drop_cell(page, 0, usable_space).unwrap();
 
-        defragment_page(page, usable_space);
+        defragment_page(page, usable_space, 4).unwrap();
 
         let regs = &[Register::Value(Value::Integer(0))];
         let record = ImmutableRecord::from_registers(regs, regs.len());
@@ -9142,7 +9283,7 @@ mod tests {
             drop_cell(page, pos, usable_space).unwrap();
         };
         let defragment = |page| {
-            defragment_page(page, usable_space);
+            defragment_page(page, usable_space, 4).unwrap();
         };
         let page = page.get();
         defragment(page.get_contents());
@@ -9183,7 +9324,7 @@ mod tests {
             drop_cell(page, pos, usable_space).unwrap();
         };
         let defragment = |page| {
-            defragment_page(page, usable_space);
+            defragment_page(page, usable_space, 4).unwrap();
         };
         let regs = &[Register::Value(Value::Integer(0))];
         let record = ImmutableRecord::from_registers(regs, regs.len());
