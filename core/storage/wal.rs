@@ -20,8 +20,9 @@ use crate::fast_lock::SpinLock;
 use crate::io::{File, IO};
 use crate::result::LimboResult;
 use crate::storage::sqlite3_ondisk::{
-    begin_read_wal_frame, begin_read_wal_frame_raw, finish_read_page, prepare_wal_frame,
-    write_pages_vectored, WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE,
+    begin_read_wal_frame, begin_read_wal_frame_raw, finish_read_page,
+    prepare_contiguous_wal_frames, prepare_wal_frame, write_pages_vectored, WAL_FRAME_HEADER_SIZE,
+    WAL_HEADER_SIZE,
 };
 use crate::types::IOResult;
 use crate::{turso_assert, Buffer, LimboError, Result};
@@ -256,6 +257,13 @@ pub trait Wal {
         &mut self,
         page: PageRef,
         db_size: u32,
+        write_counter: Rc<RefCell<usize>>,
+    ) -> Result<Completion>;
+
+    fn append_contiguous_frames(
+        &mut self,
+        // (page_number, db_size, page)
+        pages: &[(u32, u32, Arc<Page>)],
         write_counter: Rc<RefCell<usize>>,
     ) -> Result<Completion>;
 
@@ -1056,6 +1064,55 @@ impl Wal for WalFile {
             (result.unwrap(), frame_checksums)
         };
         self.complete_append_frame(page_id as u64, frame_id, checksums);
+        Ok(c)
+    }
+
+    fn append_contiguous_frames(
+        &mut self,
+        // (page_number, db_size, page)
+        pages: &[(u32, u32, Arc<Page>)],
+        write_counter: Rc<RefCell<usize>>,
+    ) -> Result<Completion> {
+        let shared = self.get_shared();
+        if shared.max_frame.load(Ordering::SeqCst).eq(&0) {
+            self.ensure_header_if_needed()?;
+        }
+        let first_frame_id = self.max_frame + 1;
+        let offset = self.frame_offset(first_frame_id);
+        tracing::debug!(first_frame_id, offset);
+
+        let (c, checksums) = {
+            let shared = self.get_shared();
+            let header = shared.wal_header.clone();
+            let header = header.lock();
+            let checksums = self.last_checksum;
+            let (frame_checksums, frame_bytes) =
+                prepare_contiguous_wal_frames(&header, checksums, header.page_size, pages);
+
+            *write_counter.borrow_mut() += 1;
+            let c = Completion::new_write({
+                let frame_bytes = frame_bytes.clone();
+                let write_counter = write_counter.clone();
+                move |bytes_written| {
+                    let frame_len = frame_bytes.borrow().len();
+                    turso_assert!(
+                        bytes_written == frame_len as i32,
+                        "wrote({bytes_written}) != expected({frame_len})"
+                    );
+                    *write_counter.borrow_mut() -= 1;
+                }
+            });
+            let result = shared.file.pwrite(offset, frame_bytes.clone(), c);
+            if let Err(err) = result {
+                *write_counter.borrow_mut() -= 1;
+                return Err(err);
+            }
+            (result.unwrap(), frame_checksums)
+        };
+
+        for (i, (page_number, _, _)) in pages.iter().enumerate() {
+            self.complete_append_frame(*page_number as u64, first_frame_id + i as u64, checksums);
+        }
         Ok(c)
     }
 

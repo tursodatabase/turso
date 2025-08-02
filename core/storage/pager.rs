@@ -264,11 +264,15 @@ enum CacheFlushState {
 enum CommitState {
     /// Idle.
     Start,
-    /// Append a single frame to the WAL.
-    AppendFrame { current_page_to_append_idx: usize },
-    /// Wait for append frame to complete.
-    /// If the current page is the last page to append, sync wal and clear dirty pages and cache.
-    WaitAppendFrame { current_page_to_append_idx: usize },
+    /// Append a contiguous range of non-commit frames to the WAL in a single write.
+    AppendNonCommitFrames { first_frame_idx: usize },
+    WaitAppendNonCommitFrames {
+        next_non_commit_frame_idx: Option<usize>,
+    },
+    /// Append a single commit frame to the WAL. This is always the last frame in the dirty pages list.
+    AppendCommitFrame,
+    /// Wait for appended commit frame to complete.
+    WaitAppendCommitFrame,
     /// Fsync the on-disk WAL.
     SyncWal,
     /// Checkpoint the WAL to the database file (if needed).
@@ -1156,65 +1160,73 @@ impl Pager {
                     let mut commit_info = self.commit_info.borrow_mut();
                     if dirty_pages.is_empty() {
                         return Ok(IOResult::Done(PagerCommitResult::WalWritten));
+                    } else if dirty_pages.len() == 1 {
+                        commit_info.dirty_pages = dirty_pages;
+                        commit_info.state = CommitState::AppendCommitFrame;
+                        return Ok(IOResult::IO);
                     } else {
                         commit_info.dirty_pages = dirty_pages;
-                        commit_info.state = CommitState::AppendFrame {
-                            current_page_to_append_idx: 0,
-                        };
+                        commit_info.state =
+                            CommitState::AppendNonCommitFrames { first_frame_idx: 0 };
+                        return Ok(IOResult::IO);
                     }
                 }
-                CommitState::AppendFrame {
-                    current_page_to_append_idx,
-                } => {
-                    let page_id = self.commit_info.borrow().dirty_pages[current_page_to_append_idx];
-                    let is_last_frame = current_page_to_append_idx
-                        == self.commit_info.borrow().dirty_pages.len() - 1;
-                    let page = {
-                        let mut cache = self.page_cache.write();
-                        let page_key = PageCacheKey::new(page_id);
-                        let page = cache.get(&page_key).unwrap_or_else(|| {
-                            panic!(
-                                "we somehow added a page to dirty list but we didn't mark it as dirty, causing cache to drop it. page={page_id}"
-                            )
-                        });
-                        let page_type = page.get().contents.as_ref().unwrap().maybe_page_type();
-                        trace!(
-                            "commit_dirty_pages(page={}, page_type={:?}",
-                            page_id,
-                            page_type
-                        );
-                        page
-                    };
-
-                    let db_size = {
-                        let db_size = self
-                            .io
-                            .block(|| self.with_header(|header| header.database_size))?
-                            .get();
-                        if is_last_frame {
-                            db_size
-                        } else {
-                            0
-                        }
-                    };
-                    let _c = wal.borrow_mut().append_frame(
-                        page.clone(),
-                        db_size,
+                CommitState::AppendNonCommitFrames { first_frame_idx } => {
+                    let frames_count = self.commit_info.borrow().dirty_pages.len();
+                    const MAX_FRAMES_PER_WRITE: usize = 20;
+                    // Never take the last frame as we write the last (commit) frame separately for durability reasons.
+                    let frames_to_write =
+                        (frames_count - 1 - first_frame_idx).min(MAX_FRAMES_PER_WRITE);
+                    let pages = self.commit_info.borrow().dirty_pages.iter().skip(first_frame_idx).take(frames_to_write).map(|page_id| {
+                        let page = {
+                            let mut cache = self.page_cache.write();
+                            let page_key = PageCacheKey::new(*page_id);
+                            let page = cache.get(&page_key).unwrap_or_else(|| {
+                                panic!(
+                                    "we somehow added a page to dirty list but we didn't mark it as dirty, causing cache to drop it. page={page_id}"
+                                )
+                            });
+                            page
+                        };
+                        (*page_id as u32, 0, page.clone())
+                    }).collect::<Vec<(u32, u32, Arc<Page>)>>();
+                    let _c = wal.borrow_mut().append_contiguous_frames(
+                        &pages,
                         self.commit_info.borrow().in_flight_writes.clone(),
                     )?;
-                    self.commit_info.borrow_mut().state = CommitState::WaitAppendFrame {
-                        current_page_to_append_idx,
+                    let next_non_commit_frame_idx = first_frame_idx + frames_to_write;
+                    self.commit_info.borrow_mut().state = CommitState::WaitAppendNonCommitFrames {
+                        next_non_commit_frame_idx: if next_non_commit_frame_idx < frames_count - 1 {
+                            Some(next_non_commit_frame_idx)
+                        } else {
+                            None
+                        },
                     };
+                    return Ok(IOResult::IO);
                 }
-                CommitState::WaitAppendFrame {
-                    current_page_to_append_idx,
+                CommitState::WaitAppendNonCommitFrames {
+                    next_non_commit_frame_idx,
                 } => {
                     let in_flight = self.commit_info.borrow().in_flight_writes.clone();
                     if *in_flight.borrow() > 0 {
                         return Ok(IOResult::IO);
                     }
-                    // First clear dirty
-                    let page_id = self.commit_info.borrow().dirty_pages[current_page_to_append_idx];
+
+                    match next_non_commit_frame_idx {
+                        Some(next_non_commit_frame_idx) => {
+                            self.commit_info.borrow_mut().state =
+                                CommitState::AppendNonCommitFrames {
+                                    first_frame_idx: next_non_commit_frame_idx,
+                                };
+                        }
+                        None => {
+                            self.commit_info.borrow_mut().state = CommitState::AppendCommitFrame;
+                        }
+                    }
+                    return Ok(IOResult::IO);
+                }
+                CommitState::AppendCommitFrame => {
+                    let page_id = *self.commit_info.borrow().dirty_pages.last().unwrap();
                     let page = {
                         let mut cache = self.page_cache.write();
                         let page_key = PageCacheKey::new(page_id);
@@ -1231,19 +1243,40 @@ impl Pager {
                         );
                         page
                     };
-                    page.clear_dirty();
 
-                    // Now advance to next page if there are more
-                    let is_last_frame = current_page_to_append_idx
-                        == self.commit_info.borrow().dirty_pages.len() - 1;
-                    if is_last_frame {
-                        self.dirty_pages.borrow_mut().clear();
-                        self.commit_info.borrow_mut().state = CommitState::SyncWal;
-                    } else {
-                        self.commit_info.borrow_mut().state = CommitState::AppendFrame {
-                            current_page_to_append_idx: current_page_to_append_idx + 1,
-                        }
+                    let db_size = self
+                        .io
+                        .block(|| self.with_header(|header| header.database_size))?
+                        .get();
+                    let _c = wal.borrow_mut().append_frame(
+                        page.clone(),
+                        db_size,
+                        self.commit_info.borrow().in_flight_writes.clone(),
+                    )?;
+                    self.commit_info.borrow_mut().state = CommitState::WaitAppendCommitFrame;
+                }
+                CommitState::WaitAppendCommitFrame => {
+                    let in_flight = self.commit_info.borrow().in_flight_writes.clone();
+                    if *in_flight.borrow() > 0 {
+                        return Ok(IOResult::IO);
                     }
+                    // First clear dirty
+                    for page_id in self.commit_info.borrow().dirty_pages.iter() {
+                        let page = {
+                            let mut cache = self.page_cache.write();
+                            let page_key = PageCacheKey::new(*page_id);
+                            let page = cache.get(&page_key).unwrap_or_else(|| {
+                                panic!(
+                                    "we somehow added a page to dirty list but we didn't mark it as dirty, causing cache to drop it. page={page_id}"
+                                )
+                            });
+                            page
+                        };
+                        page.clear_dirty();
+                    }
+
+                    self.dirty_pages.borrow_mut().clear();
+                    self.commit_info.borrow_mut().state = CommitState::SyncWal;
                 }
                 CommitState::SyncWal => {
                     return_if_io!(wal.borrow_mut().sync());
