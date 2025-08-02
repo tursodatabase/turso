@@ -11,7 +11,8 @@ use crate::{
             LEAF_PAGE_HEADER_SIZE_BYTES, LEFT_CHILD_PTR_SIZE_BYTES,
         },
         state_machines::{
-            AdvanceState, EmptyTableState, MoveToRightState, RewindState, SeekToLastState,
+            AdvanceState, CountState, EmptyTableState, MoveToRightState, RewindState,
+            SeekToLastState,
         },
     },
     translate::plan::IterationDirection,
@@ -583,6 +584,8 @@ pub struct BTreeCursor {
     rewind_state: RewindState,
     /// State machine for [BTreeCursor::next] and [BTreeCursor::prev]
     advance_state: AdvanceState,
+    /// State machine for [BTreeCursor::count]
+    count_state: CountState,
 }
 
 /// We store the cell index and cell count for each page in the stack.
@@ -642,6 +645,7 @@ impl BTreeCursor {
             seek_to_last_state: SeekToLastState::Start,
             rewind_state: RewindState::Start,
             advance_state: AdvanceState::Start,
+            count_state: CountState::Start,
         }
     }
 
@@ -5365,10 +5369,6 @@ impl BTreeCursor {
     /// Only supposed to be used in the context of a simple Count Select Statement
     #[instrument(skip(self), level = Level::DEBUG)]
     pub fn count(&mut self) -> Result<IOResult<usize>> {
-        if self.count == 0 {
-            let _c = self.move_to_root()?;
-        }
-
         if let Some(_mv_cursor) = &self.mv_cursor {
             todo!("Implement count for mvcc");
         }
@@ -5378,76 +5378,93 @@ impl BTreeCursor {
         let mut contents;
 
         loop {
-            mem_page_rc = self.stack.top();
-            return_if_locked_maybe_load!(self.pager, mem_page_rc);
-            mem_page = mem_page_rc.get();
-            contents = mem_page.get().contents.as_ref().unwrap();
+            let state = self.count_state;
+            match state {
+                CountState::Start => {
+                    let _c = self.move_to_root()?;
+                    self.count_state = CountState::Loop;
+                    return Ok(IOResult::IO);
+                }
+                CountState::Loop => {
+                    mem_page_rc = self.stack.top();
+                    mem_page = mem_page_rc.get();
+                    turso_assert!(mem_page.is_loaded(), "page should be loaded");
+                    contents = mem_page.get().contents.as_ref().unwrap();
 
-            /* If this is a leaf page or the tree is not an int-key tree, then
-             ** this page contains countable entries. Increment the entry counter
-             ** accordingly.
-             */
-            if !matches!(contents.page_type(), PageType::TableInterior) {
-                self.count += contents.cell_count();
-            }
-
-            self.stack.advance();
-            let cell_idx = self.stack.current_cell_index() as usize;
-
-            // Second condition is necessary in case we return if the page is locked in the loop below
-            if contents.is_leaf() || cell_idx > contents.cell_count() {
-                loop {
-                    if !self.stack.has_parent() {
-                        // All pages of the b-tree have been visited. Return successfully
-                        let _c = self.move_to_root()?;
-
-                        return Ok(IOResult::Done(self.count));
+                    /* If this is a leaf page or the tree is not an int-key tree, then
+                     ** this page contains countable entries. Increment the entry counter
+                     ** accordingly.
+                     */
+                    if !matches!(contents.page_type(), PageType::TableInterior) {
+                        self.count += contents.cell_count();
                     }
 
-                    // Move to parent
-                    self.stack.pop();
+                    self.stack.advance();
+                    let cell_idx = self.stack.current_cell_index() as usize;
 
-                    mem_page_rc = self.stack.top();
-                    return_if_locked_maybe_load!(self.pager, mem_page_rc);
-                    mem_page = mem_page_rc.get();
-                    contents = mem_page.get().contents.as_ref().unwrap();
+                    // Second condition is necessary in case we return if the page is locked in the loop below
+                    if contents.is_leaf() || cell_idx > contents.cell_count() {
+                        loop {
+                            if !self.stack.has_parent() {
+                                // All pages of the b-tree have been visited. Return successfully
+                                let _c = self.move_to_root()?;
+                                self.count_state = CountState::Finish;
+                                return Ok(IOResult::IO);
+                            }
+
+                            // Move to parent
+                            self.stack.pop();
+
+                            mem_page_rc = self.stack.top();
+                            mem_page = mem_page_rc.get();
+                            turso_assert!(mem_page.is_loaded(), "page should be loaded");
+                            contents = mem_page.get().contents.as_ref().unwrap();
+
+                            let cell_idx = self.stack.current_cell_index() as usize;
+
+                            if cell_idx <= contents.cell_count() {
+                                break;
+                            }
+                        }
+                    }
 
                     let cell_idx = self.stack.current_cell_index() as usize;
 
-                    if cell_idx <= contents.cell_count() {
-                        break;
+                    assert!(cell_idx <= contents.cell_count(),);
+                    assert!(!contents.is_leaf());
+
+                    if cell_idx == contents.cell_count() {
+                        // Move to right child
+                        // should be safe as contents is not a leaf page
+                        let right_most_pointer = contents.rightmost_pointer().unwrap();
+                        self.stack.advance();
+                        let (mem_page, _c) = self.read_page(right_most_pointer as usize)?;
+                        self.stack.push(mem_page);
+                        return Ok(IOResult::IO);
+                    } else {
+                        // Move to child left page
+                        let cell = contents.cell_get(cell_idx, self.usable_space())?;
+
+                        match cell {
+                            BTreeCell::TableInteriorCell(TableInteriorCell {
+                                left_child_page,
+                                ..
+                            })
+                            | BTreeCell::IndexInteriorCell(IndexInteriorCell {
+                                left_child_page,
+                                ..
+                            }) => {
+                                self.stack.advance();
+                                let (mem_page, _c) = self.read_page(left_child_page as usize)?;
+                                self.stack.push(mem_page);
+                                return Ok(IOResult::IO);
+                            }
+                            _ => unreachable!(),
+                        }
                     }
                 }
-            }
-
-            let cell_idx = self.stack.current_cell_index() as usize;
-
-            assert!(cell_idx <= contents.cell_count(),);
-            assert!(!contents.is_leaf());
-
-            if cell_idx == contents.cell_count() {
-                // Move to right child
-                // should be safe as contents is not a leaf page
-                let right_most_pointer = contents.rightmost_pointer().unwrap();
-                self.stack.advance();
-                let (mem_page, _c) = self.read_page(right_most_pointer as usize)?;
-                self.stack.push(mem_page);
-            } else {
-                // Move to child left page
-                let cell = contents.cell_get(cell_idx, self.usable_space())?;
-
-                match cell {
-                    BTreeCell::TableInteriorCell(TableInteriorCell {
-                        left_child_page, ..
-                    })
-                    | BTreeCell::IndexInteriorCell(IndexInteriorCell {
-                        left_child_page, ..
-                    }) => {
-                        self.stack.advance();
-                        let (mem_page, _c) = self.read_page(left_child_page as usize)?;
-                        self.stack.push(mem_page);
-                    }
-                    _ => unreachable!(),
+                CountState::Finish => {
+                    return Ok(IOResult::Done(self.count));
                 }
             }
         }

@@ -29,3 +29,10 @@ pub enum AdvanceState {
     Start,
     Advance,
 }
+
+#[derive(Debug, Clone, Copy)]
+pub enum CountState {
+    Start,
+    Loop,
+    Finish,
+}
