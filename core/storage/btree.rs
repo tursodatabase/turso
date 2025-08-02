@@ -10,7 +10,9 @@ use crate::{
             TableInteriorCell, TableLeafCell, CELL_PTR_SIZE_BYTES, INTERIOR_PAGE_HEADER_SIZE_BYTES,
             LEAF_PAGE_HEADER_SIZE_BYTES, LEFT_CHILD_PTR_SIZE_BYTES,
         },
-        state_machines::{EmptyTableState, MoveToRightState, RewindState, SeekToLastState},
+        state_machines::{
+            AdvanceState, EmptyTableState, MoveToRightState, RewindState, SeekToLastState,
+        },
     },
     translate::plan::IterationDirection,
     turso_assert,
@@ -579,6 +581,8 @@ pub struct BTreeCursor {
     seek_to_last_state: SeekToLastState,
     /// State machine for [BTreeCursor::rewind]
     rewind_state: RewindState,
+    /// State machine for [BTreeCursor::next] and [BTreeCursor::prev]
+    advance_state: AdvanceState,
 }
 
 /// We store the cell index and cell count for each page in the stack.
@@ -637,6 +641,7 @@ impl BTreeCursor {
             move_to_right_state: MoveToRightState::Start,
             seek_to_last_state: SeekToLastState::Start,
             rewind_state: RewindState::Start,
+            advance_state: AdvanceState::Start,
         }
     }
 
@@ -4258,11 +4263,21 @@ impl BTreeCursor {
 
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn next(&mut self) -> Result<IOResult<bool>> {
-        return_if_io!(self.restore_context());
-        let cursor_has_record = return_if_io!(self.get_next_record());
-        self.has_record.replace(cursor_has_record);
-        self.invalidate_record();
-        Ok(IOResult::Done(cursor_has_record))
+        loop {
+            match self.advance_state {
+                AdvanceState::Start => {
+                    return_if_io!(self.restore_context());
+                    self.advance_state = AdvanceState::Advance;
+                }
+                AdvanceState::Advance => {
+                    let cursor_has_record = return_if_io!(self.get_next_record());
+                    self.has_record.replace(cursor_has_record);
+                    self.invalidate_record();
+                    self.advance_state = AdvanceState::Start;
+                    return Ok(IOResult::Done(cursor_has_record));
+                }
+            }
+        }
     }
 
     fn invalidate_record(&mut self) {
@@ -4276,11 +4291,21 @@ impl BTreeCursor {
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn prev(&mut self) -> Result<IOResult<bool>> {
         assert!(self.mv_cursor.is_none());
-        return_if_io!(self.restore_context());
-        let cursor_has_record = return_if_io!(self.get_prev_record());
-        self.has_record.replace(cursor_has_record);
-        self.invalidate_record();
-        Ok(IOResult::Done(cursor_has_record))
+        loop {
+            match self.advance_state {
+                AdvanceState::Start => {
+                    return_if_io!(self.restore_context());
+                    self.advance_state = AdvanceState::Advance;
+                }
+                AdvanceState::Advance => {
+                    let cursor_has_record = return_if_io!(self.get_prev_record());
+                    self.has_record.replace(cursor_has_record);
+                    self.invalidate_record();
+                    self.advance_state = AdvanceState::Start;
+                    return Ok(IOResult::Done(cursor_has_record));
+                }
+            }
+        }
     }
 
     #[instrument(skip(self), level = Level::DEBUG)]
