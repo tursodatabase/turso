@@ -246,7 +246,7 @@ pub struct ProgramState {
     regex_cache: RegexCache,
     pub(crate) mv_tx_id: Option<crate::mvcc::database::TxID>,
     interrupted: bool,
-    parameters: HashMap<NonZero<usize>, Value>,
+    pub parameters: HashMap<NonZero<usize>, Value>,
     commit_state: CommitState,
     #[cfg(feature = "json")]
     json_cache: JsonCacheCell,
@@ -380,6 +380,7 @@ pub struct Program {
     pub change_cnt_on: bool,
     pub result_columns: Vec<ResultSetColumn>,
     pub table_references: TableReferences,
+    pub sql: String,
 }
 
 impl Program {

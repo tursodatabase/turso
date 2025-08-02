@@ -42,6 +42,7 @@ mod numeric;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+use crate::storage::header_accessor::HeaderRef;
 use crate::translate::optimizer::optimize_plan;
 use crate::translate::pragma::TURSO_CDC_DEFAULT_TABLE_NAME;
 #[cfg(feature = "fs")]
@@ -310,7 +311,10 @@ impl Database {
             let pager = conn.pager.borrow().clone();
 
             db.with_schema_mut(|schema| {
-                schema.schema_version = get_schema_version(&conn)?;
+                let header_ref = pager.io.block(|| HeaderRef::from_pager(&pager))?;
+                let header = header_ref.borrow();
+                let header_schema_cookie = header.schema_cookie.get();
+                schema.schema_version = header_schema_cookie;
                 let result = schema
                     .make_from_btree(None, pager.clone(), &syms)
                     .or_else(|e| {
@@ -505,7 +509,6 @@ impl Database {
         let schema = Arc::make_mut(&mut *schema_ref);
         f(schema)
     }
-
     pub(crate) fn clone_schema(&self) -> Result<Arc<Schema>> {
         let schema = self.schema.lock().map_err(|_| LimboError::SchemaLocked)?;
         Ok(schema.clone())
@@ -532,50 +535,6 @@ impl Database {
 
     pub fn get_mv_store(&self) -> Option<&Arc<MvStore>> {
         self.mv_store.as_ref()
-    }
-}
-
-fn get_schema_version(conn: &Arc<Connection>) -> Result<u32> {
-    let mut rows = conn
-        .query("PRAGMA schema_version")?
-        .ok_or(LimboError::InternalError(
-            "failed to parse pragma schema_version on initialization".to_string(),
-        ))?;
-    let mut schema_version = None;
-    loop {
-        match rows.step()? {
-            StepResult::Row => {
-                let row = rows.row().unwrap();
-                if schema_version.is_some() {
-                    return Err(LimboError::InternalError(
-                        "PRAGMA schema_version; returned more that one row".to_string(),
-                    ));
-                }
-                schema_version = Some(row.get::<i64>(0)? as u32);
-            }
-            StepResult::IO => {
-                rows.run_once()?;
-            }
-            StepResult::Interrupt => {
-                return Err(LimboError::InternalError(
-                    "PRAGMA schema_version; returned more that one row".to_string(),
-                ));
-            }
-            StepResult::Done => {
-                if let Some(version) = schema_version {
-                    return Ok(version);
-                } else {
-                    return Err(LimboError::InternalError(
-                        "failed to get schema_version".to_string(),
-                    ));
-                }
-            }
-            StepResult::Busy => {
-                return Err(LimboError::InternalError(
-                    "PRAGMA schema_version; returned more that one row".to_string(),
-                ));
-            }
-        }
     }
 }
 
@@ -796,7 +755,7 @@ impl Connection {
         let pager = self.pager.borrow().clone();
         match cmd {
             Cmd::Stmt(stmt) => {
-                let program = Rc::new(translate::translate(
+                let program = translate::translate(
                     self.schema.borrow().deref(),
                     stmt,
                     pager.clone(),
@@ -804,7 +763,7 @@ impl Connection {
                     &syms,
                     QueryMode::Normal,
                     input,
-                )?);
+                )?;
                 Ok(Statement::new(program, self._db.mv_store.clone(), pager))
             }
             _ => unreachable!(),
@@ -815,55 +774,77 @@ impl Connection {
     /// This function must be called outside of any transaction because internally it will start transaction session by itself
     fn maybe_reparse_schema(self: &Arc<Connection>) -> Result<()> {
         let pager = self.pager.borrow().clone();
+        let conn_schema_version = self.schema.borrow().schema_version;
 
         // first, quickly read schema_version from the root page in order to check if schema changed
         pager.begin_read_tx()?;
         let db_schema_version = pager
             .io
             .block(|| pager.with_header(|header| header.schema_cookie));
-        pager.end_read_tx().expect("read txn must be finished");
 
-        let db_schema_version = db_schema_version?.get();
-        let conn_schema_version = self.schema.borrow().schema_version;
+        let db_schema_version = match db_schema_version {
+            Ok(db_schema_version) => db_schema_version.get(),
+            Err(LimboError::Page1NotAlloc) => {
+                // this means this is a fresh db, so return a schema version of 0
+                0
+            }
+            Err(err) => {
+                pager.end_read_tx().expect("read txn must be finished");
+                return Err(err);
+            }
+        };
         turso_assert!(
             conn_schema_version <= db_schema_version,
             "connection schema_version can't be larger than db schema_version: {} vs {}",
             conn_schema_version,
             db_schema_version
         );
+        pager.end_read_tx().expect("read txn must be finished");
 
         // if schema_versions matches - exit early
         if conn_schema_version == db_schema_version {
             return Ok(());
         }
-
         // maybe_reparse_schema must be called outside of any transaction
         turso_assert!(
             self.transaction_state.get() == TransactionState::None,
             "unexpected start transaction"
         );
+        self.reparse_schema()
+    }
+
+    fn reparse_schema(self: &Arc<Connection>) -> Result<()> {
+        let pager = self.pager.borrow().clone();
 
         // reparse logic extracted to the function in order to not accidentally propagate error from it before closing transaction
         let reparse = || -> Result<()> {
+            // read cookie before consuming statement program - otherwise we can end up reading cookie with closed transaction state
+            let cookie = pager
+                .io
+                .block(|| pager.with_header(|header| header.schema_cookie))?
+                .get();
+
+            // create fresh schema as some objects can be deleted
+            let mut fresh = Schema::new(self.schema.borrow().indexes_enabled);
+            fresh.schema_version = cookie;
+
+            // TODO: this is hack to avoid a cyclical problem with schema reprepare
+            // The problem here is that we prepare a statement here, but when the statement tries
+            // to execute it, it first checks the schema cookie to see if it needs to reprepare the statement.
+            // But in this occasion it will always reprepare, and we get an error. So we trick the statement by swapping our schema
+            // with a new clean schema that has the same header cookie.
+            self.with_schema_mut(|schema| {
+                *schema = fresh.clone();
+            });
+
             let stmt = self.prepare("SELECT * FROM sqlite_schema")?;
-            self.with_schema_mut(|schema| -> Result<()> {
-                // create fresh schema as some objects can be deleted
-                let mut fresh = Schema::new(false); // todo: indices!
 
-                // read cookie before consuming statement program - otherwise we can end up reading cookie with closed transaction state
-                let cookie = pager
-                    .io
-                    .block(|| pager.with_header(|header| header.schema_cookie))?
-                    .get();
+            // TODO: This function below is synchronous, make it async
+            parse_schema_rows(stmt, &mut fresh, &self.syms.borrow(), None)?;
 
-                // TODO: This function below is synchronous, make it async
-                parse_schema_rows(stmt, &mut fresh, &self.syms.borrow(), None)?;
-
+            self.with_schema_mut(|schema| {
                 *schema = fresh;
-                schema.schema_version = cookie;
-
-                Result::Ok(())
-            })?;
+            });
             Result::Ok(())
         };
 
@@ -985,7 +966,7 @@ impl Connection {
                     cmd.into(),
                     input,
                 )?;
-                let stmt = Statement::new(program.into(), self._db.mv_store.clone(), pager);
+                let stmt = Statement::new(program, self._db.mv_store.clone(), pager);
                 Ok(Some(stmt))
             }
             Cmd::ExplainQueryPlan(stmt) => {
@@ -1132,7 +1113,7 @@ impl Connection {
             .lock()
             .map_err(|_| LimboError::SchemaLocked)?;
         if matches!(self.transaction_state.get(), TransactionState::None)
-            && current_schema_version < schema.schema_version
+            && current_schema_version != schema.schema_version
         {
             self.schema.replace(schema.clone());
         }
@@ -1202,7 +1183,8 @@ impl Connection {
         }
 
         // let's re-parse schema from scratch if schema cookie changed compared to the our in-memory view of schema
-        self.maybe_reparse_schema()
+        self.maybe_reparse_schema()?;
+        Ok(())
     }
 
     /// Flush dirty pages to disk.
@@ -1712,18 +1694,14 @@ impl Connection {
 }
 
 pub struct Statement {
-    program: Rc<vdbe::Program>,
+    program: vdbe::Program,
     state: vdbe::ProgramState,
     mv_store: Option<Arc<MvStore>>,
     pager: Rc<Pager>,
 }
 
 impl Statement {
-    pub fn new(
-        program: Rc<vdbe::Program>,
-        mv_store: Option<Arc<MvStore>>,
-        pager: Rc<Pager>,
-    ) -> Self {
+    pub fn new(program: vdbe::Program, mv_store: Option<Arc<MvStore>>, pager: Rc<Pager>) -> Self {
         let state = vdbe::ProgramState::new(program.max_registers, program.cursor_ref.len());
         Self {
             program,
@@ -1746,8 +1724,54 @@ impl Statement {
     }
 
     pub fn step(&mut self) -> Result<StepResult> {
-        self.program
-            .step(&mut self.state, self.mv_store.clone(), self.pager.clone())
+        const MAX_SCHEMA_RETRY: usize = 50;
+        let mut res = self
+            .program
+            .step(&mut self.state, self.mv_store.clone(), self.pager.clone());
+        for _ in 0..MAX_SCHEMA_RETRY {
+            // Only reprepare if we still need to update schema
+            if !matches!(res, Err(LimboError::SchemaUpdated)) {
+                break;
+            }
+            self.reprepare()?;
+            res = self
+                .program
+                .step(&mut self.state, self.mv_store.clone(), self.pager.clone());
+        }
+
+        res
+    }
+
+    fn reprepare(&mut self) -> Result<()> {
+        let conn = self.program.connection.clone();
+        *conn.schema.borrow_mut() = conn._db.clone_schema()?;
+        self.program = {
+            let mut parser = Parser::new(self.program.sql.as_bytes());
+            let cmd = parser.next()?;
+            let cmd = cmd.expect("Same SQL string should be able to be parsed");
+
+            let syms = conn.syms.borrow();
+
+            match cmd {
+                Cmd::Stmt(stmt) => translate::translate(
+                    conn.schema.borrow().deref(),
+                    stmt,
+                    self.pager.clone(),
+                    conn.clone(),
+                    &syms,
+                    QueryMode::Normal,
+                    &self.program.sql,
+                )?,
+                Cmd::Explain(_stmt) => todo!(),
+                Cmd::ExplainQueryPlan(_stmt) => todo!(),
+            }
+        };
+        // Save parameters before they are reset
+        let parameters = std::mem::take(&mut self.state.parameters);
+        self.reset();
+        // Load the parameters back into the state
+        self.state.parameters = parameters;
+        Ok(())
     }
 
     pub fn run_once(&self) -> Result<()> {

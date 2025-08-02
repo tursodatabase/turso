@@ -5,29 +5,42 @@ use turso_core::StepResult;
 use crate::common::{maybe_setup_tracing, TempDatabase};
 
 #[test]
-fn test_schema_change() {
+fn test_schema_reprepare() {
     let tmp_db = TempDatabase::new_empty(false);
     let conn1 = tmp_db.connect_limbo();
-    conn1.execute("CREATE TABLE t (x, y, z)").unwrap();
+    conn1.execute("CREATE TABLE t(x, y, z)").unwrap();
     conn1
         .execute("INSERT INTO t VALUES (1, 2, 3), (10, 20, 30)")
         .unwrap();
     let conn2 = tmp_db.connect_limbo();
-    let mut stmt = conn2.prepare("SELECT x, z FROM t").unwrap();
+    let mut stmt = conn2.prepare("SELECT y, z FROM t").unwrap();
+    let mut stmt2 = conn2.prepare("SELECT x, z FROM t").unwrap();
     conn1.execute("ALTER TABLE t DROP COLUMN x").unwrap();
-    let row = loop {
-        match stmt.step() {
-            Ok(turso_core::StepResult::Row) => {
-                let row = stmt.row().unwrap();
-                break row;
+    assert_eq!(
+        stmt2.step().unwrap_err().to_string(),
+        "Parse error: no such column: x"
+    );
+
+    let mut rows = Vec::new();
+    loop {
+        match stmt.step().unwrap() {
+            turso_core::StepResult::Done => {
+                break;
             }
-            Ok(turso_core::StepResult::IO) => {
+            turso_core::StepResult::Row => {
+                let row = stmt.row().unwrap();
+                rows.push((row.get::<i64>(0).unwrap(), row.get::<i64>(1).unwrap()));
+            }
+            turso_core::StepResult::IO => {
                 stmt.run_once().unwrap();
             }
-            _ => panic!("unexpected step result"),
+            step => panic!("unexpected step result {step:?}"),
         }
-    };
-    println!("{:?} {:?}", row.get_value(0), row.get_value(1));
+    }
+    let row = rows[0];
+    assert_eq!(row, (2, 3));
+    let row = rows[1];
+    assert_eq!(row, (20, 30));
 }
 
 #[test]

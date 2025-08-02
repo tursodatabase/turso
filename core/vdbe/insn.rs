@@ -459,8 +459,9 @@ pub enum Insn {
 
     /// Start a transaction.
     Transaction {
-        db: usize,   // p1
-        write: bool, // p2
+        db: usize,          // p1
+        write: bool,        // p2
+        schema_cookie: u32, // p3
     },
 
     /// Set database auto-commit mode and potentially rollback.

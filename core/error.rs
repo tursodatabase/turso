@@ -63,6 +63,12 @@ pub enum LimboError {
     Busy,
     #[error("Conflict: {0}")]
     Conflict(String),
+    #[error("Database schema changed")]
+    SchemaUpdated,
+    #[error(
+        "Database is empty, header does not exist - page 1 should've been allocated before this"
+    )]
+    Page1NotAlloc,
     #[error("Transaction terminated")]
     TxTerminated,
     #[error("Write-write conflict")]

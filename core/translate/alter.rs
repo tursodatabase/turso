@@ -13,9 +13,7 @@ use crate::{
     LimboError, Result, SymbolTable,
 };
 
-use super::{
-    emitter::TransactionMode, schema::SQLITE_TABLEID, update::translate_update_with_after,
-};
+use super::{schema::SQLITE_TABLEID, update::translate_update_with_after};
 
 pub fn translate_alter_table(
     alter: (ast::QualifiedName, ast::AlterTableBody),
@@ -24,6 +22,7 @@ pub fn translate_alter_table(
     mut program: ProgramBuilder,
     connection: &Arc<crate::Connection>,
 ) -> Result<ProgramBuilder> {
+    program.begin_write_operation();
     let (table_name, alter_table) = alter;
     let table_name = table_name.name.as_str();
     if schema.table_has_indexes(table_name) && !schema.indexes_enabled() {
@@ -318,8 +317,6 @@ pub fn translate_alter_table(
                 where_clause: None,
             });
 
-            program.epilogue(TransactionMode::Write);
-
             program
         }
         ast::AlterTableBody::RenameTo(new_name) => {
@@ -402,8 +399,6 @@ pub fn translate_alter_table(
                 db: usize::MAX, // TODO: This value is unused, change when we do something with it
                 where_clause: None,
             });
-
-            program.epilogue(TransactionMode::Write);
 
             program
         }

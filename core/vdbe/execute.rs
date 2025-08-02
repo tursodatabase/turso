@@ -1970,7 +1970,12 @@ pub fn op_transaction(
     _pager: &Rc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
-    let Insn::Transaction { db, write } = insn else {
+    let Insn::Transaction {
+        db,
+        write,
+        schema_cookie,
+    } = insn
+    else {
         unreachable!("unexpected Insn {:?}", insn)
     };
     let conn = program.connection.clone();
@@ -1984,6 +1989,13 @@ pub fn op_transaction(
         if state.mv_tx_id.is_none() {
             // We allocate the first page lazily in the first transaction.
             return_if_io!(pager.maybe_allocate_page1());
+            // TODO: when we fix MVCC enable schema cookie detection for reprepare statements
+            // let header_schema_cookie = pager
+            //     .io
+            //     .block(|| pager.with_header(|header| header.schema_cookie.get()))?;
+            // if header_schema_cookie != *schema_cookie {
+            //     return Err(LimboError::SchemaUpdated);
+            // }
             let tx_id = mv_store.begin_tx(pager.clone());
             conn.mv_transactions.borrow_mut().push(tx_id);
             state.mv_tx_id = Some(tx_id);
@@ -2053,6 +2065,25 @@ pub fn op_transaction(
                 }
             }
         }
+
+        // Can only read header if page 1 has been allocated already
+        // begin_write_tx that happens, but not begin_read_tx
+        let res = pager
+            .io
+            .block(|| pager.with_header(|header| header.schema_cookie.get()));
+        match res {
+            Ok(header_schema_cookie) => {
+                if header_schema_cookie != *schema_cookie {
+                    return Err(LimboError::SchemaUpdated);
+                }
+            }
+            // This means we are starting a read_tx and we do not have a page 1 yet, so we just continue execution
+            Err(LimboError::Page1NotAlloc) => {}
+            Err(err) => {
+                return Err(err);
+            }
+        }
+
         if updated {
             conn.transaction_state.replace(new_transaction_state);
         }
