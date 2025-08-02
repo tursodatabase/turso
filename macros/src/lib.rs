@@ -1,4 +1,6 @@
 mod ext;
+mod opcode;
+mod test_macro;
 extern crate proc_macro;
 use proc_macro::{token_stream::IntoIter, Group, TokenStream, TokenTree};
 use std::collections::HashMap;
@@ -438,4 +440,30 @@ pub fn derive_vtab_module(input: TokenStream) -> TokenStream {
 #[proc_macro_derive(VfsDerive)]
 pub fn derive_vfs_module(input: TokenStream) -> TokenStream {
     ext::derive_vfs_module(input)
+}
+
+/// Generate opcode methods to eliminate duplicate code
+///
+/// Instead of manually writing the same pattern for every opcode, this macro
+/// automatically creates the methods we need:
+///
+/// - `to_explain_tuple()` - formats opcodes for the EXPLAIN command
+/// - `get_opcode_descriptions()` - provides help text for the CLI
+///
+/// Just annotate your enum fields with `#[p1]`, `#[p2]`, `#[p3]` to map them
+/// to SQLite's parameter system.
+///
+/// ```ignore
+/// #[derive(OpCode)]
+/// pub enum Insn {
+///     Add {
+///         #[p1] lhs: usize,    // becomes P1 in EXPLAIN output
+///         #[p2] rhs: usize,    // becomes P2 in EXPLAIN output
+///         #[p3] dest: usize,   // becomes P3 in EXPLAIN output
+///     },
+/// }
+/// ```
+#[proc_macro_derive(OpCode, attributes(opcode, p1, p2, p3, p4, p5))]
+pub fn derive_opcode(input: TokenStream) -> TokenStream {
+    opcode::derive_opcode(input)
 }

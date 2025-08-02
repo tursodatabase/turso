@@ -10,7 +10,7 @@ use crate::{
     translate::collate::CollationSeq,
     Value,
 };
-use turso_macros::Description;
+use turso_macros::{Description, OpCode};
 use turso_sqlite3_parser::ast::SortOrder;
 
 /// Flags provided to comparison instructions (e.g. Eq, Ne) which determine behavior related to NULL values.
@@ -145,7 +145,7 @@ impl<T: Copy + std::fmt::Display> std::fmt::Display for RegisterOrLiteral<T> {
     }
 }
 
-#[derive(Description, Debug)]
+#[derive(Description, OpCode, Debug)]
 pub enum Insn {
     /// Initialize the program state and jump to the given PC.
     Init {
@@ -168,8 +168,11 @@ pub enum Insn {
     },
     /// Add two registers and store the result in a third register.
     Add {
+        #[p1]
         lhs: usize,
+        #[p2]
         rhs: usize,
+        #[p3]
         dest: usize,
     },
     /// Subtract rhs from lhs and store in dest
