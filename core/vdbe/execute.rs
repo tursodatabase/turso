@@ -6755,14 +6755,14 @@ pub fn op_rename_table(
     let conn = program.connection.clone();
 
     conn.with_schema_mut(|schema| {
-        schema.indexes.remove(from).map(|mut indexes| {
+        if let Some(mut indexes) = schema.indexes.remove(from) {
             indexes.iter_mut().for_each(|index| {
                 let index = Arc::make_mut(index);
                 index.table_name = to.to_owned();
             });
 
             schema.indexes.insert(to.to_owned(), indexes);
-        });
+        };
 
         let mut table = schema
             .tables
