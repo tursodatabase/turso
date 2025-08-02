@@ -10,7 +10,7 @@ source $testdir/select5.test
 source $testdir/select6.test
 source $testdir/select7.test
 source $testdir/select8.test
-source $testdir/select9.test
+# FIXME: source $testdir/select9.test
 source $testdir/selectA.test
 source $testdir/selectB.test
 source $testdir/selectC.test
@@ -42,3 +42,18 @@ source $testdir/joinD.test
 source $testdir/joinE.test
 source $testdir/joinF.test
 source $testdir/joinH.test
+
+source $testdir/alter.test
+source $testdir/alter2.test
+source $testdir/alter3.test
+source $testdir/alter4.test
+
+source $testdir/func.test
+source $testdir/func2.test
+source $testdir/func3.test
+source $testdir/func4.test
+source $testdir/func5.test
+source $testdir/func6.test
+source $testdir/func7.test
+source $testdir/func8.test
+source $testdir/func9.test

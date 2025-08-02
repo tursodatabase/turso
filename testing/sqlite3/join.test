@@ -18,7 +18,7 @@ source $testdir/tester.tcl
 
 do_test join-1.1 {
   execsql {
-    CREATE TABLE t1 (a,b,c);
+    CREATE TABLE t1(a,b,c);
     INSERT INTO t1 VALUES(1,2,3);
     INSERT INTO t1 VALUES(2,3,4);
     INSERT INTO t1 VALUES(3,4,5);
@@ -27,7 +27,7 @@ do_test join-1.1 {
 } {1 2 3 2 3 4 3 4 5}
 do_test join-1.2 {
   execsql {
-    CREATE TABLE t2 (b,c,d);
+    CREATE TABLE t2(b,c,d);
     INSERT INTO t2 VALUES(1,2,3);
     INSERT INTO t2 VALUES(2,3,4);
     INSERT INTO t2 VALUES(3,4,5);
@@ -202,7 +202,7 @@ ifcapable subquery {
 
 do_test join-1.15 {
   execsql {
-    CREATE TABLE t3 (c,d,e);
+    CREATE TABLE t3(c,d,e);
     INSERT INTO t3 VALUES(2,3,4);
     INSERT INTO t3 VALUES(3,4,5);
     INSERT INTO t3 VALUES(4,5,6);
@@ -221,7 +221,7 @@ do_test join-1.17 {
 } {a 1 b 2 c 3 d 4 e 5 a 2 b 3 c 4 d 5 e 6}
 do_test join-1.18 {
   execsql {
-    CREATE TABLE t4 (d,e,f);
+    CREATE TABLE t4(d,e,f);
     INSERT INTO t4 VALUES(2,3,4);
     INSERT INTO t4 VALUES(3,4,5);
     INSERT INTO t4 VALUES(4,5,6);
@@ -378,8 +378,8 @@ do_test join-3.12 {
 do_test join-4.1 {
   execsql {
     BEGIN;
-    CREATE TABLE t5 (a INTEGER PRIMARY KEY);
-    CREATE TABLE t6 (a INTEGER);
+    CREATE TABLE t5(a INTEGER PRIMARY KEY);
+    CREATE TABLE t6(a INTEGER);
     INSERT INTO t6 VALUES(NULL);
     INSERT INTO t6 VALUES(NULL);
     INSERT INTO t6 SELECT * FROM t6;
@@ -487,13 +487,13 @@ ifcapable view {
 do_test join-8.1 {
   execsql {
     BEGIN;
-    CREATE TABLE t9 (a INTEGER PRIMARY KEY, b);
+    CREATE TABLE t9(a INTEGER PRIMARY KEY, b);
     INSERT INTO t9 VALUES(1,11);
     INSERT INTO t9 VALUES(2,22);
-    CREATE TABLE t10 (x INTEGER PRIMARY KEY, y);
+    CREATE TABLE t10(x INTEGER PRIMARY KEY, y);
     INSERT INTO t10 VALUES(1,2);
     INSERT INTO t10 VALUES(3,3);    
-    CREATE TABLE t11 (p INTEGER PRIMARY KEY, q);
+    CREATE TABLE t11(p INTEGER PRIMARY KEY, q);
     INSERT INTO t11 VALUES(2,111);
     INSERT INTO t11 VALUES(3,333);    
     CREATE VIEW v10_11 AS SELECT x, q FROM t10, t11 WHERE t10.y=t11.p;
@@ -540,10 +540,10 @@ ifcapable compound {
 do_test join-9.1 {
   execsql {
     BEGIN;
-    CREATE TABLE t12 (a,b);
+    CREATE TABLE t12(a,b);
     INSERT INTO t12 VALUES(1,11);
     INSERT INTO t12 VALUES(2,22);
-    CREATE TABLE t13 (b,c);
+    CREATE TABLE t13(b,c);
     INSERT INTO t13 VALUES(22,222);
     COMMIT;
   }
@@ -576,8 +576,8 @@ ifcapable subquery {
   #
   do_test join-10.1 {
     execsql {
-      CREATE TABLE t21 (a,b,c);
-      CREATE TABLE t22 (p,q);
+      CREATE TABLE t21(a,b,c);
+      CREATE TABLE t22(p,q);
       CREATE INDEX i22 ON t22(q);
       SELECT a FROM t21 LEFT JOIN t22 ON b=p WHERE q=
          (SELECT max(m.q) FROM t22 m JOIN t21 n ON n.b=m.p WHERE n.c=1);
@@ -589,8 +589,8 @@ ifcapable subquery {
   #
   do_test join-10.2 {
     execsql {
-      CREATE TABLE t23 (a, b, c);
-      CREATE TABLE t24 (a, b, c);
+      CREATE TABLE t23(a, b, c);
+      CREATE TABLE t24(a, b, c);
       INSERT INTO t23 VALUES(1, 2, 3);
     }
     execsql {
@@ -611,8 +611,8 @@ ifcapable subquery {
 do_test join-11.1 {
   drop_all_tables
   execsql {
-    CREATE TABLE t1 (a INTEGER PRIMARY KEY, b TEXT);
-    CREATE TABLE t2 (a INTEGER PRIMARY KEY, b TEXT);
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);
+    CREATE TABLE t2(a INTEGER PRIMARY KEY, b TEXT);
     INSERT INTO t1 VALUES(1,'abc');
     INSERT INTO t1 VALUES(2,'def');
     INSERT INTO t2 VALUES(1,'abc');
@@ -637,8 +637,8 @@ do_test join-11.4 {
 do_test join-11.5 {
   drop_all_tables
   execsql {
-    CREATE TABLE t1 (a COLLATE nocase, b);
-    CREATE TABLE t2 (a, b);
+    CREATE TABLE t1(a COLLATE nocase, b);
+    CREATE TABLE t2(a, b);
     INSERT INTO t1 VALUES('ONE', 1);
     INSERT INTO t1 VALUES('two', 2);
     INSERT INTO t2 VALUES('one', 1);
@@ -655,8 +655,8 @@ do_test join-11.7 {
 do_test join-11.8 {
   drop_all_tables
   execsql {
-    CREATE TABLE t1 (a, b TEXT);
-    CREATE TABLE t2 (b INTEGER, a);
+    CREATE TABLE t1(a, b TEXT);
+    CREATE TABLE t2(b INTEGER, a);
     INSERT INTO t1 VALUES('one', '1.0');
     INSERT INTO t1 VALUES('two', '2');
     INSERT INTO t2 VALUES(1, 'one');
@@ -674,7 +674,7 @@ do_test join-11.10 {
 # Test that at most 64 tables are allowed in a join.
 #
 do_execsql_test join-12.1 {
-  CREATE TABLE t14 (x);
+  CREATE TABLE t14(x);
   INSERT INTO t14 VALUES('abcdefghij');
 }
 
@@ -716,9 +716,9 @@ jointest join-12.8 128 {1 {at most 64 tables in a join}}
 # Test a problem with reordering tables following a LEFT JOIN.
 #
 do_execsql_test join-13.0 {
-  CREATE TABLE aa (a);
-  CREATE TABLE bb (b);
-  CREATE TABLE cc (c);
+  CREATE TABLE aa(a);
+  CREATE TABLE bb(b);
+  CREATE TABLE cc(c);
 
   INSERT INTO aa VALUES(45);
   INSERT INTO cc VALUES(45);
@@ -759,7 +759,7 @@ do_execsql_test join-14.3 {
 
 do_execsql_test join-14.4 {
   DROP TABLE IF EXISTS t1;
-  CREATE TABLE t1 (c PRIMARY KEY, a TEXT(10000), b TEXT(10000));
+  CREATE TABLE t1(c PRIMARY KEY, a TEXT(10000), b TEXT(10000));
   SELECT * FROM (SELECT 111) LEFT JOIN (SELECT c+222 FROM t1) GROUP BY 1;
 } {111 {}}
 do_execsql_test join-14.4b {
@@ -794,7 +794,7 @@ do_execsql_test join-14.8 {
 } {111 {} 222 222}
 do_execsql_test join-14.9 {
   DROP TABLE IF EXISTS t1;
-  CREATE TABLE t1 (c PRIMARY KEY) WITHOUT ROWID;
+  CREATE TABLE t1(c PRIMARY KEY) WITHOUT ROWID;
   SELECT * FROM (SELECT 111) LEFT JOIN (SELECT c+222 FROM t1) GROUP BY 1;
 } {111 {}}
 
@@ -804,10 +804,10 @@ do_execsql_test join-14.9 {
 db close
 sqlite3 db :memory:
 do_execsql_test join-14.10 {
-  CREATE TABLE t1 (a);
+  CREATE TABLE t1(a);
   INSERT INTO t1 VALUES(1),(2),(3);
   CREATE VIEW v2 AS SELECT a, 1 AS b FROM t1;
-  CREATE TABLE t3 (x);
+  CREATE TABLE t3(x);
   INSERT INTO t3 VALUES(2),(4);
   SELECT *, '|' FROM t3 LEFT JOIN v2 ON a=x WHERE b=1;
 } {2 2 1 |}
@@ -824,9 +824,9 @@ do_execsql_test join-14.12 {
 db close
 sqlite3 db :memory:
 do_execsql_test join-14.20 {
-  CREATE TABLE t1 (id INTEGER PRIMARY KEY);
-  CREATE TABLE t2 (id INTEGER PRIMARY KEY, c2 INTEGER);
-  CREATE TABLE t3 (id INTEGER PRIMARY KEY, c3 INTEGER);
+  CREATE TABLE t1(id INTEGER PRIMARY KEY);
+  CREATE TABLE t2(id INTEGER PRIMARY KEY, c2 INTEGER);
+  CREATE TABLE t3(id INTEGER PRIMARY KEY, c3 INTEGER);
   INSERT INTO t1(id) VALUES(456);
   INSERT INTO t3(id) VALUES(1),(2);
   SELECT t1.id, x2.id, x3.id
@@ -849,9 +849,9 @@ do_execsql_test join-14.20 {
 db close
 sqlite3 db :memory:
 do_execsql_test join-15.100 {
-  CREATE TABLE t1 (a INT, b INT);
+  CREATE TABLE t1(a INT, b INT);
   INSERT INTO t1 VALUES(1,2),(3,4);
-  CREATE TABLE t2 (x INT, y INT);
+  CREATE TABLE t2(x INT, y INT);
   SELECT *, 'x'
     FROM t1 LEFT JOIN t2
    WHERE CASE WHEN FALSE THEN a=x ELSE 1 END;
@@ -879,10 +879,10 @@ do_execsql_test join-15.107 {
 do_execsql_test join-15.110 {
   DROP TABLE t1;
   DROP TABLE t2;
-  CREATE TABLE t1 (a INTEGER PRIMARY KEY, b INTEGER);
+  CREATE TABLE t1(a INTEGER PRIMARY KEY, b INTEGER);
   INSERT INTO t1(a,b) VALUES(1,0),(11,1),(12,1),(13,1),(121,12);
   CREATE INDEX t1b ON t1(b);
-  CREATE TABLE t2 (x INTEGER PRIMARY KEY);
+  CREATE TABLE t2(x INTEGER PRIMARY KEY);
   INSERT INTO t2(x) VALUES(0),(1);
   SELECT  a1, a2, a3, a4, a5
    FROM (SELECT a AS a1 FROM t1 WHERE b=0)
@@ -910,9 +910,9 @@ do_execsql_test join-15.110 {
 do_execsql_test join-16.100 {
   DROP TABLE IF EXISTS t1;
   DROP TABLE IF EXISTS t2;
-  CREATE TABLE t1 (a INT);
+  CREATE TABLE t1(a INT);
   INSERT INTO t1(a) VALUES(1);
-  CREATE TABLE t2 (b INT);
+  CREATE TABLE t2(b INT);
   SELECT a, b
     FROM t1 LEFT JOIN t2 ON 0
    WHERE (b IS NOT NULL)=0;
@@ -924,7 +924,7 @@ do_execsql_test join-16.100 {
 #
 do_execsql_test join-17.100 {
   DROP TABLE IF EXISTS t1;
-  CREATE TABLE t1 (x);
+  CREATE TABLE t1(x);
   INSERT INTO t1(x) VALUES(0),(1);
   SELECT * FROM t1 LEFT JOIN (SELECT abs(1) AS y FROM t1) ON x WHERE NOT(y='a');
 } {1 1 1 1}
@@ -936,8 +936,8 @@ do_execsql_test join-17.110 {
 #-------------------------------------------------------------------------
 reset_db
 do_execsql_test join-18.1 {
-  CREATE TABLE t0 (a);
-  CREATE TABLE t1 (b);
+  CREATE TABLE t0(a);
+  CREATE TABLE t1(b);
   CREATE VIEW v0 AS SELECT a FROM t1 LEFT JOIN t0;
   INSERT INTO t1 VALUES (1);
 } {}
@@ -957,8 +957,8 @@ do_execsql_test join-18.4 {
 #-------------------------------------------------------------------------
 reset_db
 do_execsql_test join-19.0 {
-  CREATE TABLE t1 (a);
-  CREATE TABLE t2 (b);
+  CREATE TABLE t1(a);
+  CREATE TABLE t2(b);
   INSERT INTO t1(a) VALUES(0);
   CREATE VIEW v0(c) AS SELECT t2.b FROM t1 LEFT JOIN t2;
 }
@@ -992,8 +992,8 @@ do_execsql_test join-19.5 {
 db close
 sqlite3 db :memory:
 do_execsql_test join-20.1 {
-  CREATE TABLE t1 (c1);
-  CREATE TABLE t0 (c0);
+  CREATE TABLE t1(c1);
+  CREATE TABLE t0(c0);
   INSERT INTO t0(c0) VALUES (0);
   SELECT * FROM t0 LEFT JOIN t1 WHERE NULL IN (c1);
 } {}
@@ -1010,9 +1010,9 @@ do_execsql_test join-20.2 {
 #
 do_execsql_test join-20.3 {
   DROP TABLE t1;
-  CREATE TABLE t1 (x INT);      INSERT INTO t1(x) VALUES(1);
-  CREATE TABLE t2 (y BOOLEAN);  INSERT INTO t2(y) VALUES(false);
-  CREATE TABLE t3 (z INT);      INSERT INTO t3(z) VALUES(3);
+  CREATE TABLE t1(x INT);      INSERT INTO t1(x) VALUES(1);
+  CREATE TABLE t2(y BOOLEAN);  INSERT INTO t2(y) VALUES(false);
+  CREATE TABLE t3(z INT);      INSERT INTO t3(z) VALUES(3);
   CREATE INDEX t2y ON t2(y) WHERE y;
   SELECT quote(z) FROM t1 RIGHT JOIN t2 ON y LEFT JOIN t3 ON y;
 } {NULL}
@@ -1024,8 +1024,8 @@ do_execsql_test join-20.3 {
 do_execsql_test join-21.10 {
   DROP TABLE t0;
   DROP TABLE t1;
-  CREATE TABLE t0 (aa);
-  CREATE TABLE t1 (bb);
+  CREATE TABLE t0(aa);
+  CREATE TABLE t1(bb);
   INSERT INTO t0(aa) VALUES (1);
   INSERT INTO t1(bb) VALUES (1);
   SELECT 11, * FROM t1 LEFT JOIN t0 WHERE aa ISNULL;
@@ -1046,7 +1046,7 @@ do_execsql_test join-21.10 {
 #
 reset_db
 do_execsql_test join-22.10 {
-  CREATE TABLE t0 (a, b);
+  CREATE TABLE t0(a, b);
   CREATE INDEX t0a ON t0(a);
   INSERT INTO t0 VALUES(10,10),(10,11),(10,12);
   SELECT DISTINCT c FROM t0 LEFT JOIN (SELECT a+1 AS c FROM t0) ORDER BY c ;
@@ -1061,7 +1061,7 @@ do_execsql_test join-22.10 {
 reset_db
 ifcapable vtab {
   do_execsql_test join-23.10 {
-    CREATE TABLE t0 (c0);
+    CREATE TABLE t0(c0);
     INSERT INTO t0(c0) VALUES(123);
     CREATE VIEW v0(c0) AS SELECT 0 GROUP BY 1;
     SELECT t0.c0, v0.c0, vt0.name
@@ -1070,9 +1070,9 @@ ifcapable vtab {
      WHERE v0.c0 == 0;
   } {123 0 c0}
   do_execsql_test join-23.20 {
-    CREATE TABLE a (value TEXT);
+    CREATE TABLE a(value TEXT);
     INSERT INTO a(value) SELECT value FROM json_each('["a", "b", null]');
-    CREATE TABLE b (value TEXT);
+    CREATE TABLE b(value TEXT);
     INSERT INTO b(value) SELECT value FROM json_each('["a", "c", null]');
     SELECT a.value, b.value FROM a RIGHT JOIN b ON a.value = b.value;
   } {a a {} c {} {}}
@@ -1108,8 +1108,8 @@ ifcapable vtab {
 #-------------------------------------------------------------------------
 reset_db
 do_execsql_test join-24.1 {
-  CREATE TABLE t1 (a PRIMARY KEY, x);
-  CREATE TABLE t2 (b INT);
+  CREATE TABLE t1(a PRIMARY KEY, x);
+  CREATE TABLE t2(b INT);
   CREATE INDEX t1aa ON t1(a, a);
 
   INSERT INTO t1 VALUES('abc', 'def');
@@ -1134,7 +1134,7 @@ do_execsql_test join-24.2 {
 #
 reset_db
 do_execsql_test join-25.1 {
-  CREATE TABLE t0 (c0 INT);
+  CREATE TABLE t0(c0 INT);
   CREATE VIEW v0 AS SELECT (NULL AND 5) as c0 FROM t0;
   INSERT INTO t0(c0) VALUES (NULL);
   SELECT count(*)  FROM v0 LEFT JOIN t0 ON v0.c0;
@@ -1144,9 +1144,9 @@ do_execsql_test join-25.1 {
 #
 reset_db
 do_catchsql_test join-26.1 {
-  CREATE TABLE t4 (a,b);
-  CREATE TABLE t5 (a,c);
-  CREATE TABLE t6 (a,d);
+  CREATE TABLE t4(a,b);
+  CREATE TABLE t5(a,c);
+  CREATE TABLE t6(a,d);
   SELECT * FROM t5 JOIN ((t4 JOIN (t5 JOIN t6)) t7);
 } {/1 {.*}/}
 
@@ -1155,10 +1155,10 @@ do_catchsql_test join-26.1 {
 #
 reset_db
 do_execsql_test join-27.1 {
-  CREATE TABLE t1 (a INT,b INT,c INT);  INSERT INTO t1 VALUES(NULL,NULL,NULL);
-  CREATE TABLE t2 (d INT,e INT);        INSERT INTO t2 VALUES(NULL,NULL);
+  CREATE TABLE t1(a INT,b INT,c INT);  INSERT INTO t1 VALUES(NULL,NULL,NULL);
+  CREATE TABLE t2(d INT,e INT);        INSERT INTO t2 VALUES(NULL,NULL);
   CREATE INDEX x2 ON t1(c,b);
-  CREATE TABLE t3 (x INT);              INSERT INTO t3 VALUES(NULL);
+  CREATE TABLE t3(x INT);              INSERT INTO t3 VALUES(NULL);
 }
 do_execsql_test join-27.2 {
   WITH t99(b) AS MATERIALIZED (
@@ -1234,10 +1234,10 @@ do_execsql_test join-27.10 {
 #
 reset_db
 do_execsql_test join-28.1 {
-  CREATE TABLE t1 (a INTEGER PRIMARY KEY, b INT, c INT);
-  CREATE TABLE t2 (d INTEGER PRIMARY KEY, e INT);
+  CREATE TABLE t1(a INTEGER PRIMARY KEY, b INT, c INT);
+  CREATE TABLE t2(d INTEGER PRIMARY KEY, e INT);
   CREATE VIEW t3(a,b,c,d,e) AS SELECT * FROM t1 LEFT JOIN t2 ON d=c;
-  CREATE TABLE t4 (x INT, y INT);
+  CREATE TABLE t4(x INT, y INT);
   INSERT INTO t1 VALUES(1,2,3);
   INSERT INTO t2 VALUES(1,5);
   INSERT INTO t4 VALUES(1,4);
@@ -1266,8 +1266,8 @@ do_eqp_test join-28.2 {
 reset_db
 db null NULL
 do_execsql_test join-29.1 {
-  CREATE TABLE t0 (a INT); INSERT INTO t0(a) VALUES (1);
-  CREATE TABLE t1 (b INT); INSERT INTO t1(b) VALUES (2);
+  CREATE TABLE t0(a INT); INSERT INTO t0(a) VALUES (1);
+  CREATE TABLE t1(b INT); INSERT INTO t1(b) VALUES (2);
   CREATE VIEW v2(c) AS SELECT 3 FROM t1;
   SELECT * FROM t1 JOIN v2 ON 0     FULL OUTER JOIN t0 ON true;
 } {NULL NULL 1}
@@ -1286,11 +1286,11 @@ do_execsql_test join-29.3 {
 reset_db
 db null NULL
 do_execsql_test join-30.1 {
-  CREATE TABLE t0 (z INT);         INSERT INTO t0 VALUES(1),(2);
-  CREATE TABLE t1 (a INT);         INSERT INTO t1 VALUES(1);
-  CREATE TABLE t2 (b INT);         INSERT INTO t2 VALUES(2);
-  CREATE TABLE t3 (c INT, d INT);  INSERT INTO t3 VALUES(3,4);
-  CREATE TABLE t4 (e INT);         INSERT INTO t4 VALUES(5);
+  CREATE TABLE t0(z INT);         INSERT INTO t0 VALUES(1),(2);
+  CREATE TABLE t1(a INT);         INSERT INTO t1 VALUES(1);
+  CREATE TABLE t2(b INT);         INSERT INTO t2 VALUES(2);
+  CREATE TABLE t3(c INT, d INT);  INSERT INTO t3 VALUES(3,4);
+  CREATE TABLE t4(e INT);         INSERT INTO t4 VALUES(5);
   CREATE VIEW v5(x,y) AS SELECT c, d FROM t3 LEFT JOIN t4 ON false;
 }
 do_execsql_test join-30.2 {
@@ -1313,12 +1313,12 @@ do_execsql_test join-30.3 {
 reset_db
 db null NULL
 do_execsql_test join-31.1 {
-  CREATE TABLE t1 (c0 INT , c1 INT); INSERT INTO t1(c0, c1) VALUES(NULL,11);
-  CREATE TABLE t2 (c0 INT NOT NULL);
-  CREATE TABLE t2n (c0 INT);
-  CREATE TABLE t3 (x INT);           INSERT INTO t3(x) VALUES(3);
-  CREATE TABLE t4 (y INT);           INSERT INTO t4(y) VALUES(4);
-  CREATE TABLE t5 (c0 INT, x INT);   INSERT INTO t5 VALUES(NULL, 5);
+  CREATE TABLE t1(c0 INT , c1 INT); INSERT INTO t1(c0, c1) VALUES(NULL,11);
+  CREATE TABLE t2(c0 INT NOT NULL);
+  CREATE TABLE t2n(c0 INT);
+  CREATE TABLE t3(x INT);           INSERT INTO t3(x) VALUES(3);
+  CREATE TABLE t4(y INT);           INSERT INTO t4(y) VALUES(4);
+  CREATE TABLE t5(c0 INT, x INT);   INSERT INTO t5 VALUES(NULL, 5);
 }
 do_execsql_test join-31.2 {
   SELECT * FROM t2 RIGHT JOIN t3 ON true LEFT JOIN t1 USING(c0);
@@ -1349,9 +1349,9 @@ do_execsql_test join-31.8 {
 reset_db
 db null NULL
 do_execsql_test join-32.1 {
-  CREATE TABLE t0 (w INT);
-  CREATE TABLE t1 (x INT);
-  CREATE TABLE t2 (y INT UNIQUE);
+  CREATE TABLE t0(w INT);
+  CREATE TABLE t1(x INT);
+  CREATE TABLE t2(y INT UNIQUE);
   CREATE VIEW v0(z) AS SELECT CAST(x AS INT) FROM t1 LEFT JOIN t2 ON true;
   INSERT INTO t1(x) VALUES(123);
   INSERT INTO t2(y) VALUES(NULL);
