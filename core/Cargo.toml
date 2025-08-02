@@ -114,3 +114,7 @@ harness = false
 [[bench]]
 name = "tpc_h_benchmark"
 harness = false
+
+[[bench]]
+name = "parser_benchmark"
+harness = false
