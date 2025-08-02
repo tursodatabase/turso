@@ -10,7 +10,7 @@ use crate::{
             TableInteriorCell, TableLeafCell, CELL_PTR_SIZE_BYTES, INTERIOR_PAGE_HEADER_SIZE_BYTES,
             LEAF_PAGE_HEADER_SIZE_BYTES, LEFT_CHILD_PTR_SIZE_BYTES,
         },
-        state_machines::{EmptyTableState, MoveToRightState, SeekToLastState},
+        state_machines::{EmptyTableState, MoveToRightState, RewindState, SeekToLastState},
     },
     translate::plan::IterationDirection,
     turso_assert,
@@ -575,7 +575,10 @@ pub struct BTreeCursor {
     is_empty_table_state: RefCell<EmptyTableState>,
     /// State machine for [BTreeCursor::move_to_rightmost]
     move_to_right_state: MoveToRightState,
+    /// State machine for [BTreeCursor::seek_to_last]
     seek_to_last_state: SeekToLastState,
+    /// State machine for [BTreeCursor::rewind]
+    rewind_state: RewindState,
 }
 
 /// We store the cell index and cell count for each page in the stack.
@@ -633,6 +636,7 @@ impl BTreeCursor {
             is_empty_table_state: RefCell::new(EmptyTableState::Start),
             move_to_right_state: MoveToRightState::Start,
             seek_to_last_state: SeekToLastState::Start,
+            rewind_state: RewindState::Start,
         }
     }
 
@@ -4220,22 +4224,27 @@ impl BTreeCursor {
 
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn rewind(&mut self) -> Result<IOResult<()>> {
-        if let Some(mv_cursor) = &self.mv_cursor {
-            {
-                let mut mv_cursor = mv_cursor.borrow_mut();
-                mv_cursor.rewind();
+        loop {
+            match self.rewind_state {
+                RewindState::Start => {
+                    self.rewind_state = RewindState::NextRecord;
+                    if let Some(mv_cursor) = &self.mv_cursor {
+                        let mut mv_cursor = mv_cursor.borrow_mut();
+                        mv_cursor.rewind();
+                    } else {
+                        let _c = self.move_to_root()?;
+                        return Ok(IOResult::IO);
+                    }
+                }
+                RewindState::NextRecord => {
+                    let cursor_has_record = return_if_io!(self.get_next_record());
+                    self.invalidate_record();
+                    self.has_record.replace(cursor_has_record);
+                    self.rewind_state = RewindState::Start;
+                    return Ok(IOResult::Done(()));
+                }
             }
-            let cursor_has_record = return_if_io!(self.get_next_record());
-            self.invalidate_record();
-            self.has_record.replace(cursor_has_record);
-        } else {
-            let _c = self.move_to_root()?;
-
-            let cursor_has_record = return_if_io!(self.get_next_record());
-            self.invalidate_record();
-            self.has_record.replace(cursor_has_record);
         }
-        Ok(IOResult::Done(()))
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]

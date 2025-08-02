@@ -17,3 +17,10 @@ pub enum SeekToLastState {
     Start,
     IsEmpty,
 }
+
+#[derive(Debug, Clone, Copy)]
+pub enum RewindState {
+    Start,
+    NextRecord,
+}
+
