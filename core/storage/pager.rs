@@ -121,6 +121,8 @@ const PAGE_ERROR: usize = 0b100;
 const PAGE_DIRTY: usize = 0b1000;
 /// Page's contents are loaded in memory.
 const PAGE_LOADED: usize = 0b10000;
+/// Page should not be written to disk.
+const PAGE_DONT_WRITE: usize = 0b100000;
 
 impl Page {
     pub fn new(id: usize) -> Self {
@@ -204,6 +206,14 @@ impl Page {
     pub fn clear_loaded(&self) {
         tracing::debug!("clear loaded {}", self.get().id);
         self.get().flags.fetch_and(!PAGE_LOADED, Ordering::SeqCst);
+    }
+
+    pub fn set_dont_write(&self) {
+        self.get().flags.fetch_or(PAGE_DONT_WRITE, Ordering::SeqCst);
+    }
+
+    pub fn is_dont_write(&self) -> bool {
+        self.get().flags.load(Ordering::SeqCst) & PAGE_DONT_WRITE != 0
     }
 
     pub fn is_index(&self) -> bool {
@@ -1043,10 +1053,21 @@ impl Pager {
         trace!(?state);
         match state {
             CacheFlushState::Start => {
+                let mut cache = self.page_cache.write();
                 let dirty_pages = self
                     .dirty_pages
                     .borrow()
                     .iter()
+                    .filter(|page_id| {
+                        let page = cache.get(&PageCacheKey::new(**page_id)).unwrap();
+                        if page.is_dont_write() {
+                            // Let's make sure we clear the dirty flag as we don't want to keep them dirty for other operations.
+                            page.clear_dirty();
+                            false
+                        } else {
+                            true
+                        }
+                    })
                     .copied()
                     .collect::<Vec<usize>>();
                 let mut flush_info = self.flush_info.borrow_mut();
@@ -1147,10 +1168,23 @@ impl Pager {
             trace!(?state);
             match state {
                 CommitState::Start => {
+                    let mut cache = self.page_cache.write();
                     let dirty_pages = self
                         .dirty_pages
                         .borrow()
                         .iter()
+                        .filter(|page_id| {
+                            // We don't want to write pages that are marked as dont_write to the WAL. These pages are usually,
+                            // pages that are being freed.
+                            let page = cache.get(&PageCacheKey::new(**page_id)).unwrap();
+                            if page.is_dont_write() {
+                                // Let's make sure we clear the dirty flag as we don't want to keep them dirty for other operations.
+                                page.clear_dirty();
+                                false
+                            } else {
+                                true
+                            }
+                        })
                         .copied()
                         .collect::<Vec<usize>>();
                     let mut commit_info = self.commit_info.borrow_mut();
@@ -1513,6 +1547,7 @@ impl Pager {
                             if page.is_loaded() {
                                 let page_contents = page.get_contents();
                                 page_contents.overflow_cells.clear();
+                                page.set_dont_write();
                             }
                             (page, None)
                         }
@@ -1692,7 +1727,7 @@ impl Pager {
         let header_ref = self.io.block(|| HeaderRefMut::from_pager(self))?;
         let mut header = header_ref.borrow_mut();
 
-        loop {
+        let page = loop {
             let mut state = self.allocate_page_state.borrow_mut();
             tracing::debug!("allocate_page(state={:?})", state);
             match &mut *state {
@@ -1805,7 +1840,7 @@ impl Pager {
                     }
                     let trunk_page = trunk_page.clone();
                     *state = AllocatePageState::Start;
-                    return Ok(IOResult::Done(trunk_page));
+                    break trunk_page;
                 }
                 AllocatePageState::ReuseFreelistLeaf {
                     trunk_page,
@@ -1870,7 +1905,7 @@ impl Pager {
 
                     header.freelist_pages = (header.freelist_pages.get() - 1).into();
                     *state = AllocatePageState::Start;
-                    return Ok(IOResult::Done(leaf_page));
+                    break leaf_page;
                 }
                 AllocatePageState::AllocateNewPage { current_db_size } => {
                     let new_db_size = *current_db_size + 1;
@@ -1896,11 +1931,13 @@ impl Pager {
                         }
                         header.database_size = new_db_size.into();
                         *state = AllocatePageState::Start;
-                        return Ok(IOResult::Done(page));
+                        break page;
                     }
                 }
             }
-        }
+        };
+        assert!(page.is_dont_write(), "page should be marked as dont_write");
+        Ok(IOResult::Done(page))
     }
 
     pub fn update_dirty_loaded_page_in_cache(
