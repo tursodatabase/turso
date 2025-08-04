@@ -11,7 +11,12 @@ pub enum Parameter {
 
 impl PartialEq for Parameter {
     fn eq(&self, other: &Self) -> bool {
-        self.index() == other.index()
+        match (self, other) {
+            (Parameter::Named(name1, idx1), Parameter::Named(name2, idx2)) => {
+                name1 == name2 && idx1 == idx2
+            }
+            _ => self.index() == other.index(),
+        }
     }
 }
 
@@ -120,5 +125,19 @@ impl Parameters {
                 index
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parameters_count() {
+        let mut params = Parameters::new();
+        params.push("?1");
+        params.push(":val");
+
+        assert_eq!(params.count(), 2);
     }
 }
