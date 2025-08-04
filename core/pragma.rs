@@ -59,7 +59,6 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
             unreachable!("pragma_for() called with LegacyFileFormat, which is unsupported")
         }
         ModuleList => Pragma::new(
-            // TODO:: change the flags below
             PragmaFlags::NeedSchema | PragmaFlags::Result0 | PragmaFlags::SchemaReq,
             &["module_list"],
         ),
