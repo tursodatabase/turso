@@ -146,6 +146,7 @@ fn update_pragma(
             connection,
             program,
         ),
+        PragmaName::ModuleList => Ok((program, TransactionMode::None)),
         PragmaName::PageCount => query_pragma(
             PragmaName::PageCount,
             schema,
@@ -389,6 +390,17 @@ fn query_pragma(
                 dest: register,
             });
             program.emit_result_row(register, 3);
+            Ok((program, TransactionMode::None))
+        }
+        PragmaName::ModuleList => {
+            let modules = connection.get_used_vtab_mods();
+
+            for module in modules {
+                program.emit_string8(module.to_string(), register);
+                program.emit_result_row(register, 1);
+            }
+
+            program.add_pragma_result_column(pragma.to_string());
             Ok((program, TransactionMode::None))
         }
         PragmaName::PageCount => {
