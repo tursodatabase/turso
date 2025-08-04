@@ -1813,6 +1813,7 @@ pub enum PragmaName {
     /// Set or get the maximum number of pages in the database file.
     MaxPageCount,
     /// `module_list` praagma
+    /// `module_list` lists modules used by virtual tables.
     ModuleList,
     /// Return the total number of pages in the database file.
     PageCount,
