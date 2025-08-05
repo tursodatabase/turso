@@ -1,17 +1,17 @@
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::num::NonZeroUsize;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use turso_ext::{
     register_extension, scalar, Connection, ConstraintInfo, ConstraintOp, ConstraintUsage,
     ExtResult, IndexInfo, OrderByInfo, ResultCode, StepResult, VTabCursor, VTabKind, VTabModule,
     VTabModuleDerive, VTable, Value,
 };
 #[cfg(not(target_family = "wasm"))]
-use turso_ext::{VfsDerive, VfsExtension, VfsFile};
+use turso_ext::{BufferRef, Callback, VfsDerive, VfsExtension, VfsFile};
 
 register_extension! {
     vtabs: { KVStoreVTabModule, TableStatsVtabModule },
@@ -265,7 +265,35 @@ impl VTable for KVStoreTable {
     }
 }
 
+#[derive(Default, Clone)]
+pub struct CallbackQueue {
+    queue: Arc<Mutex<VecDeque<(Callback, i32)>>>,
+}
+
+impl CallbackQueue {
+    pub fn new() -> Self {
+        Self {
+            queue: Arc::new(Mutex::new(VecDeque::new())),
+        }
+    }
+
+    // Store a callback with its result for later execution
+    pub fn enqueue(&self, callback: Callback, result: i32) {
+        let mut queue = self.queue.lock().unwrap();
+        queue.push_back((callback, result));
+    }
+
+    // Process all pending callbacks
+    pub fn process_all(&self) {
+        let mut queue = self.queue.lock().unwrap();
+        while let Some((callback, result)) = queue.pop_front() {
+            callback(result);
+        }
+    }
+}
+
 pub struct TestFile {
+    io: CallbackQueue,
     file: File,
 }
 
@@ -274,7 +302,9 @@ pub struct TestFS;
 
 #[cfg(not(target_family = "wasm"))]
 #[derive(VfsDerive, Default)]
-pub struct TestFS;
+pub struct TestFS {
+    callbacks: CallbackQueue,
+}
 
 // Test that we can have additional extension types in the same file
 // and still register the vfs at comptime if linking staticly
@@ -287,6 +317,12 @@ fn test_scalar(_args: turso_ext::Value) -> turso_ext::Value {
 impl VfsExtension for TestFS {
     const NAME: &'static str = "testvfs";
     type File = TestFile;
+    fn run_once(&self) -> ExtResult<()> {
+        log::debug!("running once with testing VFS");
+        self.callbacks.process_all();
+        Ok(())
+    }
+
     fn open_file(&self, path: &str, flags: i32, _direct: bool) -> ExtResult<Self::File> {
         let _ = env_logger::try_init();
         log::debug!("opening file with testing VFS: {path} flags: {flags}");
@@ -296,42 +332,67 @@ impl VfsExtension for TestFS {
             .create(flags & 1 != 0)
             .open(path)
             .map_err(|_| ResultCode::Error)?;
-        Ok(TestFile { file })
+        Ok(TestFile {
+            file,
+            io: self.callbacks.clone(),
+        })
     }
 }
 
 #[cfg(not(target_family = "wasm"))]
 impl VfsFile for TestFile {
-    fn read(&mut self, buf: &mut [u8], count: usize, offset: i64) -> ExtResult<i32> {
-        log::debug!("reading file with testing VFS: bytes: {count} offset: {offset}");
+    fn read(&mut self, mut buf: BufferRef, offset: i64, cb: Callback) -> ExtResult<()> {
+        log::debug!(
+            "reading file with testing VFS: bytes: {} offset: {}",
+            buf.len(),
+            offset
+        );
         if self.file.seek(SeekFrom::Start(offset as u64)).is_err() {
             return Err(ResultCode::Error);
         }
-        self.file
-            .read(&mut buf[..count])
+        let len = buf.len();
+        let buf = buf.as_mut_slice();
+        let res = self
+            .file
+            .read(&mut buf[..len])
             .map_err(|_| ResultCode::Error)
-            .map(|n| n as i32)
+            .map(|n| n as i32)?;
+        self.io.enqueue(cb, res);
+        Ok(())
     }
 
-    fn write(&mut self, buf: &[u8], count: usize, offset: i64) -> ExtResult<i32> {
-        log::debug!("writing to file with testing VFS: bytes: {count} offset: {offset}");
+    fn write(&mut self, buf: turso_ext::BufferRef, offset: i64, cb: Callback) -> ExtResult<()> {
+        log::debug!(
+            "writing to file with testing VFS: bytes: {} offset: {offset}",
+            buf.len()
+        );
         if self.file.seek(SeekFrom::Start(offset as u64)).is_err() {
             return Err(ResultCode::Error);
         }
-        self.file
-            .write(&buf[..count])
+        let len = buf.len();
+        let n = self
+            .file
+            .write(&buf[..len])
             .map_err(|_| ResultCode::Error)
-            .map(|n| n as i32)
+            .map(|n| n as i32)?;
+        self.io.enqueue(cb, n);
+        Ok(())
     }
 
-    fn sync(&self) -> ExtResult<()> {
+    fn sync(&self, cb: Callback) -> ExtResult<()> {
         log::debug!("syncing file with testing VFS");
-        self.file.sync_all().map_err(|_| ResultCode::Error)
+        self.file.sync_all().map_err(|_| ResultCode::Error)?;
+        self.io.enqueue(cb, 0);
+        Ok(())
     }
 
-    fn truncate(&self, len: i64) -> ExtResult<()> {
+    fn truncate(&self, len: i64, cb: Callback) -> ExtResult<()> {
         log::debug!("truncating file with testing VFS to length: {len}");
-        self.file.set_len(len as u64).map_err(|_| ResultCode::Error)
+        self.file
+            .set_len(len as u64)
+            .map_err(|_| ResultCode::Error)?;
+        self.io.enqueue(cb, 0);
+        Ok(())
     }
 
     fn size(&self) -> i64 {

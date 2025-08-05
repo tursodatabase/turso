@@ -1,5 +1,9 @@
 use crate::{ExtResult, ExtensionApi, ResultCode};
-use std::ffi::{c_char, c_void};
+use std::{
+    ffi::{c_char, c_void},
+    ops::{Deref, DerefMut},
+    ptr::NonNull,
+};
 
 /// Field for ExtensionApi to interface with VFS extensions,
 /// separated to more easily feature flag out for WASM builds.
@@ -38,10 +42,10 @@ pub trait VfsFile: Send + Sync {
     fn unlock(&self) -> ExtResult<()> {
         Ok(())
     }
-    fn read(&mut self, buf: &mut [u8], count: usize, offset: i64) -> ExtResult<i32>;
-    fn write(&mut self, buf: &[u8], count: usize, offset: i64) -> ExtResult<i32>;
-    fn sync(&self) -> ExtResult<()>;
-    fn truncate(&self, len: i64) -> ExtResult<()>;
+    fn read(&mut self, buf: BufferRef, offset: i64, cb: Callback) -> ExtResult<()>;
+    fn write(&mut self, buf: BufferRef, offset: i64, cb: Callback) -> ExtResult<()>;
+    fn sync(&self, cb: Callback) -> ExtResult<()>;
+    fn truncate(&self, len: i64, cb: Callback) -> ExtResult<()>;
     fn size(&self) -> i64;
 }
 
@@ -63,6 +67,93 @@ pub struct VfsImpl {
     pub truncate: VfsTruncate,
 }
 
+/// a wrapper around the raw `*mut u8` buffer for extensions.
+#[derive(Debug)]
+#[repr(C)]
+pub struct BufferRef {
+    _ptr: NonNull<u8>,
+    len: usize,
+}
+
+unsafe impl Send for BufferRef {}
+impl BufferRef {
+    /// create a new `BufferRef` from a raw pointer
+    ///
+    /// # Safety
+    /// The caller must ensure that the pointer is valid and the buffer is not deallocated.
+    /// should only be called on ptr to core's Buffer type
+    pub unsafe fn new(ptr: *mut u8, len: usize) -> Self {
+        Self {
+            _ptr: NonNull::new(ptr).expect("Received null buffer pointer"),
+            len,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Get a safe slice reference to the buffer
+    pub fn as_slice(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self._ptr.as_ptr(), self.len) }
+    }
+
+    /// Get a safe mutable slice reference to the buffer
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self._ptr.as_ptr(), self.len) }
+    }
+}
+
+impl Deref for BufferRef {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+
+impl DerefMut for BufferRef {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.as_mut_slice()
+    }
+}
+pub type Callback = Box<dyn FnOnce(i32) + Send>;
+
+#[repr(C)]
+pub struct IOCallback {
+    pub callback: CallbackFn,
+    pub ctx: SendPtr,
+}
+
+unsafe impl Send for IOCallback {}
+
+#[repr(transparent)]
+/// Wrapper type to support creating Box<dyn FnOnce()+Send> obj
+/// that needs to call a C function with an opaque pointer.
+pub struct SendPtr(NonNull<c_void>);
+unsafe impl Send for SendPtr {}
+
+impl SendPtr {
+    pub fn inner(&self) -> NonNull<c_void> {
+        self.0
+    }
+}
+
+impl IOCallback {
+    pub fn new(cb: CallbackFn, ctx: NonNull<c_void>) -> Self {
+        Self {
+            callback: cb,
+            ctx: SendPtr(ctx),
+        }
+    }
+}
+
+pub type CallbackFn = unsafe extern "C" fn(res: i32, user_data: SendPtr);
+
 pub type RegisterVfsFn =
     unsafe extern "C" fn(name: *const c_char, vfs: *const VfsImpl) -> ResultCode;
 
@@ -75,15 +166,24 @@ pub type VfsOpen = unsafe extern "C" fn(
 
 pub type VfsClose = unsafe extern "C" fn(file: *const c_void) -> ResultCode;
 
-pub type VfsRead =
-    unsafe extern "C" fn(file: *const c_void, buf: *mut u8, count: usize, offset: i64) -> i32;
+pub type VfsRead = unsafe extern "C" fn(
+    file: *const c_void,
+    buf: BufferRef,
+    offset: i64,
+    cb: IOCallback,
+) -> ResultCode;
 
-pub type VfsWrite =
-    unsafe extern "C" fn(file: *const c_void, buf: *const u8, count: usize, offset: i64) -> i32;
+pub type VfsWrite = unsafe extern "C" fn(
+    file: *const c_void,
+    buf: BufferRef,
+    offset: i64,
+    cb: IOCallback,
+) -> ResultCode;
 
-pub type VfsSync = unsafe extern "C" fn(file: *const c_void) -> i32;
+pub type VfsSync = unsafe extern "C" fn(file: *const c_void, cb: IOCallback) -> ResultCode;
 
-pub type VfsTruncate = unsafe extern "C" fn(file: *const c_void, len: i64) -> ResultCode;
+pub type VfsTruncate =
+    unsafe extern "C" fn(file: *const c_void, len: i64, cb: IOCallback) -> ResultCode;
 
 pub type VfsLock = unsafe extern "C" fn(file: *const c_void, exclusive: bool) -> ResultCode;
 

@@ -70,6 +70,13 @@ pub fn derive_vfs_module(input: TokenStream) -> TokenStream {
             (api.vfs_interface.register_vfs)(name, vfsimpl)
         }
 
+        fn __get_cb(cb: ::turso_ext::IOCallback) -> ::std::boxed::Box<dyn FnOnce(i32) + Send> {
+            let callback: ::std::boxed::Box<dyn FnOnce(i32) + Send> = ::std::boxed::Box::new(move | res: i32| {
+                unsafe { (cb.callback)(res, cb.ctx) };
+            });
+            callback
+        }
+
         #[no_mangle]
         pub unsafe extern "C" fn #open_fn_name(
             ctx: *const ::std::ffi::c_void,
@@ -109,18 +116,19 @@ pub fn derive_vfs_module(input: TokenStream) -> TokenStream {
             ::turso_ext::ResultCode::OK
         }
 
-        #[no_mangle]
-        pub unsafe extern "C" fn #read_fn_name(file_ptr: *const ::std::ffi::c_void, buf: *mut u8, count: usize, offset: i64) -> i32 {
+          #[no_mangle]
+          pub unsafe extern "C" fn #read_fn_name(file_ptr: *const ::std::ffi::c_void, buf: ::turso_ext::BufferRef, offset: i64, cb: ::turso_ext::IOCallback) -> ::turso_ext::ResultCode {
             if file_ptr.is_null() {
-                return -1;
+                return ::turso_ext::ResultCode::Error;
             }
+            let callback = __get_cb(cb);
             let vfs_file: &mut ::turso_ext::VfsFileImpl = &mut *(file_ptr as *mut ::turso_ext::VfsFileImpl);
             let file: &mut <#struct_name as ::turso_ext::VfsExtension>::File =
                 &mut *(vfs_file.file as *mut <#struct_name as ::turso_ext::VfsExtension>::File);
-            match <#struct_name as ::turso_ext::VfsExtension>::File::read(file, ::std::slice::from_raw_parts_mut(buf, count), count, offset) {
-                Ok(n) => n,
-                Err(_) => -1,
+            if <#struct_name as ::turso_ext::VfsExtension>::File::read(file, buf, offset, callback).is_err() {
+                return ::turso_ext::ResultCode::Error;
             }
+          ::turso_ext::ResultCode::OK
         }
 
         #[no_mangle]
@@ -136,17 +144,18 @@ pub fn derive_vfs_module(input: TokenStream) -> TokenStream {
         }
 
         #[no_mangle]
-        pub unsafe extern "C" fn #write_fn_name(file_ptr: *const ::std::ffi::c_void, buf: *const u8, count: usize, offset: i64) -> i32 {
+        pub unsafe extern "C" fn #write_fn_name(file_ptr: *const ::std::ffi::c_void, buf: ::turso_ext::BufferRef, offset: i64, cb: ::turso_ext::IOCallback) -> ::turso_ext::ResultCode {
             if file_ptr.is_null() {
-                return -1;
+                return ::turso_ext::ResultCode::Error;
             }
+            let callback = __get_cb(cb);
             let vfs_file: &mut ::turso_ext::VfsFileImpl = &mut *(file_ptr as *mut ::turso_ext::VfsFileImpl);
             let file: &mut <#struct_name as ::turso_ext::VfsExtension>::File =
                 &mut *(vfs_file.file as *mut <#struct_name as ::turso_ext::VfsExtension>::File);
-            match <#struct_name as ::turso_ext::VfsExtension>::File::write(file, ::std::slice::from_raw_parts(buf, count), count, offset) {
-                Ok(n) => n,
-                Err(_) => -1,
+            if <#struct_name as ::turso_ext::VfsExtension>::File::write(file, buf, offset, callback).is_err() {
+                return ::turso_ext::ResultCode::Error;
             }
+          ::turso_ext::ResultCode::OK
         }
 
         #[no_mangle]
@@ -178,29 +187,31 @@ pub fn derive_vfs_module(input: TokenStream) -> TokenStream {
         }
 
         #[no_mangle]
-        pub unsafe extern "C" fn #sync_fn_name(file_ptr: *const ::std::ffi::c_void) -> i32 {
+        pub unsafe extern "C" fn #sync_fn_name(file_ptr: *const ::std::ffi::c_void, cb: ::turso_ext::IOCallback) -> ::turso_ext::ResultCode {
             if file_ptr.is_null() {
-                return -1;
+                return ::turso_ext::ResultCode::Error;
             }
+            let callback  = __get_cb(cb);
             let vfs_file: &mut ::turso_ext::VfsFileImpl = &mut *(file_ptr as *mut ::turso_ext::VfsFileImpl);
             let file: &mut <#struct_name as ::turso_ext::VfsExtension>::File =
                 &mut *(vfs_file.file as *mut <#struct_name as ::turso_ext::VfsExtension>::File);
-            if <#struct_name as ::turso_ext::VfsExtension>::File::sync(file).is_err() {
-                return -1;
+            if <#struct_name as ::turso_ext::VfsExtension>::File::sync(file, callback).is_err() {
+                return ::turso_ext::ResultCode::Error;
             }
-            0
+            ::turso_ext::ResultCode::OK
         }
 
         #[no_mangle]
-        pub unsafe extern "C" fn #trunc_fn_name(file_ptr: *const ::std::ffi::c_void, len: i64) -> ::turso_ext::ResultCode {
+        pub unsafe extern "C" fn #trunc_fn_name(file_ptr: *const ::std::ffi::c_void, len: i64, cb: ::turso_ext::IOCallback) -> ::turso_ext::ResultCode {
             if file_ptr.is_null() {
-                return ::turso_ext::ResultCode::Error;
+                return turso_ext::ResultCode::Error;
             }
+            let callback = __get_cb(cb);
             let vfs_file: &mut ::turso_ext::VfsFileImpl = &mut *(file_ptr as *mut ::turso_ext::VfsFileImpl);
             let file: &mut <#struct_name as ::turso_ext::VfsExtension>::File =
                 &mut *(vfs_file.file as *mut <#struct_name as ::turso_ext::VfsExtension>::File);
-            if <#struct_name as ::turso_ext::VfsExtension>::File::truncate(file, len).is_err() {
-                return ::turso_ext::ResultCode::Error;
+            if <#struct_name as ::turso_ext::VfsExtension>::File::truncate(file, len, callback).is_err() {
+                    return turso_ext::ResultCode::Error;
             }
             ::turso_ext::ResultCode::OK
         }
