@@ -325,3 +325,6 @@ do_execsql_test_in_memory_any_error pragma-max-page-count-enforcement-error {
   PRAGMA max_page_count = 1;
   CREATE TABLE test (id INTEGER)
 }
+do_execsql_test_regex pragma-module-list-nonempty {
+  SELECT * FROM pragma_module_list;
+} {.+}
