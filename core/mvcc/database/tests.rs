@@ -1126,7 +1126,9 @@ fn commit_should_release_lock() {
     let conn = &db.conn;
 
     let tx_id = db.mvcc_store.begin_tx(conn.get_pager().clone());
-    let _ = db.mvcc_store.commit_tx(tx_id, conn.get_pager().clone(), conn);
+    let _ = db
+        .mvcc_store
+        .commit_tx(tx_id, conn.get_pager().clone(), conn);
 
     let _tx_id_2 = db.mvcc_store.begin_tx(conn.get_pager().clone());
 }
