@@ -74,8 +74,16 @@ fn bench(c: &mut Criterion) {
                     },
                 )
                 .unwrap();
-            db.mvcc_store
+            let mut sm = db
+                .mvcc_store
                 .commit_tx(tx_id, conn.get_pager().clone(), conn)
+                .unwrap();
+            let result = sm.step(&db.mvcc_store.clone()).unwrap();
+            assert!(sm.is_finalized());
+            match result {
+                TransitionResult::Done(()) => {}
+                _ => unreachable!(),
+            }
         })
     });
 
