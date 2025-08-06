@@ -19,6 +19,7 @@ mod schema;
 #[cfg(feature = "series")]
 mod series;
 mod state_machine;
+pub use state_machine::{StateTransition, TransitionResult};
 mod storage;
 #[allow(dead_code)]
 #[cfg(feature = "time")]
