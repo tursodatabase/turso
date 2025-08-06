@@ -4131,6 +4131,11 @@ pub fn op_function(
                 let result = exec_concat_ws(reg_values);
                 state.registers[*dest] = Register::Value(result);
             }
+            ScalarFunc::Format => {
+                let reg_values = &state.registers[*start_reg..*start_reg + arg_count];
+                let result = exec_format(reg_values);
+                state.registers[*dest] = Register::Value(result);
+            }
             ScalarFunc::Glob => {
                 let pattern = &state.registers[*start_reg];
                 let text = &state.registers[*start_reg + 1];
@@ -7913,6 +7918,21 @@ fn exec_concat_ws(registers: &[Register]) -> Value {
 
     let result = parts.collect::<Vec<_>>().join(&separator);
     Value::build_text(result)
+}
+
+fn exec_format(registers: &[Register]) -> Value {
+    if registers.is_empty() {
+        return Value::Null;
+    }
+
+    let format = registers[0].get_owned_value();
+
+    let parts = registers[1..]
+        .iter()
+        .map(|part| part.get_owned_value())
+        .collect::<Vec<&Value>>();
+
+    format.exec_format(&parts[..])
 }
 
 fn exec_char(values: &[Register]) -> Value {
