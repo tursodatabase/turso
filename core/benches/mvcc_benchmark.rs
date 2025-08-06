@@ -106,9 +106,7 @@ fn bench(c: &mut Criterion) {
                     conn.get_pager().clone(),
                 )
                 .unwrap();
-            db.mvcc_store
-                .commit_tx(tx_id, conn.get_pager().clone(), conn)
-                .unwrap();
+            commit_tx_and_step(db.mvcc_store.clone(), conn, tx_id).unwrap();
         })
     });
 
