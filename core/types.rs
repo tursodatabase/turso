@@ -14,7 +14,7 @@ use crate::translate::plan::IterationDirection;
 use crate::vdbe::sorter::Sorter;
 use crate::vdbe::Register;
 use crate::vtab::VirtualTableCursor;
-use crate::{turso_assert, Result};
+use crate::{turso_assert, Completion, Result};
 use std::fmt::{Debug, Display};
 
 const MAX_REAL_SIZE: u8 = 15;
@@ -2451,6 +2451,13 @@ impl Cursor {
             _ => panic!("Cursor is not a virtual cursor"),
         }
     }
+}
+
+#[derive(Debug)]
+#[must_use]
+pub enum IOCompletions {
+    Single(Completion),
+    Many(Vec<Completion>),
 }
 
 #[derive(Debug)]

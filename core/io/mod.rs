@@ -138,11 +138,12 @@ pub type SyncComplete = dyn Fn(i32);
 pub type TruncateComplete = dyn Fn(i32);
 
 #[must_use]
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct Completion {
     inner: Arc<CompletionInner>,
 }
 
+#[derive(Debug)]
 struct CompletionInner {
     pub completion_type: CompletionType,
     is_completed: Cell<bool>,
@@ -153,6 +154,17 @@ pub enum CompletionType {
     Write(WriteCompletion),
     Sync(SyncCompletion),
     Truncate(TruncateCompletion),
+}
+
+impl Debug for CompletionType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Read(..) => f.debug_tuple("Read").finish(),
+            Self::Write(..) => f.debug_tuple("Write").finish(),
+            Self::Sync(..) => f.debug_tuple("Sync").finish(),
+            Self::Truncate(..) => f.debug_tuple("Truncate").finish(),
+        }
+    }
 }
 
 pub struct ReadCompletion {
