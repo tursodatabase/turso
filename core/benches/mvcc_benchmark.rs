@@ -1,3 +1,4 @@
+use std::error::Error;
 use std::sync::Arc;
 
 use criterion::async_executor::FuturesExecutor;
@@ -27,6 +28,22 @@ fn bench_db() -> BenchDb {
     }
 }
 
+fn commit_tx_and_step(
+    mv_store: Arc<MvStore<LocalClock>>,
+    conn: &Arc<Connection>,
+    tx_id: u64,
+) -> Result<(), Box<dyn Error>> {
+    let mut sm = mv_store
+        .commit_tx(tx_id, conn.get_pager().clone(), conn)
+        .unwrap();
+    let result = sm.step(&mv_store)?;
+    assert!(sm.is_finalized());
+    match result {
+        TransitionResult::Done(()) => Ok(()),
+        _ => unreachable!(),
+    }
+}
+
 fn bench(c: &mut Criterion) {
     let mut group = c.benchmark_group("mvcc-ops-throughput");
     group.throughput(Throughput::Elements(1));
@@ -46,17 +63,7 @@ fn bench(c: &mut Criterion) {
         b.to_async(FuturesExecutor).iter(|| async {
             let conn = &db.conn;
             let tx_id = db.mvcc_store.begin_tx(conn.get_pager().clone());
-            let mut sm = db
-                .mvcc_store
-                .commit_tx(tx_id, conn.get_pager().clone(), conn)
-                .unwrap();
-
-            let result = sm.step(&db.mvcc_store.clone()).unwrap();
-            assert!(sm.is_finalized());
-            match result {
-                TransitionResult::Done(()) => {}
-                _ => unreachable!(),
-            }
+            commit_tx_and_step(db.mvcc_store.clone(), conn, tx_id).unwrap();
         })
     });
 
@@ -74,16 +81,7 @@ fn bench(c: &mut Criterion) {
                     },
                 )
                 .unwrap();
-            let mut sm = db
-                .mvcc_store
-                .commit_tx(tx_id, conn.get_pager().clone(), conn)
-                .unwrap();
-            let result = sm.step(&db.mvcc_store.clone()).unwrap();
-            assert!(sm.is_finalized());
-            match result {
-                TransitionResult::Done(()) => {}
-                _ => unreachable!(),
-            }
+            commit_tx_and_step(db.mvcc_store.clone(), conn, tx_id).unwrap();
         })
     });
 
