@@ -7671,6 +7671,162 @@ impl Value {
         }
     }
 
+    pub fn exec_format(&self, args: &[&Value]) -> Value {
+        let fmt = match self {
+            Value::Text(s) => s.as_str().to_string(),
+            Value::Integer(i) => i.to_string(),
+            Value::Float(f) => f.to_string(),
+            Value::Null => return Value::Null,
+            Value::Blob(_) => return Value::Null,
+        };
+
+        let mut result = String::new();
+        let mut chars = fmt.chars().peekable();
+        let mut arg_index = 0;
+
+        while let Some(ch) = chars.next() {
+            if ch != '%' {
+                result.push(ch);
+                continue;
+            }
+
+            if let Some('%') = chars.peek() {
+                result.push('%');
+                chars.next();
+                continue;
+            }
+
+            let mut flags = String::new();
+            while let Some(&c) = chars.peek() {
+                if "-+ 0#".contains(c) {
+                    flags.push(c);
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+
+            let mut width_str = String::new();
+            while let Some(&c) = chars.peek() {
+                if c.is_ascii_digit() {
+                    width_str.push(c);
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            let width = width_str.parse::<usize>().unwrap_or(0);
+
+            let mut precision: Option<usize> = None;
+            if let Some('.') = chars.peek() {
+                chars.next();
+                let mut prec_str = String::new();
+                while let Some(&c) = chars.peek() {
+                    if c.is_ascii_digit() {
+                        prec_str.push(c);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                precision = prec_str.parse::<usize>().ok();
+            }
+
+            if let Some(&c) = chars.peek() {
+                if "lh".contains(c) {
+                    chars.next();
+                    if let Some(&'l') = chars.peek() {
+                        chars.next();
+                    }
+                }
+            }
+
+            let spec = chars.next().unwrap_or('s');
+
+            let val = args.get(arg_index).unwrap_or(&&Value::Null);
+            arg_index += 1;
+
+            let mut formatted = match spec {
+                'd' | 'i' | 'u' | 'x' | 'X' | 'o' => match val {
+                    Value::Integer(i) => match spec {
+                        'x' => format!("{:x}", i),
+                        'X' => format!("{:X}", i),
+                        'o' => format!("{:o}", i),
+                        _ => i.to_string(),
+                    },
+                    Value::Float(f) => format!("{}", *f as i64),
+                    Value::Text(s) => s.to_string().parse::<i64>().unwrap_or(0).to_string(),
+                    Value::Null => "0".to_string(),
+                    _ => "0".to_string(),
+                },
+                'f' | 'F' | 'g' | 'G' | 'e' | 'E' => match val {
+                    Value::Float(f) => {
+                        if let Some(p) = precision {
+                            format!("{:.*}", p, f)
+                        } else {
+                            format!("{f}")
+                        }
+                    }
+                    Value::Integer(i) => {
+                        if let Some(p) = precision {
+                            format!("{:.*}", p, *i as f64)
+                        } else {
+                            format!("{}", *i as f64)
+                        }
+                    }
+                    Value::Text(s) => {
+                        let parsed = s.to_string().parse::<f64>().unwrap_or(0.0);
+                        if let Some(p) = precision {
+                            format!("{:.*}", p, parsed)
+                        } else {
+                            format!("{parsed}")
+                        }
+                    }
+                    Value::Null => "0.0".to_string(),
+                    _ => "0.0".to_string(),
+                },
+                's' => match val {
+                    Value::Text(s) => {
+                        if let Some(p) = precision {
+                            s.to_string().chars().take(p).collect()
+                        } else {
+                            s.to_string()
+                        }
+                    }
+                    Value::Integer(i) => i.to_string(),
+                    Value::Float(f) => f.to_string(),
+                    Value::Null => "(null)".to_string(),
+                    _ => "[BLOB]".to_string(),
+                },
+                _ => match val {
+                    Value::Text(s) => s.to_string(),
+                    Value::Integer(i) => i.to_string(),
+                    Value::Float(f) => f.to_string(),
+                    Value::Null => "(null)".to_string(),
+                    _ => "[BLOB]".to_string(),
+                },
+            };
+
+            if width > formatted.len() {
+                let pad_char = if flags.contains('0') && !flags.contains('-') {
+                    '0'
+                } else {
+                    ' '
+                };
+                let padding = pad_char.to_string().repeat(width - formatted.len());
+                if flags.contains('-') {
+                    formatted.push_str(&padding);
+                } else {
+                    formatted = format!("{padding}{formatted}");
+                }
+            }
+
+            result.push_str(&formatted);
+        }
+
+        Value::build_text(result)
+    }
+
     pub fn exec_and(&self, rhs: &Value) -> Value {
         match (
             Numeric::from(self).try_into_bool(),
