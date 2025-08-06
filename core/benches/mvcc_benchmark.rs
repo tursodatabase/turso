@@ -7,6 +7,7 @@ use turso_core::mvcc::clock::LocalClock;
 use turso_core::mvcc::database::{MvStore, Row, RowID};
 use turso_core::types::{ImmutableRecord, Text};
 use turso_core::{Connection, Database, MemoryIO, Value};
+use turso_core::{StateTransition, TransitionResult};
 
 struct BenchDb {
     _db: Arc<Database>,
@@ -45,8 +46,17 @@ fn bench(c: &mut Criterion) {
         b.to_async(FuturesExecutor).iter(|| async {
             let conn = &db.conn;
             let tx_id = db.mvcc_store.begin_tx(conn.get_pager().clone());
-            db.mvcc_store
+            let mut sm = db
+                .mvcc_store
                 .commit_tx(tx_id, conn.get_pager().clone(), conn)
+                .unwrap();
+
+            let result = sm.step(&db.mvcc_store.clone()).unwrap();
+            assert!(sm.is_finalized());
+            match result {
+                TransitionResult::Done(()) => {}
+                _ => unreachable!(),
+            }
         })
     });
 
