@@ -3727,7 +3727,7 @@ pub fn op_sorter_insert(
             Register::Record(record) => record,
             _ => unreachable!("SorterInsert on non-record register"),
         };
-        cursor.insert(record)?;
+        return_if_io!(cursor.insert(record));
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
