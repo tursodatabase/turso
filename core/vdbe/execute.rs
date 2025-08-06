@@ -10,8 +10,8 @@ use crate::storage::pager::{AtomicDbState, CreateBTreeFlags, DbState};
 use crate::storage::sqlite3_ondisk::read_varint;
 use crate::translate::collate::CollationSeq;
 use crate::types::{
-    compare_immutable, compare_records_generic, Extendable, ImmutableRecord, RawSlice, SeekResult,
-    Text, TextRef, TextSubtype,
+    compare_immutable, compare_records_generic, Extendable, IOCompletions, ImmutableRecord,
+    RawSlice, SeekResult, Text, TextRef, TextSubtype,
 };
 use crate::util::{normalize_ident, IOExt as _};
 use crate::vdbe::insn::InsertFlags;
@@ -120,7 +120,7 @@ macro_rules! return_if_io {
     ($expr:expr) => {
         match $expr? {
             IOResult::Done(v) => v,
-            IOResult::IO => return Ok(InsnFunctionStepResult::IO),
+            IOResult::IO(io) => return Ok(InsnFunctionStepResult::IO(io)),
         }
     };
 }
@@ -153,23 +153,11 @@ fn compare_with_collation(
 
 pub enum InsnFunctionStepResult {
     Done,
-    IO,
+    IO(IOCompletions),
     Row,
     Interrupt,
     Busy,
     Step,
-}
-
-impl From<StepResult> for InsnFunctionStepResult {
-    fn from(value: StepResult) -> Self {
-        match value {
-            super::StepResult::Done => Self::Done,
-            super::StepResult::IO => Self::IO,
-            super::StepResult::Row => Self::Row,
-            super::StepResult::Interrupt => Self::Interrupt,
-            super::StepResult::Busy => Self::Busy,
-        }
-    }
 }
 
 pub fn op_init(

@@ -2464,12 +2464,12 @@ pub enum IOCompletions {
 #[must_use]
 pub enum IOResult<T> {
     Done(T),
-    IO,
+    IO(IOCompletions),
 }
 
 impl<T> IOResult<T> {
     pub fn is_io(&self) -> bool {
-        matches!(self, IOResult::IO)
+        matches!(self, IOResult::IO(..))
     }
 }
 
@@ -2479,7 +2479,7 @@ macro_rules! return_if_io {
     ($expr:expr) => {
         match $expr? {
             IOResult::Done(v) => v,
-            IOResult::IO => return Ok(IOResult::IO),
+            IOResult::IO(io) => return Ok(IOResult::IO(io)),
         }
     };
 }
