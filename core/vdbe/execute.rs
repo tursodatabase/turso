@@ -7754,9 +7754,9 @@ impl Value {
             let mut formatted = match spec {
                 'd' | 'i' | 'u' | 'x' | 'X' | 'o' => match val {
                     Value::Integer(i) => match spec {
-                        'x' => format!("{:x}", i),
-                        'X' => format!("{:X}", i),
-                        'o' => format!("{:o}", i),
+                        'x' => format!("{i:x}"),
+                        'X' => format!("{i:X}"),
+                        'o' => format!("{i:o}"),
                         _ => i.to_string(),
                     },
                     Value::Float(f) => format!("{}", *f as i64),
@@ -7767,7 +7767,7 @@ impl Value {
                 'f' | 'F' | 'g' | 'G' | 'e' | 'E' => match val {
                     Value::Float(f) => {
                         if let Some(p) = precision {
-                            format!("{:.*}", p, f)
+                            format!("{f:.p$}")
                         } else {
                             format!("{f}")
                         }
@@ -7782,7 +7782,7 @@ impl Value {
                     Value::Text(s) => {
                         let parsed = s.to_string().parse::<f64>().unwrap_or(0.0);
                         if let Some(p) = precision {
-                            format!("{:.*}", p, parsed)
+                            format!("{parsed:.p$}")
                         } else {
                             format!("{parsed}")
                         }
