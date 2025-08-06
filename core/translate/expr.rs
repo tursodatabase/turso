@@ -1068,6 +1068,33 @@ pub fn translate_expr(
                             });
                             Ok(target_register)
                         }
+                        ScalarFunc::Format => {
+                            let args = expect_arguments_min!(args, 2, srf);
+
+                            let temp_register = program.alloc_registers(args.len() + 1);
+                            for (i, arg) in args.iter().enumerate() {
+                                translate_expr(
+                                    program,
+                                    referenced_tables,
+                                    arg,
+                                    temp_register + i + 1,
+                                    resolver,
+                                )?;
+                            }
+                            program.emit_insn(Insn::Function {
+                                constant_mask: 0,
+                                start_reg: temp_register + 1,
+                                dest: temp_register,
+                                func: func_ctx,
+                            });
+
+                            program.emit_insn(Insn::Copy {
+                                src_reg: temp_register,
+                                dst_reg: target_register,
+                                extra_amount: 0,
+                            });
+                            Ok(target_register)
+                        }
                         ScalarFunc::IfNull => {
                             let args = match args {
                                 Some(args) if args.len() == 2 => args,
