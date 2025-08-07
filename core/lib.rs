@@ -43,7 +43,6 @@ mod numeric;
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use crate::schema::Table;
-use crate::storage::wal::DummyWAL;
 use crate::translate::optimizer::optimize_plan;
 use crate::translate::pragma::TURSO_CDC_DEFAULT_TABLE_NAME;
 #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
@@ -65,7 +64,6 @@ pub use io::{
 };
 use parking_lot::RwLock;
 use schema::Schema;
-use std::ffi::CStr;
 use std::{
     borrow::Cow,
     cell::{Cell, RefCell, UnsafeCell},
@@ -1739,20 +1737,24 @@ impl Connection {
 
     pub fn get_pager(&self) -> Rc<Pager> {
         self.pager.borrow().clone()
+    }
+
     pub fn get_used_vtab_mods(&self) -> std::collections::HashSet<String> {
-        let mut mods = std::collections::HashSet::new();
+        let mut mods: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         let schema = self._db.schema.lock().unwrap();
 
-    schema.tables.values()
-        .filter_map(|table| {
-            if let Table::Virtual(vtab) = table.as_ref() {
-                vtab.module_name().map(|name| name.to_string())
-            } else {
-                None
-            }
-        })
-        .collect()
+        schema
+            .tables
+            .values()
+            .filter_map(|table| {
+                if let Table::Virtual(vtab) = table.as_ref() {
+                    vtab.module_name().map(|name| name.to_string())
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 }
 
