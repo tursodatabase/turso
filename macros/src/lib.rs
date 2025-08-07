@@ -1,4 +1,5 @@
 mod ext;
+mod testing;
 extern crate proc_macro;
 use proc_macro::{token_stream::IntoIter, Group, TokenStream, TokenTree};
 use std::collections::HashMap;
@@ -438,4 +439,10 @@ pub fn derive_vtab_module(input: TokenStream) -> TokenStream {
 #[proc_macro_derive(VfsDerive)]
 pub fn derive_vfs_module(input: TokenStream) -> TokenStream {
     ext::derive_vfs_module(input)
+}
+
+/// Attribute macro to create tests that check for memory leaks and
+#[proc_macro_attribute]
+pub fn turso_test(_attr: TokenStream, input: TokenStream) -> TokenStream {
+    testing::turso_test_attr(input)
 }
