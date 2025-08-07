@@ -1,4 +1,4 @@
-use std::error::Error;
+use std::cell::RefCell;
 use std::sync::Arc;
 
 use criterion::async_executor::FuturesExecutor;
@@ -8,7 +8,6 @@ use turso_core::mvcc::clock::LocalClock;
 use turso_core::mvcc::database::{MvStore, Row, RowID};
 use turso_core::types::{ImmutableRecord, Text};
 use turso_core::{Connection, Database, MemoryIO, Value};
-use turso_core::{StateTransition, TransitionResult};
 
 struct BenchDb {
     _db: Arc<Database>,
@@ -28,27 +27,17 @@ fn bench_db() -> BenchDb {
     }
 }
 
-fn commit_tx_and_step(
-    mv_store: Arc<MvStore<LocalClock>>,
-    conn: &Arc<Connection>,
-    tx_id: u64,
-) -> Result<(), Box<dyn Error>> {
-    let mut sm = mv_store
-        .commit_tx(tx_id, conn.get_pager().clone(), conn)
-        .unwrap();
-    let result = sm.step(&mv_store)?;
-    assert!(sm.is_finalized());
-    match result {
-        TransitionResult::Done(()) => Ok(()),
-        _ => unreachable!(),
-    }
+macro_rules! prepare_tx_statements {
+    ($db:ident, $begin_stmt:ident, $commit_stmt:ident) => {
+        let $begin_stmt = RefCell::new($db.conn.prepare("BEGIN TRANSACTION;").unwrap());
+        let $commit_stmt = RefCell::new($db.conn.prepare("COMMIT;").unwrap());
+    };
 }
 
 fn bench(c: &mut Criterion) {
     let mut group = c.benchmark_group("mvcc-ops-throughput");
     group.throughput(Throughput::Elements(1));
 
-    let db = bench_db();
     group.bench_function("begin_tx + rollback_tx", |b| {
         let db = bench_db();
         b.to_async(FuturesExecutor).iter(|| async {
@@ -59,58 +48,49 @@ fn bench(c: &mut Criterion) {
     });
 
     let db = bench_db();
-    group.bench_function("begin_tx + commit_tx", |b| {
+    prepare_tx_statements!(db, begin_stmt, commit_stmt);
+    group.bench_function("begin_tx-commit_tx", |b| {
         b.to_async(FuturesExecutor).iter(|| async {
-            let conn = &db.conn;
-            let tx_id = db.mvcc_store.begin_tx(conn.get_pager().clone());
-            commit_tx_and_step(db.mvcc_store.clone(), conn, tx_id).unwrap();
+            begin_stmt.borrow_mut().step().unwrap();
+            commit_stmt.borrow_mut().step().unwrap();
         })
     });
 
     let db = bench_db();
+    prepare_tx_statements!(db, begin_stmt, commit_stmt);
+    let read_stmt = RefCell::new(db.conn.prepare("SELECT 1").unwrap());
     group.bench_function("begin_tx-read-commit_tx", |b| {
         b.to_async(FuturesExecutor).iter(|| async {
-            let conn = &db.conn;
-            let tx_id = db.mvcc_store.begin_tx(conn.get_pager().clone());
-            db.mvcc_store
-                .read(
-                    tx_id,
-                    RowID {
-                        table_id: 1,
-                        row_id: 1,
-                    },
-                )
-                .unwrap();
-            commit_tx_and_step(db.mvcc_store.clone(), conn, tx_id).unwrap();
+            begin_stmt.borrow_mut().step().unwrap();
+            read_stmt.borrow_mut().step().unwrap();
+            commit_stmt.borrow_mut().step().unwrap();
+        })
+    });
+
+    let db = bench_db();
+    db.conn
+        .execute("CREATE TABLE dummy (id INTEGER PRIMARY KEY);")
+        .unwrap();
+    db.conn
+        .execute("INSERT INTO dummy (id) VALUES (1);")
+        .unwrap();
+    prepare_tx_statements!(db, begin_stmt, commit_stmt);
+    let update_stmt = RefCell::new(
+        db.conn
+            .prepare("UPDATE dummy SET id = 1 WHERE id = 1;")
+            .unwrap(),
+    );
+    group.bench_function("begin_tx-update-commit_tx", |b| {
+        b.to_async(FuturesExecutor).iter(|| async {
+            begin_stmt.borrow_mut().step().unwrap();
+            update_stmt.borrow_mut().step().unwrap();
+            commit_stmt.borrow_mut().step().unwrap();
         })
     });
 
     let db = bench_db();
     let record = ImmutableRecord::from_values(&vec![Value::Text(Text::new("World"))], 1);
     let record_data = record.as_blob();
-    group.bench_function("begin_tx-update-commit_tx", |b| {
-        b.to_async(FuturesExecutor).iter(|| async {
-            let conn = &db.conn;
-            let tx_id = db.mvcc_store.begin_tx(conn.get_pager().clone());
-            db.mvcc_store
-                .update(
-                    tx_id,
-                    Row {
-                        id: RowID {
-                            table_id: 1,
-                            row_id: 1,
-                        },
-                        data: record_data.clone(),
-                        column_count: 1,
-                    },
-                    conn.get_pager().clone(),
-                )
-                .unwrap();
-            commit_tx_and_step(db.mvcc_store.clone(), conn, tx_id).unwrap();
-        })
-    });
-
-    let db = bench_db();
     let tx_id = db.mvcc_store.begin_tx(db.conn.get_pager().clone());
     db.mvcc_store
         .insert(
