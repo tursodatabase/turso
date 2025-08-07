@@ -1743,15 +1743,16 @@ impl Connection {
         let mut mods = std::collections::HashSet::new();
 
         let schema = self._db.schema.lock().unwrap();
-        for table in schema.tables.values() {
-            if let Table::Virtual(vtab) = table.as_ref() {
-                if let Some(module_name) = vtab.module_name() {
-                    mods.insert(module_name.to_string());
-                }
-            }
-        }
 
-        mods
+    schema.tables.values()
+        .filter_map(|table| {
+            if let Table::Virtual(vtab) = table.as_ref() {
+                vtab.module_name().map(|name| name.to_string())
+            } else {
+                None
+            }
+        })
+        .collect()
     }
 }
 
