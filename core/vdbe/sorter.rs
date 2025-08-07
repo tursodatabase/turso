@@ -134,10 +134,10 @@ impl Sorter {
                     }
                 }
                 SortState::Flush => {
+                    self.sort_state = SortState::InitHeap;
                     if let Some(_c) = self.flush()? {
                         return Ok(IOResult::IO);
                     }
-                    self.sort_state = SortState::InitHeap;
                 }
                 SortState::InitHeap => {
                     return_if_io!(self.init_chunk_heap());
@@ -415,6 +415,7 @@ impl SortedChunk {
                     }
 
                     self.next_state = NextState::Finish;
+                    // This check is done to see if we need to read more from the chunk before popping the record
                     if self.records.len() == 1 && self.io_state.get() != SortedChunkIOState::ReadEOF
                     {
                         // We've consumed the last record. Read more payload into the buffer.
