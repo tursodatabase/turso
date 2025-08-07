@@ -639,9 +639,11 @@ impl Drop for UnixFile<'_> {
 
 #[cfg(test)]
 mod tests {
+    use turso_macros::turso_test;
+
     use super::*;
 
-    #[test]
+    #[turso_test]
     fn test_multiple_processes_cannot_open_file() {
         common::tests::test_multiple_processes_cannot_open_file(UnixIO::new);
     }

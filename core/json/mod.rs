@@ -651,10 +651,12 @@ pub fn json_quote(value: &Value) -> crate::Result<Value> {
 
 #[cfg(test)]
 mod tests {
+    use turso_macros::turso_test;
+
     use super::*;
     use crate::types::Value;
 
-    #[test]
+    #[turso_test]
     fn test_get_json_valid_json5() {
         let input = Value::build_text("{ key: 'value' }");
         let result = get_json(&input, None).unwrap();
@@ -666,7 +668,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[turso_test]
     fn test_get_json_valid_json5_infinity() {
         let input = Value::build_text("{ \"key\": Infinity }");
         let result = get_json(&input, None).unwrap();
@@ -678,7 +680,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[turso_test]
     fn test_get_json_valid_json5_negative_infinity() {
         let input = Value::build_text("{ \"key\": -Infinity }");
         let result = get_json(&input, None).unwrap();
@@ -690,7 +692,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[turso_test]
     fn test_get_json_valid_json5_nan() {
         let input = Value::build_text("{ \"key\": NaN }");
         let result = get_json(&input, None).unwrap();
@@ -702,7 +704,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[turso_test]
     fn test_get_json_invalid_json5() {
         let input = Value::build_text("{ key: value }");
         let result = get_json(&input, None);
@@ -712,7 +714,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[turso_test]
     fn test_get_json_valid_jsonb() {
         let input = Value::build_text("{\"key\":\"value\"}");
         let result = get_json(&input, None).unwrap();
@@ -724,7 +726,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[turso_test]
     fn test_get_json_invalid_jsonb() {
         let input = Value::build_text("{key:\"value\"");
         let result = get_json(&input, None);
@@ -734,7 +736,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[turso_test]
     fn test_get_json_blob_valid_jsonb() {
         let binary_json = vec![124, 55, 104, 101, 121, 39, 121, 111];
         let input = Value::Blob(binary_json);
@@ -747,7 +749,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[turso_test]
     fn test_get_json_blob_invalid_jsonb() {
         let binary_json: Vec<u8> = vec![0xA2, 0x62, 0x6B, 0x31, 0x62, 0x76]; // Incomplete binary JSON
         let input = Value::Blob(binary_json);
@@ -759,7 +761,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[turso_test]
     fn test_get_json_non_text() {
         let input = Value::Null;
         let result = get_json(&input, None).unwrap();
@@ -770,7 +772,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[turso_test]
     fn test_json_array_simple() {
         let text = Register::Value(Value::build_text("value1"));
         let json = Register::Value(Value::Text(Text::json("\"value2\"".to_string())));
@@ -790,7 +792,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[turso_test]
     fn test_json_array_empty() {
         let input = vec![];
 
@@ -803,7 +805,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[turso_test]
     fn test_json_array_blob_invalid() {
         let blob = Register::Value(Value::Blob("1".as_bytes().to_vec()));
 
@@ -817,7 +819,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[turso_test]
     fn test_json_array_length() {
         let input = Value::build_text("[1,2,3,4]");
         let json_cache = JsonCacheCell::new();
@@ -829,7 +831,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[turso_test]
     fn test_json_array_length_empty() {
         let input = Value::build_text("[]");
         let json_cache = JsonCacheCell::new();
@@ -841,7 +843,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[turso_test]
     fn test_json_array_length_root() {
         let input = Value::build_text("[1,2,3,4]");
         let json_cache = JsonCacheCell::new();
@@ -853,7 +855,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[turso_test]
     fn test_json_array_length_not_array() {
         let input = Value::build_text("{one: [1,2,3,4]}");
         let json_cache = JsonCacheCell::new();
@@ -865,7 +867,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[turso_test]
     fn test_json_array_length_via_prop() {
         let input = Value::build_text("{one: [1,2,3,4]}");
         let json_cache = JsonCacheCell::new();
@@ -878,7 +880,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[turso_test]
     fn test_json_array_length_via_index() {
         let input = Value::build_text("[[1,2,3,4]]");
         let json_cache = JsonCacheCell::new();
@@ -891,7 +893,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[turso_test]
     fn test_json_array_length_via_index_not_array() {
         let input = Value::build_text("[1,2,3,4]");
         let json_cache = JsonCacheCell::new();
@@ -904,7 +906,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[turso_test]
     fn test_json_array_length_via_index_bad_prop() {
         let input = Value::build_text("{one: [1,2,3,4]}");
         let json_cache = JsonCacheCell::new();
@@ -913,7 +915,7 @@ mod tests {
         assert_eq!(Value::Null, result);
     }
 
-    #[test]
+    #[turso_test]
     fn test_json_array_length_simple_json_subtype() {
         let input = Value::build_text("[1,2,3]");
         let json_cache = JsonCacheCell::new();
@@ -927,7 +929,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[turso_test]
     fn test_json_extract_missing_path() {
         let json_cache = JsonCacheCell::new();
         let result = json_extract(
@@ -941,7 +943,7 @@ mod tests {
             _ => panic!("Expected null result, got: {result:?}"),
         }
     }
-    #[test]
+    #[turso_test]
     fn test_json_extract_null_path() {
         let json_cache = JsonCacheCell::new();
         let result = json_extract(
@@ -956,7 +958,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[turso_test]
     fn test_json_path_invalid() {
         let json_cache = JsonCacheCell::new();
         let result = json_extract(
@@ -971,56 +973,56 @@ mod tests {
         }
     }
 
-    #[test]
+    #[turso_test]
     fn test_json_error_position_no_error() {
         let input = Value::build_text("[1,2,3]");
         let result = json_error_position(&input).unwrap();
         assert_eq!(result, Value::Integer(0));
     }
 
-    #[test]
+    #[turso_test]
     fn test_json_error_position_no_error_more() {
         let input = Value::build_text(r#"{"a":55,"b":72 , }"#);
         let result = json_error_position(&input).unwrap();
         assert_eq!(result, Value::Integer(0));
     }
 
-    #[test]
+    #[turso_test]
     fn test_json_error_position_object() {
         let input = Value::build_text(r#"{"a":55,"b":72,,}"#);
         let result = json_error_position(&input).unwrap();
         assert_eq!(result, Value::Integer(16));
     }
 
-    #[test]
+    #[turso_test]
     fn test_json_error_position_array() {
         let input = Value::build_text(r#"["a",55,"b",72,,]"#);
         let result = json_error_position(&input).unwrap();
         assert_eq!(result, Value::Integer(16));
     }
 
-    #[test]
+    #[turso_test]
     fn test_json_error_position_null() {
         let input = Value::Null;
         let result = json_error_position(&input).unwrap();
         assert_eq!(result, Value::Null);
     }
 
-    #[test]
+    #[turso_test]
     fn test_json_error_position_integer() {
         let input = Value::Integer(5);
         let result = json_error_position(&input).unwrap();
         assert_eq!(result, Value::Integer(0));
     }
 
-    #[test]
+    #[turso_test]
     fn test_json_error_position_float() {
         let input = Value::Float(-5.5);
         let result = json_error_position(&input).unwrap();
         assert_eq!(result, Value::Integer(0));
     }
 
-    #[test]
+    #[turso_test]
     fn test_json_object_simple() {
         let key = Register::Value(Value::build_text("key"));
         let value = Register::Value(Value::build_text("value"));
@@ -1033,7 +1035,7 @@ mod tests {
         assert_eq!(json_text.as_str(), r#"{"key":"value"}"#);
     }
 
-    #[test]
+    #[turso_test]
     fn test_json_object_multiple_values() {
         let text_key = Value::build_text("text_key");
         let text_value = Value::build_text("text_value");
@@ -1069,7 +1071,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[turso_test]
     fn test_json_object_json_value_is_rendered_as_json() {
         let key = Register::Value(Value::build_text("key"));
         let value = Register::Value(Value::Text(Text::json(r#"{"json":"value"}"#.to_string())));
@@ -1082,7 +1084,7 @@ mod tests {
         assert_eq!(json_text.as_str(), r#"{"key":{"json":"value"}}"#);
     }
 
-    #[test]
+    #[turso_test]
     fn test_json_object_json_text_value_is_rendered_as_regular_text() {
         let key = Register::Value(Value::build_text("key"));
         let value = Register::Value(Value::Text(Text::new(r#"{"json":"value"}"#)));
@@ -1095,7 +1097,7 @@ mod tests {
         assert_eq!(json_text.as_str(), r#"{"key":"{\"json\":\"value\"}"}"#);
     }
 
-    #[test]
+    #[turso_test]
     fn test_json_object_nested() {
         let key = Register::Value(Value::build_text("key"));
         let value = Register::Value(Value::build_text("value"));
@@ -1113,7 +1115,7 @@ mod tests {
         assert_eq!(json_text.as_str(), r#"{"parent_key":{"key":"value"}}"#);
     }
 
-    #[test]
+    #[turso_test]
     fn test_json_object_duplicated_keys() {
         let key = Register::Value(Value::build_text("key"));
         let value = Register::Value(Value::build_text("value"));
@@ -1126,7 +1128,7 @@ mod tests {
         assert_eq!(json_text.as_str(), r#"{"key":"value","key":"value"}"#);
     }
 
-    #[test]
+    #[turso_test]
     fn test_json_object_empty() {
         let input = vec![];
 
@@ -1137,7 +1139,7 @@ mod tests {
         assert_eq!(json_text.as_str(), r#"{}"#);
     }
 
-    #[test]
+    #[turso_test]
     fn test_json_object_non_text_key() {
         let key = Register::Value(Value::Integer(1));
         let value = Register::Value(Value::build_text("value"));
@@ -1149,7 +1151,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[turso_test]
     fn test_json_odd_number_of_values() {
         let key = Register::Value(Value::build_text("key"));
         let value = Register::Value(Value::build_text("value"));
@@ -1158,7 +1160,7 @@ mod tests {
         assert!(json_object(&input).is_err());
     }
 
-    #[test]
+    #[turso_test]
     fn test_json_path_from_owned_value_root_strict() {
         let path = Value::Text(Text::new("$"));
 
@@ -1175,7 +1177,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[turso_test]
     fn test_json_path_from_owned_value_root_non_strict() {
         let path = Value::Text(Text::new("$"));
 
@@ -1192,14 +1194,14 @@ mod tests {
         }
     }
 
-    #[test]
+    #[turso_test]
     fn test_json_path_from_owned_value_named_strict() {
         let path = Value::Text(Text::new("field"));
 
         assert!(json_path_from_owned_value(&path, true).is_err());
     }
 
-    #[test]
+    #[turso_test]
     fn test_json_path_from_owned_value_named_non_strict() {
         let path = Value::Text(Text::new("field"));
 
@@ -1216,13 +1218,13 @@ mod tests {
         }
     }
 
-    #[test]
+    #[turso_test]
     fn test_json_path_from_owned_value_integer_strict() {
         let path = Value::Integer(3);
         assert!(json_path_from_owned_value(&path, true).is_err());
     }
 
-    #[test]
+    #[turso_test]
     fn test_json_path_from_owned_value_integer_non_strict() {
         let path = Value::Integer(3);
 
@@ -1239,7 +1241,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[turso_test]
     fn test_json_path_from_owned_value_null_strict() {
         let path = Value::Null;
 
@@ -1250,7 +1252,7 @@ mod tests {
         assert!(result.is_none());
     }
 
-    #[test]
+    #[turso_test]
     fn test_json_path_from_owned_value_null_non_strict() {
         let path = Value::Null;
 
@@ -1261,14 +1263,14 @@ mod tests {
         assert!(result.is_none());
     }
 
-    #[test]
+    #[turso_test]
     fn test_json_path_from_owned_value_float_strict() {
         let path = Value::Float(1.23);
 
         assert!(json_path_from_owned_value(&path, true).is_err());
     }
 
-    #[test]
+    #[turso_test]
     fn test_json_path_from_owned_value_float_non_strict() {
         let path = Value::Float(1.23);
 
@@ -1285,7 +1287,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[turso_test]
     fn test_json_set_field_empty_object() {
         let json_cache = JsonCacheCell::new();
         let result = json_set(
@@ -1302,7 +1304,7 @@ mod tests {
         assert_eq!(result.unwrap().to_text().unwrap(), r#"{"field":"value"}"#);
     }
 
-    #[test]
+    #[turso_test]
     fn test_json_set_replace_field() {
         let json_cache = JsonCacheCell::new();
         let result = json_set(
@@ -1322,7 +1324,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[turso_test]
     fn test_json_set_set_deeply_nested_key() {
         let json_cache = JsonCacheCell::new();
         let result = json_set(
@@ -1342,7 +1344,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[turso_test]
     fn test_json_set_add_value_to_empty_array() {
         let json_cache = JsonCacheCell::new();
         let result = json_set(
@@ -1359,7 +1361,7 @@ mod tests {
         assert_eq!(result.unwrap().to_text().unwrap(), r#"["value"]"#);
     }
 
-    #[test]
+    #[turso_test]
     fn test_json_set_add_value_to_nonexistent_array() {
         let json_cache = JsonCacheCell::new();
         let result = json_set(
@@ -1379,7 +1381,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[turso_test]
     fn test_json_set_add_value_to_array() {
         let json_cache = JsonCacheCell::new();
         let result = json_set(
@@ -1396,7 +1398,7 @@ mod tests {
         assert_eq!(result.unwrap().to_text().unwrap(), "[123,456]");
     }
 
-    #[test]
+    #[turso_test]
     fn test_json_set_add_value_to_array_out_of_bounds() {
         let json_cache = JsonCacheCell::new();
         let result = json_set(
@@ -1413,7 +1415,7 @@ mod tests {
         assert_eq!(result.unwrap().to_text().unwrap(), "[123]");
     }
 
-    #[test]
+    #[turso_test]
     fn test_json_set_replace_value_in_array() {
         let json_cache = JsonCacheCell::new();
         let result = json_set(
@@ -1430,7 +1432,7 @@ mod tests {
         assert_eq!(result.unwrap().to_text().unwrap(), "[456]");
     }
 
-    #[test]
+    #[turso_test]
     fn test_json_set_null_path() {
         let json_cache = JsonCacheCell::new();
         let result = json_set(
@@ -1447,7 +1449,7 @@ mod tests {
         assert_eq!(result.unwrap().to_text().unwrap(), "{}");
     }
 
-    #[test]
+    #[turso_test]
     fn test_json_set_multiple_keys() {
         let json_cache = JsonCacheCell::new();
         let result = json_set(
@@ -1466,7 +1468,7 @@ mod tests {
         assert_eq!(result.unwrap().to_text().unwrap(), "[456,789]");
     }
 
-    #[test]
+    #[turso_test]
     fn test_json_set_add_array_in_nested_object() {
         let json_cache = JsonCacheCell::new();
         let result = json_set(
@@ -1486,7 +1488,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[turso_test]
     fn test_json_set_add_array_in_array_in_nested_object() {
         let json_cache = JsonCacheCell::new();
         let result = json_set(
@@ -1503,7 +1505,7 @@ mod tests {
         assert_eq!(result.unwrap().to_text().unwrap(), r#"{"object":[[123]]}"#);
     }
 
-    #[test]
+    #[turso_test]
     fn test_json_set_add_array_in_array_in_nested_object_out_of_bounds() {
         let json_cache = JsonCacheCell::new();
         let result = json_set(

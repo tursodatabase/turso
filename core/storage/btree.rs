@@ -7176,6 +7176,7 @@ mod tests {
     };
     use sorted_vec::SortedVec;
     use test_log::test;
+    use turso_macros::turso_test;
     use turso_sqlite3_parser::ast::SortOrder;
 
     use super::*;
@@ -7286,7 +7287,7 @@ mod tests {
         payload
     }
 
-    #[test]
+    #[turso_test]
     fn test_insert_cell() {
         let db = get_database();
         let conn = db.connect().unwrap();
@@ -7310,7 +7311,7 @@ mod tests {
         payload: Vec<u8>,
     }
 
-    #[test]
+    #[turso_test]
     fn test_drop_1() {
         let db = get_database();
         let conn = db.connect().unwrap();
@@ -7530,7 +7531,7 @@ mod tests {
         (pager, page2.get().get().id, db, conn)
     }
 
-    #[test]
+    #[turso_test]
     pub fn btree_test_overflow_pages_are_cleared_on_overwrite() {
         // Create a database with a table
         let (pager, root_page, _, _) = empty_btree();
@@ -7652,7 +7653,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[turso_test]
     #[ignore]
     pub fn btree_insert_fuzz_ex() {
         for sequence in [
@@ -8294,7 +8295,7 @@ mod tests {
         pager.end_read_tx().unwrap();
     }
 
-    #[test]
+    #[turso_test]
     pub fn test_drop_odd() {
         let db = get_database();
         let conn = db.connect().unwrap();
@@ -8339,7 +8340,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[turso_test]
     pub fn btree_insert_fuzz_run_equal_size() {
         for size in 1..8 {
             tracing::info!("======= size:{} =======", size);
@@ -8347,12 +8348,12 @@ mod tests {
         }
     }
 
-    #[test]
+    #[turso_test]
     pub fn btree_index_insert_fuzz_run_equal_size() {
         btree_index_insert_fuzz_run(2, 1024);
     }
 
-    #[test]
+    #[turso_test]
     pub fn btree_index_insert_delete_fuzz_run_test() {
         btree_index_insert_delete_fuzz_run(
             2,
@@ -8366,27 +8367,27 @@ mod tests {
         );
     }
 
-    #[test]
+    #[turso_test]
     pub fn btree_insert_fuzz_run_random() {
         btree_insert_fuzz_run(128, 16, |rng| (rng.next_u32() % 4096) as usize);
     }
 
-    #[test]
+    #[turso_test]
     pub fn btree_insert_fuzz_run_small() {
         btree_insert_fuzz_run(1, 100, |rng| (rng.next_u32() % 128) as usize);
     }
 
-    #[test]
+    #[turso_test]
     pub fn btree_insert_fuzz_run_big() {
         btree_insert_fuzz_run(64, 32, |rng| 3 * 1024 + (rng.next_u32() % 1024) as usize);
     }
 
-    #[test]
+    #[turso_test]
     pub fn btree_insert_fuzz_run_overflow() {
         btree_insert_fuzz_run(64, 32, |rng| (rng.next_u32() % 32 * 1024) as usize);
     }
 
-    #[test]
+    #[turso_test]
     #[ignore]
     pub fn fuzz_long_btree_insert_fuzz_run_equal_size() {
         for size in 1..8 {
@@ -8395,13 +8396,13 @@ mod tests {
         }
     }
 
-    #[test]
+    #[turso_test]
     #[ignore]
     pub fn fuzz_long_btree_index_insert_fuzz_run_equal_size() {
         btree_index_insert_fuzz_run(2, 10_000);
     }
 
-    #[test]
+    #[turso_test]
     #[ignore]
     pub fn fuzz_long_btree_index_insert_delete_fuzz_run() {
         btree_index_insert_delete_fuzz_run(
@@ -8416,25 +8417,25 @@ mod tests {
         );
     }
 
-    #[test]
+    #[turso_test]
     #[ignore]
     pub fn fuzz_long_btree_insert_fuzz_run_random() {
         btree_insert_fuzz_run(2, 10_000, |rng| (rng.next_u32() % 4096) as usize);
     }
 
-    #[test]
+    #[turso_test]
     #[ignore]
     pub fn fuzz_long_btree_insert_fuzz_run_small() {
         btree_insert_fuzz_run(2, 10_000, |rng| (rng.next_u32() % 128) as usize);
     }
 
-    #[test]
+    #[turso_test]
     #[ignore]
     pub fn fuzz_long_btree_insert_fuzz_run_big() {
         btree_insert_fuzz_run(2, 10_000, |rng| 3 * 1024 + (rng.next_u32() % 1024) as usize);
     }
 
-    #[test]
+    #[turso_test]
     #[ignore]
     pub fn fuzz_long_btree_insert_fuzz_run_overflow() {
         btree_insert_fuzz_run(2, 5_000, |rng| (rng.next_u32() % 32 * 1024) as usize);
@@ -8495,7 +8496,7 @@ mod tests {
         pager
     }
 
-    #[test]
+    #[turso_test]
     pub fn test_clear_overflow_pages() -> Result<()> {
         let pager = setup_test_env(5);
         let num_columns = 5;
@@ -8613,7 +8614,7 @@ mod tests {
         Ok(())
     }
 
-    #[test]
+    #[turso_test]
     pub fn test_clear_overflow_pages_no_overflow() -> Result<()> {
         let pager = setup_test_env(5);
         let num_columns = 5;
@@ -8668,7 +8669,7 @@ mod tests {
         Ok(())
     }
 
-    #[test]
+    #[turso_test]
     fn test_btree_destroy() -> Result<()> {
         let initial_size = 1;
         let pager = setup_test_env(initial_size);
@@ -8763,7 +8764,7 @@ mod tests {
         Ok(())
     }
 
-    #[test]
+    #[turso_test]
     pub fn test_defragment() {
         let db = get_database();
         let conn = db.connect().unwrap();
@@ -8804,7 +8805,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[turso_test]
     pub fn test_drop_odd_with_defragment() {
         let db = get_database();
         let conn = db.connect().unwrap();
@@ -8851,7 +8852,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[turso_test]
     pub fn test_fuzz_drop_defragment_insert() {
         let db = get_database();
         let conn = db.connect().unwrap();
@@ -8931,7 +8932,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[turso_test]
     pub fn test_fuzz_drop_defragment_insert_issue_1085() {
         // This test is used to demonstrate that issue at https://github.com/tursodatabase/turso/issues/1085
         // is FIXED.
@@ -9017,7 +9018,7 @@ mod tests {
     //   +cells:leaf[rowid:11, len(payload):137, overflow:false]
     //   -page:4, ptr(right):0
     //   +cells:
-    #[test]
+    #[turso_test]
     pub fn test_drop_page_in_balancing_issue_1203() {
         let db = get_database();
         let conn = db.connect().unwrap();
@@ -9056,7 +9057,7 @@ mod tests {
     // +cells:
     //   -page:3, ptr(right):0
     //   +cells:
-    #[test]
+    #[turso_test]
     pub fn test_drop_page_in_balancing_issue_1203_2() {
         let db = get_database();
         let conn = db.connect().unwrap();
@@ -9110,7 +9111,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[turso_test]
     pub fn test_free_space() {
         let db = get_database();
         let conn = db.connect().unwrap();
@@ -9127,7 +9128,7 @@ mod tests {
         assert_eq!(free, 4096 - payload.len() as u16 - 2 - header_size);
     }
 
-    #[test]
+    #[turso_test]
     pub fn test_defragment_1() {
         let db = get_database();
         let conn = db.connect().unwrap();
@@ -9149,7 +9150,7 @@ mod tests {
         assert_eq!(&payload, &buf[start..start + len]);
     }
 
-    #[test]
+    #[turso_test]
     pub fn test_insert_drop_insert() {
         let db = get_database();
         let conn = db.connect().unwrap();
@@ -9180,7 +9181,7 @@ mod tests {
         assert_eq!(&payload, &buf[start..start + len]);
     }
 
-    #[test]
+    #[turso_test]
     pub fn test_insert_drop_insert_multiple() {
         let db = get_database();
         let conn = db.connect().unwrap();
@@ -9213,7 +9214,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[turso_test]
     pub fn test_drop_a_few_insert() {
         let db = get_database();
         let conn = db.connect().unwrap();
@@ -9239,7 +9240,7 @@ mod tests {
         ensure_cell(page, 0, &payload);
     }
 
-    #[test]
+    #[turso_test]
     pub fn test_fuzz_victim_1() {
         let db = get_database();
         let conn = db.connect().unwrap();
@@ -9271,7 +9272,7 @@ mod tests {
         let _ = add_record(0, 1, page, record, &conn);
     }
 
-    #[test]
+    #[turso_test]
     pub fn test_fuzz_victim_2() {
         let db = get_database();
         let conn = db.connect().unwrap();
@@ -9312,7 +9313,7 @@ mod tests {
         compute_free_space(page.get_contents(), usable_space);
     }
 
-    #[test]
+    #[turso_test]
     pub fn test_fuzz_victim_3() {
         let db = get_database();
         let conn = db.connect().unwrap();
@@ -9367,7 +9368,7 @@ mod tests {
         dbg!(free);
     }
 
-    #[test]
+    #[turso_test]
     pub fn btree_insert_sequential() {
         let (pager, root_page, _, _) = empty_btree();
         let mut keys = Vec::new();
@@ -9409,7 +9410,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[turso_test]
     pub fn test_big_payload_compute_free() {
         let db = get_database();
         let conn = db.connect().unwrap();
@@ -9446,7 +9447,7 @@ mod tests {
         dbg!(free);
     }
 
-    #[test]
+    #[turso_test]
     pub fn test_delete_balancing() {
         // What does this test do:
         // 1. Insert 10,000 rows of ~15 byte payload each. This creates
@@ -9523,7 +9524,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[turso_test]
     pub fn test_overflow_cells() {
         let iterations = 10_usize;
         let mut huge_texts = Vec::new();
@@ -9583,7 +9584,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[turso_test]
     pub fn test_read_write_payload_with_offset() {
         let (pager, root_page, _, _) = empty_btree();
         let num_columns = 5;
@@ -9660,7 +9661,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[turso_test]
     pub fn test_read_write_payload_with_overflow_page() {
         let (pager, root_page, _, _) = empty_btree();
         let num_columns = 5;
@@ -9749,7 +9750,7 @@ mod tests {
         pager.io.block(action)
     }
 
-    #[test]
+    #[turso_test]
     fn test_free_array() {
         let (mut rng, seed) = rng_from_time_or_env();
         tracing::info!("seed={}", seed);

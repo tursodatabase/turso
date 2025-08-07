@@ -179,6 +179,8 @@ pub fn jsonb_insert(args: &[Register], json_cache: &JsonCacheCell) -> crate::Res
 
 #[cfg(test)]
 mod tests {
+    use turso_macros::turso_test;
+
     use crate::types::Text;
 
     use super::*;
@@ -191,7 +193,7 @@ mod tests {
         Value::Text(Text::json(s.to_string()))
     }
 
-    #[test]
+    #[turso_test]
     fn test_basic_text_replacement() {
         let target = create_text(r#"{"name":"John","age":"30"}"#);
         let patch = create_text(r#"{"age":"31"}"#);
@@ -201,7 +203,7 @@ mod tests {
         assert_eq!(result, create_json(r#"{"name":"John","age":"31"}"#));
     }
 
-    #[test]
+    #[turso_test]
     fn test_null_field_removal() {
         let target = create_text(r#"{"name":"John","email":"john@example.com"}"#);
         let patch = create_text(r#"{"email":null}"#);
@@ -211,7 +213,7 @@ mod tests {
         assert_eq!(result, create_json(r#"{"name":"John"}"#));
     }
 
-    #[test]
+    #[turso_test]
     fn test_nested_object_merge() {
         let target =
             create_text(r#"{"user":{"name":"John","details":{"age":"30","score":"95.5"}}}"#);
@@ -226,7 +228,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[turso_test]
     #[should_panic(expected = "blob is not supported!")]
     fn test_blob_not_supported() {
         let target = Value::Blob(vec![1, 2, 3]);
@@ -236,7 +238,7 @@ mod tests {
         json_patch(&target, &patch, &cache).unwrap();
     }
 
-    #[test]
+    #[turso_test]
     fn test_deep_null_replacement() {
         let target = create_text(r#"{"level1":{"level2":{"keep":"value","remove":"value"}}}"#);
 
@@ -250,7 +252,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[turso_test]
     fn test_empty_patch() {
         let target = create_json(r#"{"name":"John","age":"30"}"#);
         let patch = create_text("{}");
@@ -260,7 +262,7 @@ mod tests {
         assert_eq!(result, target);
     }
 
-    #[test]
+    #[turso_test]
     fn test_add_new_field() {
         let target = create_text(r#"{"existing":"value"}"#);
         let patch = create_text(r#"{"new":"field"}"#);
@@ -270,7 +272,7 @@ mod tests {
         assert_eq!(result, create_json(r#"{"existing":"value","new":"field"}"#));
     }
 
-    #[test]
+    #[turso_test]
     fn test_complete_object_replacement() {
         let target = create_text(r#"{"old":{"nested":"value"}}"#);
         let patch = create_text(r#"{"old":"new_value"}"#);
@@ -280,14 +282,14 @@ mod tests {
         assert_eq!(result, create_json(r#"{"old":"new_value"}"#));
     }
 
-    #[test]
+    #[turso_test]
     fn test_json_remove_empty_args() {
         let args = vec![];
         let json_cache = JsonCacheCell::new();
         assert_eq!(json_remove(&args, &json_cache).unwrap(), Value::Null);
     }
 
-    #[test]
+    #[turso_test]
     fn test_json_remove_array_element() {
         let args = vec![
             Register::Value(create_json(r#"[1,2,3,4,5]"#)),
@@ -302,7 +304,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[turso_test]
     fn test_json_remove_multiple_paths() {
         let args = vec![
             Register::Value(create_json(r#"{"a": 1, "b": 2, "c": 3}"#)),
@@ -318,7 +320,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[turso_test]
     fn test_json_remove_nested_paths() {
         let args = vec![
             Register::Value(create_json(r#"{"a": {"b": {"c": 1, "d": 2}}}"#)),
@@ -333,7 +335,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[turso_test]
     fn test_json_remove_duplicate_keys() {
         let args = vec![
             Register::Value(create_json(r#"{"a": 1, "a": 2, "a": 3}"#)),
@@ -348,7 +350,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[turso_test]
     fn test_json_remove_invalid_path() {
         let args = vec![
             Register::Value(create_json(r#"{"a": 1}"#)),
@@ -359,7 +361,7 @@ mod tests {
         assert!(json_remove(&args, &json_cache).is_err());
     }
 
-    #[test]
+    #[turso_test]
     fn test_json_remove_complex_case() {
         let args = vec![
             Register::Value(create_json(

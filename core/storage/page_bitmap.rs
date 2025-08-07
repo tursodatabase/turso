@@ -419,6 +419,7 @@ impl PageBitmap {
 pub mod tests {
     use super::*;
     use rand::{rngs::StdRng, Rng, SeedableRng};
+    use turso_macros::turso_test;
 
     fn pb_free_vec(pb: &PageBitmap) -> Vec<bool> {
         let mut v = vec![false; pb.n_pages as usize];
@@ -464,7 +465,7 @@ pub mod tests {
         assert_eq!(pv, model, "bitmap bits disagree with reference model");
     }
 
-    #[test]
+    #[turso_test]
     fn new_masks_trailing_bits() {
         for n_pages in [1, 63, 64, 65, 127, 128, 129, 255, 256, 1023] {
             let pb = PageBitmap::new(n_pages);
@@ -484,7 +485,7 @@ pub mod tests {
         }
     }
 
-    #[test]
+    #[turso_test]
     fn alloc_one_exhausts_all() {
         let mut pb = PageBitmap::new(257);
         let mut model = vec![true; 257];
@@ -500,7 +501,7 @@ pub mod tests {
         assert_equivalent(&pb, &model);
     }
 
-    #[test]
+    #[turso_test]
     fn alloc_run_basic_and_free() {
         let mut pb = PageBitmap::new(200);
         let mut model = vec![true; 200];
@@ -518,7 +519,7 @@ pub mod tests {
         assert_equivalent(&pb, &model);
     }
 
-    #[test]
+    #[turso_test]
     fn alloc_run_none_when_only_smaller_gaps() {
         let n = 128u32;
         let mut pb = PageBitmap::new(n);
@@ -544,7 +545,7 @@ pub mod tests {
         assert_equivalent(&pb, &model);
     }
 
-    #[test]
+    #[turso_test]
     fn singles_from_tail_preserve_front_run() {
         let mut pb = PageBitmap::new(512);
         let mut model = vec![true; 512];
@@ -561,7 +562,7 @@ pub mod tests {
         assert_equivalent(&pb, &model);
     }
 
-    #[test]
+    #[turso_test]
     fn fuzz_rand_compare_with_reference_model() {
         let seeds: &[u64] = &[
             std::time::SystemTime::UNIX_EPOCH
@@ -645,7 +646,7 @@ pub mod tests {
         }
     }
 
-    #[test]
+    #[turso_test]
     fn test_run_crossing_word_boundaries_and_edge_cases() {
         let mut pb = PageBitmap::new(256);
         let cases = [(60, 8), (62, 4), (120, 16), (0, 128), (32, 64)];
@@ -672,7 +673,7 @@ pub mod tests {
         assert_eq!(pb.alloc_run(11), None);
     }
 
-    #[test]
+    #[turso_test]
     fn test_reused_hints() {
         let mut bitmap = PageBitmap::new(128);
         // Single allocations come from high end

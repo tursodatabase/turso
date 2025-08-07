@@ -503,6 +503,7 @@ fn generate_join_bitmasks(table_number_max_exclusive: usize, how_many: usize) ->
 mod tests {
     use std::sync::Arc;
 
+    use turso_macros::turso_test;
     use turso_sqlite3_parser::ast::{self, Expr, Operator, SortOrder, TableInternalId};
 
     use super::*;
@@ -521,7 +522,7 @@ mod tests {
         vdbe::builder::TableRefIdCounter,
     };
 
-    #[test]
+    #[turso_test]
     fn test_generate_bitmasks() {
         let bitmasks = generate_join_bitmasks(4, 2).collect::<Vec<_>>();
         assert!(bitmasks.contains(&TableMask(0b110))); // {0,1} -- first bit is always set to 0 so that a Mask with value 0 means "no tables are referenced".
@@ -532,7 +533,7 @@ mod tests {
         assert!(bitmasks.contains(&TableMask(0b11000))); // {2,3}
     }
 
-    #[test]
+    #[turso_test]
     /// Test that [compute_best_join_order] returns None when there are no table references.
     fn test_compute_best_join_order_empty() {
         let table_references = TableReferences::new(vec![], vec![]);
@@ -554,7 +555,7 @@ mod tests {
         assert!(result.is_none());
     }
 
-    #[test]
+    #[turso_test]
     /// Test that [compute_best_join_order] returns a table scan access method when the where clause is empty.
     fn test_compute_best_join_order_single_table_no_indexes() {
         let t1 = _create_btree_table("test_table", _create_column_list(&["id"], Type::Integer));
@@ -590,7 +591,7 @@ mod tests {
         assert!(iter_dir == IterationDirection::Forwards);
     }
 
-    #[test]
+    #[turso_test]
     /// Test that [compute_best_join_order] returns a RowidEq access method when the where clause has an EQ constraint on the rowid alias.
     fn test_compute_best_join_order_single_table_rowid_eq() {
         let t1 = _create_btree_table("test_table", vec![_create_column_rowid_alias("id")]);
@@ -638,7 +639,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[turso_test]
     /// Test that [compute_best_join_order] returns an IndexScan access method when the where clause has an EQ constraint on a primary key.
     fn test_compute_best_join_order_single_table_pk_eq() {
         let t1 = _create_btree_table(
@@ -706,7 +707,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[turso_test]
     /// Test that [compute_best_join_order] moves the outer table to the inner position when an index can be used on it, but not the original inner table.
     fn test_compute_best_join_order_two_tables() {
         let t1 = _create_btree_table("table1", _create_column_list(&["id"], Type::Integer));
@@ -788,7 +789,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[turso_test]
     /// Test that [compute_best_join_order] returns a sensible order and plan for three tables, each with indexes.
     fn test_compute_best_join_order_three_tables_indexed() {
         let table_orders = _create_btree_table(
@@ -994,7 +995,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[turso_test]
     fn test_join_order_three_tables_no_indexes() {
         let t1 = _create_btree_table("t1", _create_column_list(&["id", "foo"], Type::Integer));
         let t2 = _create_btree_table("t2", _create_column_list(&["id", "foo"], Type::Integer));
@@ -1074,7 +1075,7 @@ mod tests {
         assert!(index.is_none());
     }
 
-    #[test]
+    #[turso_test]
     /// Test that [compute_best_join_order] chooses a "fact table" as the outer table,
     /// when it has a foreign key to all dimension tables.
     fn test_compute_best_join_order_star_schema() {
@@ -1189,7 +1190,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[turso_test]
     /// Test that [compute_best_join_order] figures out that the tables form a "linked list" pattern
     /// where a column in each table points to an indexed column in the next table,
     /// and chooses the best order based on that.
@@ -1281,7 +1282,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[turso_test]
     /// Test that [compute_best_join_order] figures out that the index can't be used when only the second column is referenced
     fn test_index_second_column_only() {
         let mut joined_tables = Vec::new();
@@ -1368,7 +1369,7 @@ mod tests {
         assert!(constraint_refs.is_empty());
     }
 
-    #[test]
+    #[turso_test]
     /// Test that an index with a gap in referenced columns (e.g. index on (a,b,c), where clause on a and c)
     /// only uses the prefix before the gap.
     fn test_index_skips_middle_column() {
@@ -1479,7 +1480,7 @@ mod tests {
         assert!(constraint.table_col_pos == 0); // c1
     }
 
-    #[test]
+    #[turso_test]
     /// Test that an index seek stops after a range operator.
     /// e.g. index on (a,b,c), where clause a=1, b>2, c=3. Only a and b should be used for seek.
     fn test_index_stops_at_range_operator() {

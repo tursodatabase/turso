@@ -3084,9 +3084,11 @@ fn is_json_ok(ch: u8) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use turso_macros::turso_test;
+
     use super::*;
 
-    #[test]
+    #[turso_test]
     fn test_null_serialization() {
         // Create JSONB with null value
         let mut jsonb = Jsonb::new(10, None);
@@ -3101,7 +3103,7 @@ mod tests {
         assert_eq!(reparsed.data[0], ElementType::NULL as u8);
     }
 
-    #[test]
+    #[turso_test]
     fn test_boolean_serialization() {
         // True
         let mut jsonb_true = Jsonb::new(10, None);
@@ -3121,7 +3123,7 @@ mod tests {
         assert_eq!(false_parsed.data[0], ElementType::FALSE as u8);
     }
 
-    #[test]
+    #[turso_test]
     fn test_integer_serialization() {
         // Standard integer
         let parsed = Jsonb::from_str("42").unwrap();
@@ -3140,7 +3142,7 @@ mod tests {
         assert!(matches!(header.0, ElementType::INT));
     }
 
-    #[test]
+    #[turso_test]
     fn test_json5_integer_serialization() {
         // Hexadecimal notation
         let parsed = Jsonb::from_str("0x1A").unwrap();
@@ -3159,7 +3161,7 @@ mod tests {
         assert!(matches!(header.0, ElementType::INT5));
     }
 
-    #[test]
+    #[turso_test]
     fn test_float_serialization() {
         // Standard float
         let parsed = Jsonb::from_str("3.14159").unwrap();
@@ -3178,7 +3180,7 @@ mod tests {
         assert!(matches!(header.0, ElementType::FLOAT));
     }
 
-    #[test]
+    #[turso_test]
     fn test_json5_float_serialization() {
         // Leading decimal point
         let parsed = Jsonb::from_str(".123").unwrap();
@@ -3205,7 +3207,7 @@ mod tests {
         assert!(matches!(header.0, ElementType::FLOAT5));
     }
 
-    #[test]
+    #[turso_test]
     fn test_string_serialization() {
         // Simple string
         let parsed = Jsonb::from_str(r#""hello world""#).unwrap();
@@ -3224,7 +3226,7 @@ mod tests {
         assert!(matches!(header.0, ElementType::TEXTJ));
     }
 
-    #[test]
+    #[turso_test]
     fn test_json5_string_serialization() {
         // Single quotes
         let parsed = Jsonb::from_str("'hello world'").unwrap();
@@ -3251,7 +3253,7 @@ world""#,
         assert!(matches!(header.0, ElementType::TEXT5));
     }
 
-    #[test]
+    #[turso_test]
     fn test_array_serialization() {
         // Empty array
         let parsed = Jsonb::from_str("[]").unwrap();
@@ -3277,7 +3279,7 @@ world""#,
         assert!(matches!(header.0, ElementType::ARRAY));
     }
 
-    #[test]
+    #[turso_test]
     fn test_json5_array_serialization() {
         // Trailing comma
         let parsed = Jsonb::from_str("[1,2,3,]").unwrap();
@@ -3292,7 +3294,7 @@ world""#,
         assert_eq!(parsed.to_string().unwrap(), "[1,2,3]");
     }
 
-    #[test]
+    #[turso_test]
     fn test_object_serialization() {
         // Empty object
         let parsed = Jsonb::from_str("{}").unwrap();
@@ -3327,7 +3329,7 @@ world""#,
         assert!(matches!(header.0, ElementType::OBJECT));
     }
 
-    #[test]
+    #[turso_test]
     fn test_json5_object_serialization() {
         // Unquoted keys
         let parsed = Jsonb::from_str("{key:\"value\"}").unwrap();
@@ -3346,7 +3348,7 @@ world""#,
         assert_eq!(parsed.to_string().unwrap(), r#"{"a":"value"}"#);
     }
 
-    #[test]
+    #[turso_test]
     fn test_complex_json() {
         let complex_json = r#"{
             "string": "Hello, world!",
@@ -3370,7 +3372,7 @@ world""#,
         assert_eq!(parsed.to_string().unwrap(), reparsed.to_string().unwrap());
     }
 
-    #[test]
+    #[turso_test]
     fn test_error_handling() {
         // Invalid JSON syntax
         assert!(Jsonb::from_str("{").is_err());
@@ -3398,7 +3400,7 @@ world""#,
         assert!(Jsonb::from_str(r#"{"key":"value"} extra"#).is_err());
     }
 
-    #[test]
+    #[turso_test]
     fn test_depth_limit() {
         // Create a JSON string that exceeds MAX_JSON_DEPTH
         let mut deep_json = String::from("[");
@@ -3414,7 +3416,7 @@ world""#,
         assert!(Jsonb::from_str(&deep_json).is_err());
     }
 
-    #[test]
+    #[turso_test]
     fn test_header_encoding() {
         // Small payload (fits in 4 bits)
         let header = JsonbHeader::new(ElementType::TEXT, 5);
@@ -3453,7 +3455,7 @@ world""#,
         assert_eq!(bytes[4], (70000 & 0xFF) as u8);
     }
 
-    #[test]
+    #[turso_test]
     fn test_header_decoding() {
         // Create sample data with various headers
         let data = vec![
@@ -3482,7 +3484,7 @@ world""#,
         assert_eq!(header3.1, 0x9868); // 39000
     }
 
-    #[test]
+    #[turso_test]
     fn test_unicode_escapes() {
         // Basic unicode escape
         let parsed = Jsonb::from_str(r#""\u00A9""#).unwrap(); // Copyright symbol
@@ -3493,7 +3495,7 @@ world""#,
         assert_eq!(parsed.to_string().unwrap(), r#""\uD83D\uDE00""#);
     }
 
-    #[test]
+    #[turso_test]
     fn test_json5_comments() {
         // Line comments
         let parsed = Jsonb::from_str(
@@ -3525,7 +3527,7 @@ world""#,
         assert_eq!(parsed.to_string().unwrap(), "[1,2,3]");
     }
 
-    #[test]
+    #[turso_test]
     fn test_whitespace_handling() {
         // Various whitespace patterns
         let json_with_whitespace = r#"
@@ -3545,7 +3547,7 @@ world""#,
         );
     }
 
-    #[test]
+    #[turso_test]
     fn test_binary_roundtrip() {
         // Test that binary data can be round-tripped through the JSONB format
         let original = r#"{"test":"value","array":[1,2,3]}"#;
@@ -3557,7 +3559,7 @@ world""#,
         assert_eq!(from_binary.to_string().unwrap(), original);
     }
 
-    #[test]
+    #[turso_test]
     fn test_large_json() {
         // Generate a large JSON with many elements
         let mut large_array = String::from("[");
@@ -3574,7 +3576,7 @@ world""#,
         assert!(parsed.to_string().unwrap().ends_with("998,999]"));
     }
 
-    #[test]
+    #[turso_test]
     fn test_jsonb_is_valid() {
         // Valid JSONB
         let jsonb = Jsonb::from_str(r#"{"test":"value"}"#).unwrap();
@@ -3589,7 +3591,7 @@ world""#,
         }
     }
 
-    #[test]
+    #[turso_test]
     fn test_special_characters_in_strings() {
         // Test handling of various special characters
         let json = r#"{
@@ -3611,6 +3613,8 @@ world""#,
 
 #[cfg(test)]
 mod path_operations_tests {
+    use turso_macros::turso_test;
+
     use super::*;
     use crate::json::path::{JsonPath, PathElement};
     use std::borrow::Cow;
@@ -3620,7 +3624,7 @@ mod path_operations_tests {
         JsonPath { elements }
     }
 
-    #[test]
+    #[turso_test]
     fn test_navigate_root_path() {
         let json_str = r#"{"name": "John", "age": 30}"#;
         let mut jsonb = Jsonb::from_str(json_str).unwrap();
@@ -3639,7 +3643,7 @@ mod path_operations_tests {
         assert_eq!(stack[0].field_key_index, JsonLocationKind::DocumentRoot);
     }
 
-    #[test]
+    #[turso_test]
     fn test_navigate_object_property() {
         let json_str = r#"{"name": "John", "age": 30}"#;
         let mut jsonb = Jsonb::from_str(json_str).unwrap();
@@ -3669,7 +3673,7 @@ mod path_operations_tests {
         assert_eq!(text, "John");
     }
 
-    #[test]
+    #[turso_test]
     fn test_navigate_nested_object_property() {
         let json_str = r#"{"person": {"name": "John", "age": 30}}"#;
         let mut jsonb = Jsonb::from_str(json_str).unwrap();
@@ -3690,7 +3694,7 @@ mod path_operations_tests {
         assert_eq!(stack.len(), 3);
     }
 
-    #[test]
+    #[turso_test]
     fn test_navigate_array_element() {
         let json_str = r#"{"items": [10, 20, 30]}"#;
         let mut jsonb = Jsonb::from_str(json_str).unwrap();
@@ -3723,7 +3727,7 @@ mod path_operations_tests {
         assert_eq!(int_str, "20");
     }
 
-    #[test]
+    #[turso_test]
     fn test_navigate_negative_array_index() {
         let json_str = r#"{"items": [10, 20, 30]}"#;
         let mut jsonb = Jsonb::from_str(json_str).unwrap();
@@ -3747,7 +3751,7 @@ mod path_operations_tests {
         assert!(stack[1].has_specific_index());
     }
 
-    #[test]
+    #[turso_test]
     fn test_set_operation() {
         let json_str = r#"{"name": "John", "age": 30}"#;
         let mut jsonb = Jsonb::from_str(json_str).unwrap();
@@ -3771,7 +3775,7 @@ mod path_operations_tests {
         assert_eq!(updated_json, r#"{"name":"Jane","age":30}"#);
     }
 
-    #[test]
+    #[turso_test]
     fn test_insert_operation() {
         let json_str = r#"{"name": "John"}"#;
         let mut jsonb = Jsonb::from_str(json_str).unwrap();
@@ -3795,7 +3799,7 @@ mod path_operations_tests {
         assert_eq!(updated_json, r#"{"name":"John","age":30}"#);
     }
 
-    #[test]
+    #[turso_test]
     fn test_delete_operation() {
         let json_str = r#"{"name": "John", "age": 30}"#;
         let mut jsonb = Jsonb::from_str(json_str).unwrap();
@@ -3818,7 +3822,7 @@ mod path_operations_tests {
         assert_eq!(updated_json, r#"{"name":"John"}"#);
     }
 
-    #[test]
+    #[turso_test]
     fn test_replace_operation() {
         let json_str = r#"{"items": [10, 20, 30]}"#;
         let mut jsonb = Jsonb::from_str(json_str).unwrap();
@@ -3843,7 +3847,7 @@ mod path_operations_tests {
         assert_eq!(updated_json, r#"{"items":[10,50,30]}"#);
     }
 
-    #[test]
+    #[turso_test]
     fn test_search_operation() {
         let json_str = r#"{"person": {"name": "John", "age": 30}}"#;
         let mut jsonb = Jsonb::from_str(json_str).unwrap();
@@ -3869,7 +3873,7 @@ mod path_operations_tests {
         assert_eq!(result_str, r#"{"name":"John","age":30}"#);
     }
 
-    #[test]
+    #[turso_test]
     fn test_error_for_nonexistent_path() {
         let json_str = r#"{"name": "John", "age": 30}"#;
         let mut jsonb = Jsonb::from_str(json_str).unwrap();
@@ -3889,7 +3893,7 @@ mod path_operations_tests {
         assert!(result.is_err());
     }
 
-    #[test]
+    #[turso_test]
     fn test_deep_nested_path() {
         let json_str = r#"{"level1": {"level2": {"level3": {"value": 42}}}}"#;
         let mut jsonb = Jsonb::from_str(json_str).unwrap();
@@ -3919,7 +3923,7 @@ mod path_operations_tests {
         );
     }
 
-    #[test]
+    #[turso_test]
     fn test_path_modes() {
         // Test the different path operation modes
 

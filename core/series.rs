@@ -286,6 +286,7 @@ mod tests {
     use super::*;
     use quickcheck::{Arbitrary, Gen};
     use quickcheck_macros::quickcheck;
+    use turso_macros::turso_test;
 
     #[derive(Debug, Clone)]
     struct Series {
@@ -491,7 +492,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[turso_test]
 
     fn test_series_empty_positive_step() {
         let values = collect_series(Series {
@@ -506,7 +507,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[turso_test]
     fn test_series_empty_negative_step() {
         let values = collect_series(Series {
             start: 5,
@@ -520,7 +521,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[turso_test]
     fn test_series_single_element() {
         let values = collect_series(Series {
             start: 5,
@@ -535,7 +536,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[turso_test]
     fn test_zero_step_is_interpreted_as_1() {
         let values = collect_series(Series {
             start: 1,
@@ -550,7 +551,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[turso_test]
     fn test_invalid_inputs() {
         // Test that invalid ranges return empty series instead of errors
         let values = collect_series(Series {
@@ -682,7 +683,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[turso_test]
     fn test_best_index_argv_order_all_constraints() {
         // Test when start, stop, and step constraints are present
         let constraints = vec![
@@ -700,7 +701,7 @@ mod tests {
         assert_eq!(index_info.idx_num, 7); // All bits set (1 | 2 | 4)
     }
 
-    #[test]
+    #[turso_test]
     fn test_best_index_argv_order_start_stop_only() {
         let constraints = vec![
             usable_constraint(1), // start
@@ -715,7 +716,7 @@ mod tests {
         assert_eq!(index_info.idx_num, 3); // Bits 0 and 1 set (1 | 2)
     }
 
-    #[test]
+    #[turso_test]
     fn test_best_index_argv_order_only_start() {
         let constraints = vec![
             usable_constraint(1), // start
@@ -728,7 +729,7 @@ mod tests {
         assert_eq!(index_info.idx_num, 1); // Only bit 0 set
     }
 
-    #[test]
+    #[turso_test]
     fn test_best_index_argv_order_reverse_constraint_order() {
         // Test when constraints are provided in reverse order (step, stop, start)
         let constraints = vec![
@@ -746,7 +747,7 @@ mod tests {
         assert_eq!(index_info.idx_num, 7); // All bits set (1 | 2 | 4)
     }
 
-    #[test]
+    #[turso_test]
     fn test_best_index_argv_order_missing_start() {
         // Test when start constraint is missing but stop and step are present
         let constraints = vec![
@@ -759,7 +760,7 @@ mod tests {
         assert!(matches!(result, Err(ResultCode::InvalidArgs)));
     }
 
-    #[test]
+    #[turso_test]
     fn test_best_index_no_usable_constraints() {
         let constraints = vec![ConstraintInfo {
             column_index: 1,

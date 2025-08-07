@@ -429,6 +429,7 @@ mod tests {
     use super::*;
     use quickcheck::{Arbitrary, Gen};
     use quickcheck_macros::quickcheck;
+    use turso_macros::turso_test;
 
     // Helper to generate arbitrary vectors of specific type and dimensions
     #[derive(Debug, Clone)]
@@ -665,7 +666,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[turso_test]
     fn parse_string_vector_zero_length() {
         let value = Value::from_text("[]");
         let vector = parse_string_vector(VectorType::Float32, &value).unwrap();
@@ -673,7 +674,7 @@ mod tests {
         assert_eq!(vector.vector_type, VectorType::Float32);
     }
 
-    #[test]
+    #[turso_test]
     fn test_parse_string_vector_valid_whitespace() {
         let value = Value::from_text("  [  1.0  ,  2.0  ,  3.0  ]  ");
         let vector = parse_string_vector(VectorType::Float32, &value).unwrap();
@@ -681,7 +682,7 @@ mod tests {
         assert_eq!(vector.vector_type, VectorType::Float32);
     }
 
-    #[test]
+    #[turso_test]
     fn test_parse_string_vector_valid() {
         let value = Value::from_text("[1.0, 2.0, 3.0]");
         let vector = parse_string_vector(VectorType::Float32, &value).unwrap();
@@ -706,7 +707,7 @@ mod tests {
         vector.as_f32_slice().to_vec()
     }
 
-    #[test]
+    #[turso_test]
     fn test_vector_concat_normal_case() {
         let v1 = float32_vec_from(&[1.0, 2.0, 3.0]);
         let v2 = float32_vec_from(&[4.0, 5.0, 6.0]);
@@ -721,7 +722,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[turso_test]
     fn test_vector_concat_empty_left() {
         let v1 = float32_vec_from(&[]);
         let v2 = float32_vec_from(&[4.0, 5.0]);
@@ -732,7 +733,7 @@ mod tests {
         assert_eq!(f32_slice_from_vector(&result), vec![4.0, 5.0]);
     }
 
-    #[test]
+    #[turso_test]
     fn test_vector_concat_empty_right() {
         let v1 = float32_vec_from(&[1.0, 2.0]);
         let v2 = float32_vec_from(&[]);
@@ -743,7 +744,7 @@ mod tests {
         assert_eq!(f32_slice_from_vector(&result), vec![1.0, 2.0]);
     }
 
-    #[test]
+    #[turso_test]
     fn test_vector_concat_both_empty() {
         let v1 = float32_vec_from(&[]);
         let v2 = float32_vec_from(&[]);
@@ -752,7 +753,7 @@ mod tests {
         assert_eq!(f32_slice_from_vector(&result), Vec::<f32>::new());
     }
 
-    #[test]
+    #[turso_test]
     fn test_vector_concat_different_lengths() {
         let v1 = float32_vec_from(&[1.0]);
         let v2 = float32_vec_from(&[2.0, 3.0, 4.0]);
@@ -763,7 +764,7 @@ mod tests {
         assert_eq!(f32_slice_from_vector(&result), vec![1.0, 2.0, 3.0, 4.0]);
     }
 
-    #[test]
+    #[turso_test]
     fn test_vector_slice_normal_case() {
         let input_vec = float32_vec_from(&[1.0, 2.0, 3.0, 4.0, 5.0]);
         let result = vector_slice(&input_vec, 1, 4).unwrap();
@@ -772,7 +773,7 @@ mod tests {
         assert_eq!(f32_slice_from_vector(&result), vec![2.0, 3.0, 4.0]);
     }
 
-    #[test]
+    #[turso_test]
     fn test_vector_slice_full_range() {
         let input_vec = float32_vec_from(&[10.0, 20.0, 30.0]);
         let result = vector_slice(&input_vec, 0, 3).unwrap();
@@ -781,7 +782,7 @@ mod tests {
         assert_eq!(f32_slice_from_vector(&result), vec![10.0, 20.0, 30.0]);
     }
 
-    #[test]
+    #[turso_test]
     fn test_vector_slice_single_element() {
         let input_vec = float32_vec_from(&[4.40, 2.71]);
         let result = vector_slice(&input_vec, 1, 2).unwrap();
@@ -790,7 +791,7 @@ mod tests {
         assert_eq!(f32_slice_from_vector(&result), vec![2.71]);
     }
 
-    #[test]
+    #[turso_test]
     fn test_vector_slice_empty_list() {
         let input_vec = float32_vec_from(&[1.0, 2.0]);
         let result = vector_slice(&input_vec, 2, 2).unwrap();
@@ -798,28 +799,28 @@ mod tests {
         assert_eq!(result.dims, 0);
     }
 
-    #[test]
+    #[turso_test]
     fn test_vector_slice_zero_length() {
         let input_vec = float32_vec_from(&[1.0, 2.0, 3.0]);
         let err = vector_slice(&input_vec, 2, 1);
         assert!(err.is_err(), "Expected error on zero-length range");
     }
 
-    #[test]
+    #[turso_test]
     fn test_vector_slice_out_of_bounds() {
         let input_vec = float32_vec_from(&[1.0, 2.0]);
         let err = vector_slice(&input_vec, 0, 5);
         assert!(err.is_err());
     }
 
-    #[test]
+    #[turso_test]
     fn test_vector_slice_start_out_of_bounds() {
         let input_vec = float32_vec_from(&[1.0, 2.0]);
         let err = vector_slice(&input_vec, 5, 5);
         assert!(err.is_err());
     }
 
-    #[test]
+    #[turso_test]
     fn test_vector_slice_end_out_of_bounds() {
         let input_vec = float32_vec_from(&[1.0, 2.0]);
         let err = vector_slice(&input_vec, 1, 3);

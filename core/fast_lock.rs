@@ -61,9 +61,11 @@ impl<T> SpinLock<T> {
 mod tests {
     use std::sync::Arc;
 
+    use turso_macros::turso_test;
+
     use super::SpinLock;
 
-    #[test]
+    #[turso_test]
     fn test_fast_lock_multiple_thread_sum() {
         let lock = Arc::new(SpinLock::new(0));
         let mut threads = vec![];

@@ -8387,10 +8387,12 @@ pub fn op_journal_mode(
 
 #[cfg(test)]
 mod tests {
+    use turso_macros::turso_test;
+
     use super::*;
     use crate::types::Value;
 
-    #[test]
+    #[turso_test]
     fn test_apply_numeric_affinity_partial_numbers() {
         let mut reg = Register::Value(Value::Text("123abc".into()));
         assert!(!apply_numeric_affinity(&mut reg, false));
@@ -8405,7 +8407,7 @@ mod tests {
         assert!(matches!(reg, Register::Value(Value::Text(_))));
     }
 
-    #[test]
+    #[turso_test]
     fn test_apply_numeric_affinity_complete_numbers() {
         let mut reg = Register::Value(Value::Text("123".into()));
         assert!(apply_numeric_affinity(&mut reg, false));
@@ -8424,7 +8426,7 @@ mod tests {
         assert_eq!(*reg.get_owned_value(), Value::Integer(0));
     }
 
-    #[test]
+    #[turso_test]
     fn test_exec_add() {
         let inputs = vec![
             (Value::Integer(3), Value::Integer(1)),
@@ -8480,7 +8482,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[turso_test]
     fn test_exec_subtract() {
         let inputs = vec![
             (Value::Integer(3), Value::Integer(1)),
@@ -8536,7 +8538,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[turso_test]
     fn test_exec_multiply() {
         let inputs = vec![
             (Value::Integer(3), Value::Integer(2)),
@@ -8592,7 +8594,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[turso_test]
     fn test_exec_divide() {
         let inputs = vec![
             (Value::Integer(1), Value::Integer(0)),
@@ -8636,7 +8638,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[turso_test]
     fn test_exec_remainder() {
         let inputs = vec![
             (Value::Null, Value::Null),
@@ -8702,7 +8704,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[turso_test]
     fn test_exec_and() {
         let inputs = vec![
             (Value::Integer(0), Value::Null),
@@ -8739,7 +8741,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[turso_test]
     fn test_exec_or() {
         let inputs = vec![
             (Value::Integer(0), Value::Null),
@@ -8783,7 +8785,7 @@ mod tests {
     use super::{exec_char, execute_sqlite_version};
     use std::collections::HashMap;
 
-    #[test]
+    #[turso_test]
     fn test_length() {
         let input_str = Value::build_text("bob");
         let expected_len = Value::Integer(3);
@@ -8802,7 +8804,7 @@ mod tests {
         assert_eq!(expected_blob.exec_length(), expected_len);
     }
 
-    #[test]
+    #[turso_test]
     fn test_quote() {
         let input = Value::build_text("abc\0edf");
         let expected = Value::build_text("'abc'");
@@ -8817,7 +8819,7 @@ mod tests {
         assert_eq!(input.exec_quote(), expected);
     }
 
-    #[test]
+    #[turso_test]
     fn test_typeof() {
         let input = Value::Null;
         let expected: Value = Value::build_text("null");
@@ -8840,7 +8842,7 @@ mod tests {
         assert_eq!(input.exec_typeof(), expected);
     }
 
-    #[test]
+    #[turso_test]
     fn test_unicode() {
         assert_eq!(Value::build_text("a").exec_unicode(), Value::Integer(97));
         assert_eq!(
@@ -8859,7 +8861,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[turso_test]
     fn test_min_max() {
         let input_int_vec = [
             Register::Value(Value::Integer(-1)),
@@ -8907,7 +8909,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[turso_test]
     fn test_trim() {
         let input_str = Value::build_text("     Bob and Alice     ");
         let expected_str = Value::build_text("Bob and Alice");
@@ -8919,7 +8921,7 @@ mod tests {
         assert_eq!(input_str.exec_trim(Some(&pattern_str)), expected_str);
     }
 
-    #[test]
+    #[turso_test]
     fn test_ltrim() {
         let input_str = Value::build_text("     Bob and Alice     ");
         let expected_str = Value::build_text("Bob and Alice     ");
@@ -8931,7 +8933,7 @@ mod tests {
         assert_eq!(input_str.exec_ltrim(Some(&pattern_str)), expected_str);
     }
 
-    #[test]
+    #[turso_test]
     fn test_rtrim() {
         let input_str = Value::build_text("     Bob and Alice     ");
         let expected_str = Value::build_text("     Bob and Alice");
@@ -8948,7 +8950,7 @@ mod tests {
         assert_eq!(input_str.exec_rtrim(Some(&pattern_str)), expected_str);
     }
 
-    #[test]
+    #[turso_test]
     fn test_soundex() {
         let input_str = Value::build_text("Pfister");
         let expected_str = Value::build_text("P236");
@@ -8995,7 +8997,7 @@ mod tests {
         assert_eq!(input_str.exec_soundex(), expected_str);
     }
 
-    #[test]
+    #[turso_test]
     fn test_upper_case() {
         let input_str = Value::build_text("Limbo");
         let expected_str = Value::build_text("LIMBO");
@@ -9006,7 +9008,7 @@ mod tests {
         assert_eq!(Value::Null.exec_upper().unwrap(), Value::Null)
     }
 
-    #[test]
+    #[turso_test]
     fn test_lower_case() {
         let input_str = Value::build_text("Limbo");
         let expected_str = Value::build_text("limbo");
@@ -9017,7 +9019,7 @@ mod tests {
         assert_eq!(Value::Null.exec_lower().unwrap(), Value::Null)
     }
 
-    #[test]
+    #[turso_test]
     fn test_hex() {
         let input_str = Value::build_text("limbo");
         let expected_val = Value::build_text("6C696D626F");
@@ -9036,7 +9038,7 @@ mod tests {
         assert_eq!(input_blob.exec_hex(), expected_val);
     }
 
-    #[test]
+    #[turso_test]
     fn test_unhex() {
         let input = Value::build_text("6f");
         let expected = Value::Blob(vec![0x6f]);
@@ -9063,7 +9065,7 @@ mod tests {
         assert_eq!(input.exec_unhex(None), expected);
     }
 
-    #[test]
+    #[turso_test]
     fn test_abs() {
         let int_positive_reg = Value::Integer(10);
         let int_negative_reg = Value::Integer(-10);
@@ -9085,7 +9087,7 @@ mod tests {
         assert!(Value::Integer(i64::MIN).exec_abs().is_err());
     }
 
-    #[test]
+    #[turso_test]
     fn test_char() {
         assert_eq!(
             exec_char(&[
@@ -9105,13 +9107,13 @@ mod tests {
         );
     }
 
-    #[test]
+    #[turso_test]
     fn test_like_with_escape_or_regexmeta_chars() {
         assert!(Value::exec_like(None, r#"\%A"#, r#"\A"#));
         assert!(Value::exec_like(None, "%a%a", "aaaa"));
     }
 
-    #[test]
+    #[turso_test]
     fn test_like_no_cache() {
         assert!(Value::exec_like(None, "a%", "aaaa"));
         assert!(Value::exec_like(None, "%a%a", "aaaa"));
@@ -9120,7 +9122,7 @@ mod tests {
         assert!(!Value::exec_like(None, "%a.ab", "aaaa"));
     }
 
-    #[test]
+    #[turso_test]
     fn test_like_with_cache() {
         let mut cache = HashMap::new();
         assert!(Value::exec_like(Some(&mut cache), "a%", "aaaa"));
@@ -9137,7 +9139,7 @@ mod tests {
         assert!(!Value::exec_like(Some(&mut cache), "%a.ab", "aaaa"));
     }
 
-    #[test]
+    #[turso_test]
     fn test_random() {
         match Value::exec_random() {
             Value::Integer(value) => {
@@ -9151,7 +9153,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[turso_test]
     fn test_exec_randomblob() {
         struct TestCase {
             input: Value,
@@ -9212,7 +9214,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[turso_test]
     fn test_exec_round() {
         let input_val = Value::Float(123.456);
         let expected_val = Value::Float(123.0);
@@ -9247,7 +9249,7 @@ mod tests {
         assert_eq!(input_val.exec_round(Some(&Value::Null)), expected_val);
     }
 
-    #[test]
+    #[turso_test]
     fn test_exec_if() {
         let reg = Value::Integer(0);
         assert!(!reg.exec_if(false, false));
@@ -9270,7 +9272,7 @@ mod tests {
         assert!(!reg.exec_if(false, true));
     }
 
-    #[test]
+    #[turso_test]
     fn test_nullif() {
         assert_eq!(
             Value::Integer(1).exec_nullif(&Value::Integer(1)),
@@ -9299,7 +9301,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[turso_test]
     fn test_substring() {
         let str_value = Value::build_text("limbo");
         let start_value = Value::Integer(1);
@@ -9347,7 +9349,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[turso_test]
     fn test_exec_instr() {
         let input = Value::build_text("limbo");
         let pattern = Value::build_text("im");
@@ -9450,7 +9452,7 @@ mod tests {
         assert_eq!(input.exec_instr(&pattern), expected);
     }
 
-    #[test]
+    #[turso_test]
     fn test_exec_sign() {
         let input = Value::Integer(42);
         let expected = Some(Value::Integer(1));
@@ -9517,7 +9519,7 @@ mod tests {
         assert_eq!(input.exec_sign(), expected);
     }
 
-    #[test]
+    #[turso_test]
     fn test_exec_zeroblob() {
         let input = Value::Integer(0);
         let expected = Value::Blob(vec![]);
@@ -9556,14 +9558,14 @@ mod tests {
         assert_eq!(input.exec_zeroblob(), expected);
     }
 
-    #[test]
+    #[turso_test]
     fn test_execute_sqlite_version() {
         let version_integer = 3046001;
         let expected = "3.46.1";
         assert_eq!(execute_sqlite_version(version_integer), expected);
     }
 
-    #[test]
+    #[turso_test]
     fn test_replace() {
         let input_str = Value::build_text("bob");
         let pattern_str = Value::build_text("b");
@@ -9666,7 +9668,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[turso_test]
     fn test_likely() {
         let input = Value::build_text("limbo");
         let expected = Value::build_text("limbo");
@@ -9689,7 +9691,7 @@ mod tests {
         assert_eq!(input.exec_likely(), expected);
     }
 
-    #[test]
+    #[turso_test]
     fn test_likelihood() {
         let value = Value::build_text("limbo");
         let prob = Value::Float(0.5);
@@ -9722,7 +9724,7 @@ mod tests {
         assert_eq!(value.exec_likelihood(&prob), value);
     }
 
-    #[test]
+    #[turso_test]
     fn test_bitfield() {
         let mut bitfield = Bitfield::<4>::new();
         for i in 0..256 {

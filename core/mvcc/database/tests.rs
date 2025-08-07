@@ -1,3 +1,5 @@
+use turso_macros::turso_test;
+
 use super::*;
 use crate::io::PlatformIO;
 use crate::mvcc::clock::LocalClock;
@@ -91,7 +93,7 @@ pub(crate) fn generate_simple_string_row(table_id: u64, id: i64, data: &str) -> 
     }
 }
 
-#[test]
+#[turso_test]
 fn test_insert_read() {
     let db = MvccTestDb::new();
 
@@ -127,7 +129,7 @@ fn test_insert_read() {
     assert_eq!(tx1_row, row);
 }
 
-#[test]
+#[turso_test]
 fn test_read_nonexistent() {
     let db = MvccTestDb::new();
     let tx = db.mvcc_store.begin_tx(db.conn.pager.borrow().clone());
@@ -141,7 +143,7 @@ fn test_read_nonexistent() {
     assert!(row.unwrap().is_none());
 }
 
-#[test]
+#[turso_test]
 fn test_delete() {
     let db = MvccTestDb::new();
 
@@ -197,7 +199,7 @@ fn test_delete() {
     assert!(row.is_none());
 }
 
-#[test]
+#[turso_test]
 fn test_delete_nonexistent() {
     let db = MvccTestDb::new();
     let tx = db.mvcc_store.begin_tx(db.conn.pager.borrow().clone());
@@ -214,7 +216,7 @@ fn test_delete_nonexistent() {
         .unwrap());
 }
 
-#[test]
+#[turso_test]
 fn test_commit() {
     let db = MvccTestDb::new();
     let tx1 = db.mvcc_store.begin_tx(db.conn.pager.borrow().clone());
@@ -267,7 +269,7 @@ fn test_commit() {
     db.mvcc_store.drop_unused_row_versions();
 }
 
-#[test]
+#[turso_test]
 fn test_rollback() {
     let db = MvccTestDb::new();
     let tx1 = db.mvcc_store.begin_tx(db.conn.pager.borrow().clone());
@@ -317,7 +319,7 @@ fn test_rollback() {
     assert_eq!(row5, None);
 }
 
-#[test]
+#[turso_test]
 fn test_dirty_write() {
     let db = MvccTestDb::new();
 
@@ -361,7 +363,7 @@ fn test_dirty_write() {
     assert_eq!(tx1_row, row);
 }
 
-#[test]
+#[turso_test]
 fn test_dirty_read() {
     let db = MvccTestDb::new();
 
@@ -386,7 +388,7 @@ fn test_dirty_read() {
     assert_eq!(row2, None);
 }
 
-#[test]
+#[turso_test]
 fn test_dirty_read_deleted() {
     let db = MvccTestDb::new();
 
@@ -428,7 +430,7 @@ fn test_dirty_read_deleted() {
     assert_eq!(tx1_row, row);
 }
 
-#[test]
+#[turso_test]
 fn test_fuzzy_read() {
     let db = MvccTestDb::new();
 
@@ -498,7 +500,7 @@ fn test_fuzzy_read() {
     assert!(matches!(update_result, Err(LimboError::WriteWriteConflict)));
 }
 
-#[test]
+#[turso_test]
 fn test_lost_update() {
     let db = MvccTestDb::new();
 
@@ -563,7 +565,7 @@ fn test_lost_update() {
 
 // Test for the visibility to check if a new transaction can see old committed values.
 // This test checks for the typo present in the paper, explained in https://github.com/penberg/mvcc-rs/issues/15
-#[test]
+#[turso_test]
 fn test_committed_visibility() {
     let db = MvccTestDb::new();
 
@@ -612,7 +614,7 @@ fn test_committed_visibility() {
 }
 
 // Test to check if a older transaction can see (un)committed future rows
-#[test]
+#[turso_test]
 fn test_future_row() {
     let db = MvccTestDb::new();
 
@@ -741,7 +743,7 @@ pub(crate) fn commit_tx_no_conn(
     }
 }
 
-#[test]
+#[turso_test]
 fn test_lazy_scan_cursor_basic() {
     let (db, tx_id) = setup_lazy_db(&[1, 2, 3, 4, 5]);
     let table_id = 1;
@@ -776,7 +778,7 @@ fn test_lazy_scan_cursor_basic() {
     assert!(cursor.is_empty());
 }
 
-#[test]
+#[turso_test]
 fn test_lazy_scan_cursor_with_gaps() {
     let (db, tx_id) = setup_test_db();
     let table_id = 1;
@@ -812,7 +814,7 @@ fn test_lazy_scan_cursor_with_gaps() {
     assert_eq!(index, expected_ids.len() - 1);
 }
 
-#[test]
+#[turso_test]
 fn test_cursor_basic() {
     let (db, tx_id) = setup_lazy_db(&[1, 2, 3, 4, 5]);
     let table_id = 1;
@@ -848,7 +850,7 @@ fn test_cursor_basic() {
     assert!(cursor.is_empty());
 }
 
-#[test]
+#[turso_test]
 fn test_cursor_with_empty_table() {
     let db = MvccTestDb::new();
     {
@@ -872,7 +874,7 @@ fn test_cursor_with_empty_table() {
     assert!(cursor.current_row_id().is_none());
 }
 
-#[test]
+#[turso_test]
 fn test_cursor_modification_during_scan() {
     let (db, tx_id) = setup_lazy_db(&[1, 2, 4, 5]);
     let table_id = 1;
@@ -982,7 +984,7 @@ fn new_tx(tx_id: TxID, begin_ts: u64, state: TransactionState) -> RwLock<Transac
     })
 }
 
-#[test]
+#[turso_test]
 fn test_snapshot_isolation_tx_visible1() {
     let txs: SkipMap<TxID, RwLock<Transaction>> = SkipMap::from_iter([
         (1, new_tx(1, 1, TransactionState::Committed(2))),
@@ -1075,7 +1077,7 @@ fn test_snapshot_isolation_tx_visible1() {
     ));
 }
 
-#[test]
+#[turso_test]
 fn test_restart() {
     let mut db = MvccTestDbNoConn::new_with_random_db();
     {

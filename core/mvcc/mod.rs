@@ -41,6 +41,8 @@ pub use database::MvStore;
 
 #[cfg(test)]
 mod tests {
+    use turso_macros::turso_test;
+
     use crate::mvcc::database::tests::{
         commit_tx_no_conn, generate_simple_string_row, MvccTestDbNoConn,
     };
@@ -51,7 +53,7 @@ mod tests {
 
     static IDS: AtomicI64 = AtomicI64::new(1);
 
-    #[test]
+    #[turso_test]
     #[ignore = "FIXME: This test fails because there is write busy lock yet to be fixed"]
     fn test_non_overlapping_concurrent_inserts() {
         // Two threads insert to the database concurrently using non-overlapping
@@ -107,7 +109,7 @@ mod tests {
     }
 
     // FIXME: This test fails sporadically.
-    #[test]
+    #[turso_test]
     #[ignore]
     fn test_overlapping_concurrent_inserts_read_your_writes() {
         let db = Arc::new(MvccTestDbNoConn::new());

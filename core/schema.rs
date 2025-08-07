@@ -1462,10 +1462,12 @@ impl Index {
 
 #[cfg(test)]
 mod tests {
+    use turso_macros::turso_test;
+
     use super::*;
     use crate::LimboError;
 
-    #[test]
+    #[turso_test]
     pub fn test_has_rowid_true() -> Result<()> {
         let sql = r#"CREATE TABLE t1 (a INTEGER PRIMARY KEY, b TEXT);"#;
         let table = BTreeTable::from_sql(sql, 0)?;
@@ -1473,7 +1475,7 @@ mod tests {
         Ok(())
     }
 
-    #[test]
+    #[turso_test]
     pub fn test_has_rowid_false() -> Result<()> {
         let sql = r#"CREATE TABLE t1 (a INTEGER PRIMARY KEY, b TEXT) WITHOUT ROWID;"#;
         let table = BTreeTable::from_sql(sql, 0)?;
@@ -1481,7 +1483,7 @@ mod tests {
         Ok(())
     }
 
-    #[test]
+    #[turso_test]
     pub fn test_column_is_rowid_alias_single_text() -> Result<()> {
         let sql = r#"CREATE TABLE t1 (a TEXT PRIMARY KEY, b TEXT);"#;
         let table = BTreeTable::from_sql(sql, 0)?;
@@ -1493,7 +1495,7 @@ mod tests {
         Ok(())
     }
 
-    #[test]
+    #[turso_test]
     pub fn test_column_is_rowid_alias_single_integer() -> Result<()> {
         let sql = r#"CREATE TABLE t1 (a INTEGER PRIMARY KEY, b TEXT);"#;
         let table = BTreeTable::from_sql(sql, 0)?;
@@ -1505,7 +1507,7 @@ mod tests {
         Ok(())
     }
 
-    #[test]
+    #[turso_test]
     pub fn test_column_is_rowid_alias_single_integer_separate_primary_key_definition() -> Result<()>
     {
         let sql = r#"CREATE TABLE t1 (a INTEGER, b TEXT, PRIMARY KEY(a));"#;
@@ -1518,7 +1520,7 @@ mod tests {
         Ok(())
     }
 
-    #[test]
+    #[turso_test]
     pub fn test_column_is_rowid_alias_single_integer_separate_primary_key_definition_without_rowid(
     ) -> Result<()> {
         let sql = r#"CREATE TABLE t1 (a INTEGER, b TEXT, PRIMARY KEY(a)) WITHOUT ROWID;"#;
@@ -1531,7 +1533,7 @@ mod tests {
         Ok(())
     }
 
-    #[test]
+    #[turso_test]
     pub fn test_column_is_rowid_alias_single_integer_without_rowid() -> Result<()> {
         let sql = r#"CREATE TABLE t1 (a INTEGER PRIMARY KEY, b TEXT) WITHOUT ROWID;"#;
         let table = BTreeTable::from_sql(sql, 0)?;
@@ -1543,7 +1545,7 @@ mod tests {
         Ok(())
     }
 
-    #[test]
+    #[turso_test]
     pub fn test_column_is_rowid_alias_inline_composite_primary_key() -> Result<()> {
         let sql = r#"CREATE TABLE t1 (a INTEGER PRIMARY KEY, b TEXT PRIMARY KEY);"#;
         let table = BTreeTable::from_sql(sql, 0)?;
@@ -1555,7 +1557,7 @@ mod tests {
         Ok(())
     }
 
-    #[test]
+    #[turso_test]
     pub fn test_column_is_rowid_alias_separate_composite_primary_key_definition() -> Result<()> {
         let sql = r#"CREATE TABLE t1 (a INTEGER, b TEXT, PRIMARY KEY(a, b));"#;
         let table = BTreeTable::from_sql(sql, 0)?;
@@ -1567,7 +1569,7 @@ mod tests {
         Ok(())
     }
 
-    #[test]
+    #[turso_test]
     pub fn test_primary_key_inline_single() -> Result<()> {
         let sql = r#"CREATE TABLE t1 (a INTEGER PRIMARY KEY, b TEXT, c REAL);"#;
         let table = BTreeTable::from_sql(sql, 0)?;
@@ -1585,7 +1587,7 @@ mod tests {
         Ok(())
     }
 
-    #[test]
+    #[turso_test]
     pub fn test_primary_key_inline_multiple() -> Result<()> {
         let sql = r#"CREATE TABLE t1 (a INTEGER PRIMARY KEY, b TEXT PRIMARY KEY, c REAL);"#;
         let table = BTreeTable::from_sql(sql, 0)?;
@@ -1606,7 +1608,7 @@ mod tests {
         Ok(())
     }
 
-    #[test]
+    #[turso_test]
     pub fn test_primary_key_separate_single() -> Result<()> {
         let sql = r#"CREATE TABLE t1 (a INTEGER, b TEXT, c REAL, PRIMARY KEY(a desc));"#;
         let table = BTreeTable::from_sql(sql, 0)?;
@@ -1624,7 +1626,7 @@ mod tests {
         Ok(())
     }
 
-    #[test]
+    #[turso_test]
     pub fn test_primary_key_separate_multiple() -> Result<()> {
         let sql = r#"CREATE TABLE t1 (a INTEGER, b TEXT, c REAL, PRIMARY KEY(a, b desc));"#;
         let table = BTreeTable::from_sql(sql, 0)?;
@@ -1645,7 +1647,7 @@ mod tests {
         Ok(())
     }
 
-    #[test]
+    #[turso_test]
     pub fn test_primary_key_separate_single_quoted() -> Result<()> {
         let sql = r#"CREATE TABLE t1 (a INTEGER, b TEXT, c REAL, PRIMARY KEY('a'));"#;
         let table = BTreeTable::from_sql(sql, 0)?;
@@ -1662,7 +1664,7 @@ mod tests {
         );
         Ok(())
     }
-    #[test]
+    #[turso_test]
     pub fn test_primary_key_separate_single_doubly_quoted() -> Result<()> {
         let sql = r#"CREATE TABLE t1 (a INTEGER, b TEXT, c REAL, PRIMARY KEY("a"));"#;
         let table = BTreeTable::from_sql(sql, 0)?;
@@ -1680,7 +1682,7 @@ mod tests {
         Ok(())
     }
 
-    #[test]
+    #[turso_test]
     pub fn test_default_value() -> Result<()> {
         let sql = r#"CREATE TABLE t1 (a INTEGER DEFAULT 23);"#;
         let table = BTreeTable::from_sql(sql, 0)?;
@@ -1690,7 +1692,7 @@ mod tests {
         Ok(())
     }
 
-    #[test]
+    #[turso_test]
     pub fn test_col_notnull() -> Result<()> {
         let sql = r#"CREATE TABLE t1 (a INTEGER NOT NULL);"#;
         let table = BTreeTable::from_sql(sql, 0)?;
@@ -1699,7 +1701,7 @@ mod tests {
         Ok(())
     }
 
-    #[test]
+    #[turso_test]
     pub fn test_col_notnull_negative() -> Result<()> {
         let sql = r#"CREATE TABLE t1 (a INTEGER);"#;
         let table = BTreeTable::from_sql(sql, 0)?;
@@ -1708,7 +1710,7 @@ mod tests {
         Ok(())
     }
 
-    #[test]
+    #[turso_test]
     pub fn test_col_type_string_integer() -> Result<()> {
         let sql = r#"CREATE TABLE t1 (a InTeGeR);"#;
         let table = BTreeTable::from_sql(sql, 0)?;
@@ -1717,14 +1719,14 @@ mod tests {
         Ok(())
     }
 
-    #[test]
+    #[turso_test]
     pub fn test_sqlite_schema() {
         let expected = r#"CREATE TABLE sqlite_schema (type TEXT, name TEXT, tbl_name TEXT, rootpage INT, sql TEXT)"#;
         let actual = sqlite_schema_table().to_sql();
         assert_eq!(expected, actual);
     }
 
-    #[test]
+    #[turso_test]
     pub fn test_special_column_names() -> Result<()> {
         let tests = [
             ("foobar", "CREATE TABLE t (foobar TEXT)"),
@@ -1743,7 +1745,7 @@ mod tests {
         Ok(())
     }
 
-    #[test]
+    #[turso_test]
     #[should_panic]
     fn test_automatic_index_single_column() {
         // Without composite primary keys, we should not have an automatic index on a primary key that is a rowid alias
@@ -1756,7 +1758,7 @@ mod tests {
         .unwrap();
     }
 
-    #[test]
+    #[turso_test]
     fn test_automatic_index_composite_key() -> Result<()> {
         let sql = r#"CREATE TABLE t1 (a INTEGER, b TEXT, PRIMARY KEY(a, b));"#;
         let table = BTreeTable::from_sql(sql, 0)?;
@@ -1779,7 +1781,7 @@ mod tests {
         Ok(())
     }
 
-    #[test]
+    #[turso_test]
     fn test_automatic_index_no_primary_key() -> Result<()> {
         let sql = r#"CREATE TABLE t1 (a INTEGER, b TEXT);"#;
         let table = BTreeTable::from_sql(sql, 0)?;
@@ -1796,7 +1798,7 @@ mod tests {
         Ok(())
     }
 
-    #[test]
+    #[turso_test]
     #[should_panic]
     fn test_automatic_index_nonexistent_column() {
         // Create a table with a primary key column that doesn't exist in the table
@@ -1827,7 +1829,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[turso_test]
     fn test_automatic_index_unique_column() -> Result<()> {
         let sql = r#"CREATE table t1 (x INTEGER, y INTEGER UNIQUE);"#;
         let table = BTreeTable::from_sql(sql, 0)?;
@@ -1849,7 +1851,7 @@ mod tests {
         Ok(())
     }
 
-    #[test]
+    #[turso_test]
     fn test_automatic_index_pkey_unique_column() -> Result<()> {
         let sql = r#"CREATE TABLE t1 (x PRIMARY KEY, y UNIQUE);"#;
         let table = BTreeTable::from_sql(sql, 0)?;
@@ -1880,7 +1882,7 @@ mod tests {
         Ok(())
     }
 
-    #[test]
+    #[turso_test]
     fn test_automatic_index_pkey_many_unique_columns() -> Result<()> {
         let sql = r#"CREATE TABLE t1 (a PRIMARY KEY, b UNIQUE, c, d, UNIQUE(c, d));"#;
         let table = BTreeTable::from_sql(sql, 0)?;
@@ -1918,7 +1920,7 @@ mod tests {
         Ok(())
     }
 
-    #[test]
+    #[turso_test]
     fn test_automatic_index_unique_set_dedup() -> Result<()> {
         let sql = r#"CREATE TABLE t1 (a, b, UNIQUE(a, b), UNIQUE(a, b));"#;
         let table = BTreeTable::from_sql(sql, 0)?;
@@ -1943,7 +1945,7 @@ mod tests {
         Ok(())
     }
 
-    #[test]
+    #[turso_test]
     fn test_automatic_index_primary_key_is_unique() -> Result<()> {
         let sql = r#"CREATE TABLE t1 (a primary key unique);"#;
         let table = BTreeTable::from_sql(sql, 0)?;
@@ -1966,7 +1968,7 @@ mod tests {
         Ok(())
     }
 
-    #[test]
+    #[turso_test]
     fn test_automatic_index_primary_key_is_unique_and_composite() -> Result<()> {
         let sql = r#"CREATE TABLE t1 (a, b, PRIMARY KEY(a, b), UNIQUE(a, b));"#;
         let table = BTreeTable::from_sql(sql, 0)?;
@@ -1990,7 +1992,7 @@ mod tests {
         Ok(())
     }
 
-    #[test]
+    #[turso_test]
     fn test_automatic_index_unique_and_a_pk() -> Result<()> {
         let sql = r#"CREATE TABLE t1 (a NUMERIC UNIQUE UNIQUE,  b TEXT PRIMARY KEY)"#;
         let table = BTreeTable::from_sql(sql, 0)?;

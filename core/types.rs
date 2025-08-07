@@ -2613,6 +2613,8 @@ impl WalFrameInfo {
 
 #[cfg(test)]
 mod tests {
+    use turso_macros::turso_test;
+
     use super::*;
     use crate::translate::collate::CollationSeq;
 
@@ -2740,7 +2742,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[turso_test]
     fn test_calc_header_size() {
         // Test 1-byte header size (serial type sizes 0 to 126)
         const MIN_SERIALTYPES_SIZE_FOR_1_BYTE_HEADER: usize = 0;
@@ -2798,7 +2800,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[turso_test]
     fn test_integer_fast_path() {
         let index_info = create_index_info(
             2,
@@ -2870,7 +2872,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[turso_test]
     fn test_string_fast_path() {
         let index_info = create_index_info(
             2,
@@ -2933,7 +2935,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[turso_test]
     fn test_type_precedence() {
         let index_info = create_index_info(1, vec![SortOrder::Asc], vec![CollationSeq::Binary]);
 
@@ -3015,7 +3017,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[turso_test]
     fn test_sort_order_desc() {
         let index_info = create_index_info(
             2,
@@ -3056,7 +3058,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[turso_test]
     fn test_edge_cases() {
         let index_info =
             create_index_info(15, vec![SortOrder::Asc; 15], vec![CollationSeq::Binary; 15]);
@@ -3112,7 +3114,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[turso_test]
     fn test_skip_parameter() {
         let index_info = create_index_info(
             3,
@@ -3142,7 +3144,7 @@ mod tests {
         assert_eq!(result_skip_1, std::cmp::Ordering::Less);
     }
 
-    #[test]
+    #[turso_test]
     fn test_strategy_selection() {
         let collations_small = vec![CollationSeq::Binary; 3];
         let collations_large = vec![CollationSeq::Binary; 15];
@@ -3184,7 +3186,7 @@ mod tests {
         ));
     }
 
-    #[test]
+    #[turso_test]
     fn test_record_parsing() {
         let values = [
             Value::Integer(42),
@@ -3256,7 +3258,7 @@ mod tests {
         assert_eq!(cursor1.offsets, cursor2.offsets, "offsets must match");
     }
 
-    #[test]
+    #[turso_test]
     fn test_serialize_null() {
         let record = Record::new(vec![Value::Null]);
         let mut buf = Vec::new();
@@ -3272,7 +3274,7 @@ mod tests {
         assert_eq!(buf.len(), header_length);
     }
 
-    #[test]
+    #[turso_test]
     fn test_serialize_integers() {
         let record = Record::new(vec![
             Value::Integer(0),                 // Should use ConstInt0
@@ -3368,7 +3370,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[turso_test]
     fn test_serialize_const_integers() {
         let record = Record::new(vec![Value::Integer(0), Value::Integer(1)]);
         let mut buf = Vec::new();
@@ -3389,7 +3391,7 @@ mod tests {
         assert_eq!(buf[2], 9); // ConstInt1 serial type
     }
 
-    #[test]
+    #[turso_test]
     fn test_serialize_single_const_int0() {
         let record = Record::new(vec![Value::Integer(0)]);
         let mut buf = Vec::new();
@@ -3401,7 +3403,7 @@ mod tests {
         assert_eq!(buf[1], 8); // ConstInt0 serial type
     }
 
-    #[test]
+    #[turso_test]
     fn test_serialize_float() {
         #[warn(clippy::approx_constant)]
         let record = Record::new(vec![Value::Float(3.15555)]);
@@ -3421,7 +3423,7 @@ mod tests {
         assert_eq!(buf.len(), header_length + size_of::<f64>());
     }
 
-    #[test]
+    #[turso_test]
     fn test_serialize_text() {
         let text = "hello";
         let record = Record::new(vec![Value::Text(Text::new(text))]);
@@ -3440,7 +3442,7 @@ mod tests {
         assert_eq!(buf.len(), header_length + text.len());
     }
 
-    #[test]
+    #[turso_test]
     fn test_serialize_blob() {
         let blob = vec![1, 2, 3, 4, 5];
         let record = Record::new(vec![Value::Blob(blob.clone())]);
@@ -3459,7 +3461,7 @@ mod tests {
         assert_eq!(buf.len(), header_length + blob.len());
     }
 
-    #[test]
+    #[turso_test]
     fn test_serialize_mixed_types() {
         let text = "test";
         let record = Record::new(vec![

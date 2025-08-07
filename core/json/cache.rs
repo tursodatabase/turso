@@ -167,6 +167,8 @@ impl JsonCacheCell {
 
 #[cfg(test)]
 mod tests {
+    use turso_macros::turso_test;
+
     use super::*;
     use std::str::FromStr;
 
@@ -181,7 +183,7 @@ mod tests {
         (key, value)
     }
 
-    #[test]
+    #[turso_test]
     fn test_json_cache_new() {
         let cache = JsonCache::new();
         assert_eq!(cache.used, 0);
@@ -190,7 +192,7 @@ mod tests {
         assert!(cache.entries.iter().all(|entry| entry.is_none()));
     }
 
-    #[test]
+    #[turso_test]
     fn test_json_cache_insert_and_lookup() {
         let mut cache = JsonCache::new();
         let json_str = "{\"test\": \"value\"}";
@@ -212,7 +214,7 @@ mod tests {
         assert_eq!(cache.counter, 2);
     }
 
-    #[test]
+    #[turso_test]
     fn test_json_cache_lookup_nonexistent() {
         let mut cache = JsonCache::new();
         let (key, _) = create_test_pair("{\"id\": 123}");
@@ -225,7 +227,7 @@ mod tests {
         assert_eq!(cache.counter, 0);
     }
 
-    #[test]
+    #[turso_test]
     fn test_json_cache_multiple_entries() {
         let mut cache = JsonCache::new();
 
@@ -255,7 +257,7 @@ mod tests {
         assert_eq!(cache.counter, 6);
     }
 
-    #[test]
+    #[turso_test]
     fn test_json_cache_eviction() {
         let mut cache = JsonCache::new();
 
@@ -294,7 +296,7 @@ mod tests {
         assert!(cache.lookup(&key5).is_some());
     }
 
-    #[test]
+    #[turso_test]
     fn test_json_cache_find_oldest_entry() {
         let mut cache = JsonCache::new();
 
@@ -319,7 +321,7 @@ mod tests {
 
     // Tests for JsonCacheCell
 
-    #[test]
+    #[turso_test]
     fn test_json_cache_cell_new() {
         let cache_cell = JsonCacheCell::new();
 
@@ -333,7 +335,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[turso_test]
     fn test_json_cache_cell_lookup() {
         let cache_cell = JsonCacheCell::new();
         let (key, value) = create_test_pair("{\"test\": \"value\"}");
@@ -370,7 +372,7 @@ mod tests {
         assert_eq!(lookup_result.unwrap(), value);
     }
 
-    #[test]
+    #[turso_test]
     fn test_json_cache_cell_get_or_insert_with_existing() {
         let cache_cell = JsonCacheCell::new();
         let (key, value) = create_test_pair("{\"test\": \"value\"}");
@@ -394,7 +396,7 @@ mod tests {
         assert_eq!(result.unwrap(), value);
     }
 
-    #[test]
+    #[turso_test]
     #[should_panic]
     fn test_json_cache_cell_double_access() {
         let cache_cell = JsonCacheCell::new();
@@ -410,7 +412,7 @@ mod tests {
         let _ = cache_cell.lookup(&key);
     }
 
-    #[test]
+    #[turso_test]
     fn test_json_cache_cell_get_or_insert_error_handling() {
         let cache_cell = JsonCacheCell::new();
         let (key, _) = create_test_pair("{\"test\": \"value\"}");

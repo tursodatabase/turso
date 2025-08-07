@@ -1963,6 +1963,7 @@ mod tests {
 
     use super::*;
     use rstest::rstest;
+    use turso_macros::turso_test;
 
     #[rstest]
     #[case(&[], SerialType::null(), Value::Null)]
@@ -2000,7 +2001,7 @@ mod tests {
         assert_eq!(result.0.to_owned(), expected);
     }
 
-    #[test]
+    #[turso_test]
     fn test_serial_type_helpers() {
         assert_eq!(
             TryInto::<SerialType>::try_into(12u64).unwrap(),
@@ -2048,7 +2049,7 @@ mod tests {
         assert_eq!(result, expected);
     }
 
-    #[test]
+    #[turso_test]
     fn test_validate_serial_type() {
         for i in 0..=9 {
             let result = validate_serial_type(i);
@@ -2064,7 +2065,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[turso_test]
     fn test_smallvec_iter() {
         let mut small_vec = SmallVec::<i32, 4>::new();
         (0..8).for_each(|i| small_vec.push(i));
@@ -2081,7 +2082,7 @@ mod tests {
         assert_eq!(iter.next(), None);
     }
 
-    #[test]
+    #[turso_test]
     fn test_smallvec_get() {
         let mut small_vec = SmallVec::<i32, 4>::new();
         (0..8).for_each(|i| small_vec.push(i));

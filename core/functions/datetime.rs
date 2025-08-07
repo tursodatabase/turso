@@ -695,9 +695,11 @@ fn format_time_duration(duration: &chrono::Duration) -> Value {
 
 #[cfg(test)]
 mod tests {
+    use turso_macros::turso_test;
+
     use super::*;
 
-    #[test]
+    #[turso_test]
     fn test_valid_get_date_from_time_value() {
         let now = chrono::Local::now().to_utc().format("%Y-%m-%d").to_string();
 
@@ -815,7 +817,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[turso_test]
     fn test_invalid_get_date_from_time_value() {
         let invalid_cases = vec![
             Value::build_text("2024-07-21 25:00"),    // Invalid hour
@@ -854,7 +856,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[turso_test]
     fn test_valid_get_time_from_datetime_value() {
         let test_time_str = "22:30:45";
         let prev_time_str = "20:30:45";
@@ -947,7 +949,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[turso_test]
     fn test_invalid_get_time_from_datetime_value() {
         let invalid_cases = vec![
             Value::build_text("2024-07-21 25:00"),    // Invalid hour
@@ -986,7 +988,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[turso_test]
     fn test_parse_days() {
         assert_eq!(parse_modifier("5 days").unwrap(), Modifier::Days(5));
         assert_eq!(parse_modifier("-3 days").unwrap(), Modifier::Days(-3));
@@ -996,14 +998,14 @@ mod tests {
         assert_eq!(parse_modifier("+5  DAYS").unwrap(), Modifier::Days(5));
     }
 
-    #[test]
+    #[turso_test]
     fn test_parse_hours() {
         assert_eq!(parse_modifier("12 hours").unwrap(), Modifier::Hours(12));
         assert_eq!(parse_modifier("-2 hours").unwrap(), Modifier::Hours(-2));
         assert_eq!(parse_modifier("+3  HOURS").unwrap(), Modifier::Hours(3));
     }
 
-    #[test]
+    #[turso_test]
     fn test_parse_minutes() {
         assert_eq!(parse_modifier("30 minutes").unwrap(), Modifier::Minutes(30));
         assert_eq!(
@@ -1016,7 +1018,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[turso_test]
     fn test_parse_seconds() {
         assert_eq!(parse_modifier("45 seconds").unwrap(), Modifier::Seconds(45));
         assert_eq!(
@@ -1029,21 +1031,21 @@ mod tests {
         );
     }
 
-    #[test]
+    #[turso_test]
     fn test_parse_months() {
         assert_eq!(parse_modifier("3 months").unwrap(), Modifier::Months(3));
         assert_eq!(parse_modifier("-1 months").unwrap(), Modifier::Months(-1));
         assert_eq!(parse_modifier("+6  MONTHS").unwrap(), Modifier::Months(6));
     }
 
-    #[test]
+    #[turso_test]
     fn test_parse_years() {
         assert_eq!(parse_modifier("2 years").unwrap(), Modifier::Years(2));
         assert_eq!(parse_modifier("-1 years").unwrap(), Modifier::Years(-1));
         assert_eq!(parse_modifier("+10  YEARS").unwrap(), Modifier::Years(10));
     }
 
-    #[test]
+    #[turso_test]
     fn test_parse_time_offset() {
         assert_eq!(
             parse_modifier("+01:30").unwrap(),
@@ -1067,7 +1069,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[turso_test]
     fn test_parse_date_offset() {
         assert_eq!(
             parse_modifier("+2023-05-15").unwrap(),
@@ -1087,7 +1089,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[turso_test]
     fn test_parse_date_time_offset() {
         assert_eq!(
             parse_modifier("+2023-05-15 14:30").unwrap(),
@@ -1109,7 +1111,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[turso_test]
     fn test_parse_start_of() {
         assert_eq!(
             parse_modifier("start of month").unwrap(),
@@ -1137,13 +1139,13 @@ mod tests {
         );
     }
 
-    #[test]
+    #[turso_test]
     fn test_parse_weekday() {
         assert_eq!(parse_modifier("weekday 0").unwrap(), Modifier::Weekday(0));
         assert_eq!(parse_modifier("WEEKDAY 6").unwrap(), Modifier::Weekday(6));
     }
 
-    #[test]
+    #[turso_test]
     fn test_parse_other_modifiers() {
         assert_eq!(parse_modifier("unixepoch").unwrap(), Modifier::UnixEpoch);
         assert_eq!(parse_modifier("UNIXEPOCH").unwrap(), Modifier::UnixEpoch);
@@ -1161,7 +1163,7 @@ mod tests {
         assert_eq!(parse_modifier("SUBSECOND").unwrap(), Modifier::Subsec);
     }
 
-    #[test]
+    #[turso_test]
     fn test_parse_invalid_modifier() {
         assert!(parse_modifier("invalid modifier").is_err());
         assert!(parse_modifier("5").is_err());
@@ -1188,7 +1190,7 @@ mod tests {
         create_datetime(2023, 6, 15, 12, 30, 45)
     }
 
-    #[test]
+    #[turso_test]
     fn test_apply_modifier_days() {
         let mut dt = setup_datetime();
         apply_modifier(&mut dt, "5 days").unwrap();
@@ -1199,7 +1201,7 @@ mod tests {
         assert_eq!(dt, create_datetime(2023, 6, 12, 12, 30, 45));
     }
 
-    #[test]
+    #[turso_test]
     fn test_apply_modifier_hours() {
         let mut dt = setup_datetime();
         apply_modifier(&mut dt, "6 hours").unwrap();
@@ -1210,7 +1212,7 @@ mod tests {
         assert_eq!(dt, create_datetime(2023, 6, 15, 10, 30, 45));
     }
 
-    #[test]
+    #[turso_test]
     fn test_apply_modifier_minutes() {
         let mut dt = setup_datetime();
         apply_modifier(&mut dt, "45 minutes").unwrap();
@@ -1221,7 +1223,7 @@ mod tests {
         assert_eq!(dt, create_datetime(2023, 6, 15, 12, 15, 45));
     }
 
-    #[test]
+    #[turso_test]
     fn test_apply_modifier_seconds() {
         let mut dt = setup_datetime();
         apply_modifier(&mut dt, "30 seconds").unwrap();
@@ -1232,7 +1234,7 @@ mod tests {
         assert_eq!(dt, create_datetime(2023, 6, 15, 12, 30, 25));
     }
 
-    #[test]
+    #[turso_test]
     fn test_apply_modifier_time_offset() {
         let mut dt = setup_datetime();
         apply_modifier(&mut dt, "+01:30").unwrap();
@@ -1243,7 +1245,7 @@ mod tests {
         assert_eq!(dt, create_datetime(2023, 6, 15, 11, 45, 45));
     }
 
-    #[test]
+    #[turso_test]
     fn test_apply_modifier_date_time_offset() {
         let mut dt = setup_datetime();
         apply_modifier(&mut dt, "+0001-01-01 01:01").unwrap();
@@ -1263,14 +1265,14 @@ mod tests {
         assert_eq!(dt, create_datetime(2021, 3, 11, 7, 24, 45));
     }
 
-    #[test]
+    #[turso_test]
     fn test_apply_modifier_start_of_year() {
         let mut dt = setup_datetime();
         apply_modifier(&mut dt, "start of year").unwrap();
         assert_eq!(dt, create_datetime(2023, 1, 1, 0, 0, 0));
     }
 
-    #[test]
+    #[turso_test]
     fn test_apply_modifier_start_of_day() {
         let mut dt = setup_datetime();
         apply_modifier(&mut dt, "start of day").unwrap();
@@ -1288,7 +1290,7 @@ mod tests {
         dt.weekday().num_days_from_sunday()
     }
 
-    #[test]
+    #[turso_test]
     fn test_single_modifier() {
         let time = setup_datetime();
         let expected = format(time - TimeDelta::days(1));
@@ -1299,7 +1301,7 @@ mod tests {
         assert_eq!(result, *text(&expected).get_owned_value());
     }
 
-    #[test]
+    #[turso_test]
     fn test_multiple_modifiers() {
         let time = setup_datetime();
         let expected = format(time - TimeDelta::days(1) + TimeDelta::hours(3));
@@ -1314,7 +1316,7 @@ mod tests {
         assert_eq!(result, *text(&expected).get_owned_value());
     }
 
-    #[test]
+    #[turso_test]
     fn test_subsec_modifier() {
         let time = setup_datetime();
         let result = exec_datetime(
@@ -1325,7 +1327,7 @@ mod tests {
         assert_eq!(time.time(), result);
     }
 
-    #[test]
+    #[turso_test]
     fn test_start_of_day_modifier() {
         let time = setup_datetime();
         let start_of_day = time.date().and_hms_opt(0, 0, 0).unwrap();
@@ -1341,7 +1343,7 @@ mod tests {
         assert_eq!(result, *text(&expected).get_owned_value());
     }
 
-    #[test]
+    #[turso_test]
     fn test_start_of_month_modifier() {
         let time = setup_datetime();
         let start_of_month = NaiveDate::from_ymd_opt(time.year(), time.month(), 1)
@@ -1360,7 +1362,7 @@ mod tests {
         assert_eq!(result, *text(&expected).get_owned_value());
     }
 
-    #[test]
+    #[turso_test]
     fn test_start_of_year_modifier() {
         let time = setup_datetime();
         let start_of_year = NaiveDate::from_ymd_opt(time.year(), 1, 1)
@@ -1380,7 +1382,7 @@ mod tests {
         assert_eq!(result, *text(&expected).get_owned_value());
     }
 
-    #[test]
+    #[turso_test]
     fn test_timezone_modifiers() {
         let dt = setup_datetime();
         let result_local = exec_datetime(
@@ -1401,7 +1403,7 @@ mod tests {
         // add test when fixed in the future
     }
 
-    #[test]
+    #[turso_test]
     fn test_combined_modifiers() {
         let time = create_datetime(2000, 1, 1, 0, 0, 0);
         let expected = time - TimeDelta::days(1)
@@ -1424,7 +1426,7 @@ mod tests {
         assert_eq!(expected, result);
     }
 
-    #[test]
+    #[turso_test]
     fn test_max_datetime_limit() {
         // max datetime limit
         let max = NaiveDate::from_ymd_opt(9999, 12, 31)
@@ -1437,7 +1439,7 @@ mod tests {
     }
 
     // leap second
-    #[test]
+    #[turso_test]
     fn test_leap_second_ignored() {
         let leap_second = NaiveDate::from_ymd_opt(2024, 6, 30)
             .unwrap()
@@ -1448,7 +1450,7 @@ mod tests {
         assert_eq!(result, *text(&expected).get_owned_value());
     }
 
-    #[test]
+    #[turso_test]
     fn test_already_on_weekday_no_change() {
         // 2023-01-01 is a Sunday => weekday 0
         let mut dt = create_datetime(2023, 1, 1, 12, 0, 0);
@@ -1457,7 +1459,7 @@ mod tests {
         assert_eq!(weekday_sunday_based(&dt), 0);
     }
 
-    #[test]
+    #[turso_test]
     fn test_move_forward_if_different() {
         // 2023-01-01 is a Sunday => weekday 0
         // "weekday 1" => next Monday => 2023-01-02
@@ -1474,7 +1476,7 @@ mod tests {
         assert_eq!(weekday_sunday_based(&dt), 5);
     }
 
-    #[test]
+    #[turso_test]
     fn test_wrap_around_weekend() {
         // 2023-01-06 is a Friday => weekday 5
         // "weekday 0" => next Sunday => 2023-01-08
@@ -1489,7 +1491,7 @@ mod tests {
         assert_eq!(weekday_sunday_based(&dt), 0);
     }
 
-    #[test]
+    #[turso_test]
     fn test_same_day_stays_put() {
         // 2023-01-05 is a Thursday => weekday 4
         // Asking for weekday 4 => no change
@@ -1499,7 +1501,7 @@ mod tests {
         assert_eq!(weekday_sunday_based(&dt), 4);
     }
 
-    #[test]
+    #[turso_test]
     fn test_already_on_friday_no_change() {
         // 2023-01-06 is a Friday => weekday 5
         // Asking for weekday 5 => no change if already on Friday
@@ -1510,7 +1512,7 @@ mod tests {
     }
 
     #[allow(deprecated)]
-    #[test]
+    #[turso_test]
     fn test_apply_modifier_julianday() {
         use julian_day_converter::*;
 
@@ -1523,14 +1525,14 @@ mod tests {
         assert_eq!(dt_result, dt);
     }
 
-    #[test]
+    #[turso_test]
     fn test_apply_modifier_start_of_month() {
         let mut dt = create_datetime(2023, 6, 15, 12, 30, 45);
         apply_modifier(&mut dt, "start of month").unwrap();
         assert_eq!(dt, create_datetime(2023, 6, 1, 0, 0, 0));
     }
 
-    #[test]
+    #[turso_test]
     fn test_apply_modifier_subsec() {
         let mut dt = create_datetime(2023, 6, 15, 12, 30, 45);
         let dt_with_nanos = dt.with_nanosecond(123_456_789).unwrap();
@@ -1539,7 +1541,7 @@ mod tests {
         assert_eq!(dt, dt_with_nanos);
     }
 
-    #[test]
+    #[turso_test]
     fn test_apply_modifier_start_of_month_basic() {
         // Basic check: from mid-month to the 1st at 00:00:00.
         let mut dt = create_datetime(2023, 6, 15, 12, 30, 45);
@@ -1547,7 +1549,7 @@ mod tests {
         assert_eq!(dt, create_datetime(2023, 6, 1, 0, 0, 0));
     }
 
-    #[test]
+    #[turso_test]
     fn test_apply_modifier_start_of_month_already_at_first() {
         // If we're already at the start of the month, no change.
         let mut dt = create_datetime(2023, 6, 1, 0, 0, 0);
@@ -1555,7 +1557,7 @@ mod tests {
         assert_eq!(dt, create_datetime(2023, 6, 1, 0, 0, 0));
     }
 
-    #[test]
+    #[turso_test]
     fn test_apply_modifier_start_of_month_edge_case() {
         // edge case: month boundary. 2023-07-31 -> start of July.
         let mut dt = create_datetime(2023, 7, 31, 23, 59, 59);
@@ -1563,7 +1565,7 @@ mod tests {
         assert_eq!(dt, create_datetime(2023, 7, 1, 0, 0, 0));
     }
 
-    #[test]
+    #[turso_test]
     fn test_apply_modifier_subsec_no_change() {
         let mut dt = create_datetime(2023, 6, 15, 12, 30, 45);
         let dt_with_nanos = dt.with_nanosecond(123_456_789).unwrap();
@@ -1572,7 +1574,7 @@ mod tests {
         assert_eq!(dt, dt_with_nanos);
     }
 
-    #[test]
+    #[turso_test]
     fn test_apply_modifier_subsec_preserves_fractional_seconds() {
         let mut dt = create_datetime(2025, 1, 2, 4, 12, 21)
             .with_nanosecond(891_000_000) // 891 milliseconds
@@ -1583,7 +1585,7 @@ mod tests {
         assert_eq!(formatted, "2025-01-02 04:12:21.891");
     }
 
-    #[test]
+    #[turso_test]
     fn test_apply_modifier_subsec_no_fractional_seconds() {
         let mut dt = create_datetime(2025, 1, 2, 4, 12, 21);
         apply_modifier(&mut dt, "subsec").unwrap();
@@ -1592,7 +1594,7 @@ mod tests {
         assert_eq!(formatted, "2025-01-02 04:12:21.000");
     }
 
-    #[test]
+    #[turso_test]
     fn test_apply_modifier_subsec_truncate_to_milliseconds() {
         let mut dt = create_datetime(2025, 1, 2, 4, 12, 21)
             .with_nanosecond(891_123_456)
@@ -1603,7 +1605,7 @@ mod tests {
         assert_eq!(formatted, "2025-01-02 04:12:21.891");
     }
 
-    #[test]
+    #[turso_test]
     fn test_is_leap_second() {
         let dt = DateTime::from_timestamp(1483228799, 999_999_999)
             .unwrap()
@@ -1616,10 +1618,10 @@ mod tests {
         assert!(is_leap_second(&dt));
     }
 
-    #[test]
+    #[turso_test]
     fn test_strftime() {}
 
-    #[test]
+    #[turso_test]
     fn test_exec_timediff() {
         let start = Value::build_text("12:00:00");
         let end = Value::build_text("14:30:45");

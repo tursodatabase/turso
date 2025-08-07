@@ -633,6 +633,7 @@ mod tests {
         rand_core::{RngCore, SeedableRng},
         ChaCha8Rng,
     };
+    use turso_macros::turso_test;
 
     fn create_key(id: usize) -> PageCacheKey {
         PageCacheKey::new(id)
@@ -677,7 +678,7 @@ mod tests {
         (key, entry)
     }
 
-    #[test]
+    #[turso_test]
     fn test_detach_only_element() {
         let mut cache = DumbLruPageCache::default();
         let key1 = insert_page(&mut cache, 1);
@@ -703,7 +704,7 @@ mod tests {
         cache.verify_list_integrity();
     }
 
-    #[test]
+    #[turso_test]
     fn test_detach_head() {
         let mut cache = DumbLruPageCache::default();
         let _key1 = insert_page(&mut cache, 1); // Tail
@@ -747,7 +748,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[turso_test]
     fn test_detach_tail() {
         let mut cache = DumbLruPageCache::default();
         let key1 = insert_page(&mut cache, 1); // Tail
@@ -801,7 +802,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[turso_test]
     fn test_detach_middle() {
         let mut cache = DumbLruPageCache::default();
         let key1 = insert_page(&mut cache, 1); // Tail
@@ -849,7 +850,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[turso_test]
     #[ignore = "for now let's not track active refs"]
     fn test_detach_via_delete() {
         let mut cache = DumbLruPageCache::default();
@@ -871,7 +872,7 @@ mod tests {
         cache.verify_list_integrity();
     }
 
-    #[test]
+    #[turso_test]
     #[should_panic(expected = "Attempted to insert different page with same key")]
     fn test_insert_existing_key_fail() {
         let mut cache = DumbLruPageCache::default();
@@ -884,7 +885,7 @@ mod tests {
         let _ = cache.insert(key1.clone(), page1_v2.clone()); // Panic
     }
 
-    #[test]
+    #[turso_test]
     fn test_detach_nonexistent_key() {
         let mut cache = DumbLruPageCache::default();
         let key_nonexist = create_key(99);
@@ -892,7 +893,7 @@ mod tests {
         assert!(cache.delete(key_nonexist.clone()).is_ok()); // no-op
     }
 
-    #[test]
+    #[turso_test]
     fn test_page_cache_evict() {
         let mut cache = DumbLruPageCache::new(1);
         let key1 = insert_page(&mut cache, 1);
@@ -901,7 +902,7 @@ mod tests {
         assert!(cache.get(&key1).is_none());
     }
 
-    #[test]
+    #[turso_test]
     fn test_detach_locked_page() {
         let mut cache = DumbLruPageCache::default();
         let (_, mut entry) = insert_and_get_entry(&mut cache, 1);
@@ -910,7 +911,7 @@ mod tests {
         cache.verify_list_integrity();
     }
 
-    #[test]
+    #[turso_test]
     fn test_detach_dirty_page() {
         let mut cache = DumbLruPageCache::default();
         let (key, mut entry) = insert_and_get_entry(&mut cache, 1);
@@ -923,7 +924,7 @@ mod tests {
         cache.verify_list_integrity();
     }
 
-    #[test]
+    #[turso_test]
     #[ignore = "for now let's not track active refs"]
     fn test_detach_with_active_reference_clean() {
         let mut cache = DumbLruPageCache::default();
@@ -934,7 +935,7 @@ mod tests {
         cache.verify_list_integrity();
     }
 
-    #[test]
+    #[turso_test]
     #[ignore = "for now let's not track active refs"]
     fn test_detach_with_active_reference_no_clean() {
         let mut cache = DumbLruPageCache::default();
@@ -945,7 +946,7 @@ mod tests {
         cache.verify_list_integrity();
     }
 
-    #[test]
+    #[turso_test]
     fn test_detach_without_cleaning() {
         let mut cache = DumbLruPageCache::default();
         let (key, entry) = insert_and_get_entry(&mut cache, 1);
@@ -955,7 +956,7 @@ mod tests {
         assert_eq!(cache.len(), 0);
     }
 
-    #[test]
+    #[turso_test]
     fn test_detach_with_cleaning() {
         let mut cache = DumbLruPageCache::default();
         let (key, entry) = insert_and_get_entry(&mut cache, 1);
@@ -970,7 +971,7 @@ mod tests {
         cache.verify_list_integrity();
     }
 
-    #[test]
+    #[turso_test]
     fn test_detach_only_element_preserves_integrity() {
         let mut cache = DumbLruPageCache::default();
         let (_, entry) = insert_and_get_entry(&mut cache, 1);
@@ -985,7 +986,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[turso_test]
     fn test_detach_with_multiple_pages() {
         let mut cache = DumbLruPageCache::default();
         let (key1, _) = insert_and_get_entry(&mut cache, 1);
@@ -1014,7 +1015,7 @@ mod tests {
         cache.verify_list_integrity();
     }
 
-    #[test]
+    #[turso_test]
     fn test_page_cache_fuzz() {
         let seed = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1101,7 +1102,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[turso_test]
     fn test_page_cache_insert_and_get() {
         let mut cache = DumbLruPageCache::default();
         let key1 = insert_page(&mut cache, 1);
@@ -1110,7 +1111,7 @@ mod tests {
         assert_eq!(cache.get(&key2).unwrap().get().id, 2);
     }
 
-    #[test]
+    #[turso_test]
     fn test_page_cache_over_capacity() {
         let mut cache = DumbLruPageCache::new(2);
         let key1 = insert_page(&mut cache, 1);
@@ -1121,7 +1122,7 @@ mod tests {
         assert_eq!(cache.get(&key3).unwrap().get().id, 3);
     }
 
-    #[test]
+    #[turso_test]
     fn test_page_cache_delete() {
         let mut cache = DumbLruPageCache::default();
         let key1 = insert_page(&mut cache, 1);
@@ -1129,7 +1130,7 @@ mod tests {
         assert!(cache.get(&key1).is_none());
     }
 
-    #[test]
+    #[turso_test]
     fn test_page_cache_clear() {
         let mut cache = DumbLruPageCache::default();
         let key1 = insert_page(&mut cache, 1);
@@ -1139,7 +1140,7 @@ mod tests {
         assert!(cache.get(&key2).is_none());
     }
 
-    #[test]
+    #[turso_test]
     fn test_page_cache_insert_sequential() {
         let mut cache = DumbLruPageCache::default();
         for i in 0..10000 {
@@ -1148,7 +1149,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[turso_test]
     fn test_resize_smaller_success() {
         let mut cache = DumbLruPageCache::default();
         for i in 1..=5 {
@@ -1162,7 +1163,7 @@ mod tests {
         assert!(cache.insert(create_key(6), page_with_content(6)).is_ok());
     }
 
-    #[test]
+    #[turso_test]
     #[should_panic(expected = "Attempted to insert different page with same key")]
     fn test_resize_larger() {
         let mut cache = DumbLruPageCache::default();
@@ -1184,7 +1185,7 @@ mod tests {
         cache.verify_list_integrity();
     }
 
-    #[test]
+    #[turso_test]
     #[ignore = "for now let's not track active refs"]
     fn test_resize_with_active_references() {
         let mut cache = DumbLruPageCache::default();
@@ -1207,7 +1208,7 @@ mod tests {
         cache.verify_list_integrity();
     }
 
-    #[test]
+    #[turso_test]
     fn test_resize_same_capacity() {
         let mut cache = DumbLruPageCache::new(3);
         for i in 1..=3 {
@@ -1221,7 +1222,7 @@ mod tests {
         assert!(cache.insert(create_key(4), page_with_content(4)).is_ok());
     }
 
-    #[test]
+    #[turso_test]
     #[ignore = "long running test, remove to verify"]
     fn test_clear_memory_stability() {
         let initial_memory = memory_stats::memory_stats().unwrap().physical_mem;

@@ -681,8 +681,9 @@ impl Drop for UringFile {
 mod tests {
     use super::*;
     use crate::io::common;
+    use turso_macros::turso_test;
 
-    #[test]
+    #[turso_test]
     fn test_multiple_processes_cannot_open_file() {
         common::tests::test_multiple_processes_cannot_open_file(UringIO::new);
     }

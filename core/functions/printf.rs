@@ -80,6 +80,8 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
 
 #[cfg(test)]
 mod tests {
+    use turso_macros::turso_test;
+
     use super::*;
 
     fn text(value: &str) -> Register {
@@ -94,12 +96,12 @@ mod tests {
         Register::Value(Value::Float(value))
     }
 
-    #[test]
+    #[turso_test]
     fn test_printf_no_args() {
         assert_eq!(exec_printf(&[]).unwrap(), Value::Null);
     }
 
-    #[test]
+    #[turso_test]
     fn test_printf_basic_string() {
         assert_eq!(
             exec_printf(&[text("Hello World")]).unwrap(),
@@ -107,7 +109,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[turso_test]
     fn test_printf_string_formatting() {
         let test_cases = vec![
             // Simple string substitution
@@ -135,7 +137,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[turso_test]
     fn test_printf_integer_formatting() {
         let test_cases = vec![
             // Basic integer formatting
@@ -158,7 +160,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[turso_test]
     fn test_printf_float_formatting() {
         let test_cases = vec![
             // Basic float formatting
@@ -193,7 +195,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[turso_test]
     fn test_printf_mixed_formatting() {
         let test_cases = vec![
             // Mix of string and integer
@@ -228,7 +230,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[turso_test]
     fn test_printf_error_cases() {
         let error_cases = vec![
             // Not enough arguments
@@ -244,7 +246,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[turso_test]
     fn test_printf_edge_cases() {
         let test_cases = vec![
             // Empty format string

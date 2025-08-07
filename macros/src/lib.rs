@@ -441,7 +441,7 @@ pub fn derive_vfs_module(input: TokenStream) -> TokenStream {
     ext::derive_vfs_module(input)
 }
 
-/// Attribute macro to create tests that check for memory leaks and
+/// Attribute macro to create tests that check for memory leaks and memory usage
 #[proc_macro_attribute]
 pub fn turso_test(_attr: TokenStream, input: TokenStream) -> TokenStream {
     testing::turso_test_attr(input)

@@ -183,9 +183,11 @@ fn construct_glob_regex(pattern: &str) -> Result<Regex, LimboError> {
 
 #[cfg(test)]
 mod test {
+    use turso_macros::turso_test;
+
     use super::*;
 
-    #[test]
+    #[turso_test]
     fn test_exec_like_with_escape() {
         assert!(exec_like_with_escape("abcX%", "abc%", 'X'));
         assert!(!exec_like_with_escape("abcX%", "abc5", 'X'));
@@ -203,7 +205,7 @@ mod test {
         assert!(!exec_like_with_escape("abcXX", "abcXX", 'X'));
     }
 
-    #[test]
+    #[turso_test]
     fn test_glob_no_cache() {
         assert!(exec_glob(None, r#"?*/abc/?*"#, r#"x//a/ab/abc/y"#));
         assert!(exec_glob(None, r#"a[1^]"#, r#"a1"#));

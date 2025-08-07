@@ -346,16 +346,18 @@ fn finalize_path<'a>(
 
 #[cfg(test)]
 mod tests {
+    use turso_macros::turso_test;
+
     use super::*;
 
-    #[test]
+    #[turso_test]
     fn test_json_path_root() {
         let path = json_path("$").unwrap();
         assert_eq!(path.elements.len(), 1);
         assert_eq!(path.elements[0], PathElement::Root());
     }
 
-    #[test]
+    #[turso_test]
     fn test_json_path_single_locator() {
         let path = json_path("$.x").unwrap();
         assert_eq!(path.elements.len(), 2);
@@ -366,7 +368,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[turso_test]
     fn test_json_path_single_array_locator() {
         let path = json_path("$[0]").unwrap();
         assert_eq!(path.elements.len(), 2);
@@ -374,7 +376,7 @@ mod tests {
         assert_eq!(path.elements[1], PathElement::ArrayLocator(Some(0)));
     }
 
-    #[test]
+    #[turso_test]
     fn test_json_path_single_negative_array_locator() {
         let path = json_path("$[#-2]").unwrap();
         assert_eq!(path.elements.len(), 2);
@@ -382,7 +384,7 @@ mod tests {
         assert_eq!(path.elements[1], PathElement::ArrayLocator(Some(-2)));
     }
 
-    #[test]
+    #[turso_test]
     fn test_json_path_invalid() {
         let invalid_values = vec![
             "", "$$$", "$.", "$ ", "$[", "$]", "$[-1]", "x", "[]", "$[0", "$[0x]", "$\"",
@@ -400,7 +402,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[turso_test]
     fn test_json_path() {
         let path = json_path("$.store.book[0].title").unwrap();
         assert_eq!(path.elements.len(), 5);
@@ -420,7 +422,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[turso_test]
     fn test_large_index_wrapping() {
         let path = json_path("$[4294967296]").unwrap();
         assert_eq!(path.elements[1], PathElement::ArrayLocator(Some(0)));
@@ -429,7 +431,7 @@ mod tests {
         assert_eq!(path.elements[1], PathElement::ArrayLocator(Some(1)));
     }
 
-    #[test]
+    #[turso_test]
     fn test_deeply_nested_path() {
         let path = json_path("$[0][1][2].key[3].other").unwrap();
         assert_eq!(path.elements.len(), 7);
@@ -444,7 +446,7 @@ mod tests {
         assert_eq!(path.elements[5], PathElement::ArrayLocator(Some(3)));
     }
 
-    #[test]
+    #[turso_test]
     fn test_edge_cases() {
         // Empty key
         assert!(json_path("$.").is_err());
@@ -460,7 +462,7 @@ mod tests {
         assert!(json_path("$[-1]").is_err()); // should be $[#-1]
     }
 
-    #[test]
+    #[turso_test]
     fn test_path_capacity() {
         // Test that our capacity estimation is reasonable
         let short_path = "$[0]";
@@ -470,7 +472,7 @@ mod tests {
         assert!(estimate_path_capacity(long_path) >= 11);
     }
 
-    #[test]
+    #[turso_test]
     fn test_quoted_keys() {
         let path = json_path(r#"$."key""#).unwrap();
         assert_eq!(
@@ -491,7 +493,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[turso_test]
     fn test_empty_quoted_key() {
         assert!(json_path(r#"$."""#).is_ok());
     }

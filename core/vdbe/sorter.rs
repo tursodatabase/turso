@@ -582,6 +582,7 @@ mod tests {
         rand_core::{RngCore, SeedableRng},
         ChaCha8Rng,
     };
+    use turso_macros::turso_test;
 
     fn get_seed() -> u64 {
         std::env::var("SEED").map_or(
@@ -596,7 +597,7 @@ mod tests {
         ) as u64
     }
 
-    #[test]
+    #[turso_test]
     fn fuzz_external_sort() {
         let seed = get_seed();
         let mut rng = ChaCha8Rng::seed_from_u64(seed);

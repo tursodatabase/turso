@@ -34,11 +34,13 @@ impl BufferPool {
 
 #[cfg(test)]
 mod tests {
+    use turso_macros::turso_test;
+
     use super::*;
 
     fn is_send_sync_static<T: Send + Sync + 'static>() {}
 
-    #[test]
+    #[turso_test]
     fn test_send_sync() {
         is_send_sync_static::<BufferPool>();
     }

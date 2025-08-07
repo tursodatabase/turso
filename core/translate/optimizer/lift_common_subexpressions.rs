@@ -189,9 +189,10 @@ fn rebuild_or_expr_from_list(mut operands: Vec<Expr>) -> Expr {
 mod tests {
     use super::*;
     use crate::translate::plan::WhereTerm;
+    use turso_macros::turso_test;
     use turso_sqlite3_parser::ast::{self, Expr, Literal, Operator, TableInternalId};
 
-    #[test]
+    #[turso_test]
     fn test_lift_common_subexpressions() -> Result<()> {
         // SELECT * FROM t WHERE (a = 1 and x = 1 and b = 1) OR (a = 1 and y = 1 and b = 1)
         // should be rewritten to:
@@ -284,7 +285,7 @@ mod tests {
         Ok(())
     }
 
-    #[test]
+    #[turso_test]
     fn test_lift_common_subexpressions_three_branches() -> Result<()> {
         // Test case with three OR branches and one common term:
         // (a = 1 AND x = 1) OR (a = 1 AND y = 1) OR (a = 1 AND z = 1)
@@ -385,7 +386,7 @@ mod tests {
         Ok(())
     }
 
-    #[test]
+    #[turso_test]
     fn test_lift_common_subexpressions_no_common_terms() -> Result<()> {
         // Test case where there are no common terms between OR branches:
         // SELECT * FROM t WHERE (x = 1) OR (y = 1)
@@ -438,7 +439,7 @@ mod tests {
         Ok(())
     }
 
-    #[test]
+    #[turso_test]
     fn test_lift_common_subexpressions_from_outer_join() -> Result<()> {
         // Test case with from_outer_join flag set;
         // it should be retained in the new WhereTerms, for outer join correctness.
@@ -521,7 +522,7 @@ mod tests {
         Ok(())
     }
 
-    #[test]
+    #[turso_test]
     fn test_lift_common_subexpressions_single_term() -> Result<()> {
         // Test case with a single non-OR term:
         // SELECT * FROM t WHERE a = 1
@@ -557,7 +558,7 @@ mod tests {
         Ok(())
     }
 
-    #[test]
+    #[turso_test]
     fn test_lift_common_subexpressions_empty_or_branch() -> Result<()> {
         // Test case where OR becomes redundant:
         // (a = 1 AND b = 1) OR (a = 1) becomes -> a = 1.

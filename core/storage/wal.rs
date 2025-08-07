@@ -1902,6 +1902,8 @@ impl WalFileShared {
 
 #[cfg(test)]
 pub mod test {
+    use turso_macros::turso_test;
+
     use crate::{
         result::LimboResult,
         storage::{
@@ -1935,7 +1937,7 @@ pub mod test {
         // db + tmp directory
         (db, dbpath)
     }
-    #[test]
+    #[turso_test]
     fn test_truncate_file() {
         let (db, _path) = get_database();
         let conn = db.connect().unwrap();
@@ -1958,7 +1960,7 @@ pub mod test {
         assert!(done.get());
     }
 
-    #[test]
+    #[turso_test]
     fn test_wal_truncate_checkpoint() {
         let (db, path) = get_database();
         let mut walpath = path.clone().into_os_string().into_string().unwrap();
@@ -2051,7 +2053,7 @@ pub mod test {
         }
     }
 
-    #[test]
+    #[turso_test]
     fn restart_checkpoint_reset_wal_state_handling() {
         let (db, path) = get_database();
 
@@ -2149,7 +2151,7 @@ pub mod test {
         std::fs::remove_dir_all(path).unwrap();
     }
 
-    #[test]
+    #[turso_test]
     fn test_wal_passive_partial_then_complete() {
         let (db, _tmp) = get_database();
         let conn1 = db.connect().unwrap();
@@ -2217,7 +2219,7 @@ pub mod test {
         );
     }
 
-    #[test]
+    #[turso_test]
     fn test_wal_restart_blocks_readers() {
         let (db, _) = get_database();
         let conn1 = db.connect().unwrap();
@@ -2286,7 +2288,7 @@ pub mod test {
         }
     }
 
-    #[test]
+    #[turso_test]
     fn test_wal_read_marks_after_restart() {
         let (db, _path) = get_database();
         let wal_shared = db.maybe_shared_wal.read().as_ref().unwrap().clone();
@@ -2324,7 +2326,7 @@ pub mod test {
         }
     }
 
-    #[test]
+    #[turso_test]
     fn test_wal_concurrent_readers_during_checkpoint() {
         let (db, _path) = get_database();
         let conn_writer = db.connect().unwrap();
@@ -2386,7 +2388,7 @@ pub mod test {
         );
     }
 
-    #[test]
+    #[turso_test]
     fn test_wal_checkpoint_updates_read_marks() {
         let (db, _path) = get_database();
         let wal_shared = db.maybe_shared_wal.read().as_ref().unwrap().clone();
@@ -2418,7 +2420,7 @@ pub mod test {
         );
     }
 
-    #[test]
+    #[turso_test]
     fn test_wal_writer_blocks_restart_checkpoint() {
         let (db, _path) = get_database();
         let conn1 = db.connect().unwrap();
@@ -2478,7 +2480,7 @@ pub mod test {
         assert!(result.everything_backfilled());
     }
 
-    #[test]
+    #[turso_test]
     #[should_panic(expected = "must have a read transaction to begin a write transaction")]
     fn test_wal_read_transaction_required_before_write() {
         let (db, _path) = get_database();
@@ -2507,7 +2509,7 @@ pub mod test {
         false
     }
 
-    #[test]
+    #[turso_test]
     fn test_wal_multiple_readers_at_different_frames() {
         let (db, _path) = get_database();
         let conn_writer = db.connect().unwrap();
@@ -2586,7 +2588,7 @@ pub mod test {
         assert_eq!(r3_cnt, 45);
     }
 
-    #[test]
+    #[turso_test]
     fn test_checkpoint_truncate_reset_handling() {
         let (db, path) = get_database();
         let conn = db.connect().unwrap();
@@ -2641,7 +2643,7 @@ pub mod test {
         std::fs::remove_dir_all(path).unwrap();
     }
 
-    #[test]
+    #[turso_test]
     fn test_wal_checkpoint_truncate_db_file_contains_data() {
         let (db, path) = get_database();
         let conn = db.connect().unwrap();
@@ -2727,7 +2729,7 @@ pub mod test {
         }
     }
 
-    #[test]
+    #[turso_test]
     fn test_wal_stale_snapshot_in_write_transaction() {
         let (db, _path) = get_database();
         let conn1 = db.connect().unwrap();
@@ -2771,7 +2773,7 @@ pub mod test {
         assert!(matches!(result.unwrap(), LimboResult::Ok));
     }
 
-    #[test]
+    #[turso_test]
     fn test_wal_readlock0_optimization_behavior() {
         let (db, _path) = get_database();
         let conn1 = db.connect().unwrap();

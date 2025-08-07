@@ -2368,12 +2368,13 @@ mod tests {
     use std::sync::Arc;
 
     use parking_lot::RwLock;
+    use turso_macros::turso_test;
 
     use crate::storage::page_cache::{DumbLruPageCache, PageCacheKey};
 
     use super::Page;
 
-    #[test]
+    #[turso_test]
     fn test_shared_cache() {
         // ensure cache can be shared between threads
         let cache = Arc::new(RwLock::new(DumbLruPageCache::new(10)));
@@ -2400,6 +2401,8 @@ mod ptrmap_tests {
     use std::cell::RefCell;
     use std::rc::Rc;
     use std::sync::Arc;
+
+    use turso_macros::turso_test;
 
     use super::ptrmap::*;
     use super::*;
@@ -2505,7 +2508,7 @@ mod ptrmap_tests {
         pager
     }
 
-    #[test]
+    #[turso_test]
     fn test_ptrmap_page_allocation() {
         let page_size = 4096;
         let initial_db_pages = 10;
@@ -2541,7 +2544,7 @@ mod ptrmap_tests {
         assert_eq!(entry.parent_page_no, 0);
     }
 
-    #[test]
+    #[turso_test]
     fn test_is_ptrmap_page_logic() {
         let page_size = PageSize::MIN as usize;
         let n_data_pages = entries_per_ptrmap_page(page_size);
@@ -2559,7 +2562,7 @@ mod ptrmap_tests {
         assert!(is_ptrmap_page(208, page_size)); // P2
     }
 
-    #[test]
+    #[turso_test]
     fn test_get_ptrmap_page_no() {
         let page_size = PageSize::MIN as usize; // Maps 103 data pages
 
@@ -2579,7 +2582,7 @@ mod ptrmap_tests {
         assert_eq!(get_ptrmap_page_no_for_db_page(208, page_size), 208); // Page 208 is a pointer map page.
     }
 
-    #[test]
+    #[turso_test]
     fn test_get_ptrmap_offset() {
         let page_size = PageSize::MIN as usize; //  Maps 103 data pages
 

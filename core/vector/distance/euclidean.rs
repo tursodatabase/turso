@@ -38,9 +38,11 @@ fn euclidean_distance_f64(v1: &[f64], v2: &[f64]) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    use turso_macros::turso_test;
+
     use super::*;
 
-    #[test]
+    #[turso_test]
     fn test_euclidean_distance_f32() {
         let vectors = [
             (0..8).map(|x| x as f32).collect::<Vec<f32>>(),
@@ -63,7 +65,7 @@ mod tests {
         assert_eq!(results, expected);
     }
 
-    #[test]
+    #[turso_test]
     fn test_odd_len() {
         let v = (0..5).map(|x| x as f32).collect::<Vec<f32>>();
         let query = (2..7).map(|x| x as f32).collect::<Vec<f32>>();

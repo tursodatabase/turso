@@ -325,9 +325,11 @@ impl PragmaVirtualTableCursor {
 
 #[cfg(test)]
 mod tests {
+    use turso_macros::turso_test;
+
     use super::*;
 
-    #[test]
+    #[turso_test]
     fn test_best_index_argv_order_both_hidden_constraints() {
         // Test when both hidden constraints are present (arg and schema)
         let pragma_vtab = PragmaVirtualTable {
@@ -351,7 +353,7 @@ mod tests {
         assert!(index_info.constraint_usages[1].omit);
     }
 
-    #[test]
+    #[turso_test]
     fn test_best_index_argv_order_only_arg() {
         let pragma_vtab = PragmaVirtualTable {
             pragma_name: "table_info".to_string(),
@@ -371,7 +373,7 @@ mod tests {
         assert!(index_info.constraint_usages[0].omit);
     }
 
-    #[test]
+    #[turso_test]
     fn test_best_index_argv_order_only_schema() {
         let pragma_vtab = PragmaVirtualTable {
             pragma_name: "table_info".to_string(),
@@ -391,7 +393,7 @@ mod tests {
         assert!(index_info.constraint_usages[0].omit);
     }
 
-    #[test]
+    #[turso_test]
     fn test_best_index_argv_order_reverse_constraint_order() {
         // Test when constraints are provided in reverse order (schema first, then arg)
         let pragma_vtab = PragmaVirtualTable {
@@ -415,7 +417,7 @@ mod tests {
         assert!(index_info.constraint_usages[1].omit);
     }
 
-    #[test]
+    #[turso_test]
     fn test_best_index_visible_columns_ignored() {
         let pragma_vtab = PragmaVirtualTable {
             pragma_name: "table_info".to_string(),
@@ -438,7 +440,7 @@ mod tests {
         assert!(index_info.constraint_usages[1].omit); // arg omitted
     }
 
-    #[test]
+    #[turso_test]
     fn test_best_index_no_usable_constraints() {
         let pragma_vtab = PragmaVirtualTable {
             pragma_name: "table_info".to_string(),
