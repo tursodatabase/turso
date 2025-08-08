@@ -556,8 +556,33 @@ impl PageContent {
     /// - size: the size of the freeblock
     /// - next_block: the absolute offset of the next freeblock, or None if this is the last freeblock
     pub fn write_freeblock(&self, offset: u16, size: u16, next_block: Option<u16>) {
-        self.write_u16_no_offset(offset as usize, next_block.unwrap_or(0));
+        self.write_freeblock_next_ptr(offset, next_block.unwrap_or(0));
+        self.write_freeblock_size(offset, size);
+    }
+
+    /// Write the new size of a freeblock.
+    /// Parameters:
+    /// - offset: the absolute offset of the freeblock
+    /// - size: the new size of the freeblock
+    pub fn write_freeblock_size(&self, offset: u16, size: u16) {
         self.write_u16_no_offset(offset as usize + 2, size);
+    }
+
+    /// Write the absolute offset of the next freeblock.
+    /// Parameters:
+    /// - offset: the absolute offset of the current freeblock
+    /// - next_block: the absolute offset of the next freeblock
+    pub fn write_freeblock_next_ptr(&self, offset: u16, next_block: u16) {
+        self.write_u16_no_offset(offset as usize, next_block);
+    }
+
+    /// Read a freeblock from the page content at the given absolute offset.
+    /// Returns (absolute offset of next freeblock, size of the current freeblock)
+    pub fn read_freeblock(&self, offset: u16) -> (u16, u16) {
+        (
+            self.read_u16_no_offset(offset as usize),
+            self.read_u16_no_offset(offset as usize + 2),
+        )
     }
 
     /// Write the number of cells on this page.
