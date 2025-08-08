@@ -58,6 +58,10 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
         LegacyFileFormat => {
             unreachable!("pragma_for() called with LegacyFileFormat, which is unsupported")
         }
+        ModuleList => Pragma::new(
+            PragmaFlags::NeedSchema | PragmaFlags::Result0 | PragmaFlags::SchemaReq,
+            &["module_list"],
+        ),
         PageCount => Pragma::new(
             PragmaFlags::NeedSchema | PragmaFlags::Result0 | PragmaFlags::SchemaReq,
             &["page_count"],

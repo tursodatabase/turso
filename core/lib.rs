@@ -42,6 +42,7 @@ mod numeric;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+use crate::schema::Table;
 use crate::translate::optimizer::optimize_plan;
 use crate::translate::pragma::TURSO_CDC_DEFAULT_TABLE_NAME;
 #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
@@ -1736,6 +1737,22 @@ impl Connection {
 
     pub fn get_pager(&self) -> Rc<Pager> {
         self.pager.borrow().clone()
+    }
+
+    pub fn get_used_vtab_mods(&self) -> std::collections::HashSet<String> {
+        let schema = self._db.schema.lock().unwrap();
+
+        schema
+            .tables
+            .values()
+            .filter_map(|table| {
+                if let Table::Virtual(vtab) = table.as_ref() {
+                    vtab.module_name().map(|name| name.to_string())
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 }
 
