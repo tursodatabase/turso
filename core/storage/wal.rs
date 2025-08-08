@@ -1999,8 +1999,8 @@ pub mod test {
         loop {
             match wal.checkpoint(pager, wc.clone(), mode).unwrap() {
                 IOResult::Done(r) => return r,
-                IOResult::IO => {
-                    pager.io.run_once().unwrap();
+                IOResult::IO(io) => {
+                    io.wait(pager.io.as_ref()).unwrap();
                 }
             }
         }
@@ -2028,8 +2028,8 @@ pub mod test {
         conn.execute("create table test(id integer primary key, value text)")
             .unwrap();
         bulk_inserts(&conn, 20, 3);
-        while let IOResult::IO = conn.pager.borrow_mut().cacheflush().unwrap() {
-            conn.run_once().unwrap();
+        while let IOResult::IO(io) = conn.pager.borrow_mut().cacheflush().unwrap() {
+            io.wait(conn._db.io.as_ref()).unwrap();
         }
 
         // Snapshot header & counters before the RESTART checkpoint.
@@ -2122,8 +2122,8 @@ pub mod test {
             .execute("create table test(id integer primary key, value text)")
             .unwrap();
         bulk_inserts(&conn1.clone(), 15, 2);
-        while let IOResult::IO = conn1.pager.borrow_mut().cacheflush().unwrap() {
-            conn1.run_once().unwrap();
+        while let IOResult::IO(io) = conn1.pager.borrow_mut().cacheflush().unwrap() {
+            io.wait(conn1._db.io.as_ref()).unwrap();
         }
 
         // Force a read transaction that will freeze a lower read mark
@@ -2136,8 +2136,8 @@ pub mod test {
 
         // generate more frames that the reader will not see.
         bulk_inserts(&conn1.clone(), 15, 2);
-        while let IOResult::IO = conn1.pager.borrow_mut().cacheflush().unwrap() {
-            conn1.run_once().unwrap();
+        while let IOResult::IO(io) = conn1.pager.borrow_mut().cacheflush().unwrap() {
+            io.wait(conn1._db.io.as_ref()).unwrap();
         }
 
         // Run passive checkpoint, expect partial
@@ -2203,8 +2203,8 @@ pub mod test {
         let mut w = p.wal.as_ref().unwrap().borrow_mut();
         loop {
             match w.checkpoint(&p, Rc::new(RefCell::new(0)), CheckpointMode::Restart) {
-                Ok(IOResult::IO) => {
-                    conn1.run_once().unwrap();
+                Ok(IOResult::IO(io)) => {
+                    io.wait(conn1._db.io.as_ref()).unwrap();
                 }
                 e => {
                     assert!(
@@ -2232,8 +2232,8 @@ pub mod test {
         let mut w = p.wal.as_ref().unwrap().borrow_mut();
         loop {
             match w.checkpoint(&p, Rc::new(RefCell::new(0)), CheckpointMode::Restart) {
-                Ok(IOResult::IO) => {
-                    conn1.run_once().unwrap();
+                Ok(IOResult::IO(io)) => {
+                    io.wait(conn1._db.io.as_ref()).unwrap();
                 }
                 Ok(IOResult::Done(_)) => {
                     panic!("Checkpoint should not have succeeded");
