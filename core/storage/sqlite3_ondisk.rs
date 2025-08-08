@@ -948,9 +948,9 @@ pub fn begin_write_btree_page(
 pub fn write_pages_vectored(
     pager: &Pager,
     batch: BTreeMap<usize, Arc<Buffer>>,
-) -> Result<PendingFlush> {
+) -> Result<(PendingFlush, Vec<Completion>)> {
     if batch.is_empty() {
-        return Ok(PendingFlush::default());
+        return Ok((PendingFlush::default(), Vec::new()));
     }
 
     // batch item array is already sorted by id, so we just need to find contiguous ranges of page_id's
@@ -988,6 +988,7 @@ pub fn write_pages_vectored(
     // Iterate through the batch
     let mut iter = batch.into_iter().peekable();
 
+    let mut completions = Vec::new();
     while let Some((id, item)) = iter.next() {
         // Track the start of the run
         if run_start_id.is_none() {
@@ -1016,15 +1017,20 @@ pub fn write_pages_vectored(
             });
 
             // Submit write operation for this run, decrementing the counter if we error
-            if let Err(e) = pager
+            let c = match pager
                 .db_file
                 .write_pages(start_id, page_sz, run_bufs.clone(), c)
             {
-                if runs_left.fetch_sub(1, Ordering::AcqRel) == 1 {
-                    done.store(true, Ordering::Release);
+                Ok(c) => c,
+                Err(e) => {
+                    if runs_left.fetch_sub(1, Ordering::AcqRel) == 1 {
+                        done.store(true, Ordering::Release);
+                    }
+                    // TODO: invalidate current completions in vec
+                    return Err(e);
                 }
-                return Err(e);
-            }
+            };
+            completions.push(c);
 
             // Reset for next run
             run_bufs.clear();
@@ -1037,10 +1043,13 @@ pub fn write_pages_vectored(
         all_ids.len()
     );
 
-    Ok(PendingFlush {
-        pages: all_ids,
-        done,
-    })
+    Ok((
+        PendingFlush {
+            pages: all_ids,
+            done,
+        },
+        completions,
+    ))
 }
 
 #[instrument(skip_all, level = Level::DEBUG)]
