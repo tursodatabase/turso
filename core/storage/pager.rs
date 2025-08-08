@@ -605,12 +605,7 @@ impl Pager {
                 ptrmap_page,
                 offset_in_ptrmap_page,
             } => {
-                if ptrmap_page.is_locked() {
-                    return Ok(IOResult::IO);
-                }
-                if !ptrmap_page.is_loaded() {
-                    return Ok(IOResult::IO);
-                }
+                turso_assert!(ptrmap_page.is_loaded(), "ptrmap_page should be loaded");
                 let ptrmap_page_inner = ptrmap_page.get();
                 let ptrmap_pg_no = ptrmap_page_inner.id;
 
@@ -709,6 +704,7 @@ impl Pager {
                 ptrmap_page,
                 offset_in_ptrmap_page,
             } => {
+                turso_assert!(ptrmap_page.is_loaded(), "ptrmap_page should be loaded");
                 let ptrmap_page_inner = ptrmap_page.get();
                 let ptrmap_pg_no = ptrmap_page_inner.id;
 
@@ -827,7 +823,7 @@ impl Pager {
                                     0,
                                 )? {
                                     IOResult::Done(_) => Ok(IOResult::Done(allocated_page_id)),
-                                    IOResult::IO => return Ok(IOResult::IO),
+                                    IOResult::IO(io) => return Ok(IOResult::IO(io)),
                                 };
                                 self.btree_create_vacuum_full_state
                                     .set(BtreeCreateVacuumFullState::Start);
