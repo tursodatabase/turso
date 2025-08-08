@@ -63,7 +63,7 @@ use crate::{
     vector::{vector32, vector64, vector_distance_cos, vector_distance_l2, vector_extract},
 };
 
-use crate::{info, turso_assert, OpenFlags, RefValue, Row, StepResult, TransactionState};
+use crate::{info, turso_assert, OpenFlags, RefValue, Row, TransactionState};
 
 use super::{
     insn::{Cookie, RegisterOrLiteral},
@@ -1948,11 +1948,8 @@ pub fn halt(
         }
     }
     match program.commit_txn(pager.clone(), state, mv_store, false)? {
-        StepResult::Done => Ok(InsnFunctionStepResult::Done),
-        StepResult::IO => Ok(InsnFunctionStepResult::IO),
-        StepResult::Row => Ok(InsnFunctionStepResult::Row),
-        StepResult::Interrupt => Ok(InsnFunctionStepResult::Interrupt),
-        StepResult::Busy => Ok(InsnFunctionStepResult::Busy),
+        IOResult::Done(_) => Ok(InsnFunctionStepResult::Done),
+        IOResult::IO(io) => Ok(InsnFunctionStepResult::IO(io)),
     }
 }
 
@@ -1996,11 +1993,8 @@ pub fn op_halt(
     tracing::trace!("op_halt(auto_commit={})", auto_commit);
     if auto_commit {
         match program.commit_txn(pager.clone(), state, mv_store, false)? {
-            StepResult::Done => Ok(InsnFunctionStepResult::Done),
-            StepResult::IO => Ok(InsnFunctionStepResult::IO),
-            StepResult::Row => Ok(InsnFunctionStepResult::Row),
-            StepResult::Interrupt => Ok(InsnFunctionStepResult::Interrupt),
-            StepResult::Busy => Ok(InsnFunctionStepResult::Busy),
+            IOResult::Done(_) => Ok(InsnFunctionStepResult::Done),
+            IOResult::IO(io) => Ok(InsnFunctionStepResult::IO(io)),
         }
     } else {
         Ok(InsnFunctionStepResult::Done)
@@ -2121,14 +2115,14 @@ pub fn op_transaction(
                         return Ok(InsnFunctionStepResult::Busy);
                     }
                 }
-                IOResult::IO => {
+                IOResult::IO(io) => {
                     // set the transaction state to pending so we don't have to
                     // end the read transaction.
                     program
                         .connection
                         .transaction_state
                         .replace(TransactionState::PendingUpgrade);
-                    return Ok(InsnFunctionStepResult::IO);
+                    return Ok(InsnFunctionStepResult::IO(io));
                 }
             }
         }
@@ -2176,9 +2170,10 @@ pub fn op_auto_commit(
     );
     let conn = program.connection.clone();
     if state.commit_state == CommitState::Committing {
-        return program
-            .commit_txn(pager.clone(), state, mv_store, *rollback)
-            .map(Into::into);
+        match program.commit_txn(pager.clone(), state, mv_store, *rollback)? {
+            IOResult::Done(_) => {}
+            IOResult::IO(io) => return Ok(InsnFunctionStepResult::IO(io)),
+        };
     }
     let schema_did_change =
         if let TransactionState::Write { schema_did_change } = conn.transaction_state.get() {
@@ -2209,9 +2204,10 @@ pub fn op_auto_commit(
             "cannot commit - no transaction is active".to_string(),
         ));
     }
-    program
-        .commit_txn(pager.clone(), state, mv_store, *rollback)
-        .map(Into::into)
+    match program.commit_txn(pager.clone(), state, mv_store, *rollback)? {
+        IOResult::Done(_) => Ok(InsnFunctionStepResult::Done),
+        IOResult::IO(io) => Ok(InsnFunctionStepResult::IO(io)),
+    }
 }
 
 pub fn op_goto(

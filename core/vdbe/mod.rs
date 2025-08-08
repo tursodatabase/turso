@@ -416,7 +416,10 @@ impl Program {
                 let state = self.connection.transaction_state.get();
                 if let TransactionState::Write { schema_did_change } = state {
                     match pager.end_tx(true, schema_did_change, &self.connection, false)? {
-                        IOResult::IO => return Ok(StepResult::IO),
+                        IOResult::IO(io) => {
+                            // TODO: save completions in program state
+                            return Ok(StepResult::IO);
+                        }
                         IOResult::Done(_) => {}
                     }
                 }
@@ -451,11 +454,11 @@ impl Program {
         program_state: &mut ProgramState,
         mv_store: Option<&Arc<MvStore>>,
         rollback: bool,
-    ) -> Result<StepResult> {
+    ) -> Result<IOResult<()>> {
         if self.connection.transaction_state.get() == TransactionState::None && mv_store.is_none() {
             // No need to do any work here if not in tx. Current MVCC logic doesn't work with this assumption,
             // hence the mv_store.is_none() check.
-            return Ok(StepResult::Done);
+            return Ok(IOResult::Done(()));
         }
         if let Some(mv_store) = mv_store {
             let conn = self.connection.clone();
@@ -466,14 +469,24 @@ impl Program {
                 for tx_id in mv_transactions.iter() {
                     let mut state_machine =
                         mv_store.commit_tx(*tx_id, pager.clone(), &conn).unwrap();
-                    let res = state_machine
-                        .step(mv_store)
-                        .map_err(|e| LimboError::InternalError(e.to_string()))?;
+                    loop {
+                        let res = state_machine
+                            .step(mv_store)
+                            .map_err(|e| LimboError::InternalError(e.to_string()))?;
+                        match res {
+                            crate::state_machine::TransitionResult::Io(io) => {
+                                // TODO: for now block here
+                                io.wait(pager.io.as_ref())?;
+                            }
+                            crate::state_machine::TransitionResult::Continue => {}
+                            crate::state_machine::TransitionResult::Done(_) => break,
+                        }
+                    }
                     assert!(state_machine.is_finalized());
                 }
                 mv_transactions.clear();
             }
-            Ok(StepResult::Done)
+            Ok(IOResult::Done(()))
         } else {
             let connection = self.connection.clone();
             let auto_commit = connection.auto_commit.get();
@@ -509,9 +522,9 @@ impl Program {
                     TransactionState::Read => {
                         connection.transaction_state.replace(TransactionState::None);
                         pager.end_read_tx()?;
-                        Ok(StepResult::Done)
+                        Ok(IOResult::Done(()))
                     }
-                    TransactionState::None => Ok(StepResult::Done),
+                    TransactionState::None => Ok(IOResult::Done(())),
                     TransactionState::PendingUpgrade => {
                         panic!("Unexpected transaction state: {current_state:?} during auto-commit",)
                     }
@@ -520,7 +533,7 @@ impl Program {
                 if self.change_cnt_on {
                     self.connection.set_changes(self.n_change.get());
                 }
-                Ok(StepResult::Done)
+                Ok(IOResult::Done(()))
             }
         }
     }
@@ -533,7 +546,7 @@ impl Program {
         connection: &Connection,
         rollback: bool,
         schema_did_change: bool,
-    ) -> Result<StepResult> {
+    ) -> Result<IOResult<()>> {
         let cacheflush_status = pager.end_tx(
             rollback,
             schema_did_change,
@@ -548,13 +561,13 @@ impl Program {
                 connection.transaction_state.replace(TransactionState::None);
                 *commit_state = CommitState::Ready;
             }
-            IOResult::IO => {
+            IOResult::IO(io) => {
                 tracing::trace!("Cacheflush IO");
                 *commit_state = CommitState::Committing;
-                return Ok(StepResult::IO);
+                return Ok(IOResult::IO(io));
             }
         }
-        Ok(StepResult::Done)
+        Ok(IOResult::Done(()))
     }
 
     #[rustfmt::skip]

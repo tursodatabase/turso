@@ -1,4 +1,5 @@
 use crate::result::LimboResult;
+use crate::storage::wal::{CheckpointResult, Wal};
 use crate::storage::{
     btree::BTreePageInner,
     buffer_pool::BufferPool,
@@ -8,7 +9,6 @@ use crate::storage::{
     },
     wal::{CheckpointResult, Wal},
 };
-use crate::storage::wal::{CheckpointResult, Wal};
 use crate::types::{IOCompletions, IOResult, WalFrameInfo};
 use crate::util::IOExt as _;
 use crate::{
