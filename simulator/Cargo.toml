@@ -29,7 +29,7 @@ clap = { version = "4.5", features = ["derive"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 notify = "8.0.0"
-rusqlite = { version = "0.34", features = ["bundled"] }
+rusqlite.workspace = true
 dirs = "6.0.0"
 chrono = { version = "0.4.40", features = ["serde"] }
 tracing = "0.1.41"

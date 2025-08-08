@@ -90,7 +90,7 @@ criterion = { version = "0.5", features = [
     "async_futures",
 ] }
 rstest = "0.18.2"
-rusqlite = "0.34.0"
+rusqlite.workspace = true
 quickcheck = { version = "1.0", default-features = false }
 quickcheck_macros = { version = "1.0", default-features = false }
 rand = "0.8.5" # Required for quickcheck

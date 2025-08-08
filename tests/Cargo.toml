@@ -20,7 +20,7 @@ env_logger = "0.10.1"
 turso_core = { path = "../core", features = ["conn_raw_api"] }
 turso = { path = "../bindings/rust", features = ["conn_raw_api"] }
 tokio = { version = "1.47", features = ["full"] }
-rusqlite = { version = "0.34", features = ["bundled"] }
+rusqlite.workspace = true
 tempfile = "3.0.7"
 log = "0.4.22"
 assert_cmd = "^2"
