@@ -6387,101 +6387,139 @@ fn page_insert_array(
 /// This function also updates the freeblock list in the page.
 /// Freeblocks are used to keep track of free space in the page,
 /// and are organized as a linked list.
+///
+/// This function may merge the freed cell range into either the next freeblock,
+/// previous freeblock, or both.
 fn free_cell_range(
     page: &mut PageContent,
     mut offset: u16,
     len: u16,
     usable_space: u16,
 ) -> Result<()> {
-    if len < 4 {
-        return_corrupt!("Minimum cell size is 4");
-    }
-
-    if offset > usable_space.saturating_sub(4) {
-        return_corrupt!("Start offset beyond usable space");
-    }
+    const CELL_SIZE_MIN: u16 = 4;
+    turso_assert!(
+        len >= CELL_SIZE_MIN,
+        "free_cell_range: minimum cell size is {CELL_SIZE_MIN}"
+    );
+    turso_assert!(offset <= usable_space.saturating_sub(CELL_SIZE_MIN), "free_cell_range: start offset beyond usable space: offset={offset} usable_space={usable_space}");
 
     let mut size = len;
     let mut end = offset + len;
-    let mut pointer_to_pc = page.offset as u16 + 1;
-    // if the freeblock list is empty, we set this block as the first freeblock in the page header.
-    let pc = if page.first_freeblock() == 0 {
-        0
-    } else {
-        // if the freeblock list is not empty, and the offset is greater than the first freeblock,
-        // then we need to do some more calculation to figure out where to insert the freeblock
-        // in the freeblock linked list.
-        let first_block = page.first_freeblock();
-
-        let mut pc = first_block;
-
-        while pc < offset {
-            if pc <= pointer_to_pc {
-                if pc == 0 {
-                    break;
-                }
-                return_corrupt!("free cell range free block not in ascending order");
-            }
-
-            let next = page.read_u16_no_offset(pc as usize);
-            pointer_to_pc = pc;
-            pc = next;
+    let cur_content_area = page.cell_content_area();
+    let first_block = page.first_freeblock();
+    if first_block == 0 {
+        turso_assert!(offset >= cur_content_area as u16, "free_cell_range: free block before content area: offset={offset} cell_content_area={cur_content_area}");
+        if offset == cur_content_area as u16 {
+            // if the freeblock list is empty and the freed range is exactly at the beginning of the content area,
+            // we are not creating a freeblock; instead we are just extending the unallocated region.
+            page.write_cell_content_area(end);
+        } else {
+            // otherwise we set it as the first freeblock in the page header.
+            page.write_first_freeblock(offset);
+            page.write_freeblock(offset, size, None);
         }
+        return Ok(());
+    }
 
-        if pc > usable_space - 4 {
-            return_corrupt!("Free block beyond usable space");
+    // if the freeblock list is not empty, we need to find the correct position to insert the new freeblock
+    // resulting from the freeing of this cell range; we may be also able to merge the freed range into existing freeblocks.
+    let mut prev_block = None;
+    let mut next_block = Some(first_block);
+
+    while let Some(next) = next_block {
+        turso_assert!(prev_block.is_none() || next > prev_block.unwrap(), "free_cell_range: freeblocks not in ascending order: next_block={next} prev_block={prev_block:?}");
+        if next >= offset {
+            break;
         }
-        let mut removed_fragmentation = 0;
-        if pc > 0 && offset + len + 3 >= pc {
-            removed_fragmentation = (pc - end) as u8;
+        prev_block = Some(next);
+        next_block = match page.read_u16_no_offset(next as usize) {
+            // Freed range extends beyond the last freeblock, so we are creating a new freeblock.
+            0 => None,
+            next => Some(next),
+        };
+    }
 
-            if end > pc {
-                return_corrupt!("Invalid block overlap");
-            }
-            end = pc + page.read_u16_no_offset(pc as usize + 2);
-            if end > usable_space {
-                return_corrupt!("Coalesced block extends beyond page");
-            }
+    if let Some(next) = next_block {
+        turso_assert!(next + CELL_SIZE_MIN <= usable_space, "free_cell_range: free block beyond usable space: next_block={next} usable_space={usable_space}");
+    }
+    let mut removed_fragmentation = 0;
+    const SINGLE_FRAGMENT_SIZE_MAX: u16 = CELL_SIZE_MIN - 1;
+
+    turso_assert!(end <= usable_space, "free_cell_range: freed range extends beyond usable space: offset={offset} len={len} end={end} usable_space={usable_space}");
+
+    // If the freed range extends into the next freeblock, we will merge the freed range into it.
+    // If there is a 1-3 byte gap between the freed range and the next freeblock, we are effectively
+    // clearing that amount of fragmented bytes, since a 1-3 byte range cannot be a valid cell.
+    if let Some(next) = next_block {
+        if end + SINGLE_FRAGMENT_SIZE_MAX >= next {
+            removed_fragmentation = (next - end) as u8;
+            let next_size = page.read_u16_no_offset(next as usize + 2);
+            end = next + next_size;
+            turso_assert!(end <= usable_space, "free_cell_range: coalesced block extends beyond page: offset={offset} len={len} end={end} usable_space={usable_space}");
             size = end - offset;
-            pc = page.read_u16_no_offset(pc as usize);
+            // Since we merged the two freeblocks, we need to update the next_block to the next freeblock in the list.
+            next_block = match page.read_u16_no_offset(next as usize) {
+                0 => None,
+                next => Some(next),
+            };
         }
+    }
 
-        if pointer_to_pc > page.offset as u16 + 1 {
-            let prev_end = pointer_to_pc + page.read_u16_no_offset(pointer_to_pc as usize + 2);
-            if prev_end + 3 >= offset {
-                if prev_end > offset {
-                    return_corrupt!("Invalid previous block overlap");
-                }
-                removed_fragmentation += (offset - prev_end) as u8;
-                size = end - pointer_to_pc;
-                offset = pointer_to_pc;
+    // If the freed range extends into the previous freeblock, we will merge them similarly as above.
+    if let Some(prev) = prev_block {
+        let prev_size = page.read_u16_no_offset(prev as usize + 2);
+        let prev_end = prev + prev_size;
+        turso_assert!(
+            prev_end <= offset,
+            "free_cell_range: previous block overlap: prev_end={prev_end} offset={offset}"
+        );
+        // If the previous freeblock extends into the freed range, we will merge the freed range into the
+        // previous freeblock and clear any 1-3 byte fragmentation in between, similarly as above
+        if prev_end + SINGLE_FRAGMENT_SIZE_MAX >= offset {
+            removed_fragmentation += (offset - prev_end) as u8;
+            size = end - prev;
+            offset = prev;
+        }
+    }
+
+    let cur_frag_free_bytes = page.num_frag_free_bytes();
+    turso_assert!(removed_fragmentation <= cur_frag_free_bytes, "free_cell_range: invalid fragmentation count: removed_fragmentation={removed_fragmentation} num_frag_free_bytes={}", cur_frag_free_bytes);
+    let frag = cur_frag_free_bytes - removed_fragmentation;
+    page.write_fragmented_bytes_count(frag);
+
+    turso_assert!(offset >= cur_content_area as u16, "free_cell_range: free block before content area: offset={offset} cell_content_area={cur_content_area}");
+
+    // As above, if the freed range is exactly at the beginning of the content area, we are not creating a freeblock;
+    // instead we are just extending the unallocated region.
+    if offset == cur_content_area as u16 {
+        if let Some(prev) = prev_block {
+            turso_assert!(prev == first_block, "free_cell_range: invalid content area merge - freed range should have been merged with previous freeblock: prev={prev} first_block={first_block}");
+        }
+        // If we get here, we are freeing data from the left end of the content area,
+        // so we are extending the unallocated region instead of creating a freeblock.
+        // We update the first freeblock to be the next one, and shrink the content area to start from the end
+        // of the freed range.
+        match next_block {
+            Some(next) => {
+                assert!(next > end, "free_cell_range: invalid content area merge - first freeblock should either be 0 or greater than the content area start: next_block={next} end={end}");
+                page.write_first_freeblock(next);
+            }
+            None => {
+                page.write_first_freeblock(0);
             }
         }
-        if removed_fragmentation > page.num_frag_free_bytes() {
-            return_corrupt!(format!(
-                "Invalid fragmentation count. Had {} and removed {}",
-                page.num_frag_free_bytes(),
-                removed_fragmentation
-            ));
-        }
-        let frag = page.num_frag_free_bytes() - removed_fragmentation;
-        page.write_fragmented_bytes_count(frag);
-        pc
-    };
-
-    if (offset as u32) <= page.cell_content_area() {
-        if (offset as u32) < page.cell_content_area() {
-            return_corrupt!("Free block before content area");
-        }
-        if pointer_to_pc != page.offset as u16 + offset::BTREE_FIRST_FREEBLOCK as u16 {
-            return_corrupt!("Invalid content area merge");
-        }
-        page.write_first_freeblock(pc);
         page.write_cell_content_area(end);
     } else {
-        page.write_u16_no_offset(pointer_to_pc as usize, offset);
-        page.write_u16_no_offset(offset as usize, pc);
-        page.write_u16_no_offset(offset as usize + 2, size);
+        // If we are creating a new freeblock:
+        // a) if it's the first one, we update the header to indicate so,
+        // b) if it's not the first one, we update the previous freeblock to point to the new one,
+        //    and the new one to point to the next one.
+        if let Some(prev) = prev_block {
+            page.write_u16_no_offset(prev as usize, offset);
+        } else {
+            page.write_first_freeblock(offset);
+        }
+        page.write_freeblock(offset, size, next_block);
     }
 
     Ok(())
@@ -6873,7 +6911,7 @@ fn compute_free_space(page: &PageContent, usable_space: u16) -> u16 {
         // Next should always be 0 (NULL) at this point since we have reached the end of the freeblocks linked list
         assert_eq!(
             next, 0,
-            "corrupted page: freeblocks list not in ascending order"
+            "corrupted page: freeblocks list not in ascending order: cur_freeblock_ptr={cur_freeblock_ptr} size={size} next={next}"
         );
 
         assert!(

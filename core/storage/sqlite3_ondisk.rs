@@ -550,6 +550,16 @@ impl PageContent {
         self.write_u16(BTREE_FIRST_FREEBLOCK, value);
     }
 
+    /// Write a freeblock to the page content at the given absolute offset.
+    /// Parameters:
+    /// - offset: the absolute offset of the freeblock
+    /// - size: the size of the freeblock
+    /// - next_block: the absolute offset of the next freeblock, or None if this is the last freeblock
+    pub fn write_freeblock(&self, offset: u16, size: u16, next_block: Option<u16>) {
+        self.write_u16_no_offset(offset as usize, next_block.unwrap_or(0));
+        self.write_u16_no_offset(offset as usize + 2, size);
+    }
+
     /// Write the number of cells on this page.
     pub fn write_cell_count(&self, value: u16) {
         self.write_u16(BTREE_CELL_COUNT, value);
