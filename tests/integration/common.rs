@@ -112,15 +112,9 @@ impl TempDatabase {
 }
 
 pub(crate) fn do_flush(conn: &Arc<Connection>, tmp_db: &TempDatabase) -> anyhow::Result<()> {
-    loop {
-        match conn.cacheflush()? {
-            IOResult::Done(_) => {
-                break;
-            }
-            IOResult::IO => {
-                tmp_db.io.run_once()?;
-            }
-        }
+    let completions = conn.cacheflush()?;
+    for c in completions {
+        tmp_db.io.wait_for_completion(c)?
     }
     Ok(())
 }
@@ -414,8 +408,9 @@ mod tests {
         // Begin transaction on first connection and insert a value
         let _ = limbo_exec_rows(&db, &conn1, "BEGIN");
         let _ = limbo_exec_rows(&db, &conn1, "INSERT INTO t VALUES (42)");
-        while matches!(conn1.cacheflush().unwrap(), IOResult::IO) {
-            db.io.run_once().unwrap();
+        let completions = conn1.cacheflush().unwrap();
+        for c in completions {
+            db.io.wait_for_completion(c)?;
         }
 
         // Second connection should not see uncommitted changes
@@ -483,10 +478,10 @@ mod tests {
         // Begin transaction on first connection and insert a value
         let _ = limbo_exec_rows(&db, &conn, "BEGIN");
         let _ = limbo_exec_rows(&db, &conn, "INSERT INTO t VALUES (42)");
-        while matches!(conn.cacheflush().unwrap(), IOResult::IO) {
-            db.io.run_once().unwrap();
+        let completions = conn.cacheflush().unwrap();
+        for c in completions {
+            db.io.wait_for_completion(c)?;
         }
-
         // Rollback the transaction
         let _ = limbo_exec_rows(&db, &conn, "ROLLBACK");
 
@@ -527,8 +522,9 @@ mod tests {
         let _ = limbo_exec_rows(&db, &conn, "INSERT INTO t VALUES (42)");
 
         // Flush to WAL but don't commit
-        while matches!(conn.cacheflush().unwrap(), IOResult::IO) {
-            db.io.run_once().unwrap();
+        let completions = conn.cacheflush().unwrap();
+        for c in completions {
+            db.io.wait_for_completion(c)?;
         }
 
         // Reopen the database without committing

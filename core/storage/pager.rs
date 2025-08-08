@@ -311,15 +311,6 @@ struct CommitInfo {
     dirty_pages: Vec<usize>,
 }
 
-/// This will keep track of the state of current cache flush in order to not repeat work
-struct FlushInfo {
-    state: CacheFlushState,
-    /// Number of writes taking place.
-    in_flight_writes: Rc<RefCell<usize>>,
-    /// Dirty pages to be flushed.
-    dirty_pages: Vec<usize>,
-}
-
 /// Track the state of the auto-vacuum mode.
 #[derive(Clone, Copy, Debug)]
 pub enum AutoVacuumMode {
@@ -431,7 +422,6 @@ pub struct Pager {
     dirty_pages: Rc<RefCell<HashSet<usize, hash::BuildHasherDefault<hash::DefaultHasher>>>>,
 
     commit_info: RefCell<CommitInfo>,
-    flush_info: RefCell<FlushInfo>,
     checkpoint_state: RefCell<CheckpointState>,
     checkpoint_inflight: Rc<RefCell<usize>>,
     syncing: Rc<RefCell<bool>>,
@@ -559,11 +549,6 @@ impl Pager {
             allocate_page1_state,
             page_size: Cell::new(None),
             reserved_space: OnceCell::new(),
-            flush_info: RefCell::new(FlushInfo {
-                state: CacheFlushState::Start,
-                in_flight_writes: Rc::new(RefCell::new(0)),
-                dirty_pages: Vec::new(),
-            }),
             free_page_state: RefCell::new(FreePageState::Start),
             allocate_page_state: RefCell::new(AllocatePageState::Start),
             max_page_count: Cell::new(DEFAULT_MAX_PAGE_COUNT),
@@ -1167,7 +1152,7 @@ impl Pager {
     /// Flush all dirty pages to disk.
     /// Unlike commit_dirty_pages, this function does not commit, checkpoint now sync the WAL/Database.
     #[instrument(skip_all, level = Level::INFO)]
-    pub fn cacheflush(&self) -> Result<IOResult<()>> {
+    pub fn cacheflush(&self) -> Result<Vec<Completion>> {
         let Some(wal) = self.wal.as_ref() else {
             // TODO: when ephemeral table spills to disk, it should cacheflush pages directly to the temporary database file.
             // This handling is not yet implemented, but it should be when spilling is implemented.
@@ -1175,92 +1160,27 @@ impl Pager {
                 "cacheflush() called on database without WAL".to_string(),
             ));
         };
-        let state = self.flush_info.borrow().state;
-        trace!(?state);
-        match state {
-            CacheFlushState::Start => {
-                let dirty_pages = self
-                    .dirty_pages
-                    .borrow()
-                    .iter()
-                    .copied()
-                    .collect::<Vec<usize>>();
-                let mut flush_info = self.flush_info.borrow_mut();
-                if dirty_pages.is_empty() {
-                    Ok(IOResult::Done(()))
-                } else {
-                    flush_info.dirty_pages = dirty_pages;
-                    flush_info.state = CacheFlushState::AppendFrame {
-                        current_page_to_append_idx: 0,
-                    };
-                    Ok(IOResult::IO)
-                }
-            }
-            CacheFlushState::AppendFrame {
-                current_page_to_append_idx,
-            } => {
-                let page_id = self.flush_info.borrow().dirty_pages[current_page_to_append_idx];
-                let page = {
-                    let mut cache = self.page_cache.write();
-                    let page_key = PageCacheKey::new(page_id);
-                    let page = cache.get(&page_key).expect("we somehow added a page to dirty list but we didn't mark it as dirty, causing cache to drop it.");
-                    let page_type = page.get().contents.as_ref().unwrap().maybe_page_type();
-                    trace!(
-                        "commit_dirty_pages(page={}, page_type={:?}",
-                        page_id,
-                        page_type
-                    );
-                    page
-                };
+        let mut completions = Vec::with_capacity(self.dirty_pages.borrow().len());
+        for page_id in self.dirty_pages.borrow().iter().copied() {
+            let page = {
+                let mut cache = self.page_cache.write();
+                let page_key = PageCacheKey::new(page_id);
+                let page = cache.get(&page_key).expect("we somehow added a page to dirty list but we didn't mark it as dirty, causing cache to drop it.");
+                let page_type = page.get().contents.as_ref().unwrap().maybe_page_type();
+                trace!(
+                    "commit_dirty_pages(page={}, page_type={:?}",
+                    page_id,
+                    page_type
+                );
+                page
+            };
 
-                let _c = wal.borrow_mut().append_frame(
-                    page.clone(),
-                    0,
-                    self.flush_info.borrow().in_flight_writes.clone(),
-                )?;
-                self.flush_info.borrow_mut().state = CacheFlushState::WaitAppendFrame {
-                    current_page_to_append_idx,
-                };
-                Ok(IOResult::IO)
-            }
-            CacheFlushState::WaitAppendFrame {
-                current_page_to_append_idx,
-            } => {
-                let in_flight = self.flush_info.borrow().in_flight_writes.clone();
-                if *in_flight.borrow() > 0 {
-                    return Ok(IOResult::IO);
-                }
-
-                // Clear dirty now
-                let page_id = self.flush_info.borrow().dirty_pages[current_page_to_append_idx];
-                let page = {
-                    let mut cache = self.page_cache.write();
-                    let page_key = PageCacheKey::new(page_id);
-                    let page = cache.get(&page_key).expect("we somehow added a page to dirty list but we didn't mark it as dirty, causing cache to drop it.");
-                    let page_type = page.get().contents.as_ref().unwrap().maybe_page_type();
-                    trace!(
-                        "commit_dirty_pages(page={}, page_type={:?}",
-                        page_id,
-                        page_type
-                    );
-                    page
-                };
-                page.clear_dirty();
-                // Continue with next page
-                let is_last_page =
-                    current_page_to_append_idx == self.flush_info.borrow().dirty_pages.len() - 1;
-                if is_last_page {
-                    self.dirty_pages.borrow_mut().clear();
-                    self.flush_info.borrow_mut().state = CacheFlushState::Start;
-                    Ok(IOResult::Done(()))
-                } else {
-                    self.flush_info.borrow_mut().state = CacheFlushState::AppendFrame {
-                        current_page_to_append_idx: current_page_to_append_idx + 1,
-                    };
-                    Ok(IOResult::IO)
-                }
-            }
+            // TODO: invalidade previous completions on error here
+            let c = wal.borrow_mut().append_frame(page.clone(), 0)?;
+            completions.push(c);
         }
+        // No need to have a separate state for clearing dirty the page as the callback does this for us
+        Ok(completions)
     }
 
     /// Flush all dirty pages to disk.
@@ -2107,11 +2027,6 @@ impl Pager {
         self.checkpoint_state.replace(CheckpointState::Checkpoint);
         self.checkpoint_inflight.replace(0);
         self.syncing.replace(false);
-        self.flush_info.replace(FlushInfo {
-            state: CacheFlushState::Start,
-            in_flight_writes: Rc::new(RefCell::new(0)),
-            dirty_pages: Vec::new(),
-        });
         self.commit_info.replace(CommitInfo {
             state: CommitState::Start,
             in_flight_writes: Rc::new(RefCell::new(0)),

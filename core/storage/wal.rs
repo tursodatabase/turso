@@ -255,12 +255,7 @@ pub trait Wal {
     /// db_size > 0    -> last frame written in transaction
     /// db_size == 0   -> non-last frame written in transaction
     /// write_counter is the counter we use to track when the I/O operation starts and completes
-    fn append_frame(
-        &mut self,
-        page: PageRef,
-        db_size: u32,
-        write_counter: Rc<RefCell<usize>>,
-    ) -> Result<Completion>;
+    fn append_frame(&mut self, page: PageRef, db_size: u32) -> Result<Completion>;
 
     /// Complete append of frames by updating shared wal state. Before this
     /// all changes were stored locally.
@@ -1017,12 +1012,7 @@ impl Wal for WalFile {
 
     /// Write a frame to the WAL.
     #[instrument(skip_all, level = Level::DEBUG)]
-    fn append_frame(
-        &mut self,
-        page: PageRef,
-        db_size: u32,
-        write_counter: Rc<RefCell<usize>>,
-    ) -> Result<Completion> {
+    fn append_frame(&mut self, page: PageRef, db_size: u32) -> Result<Completion> {
         let shared = self.get_shared();
         if shared.max_frame.load(Ordering::SeqCst).eq(&0) {
             self.ensure_header_if_needed()?;
@@ -1048,10 +1038,8 @@ impl Wal for WalFile {
                 page_buf,
             );
 
-            *write_counter.borrow_mut() += 1;
             let c = Completion::new_write({
                 let frame_bytes = frame_bytes.clone();
-                let write_counter = write_counter.clone();
                 move |bytes_written| {
                     let frame_len = frame_bytes.len();
                     turso_assert!(
@@ -1060,15 +1048,10 @@ impl Wal for WalFile {
                     );
 
                     page.clear_dirty();
-                    *write_counter.borrow_mut() -= 1;
                 }
             });
-            let result = shared.file.pwrite(offset, frame_bytes.clone(), c);
-            if let Err(err) = result {
-                *write_counter.borrow_mut() -= 1;
-                return Err(err);
-            }
-            (result.unwrap(), frame_checksums)
+            let result = shared.file.pwrite(offset, frame_bytes.clone(), c)?;
+            (result, frame_checksums)
         };
         self.complete_append_frame(page_id as u64, frame_id, checksums);
         Ok(c)
@@ -1935,7 +1918,10 @@ pub mod test {
             let _ = conn.execute("insert into test (value) values (randomblob(1024)), (randomblob(1024)), (randomblob(1024))");
         }
         let pager = conn.pager.borrow_mut();
-        let _ = pager.cacheflush();
+        let completions = pager.cacheflush().unwrap();
+        for c in completions {
+            pager.io.wait_for_completion(c).unwrap();
+        }
         let mut wal = pager.wal.as_ref().unwrap().borrow_mut();
 
         let stat = std::fs::metadata(&walpath).unwrap();
@@ -2028,8 +2014,9 @@ pub mod test {
         conn.execute("create table test(id integer primary key, value text)")
             .unwrap();
         bulk_inserts(&conn, 20, 3);
-        while let IOResult::IO(io) = conn.pager.borrow_mut().cacheflush().unwrap() {
-            io.wait(conn._db.io.as_ref()).unwrap();
+        let completions = conn.pager.borrow_mut().cacheflush().unwrap();
+        for c in completions {
+            conn._db.io.wait_for_completion(c).unwrap()
         }
 
         // Snapshot header & counters before the RESTART checkpoint.
@@ -2122,8 +2109,9 @@ pub mod test {
             .execute("create table test(id integer primary key, value text)")
             .unwrap();
         bulk_inserts(&conn1.clone(), 15, 2);
-        while let IOResult::IO(io) = conn1.pager.borrow_mut().cacheflush().unwrap() {
-            io.wait(conn1._db.io.as_ref()).unwrap();
+        let completions = conn1.pager.borrow_mut().cacheflush().unwrap();
+        for c in completions {
+            conn1._db.io.wait_for_completion(c).unwrap()
         }
 
         // Force a read transaction that will freeze a lower read mark
@@ -2136,8 +2124,9 @@ pub mod test {
 
         // generate more frames that the reader will not see.
         bulk_inserts(&conn1.clone(), 15, 2);
-        while let IOResult::IO(io) = conn1.pager.borrow_mut().cacheflush().unwrap() {
-            io.wait(conn1._db.io.as_ref()).unwrap();
+        let completions = conn1.pager.borrow_mut().cacheflush().unwrap();
+        for c in completions {
+            conn1._db.io.wait_for_completion(c).unwrap()
         }
 
         // Run passive checkpoint, expect partial

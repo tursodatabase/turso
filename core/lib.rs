@@ -1237,7 +1237,7 @@ impl Connection {
     }
 
     /// Flush dirty pages to disk.
-    pub fn cacheflush(&self) -> Result<IOResult<()>> {
+    pub fn cacheflush(&self) -> Result<Vec<Completion>> {
         if self.closed.get() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
