@@ -34,16 +34,25 @@ macro_rules! prepare_tx_statements {
     };
 }
 
+fn prepare_table(conn: Arc<Connection>) {
+    conn.execute("CREATE TABLE dummy (id INTEGER PRIMARY KEY, text TEXT);")
+        .unwrap();
+    conn.execute("INSERT INTO dummy (id, text) VALUES (1, 'World');")
+        .unwrap();
+}
+
 fn bench(c: &mut Criterion) {
     let mut group = c.benchmark_group("mvcc-ops-throughput");
     group.throughput(Throughput::Elements(1));
 
+    let db = bench_db();
+    let conn = db.conn.clone();
+    let begin_stmt = RefCell::new(conn.prepare("BEGIN TRANSACTION;").unwrap());
+    let rollback_stmt = RefCell::new(conn.prepare("ROLLBACK;").unwrap());
     group.bench_function("begin_tx + rollback_tx", |b| {
-        let db = bench_db();
         b.to_async(FuturesExecutor).iter(|| async {
-            let conn = db.conn.clone();
-            let tx_id = db.mvcc_store.begin_tx(conn.get_pager().clone());
-            db.mvcc_store.rollback_tx(tx_id, conn.get_pager().clone())
+            begin_stmt.borrow_mut().step().unwrap();
+            rollback_stmt.borrow_mut().step().unwrap();
         })
     });
 
@@ -68,12 +77,7 @@ fn bench(c: &mut Criterion) {
     });
 
     let db = bench_db();
-    db.conn
-        .execute("CREATE TABLE dummy (id INTEGER PRIMARY KEY);")
-        .unwrap();
-    db.conn
-        .execute("INSERT INTO dummy (id) VALUES (1);")
-        .unwrap();
+    prepare_table(db.conn.clone());
     prepare_tx_statements!(db, begin_stmt, commit_stmt);
     let update_stmt = RefCell::new(
         db.conn
@@ -89,68 +93,30 @@ fn bench(c: &mut Criterion) {
     });
 
     let db = bench_db();
-    let record = ImmutableRecord::from_values(&vec![Value::Text(Text::new("World"))], 1);
-    let record_data = record.as_blob();
-    let tx_id = db.mvcc_store.begin_tx(db.conn.get_pager().clone());
-    db.mvcc_store
-        .insert(
-            tx_id,
-            Row {
-                id: RowID {
-                    table_id: 1,
-                    row_id: 1,
-                },
-                data: record_data.clone(),
-                column_count: 1,
-            },
-        )
-        .unwrap();
+    prepare_table(db.conn.clone());
+    db.conn.execute("BEGIN TRANSACTION;").unwrap();
+    let read_stmt = RefCell::new(
+        db.conn
+            .prepare("SELECT * FROM dummy WHERE id = 1;")
+            .unwrap(),
+    );
     group.bench_function("read", |b| {
         b.to_async(FuturesExecutor).iter(|| async {
-            db.mvcc_store
-                .read(
-                    tx_id,
-                    RowID {
-                        table_id: 1,
-                        row_id: 1,
-                    },
-                )
-                .unwrap();
+            read_stmt.borrow_mut().step().unwrap();
         })
     });
 
     let db = bench_db();
-    let tx_id = db.mvcc_store.begin_tx(db.conn.get_pager().clone());
-    let conn = &db.conn;
-    db.mvcc_store
-        .insert(
-            tx_id,
-            Row {
-                id: RowID {
-                    table_id: 1,
-                    row_id: 1,
-                },
-                data: record_data.clone(),
-                column_count: 1,
-            },
-        )
-        .unwrap();
+    prepare_table(db.conn.clone());
+    db.conn.execute("BEGIN TRANSACTION;").unwrap();
+    let update_stmt = RefCell::new(
+        db.conn
+            .prepare("UPDATE dummy SET text = 'World' WHERE id = 1;")
+            .unwrap(),
+    );
     group.bench_function("update", |b| {
         b.to_async(FuturesExecutor).iter(|| async {
-            db.mvcc_store
-                .update(
-                    tx_id,
-                    Row {
-                        id: RowID {
-                            table_id: 1,
-                            row_id: 1,
-                        },
-                        data: record_data.clone(),
-                        column_count: 1,
-                    },
-                    conn.get_pager().clone(),
-                )
-                .unwrap();
+            update_stmt.borrow_mut().step().unwrap();
         })
     });
 }
