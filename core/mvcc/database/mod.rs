@@ -429,9 +429,9 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                             }
                             break;
                         }
-                        Ok(crate::types::IOResult::IO) => {
+                        Ok(crate::types::IOResult::IO(io)) => {
                             // FIXME: this is a hack to make the pager run the IO loop
-                            self.pager.io.run_once().unwrap();
+                            io.wait(self.pager.io.as_ref()).unwrap();
                             continue;
                         }
                         Err(e) => {
@@ -492,7 +492,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
             } => {
                 let write_row_state_machine = self.write_row_state_machine.as_mut().unwrap();
                 match write_row_state_machine.step(&())? {
-                    TransitionResult::Io => return Ok(TransitionResult::Io),
+                    TransitionResult::Io(io) => return Ok(TransitionResult::Io(io)),
                     TransitionResult::Continue => {
                         return Ok(TransitionResult::Continue);
                     }
@@ -634,8 +634,8 @@ impl StateTransition for WriteRowStateMachine {
                         self.state = WriteRowState::Insert;
                         Ok(TransitionResult::Continue)
                     }
-                    IOResult::IO => {
-                        return Ok(TransitionResult::Io);
+                    IOResult::IO(io) => {
+                        return Ok(TransitionResult::Io(io));
                     }
                 }
             }
@@ -657,8 +657,8 @@ impl StateTransition for WriteRowStateMachine {
                         self.finalize(&())?;
                         Ok(TransitionResult::Done(()))
                     }
-                    IOResult::IO => {
-                        return Ok(TransitionResult::Io);
+                    IOResult::IO(io) => {
+                        return Ok(TransitionResult::Io(io));
                     }
                 }
             }
@@ -1179,8 +1179,8 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 .map_err(|e| LimboError::InternalError(e.to_string()))?
             {
                 IOResult::Done(()) => break,
-                IOResult::IO => {
-                    pager.io.run_once().unwrap();
+                IOResult::IO(io) => {
+                    io.wait(pager.io.as_ref()).unwrap();
                     continue;
                 }
             }
@@ -1192,43 +1192,53 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             let row_id = match rowid_result {
                 IOResult::Done(Some(row_id)) => row_id,
                 IOResult::Done(None) => break,
-                IOResult::IO => {
-                    pager.io.run_once().unwrap();
+                IOResult::IO(io) => {
+                    io.wait(pager.io.as_ref()).unwrap();
                     continue;
                 }
             };
-            match cursor
-                .record()
-                .map_err(|e| LimboError::InternalError(e.to_string()))?
-            {
-                IOResult::Done(Some(record)) => {
-                    let id = RowID { table_id, row_id };
-                    let column_count = record.column_count();
-                    // We insert row with 0 timestamp, because it's the only version we have on initialization.
-                    self.insert_version(
-                        id,
-                        RowVersion {
-                            begin: TxTimestampOrID::Timestamp(0),
-                            end: None,
-                            row: Row::new(id, record.get_payload().to_vec(), column_count),
-                        },
-                    );
+            'record: loop {
+                match cursor
+                    .record()
+                    .map_err(|e| LimboError::InternalError(e.to_string()))?
+                {
+                    IOResult::Done(Some(record)) => {
+                        let id = RowID { table_id, row_id };
+                        let column_count = record.column_count();
+                        // We insert row with 0 timestamp, because it's the only version we have on initialization.
+                        self.insert_version(
+                            id,
+                            RowVersion {
+                                begin: TxTimestampOrID::Timestamp(0),
+                                end: None,
+                                row: Row::new(id, record.get_payload().to_vec(), column_count),
+                            },
+                        );
+                        break 'record;
+                    }
+                    IOResult::Done(None) => break,
+                    IOResult::IO(io) => {
+                        io.wait(pager.io.as_ref()).unwrap();
+                    } // FIXME: lazy me not wanting to do state machine right now
                 }
-                IOResult::Done(None) => break,
-                IOResult::IO => unreachable!(), // FIXME: lazy me not wanting to do state machine right now
             }
 
             // Move to next record
-            match cursor
-                .next()
-                .map_err(|e| LimboError::InternalError(e.to_string()))?
-            {
-                IOResult::Done(has_next) => {
-                    if !has_next {
-                        break;
+            'next: loop {
+                match cursor
+                    .next()
+                    .map_err(|e| LimboError::InternalError(e.to_string()))?
+                {
+                    IOResult::Done(has_next) => {
+                        if !has_next {
+                            break;
+                        }
+                        break 'next;
                     }
+                    IOResult::IO(io) => {
+                        io.wait(pager.io.as_ref()).unwrap();
+                    } // FIXME: lazy me not wanting to do state machine right now
                 }
-                IOResult::IO => unreachable!(), // FIXME: lazy me not wanting to do state machine right now
             }
         }
         Ok(())

@@ -23,7 +23,7 @@ impl<I: ?Sized + IO> IOExt for I {
         Ok(loop {
             match f()? {
                 IOResult::Done(v) => break v,
-                IOResult::IO => self.run_once()?,
+                IOResult::IO(io) => io.wait(self)?,
             }
         })
     }

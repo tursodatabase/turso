@@ -63,11 +63,10 @@ use crate::storage::pager::Pager;
 use crate::storage::wal::PendingFlush;
 use crate::types::{RawSlice, RefValue, SerialType, SerialTypeKind, TextRef, TextSubtype};
 use crate::{turso_assert, File, Result, WalFileShared};
-use std::cell::{RefCell, UnsafeCell};
+use std::cell::UnsafeCell;
 use std::collections::{BTreeMap, HashMap};
 use std::mem::MaybeUninit;
 use std::pin::Pin;
-use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -891,11 +890,7 @@ pub fn finish_read_page(page_idx: usize, buffer_ref: Arc<Buffer>, page: PageRef)
 }
 
 #[instrument(skip_all, level = Level::DEBUG)]
-pub fn begin_write_btree_page(
-    pager: &Pager,
-    page: &PageRef,
-    write_counter: Rc<RefCell<usize>>,
-) -> Result<Completion> {
+pub fn begin_write_btree_page(pager: &Pager, page: &PageRef) -> Result<Completion> {
     tracing::trace!("begin_write_btree_page(page={})", page.get().id);
     let page_source = &pager.db_file;
     let page_finish = page.clone();
@@ -908,15 +903,12 @@ pub fn begin_write_btree_page(
         contents.buffer.clone()
     };
 
-    *write_counter.borrow_mut() += 1;
-    let clone_counter = write_counter.clone();
     let write_complete = {
         let buf_copy = buffer.clone();
         Box::new(move |bytes_written: i32| {
             tracing::trace!("finish_write_btree_page");
             let buf_copy = buf_copy.clone();
             let buf_len = buf_copy.len();
-            *clone_counter.borrow_mut() -= 1;
 
             page_finish.clear_dirty();
             turso_assert!(
@@ -927,10 +919,6 @@ pub fn begin_write_btree_page(
     };
     let c = Completion::new_write(write_complete);
     let res = page_source.write_page(page_id, buffer.clone(), c);
-    if res.is_err() {
-        // Avoid infinite loop if write page fails
-        *write_counter.borrow_mut() -= 1;
-    }
     res
 }
 
@@ -948,9 +936,9 @@ pub fn begin_write_btree_page(
 pub fn write_pages_vectored(
     pager: &Pager,
     batch: BTreeMap<usize, Arc<Buffer>>,
-) -> Result<PendingFlush> {
+) -> Result<(PendingFlush, Vec<Completion>)> {
     if batch.is_empty() {
-        return Ok(PendingFlush::default());
+        return Ok((PendingFlush::default(), Vec::new()));
     }
 
     // batch item array is already sorted by id, so we just need to find contiguous ranges of page_id's
@@ -988,6 +976,7 @@ pub fn write_pages_vectored(
     // Iterate through the batch
     let mut iter = batch.into_iter().peekable();
 
+    let mut completions = Vec::new();
     while let Some((id, item)) = iter.next() {
         // Track the start of the run
         if run_start_id.is_none() {
@@ -1016,15 +1005,20 @@ pub fn write_pages_vectored(
             });
 
             // Submit write operation for this run, decrementing the counter if we error
-            if let Err(e) = pager
+            let c = match pager
                 .db_file
                 .write_pages(start_id, page_sz, run_bufs.clone(), c)
             {
-                if runs_left.fetch_sub(1, Ordering::AcqRel) == 1 {
-                    done.store(true, Ordering::Release);
+                Ok(c) => c,
+                Err(e) => {
+                    if runs_left.fetch_sub(1, Ordering::AcqRel) == 1 {
+                        done.store(true, Ordering::Release);
+                    }
+                    // TODO: invalidate current completions in vec
+                    return Err(e);
                 }
-                return Err(e);
-            }
+            };
+            completions.push(c);
 
             // Reset for next run
             run_bufs.clear();
@@ -1037,22 +1031,18 @@ pub fn write_pages_vectored(
         all_ids.len()
     );
 
-    Ok(PendingFlush {
-        pages: all_ids,
-        done,
-    })
+    Ok((
+        PendingFlush {
+            pages: all_ids,
+            done,
+        },
+        completions,
+    ))
 }
 
 #[instrument(skip_all, level = Level::DEBUG)]
-pub fn begin_sync(
-    db_file: Arc<dyn DatabaseStorage>,
-    syncing: Rc<RefCell<bool>>,
-) -> Result<Completion> {
-    assert!(!*syncing.borrow());
-    *syncing.borrow_mut() = true;
-    let completion = Completion::new_sync(move |_| {
-        *syncing.borrow_mut() = false;
-    });
+pub fn begin_sync(db_file: Arc<dyn DatabaseStorage>) -> Result<Completion> {
+    let completion = Completion::new_sync(move |_| {});
     #[allow(clippy::arc_with_non_send_sync)]
     db_file.sync(completion)
 }

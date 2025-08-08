@@ -9,12 +9,7 @@ use tracing::{instrument, Level};
 
 use std::fmt::Formatter;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::{
-    cell::{Cell, RefCell},
-    fmt,
-    rc::Rc,
-    sync::Arc,
-};
+use std::{cell::Cell, fmt, sync::Arc};
 
 use crate::fast_lock::SpinLock;
 use crate::io::{File, IO};
@@ -23,7 +18,7 @@ use crate::storage::sqlite3_ondisk::{
     begin_read_wal_frame, begin_read_wal_frame_raw, finish_read_page, prepare_wal_frame,
     write_pages_vectored, WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE,
 };
-use crate::types::IOResult;
+use crate::types::{IOCompletions, IOResult};
 use crate::{turso_assert, Buffer, LimboError, Result};
 use crate::{Completion, Page};
 
@@ -254,13 +249,7 @@ pub trait Wal {
     /// db_size is the database size in pages after the transaction finishes.
     /// db_size > 0    -> last frame written in transaction
     /// db_size == 0   -> non-last frame written in transaction
-    /// write_counter is the counter we use to track when the I/O operation starts and completes
-    fn append_frame(
-        &mut self,
-        page: PageRef,
-        db_size: u32,
-        write_counter: Rc<RefCell<usize>>,
-    ) -> Result<Completion>;
+    fn append_frame(&mut self, page: PageRef, db_size: u32) -> Result<Completion>;
 
     /// Complete append of frames by updating shared wal state. Before this
     /// all changes were stored locally.
@@ -270,10 +259,9 @@ pub trait Wal {
     fn checkpoint(
         &mut self,
         pager: &Pager,
-        write_counter: Rc<RefCell<usize>>,
         mode: CheckpointMode,
     ) -> Result<IOResult<CheckpointResult>>;
-    fn sync(&mut self) -> Result<IOResult<()>>;
+    fn sync(&mut self) -> Result<Completion>;
     fn get_max_frame_in_wal(&self) -> u64;
     fn get_max_frame(&self) -> u64;
     fn get_min_frame(&self) -> u64;
@@ -286,22 +274,13 @@ pub trait Wal {
     fn as_any(&self) -> &dyn std::any::Any;
 }
 
-// Syncing requires a state machine because we need to schedule a sync and then wait until it is
-// finished. If we don't wait there will be undefined behaviour that no one wants to debug.
-#[derive(Copy, Clone, Debug)]
-enum SyncState {
-    NotSyncing,
-    Syncing,
-}
-
 #[derive(Debug, Copy, Clone)]
 pub enum CheckpointState {
     Start,
     ReadFrame,
-    WaitReadFrame,
     AccumulatePage,
     FlushBatch,
-    WaitFlush,
+    AfterFlush,
     Done,
 }
 
@@ -424,9 +403,6 @@ pub struct WalFile {
     io: Arc<dyn IO>,
     buffer_pool: Arc<BufferPool>,
 
-    syncing: Rc<Cell<bool>>,
-    sync_state: Cell<SyncState>,
-
     shared: Arc<UnsafeCell<WalFileShared>>,
     ongoing_checkpoint: OngoingCheckpoint,
     checkpoint_threshold: usize,
@@ -454,8 +430,6 @@ pub struct WalFile {
 impl fmt::Debug for WalFile {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("WalFile")
-            .field("syncing", &self.syncing.get())
-            .field("sync_state", &self.sync_state)
             .field("page_size", &self.page_size())
             .field("shared", &self.shared)
             .field("ongoing_checkpoint", &self.ongoing_checkpoint)
@@ -1023,12 +997,7 @@ impl Wal for WalFile {
 
     /// Write a frame to the WAL.
     #[instrument(skip_all, level = Level::DEBUG)]
-    fn append_frame(
-        &mut self,
-        page: PageRef,
-        db_size: u32,
-        write_counter: Rc<RefCell<usize>>,
-    ) -> Result<Completion> {
+    fn append_frame(&mut self, page: PageRef, db_size: u32) -> Result<Completion> {
         let shared = self.get_shared();
         if shared.max_frame.load(Ordering::SeqCst).eq(&0) {
             self.ensure_header_if_needed()?;
@@ -1054,10 +1023,8 @@ impl Wal for WalFile {
                 page_buf,
             );
 
-            *write_counter.borrow_mut() += 1;
             let c = Completion::new_write({
                 let frame_bytes = frame_bytes.clone();
-                let write_counter = write_counter.clone();
                 move |bytes_written| {
                     let frame_len = frame_bytes.len();
                     turso_assert!(
@@ -1066,15 +1033,10 @@ impl Wal for WalFile {
                     );
 
                     page.clear_dirty();
-                    *write_counter.borrow_mut() -= 1;
                 }
             });
-            let result = shared.file.pwrite(offset, frame_bytes.clone(), c);
-            if let Err(err) = result {
-                *write_counter.borrow_mut() -= 1;
-                return Err(err);
-            }
-            (result.unwrap(), frame_checksums)
+            let result = shared.file.pwrite(offset, frame_bytes.clone(), c)?;
+            (result, frame_checksums)
         };
         self.complete_append_frame(page_id as u64, frame_id, checksums);
         Ok(c)
@@ -1092,7 +1054,6 @@ impl Wal for WalFile {
     fn checkpoint(
         &mut self,
         pager: &Pager,
-        _write_counter: Rc<RefCell<usize>>,
         mode: CheckpointMode,
     ) -> Result<IOResult<CheckpointResult>> {
         if matches!(mode, CheckpointMode::Full) {
@@ -1100,39 +1061,20 @@ impl Wal for WalFile {
                 "Full checkpoint mode is not implemented yet".into(),
             ));
         }
-        self.checkpoint_inner(pager, _write_counter, mode)
-            .inspect_err(|_| {
-                let _ = self.checkpoint_guard.take();
-                self.ongoing_checkpoint.state = CheckpointState::Start;
-            })
+        self.checkpoint_inner(pager, mode).inspect_err(|_| {
+            let _ = self.checkpoint_guard.take();
+            self.ongoing_checkpoint.state = CheckpointState::Start;
+        })
     }
 
     #[instrument(err, skip_all, level = Level::DEBUG)]
-    fn sync(&mut self) -> Result<IOResult<()>> {
-        match self.sync_state.get() {
-            SyncState::NotSyncing => {
-                tracing::debug!("wal_sync");
-                let syncing = self.syncing.clone();
-                self.syncing.set(true);
-                let completion = Completion::new_sync(move |_| {
-                    tracing::debug!("wal_sync finish");
-                    syncing.set(false);
-                });
-                let shared = self.get_shared();
-                let _c = shared.file.sync(completion)?;
-                self.sync_state.set(SyncState::Syncing);
-                Ok(IOResult::IO)
-            }
-            SyncState::Syncing => {
-                if self.syncing.get() {
-                    tracing::debug!("wal_sync is already syncing");
-                    Ok(IOResult::IO)
-                } else {
-                    self.sync_state.set(SyncState::NotSyncing);
-                    Ok(IOResult::Done(()))
-                }
-            }
-        }
+    fn sync(&mut self) -> Result<Completion> {
+        tracing::debug!("wal_sync");
+        let completion = Completion::new_sync(move |_| {
+            tracing::debug!("wal_sync finish");
+        });
+        let shared = self.get_shared();
+        shared.file.sync(completion)
     }
 
     fn get_max_frame_in_wal(&self) -> u64 {
@@ -1241,8 +1183,6 @@ impl WalFile {
             },
             checkpoint_threshold: 1000,
             buffer_pool,
-            syncing: Rc::new(Cell::new(false)),
-            sync_state: Cell::new(SyncState::NotSyncing),
             min_frame: 0,
             max_frame_read_lock_index: NO_LOCK_HELD.into(),
             last_checksum,
@@ -1298,8 +1238,6 @@ impl WalFile {
         self.max_frame_read_lock_index.set(NO_LOCK_HELD);
         self.ongoing_checkpoint.batch.clear();
         let _ = self.ongoing_checkpoint.pending_flush.take();
-        self.sync_state.set(SyncState::NotSyncing);
-        self.syncing.set(false);
     }
 
     /// the WAL file has been truncated and we are writing the first
@@ -1346,7 +1284,6 @@ impl WalFile {
     fn checkpoint_inner(
         &mut self,
         pager: &Pager,
-        _write_counter: Rc<RefCell<usize>>,
         mode: CheckpointMode,
     ) -> Result<IOResult<CheckpointResult>> {
         'checkpoint_loop: loop {
@@ -1417,23 +1354,16 @@ impl WalFile {
                                 *frame
                             );
                             self.ongoing_checkpoint.scratch_page.get().id = page as usize;
-                            let _ = self.read_frame(
+                            let c = self.read_frame(
                                 *frame,
                                 self.ongoing_checkpoint.scratch_page.clone(),
                                 self.buffer_pool.clone(),
                             )?;
-                            self.ongoing_checkpoint.state = CheckpointState::WaitReadFrame;
-                            continue 'checkpoint_loop;
+                            self.ongoing_checkpoint.state = CheckpointState::AccumulatePage;
+                            return Ok(IOResult::IO(IOCompletions::Single(c)));
                         }
                     }
                     self.ongoing_checkpoint.current_page += 1;
-                }
-                CheckpointState::WaitReadFrame => {
-                    if self.ongoing_checkpoint.scratch_page.is_locked() {
-                        return Ok(IOResult::IO);
-                    } else {
-                        self.ongoing_checkpoint.state = CheckpointState::AccumulatePage;
-                    }
                 }
                 CheckpointState::AccumulatePage => {
                     // mark before batching
@@ -1463,21 +1393,23 @@ impl WalFile {
                 }
                 CheckpointState::FlushBatch => {
                     tracing::trace!("started checkpoint backfilling batch");
-                    self.ongoing_checkpoint.pending_flush = Some(write_pages_vectored(
+                    let (pending_flush, completions) = write_pages_vectored(
                         pager,
                         std::mem::take(&mut self.ongoing_checkpoint.batch),
-                    )?);
+                    )?;
+                    self.ongoing_checkpoint.pending_flush = Some(pending_flush);
                     // batch is queued
                     self.ongoing_checkpoint.batch.clear();
-                    self.ongoing_checkpoint.state = CheckpointState::WaitFlush;
+                    self.ongoing_checkpoint.state = CheckpointState::AfterFlush;
+                    return Ok(IOResult::IO(IOCompletions::Many(completions)));
                 }
-                CheckpointState::WaitFlush => {
+                CheckpointState::AfterFlush => {
                     match self.ongoing_checkpoint.pending_flush.as_ref() {
                         Some(pf) if pf.done.load(Ordering::SeqCst) => {
                             // flush is done, we can continue
                             tracing::trace!("checkpoint backfilling batch done");
                         }
-                        Some(_) => return Ok(IOResult::IO),
+                        Some(_) => panic!("pending flush should have completed"),
                         None => panic!("we should have a pending flush here"),
                     }
                     tracing::debug!("finished checkpoint backfilling batch");
@@ -1911,7 +1843,7 @@ pub mod test {
     #[cfg(unix)]
     use std::os::unix::fs::MetadataExt;
     use std::{
-        cell::{Cell, RefCell, UnsafeCell},
+        cell::{Cell, UnsafeCell},
         rc::Rc,
         sync::{atomic::Ordering, Arc},
     };
@@ -1968,7 +1900,10 @@ pub mod test {
             let _ = conn.execute("insert into test (value) values (randomblob(1024)), (randomblob(1024)), (randomblob(1024))");
         }
         let pager = conn.pager.borrow_mut();
-        let _ = pager.cacheflush();
+        let completions = pager.cacheflush().unwrap();
+        for c in completions {
+            pager.io.wait_for_completion(c).unwrap();
+        }
         let mut wal = pager.wal.as_ref().unwrap().borrow_mut();
 
         let stat = std::fs::metadata(&walpath).unwrap();
@@ -2028,12 +1963,11 @@ pub mod test {
         pager: &crate::Pager,
         mode: CheckpointMode,
     ) -> CheckpointResult {
-        let wc = Rc::new(RefCell::new(0usize));
         loop {
-            match wal.checkpoint(pager, wc.clone(), mode).unwrap() {
+            match wal.checkpoint(pager, mode).unwrap() {
                 IOResult::Done(r) => return r,
-                IOResult::IO => {
-                    pager.io.run_once().unwrap();
+                IOResult::IO(io) => {
+                    io.wait(pager.io.as_ref()).unwrap();
                 }
             }
         }
@@ -2061,8 +1995,9 @@ pub mod test {
         conn.execute("create table test(id integer primary key, value text)")
             .unwrap();
         bulk_inserts(&conn, 20, 3);
-        while let IOResult::IO = conn.pager.borrow_mut().cacheflush().unwrap() {
-            conn.run_once().unwrap();
+        let completions = conn.pager.borrow_mut().cacheflush().unwrap();
+        for c in completions {
+            conn._db.io.wait_for_completion(c).unwrap()
         }
 
         // Snapshot header & counters before the RESTART checkpoint.
@@ -2155,8 +2090,9 @@ pub mod test {
             .execute("create table test(id integer primary key, value text)")
             .unwrap();
         bulk_inserts(&conn1.clone(), 15, 2);
-        while let IOResult::IO = conn1.pager.borrow_mut().cacheflush().unwrap() {
-            conn1.run_once().unwrap();
+        let completions = conn1.pager.borrow_mut().cacheflush().unwrap();
+        for c in completions {
+            conn1._db.io.wait_for_completion(c).unwrap()
         }
 
         // Force a read transaction that will freeze a lower read mark
@@ -2169,8 +2105,9 @@ pub mod test {
 
         // generate more frames that the reader will not see.
         bulk_inserts(&conn1.clone(), 15, 2);
-        while let IOResult::IO = conn1.pager.borrow_mut().cacheflush().unwrap() {
-            conn1.run_once().unwrap();
+        let completions = conn1.pager.borrow_mut().cacheflush().unwrap();
+        for c in completions {
+            conn1._db.io.wait_for_completion(c).unwrap()
         }
 
         // Run passive checkpoint, expect partial
@@ -2235,9 +2172,9 @@ pub mod test {
         let p = conn1.pager.borrow();
         let mut w = p.wal.as_ref().unwrap().borrow_mut();
         loop {
-            match w.checkpoint(&p, Rc::new(RefCell::new(0)), CheckpointMode::Restart) {
-                Ok(IOResult::IO) => {
-                    conn1.run_once().unwrap();
+            match w.checkpoint(&p, CheckpointMode::Restart) {
+                Ok(IOResult::IO(io)) => {
+                    io.wait(conn1._db.io.as_ref()).unwrap();
                 }
                 e => {
                     assert!(
@@ -2264,9 +2201,9 @@ pub mod test {
         let p = conn1.pager.borrow();
         let mut w = p.wal.as_ref().unwrap().borrow_mut();
         loop {
-            match w.checkpoint(&p, Rc::new(RefCell::new(0)), CheckpointMode::Restart) {
-                Ok(IOResult::IO) => {
-                    conn1.run_once().unwrap();
+            match w.checkpoint(&p, CheckpointMode::Restart) {
+                Ok(IOResult::IO(io)) => {
+                    io.wait(conn1._db.io.as_ref()).unwrap();
                 }
                 Ok(IOResult::Done(_)) => {
                     panic!("Checkpoint should not have succeeded");
@@ -2438,7 +2375,7 @@ pub mod test {
         let result = {
             let pager = conn1.pager.borrow();
             let mut wal = pager.wal.as_ref().unwrap().borrow_mut();
-            wal.checkpoint(&pager, Rc::new(RefCell::new(0)), CheckpointMode::Restart)
+            wal.checkpoint(&pager, CheckpointMode::Restart)
         };
 
         assert!(
@@ -2804,7 +2741,7 @@ pub mod test {
         {
             let pager = conn1.pager.borrow();
             let mut wal = pager.wal.as_ref().unwrap().borrow_mut();
-            let result = wal.checkpoint(&pager, Rc::new(RefCell::new(0)), CheckpointMode::Restart);
+            let result = wal.checkpoint(&pager, CheckpointMode::Restart);
 
             assert!(
                 matches!(result, Err(LimboError::Busy)),
