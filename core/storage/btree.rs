@@ -6084,59 +6084,74 @@ impl BTreePageInner {
     }
 }
 
-/// Try to find a free block available and allocate it if found
-fn find_free_cell(page_ref: &PageContent, usable_space: u16, amount: usize) -> Result<usize> {
+/// Try to find a freeblock inside the cell content area that is large enough to fit the given amount of bytes.
+/// Used to check if a cell can be inserted into a freeblock to reduce fragmentation.
+/// Returns the absolute byte offset of the freeblock if found.
+fn find_free_slot(page_ref: &PageContent, usable_space: u16, amount: u16) -> Result<Option<u16>> {
+    const CELL_SIZE_MIN: u16 = 4;
     // NOTE: freelist is in ascending order of keys and pc
     // unuse_space is reserved bytes at the end of page, therefore we must substract from maxpc
-    let mut prev_pc = page_ref.offset + offset::BTREE_FIRST_FREEBLOCK;
-    let mut pc = page_ref.first_freeblock() as usize;
-    let maxpc = usable_space as usize - amount;
+    let mut prev_block = None;
+    let mut cur_block = match page_ref.first_freeblock() {
+        0 => None,
+        first_block => Some(first_block),
+    };
 
-    while pc <= maxpc {
-        if pc + 4 > usable_space as usize {
+    let max_start_offset = usable_space - amount;
+
+    while let Some(cur) = cur_block {
+        if cur + CELL_SIZE_MIN > usable_space {
             return_corrupt!("Free block header extends beyond page");
         }
 
-        let next = page_ref.read_u16_no_offset(pc);
-        let size = page_ref.read_u16_no_offset(pc + 2);
+        let (next, size) = page_ref.read_freeblock(cur);
 
-        if amount <= size as usize {
-            let new_size = size as usize - amount;
-            if new_size < 4 {
-                // The code is checking if using a free slot that would leave behind a very small fragment (x < 4 bytes)
-                // would cause the total fragmentation to exceed the limit of 60 bytes
+        // Doesn't fit in this freeblock, try the next one.
+        if amount > size {
+            if next == 0 {
+                // No next -> can't fit.
+                return Ok(None);
+            }
+
+            prev_block = cur_block;
+            turso_assert!(next > cur, "Free list not in ascending order");
+            cur_block = Some(next);
+            continue;
+        }
+
+        let new_size = size - amount;
+        // If the freeblock's new size is < CELL_SIZE_MIN, the freeblock is deleted and the remaining bytes
+        // become fragmented free bytes.
+        if new_size < CELL_SIZE_MIN {
+            if page_ref.num_frag_free_bytes() > 57 {
+                // SQLite has a fragmentation limit of 60 bytes.
                 // check sqlite docs https://www.sqlite.org/fileformat.html#:~:text=A%20freeblock%20requires,not%20exceed%2060
-                if page_ref.num_frag_free_bytes() > 57 {
-                    return Ok(0);
+                return Ok(None);
+            }
+            // Delete the slot from freelist and update the page's fragment count.
+            match prev_block {
+                Some(prev) => {
+                    page_ref.write_freeblock_next_ptr(prev, next);
                 }
-                // Delete the slot from freelist and update the page's fragment count.
-                page_ref.write_u16_no_offset(prev_pc, next);
-                let frag = page_ref.num_frag_free_bytes() + new_size as u8;
-                page_ref.write_fragmented_bytes_count(frag);
-                return Ok(pc);
-            } else if new_size + pc > maxpc {
-                return_corrupt!("Free block extends beyond page end");
-            } else {
-                // Requested amount fits inside the current free slot so we reduce its size
-                // to account for newly allocated space.
-                page_ref.write_u16_no_offset(pc + 2, new_size as u16);
-                return Ok(pc + new_size);
+                None => {
+                    page_ref.write_first_freeblock(next);
+                }
             }
+            let frag = page_ref.num_frag_free_bytes() + new_size as u8;
+            page_ref.write_fragmented_bytes_count(frag);
+            return Ok(cur_block);
+        } else if new_size + cur > max_start_offset {
+            return_corrupt!("Free block extends beyond page end");
+        } else {
+            // Requested amount fits inside the current free slot so we reduce its size
+            // to account for newly allocated space.
+            page_ref.write_freeblock_size(cur, new_size);
+            // Return the offset immediately after the shrunk freeblock.
+            return Ok(Some(cur + new_size));
         }
+    }
 
-        prev_pc = pc;
-        pc = next as usize;
-        if pc <= prev_pc {
-            if pc != 0 {
-                return_corrupt!("Free list not in ascending order");
-            }
-            return Ok(0);
-        }
-    }
-    if pc > maxpc + amount - 4 {
-        return_corrupt!("Free block chain extends beyond page end");
-    }
-    Ok(0)
+    Ok(None)
 }
 
 pub fn btree_init_page(page: &BTreePage, page_type: PageType, offset: usize, usable_space: u16) {
@@ -6948,10 +6963,9 @@ fn allocate_cell_space(
         && unallocated_region_start + CELL_PTR_SIZE_BYTES <= cell_content_area_start
     {
         // find slot
-        let pc = find_free_cell(page_ref, usable_space, amount)?;
-        if pc != 0 {
+        if let Some(pc) = find_free_slot(page_ref, usable_space, amount as u16)? {
             // we can fit the cell in a freeblock.
-            return Ok(pc as u16);
+            return Ok(pc);
         }
         /* fall through, we might need to defragment */
     }
