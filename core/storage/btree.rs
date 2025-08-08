@@ -2573,18 +2573,15 @@ impl BTreeCursor {
                     // start loading right page first
                     let mut pgno: u32 = unsafe { right_pointer.cast::<u32>().read().swap_bytes() };
                     let current_sibling = sibling_pointer;
+                    let mut completions = Vec::with_capacity(current_sibling + 1);
                     for i in (0..=current_sibling).rev() {
-                        let (page, _c) = btree_read_page(&self.pager, pgno as usize)?;
+                        let (page, c) = btree_read_page(&self.pager, pgno as usize)?;
                         {
                             // mark as dirty
                             let sibling_page = page.get();
                             self.pager.add_dirty(&sibling_page);
                         }
-                        #[cfg(debug_assertions)]
-                        {
-                            return_if_locked!(page.get());
-                            debug_validate_cells!(&page.get().get_contents(), usable_space as u16);
-                        }
+                        completions.push(c);
                         pages_to_balance[i].replace(page);
                         if i == 0 {
                             break;
@@ -2641,23 +2638,6 @@ impl BTreeCursor {
                         }
                     }
 
-                    #[cfg(debug_assertions)]
-                    {
-                        let page_type_of_siblings = pages_to_balance[0]
-                            .as_ref()
-                            .unwrap()
-                            .get()
-                            .get_contents()
-                            .page_type();
-                        for page in pages_to_balance.iter().take(sibling_count) {
-                            return_if_locked_maybe_load!(self.pager, page.as_ref().unwrap());
-                            let page = page.as_ref().unwrap().get();
-                            let contents = page.get_contents();
-                            debug_validate_cells!(&contents, usable_space as u16);
-                            assert_eq!(contents.page_type(), page_type_of_siblings);
-                        }
-                    }
-
                     balance_info.borrow_mut().replace(BalanceInfo {
                         pages_to_balance,
                         rightmost_pointer: right_pointer,
@@ -2666,11 +2646,24 @@ impl BTreeCursor {
                         first_divider_cell: first_cell_divider,
                     });
                     *sub_state = BalanceSubState::NonRootDoBalancing;
+                    if !completions.is_empty() {
+                        // TODO: when tracking IO return all the completions here
+                        return Ok(IOResult::IO);
+                    }
                 }
                 BalanceSubState::NonRootDoBalancing => {
                     // Ensure all involved pages are in memory.
                     let mut balance_info = balance_info.borrow_mut();
                     let balance_info = balance_info.as_mut().unwrap();
+
+                    #[cfg(debug_assertions)]
+                    let page_type_of_siblings = balance_info.pages_to_balance[0]
+                        .as_ref()
+                        .unwrap()
+                        .get()
+                        .get_contents()
+                        .page_type();
+
                     for page in balance_info
                         .pages_to_balance
                         .iter()
@@ -2678,6 +2671,13 @@ impl BTreeCursor {
                     {
                         let page = page.as_ref().unwrap();
                         return_if_locked_maybe_load!(self.pager, page);
+                        #[cfg(debug_assertions)]
+                        {
+                            let page = page.get();
+                            let contents = page.get_contents();
+                            debug_validate_cells!(&contents, usable_space as u16);
+                            assert_eq!(contents.page_type(), page_type_of_siblings);
+                        }
                     }
                     // Start balancing.
                     let parent_page_btree = self.stack.top();
