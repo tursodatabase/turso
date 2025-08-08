@@ -273,7 +273,7 @@ pub trait Wal {
         write_counter: Rc<RefCell<usize>>,
         mode: CheckpointMode,
     ) -> Result<IOResult<CheckpointResult>>;
-    fn sync(&mut self) -> Result<IOResult<()>>;
+    fn sync(&mut self) -> Result<Completion>;
     fn get_max_frame_in_wal(&self) -> u64;
     fn get_max_frame(&self) -> u64;
     fn get_min_frame(&self) -> u64;
@@ -424,9 +424,6 @@ pub struct WalFile {
     io: Arc<dyn IO>,
     buffer_pool: Arc<BufferPool>,
 
-    syncing: Rc<Cell<bool>>,
-    sync_state: Cell<SyncState>,
-
     shared: Arc<UnsafeCell<WalFileShared>>,
     ongoing_checkpoint: OngoingCheckpoint,
     checkpoint_threshold: usize,
@@ -454,8 +451,6 @@ pub struct WalFile {
 impl fmt::Debug for WalFile {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("WalFile")
-            .field("syncing", &self.syncing.get())
-            .field("sync_state", &self.sync_state)
             .field("page_size", &self.page_size())
             .field("shared", &self.shared)
             .field("ongoing_checkpoint", &self.ongoing_checkpoint)
@@ -1108,31 +1103,13 @@ impl Wal for WalFile {
     }
 
     #[instrument(err, skip_all, level = Level::DEBUG)]
-    fn sync(&mut self) -> Result<IOResult<()>> {
-        match self.sync_state.get() {
-            SyncState::NotSyncing => {
-                tracing::debug!("wal_sync");
-                let syncing = self.syncing.clone();
-                self.syncing.set(true);
-                let completion = Completion::new_sync(move |_| {
-                    tracing::debug!("wal_sync finish");
-                    syncing.set(false);
-                });
-                let shared = self.get_shared();
-                let _c = shared.file.sync(completion)?;
-                self.sync_state.set(SyncState::Syncing);
-                Ok(IOResult::IO)
-            }
-            SyncState::Syncing => {
-                if self.syncing.get() {
-                    tracing::debug!("wal_sync is already syncing");
-                    Ok(IOResult::IO)
-                } else {
-                    self.sync_state.set(SyncState::NotSyncing);
-                    Ok(IOResult::Done(()))
-                }
-            }
-        }
+    fn sync(&mut self) -> Result<Completion> {
+        tracing::debug!("wal_sync");
+        let completion = Completion::new_sync(move |_| {
+            tracing::debug!("wal_sync finish");
+        });
+        let shared = self.get_shared();
+        shared.file.sync(completion)
     }
 
     fn get_max_frame_in_wal(&self) -> u64 {
@@ -1241,8 +1218,6 @@ impl WalFile {
             },
             checkpoint_threshold: 1000,
             buffer_pool,
-            syncing: Rc::new(Cell::new(false)),
-            sync_state: Cell::new(SyncState::NotSyncing),
             min_frame: 0,
             max_frame_read_lock_index: NO_LOCK_HELD.into(),
             last_checksum,
@@ -1298,8 +1273,6 @@ impl WalFile {
         self.max_frame_read_lock_index.set(NO_LOCK_HELD);
         self.ongoing_checkpoint.batch.clear();
         let _ = self.ongoing_checkpoint.pending_flush.take();
-        self.sync_state.set(SyncState::NotSyncing);
-        self.syncing.set(false);
     }
 
     /// the WAL file has been truncated and we are writing the first

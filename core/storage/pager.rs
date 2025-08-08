@@ -8,6 +8,8 @@ use crate::storage::{
     },
     wal::{CheckpointResult, Wal},
 };
+use crate::storage::wal::{CheckpointResult, Wal};
+use crate::types::{IOCompletions, IOResult, WalFrameInfo};
 use crate::util::IOExt as _;
 use crate::{
     return_if_io, turso_assert, types::WalFrameInfo, Completion, Connection, IOResult, LimboError,
@@ -275,7 +277,7 @@ enum CommitState {
     /// If the current page is the last page to append, sync wal and clear dirty pages and cache.
     WaitAppendFrame { current_page_to_append_idx: usize },
     /// Fsync the on-disk WAL.
-    SyncWal,
+    AfterSyncWal,
     /// Checkpoint the WAL to the database file (if needed).
     Checkpoint,
     /// Fsync the database file.
@@ -1382,16 +1384,16 @@ impl Pager {
                         == self.commit_info.borrow().dirty_pages.len() - 1;
                     if is_last_frame {
                         self.dirty_pages.borrow_mut().clear();
-                        self.commit_info.borrow_mut().state = CommitState::SyncWal;
+                        self.commit_info.borrow_mut().state = CommitState::AfterSyncWal;
+                        let c = wal.borrow_mut().sync()?;
+                        return Ok(IOResult::IO(IOCompletions::Single(c)));
                     } else {
                         self.commit_info.borrow_mut().state = CommitState::AppendFrame {
                             current_page_to_append_idx: current_page_to_append_idx + 1,
                         }
                     }
                 }
-                CommitState::SyncWal => {
-                    return_if_io!(wal.borrow_mut().sync());
-
+                CommitState::AfterSyncWal => {
                     if wal_checkpoint_disabled || !wal.borrow().should_checkpoint() {
                         self.commit_info.borrow_mut().state = CommitState::Start;
                         break PagerCommitResult::WalWritten;
@@ -1552,18 +1554,10 @@ impl Pager {
             };
             let mut wal = wal.borrow_mut();
             // fsync the wal syncronously before beginning checkpoint
-            while let Ok(IOResult::IO) = wal.sync() {
-                // TODO: for now forget about timeouts as they fail regularly in SIM
-                // need to think of a better way to do this
-
-                // if attempts >= 1000 {
-                //     return Err(LimboError::InternalError(
-                //         "Failed to fsync WAL before final checkpoint, fd likely closed".into(),
-                //     ));
-                // }
-                self.io.run_once()?;
-                _attempts += 1;
-            }
+            let c = wal.sync()?;
+            // TODO: for now forget about timeouts as they fail regularly in SIM
+            // need to think of a better way to do this
+            self.io.wait_for_completion(c)?;
         }
         self.wal_checkpoint(wal_checkpoint_disabled, CheckpointMode::Passive)?;
         Ok(())
