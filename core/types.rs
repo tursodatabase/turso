@@ -2473,6 +2473,13 @@ impl IOCompletions {
             }
         }
     }
+
+    pub fn completed(&self) -> bool {
+        match self {
+            IOCompletions::Single(c) => c.is_completed(),
+            IOCompletions::Many(completions) => completions.iter().all(|c| c.is_completed()),
+        }
+    }
 }
 
 #[derive(Debug)]

@@ -30,7 +30,8 @@ use crate::{
     state_machine::StateTransition,
     storage::sqlite3_ondisk::SmallVec,
     translate::{collate::CollationSeq, plan::TableReferences},
-    types::{IOResult, RawSlice, TextRef},
+    types::{IOCompletions, IOResult, RawSlice, TextRef},
+    util::IOExt,
     vdbe::execute::{
         OpColumnState, OpIdxInsertState, OpInsertState, OpNewRowidState, OpNoConflictState,
         OpRowIdState, OpSeekState,
@@ -237,6 +238,7 @@ pub struct Row {
 
 /// The program state describes the environment in which the program executes.
 pub struct ProgramState {
+    pub io_completions: Option<IOCompletions>,
     pub pc: InsnReference,
     cursors: RefCell<Vec<Option<Cursor>>>,
     registers: Vec<Register>,
@@ -273,6 +275,7 @@ impl ProgramState {
             RefCell::new((0..max_cursors).map(|_| None).collect());
         let registers = vec![Register::Value(Value::Null); max_registers];
         Self {
+            io_completions: None,
             pc: 0,
             cursors,
             registers,
@@ -415,20 +418,21 @@ impl Program {
         loop {
             if self.connection.closed.get() {
                 // Connection is closed for whatever reason, rollback the transaction.
-                let state = self.connection.transaction_state.get();
-                if let TransactionState::Write { schema_did_change } = state {
-                    match pager.end_tx(true, schema_did_change, &self.connection, false)? {
-                        IOResult::IO(io) => {
-                            // TODO: save completions in program state
-                            return Ok(StepResult::IO);
-                        }
-                        IOResult::Done(_) => {}
-                    }
+                let t_state = self.connection.transaction_state.get();
+                if let TransactionState::Write { schema_did_change } = t_state {
+                    pager
+                        .io
+                        .block(|| pager.end_tx(true, schema_did_change, &self.connection, false))?;
                 }
                 return Err(LimboError::InternalError("Connection closed".to_string()));
             }
             if state.is_interrupted() {
                 return Ok(StepResult::Interrupt);
+            }
+            if let Some(io) = &state.io_completions {
+                if !io.completed() {
+                    return Ok(StepResult::IO);
+                }
             }
             // invalidate row
             let _ = state.result_row.take();
@@ -437,7 +441,10 @@ impl Program {
             match insn_function(self, state, insn, &pager, mv_store.as_ref()) {
                 Ok(InsnFunctionStepResult::Step) => {}
                 Ok(InsnFunctionStepResult::Done) => return Ok(StepResult::Done),
-                Ok(InsnFunctionStepResult::IO) => return Ok(StepResult::IO),
+                Ok(InsnFunctionStepResult::IO(io)) => {
+                    state.io_completions = Some(io);
+                    return Ok(StepResult::IO);
+                }
                 Ok(InsnFunctionStepResult::Row) => return Ok(StepResult::Row),
                 Ok(InsnFunctionStepResult::Interrupt) => return Ok(StepResult::Interrupt),
                 Ok(InsnFunctionStepResult::Busy) => return Ok(StepResult::Busy),
@@ -807,16 +814,9 @@ pub fn handle_program_error(
         _ => {
             let state = connection.transaction_state.get();
             if let TransactionState::Write { schema_did_change } = state {
-                loop {
-                    match pager.end_tx(true, schema_did_change, connection, false) {
-                        Ok(IOResult::IO) => connection.run_once()?,
-                        Ok(IOResult::Done(_)) => break,
-                        Err(e) => {
-                            tracing::error!("end_tx failed: {e}");
-                            break;
-                        }
-                    }
-                }
+                pager
+                    .io
+                    .block(|| pager.end_tx(true, schema_did_change, connection, false))?;
             } else if let Err(e) = pager.end_read_tx() {
                 tracing::error!("end_read_tx failed: {e}");
             }

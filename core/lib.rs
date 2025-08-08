@@ -1267,14 +1267,15 @@ impl Connection {
 
         match self.transaction_state.get() {
             TransactionState::Write { schema_did_change } => {
-                while let IOResult::IO = self.pager.borrow().end_tx(
-                    true, // rollback = true for close
-                    schema_did_change,
-                    self,
-                    self.wal_checkpoint_disabled.get(),
-                )? {
-                    self.run_once()?;
-                }
+                self._db.io.block(|| {
+                    self.pager.borrow().end_tx(
+                        true, // rollback = true for close
+                        schema_did_change,
+                        self,
+                        self.wal_checkpoint_disabled.get(),
+                    )
+                })?;
+
                 self.transaction_state.set(TransactionState::None);
             }
             TransactionState::PendingUpgrade | TransactionState::Read => {
