@@ -1053,15 +1053,8 @@ pub fn write_pages_vectored(
 }
 
 #[instrument(skip_all, level = Level::DEBUG)]
-pub fn begin_sync(
-    db_file: Arc<dyn DatabaseStorage>,
-    syncing: Rc<RefCell<bool>>,
-) -> Result<Completion> {
-    assert!(!*syncing.borrow());
-    *syncing.borrow_mut() = true;
-    let completion = Completion::new_sync(move |_| {
-        *syncing.borrow_mut() = false;
-    });
+pub fn begin_sync(db_file: Arc<dyn DatabaseStorage>) -> Result<Completion> {
+    let completion = Completion::new_sync(move |_| {});
     #[allow(clippy::arc_with_non_send_sync)]
     db_file.sync(completion)
 }
