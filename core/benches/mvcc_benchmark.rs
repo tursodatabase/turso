@@ -4,27 +4,18 @@ use std::sync::Arc;
 use criterion::async_executor::FuturesExecutor;
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use pprof::criterion::{Output, PProfProfiler};
-use turso_core::mvcc::clock::LocalClock;
-use turso_core::mvcc::database::{MvStore, Row, RowID};
-use turso_core::types::{ImmutableRecord, Text};
-use turso_core::{Connection, Database, MemoryIO, Value};
+use turso_core::{Connection, Database, MemoryIO};
 
 struct BenchDb {
     _db: Arc<Database>,
     conn: Arc<Connection>,
-    mvcc_store: Arc<MvStore<LocalClock>>,
 }
 
 fn bench_db() -> BenchDb {
     let io = Arc::new(MemoryIO::new());
     let db = Database::open_file(io.clone(), ":memory:", true, true).unwrap();
     let conn = db.connect().unwrap();
-    let mvcc_store = db.get_mv_store().unwrap().clone();
-    BenchDb {
-        _db: db,
-        conn,
-        mvcc_store,
-    }
+    BenchDb { _db: db, conn }
 }
 
 macro_rules! prepare_tx_statements {
