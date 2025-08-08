@@ -43,7 +43,7 @@
     "node": ">= 10"
   },
   "scripts": {
-    "artifacts": "napi artifacts",
+    "artifacts": "npm exec tsc && napi artifacts",
     "build": "npm exec tsc && napi build --platform --release --esm",
     "build:debug": "npm exec tsc && napi build --platform",
     "prepublishOnly": "napi prepublish -t npm",
