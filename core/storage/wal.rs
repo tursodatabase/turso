@@ -9,12 +9,7 @@ use tracing::{instrument, Level};
 
 use std::fmt::Formatter;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::{
-    cell::{Cell, RefCell},
-    fmt,
-    rc::Rc,
-    sync::Arc,
-};
+use std::{cell::Cell, fmt, rc::Rc, sync::Arc};
 
 use crate::fast_lock::SpinLock;
 use crate::io::{File, IO};
@@ -254,7 +249,6 @@ pub trait Wal {
     /// db_size is the database size in pages after the transaction finishes.
     /// db_size > 0    -> last frame written in transaction
     /// db_size == 0   -> non-last frame written in transaction
-    /// write_counter is the counter we use to track when the I/O operation starts and completes
     fn append_frame(&mut self, page: PageRef, db_size: u32) -> Result<Completion>;
 
     /// Complete append of frames by updating shared wal state. Before this
@@ -265,7 +259,6 @@ pub trait Wal {
     fn checkpoint(
         &mut self,
         pager: &Pager,
-        write_counter: Rc<RefCell<usize>>,
         mode: CheckpointMode,
     ) -> Result<IOResult<CheckpointResult>>;
     fn sync(&mut self) -> Result<Completion>;
@@ -1069,7 +1062,6 @@ impl Wal for WalFile {
     fn checkpoint(
         &mut self,
         pager: &Pager,
-        _write_counter: Rc<RefCell<usize>>,
         mode: CheckpointMode,
     ) -> Result<IOResult<CheckpointResult>> {
         if matches!(mode, CheckpointMode::Full) {
@@ -1077,11 +1069,10 @@ impl Wal for WalFile {
                 "Full checkpoint mode is not implemented yet".into(),
             ));
         }
-        self.checkpoint_inner(pager, _write_counter, mode)
-            .inspect_err(|_| {
-                let _ = self.checkpoint_guard.take();
-                self.ongoing_checkpoint.state = CheckpointState::Start;
-            })
+        self.checkpoint_inner(pager, mode).inspect_err(|_| {
+            let _ = self.checkpoint_guard.take();
+            self.ongoing_checkpoint.state = CheckpointState::Start;
+        })
     }
 
     #[instrument(err, skip_all, level = Level::DEBUG)]
@@ -1301,7 +1292,6 @@ impl WalFile {
     fn checkpoint_inner(
         &mut self,
         pager: &Pager,
-        _write_counter: Rc<RefCell<usize>>,
         mode: CheckpointMode,
     ) -> Result<IOResult<CheckpointResult>> {
         'checkpoint_loop: loop {
@@ -1861,7 +1851,7 @@ pub mod test {
     #[cfg(unix)]
     use std::os::unix::fs::MetadataExt;
     use std::{
-        cell::{Cell, RefCell, UnsafeCell},
+        cell::{Cell, UnsafeCell},
         rc::Rc,
         sync::{atomic::Ordering, Arc},
     };
@@ -1981,9 +1971,8 @@ pub mod test {
         pager: &crate::Pager,
         mode: CheckpointMode,
     ) -> CheckpointResult {
-        let wc = Rc::new(RefCell::new(0usize));
         loop {
-            match wal.checkpoint(pager, wc.clone(), mode).unwrap() {
+            match wal.checkpoint(pager, mode).unwrap() {
                 IOResult::Done(r) => return r,
                 IOResult::IO(io) => {
                     io.wait(pager.io.as_ref()).unwrap();
@@ -2191,7 +2180,7 @@ pub mod test {
         let p = conn1.pager.borrow();
         let mut w = p.wal.as_ref().unwrap().borrow_mut();
         loop {
-            match w.checkpoint(&p, Rc::new(RefCell::new(0)), CheckpointMode::Restart) {
+            match w.checkpoint(&p, CheckpointMode::Restart) {
                 Ok(IOResult::IO(io)) => {
                     io.wait(conn1._db.io.as_ref()).unwrap();
                 }
@@ -2220,7 +2209,7 @@ pub mod test {
         let p = conn1.pager.borrow();
         let mut w = p.wal.as_ref().unwrap().borrow_mut();
         loop {
-            match w.checkpoint(&p, Rc::new(RefCell::new(0)), CheckpointMode::Restart) {
+            match w.checkpoint(&p, CheckpointMode::Restart) {
                 Ok(IOResult::IO(io)) => {
                     io.wait(conn1._db.io.as_ref()).unwrap();
                 }
@@ -2394,7 +2383,7 @@ pub mod test {
         let result = {
             let pager = conn1.pager.borrow();
             let mut wal = pager.wal.as_ref().unwrap().borrow_mut();
-            wal.checkpoint(&pager, Rc::new(RefCell::new(0)), CheckpointMode::Restart)
+            wal.checkpoint(&pager, CheckpointMode::Restart)
         };
 
         assert!(
@@ -2760,7 +2749,7 @@ pub mod test {
         {
             let pager = conn1.pager.borrow();
             let mut wal = pager.wal.as_ref().unwrap().borrow_mut();
-            let result = wal.checkpoint(&pager, Rc::new(RefCell::new(0)), CheckpointMode::Restart);
+            let result = wal.checkpoint(&pager, CheckpointMode::Restart);
 
             assert!(
                 matches!(result, Err(LimboError::Busy)),
