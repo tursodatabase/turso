@@ -29,11 +29,11 @@ use crate::{
     function::{AggFunc, FuncCtx},
     state_machine::StateTransition,
     storage::sqlite3_ondisk::SmallVec,
-    translate::collate::CollationSeq,
-    translate::plan::TableReferences,
+    translate::{collate::CollationSeq, plan::TableReferences},
     types::{IOResult, RawSlice, TextRef},
     vdbe::execute::{
-        OpIdxInsertState, OpInsertState, OpNewRowidState, OpNoConflictState, OpSeekState,
+        OpColumnState, OpIdxInsertState, OpInsertState, OpNewRowidState, OpNoConflictState,
+        OpSeekState,
     },
     RefValue,
 };
@@ -263,6 +263,7 @@ pub struct ProgramState {
     seek_state: OpSeekState,
     /// Current collation sequence set by OP_CollSeq instruction
     current_collation: Option<CollationSeq>,
+    op_column_state: OpColumnState,
 }
 
 impl ProgramState {
@@ -295,6 +296,7 @@ impl ProgramState {
             op_no_conflict_state: OpNoConflictState::Start,
             seek_state: OpSeekState::Start,
             current_collation: None,
+            op_column_state: OpColumnState::Start,
         }
     }
 

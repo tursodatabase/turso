@@ -1403,6 +1403,20 @@ fn read_integer_fast(buf: &[u8], len: usize) -> i64 {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum OpColumnState {
+    Start,
+    Rowid {
+        index_cursor_id: usize,
+        table_cursor_id: usize,
+    },
+    Seek {
+        rowid: i64,
+        table_cursor_id: usize,
+    },
+    GetColumn,
+}
+
 pub fn op_column(
     program: &Program,
     state: &mut ProgramState,
@@ -1419,278 +1433,320 @@ pub fn op_column(
         },
         insn
     );
-    if let Some((index_cursor_id, table_cursor_id)) = state.deferred_seeks[*cursor_id].take() {
-        let deferred_seek = 'd: {
-            let rowid = {
-                let mut index_cursor = state.get_cursor(index_cursor_id);
-                let index_cursor = index_cursor.as_btree_mut();
-                match index_cursor.rowid()? {
-                    IOResult::IO => {
-                        break 'd Some((index_cursor_id, table_cursor_id));
-                    }
-                    IOResult::Done(rowid) => rowid,
-                }
-            };
-            let mut table_cursor = state.get_cursor(table_cursor_id);
-            let table_cursor = table_cursor.as_btree_mut();
-            match table_cursor.seek(
-                SeekKey::TableRowId(rowid.unwrap()),
-                SeekOp::GE { eq_only: true },
-            )? {
-                IOResult::Done(_) => None,
-                IOResult::IO => Some((index_cursor_id, table_cursor_id)),
-            }
-        };
-        if let Some(deferred_seek) = deferred_seek {
-            state.deferred_seeks[*cursor_id] = Some(deferred_seek);
-            return Ok(InsnFunctionStepResult::IO);
-        }
-    }
 
-    let (_, cursor_type) = program.cursor_ref.get(*cursor_id).unwrap();
-    match cursor_type {
-        CursorType::BTreeTable(_) | CursorType::BTreeIndex(_) => {
-            let value = 'value: {
-                let mut cursor =
-                    must_be_btree_cursor!(*cursor_id, program.cursor_ref, state, "Column");
-                let cursor = cursor.as_btree_mut();
-
-                if cursor.get_null_flag() {
-                    break 'value Some(RefValue::Null);
-                }
-
-                let record_result = return_if_io!(cursor.record());
-                let Some(record) = record_result.as_ref() else {
-                    break 'value None;
-                };
-
-                let payload = record.get_payload();
-
-                if payload.is_empty() {
-                    break 'value None;
-                }
-
-                let mut record_cursor = cursor.record_cursor.borrow_mut();
-
-                if record_cursor.serial_types.is_empty() && record_cursor.offsets.is_empty() {
-                    let (header_size, header_len_bytes) = read_varint_fast(payload)?;
-                    let header_size = header_size as usize;
-
-                    if header_size > payload.len() || header_size > 98307 {
-                        return Err(LimboError::Corrupt("Header size exceeds bounds".into()));
-                    }
-
-                    record_cursor.header_size = header_size;
-                    record_cursor.header_offset = header_len_bytes;
-
-                    record_cursor.offsets.push(header_size);
-                }
-
-                let target_column = *column;
-                let mut parse_pos = record_cursor.header_offset;
-                let mut data_offset = record_cursor
-                    .offsets
-                    .last()
-                    .copied()
-                    .unwrap_or(record_cursor.header_size);
-
-                // Adjust data_offset if we already have some columns parsed
-                if !record_cursor.serial_types.is_empty() && !record_cursor.offsets.is_empty() {
-                    data_offset = *record_cursor.offsets.last().unwrap();
-                }
-
-                // Parse the header for serial types incrementally until we have the target column
-                while record_cursor.serial_types.len() <= target_column
-                    && parse_pos < record_cursor.header_size
-                    && parse_pos < payload.len()
+    loop {
+        match state.op_column_state {
+            OpColumnState::Start => {
+                if let Some((index_cursor_id, table_cursor_id)) =
+                    state.deferred_seeks[*cursor_id].take()
                 {
-                    let (serial_type, varint_len) = read_varint_fast(&payload[parse_pos..])?;
-
-                    record_cursor.serial_types.push(serial_type);
-                    parse_pos += varint_len;
-                    let data_size = match serial_type {
-                        0 => 0,
-                        1 => 1,
-                        2 => 2,
-                        3 => 3,
-                        4 => 4,
-                        5 => 6,
-                        6 => 8,
-                        7 => 8,
-                        8 => 0,
-                        9 => 0,
-                        n if n >= 12 && n % 2 == 0 => (n - 12) / 2,
-                        n if n >= 13 && n % 2 == 1 => (n - 13) / 2,
-                        10 | 11 => {
-                            return Err(LimboError::Corrupt(format!(
-                                "Reserved serial type: {serial_type}"
-                            )))
-                        }
-                        _ => {
-                            return Err(LimboError::Corrupt(format!(
-                                "Invalid serial type: {serial_type}"
-                            )))
-                        }
-                    } as usize;
-                    data_offset += data_size;
-                    record_cursor.offsets.push(data_offset);
+                    state.op_column_state = OpColumnState::Rowid {
+                        index_cursor_id,
+                        table_cursor_id,
+                    };
+                } else {
+                    state.op_column_state = OpColumnState::GetColumn;
                 }
-
-                record_cursor.header_offset = parse_pos;
-
-                if parse_pos > record_cursor.header_size || data_offset > payload.len() {
-                    record_cursor.serial_types.clear();
-                    record_cursor.offsets.clear();
-                    record_cursor.header_offset = 0;
-                    record_cursor.header_size = 0;
-                    break 'value None;
+            }
+            OpColumnState::Rowid {
+                index_cursor_id,
+                table_cursor_id,
+            } => {
+                let rowid = {
+                    let mut index_cursor = state.get_cursor(index_cursor_id);
+                    let index_cursor = index_cursor.as_btree_mut();
+                    return_if_io!(index_cursor.rowid())
+                };
+                state.op_column_state = OpColumnState::Seek {
+                    rowid: rowid.unwrap(),
+                    table_cursor_id,
+                };
+            }
+            OpColumnState::Seek {
+                rowid,
+                table_cursor_id,
+            } => {
+                {
+                    let mut table_cursor = state.get_cursor(table_cursor_id);
+                    let table_cursor = table_cursor.as_btree_mut();
+                    return_if_io!(
+                        table_cursor.seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true })
+                    );
                 }
+                state.op_column_state = OpColumnState::GetColumn;
+            }
+            OpColumnState::GetColumn => {
+                let (_, cursor_type) = program.cursor_ref.get(*cursor_id).unwrap();
+                match cursor_type {
+                    CursorType::BTreeTable(_) | CursorType::BTreeIndex(_) => {
+                        let value = 'value: {
+                            let mut cursor = must_be_btree_cursor!(
+                                *cursor_id,
+                                program.cursor_ref,
+                                state,
+                                "Column"
+                            );
+                            let cursor = cursor.as_btree_mut();
 
-                if target_column >= record_cursor.serial_types.len() {
-                    break 'value None;
-                }
+                            if cursor.get_null_flag() {
+                                break 'value Some(RefValue::Null);
+                            }
 
-                let serial_type = record_cursor.serial_types[target_column];
+                            let record_result = return_if_io!(cursor.record());
+                            let Some(record) = record_result.as_ref() else {
+                                break 'value None;
+                            };
 
-                // Fast path for common constant cases
-                match serial_type {
-                    0 => break 'value Some(RefValue::Null),
-                    8 => break 'value Some(RefValue::Integer(0)),
-                    9 => break 'value Some(RefValue::Integer(1)),
-                    _ => {}
-                }
+                            let payload = record.get_payload();
 
-                if target_column + 1 >= record_cursor.offsets.len() {
-                    break 'value None;
-                }
+                            if payload.is_empty() {
+                                break 'value None;
+                            }
 
-                let start_offset = record_cursor.offsets[target_column];
-                let end_offset = record_cursor.offsets[target_column + 1];
+                            let mut record_cursor = cursor.record_cursor.borrow_mut();
 
-                let data_slice = &payload[start_offset..end_offset];
-                let data_len = end_offset - start_offset;
+                            if record_cursor.serial_types.is_empty()
+                                && record_cursor.offsets.is_empty()
+                            {
+                                let (header_size, header_len_bytes) = read_varint_fast(payload)?;
+                                let header_size = header_size as usize;
 
-                match serial_type {
-                    1..=6 => {
-                        let expected_len = match serial_type {
-                            1 => 1,
-                            2 => 2,
-                            3 => 3,
-                            4 => 4,
-                            5 => 6,
-                            6 => 8,
-                            _ => 0,
-                        };
+                                if header_size > payload.len() || header_size > 98307 {
+                                    return Err(LimboError::Corrupt(
+                                        "Header size exceeds bounds".into(),
+                                    ));
+                                }
 
-                        if data_len >= expected_len {
-                            Some(RefValue::Integer(read_integer_fast(
-                                data_slice,
-                                expected_len,
-                            )))
-                        } else {
-                            return Err(LimboError::Corrupt(format!(
+                                record_cursor.header_size = header_size;
+                                record_cursor.header_offset = header_len_bytes;
+
+                                record_cursor.offsets.push(header_size);
+                            }
+
+                            let target_column = *column;
+                            let mut parse_pos = record_cursor.header_offset;
+                            let mut data_offset = record_cursor
+                                .offsets
+                                .last()
+                                .copied()
+                                .unwrap_or(record_cursor.header_size);
+
+                            // Adjust data_offset if we already have some columns parsed
+                            if !record_cursor.serial_types.is_empty()
+                                && !record_cursor.offsets.is_empty()
+                            {
+                                data_offset = *record_cursor.offsets.last().unwrap();
+                            }
+
+                            // Parse the header for serial types incrementally until we have the target column
+                            while record_cursor.serial_types.len() <= target_column
+                                && parse_pos < record_cursor.header_size
+                                && parse_pos < payload.len()
+                            {
+                                let (serial_type, varint_len) =
+                                    read_varint_fast(&payload[parse_pos..])?;
+
+                                record_cursor.serial_types.push(serial_type);
+                                parse_pos += varint_len;
+                                let data_size = match serial_type {
+                                    0 => 0,
+                                    1 => 1,
+                                    2 => 2,
+                                    3 => 3,
+                                    4 => 4,
+                                    5 => 6,
+                                    6 => 8,
+                                    7 => 8,
+                                    8 => 0,
+                                    9 => 0,
+                                    n if n >= 12 && n % 2 == 0 => (n - 12) / 2,
+                                    n if n >= 13 && n % 2 == 1 => (n - 13) / 2,
+                                    10 | 11 => {
+                                        return Err(LimboError::Corrupt(format!(
+                                            "Reserved serial type: {serial_type}"
+                                        )))
+                                    }
+                                    _ => {
+                                        return Err(LimboError::Corrupt(format!(
+                                            "Invalid serial type: {serial_type}"
+                                        )))
+                                    }
+                                } as usize;
+                                data_offset += data_size;
+                                record_cursor.offsets.push(data_offset);
+                            }
+
+                            record_cursor.header_offset = parse_pos;
+
+                            if parse_pos > record_cursor.header_size || data_offset > payload.len()
+                            {
+                                record_cursor.serial_types.clear();
+                                record_cursor.offsets.clear();
+                                record_cursor.header_offset = 0;
+                                record_cursor.header_size = 0;
+                                break 'value None;
+                            }
+
+                            if target_column >= record_cursor.serial_types.len() {
+                                break 'value None;
+                            }
+
+                            let serial_type = record_cursor.serial_types[target_column];
+
+                            // Fast path for common constant cases
+                            match serial_type {
+                                0 => break 'value Some(RefValue::Null),
+                                8 => break 'value Some(RefValue::Integer(0)),
+                                9 => break 'value Some(RefValue::Integer(1)),
+                                _ => {}
+                            }
+
+                            if target_column + 1 >= record_cursor.offsets.len() {
+                                break 'value None;
+                            }
+
+                            let start_offset = record_cursor.offsets[target_column];
+                            let end_offset = record_cursor.offsets[target_column + 1];
+
+                            let data_slice = &payload[start_offset..end_offset];
+                            let data_len = end_offset - start_offset;
+
+                            match serial_type {
+                                1..=6 => {
+                                    let expected_len = match serial_type {
+                                        1 => 1,
+                                        2 => 2,
+                                        3 => 3,
+                                        4 => 4,
+                                        5 => 6,
+                                        6 => 8,
+                                        _ => 0,
+                                    };
+
+                                    if data_len >= expected_len {
+                                        Some(RefValue::Integer(read_integer_fast(
+                                            data_slice,
+                                            expected_len,
+                                        )))
+                                    } else {
+                                        return Err(LimboError::Corrupt(format!(
                                 "Insufficient data for integer type {serial_type}: expected {expected_len}, got {data_len}"
                             )));
+                                    }
+                                }
+                                7 => {
+                                    if data_len >= 8 {
+                                        let bytes = [
+                                            data_slice[0],
+                                            data_slice[1],
+                                            data_slice[2],
+                                            data_slice[3],
+                                            data_slice[4],
+                                            data_slice[5],
+                                            data_slice[6],
+                                            data_slice[7],
+                                        ];
+                                        Some(RefValue::Float(f64::from_be_bytes(bytes)))
+                                    } else {
+                                        None
+                                    }
+                                }
+                                n if n >= 12 && n % 2 == 0 => {
+                                    Some(RefValue::Blob(RawSlice::create_from(data_slice)))
+                                }
+                                n if n >= 13 && n % 2 == 1 => Some(RefValue::Text(
+                                    TextRef::create_from(data_slice, TextSubtype::Text),
+                                )),
+                                _ => None,
+                            }
+                        };
+
+                        let Some(value) = value else {
+                            // DEFAULT handling. Try to reuse the registers when allocation is not needed.
+                            let Some(ref default) = default else {
+                                state.registers[*dest] = Register::Value(Value::Null);
+                                state.pc += 1;
+                                return Ok(InsnFunctionStepResult::Step);
+                            };
+                            match (default, &mut state.registers[*dest]) {
+                                (
+                                    Value::Text(new_text),
+                                    Register::Value(Value::Text(existing_text)),
+                                ) => {
+                                    existing_text.do_extend(new_text);
+                                }
+                                (
+                                    Value::Blob(new_blob),
+                                    Register::Value(Value::Blob(existing_blob)),
+                                ) => {
+                                    existing_blob.do_extend(new_blob);
+                                }
+                                _ => {
+                                    state.registers[*dest] = Register::Value(default.clone());
+                                }
+                            }
+                            break;
+                        };
+
+                        // Try to reuse the registers when allocation is not needed.
+                        match (&value, &mut state.registers[*dest]) {
+                            (
+                                RefValue::Text(new_text),
+                                Register::Value(Value::Text(existing_text)),
+                            ) => {
+                                existing_text.do_extend(new_text);
+                            }
+                            (
+                                RefValue::Blob(new_blob),
+                                Register::Value(Value::Blob(existing_blob)),
+                            ) => {
+                                existing_blob.do_extend(new_blob);
+                            }
+                            _ => {
+                                state.registers[*dest] = Register::Value(match value {
+                                    RefValue::Integer(i) => Value::Integer(i),
+                                    RefValue::Float(f) => Value::Float(f),
+                                    RefValue::Text(t) => Value::Text(Text::new(t.as_str())),
+                                    RefValue::Blob(b) => Value::Blob(b.to_slice().to_vec()),
+                                    RefValue::Null => Value::Null,
+                                });
+                            }
                         }
                     }
-                    7 => {
-                        if data_len >= 8 {
-                            let bytes = [
-                                data_slice[0],
-                                data_slice[1],
-                                data_slice[2],
-                                data_slice[3],
-                                data_slice[4],
-                                data_slice[5],
-                                data_slice[6],
-                                data_slice[7],
-                            ];
-                            Some(RefValue::Float(f64::from_be_bytes(bytes)))
+                    CursorType::Sorter => {
+                        let record = {
+                            let mut cursor = state.get_cursor(*cursor_id);
+                            let cursor = cursor.as_sorter_mut();
+                            cursor.record().cloned()
+                        };
+                        if let Some(record) = record {
+                            state.registers[*dest] =
+                                Register::Value(match record.get_value_opt(*column) {
+                                    Some(val) => val.to_owned(),
+                                    None => default.clone().unwrap_or(Value::Null),
+                                });
                         } else {
-                            None
+                            state.registers[*dest] = Register::Value(Value::Null);
                         }
                     }
-                    n if n >= 12 && n % 2 == 0 => {
-                        Some(RefValue::Blob(RawSlice::create_from(data_slice)))
+                    CursorType::Pseudo(_) => {
+                        let value = {
+                            let mut cursor = state.get_cursor(*cursor_id);
+                            let cursor = cursor.as_pseudo_mut();
+                            if let Some(record) = cursor.record() {
+                                record.get_value(*column)?.to_owned()
+                            } else {
+                                Value::Null
+                            }
+                        };
+                        state.registers[*dest] = Register::Value(value);
                     }
-                    n if n >= 13 && n % 2 == 1 => Some(RefValue::Text(TextRef::create_from(
-                        data_slice,
-                        TextSubtype::Text,
-                    ))),
-                    _ => None,
-                }
-            };
-
-            let Some(value) = value else {
-                // DEFAULT handling. Try to reuse the registers when allocation is not needed.
-                let Some(ref default) = default else {
-                    state.registers[*dest] = Register::Value(Value::Null);
-                    state.pc += 1;
-                    return Ok(InsnFunctionStepResult::Step);
-                };
-                match (default, &mut state.registers[*dest]) {
-                    (Value::Text(new_text), Register::Value(Value::Text(existing_text))) => {
-                        existing_text.do_extend(new_text);
-                    }
-                    (Value::Blob(new_blob), Register::Value(Value::Blob(existing_blob))) => {
-                        existing_blob.do_extend(new_blob);
-                    }
-                    _ => {
-                        state.registers[*dest] = Register::Value(default.clone());
+                    CursorType::VirtualTable(_) => {
+                        panic!("Insn:Column on virtual table cursor, use Insn:VColumn instead");
                     }
                 }
-                state.pc += 1;
-                return Ok(InsnFunctionStepResult::Step);
-            };
-
-            // Try to reuse the registers when allocation is not needed.
-            match (&value, &mut state.registers[*dest]) {
-                (RefValue::Text(new_text), Register::Value(Value::Text(existing_text))) => {
-                    existing_text.do_extend(new_text);
-                }
-                (RefValue::Blob(new_blob), Register::Value(Value::Blob(existing_blob))) => {
-                    existing_blob.do_extend(new_blob);
-                }
-                _ => {
-                    state.registers[*dest] = Register::Value(match value {
-                        RefValue::Integer(i) => Value::Integer(i),
-                        RefValue::Float(f) => Value::Float(f),
-                        RefValue::Text(t) => Value::Text(Text::new(t.as_str())),
-                        RefValue::Blob(b) => Value::Blob(b.to_slice().to_vec()),
-                        RefValue::Null => Value::Null,
-                    });
-                }
+                break;
             }
-        }
-        CursorType::Sorter => {
-            let record = {
-                let mut cursor = state.get_cursor(*cursor_id);
-                let cursor = cursor.as_sorter_mut();
-                cursor.record().cloned()
-            };
-            if let Some(record) = record {
-                state.registers[*dest] = Register::Value(match record.get_value_opt(*column) {
-                    Some(val) => val.to_owned(),
-                    None => default.clone().unwrap_or(Value::Null),
-                });
-            } else {
-                state.registers[*dest] = Register::Value(Value::Null);
-            }
-        }
-        CursorType::Pseudo(_) => {
-            let value = {
-                let mut cursor = state.get_cursor(*cursor_id);
-                let cursor = cursor.as_pseudo_mut();
-                if let Some(record) = cursor.record() {
-                    record.get_value(*column)?.to_owned()
-                } else {
-                    Value::Null
-                }
-            };
-            state.registers[*dest] = Register::Value(value);
-        }
-        CursorType::VirtualTable(_) => {
-            panic!("Insn:Column on virtual table cursor, use Insn:VColumn instead");
         }
     }
 
