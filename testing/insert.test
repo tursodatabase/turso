@@ -1,6 +1,7 @@
 #!/usr/bin/env tclsh
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
+source $testdir/sqlite3/tester.tcl
 
 do_execsql_test_on_specific_db {:memory:} basic-insert {
     create table temp (t1 integer, primary key (t1));
@@ -582,3 +583,15 @@ do_execsql_test_on_specific_db {:memory:} returning-null-values {
     CREATE TABLE test (id INTEGER, name TEXT, value INTEGER);
     INSERT INTO test (id, name, value) VALUES (1, NULL, NULL) RETURNING id, name, value;
 } {1||}
+
+do_catchsql_test unknown-identifier-in-values-clause {
+  DROP TABLE IF EXISTS tt;
+  CREATE TABLE tt (x);
+  INSERT INTO tt VALUES(asdf);
+} {1 {no such column: asdf}}
+
+do_catchsql_test unknown-backtick-identifier-in-values-clause {
+  DROP TABLE IF EXISTS tt;
+  CREATE TABLE tt (x);
+  INSERT INTO tt VALUES(`asdf`);
+} {1 {no such column: `asdf`}}

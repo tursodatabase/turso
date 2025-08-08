@@ -221,7 +221,7 @@ pub fn bind_column_references(
                 }
                 // SQLite behavior: Only double-quoted identifiers get fallback to string literals
                 // Single quotes are handled as literals earlier, unquoted identifiers must resolve to columns
-                if crate::translate::expr::is_double_quoted_identifier(id.as_str()) {
+                if id.is_double_quoted() {
                     // Convert failed double-quoted identifier to string literal
                     *expr = Expr::Literal(Literal::String(id.as_str().to_string()));
                     Ok(())

@@ -14,9 +14,8 @@ use crate::{
     parameters::PARAM_PREFIX,
     schema::{Index, IndexColumn, Schema, Table},
     translate::{
-        expr::is_double_quoted_identifier, expr::walk_expr_mut,
-        optimizer::access_method::AccessMethodParams, optimizer::constraints::TableConstraints,
-        plan::Scan, plan::TerminationKey,
+        expr::walk_expr_mut, optimizer::access_method::AccessMethodParams,
+        optimizer::constraints::TableConstraints, plan::Scan, plan::TerminationKey,
     },
     types::SeekOp,
     LimboError, Result,
@@ -701,7 +700,7 @@ impl Optimizable for ast::Expr {
             Expr::FunctionCallStar { .. } => false,
             Expr::Id(id) => {
                 // If we got here with an id, this has to be double-quotes identifier
-                assert!(is_double_quoted_identifier(id.as_str()));
+                assert!(id.is_double_quoted());
                 true
             }
             Expr::Column { .. } => false,

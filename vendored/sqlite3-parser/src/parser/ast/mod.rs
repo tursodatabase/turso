@@ -1178,6 +1178,14 @@ impl Name {
             _ => Name::Ident(s.to_string()),
         }
     }
+
+    /// Checks if a name represents a double-quoted string that should get fallback behavior
+    pub fn is_double_quoted(&self) -> bool {
+        if let Self::Quoted(ident) = self {
+            return ident.starts_with("\"");
+        }
+        false
+    }
 }
 
 struct QuotedIterator<'s>(Bytes<'s>, u8);

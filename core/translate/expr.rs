@@ -2715,11 +2715,6 @@ pub fn sanitize_double_quoted_string(input: &str) -> String {
     input[1..input.len() - 1].replace("\"\"", "\"").to_string()
 }
 
-/// Checks if an identifier represents a double-quoted string that should get fallback behavior
-pub fn is_double_quoted_identifier(id_str: &str) -> bool {
-    id_str.len() >= 2 && id_str.starts_with('"') && id_str.ends_with('"')
-}
-
 /// Returns the components of a binary expression
 /// e.g. t.x = 5 -> Some((t.x, =, 5))
 pub fn as_binary_components(

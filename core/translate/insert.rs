@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
 use turso_sqlite3_parser::ast::{
-    DistinctNames, Expr, InsertBody, OneSelect, QualifiedName, ResolveType, ResultColumn, With,
+    self, DistinctNames, Expr, InsertBody, OneSelect, QualifiedName, ResolveType, ResultColumn,
+    With,
 };
 
 use crate::error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY};
@@ -111,6 +112,14 @@ pub fn translate_insert(
                 }
                 let mut param_idx = 1;
                 for expr in values_expr.iter_mut().flat_map(|v| v.iter_mut()) {
+                    if let Expr::Id(name) = expr {
+                        if name.is_double_quoted() {
+                            *expr = Expr::Literal(ast::Literal::String(format!("{name}")));
+                        } else {
+                            // an INSERT INTO ... VALUES (...) cannot reference columns
+                            crate::bail_parse_error!("no such column: {name}");
+                        }
+                    }
                     rewrite_expr(expr, &mut param_idx)?;
                 }
                 values = values_expr.pop();
