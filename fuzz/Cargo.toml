@@ -12,11 +12,12 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 arbitrary = { version = "1.4.1", features = ["derive"] }
 turso_core = { path = "../core", features = ["fuzz"] }
-rusqlite.workspace = true
+rusqlite = { version = "0.37.0", features = ["bundled"] }
 
 # Prevent this from interfering with workspaces
 [workspace]
 members = ["."]
+
 
 [[bin]]
 name = "schema"
