@@ -3833,9 +3833,7 @@ pub fn op_sorter_sort(
         let cursor = cursor.as_sorter_mut();
         let is_empty = cursor.is_empty();
         if !is_empty {
-            if let IOResult::IO = cursor.sort()? {
-                return Ok(InsnFunctionStepResult::IO);
-            }
+            return_if_io!(cursor.sort());
         }
         is_empty
     };
@@ -3865,8 +3863,9 @@ pub fn op_sorter_next(
     let has_more = {
         let mut cursor = state.get_cursor(*cursor_id);
         let cursor = cursor.as_sorter_mut();
-        if let IOResult::IO = cursor.next()? {
-            return Ok(InsnFunctionStepResult::IO);
+        return_if_io!(cursor.next());
+        if let IOResult::IO(io) = cursor.next()? {
+            return Ok(InsnFunctionStepResult::IO(io));
         }
         cursor.has_more()
     };
@@ -6182,7 +6181,7 @@ pub fn op_page_count(
     let count = match pager.with_header(|header| header.database_size.get()) {
         Err(_) => 0.into(),
         Ok(IOResult::Done(v)) => v.into(),
-        Ok(IOResult::IO) => return Ok(InsnFunctionStepResult::IO),
+        Ok(IOResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(io)),
     };
     state.registers[*dest] = Register::Value(Value::Integer(count));
     state.pc += 1;
@@ -6251,7 +6250,7 @@ pub fn op_read_cookie(
     }) {
         Err(_) => 0.into(),
         Ok(IOResult::Done(v)) => v,
-        Ok(IOResult::IO) => return Ok(InsnFunctionStepResult::IO),
+        Ok(IOResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(io)),
     };
 
     state.registers[*dest] = Register::Value(Value::Integer(cookie_value));
@@ -8445,7 +8444,7 @@ pub fn op_max_pgcnt(
         // Set new maximum page count (will be clamped to current database size)
         match pager.set_max_page_count(*new_max as u32)? {
             IOResult::Done(new_max_count) => new_max_count,
-            IOResult::IO => return Ok(InsnFunctionStepResult::IO),
+            IOResult::IO(io) => return Ok(InsnFunctionStepResult::IO(io)),
         }
     };
 
