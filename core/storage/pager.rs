@@ -1,5 +1,4 @@
 use crate::result::LimboResult;
-use crate::storage::wal::{CheckpointResult, Wal};
 use crate::storage::{
     btree::BTreePageInner,
     buffer_pool::BufferPool,
@@ -12,8 +11,7 @@ use crate::storage::{
 use crate::types::{IOCompletions, IOResult, WalFrameInfo};
 use crate::util::IOExt as _;
 use crate::{
-    return_if_io, turso_assert, types::WalFrameInfo, Completion, Connection, IOResult, LimboError,
-    Result, TransactionState,
+    return_if_io, turso_assert, Completion, Connection, LimboError, Result, TransactionState,
 };
 use parking_lot::RwLock;
 use std::cell::{Cell, OnceCell, RefCell, UnsafeCell};

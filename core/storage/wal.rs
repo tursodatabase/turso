@@ -9,7 +9,7 @@ use tracing::{instrument, Level};
 
 use std::fmt::Formatter;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::{cell::Cell, fmt, rc::Rc, sync::Arc};
+use std::{cell::Cell, fmt, sync::Arc};
 
 use crate::fast_lock::SpinLock;
 use crate::io::{File, IO};
