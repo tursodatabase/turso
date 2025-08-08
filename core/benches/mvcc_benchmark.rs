@@ -30,7 +30,6 @@ fn bench(c: &mut Criterion) {
     let mut group = c.benchmark_group("mvcc-ops-throughput");
     group.throughput(Throughput::Elements(1));
 
-    let db = bench_db();
     group.bench_function("begin_tx + rollback_tx", |b| {
         let db = bench_db();
         b.to_async(FuturesExecutor).iter(|| async {

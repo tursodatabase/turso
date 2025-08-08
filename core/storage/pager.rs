@@ -289,10 +289,6 @@ pub enum BtreePageAllocMode {
 /// This will keep track of the state of current cache commit in order to not repeat work
 struct CommitInfo {
     state: CommitState,
-    /// Number of writes taking place. When in_flight gets to 0 we can schedule a fsync.
-    in_flight_writes: Rc<RefCell<usize>>,
-    /// Dirty pages to be flushed.
-    dirty_pages: Vec<usize>,
 }
 
 /// Track the state of the auto-vacuum mode.
@@ -407,7 +403,6 @@ pub struct Pager {
 
     commit_info: RefCell<CommitInfo>,
     checkpoint_state: RefCell<CheckpointState>,
-    checkpoint_inflight: Rc<RefCell<usize>>,
     syncing: Rc<RefCell<bool>>,
     auto_vacuum_mode: RefCell<AutoVacuumMode>,
     /// 0 -> Database is empty,
@@ -518,12 +513,9 @@ impl Pager {
             ))),
             commit_info: RefCell::new(CommitInfo {
                 state: CommitState::Start,
-                in_flight_writes: Rc::new(RefCell::new(0)),
-                dirty_pages: Vec::new(),
             }),
             syncing: Rc::new(RefCell::new(false)),
             checkpoint_state: RefCell::new(CheckpointState::Checkpoint),
-            checkpoint_inflight: Rc::new(RefCell::new(0)),
             buffer_pool,
             auto_vacuum_mode: RefCell::new(AutoVacuumMode::None),
             db_state,
@@ -602,12 +594,12 @@ impl Pager {
                     ptrmap_pg_no
                 );
 
-                let (ptrmap_page, _c) = self.read_page(ptrmap_pg_no as usize)?;
+                let (ptrmap_page, c) = self.read_page(ptrmap_pg_no as usize)?;
                 self.ptrmap_get_state.replace(PtrMapGetState::Deserialize {
                     ptrmap_page,
                     offset_in_ptrmap_page,
                 });
-                Ok(IOResult::IO)
+                Ok(IOResult::IO(IOCompletions::Single(c)))
             }
             PtrMapGetState::Deserialize {
                 ptrmap_page,
@@ -706,12 +698,12 @@ impl Pager {
                         offset_in_ptrmap_page
                     );
 
-                let (ptrmap_page, _c) = self.read_page(ptrmap_pg_no as usize)?;
+                let (ptrmap_page, c) = self.read_page(ptrmap_pg_no as usize)?;
                 self.ptrmap_put_state.replace(PtrMapPutState::Deserialize {
                     ptrmap_page,
                     offset_in_ptrmap_page,
                 });
-                Ok(IOResult::IO)
+                Ok(IOResult::IO(IOCompletions::Single(c)))
             }
             PtrMapPutState::Deserialize {
                 ptrmap_page,
@@ -1922,8 +1914,6 @@ impl Pager {
         self.syncing.replace(false);
         self.commit_info.replace(CommitInfo {
             state: CommitState::Start,
-            in_flight_writes: Rc::new(RefCell::new(0)),
-            dirty_pages: Vec::new(),
         });
         self.allocate_page_state.replace(AllocatePageState::Start);
     }

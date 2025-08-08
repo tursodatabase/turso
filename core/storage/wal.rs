@@ -274,14 +274,6 @@ pub trait Wal {
     fn as_any(&self) -> &dyn std::any::Any;
 }
 
-// Syncing requires a state machine because we need to schedule a sync and then wait until it is
-// finished. If we don't wait there will be undefined behaviour that no one wants to debug.
-#[derive(Copy, Clone, Debug)]
-enum SyncState {
-    NotSyncing,
-    Syncing,
-}
-
 #[derive(Debug, Copy, Clone)]
 pub enum CheckpointState {
     Start,

@@ -1105,7 +1105,7 @@ impl BTreeCursor {
 
                     // Load next page
                     current_offset = 0; // Reset offset for new page
-                    let (page, _c) = self.read_page(next as usize)?;
+                    let (page, c) = self.read_page(next as usize)?;
                     page_btree = page;
 
                     self.state =
@@ -1117,7 +1117,7 @@ impl BTreeCursor {
                             is_write,
                         });
                     // Return IO to allow other operations
-                    return Ok(IOResult::IO(IOCompletions::Single(Completion::new_dummy())));
+                    return Ok(IOResult::IO(IOCompletions::Single(c)));
                 }
                 _ => {
                     return Err(LimboError::InternalError(
@@ -7285,10 +7285,8 @@ mod tests {
     fn validate_btree(pager: Rc<Pager>, page_idx: usize) -> (usize, bool) {
         let num_columns = 5;
         let cursor = BTreeCursor::new_table(None, pager.clone(), page_idx, num_columns);
-        let (page, _c) = cursor.read_page(page_idx).unwrap();
-        while page.get().is_locked() {
-            pager.io.run_once().unwrap();
-        }
+        let (page, c) = cursor.read_page(page_idx).unwrap();
+        pager.io.wait_for_completion(c).unwrap();
         let page = page.get();
         // Pin page in order to not drop it in between
         page.set_dirty();
@@ -7305,10 +7303,8 @@ mod tests {
                 BTreeCell::TableInteriorCell(TableInteriorCell {
                     left_child_page, ..
                 }) => {
-                    let (child_page, _c) = cursor.read_page(left_child_page as usize).unwrap();
-                    while child_page.get().is_locked() {
-                        pager.io.run_once().unwrap();
-                    }
+                    let (child_page, c) = cursor.read_page(left_child_page as usize).unwrap();
+                    pager.io.wait_for_completion(c).unwrap();
                     child_pages.push(child_page);
                     if left_child_page == page.get().id as u32 {
                         valid = false;
@@ -7362,22 +7358,18 @@ mod tests {
         }
         let first_page_type = child_pages.first().map(|p| {
             if !p.get().is_loaded() {
-                let (new_page, _c) = pager.read_page(p.get().get().id).unwrap();
+                let (new_page, c) = pager.read_page(p.get().get().id).unwrap();
                 p.page.replace(new_page);
-            }
-            while p.get().is_locked() {
-                pager.io.run_once().unwrap();
+                pager.io.wait_for_completion(c).unwrap();
             }
             p.get().get_contents().page_type()
         });
         if let Some(child_type) = first_page_type {
             for page in child_pages.iter().skip(1) {
                 if !page.get().is_loaded() {
-                    let (new_page, _c) = pager.read_page(page.get().get().id).unwrap();
+                    let (new_page, c) = pager.read_page(page.get().get().id).unwrap();
                     page.page.replace(new_page);
-                }
-                while page.get().is_locked() {
-                    pager.io.run_once().unwrap();
+                    pager.io.wait_for_completion(c).unwrap();
                 }
                 if page.get().get_contents().page_type() != child_type {
                     tracing::error!("child pages have different types");
@@ -7396,10 +7388,8 @@ mod tests {
         let num_columns = 5;
 
         let cursor = BTreeCursor::new_table(None, pager.clone(), page_idx, num_columns);
-        let (page, _c) = cursor.read_page(page_idx).unwrap();
-        while page.get().is_locked() {
-            pager.io.run_once().unwrap();
-        }
+        let (page, c) = cursor.read_page(page_idx).unwrap();
+        pager.io.wait_for_completion(c).unwrap();
         let page = page.get();
         // Pin page in order to not drop it in between loading of different pages. If not contents will be a dangling reference.
         page.set_dirty();
@@ -8446,10 +8436,8 @@ mod tests {
                 .write_page(current_page as usize, buf.clone(), c)?;
             pager.io.run_once()?;
 
-            let (page, _c) = cursor.read_page(current_page as usize)?;
-            while page.get().is_locked() {
-                cursor.pager.io.run_once()?;
-            }
+            let (page, c) = cursor.read_page(current_page as usize)?;
+            cursor.pager.io.wait_for_completion(c).unwrap();
 
             {
                 let page = page.get();
@@ -8508,7 +8496,8 @@ mod tests {
         let trunk_page_id = freelist_trunk_page;
         if trunk_page_id > 0 {
             // Verify trunk page structure
-            let (trunk_page, _c) = cursor.read_page(trunk_page_id as usize)?;
+            let (trunk_page, c) = cursor.read_page(trunk_page_id as usize)?;
+            cursor.pager.io.wait_for_completion(c).unwrap();
             if let Some(contents) = trunk_page.get().get().contents.as_ref() {
                 // Read number of leaf pages in trunk
                 let n_leaf = contents.read_u32_no_offset(4);
