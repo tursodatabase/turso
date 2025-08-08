@@ -8,6 +8,7 @@ use std::sync::Arc;
 use tempfile;
 
 use crate::return_if_io;
+use crate::types::IOCompletions;
 use crate::util::IOExt;
 use crate::{
     error::LimboError,
@@ -135,8 +136,8 @@ impl Sorter {
                 }
                 SortState::Flush => {
                     self.sort_state = SortState::InitHeap;
-                    if let Some(_c) = self.flush()? {
-                        return Ok(IOResult::IO);
+                    if let Some(c) = self.flush()? {
+                        return Ok(IOResult::IO(IOCompletions::Single(c)));
                     }
                 }
                 SortState::InitHeap => {
@@ -158,10 +159,7 @@ impl Sorter {
             self.records.pop()
         } else {
             // Serve from sorted chunk files.
-            match self.next_from_chunk_heap()? {
-                IOResult::IO => return Ok(IOResult::IO),
-                IOResult::Done(record) => record,
-            }
+            return_if_io!(self.next_from_chunk_heap())
         };
         match record {
             Some(record) => {
@@ -187,8 +185,8 @@ impl Sorter {
                 InsertState::Start => {
                     self.insert_state = InsertState::Insert;
                     if self.current_buffer_size + payload_size > self.max_buffer_size {
-                        if let Some(_c) = self.flush()? {
-                            return Ok(IOResult::IO);
+                        if let Some(c) = self.flush()? {
+                            return Ok(IOResult::IO(IOCompletions::Single(c)));
                         }
                     }
                 }
@@ -217,7 +215,7 @@ impl Sorter {
                     completions.push(c);
                 }
                 self.init_chunk_heap_state = InitChunkHeapState::PushChunk;
-                Ok(IOResult::IO)
+                Ok(IOResult::IO(IOCompletions::Many(completions)))
             }
             InitChunkHeapState::PushChunk => {
                 // Make sure all chunks read at least one record into their buffer.
@@ -226,7 +224,7 @@ impl Sorter {
                     .iter()
                     .any(|chunk| chunk.io_state.get() == SortedChunkIOState::WaitingForRead)
                 {
-                    return Ok(IOResult::IO);
+                    panic!("All chunks should have been read");
                 }
                 self.chunk_heap.reserve(self.chunks.len());
                 // TODO: blocking will be unnecessary here with IO completions
@@ -247,7 +245,7 @@ impl Sorter {
             .iter()
             .any(|chunk| chunk.io_state.get() == SortedChunkIOState::WaitingForRead)
         {
-            return Ok(IOResult::IO);
+            panic!("All chunks should have been read");
         }
         self.wait_for_read_complete.clear();
 
@@ -422,8 +420,8 @@ impl SortedChunk {
                         if self.chunk_size - self.total_bytes_read.get() == 0 {
                             self.io_state.set(SortedChunkIOState::ReadEOF);
                         } else {
-                            let _c = self.read()?;
-                            return Ok(IOResult::IO);
+                            let c = self.read()?;
+                            return Ok(IOResult::IO(IOCompletions::Single(c)));
                         }
                     }
                 }
