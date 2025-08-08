@@ -217,6 +217,14 @@ impl Completion {
             complete,
         ))))
     }
+
+    /// Create a dummy completed completion
+    pub fn new_dummy() -> Self {
+        let c = Self::new_write(|_| {});
+        c.complete(0);
+        c
+    }
+
     pub fn is_completed(&self) -> bool {
         self.inner.is_completed.get()
     }

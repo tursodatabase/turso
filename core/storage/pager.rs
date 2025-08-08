@@ -48,15 +48,12 @@ impl HeaderRef {
                     return Err(LimboError::Page1NotAlloc);
                 }
 
-                let (page, _c) = pager.read_page(DatabaseHeader::PAGE_ID)?;
+                let (page, c) = pager.read_page(DatabaseHeader::PAGE_ID)?;
                 *pager.header_ref_state.borrow_mut() = HeaderRefState::CreateHeader { page };
-                Ok(IOResult::IO)
+                Ok(IOResult::IO(IOCompletions::Single(c)))
             }
             HeaderRefState::CreateHeader { page } => {
-                // TODO: will have to remove this when tracking IO completions
-                if page.is_locked() {
-                    return Ok(IOResult::IO);
-                }
+                turso_assert!(page.is_loaded(), "page should be loaded");
                 turso_assert!(
                     page.get().id == DatabaseHeader::PAGE_ID,
                     "incorrect header page id"
@@ -87,15 +84,12 @@ impl HeaderRefMut {
                     return Err(LimboError::Page1NotAlloc);
                 }
 
-                let (page, _c) = pager.read_page(DatabaseHeader::PAGE_ID)?;
+                let (page, c) = pager.read_page(DatabaseHeader::PAGE_ID)?;
                 *pager.header_ref_state.borrow_mut() = HeaderRefState::CreateHeader { page };
-                Ok(IOResult::IO)
+                Ok(IOResult::IO(IOCompletions::Single(c)))
             }
             HeaderRefState::CreateHeader { page } => {
-                // TODO: will have to remove this when tracking IO completions
-                if page.is_locked() {
-                    return Ok(IOResult::IO);
-                }
+                turso_assert!(page.is_loaded(), "page should be loaded");
                 turso_assert!(
                     page.get().id == DatabaseHeader::PAGE_ID,
                     "incorrect header page id"
@@ -592,10 +586,8 @@ impl Pager {
     /// Returns the new maximum page count (may be clamped to current database size)
     pub fn set_max_page_count(&self, new_max: u32) -> crate::Result<IOResult<u32>> {
         // Get current database size
-        let current_page_count = match self.with_header(|header| header.database_size.get())? {
-            IOResult::Done(size) => size,
-            IOResult::IO => return Ok(IOResult::IO),
-        };
+        let current_page_count =
+            return_if_io!(self.with_header(|header| header.database_size.get()));
 
         // Clamp new_max to be at least the current database size
         let clamped_max = std::cmp::max(new_max, current_page_count);
@@ -979,13 +971,14 @@ impl Pager {
                     (DbState::Uninitialized, false) | (DbState::Initializing, true) => {
                         match self.allocate_page1()? {
                             IOResult::Done(_) => Ok(IOResult::Done(())),
-                            IOResult::IO => Ok(IOResult::IO),
+                            IOResult::IO(io) => Ok(IOResult::IO(io)),
                         }
                     }
-                    _ => Ok(IOResult::IO),
+                    // Dummy completion to force a return IO
+                    _ => Ok(IOResult::IO(IOCompletions::Single(Completion::new_dummy()))),
                 }
             } else {
-                Ok(IOResult::IO)
+                Ok(IOResult::IO(IOCompletions::Single(Completion::new_dummy())))
             }
         } else {
             Ok(IOResult::Done(()))
@@ -997,10 +990,7 @@ impl Pager {
     pub fn begin_write_tx(&self) -> Result<IOResult<LimboResult>> {
         // TODO(Diego): The only possibly allocate page1 here is because OpenEphemeral needs a write transaction
         // we should have a unique API to begin transactions, something like sqlite3BtreeBeginTrans
-        match self.maybe_allocate_page1()? {
-            IOResult::Done(_) => {}
-            IOResult::IO => return Ok(IOResult::IO),
-        }
+        return_if_io!(self.maybe_allocate_page1());
         let Some(wal) = self.wal.as_ref() else {
             return Ok(IOResult::Done(LimboResult::Ok));
         };
@@ -1034,7 +1024,7 @@ impl Pager {
         }
         let commit_status = self.commit_dirty_pages(wal_checkpoint_disabled)?;
         match commit_status {
-            IOResult::IO => Ok(IOResult::IO),
+            IOResult::IO(io) => Ok(IOResult::IO(io)),
             IOResult::Done(_) => {
                 wal.borrow().end_write_tx();
                 wal.borrow().end_read_tx();
@@ -1100,7 +1090,7 @@ impl Pager {
         if let Some(page) = page_cache.get(&page_key) {
             tracing::trace!("read_page(page_idx = {}) = cached", page_idx);
             // Dummy completion being passed, as we do not need to read from database or wal
-            return Ok((page.clone(), Completion::new_write(|_| {})));
+            return Ok((page.clone(), Completion::new_dummy()));
         }
         let (page, c) = self.read_page_no_cache(page_idx, None, false)?;
         self.cache_insert(page_idx, page.clone(), &mut page_cache)?;
