@@ -1,7 +1,7 @@
-use crate::Result;
+use crate::{types::IOCompletions, Result};
 
 pub enum TransitionResult<Result> {
-    Io,
+    Io(IOCompletions),
     Continue,
     Done(Result),
 }
@@ -52,8 +52,8 @@ impl<State: StateTransition> StateTransition for StateMachine<State> {
                 unreachable!("StateMachine::transition: state machine is finalized");
             }
             match self.state.step(context)? {
-                TransitionResult::Io => {
-                    return Ok(TransitionResult::Io);
+                TransitionResult::Io(io) => {
+                    return Ok(TransitionResult::Io(io));
                 }
                 TransitionResult::Continue => {
                     continue;

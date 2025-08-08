@@ -464,7 +464,7 @@ impl Program {
                 for tx_id in mv_transactions.iter() {
                     let mut state_machine =
                         mv_store.commit_tx(*tx_id, pager.clone(), &conn).unwrap();
-                    state_machine
+                    let res = state_machine
                         .step(mv_store)
                         .map_err(|e| LimboError::InternalError(e.to_string()))?;
                     assert!(state_machine.is_finalized());
