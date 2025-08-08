@@ -10,7 +10,7 @@ use crate::{
             LEAF_PAGE_HEADER_SIZE_BYTES, LEFT_CHILD_PTR_SIZE_BYTES,
         },
         state_machines::{
-            AdvanceState, CountState, EmptyTableState, MoveToRightState, RewindState,
+            AdvanceState, CountState, EmptyTableState, MoveToRightState, RewindState, SeekEndState,
             SeekToLastState,
         },
     },
@@ -534,6 +534,8 @@ pub struct BTreeCursor {
     advance_state: AdvanceState,
     /// State machine for [BTreeCursor::count]
     count_state: CountState,
+    /// State machine for [BTreeCursor::seek_end]
+    seek_end_state: SeekEndState,
 }
 
 /// We store the cell index and cell count for each page in the stack.
@@ -599,6 +601,7 @@ impl BTreeCursor {
             rewind_state: RewindState::Start,
             advance_state: AdvanceState::Start,
             count_state: CountState::Start,
+            seek_end_state: SeekEndState::Start,
         }
     }
 
@@ -4071,28 +4074,32 @@ impl BTreeCursor {
 
     pub fn seek_end(&mut self) -> Result<IOResult<()>> {
         assert!(self.mv_cursor.is_none()); // unsure about this -_-
-        let _c = self.move_to_root()?;
-        loop {
-            let mem_page = self.stack.top();
-            let page_id = mem_page.get().get().id;
-            let (page, _c) = self.read_page(page_id)?;
-            return_if_locked_maybe_load!(self.pager, page);
-
-            let page = page.get();
-            let contents = page.get().contents.as_ref().unwrap();
-            if contents.is_leaf() {
-                // set cursor just past the last cell to append
-                self.stack.set_cell_index(contents.cell_count() as i32);
-                return Ok(IOResult::Done(()));
+        match self.seek_end_state {
+            SeekEndState::Start => {
+                let c = self.move_to_root()?;
+                self.seek_end_state = SeekEndState::ProcessPage;
+                return Ok(IOResult::IO(IOCompletions::Single(c)));
             }
-
-            match contents.rightmost_pointer() {
-                Some(right_most_pointer) => {
-                    self.stack.set_cell_index(contents.cell_count() as i32 + 1); // invalid on interior
-                    let (child, _c) = self.read_page(right_most_pointer as usize)?;
-                    self.stack.push(child);
+            SeekEndState::ProcessPage => {
+                let mem_page = self.stack.top();
+                let page = mem_page.get();
+                let contents = page.get().contents.as_ref().unwrap();
+                if contents.is_leaf() {
+                    // set cursor just past the last cell to append
+                    self.stack.set_cell_index(contents.cell_count() as i32);
+                    self.seek_end_state = SeekEndState::Start;
+                    return Ok(IOResult::Done(()));
                 }
-                None => unreachable!("interior page must have rightmost pointer"),
+
+                match contents.rightmost_pointer() {
+                    Some(right_most_pointer) => {
+                        self.stack.set_cell_index(contents.cell_count() as i32 + 1); // invalid on interior
+                        let (child, c) = self.read_page(right_most_pointer as usize)?;
+                        self.stack.push(child);
+                        return Ok(IOResult::IO(IOCompletions::Single(c)));
+                    }
+                    None => unreachable!("interior page must have rightmost pointer"),
+                }
             }
         }
     }
