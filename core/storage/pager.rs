@@ -1464,7 +1464,7 @@ impl Pager {
                         )));
                     }
 
-                    let (page, _c) = match page.take() {
+                    let (page, c) = match page.take() {
                         Some(page) => {
                             assert_eq!(
                                 page.get().id,
@@ -1496,19 +1496,20 @@ impl Pager {
                     } else {
                         *state = FreePageState::NewTrunk { page };
                     }
+                    if let Some(c) = c {
+                        return Ok(IOResult::IO(IOCompletions::Single(c)));
+                    }
                 }
                 FreePageState::AddToTrunk { page, trunk_page } => {
                     let trunk_page_id = header.freelist_trunk_page.get();
                     if trunk_page.is_none() {
                         // Add as leaf to current trunk
-                        let (page, _c) = self.read_page(trunk_page_id as usize)?;
+                        let (page, c) = self.read_page(trunk_page_id as usize)?;
                         trunk_page.replace(page);
-                        return Ok(IOResult::IO);
+                        return Ok(IOResult::IO(IOCompletions::Single(c)));
                     }
                     let trunk_page = trunk_page.as_ref().unwrap();
-                    if trunk_page.is_locked() || !trunk_page.is_loaded() {
-                        return Ok(IOResult::IO);
-                    }
+                    turso_assert!(trunk_page.is_loaded(), "trunk_page should be loaded");
 
                     let trunk_page_contents = trunk_page.get().contents.as_ref().unwrap();
                     let number_of_leaf_pages =
@@ -1540,9 +1541,7 @@ impl Pager {
                     *state = FreePageState::NewTrunk { page: page.clone() };
                 }
                 FreePageState::NewTrunk { page } => {
-                    if page.is_locked() || !page.is_loaded() {
-                        return Ok(IOResult::IO);
-                    }
+                    turso_assert!(page.is_loaded(), "page should be loaded");
                     // If we get here, need to make this page a new trunk
                     turso_assert!(page.get().id == page_id, "page has unexpected id");
                     self.add_dirty(page);
