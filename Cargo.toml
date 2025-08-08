@@ -57,6 +57,7 @@ strum_macros = "0.26"
 serde = "1.0"
 serde_json = "1.0"
 anyhow = "1.0.98"
+rusqlite = { version = "0.37.0", features = ["bundled"] }
 
 [profile.release]
 debug = "line-tables-only"
