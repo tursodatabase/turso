@@ -49,7 +49,7 @@ fn bench(c: &mut Criterion) {
 
     let db = bench_db();
     prepare_tx_statements!(db, begin_stmt, commit_stmt);
-    group.bench_function("begin_tx-commit_tx", |b| {
+    group.bench_function("begin_tx + commit_tx", |b| {
         b.to_async(FuturesExecutor).iter(|| async {
             begin_stmt.borrow_mut().step().unwrap();
             commit_stmt.borrow_mut().step().unwrap();
