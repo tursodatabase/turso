@@ -23,7 +23,7 @@ pub fn emit_program_for_compound_select(
         right_most,
         limit,
         offset,
-        ..
+        order_by,
     } = &plan
     else {
         crate::bail_parse_error!("expected compound select plan");
@@ -77,16 +77,32 @@ pub fn emit_program_for_compound_select(
         _ => (None, None),
     };
 
-    emit_compound_select(
-        program,
-        plan,
-        schema,
-        syms,
-        limit_ctx,
-        offset_reg,
-        yield_reg,
-        reg_result_cols_start,
-    )?;
+    match order_by {
+        Some(_) => {
+            emit_compound_select_with_order_by(
+                program,
+                plan,
+                schema,
+                syms,
+                limit_ctx,
+                offset_reg,
+                yield_reg,
+                reg_result_cols_start,
+            )?;
+        }
+        None => {
+            emit_compound_select(
+                program,
+                plan,
+                schema,
+                syms,
+                limit_ctx,
+                offset_reg,
+                yield_reg,
+                reg_result_cols_start,
+            )?;
+        }
+    }
 
     program.result_columns = right_plan.result_columns;
     program.table_references.extend(right_plan.table_references);
@@ -541,4 +557,289 @@ fn read_intersect_rows(
     program.emit_insn(Insn::Close {
         cursor_id: left_cursor_id,
     });
+}
+
+/// Emits the bytecode for a compound SELECT with ORDER BY clause.
+#[allow(clippy::too_many_arguments)]
+fn emit_compound_select_with_order_by(
+    program: &mut ProgramBuilder,
+    plan: Plan,
+    schema: &Schema,
+    syms: &SymbolTable,
+    _limit_ctx: Option<LimitCtx>,
+    _offset_reg: Option<usize>,
+    yield_reg: Option<usize>,
+    reg_result_cols_start: Option<usize>,
+) -> crate::Result<usize> {
+    let Plan::CompoundSelect {
+        mut left,
+        mut right_most,
+        limit,
+        offset,
+        order_by,
+    } = plan
+    else {
+        unreachable!()
+    };
+
+    match left.pop() {
+        Some((plan, _op)) => {
+            let result_cols_count = plan.result_columns.len();
+            let is_left_empty = left.is_empty();
+            let compound_select = Plan::CompoundSelect {
+                left,
+                right_most: plan,
+                limit,
+                offset,
+                order_by: order_by.clone(),
+            };
+
+            let left_yield_reg = program.alloc_register();
+            let start_offset = program.allocate_label();
+            let jump_on_definition = program.allocate_label();
+            program.emit_insn(Insn::InitCoroutine {
+                yield_reg: left_yield_reg,
+                jump_on_definition,
+                start_offset,
+            });
+            program.preassign_label_to_next_insn(start_offset);
+            let result_start_reg = if !is_left_empty {
+                Some(program.alloc_registers(result_cols_count))
+            } else {
+                None
+            };
+            let left_result_cols_start_reg = emit_compound_select_with_order_by(
+                program,
+                compound_select,
+                schema,
+                syms,
+                _limit_ctx,
+                _offset_reg,
+                Some(left_yield_reg),
+                result_start_reg,
+            )?;
+            program.emit_insn(Insn::EndCoroutine {
+                yield_reg: left_yield_reg,
+            });
+            program.preassign_label_to_next_insn(jump_on_definition);
+
+            let (right_yield_reg, right_result_cols_start_reg) =
+                emit_right_most_clause(program, schema, syms, &mut right_most)?;
+            emit_order_by_rows(
+                program,
+                left_yield_reg,
+                right_yield_reg,
+                left_result_cols_start_reg,
+                right_result_cols_start_reg,
+                result_cols_count,
+                yield_reg,
+                reg_result_cols_start,
+            )
+        }
+        None => {
+            let mut t_ctx = TranslateCtx::new(
+                program,
+                schema,
+                syms,
+                right_most.table_references.joined_tables().len(),
+                right_most.result_columns.len(),
+            );
+            if let Some(reg) = yield_reg {
+                right_most.query_destination = QueryDestination::CoroutineYield {
+                    yield_reg: reg,
+                    coroutine_implementation_start: BranchOffset::Offset(0),
+                };
+            }
+            emit_query(program, &mut right_most, &mut t_ctx)
+        }
+    }
+}
+
+fn emit_right_most_clause(
+    program: &mut ProgramBuilder,
+    schema: &Schema,
+    syms: &SymbolTable,
+    plan: &mut SelectPlan,
+) -> crate::Result<(usize, usize)> {
+    let reg = program.alloc_register();
+    let start_offset = program.allocate_label();
+    let jump_on_definition = program.allocate_label();
+    program.emit_insn(Insn::InitCoroutine {
+        yield_reg: reg,
+        jump_on_definition,
+        start_offset,
+    });
+    program.preassign_label_to_next_insn(start_offset);
+
+    let mut t_ctx = TranslateCtx::new(
+        program,
+        schema,
+        syms,
+        plan.table_references.joined_tables().len(),
+        plan.result_columns.len(),
+    );
+    plan.query_destination = QueryDestination::CoroutineYield {
+        yield_reg: reg,
+        coroutine_implementation_start: start_offset,
+    };
+    let result_cols_start_reg = emit_query(program, plan, &mut t_ctx)?;
+
+    program.emit_insn(Insn::EndCoroutine { yield_reg: reg });
+    program.preassign_label_to_next_insn(jump_on_definition);
+
+    Ok((reg, result_cols_start_reg))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_order_by_rows(
+    program: &mut ProgramBuilder,
+    left_yield_reg: usize,
+    right_yield_reg: usize,
+    left_result_cols_start_reg: usize,
+    right_result_cols_start_reg: usize,
+    result_cols_count: usize,
+    final_yield_reg: Option<usize>,
+    final_result_cols_start_reg: Option<usize>,
+) -> crate::Result<usize> {
+    // emit the bytecodes for the greater value between left and right
+    let left_eof_yield_label = program.allocate_label();
+    program.emit_insn(Insn::Yield {
+        yield_reg: left_yield_reg,
+        end_offset: left_eof_yield_label,
+    });
+    let right_eof_label = program.allocate_label();
+    program.emit_insn(Insn::Yield {
+        yield_reg: right_yield_reg,
+        end_offset: right_eof_label,
+    });
+    let compare_label = program.allocate_label();
+    program.preassign_label_to_next_insn(compare_label);
+    program.emit_insn(Insn::Compare {
+        start_reg_a: left_result_cols_start_reg,
+        start_reg_b: right_result_cols_start_reg,
+        count: result_cols_count,
+        collation: None,
+    });
+    let lt_label = program.allocate_label();
+    let gt_label = program.allocate_label();
+    program.emit_insn(Insn::Jump {
+        target_pc_lt: lt_label,
+        target_pc_eq: lt_label,
+        target_pc_gt: gt_label,
+    });
+
+    program.add_comment(program.offset(), "left-lt-right subroutine");
+    program.emit_insn(Insn::Noop);
+    let lt_return_reg = program.alloc_register();
+    let output_left_label = program.allocate_label();
+    program.preassign_label_to_next_insn(lt_label);
+    program.emit_insn(Insn::Gosub {
+        target_pc: output_left_label,
+        return_reg: lt_return_reg,
+    });
+    let left_eof_label = program.allocate_label();
+    program.emit_insn(Insn::Yield {
+        yield_reg: left_yield_reg,
+        end_offset: left_eof_label,
+    });
+    program.emit_insn(Insn::Goto {
+        target_pc: compare_label,
+    });
+
+    program.add_comment(program.offset(), "left-gt-right subroutine");
+    program.emit_insn(Insn::Noop);
+    let gt_return_reg = program.alloc_register();
+    let output_right_label = program.allocate_label();
+    program.preassign_label_to_next_insn(gt_label);
+    program.emit_insn(Insn::Gosub {
+        target_pc: output_right_label,
+        return_reg: gt_return_reg,
+    });
+    program.emit_insn(Insn::Yield {
+        yield_reg: right_yield_reg,
+        end_offset: right_eof_label,
+    });
+    program.emit_insn(Insn::Goto {
+        target_pc: compare_label,
+    });
+
+    program.add_comment(program.offset(), "output coroutine for left");
+    program.emit_insn(Insn::Noop);
+    program.preassign_label_to_next_insn(output_left_label);
+    match final_result_cols_start_reg {
+        Some(start_reg) => {
+            program.emit_insn(Insn::Move {
+                source_reg: left_result_cols_start_reg,
+                dest_reg: start_reg,
+                count: result_cols_count,
+            });
+            program.emit_insn(Insn::Yield {
+                yield_reg: final_yield_reg.unwrap(),
+                end_offset: BranchOffset::Offset(0),
+            });
+        }
+        None => program.emit_result_row(left_result_cols_start_reg, result_cols_count),
+    }
+    program.emit_insn(Insn::Return {
+        return_reg: lt_return_reg,
+        can_fallthrough: false,
+    });
+
+    program.add_comment(program.offset(), "output coroutine for right");
+    program.emit_insn(Insn::Noop);
+    program.preassign_label_to_next_insn(output_right_label);
+    match final_result_cols_start_reg {
+        Some(start_reg) => {
+            program.emit_insn(Insn::Move {
+                source_reg: right_result_cols_start_reg,
+                dest_reg: start_reg,
+                count: result_cols_count,
+            });
+            program.emit_insn(Insn::Yield {
+                yield_reg: final_yield_reg.unwrap(),
+                end_offset: BranchOffset::Offset(0),
+            });
+        }
+        None => program.emit_result_row(right_result_cols_start_reg, result_cols_count),
+    }
+    program.emit_insn(Insn::Return {
+        return_reg: gt_return_reg,
+        can_fallthrough: false,
+    });
+
+    program.add_comment(program.offset(), "eof-left subroutine");
+    program.emit_insn(Insn::Noop);
+    let end_label = program.allocate_label();
+    program.preassign_label_to_next_insn(left_eof_label);
+    program.emit_insn(Insn::Gosub {
+        target_pc: output_right_label,
+        return_reg: gt_return_reg,
+    });
+    program.preassign_label_to_next_insn(left_eof_yield_label);
+    program.emit_insn(Insn::Yield {
+        yield_reg: right_yield_reg,
+        end_offset: end_label,
+    });
+    program.emit_insn(Insn::Goto {
+        target_pc: left_eof_label,
+    });
+
+    program.add_comment(program.offset(), "eof-right subroutine");
+    program.emit_insn(Insn::Noop);
+    program.preassign_label_to_next_insn(right_eof_label);
+    program.emit_insn(Insn::Gosub {
+        target_pc: output_left_label,
+        return_reg: lt_return_reg,
+    });
+    program.emit_insn(Insn::Yield {
+        yield_reg: left_yield_reg,
+        end_offset: end_label,
+    });
+    program.emit_insn(Insn::Goto {
+        target_pc: right_eof_label,
+    });
+
+    program.preassign_label_to_next_insn(end_label);
+
+    Ok(final_result_cols_start_reg.unwrap_or(0))
 }

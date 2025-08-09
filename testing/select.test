@@ -297,6 +297,54 @@ do_execsql_test_on_specific_db {:memory:} select-union-all-with-filters {
 6
 10}
 
+do_execsql_test_on_specific_db {:memory:} select-union-all-with-order-by {
+  CREATE TABLE t1 (x INTEGER);
+  CREATE TABLE t2 (x INTEGER);
+
+  INSERT INTO t1 VALUES(2),(3),(4);
+  INSERT INTO t2 VALUES(1),(3);
+
+  SELECT x FROM t1 UNION ALL SELECT x FROM t2 order by x
+} {1
+2
+3
+3
+4}
+
+do_execsql_test_on_specific_db {:memory:} select-union-all-with-order-by-2 {
+  CREATE TABLE t1 (x INTEGER);
+  CREATE TABLE t2 (x INTEGER);
+
+  INSERT INTO t1 VALUES(1),(4),(6),(7);
+  INSERT INTO t2 VALUES(2),(3),(5),(8);
+
+  SELECT x FROM t1 UNION ALL SELECT x FROM t2 order by x
+} {1
+2
+3
+4
+5
+6
+7
+8}
+
+do_execsql_test_on_specific_db {:memory:} select-union-all-with-order-by-3 {
+  CREATE TABLE t1 (x INTEGER);
+  CREATE TABLE t2 (x INTEGER);
+  CREATE TABLE t3 (x INTEGER);
+
+  INSERT INTO t1 VALUES(1),(4);
+  INSERT INTO t2 VALUES(2),(3);
+  INSERT INTO t3 VALUES(3),(2);
+
+  SELECT x FROM t1 UNION ALL SELECT x FROM t2 UNION ALL SELECT x FROM t3 order by x
+} {1
+2
+2
+3
+3
+4}
+
 do_execsql_test_error select-star-no-from {
   SELECT *;
 } {no tables specified}
