@@ -77,11 +77,9 @@ pub struct Sorter {
     max_payload_size_in_buffer: usize,
     /// The IO object.
     io: Arc<dyn IO>,
-    /// The indices of the chunks for which the read is not complete.
-    wait_for_read_complete: Vec<usize>,
     /// The temporary file for chunks.
     temp_file: Option<TempFile>,
-    /// Offset where the next chunk will be placed in the `temp_fil`
+    /// Offset where the next chunk will be placed in the `temp_file`
     next_chunk_offset: usize,
     /// State machine for [Sorter::sort]
     sort_state: SortState,
@@ -121,7 +119,6 @@ impl Sorter {
             min_chunk_read_buffer_size: min_chunk_read_buffer_size_bytes,
             max_payload_size_in_buffer: 0,
             io,
-            wait_for_read_complete: Vec::new(),
             temp_file: None,
             next_chunk_offset: 0,
             sort_state: SortState::Start,
@@ -277,7 +274,6 @@ impl Sorter {
         {
             return Ok(IOResult::IO);
         }
-        self.wait_for_read_complete.clear();
 
         if let Some((next_record, next_chunk_idx)) = self.chunk_heap.pop() {
             // TODO: blocking will be unnecessary here with IO completions
@@ -301,9 +297,6 @@ impl Sorter {
                 )?),
                 chunk_idx,
             ));
-            if let SortedChunkIOState::WaitingForRead = chunk.io_state.get() {
-                self.wait_for_read_complete.push(chunk_idx);
-            }
         }
 
         Ok(IOResult::Done(()))
