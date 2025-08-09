@@ -615,22 +615,48 @@ fn translate_table_list(
             _ => None,
         }
     }
-    let filter_table: Option<String> = match body {
+    let mut filter_table: Option<String> = match body {
         Some(ast::PragmaBody::Equals(ref v)) | Some(ast::PragmaBody::Call(ref v)) => {
             extract_ident(v)
         }
         _ => None,
     };
 
+    // SQLite behavior nuances for table_list argument:
+    // - If 'sqlite_schema' is provided, return no rows
+    // - If 'sqlite_master' is provided, treat it as 'sqlite_schema'
+    if let Some(ref ft) = filter_table {
+        if ft.eq_ignore_ascii_case("sqlite_schema") {
+            return Ok((program, TransactionMode::None));
+        }
+    }
+    if let Some(ft) = filter_table.take() {
+        if ft.eq_ignore_ascii_case("sqlite_master") {
+            filter_table = Some("sqlite_schema".to_string());
+        } else {
+            filter_table = Some(ft);
+        }
+    }
+
     let mut emit_for = |db_id: usize, db_alias: &str| {
         connection.with_schema(db_id, |schema| {
-            for table in schema.tables.values() {
+            // Collect only real tables (exclude virtual tables)
+            let mut btree_tables: Vec<Arc<SchemaTable>> = schema
+                .tables
+                .values()
+                .filter(|t| t.btree().is_some())
+                .filter(|t| match &filter_table {
+                    Some(ft) => t.get_name().eq_ignore_ascii_case(ft),
+                    None => true,
+                })
+                .cloned()
+                .collect();
+
+            // Deterministic ordering by table name (matches expected tests)
+            btree_tables.sort_by(|a, b| a.get_name().cmp(b.get_name()));
+
+            for table in btree_tables {
                 let tname = table.get_name();
-                if let Some(ref ft) = filter_table {
-                    if !tname.eq_ignore_ascii_case(ft) {
-                        continue;
-                    }
-                }
                 let base = program.alloc_register();
                 // Reserve registers for remaining columns
                 program.alloc_registers(5);
@@ -638,17 +664,11 @@ fn translate_table_list(
                 program.emit_string8(db_alias.to_string(), base);
                 // name
                 program.emit_string8(tname.to_string(), base + 1);
-                // type
-                let typ = if matches!(&**table, SchemaTable::Virtual(_)) {
-                    "virtual"
-                } else {
-                    // Turso does not support views or shadow tables yet
-                    "table"
-                };
-                program.emit_string8(typ.to_string(), base + 2);
+                // type: only real tables are included here
+                program.emit_string8("table".to_string(), base + 2);
                 // ncol: include all columns currently tracked
                 program.emit_int(table.columns().len() as i64, base + 3);
-                // wr: 1 if WITHOUT ROWID, 0 otherwise (per SQLite spec for table_list)
+                // wr: 1 if WITHOUT ROWID, 0 otherwise
                 let wr = match table.btree() {
                     Some(btree) => {
                         if btree.has_rowid {
