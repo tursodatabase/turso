@@ -1818,6 +1818,8 @@ pub enum PragmaName {
     PageSize,
     /// make connection query only
     QueryOnly,
+    /// list tables in schema(s)
+    TableList,
     /// Returns schema version of the database file.
     SchemaVersion,
     /// returns information about the columns of a table

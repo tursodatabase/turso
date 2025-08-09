@@ -163,7 +163,7 @@ Turso aims to be fully compatible with SQLite, with opt-in features not supporte
 | PRAGMA stats                     | No         | Used for testing in SQLite                   |
 | PRAGMA synchronous               | No         |                                              |
 | PRAGMA table_info                | Yes        |                                              |
-| PRAGMA table_list                | No         |                                              |
+| PRAGMA table_list                | Yes        |                                              |
 | PRAGMA table_xinfo               | No         |                                              |
 | PRAGMA temp_store                | No         |                                              |
 | PRAGMA temp_store_directory      | Not Needed | deprecated in SQLite                         |

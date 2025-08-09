@@ -102,6 +102,10 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
             PragmaFlags::Result0 | PragmaFlags::NoColumns1,
             &["query_only"],
         ),
+        TableList => Pragma::new(
+            PragmaFlags::Result0,
+            &["schema", "name", "type", "ncol", "wr", "strict"],
+        ),
     }
 }
 

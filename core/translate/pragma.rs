@@ -9,6 +9,7 @@ use turso_sqlite3_parser::ast::{PragmaName, QualifiedName};
 
 use crate::pragma::pragma_for;
 use crate::schema::Schema;
+use crate::schema::Table as SchemaTable;
 use crate::storage::pager::AutoVacuumMode;
 use crate::storage::sqlite3_ondisk::CacheSize;
 use crate::storage::wal::CheckpointMode;
@@ -58,6 +59,17 @@ pub fn translate_pragma(
         Ok(pragma) => pragma,
         Err(_) => bail_parse_error!("Not a valid pragma name"),
     };
+
+    // Special handling for schema-qualified PRAGMAs that need the name
+    if let PragmaName::TableList = pragma {
+        let (mut program, mode) = translate_table_list(name, body, connection, program)?;
+        match mode {
+            TransactionMode::Read => program.begin_read_operation(),
+            TransactionMode::Write => program.begin_write_operation(),
+            TransactionMode::None => {}
+        }
+        return Ok(program);
+    }
 
     let (mut program, mode) = match body {
         None => query_pragma(pragma, schema, None, pager, connection, program)?,
@@ -292,6 +304,7 @@ fn update_pragma(
             Ok((program, TransactionMode::Write))
         }
         PragmaName::DatabaseList => unreachable!("database_list cannot be set"),
+        PragmaName::TableList => unreachable!("table_list cannot be set"),
         PragmaName::QueryOnly => query_pragma(
             PragmaName::QueryOnly,
             schema,
@@ -354,6 +367,8 @@ fn query_pragma(
             }
             Ok((program, TransactionMode::None))
         }
+        // TableList handled in translate_pragma to support schema/table filters
+        PragmaName::TableList => unreachable!("table_list handled in translate_pragma"),
         PragmaName::Encoding => {
             let encoding = pager
                 .io
@@ -563,6 +578,117 @@ fn query_pragma(
             Ok((program, TransactionMode::None))
         }
     }
+}
+
+fn translate_table_list(
+    name: &ast::QualifiedName,
+    body: Option<ast::PragmaBody>,
+    connection: Arc<crate::Connection>,
+    mut program: ProgramBuilder,
+) -> crate::Result<(ProgramBuilder, TransactionMode)> {
+    // Add columns first
+    let pragma = pragma_for(&PragmaName::TableList);
+    for col_name in pragma.columns.iter() {
+        program.add_pragma_result_column(col_name.to_string());
+    }
+
+    // Determine schema filter
+    // If name.db_name is present and not "main", use attached schema by that name, else main
+    let filter_schema: Option<String> = name
+        .db_name
+        .as_ref()
+        .map(|n| crate::util::normalize_ident(n.as_str()));
+
+    // Determine table-name filter from value Expr (handles name, 'string', or parentheses)
+    fn extract_ident(e: &ast::Expr) -> Option<String> {
+        match e {
+            ast::Expr::Name(n) => {
+                let s = n.as_str();
+                if s.len() >= 2 && s.starts_with('\'') && s.ends_with('\'') {
+                    Some(crate::util::normalize_ident(&s[1..s.len()-1]))
+                } else {
+                    Some(crate::util::normalize_ident(s))
+                }
+            }
+            ast::Expr::Literal(ast::Literal::String(s)) => Some(crate::util::normalize_ident(s)),
+            ast::Expr::Parenthesized(v) if !v.is_empty() => extract_ident(&v[0]),
+            _ => None,
+        }
+    }
+    let filter_table: Option<String> = match body {
+        Some(ast::PragmaBody::Equals(ref v)) | Some(ast::PragmaBody::Call(ref v)) => extract_ident(v),
+        _ => None,
+    };
+
+    let mut emit_for = |db_id: usize, db_alias: &str| {
+        connection.with_schema(db_id, |schema| {
+            for table in schema.tables.values() {
+                let tname = table.get_name();
+                if let Some(ref ft) = filter_table {
+                    if !tname.eq_ignore_ascii_case(ft) {
+                        continue;
+                    }
+                }
+                let base = program.alloc_register();
+                // Reserve registers for remaining columns
+                program.alloc_registers(5);
+                // schema
+                program.emit_string8(db_alias.to_string(), base);
+                // name
+                program.emit_string8(tname.to_string(), base + 1);
+                // type
+                let typ = if matches!(&**table, SchemaTable::Virtual(_)) {
+                    "virtual"
+                } else {
+                    // Turso does not support views or shadow tables yet
+                    "table"
+                };
+                program.emit_string8(typ.to_string(), base + 2);
+                // ncol: include all columns currently tracked
+                program.emit_int(table.columns().len() as i64, base + 3);
+                // wr: 1 if WITHOUT ROWID, 0 otherwise (per SQLite spec for table_list)
+                let wr = match table.btree() {
+                    Some(btree) => if btree.has_rowid { 0 } else { 1 },
+                    None => 0,
+                };
+                program.emit_int(wr, base + 4);
+                // strict
+                let strict = match table.btree() {
+                    Some(btree) => if btree.is_strict { 1 } else { 0 },
+                    None => 0,
+                };
+                program.emit_int(strict, base + 5);
+                program.emit_result_row(base, 6);
+            }
+        });
+    };
+
+    match filter_schema.as_deref() {
+        Some("main") | None => {
+            if filter_schema.is_none() || filter_schema.as_deref() == Some("main") {
+                emit_for(0, "main");
+            }
+            // If no schema filter, include attached schemas too
+            if filter_schema.is_none() {
+                for db_name in connection.list_attached_databases() {
+                    if let Some((idx, _db)) = connection.get_attached_database(&db_name) {
+                        emit_for(idx, &db_name);
+                    }
+                }
+            }
+        }
+        Some("temp") => {
+            // temp maps to database_id 1 per our implementation
+            emit_for(1, "temp");
+        }
+        Some(other) => {
+            if let Some((idx, _db)) = connection.get_attached_database(other) {
+                emit_for(idx, other);
+            }
+        }
+    }
+
+    Ok((program, TransactionMode::None))
 }
 
 fn update_auto_vacuum_mode(
