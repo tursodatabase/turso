@@ -2,8 +2,10 @@ use std::fmt::Display;
 use std::mem;
 use std::ops::Deref;
 use std::panic::UnwindSafe;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
@@ -60,10 +62,10 @@ impl Deref for SimulatorTables {
 
 pub(crate) struct SimulatorEnv {
     pub(crate) opts: SimulatorOpts,
-    pub(crate) connections: Vec<SimConnection>,
+    pub(crate) connections: Vec<Arc<Mutex<SimConnection>>>,
     pub(crate) io: Arc<SimulatorIO>,
     pub(crate) db: Arc<Database>,
-    pub(crate) rng: ChaCha8Rng,
+    pub(crate) rng: Arc<Mutex<ChaCha8Rng>>,
     pub(crate) paths: Paths,
     pub(crate) type_: SimulationType,
     pub(crate) phase: SimulationPhase,
@@ -78,7 +80,7 @@ impl SimulatorEnv {
             opts: self.opts.clone(),
             tables: self.tables.clone(),
             connections: (0..self.connections.len())
-                .map(|_| SimConnection::Disconnected)
+                .map(|_| Arc::new(Mutex::new(SimConnection::Disconnected)))
                 .collect(),
             io: self.io.clone(),
             db: self.db.clone(),
@@ -91,8 +93,10 @@ impl SimulatorEnv {
 
     pub(crate) fn clear(&mut self) {
         self.tables.clear();
-        self.connections.iter_mut().for_each(|c| c.disconnect());
-        self.rng = ChaCha8Rng::seed_from_u64(self.opts.seed);
+        self.connections
+            .iter_mut()
+            .for_each(|c| c.lock().unwrap().disconnect());
+        self.rng = Arc::new(Mutex::new(ChaCha8Rng::seed_from_u64(self.opts.seed)));
 
         let io = Arc::new(
             SimulatorIO::new(
@@ -219,7 +223,7 @@ impl SimulatorEnv {
         let opts = SimulatorOpts {
             seed,
             ticks: rng.gen_range(cli_opts.minimum_tests..=cli_opts.maximum_tests),
-            max_connections: 1, // TODO: for now let's use one connection as we didn't implement
+            max_connections: rng.gen_range(1..=cli_opts.max_connections),
             // correct transactions processing
             max_tables: rng.gen_range(0..128),
             create_percent,
@@ -287,7 +291,7 @@ impl SimulatorEnv {
         };
 
         let connections = (0..opts.max_connections)
-            .map(|_| SimConnection::Disconnected)
+            .map(|_| Arc::new(Mutex::new(SimConnection::Disconnected)))
             .collect::<Vec<_>>();
 
         SimulatorEnv {
@@ -295,7 +299,7 @@ impl SimulatorEnv {
             tables: SimulatorTables::new(),
             connections,
             paths,
-            rng,
+            rng: Arc::new(Mutex::new(rng)),
             io,
             db,
             type_: simulation_type,
@@ -308,7 +312,11 @@ impl SimulatorEnv {
             panic!("connection index out of bounds");
         }
 
-        if self.connections[connection_index].is_connected() {
+        if self.connections[connection_index]
+            .lock()
+            .unwrap()
+            .is_connected()
+        {
             log::trace!(
                 "Connection {connection_index} is already connected, skipping reconnection"
             );
@@ -317,17 +325,19 @@ impl SimulatorEnv {
 
         match self.type_ {
             SimulationType::Default | SimulationType::Doublecheck => {
-                self.connections[connection_index] = SimConnection::LimboConnection(
-                    self.db
-                        .connect()
-                        .expect("Failed to connect to Limbo database"),
-                );
+                self.connections[connection_index] =
+                    Arc::new(Mutex::new(SimConnection::LimboConnection(
+                        self.db
+                            .connect()
+                            .expect("Failed to connect to Limbo database"),
+                    )));
             }
             SimulationType::Differential => {
-                self.connections[connection_index] = SimConnection::SQLiteConnection(
-                    rusqlite::Connection::open(self.get_db_path())
-                        .expect("Failed to open SQLite connection"),
-                );
+                self.connections[connection_index] =
+                    Arc::new(Mutex::new(SimConnection::SQLiteConnection(
+                        rusqlite::Connection::open(self.get_db_path())
+                            .expect("Failed to open SQLite connection"),
+                    )));
             }
         };
     }
