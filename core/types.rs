@@ -100,6 +100,7 @@ pub trait Extendable<T> {
 }
 
 impl<T: AnyText> Extendable<T> for Text {
+    #[inline(always)]
     fn do_extend(&mut self, other: &T) {
         self.value.clear();
         self.value.extend_from_slice(other.as_ref().as_bytes());
@@ -108,6 +109,7 @@ impl<T: AnyText> Extendable<T> for Text {
 }
 
 impl<T: AnyBlob> Extendable<T> for Vec<u8> {
+    #[inline(always)]
     fn do_extend(&mut self, other: &T) {
         self.clear();
         self.extend_from_slice(other.as_slice());
@@ -136,6 +138,12 @@ impl AnyText for TextRef {
     }
 }
 
+impl AnyText for &str {
+    fn subtype(&self) -> TextSubtype {
+        TextSubtype::Text
+    }
+}
+
 pub trait AnyBlob {
     fn as_slice(&self) -> &[u8];
 }
@@ -149,6 +157,12 @@ impl AnyBlob for RawSlice {
 impl AnyBlob for Vec<u8> {
     fn as_slice(&self) -> &[u8] {
         self.as_slice()
+    }
+}
+
+impl AnyBlob for &[u8] {
+    fn as_slice(&self) -> &[u8] {
+        self
     }
 }
 
