@@ -1,5 +1,6 @@
 package tech.turso.jdbc4;
 
+import static org.assertj.core.api.AssertionsForClassTypes.assertThat;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -260,5 +261,20 @@ class JDBC4PreparedStatementTest {
     assertEquals(2.2f, rs.getFloat(2));
     assertEquals("row2", rs.getString(3));
     assertArrayEquals(new byte[] {4, 5, 6}, rs.getBytes(4));
+  }
+
+  @Test
+  void executeUpdate_should_return_inserted_or_updated_rows() throws SQLException {
+    connection.prepareStatement("CREATE TABLE test (col INTEGER)").execute();
+    PreparedStatement insertStmt =
+        connection.prepareStatement("INSERT INTO test (col) VALUES (?), (?), (?);");
+    insertStmt.setInt(1, 1);
+    insertStmt.setInt(2, 1);
+    insertStmt.setInt(3, 1);
+    assertThat(insertStmt.executeUpdate()).isEqualTo(3);
+
+    PreparedStatement updateStmt =
+        connection.prepareStatement("UPDATE test SET col = 2 WHERE col = 1");
+    assertThat(updateStmt.executeUpdate()).isEqualTo(3);
   }
 }
