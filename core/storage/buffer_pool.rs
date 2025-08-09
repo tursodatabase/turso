@@ -227,6 +227,22 @@ impl BufferPool {
     pub fn free(&self, size: usize, arena_id: u32, page_id: u32) {
         self.inner_mut().free(size, arena_id, page_id);
     }
+
+    /// Request a sequential 'run' of buffers that are contiguous in memory, useful
+    /// for coalescing multiple I/O operations together.
+    pub fn alloc_page_run(&self, pages: u32) -> Option<PageRun> {
+        let inner = self.inner_mut();
+        let arena = inner.page_arena.as_ref()?;
+        let (ptr, first_idx) = arena.try_alloc_many_raw(pages)?;
+        Some(PageRun {
+            base: ptr,
+            first_idx,
+            pages,
+            page_sz: arena.page_size,
+            arena_id: arena.id,
+            cursor: 0,
+        })
+    }
 }
 
 impl PoolInner {
@@ -429,10 +445,24 @@ impl Arena {
         self.allocated_pages
             .fetch_add(pages as usize, Ordering::Relaxed);
         let offset = first_idx as usize * self.page_size;
-        let ptr = unsafe { NonNull::new_unchecked(self.base.as_ptr().add(offset)) };
+        let ptr = unsafe { NonNull::new(self.base.as_ptr().add(offset))? };
         Some(Buffer::new_pooled(ArenaBuffer::new(
             ptr, size, self.id, first_idx,
         )))
+    }
+
+    fn try_alloc_many_raw(&self, pages: u32) -> Option<(NonNull<u8>, u32)> {
+        let mut freemap = self.free_pages.lock();
+        let first_idx = freemap.alloc_run(pages)?;
+        tracing::trace!(
+            "allocated {pages} pages starting at idx=({first_idx}), out of total_pages: {}",
+            self.arena_size / self.page_size
+        );
+        self.allocated_pages
+            .fetch_add(pages as usize, Ordering::Relaxed);
+        let offset = first_idx as usize * self.page_size;
+        let ptr = unsafe { NonNull::new(self.base.as_ptr().add(offset))? };
+        Some((ptr, first_idx))
     }
 
     /// Mark all relevant pages that include `size` starting at `page_idx` as free.
@@ -445,6 +475,87 @@ impl Arena {
         );
         bm.free_run(page_idx, count as u32);
         self.allocated_pages.fetch_sub(count, Ordering::Relaxed);
+    }
+}
+
+pub struct PageRun {
+    base: NonNull<u8>,
+    first_idx: u32,
+    pages: u32,
+    page_sz: usize,
+    arena_id: u32,
+    cursor: u32,
+}
+
+impl PageRun {
+    pub fn new(
+        base: NonNull<u8>,
+        first_idx: u32,
+        pages: u32,
+        page_sz: usize,
+        arena_id: u32,
+    ) -> Self {
+        PageRun {
+            base,
+            first_idx,
+            pages,
+            page_sz,
+            arena_id,
+            cursor: 0,
+        }
+    }
+    #[inline]
+    pub const fn len_bytes(&self) -> usize {
+        self.pages as usize * self.page_sz
+    }
+
+    pub const fn remaining(&self) -> usize {
+        (self.pages - self.cursor) as usize
+    }
+    pub const fn is_exhausted(&self) -> bool {
+        self.remaining() == 0
+    }
+    /// Returns a Buffer owning exactly one page of this run,
+    /// advancing the cursor. Returns None if fully consumed.
+    pub fn next_page(&mut self) -> Option<Buffer> {
+        if self.cursor >= self.pages {
+            return None;
+        }
+        // base already points at first_idx, so advance by `cursor` pages.
+        let ptr =
+            NonNull::new(unsafe { self.base.as_ptr().add(self.page_sz * self.cursor as usize) })?;
+        let idx = self.first_idx + self.cursor;
+        self.cursor += 1;
+        Some(Buffer::new_pooled(ArenaBuffer::new(
+            ptr,
+            self.page_sz,
+            self.arena_id,
+            idx,
+        )))
+    }
+    #[inline]
+    pub fn fixed_id(&self) -> Option<u32> {
+        if self.arena_id < UNREGISTERED_START {
+            Some(self.arena_id)
+        } else {
+            None
+        }
+    }
+}
+
+impl Drop for PageRun {
+    fn drop(&mut self) {
+        let pool = BUFFER_POOL.get().expect("buffer pool not initialized");
+        // free any unused `pages` pages starting at first_idx + cursor
+        let free_idx_start = self.first_idx + self.cursor;
+        let remaining = self.remaining();
+        if remaining > 0 {
+            pool.inner_mut()
+                .page_arena
+                .as_ref()
+                .unwrap()
+                .free(free_idx_start, remaining);
+        }
     }
 }
 
