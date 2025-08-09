@@ -1818,12 +1818,12 @@ pub enum PragmaName {
     PageSize,
     /// make connection query only
     QueryOnly,
-    /// list tables in schema(s)
-    TableList,
     /// Returns schema version of the database file.
     SchemaVersion,
     /// returns information about the columns of a table
     TableInfo,
+    /// list tables in schema(s)
+    TableList,
     /// enable capture-changes logic for the connection
     UnstableCaptureDataChangesConn,
     /// Returns the user version of the database file.
