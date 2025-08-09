@@ -124,6 +124,7 @@ impl SimulatorEnv {
         ) {
             Ok(db) => db,
             Err(e) => {
+                tracing::error!(%e);
                 panic!("error opening simulator test file {db_path:?}: {e:?}");
             }
         };
@@ -463,5 +464,14 @@ impl Paths {
     }
     pub(crate) fn plan(&self, type_: &SimulationType, phase: &SimulationPhase) -> PathBuf {
         self.path_(type_, phase).with_extension("sql")
+    }
+
+    pub fn delete_all_files(&self) {
+        if self.base.exists() {
+            let res = std::fs::remove_dir_all(&self.base);
+            if res.is_err() {
+                tracing::error!(error = %res.unwrap_err(),"failed to remove directory");
+            }
+        }
     }
 }

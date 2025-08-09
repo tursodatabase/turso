@@ -136,6 +136,10 @@ fn testing_main(cli_opts: &SimulatorCLI) -> anyhow::Result<()> {
     println!("seed: {seed}");
     println!("path: {}", paths.base.display());
 
+    if result.is_ok() {
+        paths.delete_all_files();
+    }
+
     result
 }
 

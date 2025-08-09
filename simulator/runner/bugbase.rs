@@ -439,11 +439,6 @@ impl BugBase {
         &self.path
     }
 
-    /// Get the path to the database file for a given seed.
-    pub(crate) fn db_path(&self, seed: u64) -> PathBuf {
-        self.path.join(format!("{seed}/test.db"))
-    }
-
     /// Get paths to all the files for a given seed.
     pub(crate) fn paths(&self, seed: u64) -> Paths {
         let base = self.path.join(format!("{seed}/"));
