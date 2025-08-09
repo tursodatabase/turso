@@ -667,10 +667,20 @@ pub unsafe extern "C" fn sqlite3_column_blob(
 
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_column_bytes(
-    _stmt: *mut sqlite3_stmt,
-    _idx: ffi::c_int,
+    stmt: *mut sqlite3_stmt,
+    idx: ffi::c_int,
 ) -> ffi::c_int {
-    stub!();
+    let stmt = &mut *stmt;
+    let row = stmt.stmt.row();
+    let row = match row.as_ref() {
+        Some(row) => row,
+        None => return 0,
+    };
+    match row.get::<&Value>(idx as usize) {
+        Ok(turso_core::Value::Text(text)) => text.as_str().len() as ffi::c_int,
+        Ok(turso_core::Value::Blob(blob)) => blob.len() as ffi::c_int,
+        _ => 0,
+    }
 }
 
 #[no_mangle]
