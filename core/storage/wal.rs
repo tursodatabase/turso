@@ -372,6 +372,7 @@ struct OngoingCheckpoint {
 
 impl OngoingCheckpoint {
     #[inline]
+    /// Find the next `run` of consecutive page ID's in the `worklist`
     fn next_run_len(&self) -> usize {
         let mut pages = 0;
         let mut expect = None;
@@ -391,6 +392,7 @@ impl OngoingCheckpoint {
         pages
     }
 
+    /// Set the buffer of the current `scratch-page`
     fn set_scratch_page(&self, page_id: usize, buf: Arc<Buffer>) {
         unsafe {
             let inner = &mut *self.scratch_page.inner.get();
@@ -400,6 +402,7 @@ impl OngoingCheckpoint {
         }
     }
 
+    /// allocate a run of length `want` if we dont have an ongoing run already
     fn ensure_run_for_next(&mut self, pool: &Arc<BufferPool>, want: usize) {
         if self.current_run.is_some() {
             return;
@@ -407,6 +410,7 @@ impl OngoingCheckpoint {
         self.current_run = pool.alloc_page_run(want as u32);
     }
 
+    /// build a `worklist` of all the page_id/frame_id's for the current checkpoint
     fn build_worklist(&mut self, shared: &WalFileShared) {
         let pages = shared.pages_in_frames.lock().clone();
         let mut pages: Vec<u64> = pages;
@@ -1538,9 +1542,11 @@ impl WalFile {
                 // WaitFlush: after the run flush, either start next run or finish
                 CheckpointState::WaitFlush => {
                     match self.ongoing_checkpoint.pending_flush.as_ref() {
-                        Some(pf) if pf.done.load(Ordering::SeqCst) => {}
+                        Some(pf) if pf.done.load(Ordering::SeqCst) => {
+                            tracing::trace!("checkpoint backfilling batch done");
+                        }
                         Some(_) => return Ok(IOResult::IO),
-                        None => unreachable!("pending flush required"),
+                        None => panic!("we should have a pending flush here"),
                     }
                     let pf = self.ongoing_checkpoint.pending_flush.as_ref().unwrap();
                     pf.clear_dirty(pager);
