@@ -639,6 +639,36 @@ fn translate_table_list(
     }
 
     let mut emit_for = |db_id: usize, db_alias: &str| {
+        // Special-case TEMP schema: emit only sqlite_temp_schema
+        //
+        // Rationale:
+        // - SQLite's schema table has alternative names; for the TEMP database the
+        //   schema table is named "sqlite_temp_schema" (also historically "sqlite_temp_master").
+        // - See: https://sqlite.org/schematab.html (section "Alternative Names").
+        // - When running PRAGMA table_list without a schema qualifier, SQLite lists
+        //   a single row for the TEMP schema: "temp|sqlite_temp_schema|table|5|0|0".
+        //   The values are: type="table", ncol=5 (the schema table columns), wr=0 (has rowid), strict=0.
+        // - We synthesize that row here to match SQLite behavior. Our TEMP schema currently
+        //   does not enumerate separate user tables in this path.
+        if db_id == 1 {
+            // If a specific table filter is provided and it's not sqlite_temp_schema, skip temp
+            if let Some(ref ft) = filter_table {
+                if !ft.eq_ignore_ascii_case("sqlite_temp_schema") {
+                    return;
+                }
+            }
+            let base = program.alloc_register();
+            program.alloc_registers(5);
+            program.emit_string8(db_alias.to_string(), base);
+            program.emit_string8("sqlite_temp_schema".to_string(), base + 1);
+            program.emit_string8("table".to_string(), base + 2);
+            program.emit_int(5, base + 3);
+            program.emit_int(0, base + 4);
+            program.emit_int(0, base + 5);
+            program.emit_result_row(base, 6);
+            return;
+        }
+
         connection.with_schema(db_id, |schema| {
             // Collect only real tables (exclude virtual tables)
             let mut btree_tables: Vec<Arc<SchemaTable>> = schema
@@ -702,8 +732,10 @@ fn translate_table_list(
             if filter_schema.is_none() || filter_schema.as_deref() == Some("main") {
                 emit_for(0, "main");
             }
-            // If no schema filter, include attached schemas too
+            // If no schema filter, include temp and attached schemas too
             if filter_schema.is_none() {
+                // temp maps to database_id 1 per our implementation
+                emit_for(1, "temp");
                 for db_name in connection.list_attached_databases() {
                     if let Some((idx, _db)) = connection.get_attached_database(&db_name) {
                         emit_for(idx, &db_name);
