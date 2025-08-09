@@ -605,7 +605,7 @@ fn translate_table_list(
             ast::Expr::Name(n) => {
                 let s = n.as_str();
                 if s.len() >= 2 && s.starts_with('\'') && s.ends_with('\'') {
-                    Some(crate::util::normalize_ident(&s[1..s.len()-1]))
+                    Some(crate::util::normalize_ident(&s[1..s.len() - 1]))
                 } else {
                     Some(crate::util::normalize_ident(s))
                 }
@@ -616,7 +616,9 @@ fn translate_table_list(
         }
     }
     let filter_table: Option<String> = match body {
-        Some(ast::PragmaBody::Equals(ref v)) | Some(ast::PragmaBody::Call(ref v)) => extract_ident(v),
+        Some(ast::PragmaBody::Equals(ref v)) | Some(ast::PragmaBody::Call(ref v)) => {
+            extract_ident(v)
+        }
         _ => None,
     };
 
@@ -648,13 +650,25 @@ fn translate_table_list(
                 program.emit_int(table.columns().len() as i64, base + 3);
                 // wr: 1 if WITHOUT ROWID, 0 otherwise (per SQLite spec for table_list)
                 let wr = match table.btree() {
-                    Some(btree) => if btree.has_rowid { 0 } else { 1 },
+                    Some(btree) => {
+                        if btree.has_rowid {
+                            0
+                        } else {
+                            1
+                        }
+                    }
                     None => 0,
                 };
                 program.emit_int(wr, base + 4);
                 // strict
                 let strict = match table.btree() {
-                    Some(btree) => if btree.is_strict { 1 } else { 0 },
+                    Some(btree) => {
+                        if btree.is_strict {
+                            1
+                        } else {
+                            0
+                        }
+                    }
                     None => 0,
                 };
                 program.emit_int(strict, base + 5);
