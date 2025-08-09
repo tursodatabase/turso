@@ -952,26 +952,18 @@ pub fn write_pages_vectored(
     if batch.is_empty() {
         return Ok(PendingFlush::default());
     }
-
     // batch item array is already sorted by id, so we just need to find contiguous ranges of page_id's
     // to submit as `writev`/write_pages calls.
-
     let page_sz = pager.page_size.get().unwrap_or(PageSize::DEFAULT as u32) as usize;
-
     // Count expected number of runs to create the atomic counter we need to track each batch
     let mut run_count = 0;
     let mut prev_id = None;
     for &id in batch.keys() {
-        if let Some(prev) = prev_id {
-            if id != prev + 1 {
-                run_count += 1;
-            }
-        } else {
-            run_count = 1; // First run
+        if prev_id.is_none_or(|p| id != p + 1) {
+            run_count += 1;
         }
         prev_id = Some(id);
     }
-
     // Create the atomic counters
     let runs_left = Arc::new(AtomicUsize::new(run_count));
     let done = Arc::new(AtomicBool::new(false));
@@ -979,33 +971,25 @@ pub fn write_pages_vectored(
     // estimate of the capacity
     const EST_BUFF_CAPACITY: usize = 32;
 
-    // Iterate through the batch, submitting each run as soon as it ends
-    // We can reuse this across runs without reallocating
-    let mut run_bufs = Vec::with_capacity(EST_BUFF_CAPACITY);
+    // Reused per-run buffer list
+    let mut run_bufs: Vec<Arc<Buffer>> = Vec::with_capacity(EST_BUFF_CAPACITY);
     let mut run_start_id: Option<usize> = None;
     let mut all_ids = Vec::with_capacity(batch.len());
 
     // Iterate through the batch
     let mut iter = batch.into_iter().peekable();
-
-    while let Some((id, item)) = iter.next() {
+    while let Some((id, buf)) = iter.next() {
         // Track the start of the run
         if run_start_id.is_none() {
             run_start_id = Some(id);
         }
-
         // Add this page to the current run
-        run_bufs.push(item);
+        run_bufs.push(buf);
         all_ids.push(id);
 
-        // Check if this is the end of a run
-        let is_end_of_run = match iter.peek() {
-            Some(&(next_id, _)) => next_id != id + 1,
-            None => true,
-        };
-
-        if is_end_of_run {
-            let start_id = run_start_id.expect("should have a start id");
+        let end_of_run = iter.peek().is_none_or(|(next_id, _)| *next_id != id + 1);
+        if end_of_run {
+            let start_id = run_start_id.take().expect("run must have a start");
             let runs_left_cl = runs_left.clone();
             let done_cl = done.clone();
 
@@ -1015,32 +999,54 @@ pub fn write_pages_vectored(
                 }
             });
 
+            // Move to avoid cloning
+            let bufs = std::mem::take(&mut run_bufs);
             // Submit write operation for this run, decrementing the counter if we error
-            if let Err(e) = pager
-                .db_file
-                .write_pages(start_id, page_sz, run_bufs.clone(), c)
-            {
+            // this will get automatically coalesce into single write operation at the IO level
+            if let Err(e) = pager.db_file.write_pages(start_id, page_sz, bufs, c) {
                 if runs_left.fetch_sub(1, Ordering::AcqRel) == 1 {
                     done.store(true, Ordering::Release);
                 }
                 return Err(e);
             }
-
-            // Reset for next run
-            run_bufs.clear();
             run_start_id = None;
         }
     }
 
     tracing::debug!(
-        "write_pages_vectored: {} pages to write, runs: {run_count}",
-        all_ids.len()
+        "write_pages_vectored: {} pages, runs: {}",
+        all_ids.len(),
+        run_count
     );
 
     Ok(PendingFlush {
         pages: all_ids,
         done,
     })
+}
+
+pub(super) fn begin_read_wal_frame_into(
+    io: &Arc<dyn File>,
+    offset: usize,
+    page: PageRef,
+    buff: Arc<Buffer>,
+) -> Result<Completion> {
+    tracing::trace!("begin_read_wal_frame(offset={})", offset);
+    page.set_locked();
+    let frame = page.clone();
+    let complete = Box::new(move |buf: Arc<Buffer>, bytes_read: i32| {
+        let buf_len = buf.len();
+        turso_assert!(
+            bytes_read == buf_len as i32,
+            "read({bytes_read}) less than expected({buf_len})"
+        );
+        let frame = frame.clone();
+        finish_read_page(page.get().id, buf, frame).unwrap();
+    });
+    #[allow(clippy::arc_with_non_send_sync)]
+    let c = Completion::new_read(buff, complete);
+    let c = io.pread(offset, c)?;
+    Ok(c)
 }
 
 #[instrument(skip_all, level = Level::DEBUG)]
