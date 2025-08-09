@@ -349,6 +349,7 @@ enum CheckpointMode {
     Passive,
     Restart,
     Truncate,
+    Full,
 }
 
 impl std::fmt::Display for CheckpointMode {
@@ -357,6 +358,7 @@ impl std::fmt::Display for CheckpointMode {
             CheckpointMode::Passive => write!(f, "PASSIVE"),
             CheckpointMode::Restart => write!(f, "RESTART"),
             CheckpointMode::Truncate => write!(f, "TRUNCATE"),
+            CheckpointMode::Full => write!(f, "FULL"),
         }
     }
 }
@@ -908,10 +910,11 @@ fn generate_operation(
             }
         }
         20..=22 => {
-            let mode = match rng.random_range(0..3) {
+            let mode = match rng.random_range(0..=3) {
                 0 => CheckpointMode::Passive,
                 1 => CheckpointMode::Restart,
                 2 => CheckpointMode::Truncate,
+                3 => CheckpointMode::Full,
                 _ => unreachable!(),
             };
             (Operation::Checkpoint { mode }, get_visible_rows(false))

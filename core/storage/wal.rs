@@ -598,9 +598,6 @@ impl CheckpointLocks {
             return Err(LimboError::Busy);
         }
         match mode {
-            CheckpointMode::Full => Err(LimboError::InternalError(
-                "Full checkpoint mode is not yet supported".into(),
-            )),
             // Passive mode is the only mode not requiring a write lock, as it doesn't block
             // readers or writers. It acquires the checkpoint lock to ensure that no other
             // concurrent checkpoint happens, and acquires the exclusive read lock 0
@@ -614,6 +611,22 @@ impl CheckpointLocks {
                     return Err(LimboError::Busy);
                 }
                 Ok(Self::Read0 { ptr })
+            }
+            CheckpointMode::Full => {
+                // Full blocks writers and holds read0 exclusively (readers may still use >0 slots)
+                let read0 = &mut shared.read_locks[0];
+                if !read0.write() {
+                    shared.checkpoint_lock.unlock();
+                    tracing::trace!("CheckpointGuard: read0 lock failed (Full), Busy");
+                    return Err(LimboError::Busy);
+                }
+                if !shared.write_lock.write() {
+                    read0.unlock();
+                    shared.checkpoint_lock.unlock();
+                    tracing::trace!("CheckpointGuard: write lock failed (Full), Busy");
+                    return Err(LimboError::Busy);
+                }
+                Ok(Self::Writer { ptr })
             }
             CheckpointMode::Restart | CheckpointMode::Truncate => {
                 // like all modes, we must acquire an exclusive checkpoint lock and lock on read 0
@@ -1093,11 +1106,6 @@ impl Wal for WalFile {
         _write_counter: Rc<RefCell<usize>>,
         mode: CheckpointMode,
     ) -> Result<IOResult<CheckpointResult>> {
-        if matches!(mode, CheckpointMode::Full) {
-            return Err(LimboError::InternalError(
-                "Full checkpoint mode is not implemented yet".into(),
-            ));
-        }
         self.checkpoint_inner(pager, _write_counter, mode)
             .inspect_err(|_| {
                 let _ = self.checkpoint_guard.take();
@@ -1362,14 +1370,20 @@ impl WalFile {
                         (max_frame, n_backfills)
                     };
                     let needs_backfill = max_frame > nbackfills;
-                    if !needs_backfill && matches!(mode, CheckpointMode::Passive) {
+                    if !needs_backfill
+                        && matches!(mode, CheckpointMode::Passive | CheckpointMode::Full)
+                    {
                         // there are no frames to copy over and we don't need to reset
                         // the log so we can return early success.
                         return Ok(IOResult::Done(self.prev_checkpoint.clone()));
                     }
                     // acquire the appropriate exclusive locks depending on the checkpoint mode
                     self.acquire_proper_checkpoint_guard(mode)?;
-                    self.ongoing_checkpoint.max_frame = self.determine_max_safe_checkpoint_frame();
+                    self.ongoing_checkpoint.max_frame =
+                        match self.determine_max_safe_checkpoint_frame(mode) {
+                            Err(_) => return Err(LimboError::Busy),
+                            Ok(res) => res,
+                        };
                     self.ongoing_checkpoint.min_frame = nbackfills + 1;
                     self.ongoing_checkpoint.current_page = 0;
                     self.ongoing_checkpoint.state = CheckpointState::ReadFrame;
@@ -1614,29 +1628,36 @@ impl WalFile {
     /// Others: lower `mxSafeFrame` and continue scanning.
     ///
     /// We never modify slot values while a reader holds that slot.
-    fn determine_max_safe_checkpoint_frame(&self) -> u64 {
+    fn determine_max_safe_checkpoint_frame(&self, mode: CheckpointMode) -> Result<u64> {
         let shared = self.get_shared();
-        let mut max_safe_frame = shared.max_frame.load(Ordering::Acquire);
+        let shared_max = shared.max_frame.load(Ordering::Acquire);
 
-        for (read_lock_idx, read_lock) in shared.read_locks.iter_mut().enumerate().skip(1) {
-            let this_mark = read_lock.get_value();
-            if this_mark < max_safe_frame as u32 {
-                let busy = !read_lock.write();
-                if !busy {
-                    let val = if read_lock_idx == 1 {
-                        // store the shared max_frame for the default read slot 1
-                        max_safe_frame as u32
-                    } else {
-                        READMARK_NOT_USED
-                    };
-                    read_lock.set_value_exclusive(val);
-                    read_lock.unlock();
+        // Start optimistic: we want to advance everyone to shared_max
+        for (idx, lock) in shared.read_locks.iter_mut().enumerate().skip(1) {
+            let mark = lock.get_value();
+            if mark == READMARK_NOT_USED || mark >= shared_max as u32 {
+                continue;
+            }
+            // Try to bump this slot to shared_max (requires exclusive on the slot)
+            if lock.write() {
+                // Slot is free to edit, bump to shared_max (slot 1 keeps a real mark, others can be cleaned)
+                let val = if idx == 1 {
+                    shared_max as u32
                 } else {
-                    max_safe_frame = this_mark as u64;
-                }
+                    READMARK_NOT_USED
+                };
+                lock.set_value_exclusive(val);
+                lock.unlock();
+            } else {
+                // Reader is using this slot.
+                return match mode {
+                    // clamp down for passive
+                    CheckpointMode::Passive => Ok(mark as u64),
+                    _ => Err(LimboError::Busy), // all others must wait
+                };
             }
         }
-        max_safe_frame
+        Ok(shared_max)
     }
 
     /// Called once the entire WAL has been back‑filled in RESTART or TRUNCATE mode.
@@ -2811,5 +2832,113 @@ pub mod test {
                 "RESTART checkpoint should succeed after reader releases slot 0"
             );
         }
+    }
+
+    #[test]
+    fn test_wal_full_backfills_all() {
+        let (db, _tmp) = get_database();
+        let conn = db.connect().unwrap();
+
+        // Write some data to put frames in the WAL
+        conn.execute("create table test(id integer primary key, value text)")
+            .unwrap();
+        bulk_inserts(&conn, 8, 4);
+
+        // Ensure frames are flushed to the WAL
+        while let IOResult::IO = conn.pager.borrow_mut().cacheflush().unwrap() {
+            conn.run_once().unwrap();
+        }
+
+        // Snapshot the current mxFrame before running FULL
+        let wal_shared = db.maybe_shared_wal.read().as_ref().unwrap().clone();
+        let mx_before = unsafe { (&*wal_shared.get()).max_frame.load(Ordering::SeqCst) };
+        assert!(mx_before > 0, "expected frames in WAL before FULL");
+
+        // Run FULL checkpoint - must backfill *all* frames up to mx_before
+        let result = {
+            let pager = conn.pager.borrow();
+            let mut wal = pager.wal.as_ref().unwrap().borrow_mut();
+            run_checkpoint_until_done(&mut *wal, &pager, CheckpointMode::Full)
+        };
+
+        assert_eq!(result.num_wal_frames, mx_before);
+        assert_eq!(result.num_checkpointed_frames, mx_before);
+    }
+
+    #[test]
+    fn test_wal_full_waits_for_old_reader_then_succeeds() {
+        let (db, _tmp) = get_database();
+        let writer = db.connect().unwrap();
+        let reader = db.connect().unwrap();
+
+        writer
+            .execute("create table test(id integer primary key, value text)")
+            .unwrap();
+
+        // First commit some data and flush (reader will snapshot here)
+        bulk_inserts(&writer, 2, 3);
+        while let IOResult::IO = writer.pager.borrow_mut().cacheflush().unwrap() {
+            writer.run_once().unwrap();
+        }
+
+        // Start a read transaction pinned at the current snapshot
+        {
+            let pager = reader.pager.borrow_mut();
+            let mut wal = pager.wal.as_ref().unwrap().borrow_mut();
+            let (res, _) = wal.begin_read_tx().unwrap();
+            assert!(matches!(res, LimboResult::Ok));
+        }
+        let r_snapshot = {
+            let pager = reader.pager.borrow();
+            let wal = pager.wal.as_ref().unwrap().borrow();
+            wal.get_max_frame()
+        };
+
+        // Advance WAL beyond the reader's snapshot
+        bulk_inserts(&writer, 3, 4);
+        while let IOResult::IO = writer.pager.borrow_mut().cacheflush().unwrap() {
+            writer.run_once().unwrap();
+        }
+        let mx_now = unsafe {
+            (&*db.maybe_shared_wal.read().as_ref().unwrap().get())
+                .max_frame
+                .load(Ordering::SeqCst)
+        };
+        assert!(mx_now > r_snapshot);
+
+        // FULL must return Busy while a reader is stuck behind
+        {
+            let pager = writer.pager.borrow();
+            let mut wal = pager.wal.as_ref().unwrap().borrow_mut();
+            match wal.checkpoint(&pager, Rc::new(RefCell::new(0)), CheckpointMode::Full) {
+                Ok(IOResult::IO) => {
+                    // Drive any pending IO (should quickly become Busy or Done)
+                    writer.run_once().unwrap();
+                    // Call again to see final state
+                    match wal.checkpoint(&pager, Rc::new(RefCell::new(0)), CheckpointMode::Full) {
+                        Err(LimboError::Busy) => {}
+                        other => panic!("expected Busy from FULL with old reader, got {other:?}"),
+                    }
+                }
+                Err(LimboError::Busy) => {}
+                other => panic!("expected Busy from FULL with old reader, got {other:?}"),
+            }
+        }
+
+        // Release the reader, now full mode should succeed and backfill everything
+        {
+            let pager = reader.pager.borrow();
+            let wal = pager.wal.as_ref().unwrap().borrow();
+            wal.end_read_tx();
+        }
+
+        let result = {
+            let pager = writer.pager.borrow();
+            let mut wal = pager.wal.as_ref().unwrap().borrow_mut();
+            run_checkpoint_until_done(&mut *wal, &pager, CheckpointMode::Full)
+        };
+
+        assert_eq!(result.num_wal_frames, mx_now);
+        assert_eq!(result.num_checkpointed_frames, mx_now);
     }
 }
