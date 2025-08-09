@@ -217,7 +217,7 @@ Feature support of [sqlite expr syntax](https://www.sqlite.org/lang_expr.html).
 | coalesce(X,Y,...)            | Yes     |                                                      |
 | concat(X,...)                | Yes     |                                                      |
 | concat_ws(SEP,X,...)         | Yes     |                                                      |
-| format(FORMAT,...)           | No      |                                                      |
+| format(FORMAT,...)           | Yes     |                                                      |
 | glob(X,Y)                    | Yes     |                                                      |
 | hex(X)                       | Yes     |                                                      |
 | ifnull(X,Y)                  | Yes     |                                                      |
