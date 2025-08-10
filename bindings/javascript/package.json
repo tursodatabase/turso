@@ -15,11 +15,9 @@
   },
   "files": [
     "browser.js",
-    "index.d.ts",
     "index.js",
     "dist/**"
   ],
-  "types": "index.d.ts",
   "napi": {
     "binaryName": "turso",
     "targets": [
@@ -55,7 +53,6 @@
   "packageManager": "yarn@4.9.2",
   "imports": {
     "#entry-point": {
-      "types": "./index.d.ts",
       "browser": "./browser.js",
       "node": "./index.js"
     }
