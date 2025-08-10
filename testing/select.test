@@ -574,6 +574,28 @@ z|z}
   b|b
   z|z}
 
+  do_execsql_test_on_specific_db {:memory:} select-intersect-with-order-by-1 {
+    CREATE TABLE t (x TEXT, y TEXT);
+    CREATE TABLE u (x TEXT, y TEXT);
+    INSERT INTO t VALUES('x','x'),('z','z'),('y','y');
+    INSERT INTO u VALUES('x','x'),('z','y'),('z','z');
+
+    select * from t INTERSECT select * from u order by x;
+  } {x|x
+  z|z}
+
+  do_execsql_test_on_specific_db {:memory:} select-intersect-with-order-by-2 {
+    CREATE TABLE t (x TEXT, y TEXT);
+    CREATE TABLE u (x TEXT, y TEXT);
+    CREATE TABLE v (x TEXT, y TEXT);
+    INSERT INTO t VALUES('x','x'),('y','y');
+    INSERT INTO u VALUES('x','x'),('a','a'),('y','y');
+    INSERT INTO v VALUES('a','x'),('y','y'),('x','x');
+
+    select * from t INTERSECT select * from u INTERSECT select * from v order by x;
+  } {x|x
+  y|y}
+
   do_execsql_test_on_specific_db {:memory:} select-except-1 {
     CREATE TABLE t (x TEXT, y TEXT);
     CREATE TABLE u (x TEXT, y TEXT);

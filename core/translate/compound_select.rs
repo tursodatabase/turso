@@ -725,7 +725,16 @@ fn emit_order_by_rows(
             final_result_cols_start_reg,
         ),
         CompoundOperator::Except => unimplemented!(),
-        CompoundOperator::Intersect => unimplemented!(),
+        CompoundOperator::Intersect => emit_order_by_rows_for_intersect(
+            program,
+            left_yield_reg,
+            right_yield_reg,
+            left_result_cols_start_reg,
+            right_result_cols_start_reg,
+            result_cols_count,
+            final_yield_reg,
+            final_result_cols_start_reg,
+        ),
     }
 }
 
@@ -923,6 +932,7 @@ fn emit_order_by_rows_for_union(
         left_yield_reg,
         lt_return_reg,
         compare_label,
+        None,
         lt_label,
         output_left_label,
         left_eof_label,
@@ -945,6 +955,7 @@ fn emit_order_by_rows_for_union(
         right_yield_reg,
         gt_return_reg,
         compare_label,
+        None,
         gt_label,
         output_right_label,
         right_eof_label,
@@ -1009,6 +1020,85 @@ fn emit_order_by_rows_for_union(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn emit_order_by_rows_for_intersect(
+    program: &mut ProgramBuilder,
+    left_yield_reg: usize,
+    right_yield_reg: usize,
+    left_result_cols_start_reg: usize,
+    right_result_cols_start_reg: usize,
+    result_cols_count: usize,
+    final_yield_reg: Option<usize>,
+    final_result_cols_start_reg: Option<usize>,
+) -> crate::Result<usize> {
+    let end_label = program.allocate_label();
+    let compare_label = program.allocate_label();
+    let lt_label = program.allocate_label();
+    let eq_label = program.allocate_label();
+    let gt_label = program.allocate_label();
+    emit_compare(
+        program,
+        left_result_cols_start_reg,
+        right_result_cols_start_reg,
+        result_cols_count,
+        left_yield_reg,
+        right_yield_reg,
+        end_label,
+        end_label,
+        compare_label,
+        lt_label,
+        eq_label,
+        gt_label,
+    );
+
+    let output_label = program.allocate_label();
+    let lt_return_reg = program.alloc_register();
+    program.add_comment(program.offset(), "left-lt-right subroutine");
+    emit_compare_result_routine(
+        program,
+        left_yield_reg,
+        lt_return_reg,
+        compare_label,
+        Some(lt_label),
+        eq_label,
+        output_label,
+        end_label,
+    );
+    program.add_comment(program.offset(), "left-gt-right subroutine");
+    program.emit_insn(Insn::Noop);
+    program.preassign_label_to_next_insn(gt_label);
+    program.emit_insn(Insn::Yield {
+        yield_reg: right_yield_reg,
+        end_offset: end_label,
+    });
+    program.emit_insn(Insn::Goto {
+        target_pc: compare_label,
+    });
+
+    let flag_reg = program.alloc_register();
+    program.emit_insn(Insn::Integer {
+        value: 0,
+        dest: flag_reg,
+    });
+    let last_output_reg = program.alloc_registers(result_cols_count);
+    program.add_comment(program.offset(), "output routine for left");
+    emit_output_routine(
+        program,
+        left_result_cols_start_reg,
+        result_cols_count,
+        final_result_cols_start_reg,
+        final_yield_reg,
+        flag_reg,
+        last_output_reg,
+        lt_return_reg,
+        output_label,
+    );
+
+    program.preassign_label_to_next_insn(end_label);
+
+    Ok(final_result_cols_start_reg.unwrap_or(0))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn emit_compare(
     program: &mut ProgramBuilder,
     left_result_cols_start_reg: usize,
@@ -1016,7 +1106,7 @@ fn emit_compare(
     result_cols_count: usize,
     left_yield_reg: usize,
     right_yield_reg: usize,
-    left_eof_yield_label: BranchOffset,
+    left_eof_label: BranchOffset,
     right_eof_label: BranchOffset,
     compare_label: BranchOffset,
     lt_label: BranchOffset,
@@ -1025,7 +1115,7 @@ fn emit_compare(
 ) {
     program.emit_insn(Insn::Yield {
         yield_reg: left_yield_reg,
-        end_offset: left_eof_yield_label,
+        end_offset: left_eof_label,
     });
 
     program.emit_insn(Insn::Yield {
@@ -1048,11 +1138,13 @@ fn emit_compare(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_compare_result_routine(
     program: &mut ProgramBuilder,
     yield_reg: usize,
     return_reg: usize,
-    compare_label: BranchOffset,
+    compare_begin_label: BranchOffset,
+    skip_compare_result_label: Option<BranchOffset>,
     compare_result_label: BranchOffset,
     output_label: BranchOffset,
     eof_label: BranchOffset,
@@ -1063,12 +1155,15 @@ fn emit_compare_result_routine(
         target_pc: output_label,
         return_reg,
     });
+    if let Some(offset) = skip_compare_result_label {
+        program.preassign_label_to_next_insn(offset);
+    }
     program.emit_insn(Insn::Yield {
         yield_reg,
         end_offset: eof_label,
     });
     program.emit_insn(Insn::Goto {
-        target_pc: compare_label,
+        target_pc: compare_begin_label,
     });
 }
 
