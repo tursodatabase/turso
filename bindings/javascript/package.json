@@ -58,5 +58,11 @@
       "browser": "./browser.js",
       "node": "./index.js"
     }
+  },
+  "optionalDependencies": {
+    "@tursodatabase/database-linux-x64-gnu": "0.1.4-pre.6",
+    "@tursodatabase/database-win32-x64-msvc": "0.1.4-pre.6",
+    "@tursodatabase/database-darwin-universal": "0.1.4-pre.6",
+    "@tursodatabase/database-wasm32-wasi": "0.1.4-pre.6"
   }
 }
