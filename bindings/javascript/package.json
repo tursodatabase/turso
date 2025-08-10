@@ -15,6 +15,7 @@
   },
   "files": [
     "browser.js",
+    "index.d.ts",
     "index.js",
     "dist/**"
   ],
