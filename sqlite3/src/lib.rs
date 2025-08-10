@@ -307,8 +307,13 @@ pub unsafe extern "C" fn sqlite3_reset(stmt: *mut sqlite3_stmt) -> ffi::c_int {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn sqlite3_changes(_db: *mut sqlite3) -> ffi::c_int {
-    stub!();
+pub unsafe extern "C" fn sqlite3_changes(db: *mut sqlite3) -> ffi::c_int {
+    if db.is_null() {
+        return 0;
+    }
+    let db = &mut *db;
+    let db = db.inner.lock().unwrap();
+    db.conn.changes() as ffi::c_int
 }
 
 #[no_mangle]
