@@ -449,6 +449,31 @@ do_execsql_test_error select-star-subquery {
   select * from t UNION select * from u limit 1 offset 1;
   } {y|y}
 
+do_execsql_test_on_specific_db {:memory:} select-union-with-order-by {
+  CREATE TABLE t (x TEXT, y TEXT);
+  CREATE TABLE u (x TEXT, y TEXT);
+  INSERT INTO t VALUES('x','x'),('y','y');
+  INSERT INTO u VALUES('x','x'),('y','y'),('z','z');
+
+  select * from t UNION select * from u ORDER BY x;
+} {x|x
+y|y
+z|z}
+
+do_execsql_test_on_specific_db {:memory:} select-union-with-order-by-2 {
+  CREATE TABLE t (x TEXT, y TEXT);
+  CREATE TABLE u (x TEXT, y TEXT);
+  CREATE TABLE v (x TEXT, y TEXT);
+  INSERT INTO t VALUES('x','x'),('y','y');
+  INSERT INTO u VALUES('x','x'),('y','y'),('z','z');
+  INSERT INTO v VALUES('a','a'),('x','x'),('z','z');
+
+  select * from t UNION select * from u UNION select * from v ORDER BY x;
+} {a|a
+x|x
+y|y
+z|z}
+
   do_execsql_test_on_specific_db {:memory:} select-intersect-1 {
     CREATE TABLE t (x TEXT, y TEXT);
     CREATE TABLE u (x TEXT, y TEXT);
