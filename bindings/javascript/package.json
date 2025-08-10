@@ -46,7 +46,7 @@
     "artifacts": "napi artifacts",
     "build": "npm exec tsc && napi build --platform --release --esm",
     "build:debug": "npm exec tsc && napi build --platform",
-    "prepublishOnly": "npm exec tsc && napi prepublish -t npm",
+    "prepublishOnly": "node scripts/copy-optional-deps.js && npm exec tsc && napi prepublish -t npm",
     "test": "true",
     "universal": "napi universalize",
     "version": "napi version"
