@@ -1029,7 +1029,7 @@ impl Limbo {
         db_display_name: &str,
     ) -> anyhow::Result<()> {
         let sql = format!(
-            "SELECT sql FROM {db_prefix}.sqlite_schema WHERE type IN ('table', 'index') AND name NOT LIKE 'sqlite_%'"
+            "SELECT sql FROM {db_prefix}.sqlite_schema WHERE type IN ('table', 'index') AND name NOT LIKE 'sqlite_%' ORDER BY rowid"
         );
 
         match self.conn.query(&sql) {
