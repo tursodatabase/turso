@@ -1,4 +1,8 @@
 use crate::error::LimboError;
+#[cfg(feature = "encryption")]
+use crate::storage::encryption::EncryptionKey;
+#[cfg(feature = "encryption")]
+use crate::storage::encryption::{decrypt_page, encrypt_page};
 use crate::{io::Completion, Buffer, Result};
 use std::sync::Arc;
 use tracing::{instrument, Level};
@@ -9,14 +13,25 @@ use tracing::{instrument, Level};
 /// the storage medium. A database can either be a file on disk, like in SQLite,
 /// or something like a remote page server service.
 pub trait DatabaseStorage: Send + Sync {
-    fn read_page(&self, page_idx: usize, c: Completion) -> Result<Completion>;
-    fn write_page(&self, page_idx: usize, buffer: Arc<Buffer>, c: Completion)
-        -> Result<Completion>;
+    fn read_page(
+        &self,
+        page_idx: usize,
+        #[cfg(feature = "encryption")] encryption_key: Option<&EncryptionKey>,
+        c: Completion,
+    ) -> Result<Completion>;
+    fn write_page(
+        &self,
+        page_idx: usize,
+        buffer: Arc<Buffer>,
+        #[cfg(feature = "encryption")] encryption_key: Option<&EncryptionKey>,
+        c: Completion,
+    ) -> Result<Completion>;
     fn write_pages(
         &self,
         first_page_idx: usize,
         page_size: usize,
         buffers: Vec<Arc<Buffer>>,
+        #[cfg(feature = "encryption")] encryption_key: Option<&EncryptionKey>,
         c: Completion,
     ) -> Result<Completion>;
     fn sync(&self, c: Completion) -> Result<Completion>;
