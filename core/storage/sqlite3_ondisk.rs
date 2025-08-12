@@ -60,7 +60,7 @@ use crate::storage::btree::{payload_overflow_threshold_max, payload_overflow_thr
 use crate::storage::buffer_pool::BufferPool;
 use crate::storage::database::DatabaseStorage;
 use crate::storage::pager::Pager;
-use crate::storage::wal::{PendingFlush, READMARK_NOT_USED};
+use crate::storage::wal::READMARK_NOT_USED;
 use crate::types::{RawSlice, RefValue, SerialType, SerialTypeKind, TextRef, TextSubtype};
 use crate::{bail_corrupt_error, turso_assert, File, Result, WalFileShared};
 use std::cell::{RefCell, UnsafeCell};
@@ -955,9 +955,10 @@ pub fn begin_write_btree_page(pager: &Pager, page: &PageRef) -> Result<Completio
 pub fn write_pages_vectored(
     pager: &Pager,
     batch: BTreeMap<usize, Arc<Buffer>>,
-    flush: &PendingFlush,
+    done_flag: Arc<AtomicBool>,
 ) -> Result<Vec<Completion>> {
     if batch.is_empty() {
+        done_flag.store(true, Ordering::Relaxed);
         return Ok(Vec::new());
     }
 
@@ -982,8 +983,7 @@ pub fn write_pages_vectored(
 
     // Create the atomic counters
     let runs_left = Arc::new(AtomicUsize::new(run_count));
-    flush.new_flush();
-    let done = flush.done.clone();
+    let done = done_flag.clone();
     // we know how many runs, but we don't know how many buffers per run, so we can only give an
     // estimate of the capacity
     const EST_BUFF_CAPACITY: usize = 32;
@@ -994,21 +994,21 @@ pub fn write_pages_vectored(
     let mut run_start_id: Option<usize> = None;
 
     // Iterate through the batch
-    let mut iter = batch.into_iter().peekable();
+    let mut iter = batch.iter().peekable();
 
     let mut completions = Vec::new();
     while let Some((id, item)) = iter.next() {
         // Track the start of the run
         if run_start_id.is_none() {
-            run_start_id = Some(id);
+            run_start_id = Some(*id);
         }
 
         // Add this page to the current run
-        run_bufs.push(item);
+        run_bufs.push(item.clone());
 
         // Check if this is the end of a run
         let is_end_of_run = match iter.peek() {
-            Some(&(next_id, _)) => next_id != id + 1,
+            Some(&(next_id, _)) => *next_id != id + 1,
             None => true,
         };
 

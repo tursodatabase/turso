@@ -80,6 +80,8 @@ impl CheckpointMode {
     fn should_restart_log(&self) -> bool {
         matches!(self, CheckpointMode::Truncate | CheckpointMode::Restart)
     }
+    /// All modes other than Passive require a complete backfilling of all available frames
+    /// from `shared.nbackfills + 1 -> shared.max_frame`
     fn require_all_backfilled(&self) -> bool {
         !matches!(self, CheckpointMode::Passive)
     }
@@ -296,66 +298,138 @@ pub enum CheckpointState {
 }
 
 /// IOV_MAX is 1024 on most systems
-pub const CKPT_BATCH_PAGES: usize = 512;
-type PageId = usize;
+pub const CKPT_BATCH_PAGES: usize = 1024;
 
-const MAX_INFLIGHT_READS: usize = 64;
+/// TODO: *ALL* of these need to be tuned for perf. It is tricky
+/// trying to figure out the ideal numbers here to work together concurrently
+const MIN_AVG_RUN_FOR_FLUSH: f32 = 32.0;
+const MIN_BATCH_LEN_FOR_FLUSH: usize = 512;
+const MAX_PENDING_WRITES: usize = 64;
+const MAX_INFLIGHT_READS: usize = 512;
+
+type PageId = usize;
 struct InflightRead {
     page_id: PageId,
+    /// Atomic counter representing when this read operation is finished.
     done: Arc<AtomicBool>,
+    /// Buffer slot to contain the page content from the WAL read.
     buf: Arc<SpinLock<Option<Arc<Buffer>>>>,
 }
 
-/// Batch is a collection of pages that are being checkpointed together. It is used to
+/// WriteBatch is a collection of pages that are being checkpointed together. It is used to
 /// aggregate contiguous pages into a single write operation to the database file.
-pub(super) struct Batch {
+#[derive(Default)]
+struct WriteBatch {
+    /// BTreeMap for sorting during insertion, helps create more efficient `writev` operations.
     items: BTreeMap<PageId, Arc<Buffer>>,
+    /// total number of `runs`, each representing a contiguous group of `PageId`s
+    run_count: usize,
 }
-// TODO(preston): implement the same thing for `readv`
-impl Batch {
+
+impl WriteBatch {
     fn new() -> Self {
         Self {
             items: BTreeMap::new(),
+            run_count: 0,
         }
     }
 
-    fn insert_raw(&mut self, page_id: usize, buf: Arc<Buffer>) {
+    #[inline]
+    /// Add a pageId + Buffer to the batch of Writes to be submitted.
+    fn insert(&mut self, page_id: PageId, buf: Arc<Buffer>) {
+        if let std::collections::btree_map::Entry::Occupied(mut entry) = self.items.entry(page_id) {
+            entry.insert(buf);
+            return;
+        }
+        let left = page_id
+            .checked_sub(1)
+            .is_some_and(|p| self.items.contains_key(&p));
+        let right = page_id
+            .checked_add(1)
+            .is_some_and(|p| self.items.contains_key(&p));
+        match (left, right) {
+            (false, false) => {
+                // new singleton run
+                self.run_count += 1;
+            }
+            (true, false) | (false, true) => {
+                // extends an existing run, run_count unchanged
+            }
+            (true, true) => {
+                // merges two runs into one
+                self.run_count = self.run_count.saturating_sub(1);
+            }
+        }
         self.items.insert(page_id, buf);
     }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.items.len()
+    }
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+    #[inline]
     fn is_full(&self) -> bool {
         self.items.len() >= CKPT_BATCH_PAGES
     }
+
+    #[inline]
+    fn avg_run_len(&self) -> f32 {
+        if self.run_count == 0 {
+            0.0
+        } else {
+            self.items.len() as f32 / self.run_count as f32
+        }
+    }
+
+    #[inline]
+    fn take(&mut self) -> BTreeMap<PageId, Arc<Buffer>> {
+        self.run_count = 0;
+        std::mem::take(&mut self.items)
+    }
+
+    #[inline]
+    fn clear(&mut self) {
+        self.items.clear();
+        self.run_count = 0;
+    }
 }
 
-impl std::ops::Deref for Batch {
+impl std::ops::Deref for WriteBatch {
     type Target = BTreeMap<PageId, Arc<Buffer>>;
     fn deref(&self) -> &Self::Target {
         &self.items
     }
 }
-impl std::ops::DerefMut for Batch {
+impl std::ops::DerefMut for WriteBatch {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.items
     }
 }
 
-// Checkpointing is a state machine that has multiple steps. Since there are multiple steps we save
-// in flight information of the checkpoint in OngoingCheckpoint. page is just a helper Page to do
-// page operations like reading a frame to a page, and writing a page to disk. This page should not
-// be placed back in pager page cache or anything, it's just a helper.
-// min_frame and max_frame is the range of frames that can be safely transferred from WAL to db
-// file.
-// current_page is a helper to iterate through all the pages that might have a frame in the safe
-// range. This is inefficient for now.
+/// Information and
 struct OngoingCheckpoint {
-    batch: Batch,
-    state: CheckpointState,
-    pending_flush: PendingFlush,
+    /// Used for benchmarking/debugging a checkpoint operation.
+    time: std::time::Instant,
+    /// minimum frame number to be backfilled by this checkpoint operation.
     min_frame: u64,
+    /// maximum safe frame number that will be backfilled by this checkpoint operation.
     max_frame: u64,
+    /// cursor used to iterate through all the pages that might have a frame in the safe range
     current_page: u64,
+    /// State of the checkpoint
+    state: CheckpointState,
+    /// Batch repreesnts a collection of pages to be backfilled to the DB file.
+    pending_writes: WriteBatch,
+    /// Array of
+    inflight_reads: Vec<InflightRead>,
+    /// Array of atomic counters representing write operations that are currently in flight.
+    inflight_writes: Vec<Arc<AtomicBool>>,
+    /// List of all (page_id, frame_id) combinations to be backfilled.
     pages_to_checkpoint: Vec<(u64, u64)>,
-    inflight: Vec<InflightRead>,
 }
 
 impl OngoingCheckpoint {
@@ -1260,6 +1334,7 @@ impl WalFile {
             max_frame: unsafe { (*shared.get()).max_frame.load(Ordering::Acquire) },
             shared,
             ongoing_checkpoint: OngoingCheckpoint {
+                time: std::time::Instant::now(),
                 batch: Batch::new(),
                 pending_flush: PendingFlush::new(),
                 state: CheckpointState::Start,
@@ -1327,6 +1402,8 @@ impl WalFile {
         self.max_frame_read_lock_index.set(NO_LOCK_HELD);
         self.ongoing_checkpoint.batch.clear();
         self.ongoing_checkpoint.pending_flush.clear();
+        self.sync_state.set(SyncState::NotSyncing);
+        self.ongoing_checkpoint.pages_to_checkpoint.clear();
         self.syncing.set(false);
     }
 
@@ -1379,6 +1456,7 @@ impl WalFile {
     fn checkpoint_inner(
         &mut self,
         pager: &Pager,
+        _write_counter: Rc<RefCell<usize>>,
         mode: CheckpointMode,
     ) -> Result<IOResult<CheckpointResult>> {
         loop {
@@ -1446,7 +1524,6 @@ impl WalFile {
                 CheckpointState::Processing => {
                     // Track if there was any work done on this iteration
                     let mut did_work = false;
-                    let mut completions: Vec<Completion> = Vec::new();
 
                     // Check and clean any completed writes from pending flush
                     if self.ongoing_checkpoint.process_pending_writes() {
@@ -1460,14 +1537,14 @@ impl WalFile {
                     }
 
                     // Issue reads until we hit limits
-                    let seq = self.get_shared().wal_header.lock().checkpoint_seq;
                     while self.ongoing_checkpoint.should_issue_reads() {
                         let (page_id, target_frame) = self.ongoing_checkpoint.pages_to_checkpoint
                             [self.ongoing_checkpoint.current_page as usize];
 
+                        let seq = self.get_shared().wal_header.lock().checkpoint_seq;
                         // Try cache first
                         if let Some(cached_page) =
-                            pager.cache_get_for_checkpoint(page_id as usize, target_frame)
+                            pager.cache_get_for_checkpoint(page_id as usize, target_frame, seq)
                         {
                             let contents = cached_page.get_contents();
                             let buffer = contents.buffer.clone();
@@ -1495,7 +1572,7 @@ impl WalFile {
                         let batch_map = self.ongoing_checkpoint.pending_writes.take();
                         if !batch_map.is_empty() {
                             let done_flag = self.ongoing_checkpoint.add_write();
-                            let completions = write_pages_vectored(pager, batch_map, done_flag)?;
+                            completions = write_pages_vectored(pager, batch_map, done_flag)?;
                             did_work = true;
                         }
                     }
@@ -1508,7 +1585,9 @@ impl WalFile {
                         {
                             if let Some(page) = pager.cache_get((*page_id) as usize) {
                                 // we have to check validity to ensure we dont unpin anything we didnt pin
-                                if page.is_valid_for_checkpoint(*frame_id) {
+                                if page
+                                    .is_valid_for_checkpoint(*frame_id, self.header.checkpoint_seq)
+                                {
                                     page.try_unpin();
                                 }
                             }
@@ -1810,7 +1889,7 @@ impl WalFile {
         self.ongoing_checkpoint.inflight.retain(|slot| {
             if slot.done.load(Ordering::Acquire) {
                 if let Some(buf) = slot.buf.lock().take() {
-                    self.ongoing_checkpoint.batch.insert_raw(slot.page_id, buf);
+                    self.ongoing_checkpoint.batch.insert(slot.page_id, buf);
                     moved = true;
                 }
                 false // drop this slot
