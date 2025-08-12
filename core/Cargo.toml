@@ -27,6 +27,7 @@ omit_autovacuum = []
 simulator = ["fuzz", "serde"]
 serde = ["dep:serde"]
 series = []
+encryption = ["dep:aes-gcm", "dep:aes"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = { version = "0.7.5", optional = true }
@@ -73,6 +74,8 @@ uuid = { version = "1.11.0", features = ["v4", "v7"], optional = true }
 tempfile = "3.8.0"
 pack1 = { version = "1.0.0", features = ["bytemuck"] }
 bytemuck = "1.23.1"
+aes-gcm = { version = "0.10.3", optional = true }
+aes = { version = "0.8.4", optional = true }
 
 [build-dependencies]
 chrono = { version = "0.4.38", default-features = false }
