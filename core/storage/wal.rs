@@ -11,9 +11,17 @@ use std::fmt::Formatter;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::{cell::Cell, fmt, rc::Rc, sync::Arc};
 
+use self::sqlite3_ondisk::{checksum_wal, PageContent, WAL_MAGIC_BE, WAL_MAGIC_LE};
+use super::buffer_pool::BufferPool;
+use super::pager::{PageRef, Pager};
+use super::sqlite3_ondisk::{self, WalHeader};
 use crate::fast_lock::SpinLock;
 use crate::io::{File, IO};
 use crate::result::LimboResult;
+#[cfg(feature = "encryption")]
+use crate::storage::encryption::EncryptionKey;
+#[cfg(feature = "encryption")]
+use crate::storage::encryption::{decrypt_page, encrypt_page};
 use crate::storage::sqlite3_ondisk::{
     begin_read_wal_frame, begin_read_wal_frame_raw, finish_read_page, prepare_wal_frame,
     write_pages_vectored, WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE,
@@ -21,12 +29,6 @@ use crate::storage::sqlite3_ondisk::{
 use crate::types::{IOCompletions, IOResult};
 use crate::{turso_assert, Buffer, LimboError, Result};
 use crate::{Completion, Page};
-
-use self::sqlite3_ondisk::{checksum_wal, PageContent, WAL_MAGIC_BE, WAL_MAGIC_LE};
-
-use super::buffer_pool::BufferPool;
-use super::pager::{PageRef, Pager};
-use super::sqlite3_ondisk::{self, WalHeader};
 
 #[derive(Debug, Clone, Default)]
 pub struct CheckpointResult {
@@ -278,6 +280,9 @@ pub trait Wal {
     /// Return unique set of pages changed **after** frame_watermark position and until current WAL session max_frame_no
     fn changed_pages_after(&self, frame_watermark: u64) -> Result<Vec<u32>>;
 
+    #[cfg(feature = "encryption")]
+    fn set_encryption_key(&mut self, key: Option<EncryptionKey>);
+
     #[cfg(debug_assertions)]
     fn as_any(&self) -> &dyn std::any::Any;
 }
@@ -437,6 +442,9 @@ pub struct WalFile {
 
     /// Manages locks needed for checkpointing
     checkpoint_guard: Option<CheckpointLocks>,
+
+    #[cfg(feature = "encryption")]
+    encryption_key: RefCell<Option<EncryptionKey>>,
 }
 
 impl fmt::Debug for WalFile {
@@ -1184,6 +1192,11 @@ impl Wal for WalFile {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
+
+    #[cfg(feature = "encryption")]
+    fn set_encryption_key(&mut self, key: Option<EncryptionKey>) {
+        self.encryption_key.replace(key);
+    }
 }
 
 impl WalFile {
@@ -1223,6 +1236,8 @@ impl WalFile {
             prev_checkpoint: CheckpointResult::default(),
             checkpoint_guard: None,
             header: *header,
+            #[cfg(feature = "encryption")]
+            encryption_key: RefCell::new(None),
         }
     }
 

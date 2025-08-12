@@ -59,6 +59,8 @@ use crate::storage::btree::offset::{
 use crate::storage::btree::{payload_overflow_threshold_max, payload_overflow_threshold_min};
 use crate::storage::buffer_pool::BufferPool;
 use crate::storage::database::DatabaseStorage;
+#[cfg(feature = "encryption")]
+use crate::storage::encryption::EncryptionKey;
 use crate::storage::pager::Pager;
 use crate::storage::wal::{PendingFlush, READMARK_NOT_USED};
 use crate::types::{RawSlice, RefValue, SerialType, SerialTypeKind, TextRef, TextSubtype};

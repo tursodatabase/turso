@@ -31,6 +31,8 @@ use super::wal::CheckpointMode;
 /// SQLite's default maximum page count
 const DEFAULT_MAX_PAGE_COUNT: u32 = 0xfffffffe;
 
+#[cfg(feature = "encryption")]
+use crate::storage::encryption::EncryptionKey;
 #[cfg(not(feature = "omit_autovacuum"))]
 use ptrmap::*;
 
@@ -438,6 +440,8 @@ pub struct Pager {
     header_ref_state: RefCell<HeaderRefState>,
     #[cfg(not(feature = "omit_autovacuum"))]
     btree_create_vacuum_full_state: Cell<BtreeCreateVacuumFullState>,
+    #[cfg(feature = "encryption")]
+    pub(crate) encryption_key: RefCell<Option<EncryptionKey>>,
 }
 
 #[derive(Debug, Clone)]
@@ -539,6 +543,8 @@ impl Pager {
             header_ref_state: RefCell::new(HeaderRefState::Start),
             #[cfg(not(feature = "omit_autovacuum"))]
             btree_create_vacuum_full_state: Cell::new(BtreeCreateVacuumFullState::Start),
+            #[cfg(feature = "encryption")]
+            encryption_key: RefCell::new(None),
         })
     }
 
@@ -1055,6 +1061,7 @@ impl Pager {
         page_idx: usize,
         page: PageRef,
         allow_empty_read: bool,
+        #[cfg(feature = "encryption")] encryption_key: Option<&EncryptionKey>,
     ) -> Result<Completion> {
         sqlite3_ondisk::begin_read_page(
             self.db_file.clone(),
@@ -1062,6 +1069,8 @@ impl Pager {
             page,
             page_idx,
             allow_empty_read,
+            #[cfg(feature = "encryption")]
+            encryption_key,
         )
     }
 
@@ -1928,6 +1937,13 @@ impl Pager {
         let header_ref = return_if_io!(HeaderRefMut::from_pager(self));
         let header = header_ref.borrow_mut();
         Ok(IOResult::Done(f(header)))
+    }
+
+    #[cfg(feature = "encryption")]
+    pub fn set_encryption_key(&self, key: Option<EncryptionKey>) {
+        self.encryption_key.replace(key.clone());
+        let Some(wal) = self.wal.as_ref() else { return };
+        wal.borrow_mut().set_encryption_key(key)
     }
 }
 
