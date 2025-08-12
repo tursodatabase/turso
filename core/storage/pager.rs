@@ -646,8 +646,8 @@ impl Pager {
                 // Check if the calculated offset for the entry is within the bounds of the actual page data length.
                 if offset_in_ptrmap_page + PTRMAP_ENTRY_SIZE > actual_data_length {
                     return Err(LimboError::InternalError(format!(
-                            "Ptrmap offset {offset_in_ptrmap_page} + entry size {PTRMAP_ENTRY_SIZE} out of bounds for page {ptrmap_pg_no} (actual data len {actual_data_length})"
-                        )));
+                        "Ptrmap offset {offset_in_ptrmap_page} + entry size {PTRMAP_ENTRY_SIZE} out of bounds for page {ptrmap_pg_no} (actual data len {actual_data_length})"
+                    )));
                 }
 
                 let entry_slice = &ptrmap_page_data_slice
@@ -689,8 +689,8 @@ impl Pager {
                     || is_ptrmap_page(db_page_no_to_update, page_size)
                 {
                     return Err(LimboError::InternalError(format!(
-                            "Cannot set ptrmap entry for page {db_page_no_to_update}: it's a header/ptrmap page or invalid."
-                        )));
+                        "Cannot set ptrmap entry for page {db_page_no_to_update}: it's a header/ptrmap page or invalid."
+                    )));
                 }
 
                 let ptrmap_pg_no = get_ptrmap_page_no_for_db_page(db_page_no_to_update, page_size);
@@ -1023,7 +1023,13 @@ impl Pager {
                 matches!(frame_watermark, Some(0) | None),
                 "frame_watermark must be either None or Some(0) because DB has no WAL and read with other watermark is invalid"
             );
-            let c = self.begin_read_disk_page(page_idx, page.clone(), allow_empty_read)?;
+            let c = self.begin_read_disk_page(
+                page_idx,
+                page.clone(),
+                allow_empty_read,
+                #[cfg(feature = "encryption")]
+                self.encryption_key.borrow().as_ref(),
+            )?;
             return Ok((page, c));
         };
 
@@ -1036,7 +1042,13 @@ impl Pager {
             return Ok((page, c));
         }
 
-        let c = self.begin_read_disk_page(page_idx, page.clone(), allow_empty_read)?;
+        let c = self.begin_read_disk_page(
+            page_idx,
+            page.clone(),
+            allow_empty_read,
+            #[cfg(feature = "encryption")]
+            self.encryption_key.borrow().as_ref(),
+        )?;
         Ok((page, c))
     }
 
@@ -2059,10 +2071,10 @@ mod ptrmap {
         pub fn serialize(&self, buffer: &mut [u8]) -> Result<()> {
             if buffer.len() < PTRMAP_ENTRY_SIZE {
                 return Err(LimboError::InternalError(format!(
-                "Buffer too small to serialize ptrmap entry. Expected at least {} bytes, got {}",
-                PTRMAP_ENTRY_SIZE,
-                buffer.len()
-            )));
+                    "Buffer too small to serialize ptrmap entry. Expected at least {} bytes, got {}",
+                    PTRMAP_ENTRY_SIZE,
+                    buffer.len()
+                )));
             }
             buffer[0] = self.entry_type as u8;
             buffer[1..5].copy_from_slice(&self.parent_page_no.to_be_bytes());

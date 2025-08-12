@@ -855,6 +855,7 @@ pub fn begin_read_page(
     page: PageRef,
     page_idx: usize,
     allow_empty_read: bool,
+    encryption_key: Option<&EncryptionKey>,
 ) -> Result<Completion> {
     tracing::trace!("begin_read_btree_page(page_idx = {})", page_idx);
     let buf = buffer_pool.get_page();
@@ -875,7 +876,7 @@ pub fn begin_read_page(
         }
     });
     let c = Completion::new_read(buf, complete);
-    db_file.read_page(page_idx, c)
+    db_file.read_page(page_idx, encryption_key, c)
 }
 
 #[instrument(skip_all, level = Level::INFO)]
@@ -924,7 +925,7 @@ pub fn begin_write_btree_page(pager: &Pager, page: &PageRef) -> Result<Completio
         })
     };
     let c = Completion::new_write(write_complete);
-    page_source.write_page(page_id, buffer.clone(), c)
+    page_source.write_page(page_id, buffer.clone(), None, c)
 }
 
 #[instrument(skip_all, level = Level::DEBUG)]
@@ -942,6 +943,7 @@ pub fn write_pages_vectored(
     pager: &Pager,
     batch: BTreeMap<usize, Arc<Buffer>>,
     flush: &PendingFlush,
+    encryption_key: Option<&EncryptionKey>,
 ) -> Result<Vec<Completion>> {
     if batch.is_empty() {
         return Ok(Vec::new());
@@ -1014,6 +1016,7 @@ pub fn write_pages_vectored(
                 start_id,
                 page_sz,
                 std::mem::replace(&mut run_bufs, Vec::with_capacity(EST_BUFF_CAPACITY)),
+                encryption_key,
                 c,
             ) {
                 Ok(c) => {
