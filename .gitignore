@@ -18,6 +18,8 @@ env
 .venv
 dist/
 .tmp/
+# perf
+/Mobibench
 
 *.db
 **/*.db-wal
