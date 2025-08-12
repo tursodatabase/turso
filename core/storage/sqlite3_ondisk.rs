@@ -292,6 +292,9 @@ impl Default for DatabaseHeader {
             page_size: Default::default(),
             write_version: Version::Wal,
             read_version: Version::Wal,
+            #[cfg(feature = "encryption")]
+            reserved_space: 28,
+            #[cfg(not(feature = "encryption"))]
             reserved_space: 0,
             max_embed_frac: 64,
             min_embed_frac: 32,
