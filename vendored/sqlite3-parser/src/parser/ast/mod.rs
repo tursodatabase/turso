@@ -1829,6 +1829,11 @@ pub enum PragmaName {
     IntegrityCheck,
     /// `journal_mode` pragma
     JournalMode,
+    /// encryption key for encrypted databases. This is just called `key` because most
+    /// extensions use this name instead of `encryption_key`.
+    #[strum(serialize = "key")]
+    #[cfg_attr(feature = "serde", serde(rename = "key"))]
+    EncryptionKey,
     /// Noop as per SQLite docs
     LegacyFileFormat,
     /// Set or get the maximum number of pages in the database file.

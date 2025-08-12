@@ -7,11 +7,16 @@ use std::sync::Arc;
 use turso_sqlite3_parser::ast::{self, ColumnDefinition, Expr, Literal, Name};
 use turso_sqlite3_parser::ast::{PragmaName, QualifiedName};
 
+use super::integrity_check::translate_integrity_check;
 use crate::pragma::pragma_for;
 use crate::schema::Schema;
+#[cfg(feature = "encryption")]
+use crate::storage::encryption::EncryptionKey;
 use crate::storage::pager::AutoVacuumMode;
+use crate::storage::pager::Pager;
 use crate::storage::sqlite3_ondisk::CacheSize;
 use crate::storage::wal::CheckpointMode;
+use crate::translate::emitter::TransactionMode;
 use crate::translate::schema::translate_create_table;
 use crate::util::{normalize_ident, parse_signed_number, parse_string, IOExt as _};
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
@@ -19,10 +24,6 @@ use crate::vdbe::insn::{Cookie, Insn};
 use crate::{bail_parse_error, CaptureDataChangesMode, LimboError, SymbolTable, Value};
 use std::str::FromStr;
 use strum::IntoEnumIterator;
-
-use super::integrity_check::translate_integrity_check;
-use crate::storage::pager::Pager;
-use crate::translate::emitter::TransactionMode;
 
 fn list_pragmas(program: &mut ProgramBuilder) {
     for x in PragmaName::iter() {
@@ -309,6 +310,15 @@ fn update_pragma(
             connection,
             program,
         ),
+        PragmaName::EncryptionKey => {
+            #[cfg(feature = "encryption")]
+            {
+                let value = parse_string(&value)?;
+                let key = EncryptionKey::from_string(&value);
+                connection.set_encryption_key(Some(key));
+            }
+            Ok((program, TransactionMode::None))
+        }
     }
 }
 
@@ -560,6 +570,23 @@ fn query_pragma(
             program.emit_int(value as i64, register);
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
+            Ok((program, TransactionMode::None))
+        }
+        PragmaName::EncryptionKey => {
+            #[cfg(feature = "encryption")]
+            {
+                let msg = {
+                    if connection.encryption_key.borrow().is_some() {
+                        "encryption key is set for this session"
+                    } else {
+                        "encryption key is not set for this session"
+                    }
+                };
+                let register = program.alloc_register();
+                program.emit_string8(msg.to_string(), register);
+                program.emit_result_row(register, 1);
+                program.add_pragma_result_column(pragma.to_string());
+            }
             Ok((program, TransactionMode::None))
         }
     }
