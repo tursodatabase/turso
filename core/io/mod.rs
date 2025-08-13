@@ -183,11 +183,6 @@ pub enum CompletionType {
     Truncate(TruncateCompletion),
 }
 
-pub struct ReadCompletion {
-    pub buf: Arc<Buffer>,
-    pub complete: Box<ReadComplete>,
-}
-
 impl Completion {
     pub fn new(completion_type: CompletionType) -> Self {
         Self {
@@ -281,12 +276,9 @@ impl Completion {
     }
 }
 
-pub struct WriteCompletion {
-    pub complete: Box<WriteComplete>,
-}
-
-pub struct SyncCompletion {
-    pub complete: Box<SyncComplete>,
+pub struct ReadCompletion {
+    pub buf: Arc<Buffer>,
+    pub complete: Box<ReadComplete>,
 }
 
 impl ReadCompletion {
@@ -303,6 +295,10 @@ impl ReadCompletion {
     }
 }
 
+pub struct WriteCompletion {
+    pub complete: Box<WriteComplete>,
+}
+
 impl WriteCompletion {
     pub fn new(complete: Box<WriteComplete>) -> Self {
         Self { complete }
@@ -311,6 +307,10 @@ impl WriteCompletion {
     pub fn complete(&self, bytes_written: i32) {
         (self.complete)(bytes_written);
     }
+}
+
+pub struct SyncCompletion {
+    pub complete: Box<SyncComplete>,
 }
 
 impl SyncCompletion {
