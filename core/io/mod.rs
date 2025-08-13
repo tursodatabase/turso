@@ -1,12 +1,12 @@
 use crate::storage::buffer_pool::ArenaBuffer;
 use crate::storage::sqlite3_ondisk::WAL_FRAME_HEADER_SIZE;
-use crate::{BufferPool, Result};
+use crate::{BufferPool, LimboError, Result};
 use bitflags::bitflags;
 use cfg_block::cfg_block;
 use std::cell::RefCell;
 use std::fmt;
 use std::ptr::NonNull;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::{cell::Cell, fmt::Debug, pin::Pin};
 
 pub trait File: Send + Sync {
@@ -145,8 +145,9 @@ pub struct Completion {
 
 #[derive(Debug)]
 struct CompletionInner {
-    pub completion_type: CompletionType,
+    completion_type: CompletionType,
     is_completed: Cell<bool>,
+    error: std::sync::OnceLock<LimboError>,
 }
 
 impl Debug for CompletionType {
@@ -178,6 +179,7 @@ impl Completion {
             inner: Arc::new(CompletionInner {
                 completion_type,
                 is_completed: Cell::new(false),
+                error: OnceLock::new(),
             }),
         }
     }
