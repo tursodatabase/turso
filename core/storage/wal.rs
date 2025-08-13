@@ -1543,12 +1543,12 @@ impl WalFile {
                         tracing::trace!("Drained reads into batch");
                     }
 
+                    let seq = self.header.checkpoint_seq;
                     // Issue reads until we hit limits
                     while self.ongoing_checkpoint.should_issue_reads() {
                         let (page_id, target_frame) = self.ongoing_checkpoint.pages_to_checkpoint
                             [self.ongoing_checkpoint.current_page as usize];
 
-                        let seq = self.get_shared().wal_header.lock().checkpoint_seq;
                         // Try cache first
                         if let Some(cached_page) =
                             pager.cache_get_for_checkpoint(page_id as usize, target_frame, seq)
@@ -1561,7 +1561,6 @@ impl WalFile {
                             self.ongoing_checkpoint.current_page += 1;
                             continue;
                         }
-
                         // Issue read if page wasn't found in the page cache or doesnt meet
                         // the frame requirements
                         let inflight =
