@@ -136,7 +136,9 @@ pub trait IO: Clock + Send + Sync {
         i64::from_ne_bytes(buf)
     }
 
-    fn get_memory_io(&self) -> Arc<MemoryIO>;
+    fn get_memory_io(&self) -> Arc<MemoryIO> {
+        Arc::new(MemoryIO::new())
+    }
 
     fn register_fixed_buffer(&self, _ptr: NonNull<u8>, _len: usize) -> Result<u32> {
         Err(crate::LimboError::InternalError(

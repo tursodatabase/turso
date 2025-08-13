@@ -1,4 +1,4 @@
-use super::{Completion, File, MemoryIO, OpenFlags, IO};
+use super::{Completion, File, OpenFlags, IO};
 use crate::error::LimboError;
 use crate::io::clock::{Clock, Instant};
 use crate::io::common;
@@ -397,10 +397,6 @@ impl IO for UnixIO {
         }
 
         Ok(())
-    }
-
-    fn get_memory_io(&self) -> Arc<MemoryIO> {
-        Arc::new(MemoryIO::new())
     }
 }
 

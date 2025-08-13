@@ -38,10 +38,6 @@ impl IO for GenericIO {
     fn run_once(&self) -> Result<()> {
         Ok(())
     }
-
-    fn get_memory_io(&self) -> Arc<MemoryIO> {
-        Arc::new(MemoryIO::new())
-    }
 }
 
 impl Clock for GenericIO {

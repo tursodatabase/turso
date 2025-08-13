@@ -67,10 +67,6 @@ impl IO for MemoryIO {
         // nop
         Ok(())
     }
-
-    fn get_memory_io(&self) -> Arc<MemoryIO> {
-        Arc::new(MemoryIO::new())
-    }
 }
 
 pub struct MemoryFile {

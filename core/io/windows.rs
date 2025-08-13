@@ -35,11 +35,6 @@ impl IO for WindowsIO {
     fn run_once(&self) -> Result<()> {
         Ok(())
     }
-
-    #[instrument(skip_all, level = Level::TRACE)]
-    fn get_memory_io(&self) -> Arc<MemoryIO> {
-        Arc::new(MemoryIO::new())
-    }
 }
 
 impl Clock for WindowsIO {
