@@ -38,6 +38,8 @@ jobs:
           python-version: "3.10"
       - name: Build
         run: cargo build --verbose
+      - name: Test Encryption
+        run: cargo test --features encryption --color=always --test integration_tests query_processing::encryption
       - name: Test
         env:
           RUST_LOG: ${{ runner.debug && 'turso_core::storage=trace' || '' }}
