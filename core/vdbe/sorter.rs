@@ -7,7 +7,6 @@ use std::rc::Rc;
 use std::sync::Arc;
 use tempfile;
 
-use crate::return_if_io;
 use crate::types::IOCompletions;
 use crate::util::IOExt;
 use crate::{
@@ -19,6 +18,7 @@ use crate::{
     types::{IOResult, ImmutableRecord, KeyInfo, RecordCursor, RefValue},
     Result,
 };
+use crate::{return_if_io, CompletionError};
 
 #[derive(Debug, Clone, Copy)]
 enum SortState {
@@ -489,7 +489,10 @@ impl SortedChunk {
         let stored_buffer_copy = self.buffer.clone();
         let stored_buffer_len_copy = self.buffer_len.clone();
         let total_bytes_read_copy = self.total_bytes_read.clone();
-        let read_complete = Box::new(move |buf: Arc<Buffer>, bytes_read: i32| {
+        let read_complete = Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
+            let Ok((buf, bytes_read)) = res else {
+                return;
+            };
             let read_buf_ref = buf.clone();
             let read_buf = read_buf_ref.as_slice();
 
@@ -547,7 +550,10 @@ impl SortedChunk {
 
         let buffer_ref_copy = buffer_ref.clone();
         let chunk_io_state_copy = self.io_state.clone();
-        let write_complete = Box::new(move |bytes_written: i32| {
+        let write_complete = Box::new(move |res: Result<i32, CompletionError>| {
+            let Ok(bytes_written) = res else {
+                return;
+            };
             chunk_io_state_copy.set(SortedChunkIOState::WriteComplete);
             let buf_len = buffer_ref_copy.len();
             if bytes_written < buf_len as i32 {

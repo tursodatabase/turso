@@ -1,6 +1,6 @@
 use crate::storage::buffer_pool::ArenaBuffer;
 use crate::storage::sqlite3_ondisk::WAL_FRAME_HEADER_SIZE;
-use crate::{BufferPool, CompletionError, Result};
+use crate::{turso_assert, BufferPool, CompletionError, Result};
 use bitflags::bitflags;
 use cfg_block::cfg_block;
 use std::cell::RefCell;
@@ -37,13 +37,15 @@ pub trait File: Send + Sync {
                 let total_written = total_written.clone();
                 let _cloned = buf.clone();
                 Completion::new_write(move |n| {
-                    // reference buffer in callback to ensure alive for async io
-                    let _buf = _cloned.clone();
-                    // accumulate bytes actually reported by the backend
-                    total_written.fetch_add(n as usize, Ordering::Relaxed);
-                    if outstanding.fetch_sub(1, Ordering::AcqRel) == 1 {
-                        // last one finished
-                        c_main.complete(total_written.load(Ordering::Acquire) as i32);
+                    if let Ok(n) = n {
+                        // reference buffer in callback to ensure alive for async io
+                        let _buf = _cloned.clone();
+                        // accumulate bytes actually reported by the backend
+                        total_written.fetch_add(n as usize, Ordering::Relaxed);
+                        if outstanding.fetch_sub(1, Ordering::AcqRel) == 1 {
+                            // last one finished
+                            c_main.complete(total_written.load(Ordering::Acquire) as i32);
+                        }
                     }
                 })
             };
@@ -75,10 +77,8 @@ pub trait File: Send + Sync {
             let chunk_size = (file_size - pos).min(BUFFER_SIZE);
             // Read from source
             let read_buffer = Arc::new(Buffer::new_temporary(chunk_size));
-            let read_completion = self.pread(
-                pos,
-                Completion::new_read(read_buffer.clone(), move |_, _| {}),
-            )?;
+            let read_completion =
+                self.pread(pos, Completion::new_read(read_buffer.clone(), move |_| {}))?;
 
             // Wait for read to complete
             io.wait_for_completion(read_completion)?;
@@ -147,10 +147,10 @@ pub trait IO: Clock + Send + Sync {
     }
 }
 
-pub type ReadComplete = dyn Fn(Arc<Buffer>, i32);
-pub type WriteComplete = dyn Fn(i32);
-pub type SyncComplete = dyn Fn(i32);
-pub type TruncateComplete = dyn Fn(i32);
+pub type ReadComplete = dyn Fn(Result<(Arc<Buffer>, i32), CompletionError>);
+pub type WriteComplete = dyn Fn(Result<i32, CompletionError>);
+pub type SyncComplete = dyn Fn(Result<i32, CompletionError>);
+pub type TruncateComplete = dyn Fn(Result<i32, CompletionError>);
 
 #[must_use]
 #[derive(Debug, Clone)]
@@ -196,7 +196,7 @@ impl Completion {
 
     pub fn new_write<F>(complete: F) -> Self
     where
-        F: Fn(i32) + 'static,
+        F: Fn(Result<i32, CompletionError>) + 'static,
     {
         Self::new(CompletionType::Write(WriteCompletion::new(Box::new(
             complete,
@@ -205,7 +205,7 @@ impl Completion {
 
     pub fn new_read<F>(buf: Arc<Buffer>, complete: F) -> Self
     where
-        F: Fn(Arc<Buffer>, i32) + 'static,
+        F: Fn(Result<(Arc<Buffer>, i32), CompletionError>) + 'static,
     {
         Self::new(CompletionType::Read(ReadCompletion::new(
             buf,
@@ -214,7 +214,7 @@ impl Completion {
     }
     pub fn new_sync<F>(complete: F) -> Self
     where
-        F: Fn(i32) + 'static,
+        F: Fn(Result<i32, CompletionError>) + 'static,
     {
         Self::new(CompletionType::Sync(SyncCompletion::new(Box::new(
             complete,
@@ -223,7 +223,7 @@ impl Completion {
 
     pub fn new_trunc<F>(complete: F) -> Self
     where
-        F: Fn(i32) + 'static,
+        F: Fn(Result<i32, CompletionError>) + 'static,
     {
         Self::new(CompletionType::Truncate(TruncateCompletion::new(Box::new(
             complete,
@@ -246,15 +246,37 @@ impl Completion {
     }
 
     pub fn complete(&self, result: i32) {
-        if !self.inner.is_completed.get() {
+        if !self.has_error() && !self.inner.is_completed.get() {
+            let result = Ok(result);
             match &self.inner.completion_type {
-                CompletionType::Read(r) => r.complete(result),
-                CompletionType::Write(w) => w.complete(result),
-                CompletionType::Sync(s) => s.complete(result), // fix
-                CompletionType::Truncate(t) => t.complete(result),
+                CompletionType::Read(r) => r.callback(result),
+                CompletionType::Write(w) => w.callback(result),
+                CompletionType::Sync(s) => s.callback(result), // fix
+                CompletionType::Truncate(t) => t.callback(result),
             };
             self.inner.is_completed.set(true);
         }
+    }
+
+    pub fn error(&self, err: CompletionError) {
+        turso_assert!(
+            !self.is_completed(),
+            "should not error a completed Completion"
+        );
+        if !self.has_error() {
+            let result = Err(err);
+            match &self.inner.completion_type {
+                CompletionType::Read(r) => r.callback(result),
+                CompletionType::Write(w) => w.callback(result),
+                CompletionType::Sync(s) => s.callback(result), // fix
+                CompletionType::Truncate(t) => t.callback(result),
+            };
+            self.inner.error.get_or_init(|| err);
+        }
+    }
+
+    pub fn abort(&self) {
+        self.error(CompletionError::Aborted);
     }
 
     /// only call this method if you are sure that the completion is
@@ -290,8 +312,8 @@ impl ReadCompletion {
         &self.buf
     }
 
-    pub fn complete(&self, bytes_read: i32) {
-        (self.complete)(self.buf.clone(), bytes_read);
+    pub fn callback(&self, bytes_read: Result<i32, CompletionError>) {
+        (self.complete)(bytes_read.map(|b| (self.buf.clone(), b)));
     }
 }
 
@@ -304,7 +326,7 @@ impl WriteCompletion {
         Self { complete }
     }
 
-    pub fn complete(&self, bytes_written: i32) {
+    pub fn callback(&self, bytes_written: Result<i32, CompletionError>) {
         (self.complete)(bytes_written);
     }
 }
@@ -318,7 +340,7 @@ impl SyncCompletion {
         Self { complete }
     }
 
-    pub fn complete(&self, res: i32) {
+    pub fn callback(&self, res: Result<i32, CompletionError>) {
         (self.complete)(res);
     }
 }
@@ -332,7 +354,7 @@ impl TruncateCompletion {
         Self { complete }
     }
 
-    pub fn complete(&self, res: i32) {
+    pub fn callback(&self, res: Result<i32, CompletionError>) {
         (self.complete)(res);
     }
 }

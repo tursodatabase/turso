@@ -69,7 +69,10 @@ pub async fn db_bootstrap<C: ProtocolIO>(
             buffer.as_mut_slice().copy_from_slice(chunk);
             let mut completions = Vec::with_capacity(dbs.len());
             for db in dbs {
-                let c = Completion::new_write(move |size| {
+                let c = Completion::new_write(move |res| {
+                    let Ok(size) = res else {
+                        return;
+                    };
                     // todo(sivukhin): we need to error out in case of partial read
                     assert!(size as usize == content_len);
                 });
@@ -508,7 +511,10 @@ pub async fn reset_wal_file(
         WAL_HEADER + WAL_FRAME_SIZE * (frames_count as usize)
     };
     tracing::debug!("reset db wal to the size of {} frames", frames_count);
-    let c = Completion::new_trunc(move |rc| {
+    let c = Completion::new_trunc(move |res| {
+        let Ok(rc) = res else {
+            return;
+        };
         assert!(rc as usize == 0);
     });
     let c = wal.truncate(wal_size, c)?;
