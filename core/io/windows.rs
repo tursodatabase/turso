@@ -37,13 +37,6 @@ impl IO for WindowsIO {
     }
 
     #[instrument(skip_all, level = Level::TRACE)]
-    fn generate_random_number(&self) -> i64 {
-        let mut buf = [0u8; 8];
-        getrandom::getrandom(&mut buf).unwrap();
-        i64::from_ne_bytes(buf)
-    }
-
-    #[instrument(skip_all, level = Level::TRACE)]
     fn get_memory_io(&self) -> Arc<MemoryIO> {
         Arc::new(MemoryIO::new())
     }
