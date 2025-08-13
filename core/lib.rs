@@ -1301,9 +1301,9 @@ impl Connection {
             Ok(result) => result,
             // on windows, zero read will trigger UnexpectedEof
             #[cfg(target_os = "windows")]
-            Err(LimboError::IOError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                return Ok(false)
-            }
+            Err(LimboError::CompletionError(CompletionError::IOError(
+                std::io::ErrorKind::UnexpectedEof,
+            ))) => return Ok(false),
             Err(err) => return Err(err),
         };
 

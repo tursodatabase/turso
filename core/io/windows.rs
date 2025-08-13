@@ -1,4 +1,3 @@
-use super::MemoryIO;
 use crate::{Clock, Completion, File, Instant, LimboError, OpenFlags, Result, IO};
 use parking_lot::RwLock;
 use std::io::{Read, Seek, Write};
@@ -90,7 +89,7 @@ impl File for WindowsFile {
     #[instrument(err, skip_all, level = Level::TRACE)]
     fn sync(&self, c: Completion) -> Result<Completion> {
         let file = self.file.write();
-        file.sync_all().map_err(LimboError::IOError)?;
+        file.sync_all()?;
         c.complete(0);
         Ok(c)
     }
@@ -98,7 +97,7 @@ impl File for WindowsFile {
     #[instrument(err, skip_all, level = Level::TRACE)]
     fn truncate(&self, len: usize, c: Completion) -> Result<Completion> {
         let file = self.file.write();
-        file.set_len(len as u64).map_err(LimboError::IOError)?;
+        file.set_len(len as u64)?;
         c.complete(0);
         Ok(c)
     }

@@ -34,11 +34,9 @@ impl IoOperations for Arc<dyn turso_core::IO> {
     fn try_open(&self, path: &str) -> Result<Option<Arc<dyn turso_core::File>>> {
         match self.open_file(path, OpenFlags::None, false) {
             Ok(file) => Ok(Some(file)),
-            Err(LimboError::CompletionError(turso_core::CompletionError::IOError(err)))
-                if err == std::io::ErrorKind::NotFound =>
-            {
-                Ok(None)
-            }
+            Err(LimboError::CompletionError(turso_core::CompletionError::IOError(
+                std::io::ErrorKind::NotFound,
+            ))) => Ok(None),
             Err(err) => Err(err.into()),
         }
     }
