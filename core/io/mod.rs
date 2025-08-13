@@ -277,6 +277,10 @@ impl ReadCompletion {
         &self.buf
     }
 
+    pub fn buf_arc(&self) -> Arc<Buffer> {
+        self.buf.clone()
+    }
+
     pub fn complete(&self, bytes_read: i32) {
         (self.complete)(self.buf.clone(), bytes_read);
     }

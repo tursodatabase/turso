@@ -8484,7 +8484,7 @@ mod tests {
             });
             let _c = pager
                 .db_file
-                .write_page(current_page as usize, buf.clone(), c)?;
+                .write_page(current_page as usize, buf.clone(), None, c)?;
             pager.io.run_once()?;
 
             let (page, _c) = cursor.read_page(current_page as usize)?;

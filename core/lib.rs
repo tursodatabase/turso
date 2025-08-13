@@ -75,6 +75,7 @@ use std::{
 };
 #[cfg(feature = "fs")]
 use storage::database::DatabaseFile;
+pub use storage::encryption::EncryptionKey;
 use storage::page_cache::DumbLruPageCache;
 use storage::pager::{AtomicDbState, DbState};
 use storage::sqlite3_ondisk::PageSize;
@@ -419,6 +420,7 @@ impl Database {
             attached_databases: RefCell::new(DatabaseCatalog::new()),
             query_only: Cell::new(false),
             view_transaction_states: RefCell::new(HashMap::new()),
+            encryption_key: RefCell::new(None),
         });
         let builtin_syms = self.builtin_syms.borrow();
         // add built-in extensions symbols to the connection to prevent having to load each time
@@ -794,6 +796,7 @@ pub struct Connection {
     /// Per-connection view transaction states for uncommitted changes. This represents
     /// one entry per view that was touched in the transaction.
     view_transaction_states: RefCell<HashMap<String, ViewTransactionState>>,
+    encryption_key: RefCell<Option<EncryptionKey>>,
 }
 
 impl Connection {
@@ -1881,6 +1884,13 @@ impl Connection {
     /// Creates a HashSet of modules that have been loaded
     pub fn get_syms_vtab_mods(&self) -> std::collections::HashSet<String> {
         self.syms.borrow().vtab_modules.keys().cloned().collect()
+    }
+
+    pub fn set_encryption_key(&self, key: Option<EncryptionKey>) {
+        tracing::trace!("setting encryption key for connection");
+        *self.encryption_key.borrow_mut() = key.clone();
+        let pager = self.pager.borrow();
+        pager.set_encryption_key(key);
     }
 }
 
