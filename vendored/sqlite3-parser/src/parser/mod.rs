@@ -16,7 +16,7 @@ use crate::dialect::Token;
 use ast::{Cmd, ExplainKind, Name, Stmt};
 
 /// Parser error
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ParserError {
     /// Syntax error
     SyntaxError(String),

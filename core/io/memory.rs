@@ -48,10 +48,7 @@ impl IO for MemoryIO {
     fn open_file(&self, path: &str, flags: OpenFlags, _direct: bool) -> Result<Arc<dyn File>> {
         let mut files = self.files.lock().unwrap();
         if !files.contains_key(path) && !flags.contains(OpenFlags::Create) {
-            return Err(LimboError::IOError(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "file not found",
-            )));
+            return Err(LimboError::IOError(std::io::ErrorKind::NotFound));
         }
         if !files.contains_key(path) {
             files.insert(

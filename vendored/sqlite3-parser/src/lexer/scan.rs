@@ -2,10 +2,9 @@
 
 use std::error::Error;
 use std::fmt;
-use std::io;
 
 /// Error with position
-pub trait ScanError: Error + From<io::Error> + Sized {
+pub trait ScanError: Error + Sized {
     /// Update the position where the error occurs
     fn position(&mut self, line: u64, column: usize, offset: usize);
 }

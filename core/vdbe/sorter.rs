@@ -313,7 +313,7 @@ impl Sorter {
         let chunk_file = match &self.temp_file {
             Some(temp_file) => temp_file.file.clone(),
             None => {
-                let temp_dir = tempfile::tempdir().map_err(LimboError::IOError)?;
+                let temp_dir = tempfile::tempdir()?;
                 let chunk_file_path = temp_dir.as_ref().join("chunk_file");
                 let chunk_file = self.io.open_file(
                     chunk_file_path.to_str().unwrap(),

@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-#[derive(Debug, Error, miette::Diagnostic)]
+#[derive(Debug, Clone, Error, miette::Diagnostic)]
 pub enum LimboError {
     #[error("Corrupt database: {0}")]
     Corrupt(String),
@@ -24,7 +24,7 @@ pub enum LimboError {
     #[error("Transaction error: {0}")]
     TxError(String),
     #[error("I/O error: {0}")]
-    IOError(#[from] std::io::Error),
+    IOError(std::io::ErrorKind),
     #[cfg(all(target_os = "linux", feature = "io_uring"))]
     #[error("I/O error: {0}")]
     UringIOError(String),
@@ -83,6 +83,19 @@ pub enum LimboError {
     InvalidBlobSize(usize),
     #[error("Planning error: {0}")]
     PlanningError(String),
+}
+
+// We only propagate the error kind
+impl From<std::io::Error> for LimboError {
+    fn from(value: std::io::Error) -> Self {
+        LimboError::IOError(value.kind())
+    }
+}
+
+impl From<std::io::ErrorKind> for LimboError {
+    fn from(value: std::io::ErrorKind) -> Self {
+        LimboError::IOError(value)
+    }
 }
 
 #[macro_export]
