@@ -1,6 +1,6 @@
 use crate::storage::buffer_pool::ArenaBuffer;
 use crate::storage::sqlite3_ondisk::WAL_FRAME_HEADER_SIZE;
-use crate::{BufferPool, LimboError, Result};
+use crate::{BufferPool, CompletionError, Result};
 use bitflags::bitflags;
 use cfg_block::cfg_block;
 use std::cell::RefCell;
@@ -125,7 +125,7 @@ pub trait IO: Clock + Send + Sync {
         }
         if c.has_error() {
             let err = c.inner.error.get().cloned().unwrap();
-            return Err(err);
+            return Err(err.into());
         }
         Ok(())
     }
@@ -162,7 +162,7 @@ pub struct Completion {
 struct CompletionInner {
     completion_type: CompletionType,
     is_completed: Cell<bool>,
-    error: std::sync::OnceLock<LimboError>,
+    error: std::sync::OnceLock<CompletionError>,
 }
 
 impl Debug for CompletionType {

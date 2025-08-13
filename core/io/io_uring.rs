@@ -260,9 +260,10 @@ impl InnerUringIO {
                 .register_files_update(slot, &[fd.as_raw_fd()])?;
             return Ok(slot);
         }
-        Err(LimboError::UringIOError(
-            "unable to register file, no free slots available".to_string(),
-        ))
+        Err(crate::error::CompletionError::UringIOError(
+            "unable to register file, no free slots available",
+        )
+        .into())
     }
     fn unregister_file(&mut self, id: u32) -> Result<()> {
         self.ring
@@ -538,7 +539,9 @@ impl IO for UringIO {
             .free_arenas
             .iter()
             .position(|e| e.is_none())
-            .ok_or_else(|| LimboError::UringIOError("no free fixed buffer slots".into()))?;
+            .ok_or_else(|| {
+                crate::error::CompletionError::UringIOError("no free fixed buffer slots")
+            })?;
         unsafe {
             inner.ring.ring.submitter().register_buffers_update(
                 slot as u32,

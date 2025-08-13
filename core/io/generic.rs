@@ -93,15 +93,14 @@ impl File for GenericFile {
 
     fn sync(&self, c: Completion) -> Result<Completion> {
         let mut file = self.file.borrow_mut();
-        file.sync_all().map_err(|err| LimboError::IOError(err))?;
+        file.sync_all()?;
         c.complete(0);
         Ok(c)
     }
 
     fn truncate(&self, len: usize, c: Completion) -> Result<Completion> {
         let mut file = self.file.borrow_mut();
-        file.set_len(len as u64)
-            .map_err(|err| LimboError::IOError(err))?;
+        file.set_len(len as u64)?;
         c.complete(0);
         Ok(c)
     }

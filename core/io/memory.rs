@@ -1,5 +1,5 @@
 use super::{Buffer, Clock, Completion, File, OpenFlags, IO};
-use crate::{LimboError, Result};
+use crate::Result;
 
 use crate::io::clock::Instant;
 use std::{
@@ -48,7 +48,9 @@ impl IO for MemoryIO {
     fn open_file(&self, path: &str, flags: OpenFlags, _direct: bool) -> Result<Arc<dyn File>> {
         let mut files = self.files.lock().unwrap();
         if !files.contains_key(path) && !flags.contains(OpenFlags::Create) {
-            return Err(LimboError::IOError(std::io::ErrorKind::NotFound));
+            return Err(
+                crate::error::CompletionError::IOError(std::io::ErrorKind::NotFound).into(),
+            );
         }
         if !files.contains_key(path) {
             files.insert(
