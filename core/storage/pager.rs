@@ -27,12 +27,11 @@ use super::btree::{btree_init_page, BTreePage};
 use super::page_cache::{CacheError, CacheResizeResult, DumbLruPageCache, PageCacheKey};
 use super::sqlite3_ondisk::begin_write_btree_page;
 use super::wal::CheckpointMode;
+use crate::storage::encryption::EncryptionKey;
 
 /// SQLite's default maximum page count
 const DEFAULT_MAX_PAGE_COUNT: u32 = 0xfffffffe;
 
-#[cfg(feature = "encryption")]
-use crate::storage::encryption::EncryptionKey;
 #[cfg(not(feature = "omit_autovacuum"))]
 use ptrmap::*;
 
@@ -440,7 +439,6 @@ pub struct Pager {
     header_ref_state: RefCell<HeaderRefState>,
     #[cfg(not(feature = "omit_autovacuum"))]
     btree_create_vacuum_full_state: Cell<BtreeCreateVacuumFullState>,
-    #[cfg(feature = "encryption")]
     pub(crate) encryption_key: RefCell<Option<EncryptionKey>>,
 }
 
@@ -543,7 +541,6 @@ impl Pager {
             header_ref_state: RefCell::new(HeaderRefState::Start),
             #[cfg(not(feature = "omit_autovacuum"))]
             btree_create_vacuum_full_state: Cell::new(BtreeCreateVacuumFullState::Start),
-            #[cfg(feature = "encryption")]
             encryption_key: RefCell::new(None),
         })
     }
@@ -1027,7 +1024,6 @@ impl Pager {
                 page_idx,
                 page.clone(),
                 allow_empty_read,
-                #[cfg(feature = "encryption")]
                 self.encryption_key.borrow().as_ref(),
             )?;
             return Ok((page, c));
@@ -1046,7 +1042,6 @@ impl Pager {
             page_idx,
             page.clone(),
             allow_empty_read,
-            #[cfg(feature = "encryption")]
             self.encryption_key.borrow().as_ref(),
         )?;
         Ok((page, c))
@@ -1073,7 +1068,7 @@ impl Pager {
         page_idx: usize,
         page: PageRef,
         allow_empty_read: bool,
-        #[cfg(feature = "encryption")] encryption_key: Option<&EncryptionKey>,
+        encryption_key: Option<&EncryptionKey>,
     ) -> Result<Completion> {
         sqlite3_ondisk::begin_read_page(
             self.db_file.clone(),
@@ -1081,7 +1076,6 @@ impl Pager {
             page,
             page_idx,
             allow_empty_read,
-            #[cfg(feature = "encryption")]
             encryption_key,
         )
     }
@@ -1951,7 +1945,6 @@ impl Pager {
         Ok(IOResult::Done(f(header)))
     }
 
-    #[cfg(feature = "encryption")]
     pub fn set_encryption_key(&self, key: Option<EncryptionKey>) {
         self.encryption_key.replace(key.clone());
         let Some(wal) = self.wal.as_ref() else { return };

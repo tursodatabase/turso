@@ -8482,14 +8482,9 @@ mod tests {
             let c = Completion::new_write(move |_| {
                 let _ = _buf.clone();
             });
-            #[cfg(feature = "encryption")]
             let _c = pager
                 .db_file
                 .write_page(current_page as usize, buf.clone(), None, c)?;
-            #[cfg(not(feature = "encryption"))]
-            let _c = pager
-                .db_file
-                .write_page(current_page as usize, buf.clone(), c)?;
             pager.io.run_once()?;
 
             let (page, _c) = cursor.read_page(current_page as usize)?;

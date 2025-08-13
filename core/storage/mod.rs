@@ -13,7 +13,6 @@
 pub(crate) mod btree;
 pub(crate) mod buffer_pool;
 pub(crate) mod database;
-#[cfg(feature = "encryption")]
 pub(crate) mod encryption;
 pub(crate) mod page_cache;
 #[allow(clippy::arc_with_non_send_sync)]

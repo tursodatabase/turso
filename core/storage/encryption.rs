@@ -1,3 +1,6 @@
+#![allow(unused_variables, dead_code)]
+#[cfg(not(feature = "encryption"))]
+use crate::LimboError;
 use crate::Result;
 use aes_gcm::{
     aead::{Aead, AeadCore, KeyInit, OsRng},
@@ -68,6 +71,14 @@ impl Drop for EncryptionKey {
     }
 }
 
+#[cfg(not(feature = "encryption"))]
+pub fn encrypt_page(page: &[u8], page_id: usize, key: &EncryptionKey) -> Result<Vec<u8>> {
+    Err(LimboError::InvalidArgument(
+        "encryption is not enabled, cannot encrypt page. enable via passing `--features encryption`".into(),
+    ))
+}
+
+#[cfg(feature = "encryption")]
 pub fn encrypt_page(page: &[u8], page_id: usize, key: &EncryptionKey) -> Result<Vec<u8>> {
     if page_id == 1 {
         tracing::debug!("skipping encryption for page 1 (database header)");
@@ -104,6 +115,14 @@ pub fn encrypt_page(page: &[u8], page_id: usize, key: &EncryptionKey) -> Result<
     Ok(result)
 }
 
+#[cfg(not(feature = "encryption"))]
+pub fn decrypt_page(encrypted_page: &[u8], page_id: usize, key: &EncryptionKey) -> Result<Vec<u8>> {
+    Err(LimboError::InvalidArgument(
+        "encryption is not enabled, cannot decrypt page. enable via passing `--features encryption`".into(),
+    ))
+}
+
+#[cfg(feature = "encryption")]
 pub fn decrypt_page(encrypted_page: &[u8], page_id: usize, key: &EncryptionKey) -> Result<Vec<u8>> {
     if page_id == 1 {
         tracing::debug!("skipping decryption for page 1 (database header)");
@@ -160,6 +179,7 @@ mod tests {
     use rand::Rng;
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn test_encrypt_decrypt_round_trip() {
         let mut rng = rand::thread_rng();
         let data_size = ENCRYPTED_PAGE_SIZE - ENCRYPTION_METADATA_SIZE;

@@ -75,7 +75,6 @@ use std::{
 };
 #[cfg(feature = "fs")]
 use storage::database::DatabaseFile;
-#[cfg(feature = "encryption")]
 pub use storage::encryption::EncryptionKey;
 use storage::page_cache::DumbLruPageCache;
 use storage::pager::{AtomicDbState, DbState};
@@ -419,7 +418,6 @@ impl Database {
             attached_databases: RefCell::new(DatabaseCatalog::new()),
             query_only: Cell::new(false),
             view_transaction_states: RefCell::new(HashMap::new()),
-            #[cfg(feature = "encryption")]
             encryption_key: RefCell::new(None),
         });
         let builtin_syms = self.builtin_syms.borrow();
@@ -794,7 +792,6 @@ pub struct Connection {
     /// Per-connection view transaction states for uncommitted changes. This represents
     /// one entry per view that was touched in the transaction.
     view_transaction_states: RefCell<HashMap<String, ViewTransactionState>>,
-    #[cfg(feature = "encryption")]
     encryption_key: RefCell<Option<EncryptionKey>>,
 }
 
@@ -1914,7 +1911,6 @@ impl Connection {
         self.syms.borrow().vtab_modules.keys().cloned().collect()
     }
 
-    #[cfg(feature = "encryption")]
     pub fn set_encryption_key(&self, key: Option<EncryptionKey>) {
         tracing::trace!("setting encryption key for connection");
         *self.encryption_key.borrow_mut() = key.clone();
