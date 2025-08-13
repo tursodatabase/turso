@@ -119,7 +119,16 @@ pub trait IO: Clock + Send + Sync {
 
     fn run_once(&self) -> Result<()>;
 
-    fn wait_for_completion(&self, c: Completion) -> Result<()>;
+    fn wait_for_completion(&self, c: Completion) -> Result<()> {
+        while !c.has_error() && !c.is_completed() {
+            self.run_once()?
+        }
+        if c.has_error() {
+            let err = c.inner.error.get().cloned().unwrap();
+            return Err(err);
+        }
+        Ok(())
+    }
 
     fn generate_random_number(&self) -> i64;
 
@@ -229,6 +238,10 @@ impl Completion {
 
     pub fn is_completed(&self) -> bool {
         self.inner.is_completed.get()
+    }
+
+    pub fn has_error(&self) -> bool {
+        self.inner.error.get().is_some()
     }
 
     pub fn complete(&self, result: i32) {

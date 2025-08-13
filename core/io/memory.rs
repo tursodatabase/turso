@@ -68,13 +68,6 @@ impl IO for MemoryIO {
         Ok(())
     }
 
-    fn wait_for_completion(&self, c: Completion) -> Result<()> {
-        while !c.is_completed() {
-            self.run_once()?;
-        }
-        Ok(())
-    }
-
     fn generate_random_number(&self) -> i64 {
         let mut buf = [0u8; 8];
         getrandom::getrandom(&mut buf).unwrap();

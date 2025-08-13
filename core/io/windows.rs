@@ -32,14 +32,6 @@ impl IO for WindowsIO {
     }
 
     #[instrument(err, skip_all, level = Level::TRACE)]
-    fn wait_for_completion(&self, c: Completion) -> Result<()> {
-        while !c.is_completed() {
-            self.run_once()?;
-        }
-        Ok(())
-    }
-
-    #[instrument(err, skip_all, level = Level::TRACE)]
     fn run_once(&self) -> Result<()> {
         Ok(())
     }
