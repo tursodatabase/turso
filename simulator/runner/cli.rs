@@ -129,6 +129,12 @@ pub struct SimulatorCLI {
     pub experimental_mvcc: bool,
     #[clap(long, help = "Disable experimental indexing feature")]
     pub disable_experimental_indexes: bool,
+    #[clap(
+        long,
+        help = "maximum number of connections to use",
+        default_value_t = 1
+    )]
+    pub max_connections: usize,
 }
 
 #[derive(Parser, Debug, Clone, Serialize, Deserialize, PartialEq, PartialOrd, Eq, Ord)]
