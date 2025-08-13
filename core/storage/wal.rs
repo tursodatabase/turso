@@ -278,6 +278,7 @@ pub trait Wal {
     ) -> Result<IOResult<CheckpointResult>>;
     fn sync(&mut self) -> Result<Completion>;
     fn get_max_frame_in_wal(&self) -> u64;
+    fn checkpoint_seq(&self) -> u32;
     fn get_nbackfills_in_wal(&self) -> u64;
     fn get_max_frame(&self) -> u64;
     fn get_min_frame(&self) -> u64;
@@ -298,7 +299,7 @@ pub enum CheckpointState {
 }
 
 /// IOV_MAX is 1024 on most systems
-pub const CKPT_BATCH_PAGES: usize = 1024;
+pub const CKPT_BATCH_PAGES: usize = 512;
 
 /// TODO: *ALL* of these need to be tuned for perf. It is tricky
 /// trying to figure out the ideal numbers here to work together concurrently
@@ -309,6 +310,7 @@ const MAX_INFLIGHT_READS: usize = 512;
 
 type PageId = usize;
 struct InflightRead {
+    completion: Completion,
     page_id: PageId,
     /// Atomic counter representing when this read operation is finished.
     done: Arc<AtomicBool>,
@@ -410,7 +412,7 @@ impl std::ops::DerefMut for WriteBatch {
     }
 }
 
-/// Information and
+/// Information and structures for processing a checkpoint operation.
 struct OngoingCheckpoint {
     /// Used for benchmarking/debugging a checkpoint operation.
     time: std::time::Instant,
@@ -433,6 +435,17 @@ struct OngoingCheckpoint {
 }
 
 impl OngoingCheckpoint {
+    fn reset(&mut self) {
+        self.min_frame = 0;
+        self.max_frame = 0;
+        self.current_page = 0;
+        self.pages_to_checkpoint.clear();
+        self.pending_writes.clear();
+        self.inflight_reads.clear();
+        self.inflight_writes.clear();
+        self.state = CheckpointState::Start;
+    }
+
     #[inline]
     /// Whether or not new reads should be issued during checkpoint processing.
     fn should_issue_reads(&self) -> bool {
@@ -1009,6 +1022,7 @@ impl Wal for WalFile {
         let offset = self.frame_offset(frame_id);
         page.set_locked();
         let frame = page.clone();
+        let seq = self.header.checkpoint_seq;
         let complete = Box::new(move |buf: Arc<Buffer>, bytes_read: i32| {
             let buf_len = buf.len();
             turso_assert!(
@@ -1016,7 +1030,7 @@ impl Wal for WalFile {
                 "read({bytes_read}) less than expected({buf_len}): frame_id={frame_id}"
             );
             let frame = frame.clone();
-            frame.set_wal_frame(frame_id);
+            frame.set_wal_tag(frame_id, seq);
             finish_read_page(page.get().id, buf, frame).unwrap();
         });
         begin_read_wal_frame(
@@ -1163,6 +1177,7 @@ impl Wal for WalFile {
             let checksums = self.last_checksum;
             let page_content = page.get_contents();
             let page_buf = page_content.as_ptr();
+            let seq = header.checkpoint_seq;
             let (frame_checksums, frame_bytes) = prepare_wal_frame(
                 &self.buffer_pool,
                 &header,
@@ -1183,8 +1198,7 @@ impl Wal for WalFile {
                     );
 
                     page.clear_dirty();
-                    page.set_wal_frame(frame_id);
-                    *write_counter.borrow_mut() -= 1;
+                    page.set_wal_tag(frame_id, seq);
                 }
             });
             let result = shared.file.pwrite(offset, frame_bytes.clone(), c)?;
@@ -1238,6 +1252,10 @@ impl Wal for WalFile {
 
     fn get_min_frame(&self) -> u64 {
         self.min_frame
+    }
+
+    fn checkpoint_seq(&self) -> u32 {
+        self.get_shared().wal_header.lock().checkpoint_seq
     }
 
     fn get_nbackfills_in_wal(&self) -> u64 {
@@ -1335,14 +1353,14 @@ impl WalFile {
             shared,
             ongoing_checkpoint: OngoingCheckpoint {
                 time: std::time::Instant::now(),
-                batch: Batch::new(),
-                pending_flush: PendingFlush::new(),
+                pending_writes: WriteBatch::new(),
+                inflight_writes: Vec::new(),
                 state: CheckpointState::Start,
                 min_frame: 0,
                 max_frame: 0,
                 current_page: 0,
                 pages_to_checkpoint: Vec::new(),
-                inflight: Vec::with_capacity(MAX_INFLIGHT_READS),
+                inflight_reads: Vec::with_capacity(MAX_INFLIGHT_READS),
             },
             checkpoint_threshold: 1000,
             buffer_pool,
@@ -1395,15 +1413,8 @@ impl WalFile {
     }
 
     fn reset_internal_states(&mut self) {
-        self.ongoing_checkpoint.state = CheckpointState::Start;
-        self.ongoing_checkpoint.min_frame = 0;
-        self.ongoing_checkpoint.max_frame = 0;
-        self.ongoing_checkpoint.current_page = 0;
         self.max_frame_read_lock_index.set(NO_LOCK_HELD);
-        self.ongoing_checkpoint.batch.clear();
-        self.ongoing_checkpoint.pending_flush.clear();
-        self.sync_state.set(SyncState::NotSyncing);
-        self.ongoing_checkpoint.pages_to_checkpoint.clear();
+        self.ongoing_checkpoint.reset();
         self.syncing.set(false);
     }
 
@@ -1456,7 +1467,6 @@ impl WalFile {
     fn checkpoint_inner(
         &mut self,
         pager: &Pager,
-        _write_counter: Rc<RefCell<usize>>,
         mode: CheckpointMode,
     ) -> Result<IOResult<CheckpointResult>> {
         loop {
@@ -1474,9 +1484,7 @@ impl WalFile {
                         (max_frame, n_backfills)
                     };
                     let needs_backfill = max_frame > nbackfills;
-                    if !needs_backfill
-                        && matches!(mode, CheckpointMode::Passive | CheckpointMode::Full)
-                    {
+                    if !needs_backfill && !mode.should_restart_log() {
                         // there are no frames to copy over and we don't need to reset
                         // the log so we can return early success.
                         return Ok(IOResult::Done(self.prev_checkpoint.clone()));
@@ -1500,7 +1508,8 @@ impl WalFile {
                         // This is tricky, because for situations where we need to actually read these
                         // pages from disk, we want to sort by frame for locality. For writes,
                         // it is better if we are sorting by page ID, as it will lead to more
-                        // 'batched' writev calls grouped together.
+                        // 'batched' writev calls grouped together. Since the latter is the common
+                        // case, we'll do that.
                         list.sort_unstable_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
                         list
                     };
@@ -1522,17 +1531,15 @@ impl WalFile {
                 // to prevent serialization, and we try to issue reads and flush batches concurrently
                 // if at all possible, at the cost of some batching potential.
                 CheckpointState::Processing => {
-                    // Track if there was any work done on this iteration
-                    let mut did_work = false;
+                    // Gather I/O completions, estimate with MAX_PENDING_WRITES to prevent realloc
+                    let mut completions = Vec::with_capacity(MAX_PENDING_WRITES);
 
                     // Check and clean any completed writes from pending flush
                     if self.ongoing_checkpoint.process_pending_writes() {
-                        did_work = true;
                         tracing::trace!("Completed a write batch");
                     }
                     // Process completed reads into current batch
                     if self.ongoing_checkpoint.process_pending_reads() {
-                        did_work = true;
                         tracing::trace!("Drained reads into batch");
                     }
 
@@ -1552,7 +1559,6 @@ impl WalFile {
                                 .pending_writes
                                 .insert(page_id as usize, buffer);
                             self.ongoing_checkpoint.current_page += 1;
-                            did_work = true;
                             continue;
                         }
 
@@ -1560,9 +1566,9 @@ impl WalFile {
                         // the frame requirements
                         let inflight =
                             self.issue_wal_read_into_buffer(page_id as usize, target_frame)?;
+                        completions.push(inflight.completion.clone());
                         self.ongoing_checkpoint.inflight_reads.push(inflight);
                         self.ongoing_checkpoint.current_page += 1;
-                        did_work = true;
                     }
 
                     // Start a write if batch is ready and we're not at write limit
@@ -1572,8 +1578,7 @@ impl WalFile {
                         let batch_map = self.ongoing_checkpoint.pending_writes.take();
                         if !batch_map.is_empty() {
                             let done_flag = self.ongoing_checkpoint.add_write();
-                            completions = write_pages_vectored(pager, batch_map, done_flag)?;
-                            did_work = true;
+                            completions.extend(write_pages_vectored(pager, batch_map, done_flag)?);
                         }
                     }
 
@@ -1593,9 +1598,8 @@ impl WalFile {
                             }
                         }
                         self.ongoing_checkpoint.state = CheckpointState::Done;
-                    } else if !did_work {
-                        // if we didn't finish or progress, we are strictly waiting for I/O
-                        return Ok(IOResult::IO);
+                    } else if !completions.is_empty() {
+                        return Ok(IOResult::IO(IOCompletions::Many(completions)));
                     }
                 }
                 // All eligible frames copied to the db file
@@ -1674,7 +1678,6 @@ impl WalFile {
                     self.ongoing_checkpoint.pending_writes.clear();
                     self.ongoing_checkpoint.pages_to_checkpoint.clear();
                     self.ongoing_checkpoint.current_page = 0;
-
                     tracing::debug!(
                         "total time spent checkpointing: {}",
                         std::time::Instant::now()
@@ -1867,7 +1870,7 @@ impl WalFile {
             })
         };
         // schedule read of the page payload
-        let _c = begin_read_wal_frame(
+        let c = begin_read_wal_frame(
             &self.get_shared().file,
             offset + WAL_FRAME_HEADER_SIZE,
             self.buffer_pool.clone(),
@@ -1875,29 +1878,11 @@ impl WalFile {
         )?;
 
         Ok(InflightRead {
+            completion: c,
             page_id,
             done,
             buf: buf_slot,
         })
-    }
-
-    /// Drain completed inflight reads into the batch.
-    /// Returns true if we moved at least one item.
-    fn drain_inflight_into_batch(&mut self) -> bool {
-        let mut moved = false;
-        // retain only those still pending
-        self.ongoing_checkpoint.inflight.retain(|slot| {
-            if slot.done.load(Ordering::Acquire) {
-                if let Some(buf) = slot.buf.lock().take() {
-                    self.ongoing_checkpoint.batch.insert(slot.page_id, buf);
-                    moved = true;
-                }
-                false // drop this slot
-            } else {
-                true // keep pending
-            }
-        });
-        moved
     }
 }
 
