@@ -312,8 +312,6 @@ type PageId = usize;
 struct InflightRead {
     completion: Completion,
     page_id: PageId,
-    /// Atomic counter representing when this read operation is finished.
-    done: Arc<AtomicBool>,
     /// Buffer slot to contain the page content from the WAL read.
     buf: Arc<SpinLock<Option<Arc<Buffer>>>>,
 }
@@ -491,7 +489,7 @@ impl OngoingCheckpoint {
         let mut moved = false;
         // retain only those still pending
         self.inflight_reads.retain(|slot| {
-            if slot.done.load(Ordering::Acquire) {
+            if slot.completion.is_completed() {
                 if let Some(buf) = slot.buf.lock().take() {
                     // read is done, take the buffer and add it to the batch to write
                     self.pending_writes.insert(slot.page_id, buf);
@@ -1852,11 +1850,9 @@ impl WalFile {
 
     fn issue_wal_read_into_buffer(&self, page_id: usize, frame_id: u64) -> Result<InflightRead> {
         let offset = self.frame_offset(frame_id);
-        let done = Arc::new(AtomicBool::new(false));
         let buf_slot = Arc::new(SpinLock::new(None));
 
         let complete = {
-            let done = done.clone();
             let buf_slot = buf_slot.clone();
             Box::new(move |buf: Arc<Buffer>, bytes_read: i32| {
                 let buf_len = buf.len();
@@ -1865,7 +1861,6 @@ impl WalFile {
                     "read({bytes_read}) != expected({buf_len}): frame_id={frame_id}"
                 );
                 *buf_slot.lock() = Some(buf);
-                done.store(true, Ordering::Release);
             })
         };
         // schedule read of the page payload
@@ -1879,7 +1874,6 @@ impl WalFile {
         Ok(InflightRead {
             completion: c,
             page_id,
-            done,
             buf: buf_slot,
         })
     }
