@@ -244,29 +244,20 @@ pub fn prepare_update_plan(
         }
     }
 
-    // We should use the ephemeral plan if we are editting a value that is a rowid alias, primary key or unique column
-    let ephemeral_plan_should_be_used = set_clauses
+    // Pessimistic creation of ephemeral plan here
+    // This checks if we are editting a value that is a rowid alias, primary key or unique column
+    // The optimizer later on will tell us what table or index we will iterate over
+    // when we have that info we can decide to use or not the ephemeral plan
+    let references_alias_pk_unique = set_clauses
         .iter()
         .fold(false, |accum, (idx, _)| accum || truth_map[*idx]);
 
-    let (ephemeral_plan, mut where_clause) = if ephemeral_plan_should_be_used {
-        let mut where_clause = vec![];
+    let mut where_clause = vec![];
+    let ephemeral_plan = if references_alias_pk_unique {
         let internal_id = program.table_reference_counter.next();
 
-        let joined_tables = vec![JoinedTable {
-            table: match table.as_ref() {
-                Table::Virtual(vtab) => Table::Virtual(vtab.clone()),
-                Table::BTree(btree_table) => Table::BTree(btree_table.clone()),
-                _ => unreachable!(),
-            },
-            identifier: table_name.as_str().to_string(),
-            internal_id,
-            op: build_scan_op(&table, iter_dir),
-            join_info: None,
-            col_used_mask: ColumnUsedMask::default(),
-            database_id: 0,
-        }];
-        let mut table_references = TableReferences::new(joined_tables, vec![]);
+        let mut table_references = table_references.clone();
+        table_references.joined_tables_mut()[0].internal_id = internal_id;
 
         // Parse the WHERE clause
         parse_where(
@@ -310,11 +301,11 @@ pub fn prepare_update_plan(
                 alias: None,
                 contains_aggregates: false,
             }],
-            where_clause,       // original WHERE terms from the UPDATE clause
-            group_by: None,     // N/A
-            order_by: None,     // N/A
-            aggregates: vec![], // N/A
-            limit: None,        // N/A
+            where_clause: std::mem::take(&mut where_clause), // original WHERE terms from the UPDATE clause
+            group_by: None,                                  // N/A
+            order_by: None,                                  // N/A
+            aggregates: vec![],                              // N/A
+            limit: None,                                     // N/A
             query_destination: QueryDestination::EphemeralTable {
                 cursor_id: temp_cursor_id,
                 table,
@@ -332,14 +323,45 @@ pub fn prepare_update_plan(
             .joined_tables()
             .first()
             .unwrap();
+
+        let cols = table.columns();
+
+        let set_clause_references_loop_cursor = match &table.op {
+            Operation::Scan(Scan::BTreeTable { .. }) => set_clauses.iter().any(|(idx, _)| {
+                let col = &cols[*idx];
+                col.primary_key || col.unique
+            }),
+
+            Operation::Search(Search::Seek { index, seek_def }) => {
+                if seek_def.seek.as_ref().is_some_and(|key| key.op.eq_only()) {
+                    false
+                } else if let Some(index) = index {
+                    set_clauses.iter().any(|(idx, _)| {
+                        if let Some(col_index) = index.column_table_pos_to_index_pos(*idx) {
+                            let col = &cols[col_index];
+                            index.unique || col.primary_key || col.unique
+                        } else {
+                            false
+                        }
+                    })
+                } else {
+                    set_clauses.iter().any(|(idx, _)| {
+                        let col = &cols[*idx];
+                        col.primary_key || col.unique
+                    })
+                }
+            }
+            _ => false,
+        };
+
         // We do not need to emit an ephemeral plan if we are not going to loop over the table values
-        if matches!(table.op, Operation::Search(Search::RowidEq { .. })) {
-            (None, vec![])
+        if !set_clause_references_loop_cursor {
+            None
         } else {
-            (Some(ephemeral_plan), vec![])
+            Some(ephemeral_plan)
         }
     } else {
-        (None, vec![])
+        None
     };
 
     if ephemeral_plan.is_none() {
