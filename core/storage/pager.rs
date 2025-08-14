@@ -135,16 +135,8 @@ const SEQ_MAX: u32 = (1u32 << EPOCH_BITS) - 1;
 const FRAME_MAX: u64 = (1u64 << FRAME_BITS) - 1;
 
 #[inline]
-pub fn pack_tag_pair(frame: u64, seq: u32) -> Option<u64> {
-    // Reject out-of-range and the DB-file sentinel frame==0.
-    if frame == 0 || frame > FRAME_MAX {
-        return None;
-    }
-    if seq > SEQ_MAX {
-        return None;
-    }
-    let tag = ((seq as u64) << SEQ_SHIFT) | (frame & FRAME_MAX);
-    Some(tag)
+pub fn pack_tag_pair(frame: u64, seq: u32) -> u64 {
+    ((seq as u64) << SEQ_SHIFT) | (frame & FRAME_MAX)
 }
 
 #[inline]
@@ -294,8 +286,9 @@ impl Page {
     pub fn set_wal_tag(&self, frame: u64, seq: u32) {
         // use only first 20 bits for seq (max: 1048576)
         let seq20 = seq & SEQ_MAX;
-        let tag = pack_tag_pair(frame, seq20).unwrap_or(TAG_UNSET);
-        self.get().wal_tag.store(tag, Ordering::Release);
+        self.get()
+            .wal_tag
+            .store(pack_tag_pair(frame, seq20), Ordering::Release);
     }
 
     #[inline]
