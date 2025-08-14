@@ -240,7 +240,7 @@ impl SimulatorEnv {
             disable_union_all_preserves_cardinality: cli_opts
                 .disable_union_all_preserves_cardinality,
             disable_fsync_no_wait: cli_opts.disable_fsync_no_wait,
-            enable_faulty_query: cli_opts.enable_faulty_query,
+            disable_faulty_query: cli_opts.disable_faulty_query,
             page_size: 4096, // TODO: randomize this too
             max_interactions: rng.gen_range(cli_opts.minimum_tests..=cli_opts.maximum_tests),
             max_time_simulation: cli_opts.maximum_time,
@@ -411,7 +411,7 @@ pub(crate) struct SimulatorOpts {
     pub(crate) disable_where_true_false_null: bool,
     pub(crate) disable_union_all_preserves_cardinality: bool,
     pub(crate) disable_fsync_no_wait: bool,
-    pub(crate) enable_faulty_query: bool,
+    pub(crate) disable_faulty_query: bool,
     pub(crate) disable_reopen_database: bool,
 
     pub(crate) max_interactions: usize,
