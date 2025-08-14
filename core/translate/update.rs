@@ -230,12 +230,26 @@ pub fn prepare_update_plan(
     // https://github.com/sqlite/sqlite/blob/master/src/update.c#L395
     // https://github.com/sqlite/sqlite/blob/master/src/update.c#L670
     let columns = table.columns();
+    let indices = schema.get_indices(table_name.as_str());
 
-    let rowid_alias_used = set_clauses.iter().fold(false, |accum, (idx, _)| {
-        accum || columns[*idx].is_rowid_alias
-    });
+    let mut truth_map = columns
+        .iter()
+        .map(|col| col.is_rowid_alias || col.primary_key || col.unique)
+        .collect::<Vec<_>>();
+    for index in indices {
+        if index.unique {
+            for col in &index.columns {
+                truth_map[col.pos_in_table] = true;
+            }
+        }
+    }
 
-    let (ephemeral_plan, mut where_clause) = if rowid_alias_used {
+    // We should use the ephemeral plan if we are editting a value that is a rowid alias, primary key or unique column
+    let ephemeral_plan_should_be_used = set_clauses
+        .iter()
+        .fold(false, |accum, (idx, _)| accum || truth_map[*idx]);
+
+    let (ephemeral_plan, mut where_clause) = if ephemeral_plan_should_be_used {
         let mut where_clause = vec![];
         let internal_id = program.table_reference_counter.next();
 
