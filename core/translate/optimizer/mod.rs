@@ -130,33 +130,6 @@ fn optimize_update_plan(plan: &mut UpdatePlan, schema: &Schema) -> Result<()> {
         &mut None,
     )?;
 
-    // It is not safe to use an index that is going to be updated as the iteration index for a table.
-    // In these cases, we will fall back to a table scan.
-    // FIXME: this should probably be incorporated into the optimizer itself, but it's a smaller fix this way.
-    let table_ref = &mut plan.table_references.joined_tables_mut()[0];
-
-    // No index, OK.
-    let Some(index) = table_ref.op.index() else {
-        return Ok(());
-    };
-    // Iteration index not affected by update, OK.
-    if !plan.indexes_to_update.iter().any(|i| Arc::ptr_eq(index, i)) {
-        return Ok(());
-    }
-    // Fine to use index if we aren't going to be iterating over it, since it returns at most 1 row.
-    if table_ref.op.returns_max_1_row() {
-        return Ok(());
-    }
-    // Otherwise, fall back to a table scan.
-    table_ref.op = Operation::Scan(Scan::BTreeTable {
-        iter_dir: IterationDirection::Forwards,
-        index: None,
-    });
-    // Revert the decision to use a WHERE clause term as an index constraint.
-    plan.where_clause
-        .iter_mut()
-        .for_each(|term| term.consumed = false);
-
     Ok(())
 }
 
