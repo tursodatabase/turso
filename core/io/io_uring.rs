@@ -315,7 +315,7 @@ impl WrappedIOUring {
             if available_space == 0 {
                 // No space available, always return error if we dont flush all overflow entries
                 // to prevent out of order I/O operations
-                return Err(LimboError::UringIOError("squeue full".into()));
+                return Err(crate::error::CompletionError::UringIOError("squeue full").into());
             }
             // Push as many as we can
             let to_push = std::cmp::min(available_space, self.overflow.len());
@@ -328,7 +328,9 @@ impl WrappedIOUring {
                         self.overflow.push_front(entry);
                         // No space available, always return error if we dont flush all overflow entries
                         // to prevent out of order I/O operations
-                        return Err(LimboError::UringIOError("squeue full".into()));
+                        return Err(
+                            crate::error::CompletionError::UringIOError("squeue full").into()
+                        );
                     }
                     self.pending_ops += 1;
                 }
