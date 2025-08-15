@@ -1133,7 +1133,7 @@ impl Pager {
             .iter()
             .copied()
             .collect::<Vec<usize>>();
-        let mut completions = Vec::with_capacity(dirty_pages.len());
+        let mut completions: Vec<Completion> = Vec::with_capacity(dirty_pages.len());
         for page_id in dirty_pages {
             let page = {
                 let mut cache = self.page_cache.write();
@@ -1147,11 +1147,18 @@ impl Pager {
                 );
                 page
             };
-            let c = wal.borrow_mut().append_frame(
-                page.clone(),
-                self.page_size.get().expect("page size not set"),
-                0,
-            )?;
+            let c = wal
+                .borrow_mut()
+                .append_frame(
+                    page.clone(),
+                    self.page_size.get().expect("page size not set"),
+                    0,
+                )
+                .inspect_err(|_| {
+                    for c in completions.iter() {
+                        c.abort();
+                    }
+                })?;
             // TODO: invalidade previous completions if this one fails
             completions.push(c);
         }
@@ -1185,7 +1192,7 @@ impl Pager {
                             .get()
                     };
                     let dirty_len = self.dirty_pages.borrow().iter().len();
-                    let mut completions = Vec::with_capacity(dirty_len);
+                    let mut completions: Vec<Completion> = Vec::with_capacity(dirty_len);
                     for (curr_page_idx, page_id) in
                         self.dirty_pages.borrow().iter().copied().enumerate()
                     {
@@ -1211,11 +1218,18 @@ impl Pager {
                         };
 
                         // TODO: invalidade previous completions on error here
-                        let c = wal.borrow_mut().append_frame(
-                            page.clone(),
-                            self.page_size.get().expect("page size not set"),
-                            db_size,
-                        )?;
+                        let c = wal
+                            .borrow_mut()
+                            .append_frame(
+                                page.clone(),
+                                self.page_size.get().expect("page size not set"),
+                                db_size,
+                            )
+                            .inspect_err(|_| {
+                                for c in completions.iter() {
+                                    c.abort();
+                                }
+                            })?;
                         completions.push(c);
                     }
                     self.dirty_pages.borrow_mut().clear();

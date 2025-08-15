@@ -2548,9 +2548,14 @@ impl BTreeCursor {
                     // start loading right page first
                     let mut pgno: u32 = unsafe { right_pointer.cast::<u32>().read().swap_bytes() };
                     let current_sibling = sibling_pointer;
-                    let mut completions = Vec::with_capacity(current_sibling + 1);
+                    let mut completions: Vec<Completion> = Vec::with_capacity(current_sibling + 1);
                     for i in (0..=current_sibling).rev() {
-                        let (page, c) = btree_read_page(&self.pager, pgno as usize)?;
+                        let (page, c) =
+                            btree_read_page(&self.pager, pgno as usize).inspect_err(|_| {
+                                for c in completions.iter() {
+                                    c.abort();
+                                }
+                            })?;
                         {
                             // mark as dirty
                             let sibling_page = page.get();

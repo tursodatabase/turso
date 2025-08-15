@@ -1050,6 +1050,9 @@ pub fn write_pages_vectored(
                     if runs_left.fetch_sub(1, Ordering::AcqRel) == 1 {
                         done.store(true, Ordering::Release);
                     }
+                    for c in completions {
+                        c.abort();
+                    }
                     return Err(e);
                 }
             }

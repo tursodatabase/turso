@@ -79,7 +79,7 @@ pub enum LimboError {
     PlanningError(String),
 }
 
-// We only propagate the error kind
+// We only propagate the error kind so we can avoid string allocation in hot path and copying/cloning enums is cheaper
 impl From<std::io::Error> for LimboError {
     fn from(value: std::io::Error) -> Self {
         Self::CompletionError(CompletionError::IOError(value.kind()))

@@ -236,9 +236,13 @@ impl Sorter {
     fn init_chunk_heap(&mut self) -> Result<IOResult<()>> {
         match self.init_chunk_heap_state {
             InitChunkHeapState::Start => {
-                let mut completions = Vec::with_capacity(self.chunks.len());
+                let mut completions: Vec<Completion> = Vec::with_capacity(self.chunks.len());
                 for chunk in self.chunks.iter_mut() {
-                    let c = chunk.read()?;
+                    let c = chunk.read().inspect_err(|_| {
+                        for c in completions.iter() {
+                            c.abort();
+                        }
+                    })?;
                     completions.push(c);
                 }
                 self.init_chunk_heap_state = InitChunkHeapState::PushChunk;
