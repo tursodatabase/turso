@@ -144,6 +144,43 @@ impl ArbitraryFrom<&SimulatorEnv> for SelectInner {
     }
 }
 
+impl ArbitrarySizedFrom<&SimulatorEnv> for SelectInner {
+    fn arbitrary_sized_from<R: Rng>(
+        rng: &mut R,
+        env: &SimulatorEnv,
+        num_result_columns: usize,
+    ) -> Self {
+        let mut select_inner = SelectInner::arbitrary_from(rng, env);
+        let select_from = &select_inner.from.as_ref().unwrap();
+        let table_names = select_from
+            .joins
+            .iter()
+            .map(|j| j.table.clone())
+            .chain(std::iter::once(select_from.table.clone()))
+            .collect::<Vec<_>>();
+
+        let flat_columns_names = table_names
+            .iter()
+            .flat_map(|t| {
+                env.tables
+                    .iter()
+                    .find(|table| table.name == *t)
+                    .unwrap()
+                    .columns
+                    .iter()
+                    .map(|c| format!("{}.{}", t.clone(), c.name))
+            })
+            .collect::<Vec<_>>();
+        let selected_columns = pick_unique(&flat_columns_names, num_result_columns, rng);
+        let mut columns = Vec::new();
+        for column_name in selected_columns {
+            columns.push(ResultColumn::Column(column_name.clone()));
+        }
+        select_inner.columns = columns;
+        select_inner
+    }
+}
+
 impl Arbitrary for Distinctness {
     fn arbitrary<R: Rng>(rng: &mut R) -> Self {
         match rng.gen_range(0..=5) {
@@ -191,10 +228,15 @@ impl ArbitraryFrom<&SimulatorEnv> for Select {
             0
         };
 
-        let first = SelectInner::arbitrary_from(rng, env);
+        let min_column_count_across_tables =
+            env.tables.iter().map(|t| t.columns.len()).min().unwrap();
+
+        let num_result_columns = rng.gen_range(1..=min_column_count_across_tables);
+
+        let first = SelectInner::arbitrary_sized_from(rng, env, num_result_columns);
 
         let rest: Vec<SelectInner> = (0..num_compound_selects)
-            .map(|_| SelectInner::arbitrary_from(rng, env))
+            .map(|_| SelectInner::arbitrary_sized_from(rng, env, num_result_columns))
             .collect();
 
         Self {
