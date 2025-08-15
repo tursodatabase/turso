@@ -1259,28 +1259,21 @@ impl Wal for WalFile {
 
     #[instrument(err, skip_all, level = Level::DEBUG)]
     fn rollback(&mut self) -> Result<()> {
-        // TODO(pere): have to remove things from frame_cache because they are no longer valid.
-        // TODO(pere): clear page cache in pager.
-        {
-            // TODO(pere): implement proper hashmap, this sucks :).
+        let (max_frame, last_checksum) = {
             let shared = self.get_shared();
             let max_frame = shared.max_frame.load(Ordering::Acquire);
-            tracing::debug!(to_max_frame = max_frame);
-            {
-                let mut frame_cache = shared.frame_cache.lock();
-                for (_, frames) in frame_cache.iter_mut() {
-                    let mut last_valid_frame = frames.len();
-                    for frame in frames.iter().rev() {
-                        if *frame <= max_frame {
-                            break;
-                        }
-                        last_valid_frame -= 1;
-                    }
-                    frames.truncate(last_valid_frame);
+            let mut frame_cache = shared.frame_cache.lock();
+            frame_cache.retain(|_page_id, frames| {
+                // keep frames <= max_frame
+                while frames.last().is_some_and(|&f| f > max_frame) {
+                    frames.pop();
                 }
-            }
-            self.last_checksum = shared.last_checksum;
-        }
+                !frames.is_empty()
+            });
+            (max_frame, shared.last_checksum)
+        };
+        self.last_checksum = last_checksum;
+        self.max_frame = max_frame;
         self.reset_internal_states();
         Ok(())
     }
@@ -1482,7 +1475,12 @@ impl WalFile {
                     let to_checkpoint = {
                         let shared = self.get_shared();
                         let frame_cache = shared.frame_cache.lock();
-                        let mut list = Vec::new();
+                        let mut list = Vec::with_capacity(
+                            self.ongoing_checkpoint
+                                .max_frame
+                                .checked_sub(nbackfills)
+                                .unwrap_or_default() as usize,
+                        );
                         for (&page_id, frames) in frame_cache.iter() {
                             // for each page in the frame cache, grab the last (latest) frame for
                             // that page that falls in the range of our safe min..max frame
