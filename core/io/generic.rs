@@ -35,25 +35,8 @@ impl IO for GenericIO {
         }))
     }
 
-    fn wait_for_completion(&self, c: Completion) -> Result<()> {
-        while !c.is_completed() {
-            self.run_once()?;
-        }
-        Ok(())
-    }
-
     fn run_once(&self) -> Result<()> {
         Ok(())
-    }
-
-    fn generate_random_number(&self) -> i64 {
-        let mut buf = [0u8; 8];
-        getrandom::getrandom(&mut buf).unwrap();
-        i64::from_ne_bytes(buf)
-    }
-
-    fn get_memory_io(&self) -> Arc<MemoryIO> {
-        Arc::new(MemoryIO::new())
     }
 }
 
@@ -110,15 +93,14 @@ impl File for GenericFile {
 
     fn sync(&self, c: Completion) -> Result<Completion> {
         let mut file = self.file.borrow_mut();
-        file.sync_all().map_err(|err| LimboError::IOError(err))?;
+        file.sync_all()?;
         c.complete(0);
         Ok(c)
     }
 
     fn truncate(&self, len: usize, c: Completion) -> Result<Completion> {
         let mut file = self.file.borrow_mut();
-        file.set_len(len as u64)
-            .map_err(|err| LimboError::IOError(err))?;
+        file.set_len(len as u64)?;
         c.complete(0);
         Ok(c)
     }

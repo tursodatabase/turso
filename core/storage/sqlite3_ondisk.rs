@@ -62,7 +62,7 @@ use crate::storage::database::DatabaseStorage;
 use crate::storage::pager::Pager;
 use crate::storage::wal::{PendingFlush, READMARK_NOT_USED};
 use crate::types::{RawSlice, RefValue, SerialType, SerialTypeKind, TextRef, TextSubtype};
-use crate::{bail_corrupt_error, turso_assert, File, Result, WalFileShared};
+use crate::{bail_corrupt_error, turso_assert, CompletionError, File, Result, WalFileShared};
 use std::cell::{RefCell, UnsafeCell};
 use std::collections::{BTreeMap, HashMap};
 use std::mem::MaybeUninit;
@@ -874,7 +874,10 @@ pub fn begin_read_page(
     let buf = buffer_pool.get_page();
     #[allow(clippy::arc_with_non_send_sync)]
     let buf = Arc::new(buf);
-    let complete = Box::new(move |mut buf: Arc<Buffer>, bytes_read: i32| {
+    let complete = Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
+        let Ok((mut buf, bytes_read)) = res else {
+            return;
+        };
         let buf_len = buf.len();
         turso_assert!(
             (allow_empty_read && bytes_read == 0) || bytes_read == buf_len as i32,
@@ -925,7 +928,10 @@ pub fn begin_write_btree_page(pager: &Pager, page: &PageRef) -> Result<Completio
 
     let write_complete = {
         let buf_copy = buffer.clone();
-        Box::new(move |bytes_written: i32| {
+        Box::new(move |res: Result<i32, CompletionError>| {
+            let Ok(bytes_written) = res else {
+                return;
+            };
             tracing::trace!("finish_write_btree_page");
             let buf_copy = buf_copy.clone();
             let buf_len = buf_copy.len();
@@ -1019,6 +1025,9 @@ pub fn write_pages_vectored(
 
             let total_sz = (page_sz * run_bufs.len()) as i32;
             let c = Completion::new_write(move |res| {
+                let Ok(res) = res else {
+                    return;
+                };
                 // writev calls can sometimes return partial writes, but our `pwritev`
                 // implementation aggregates any partial writes and calls completion with total
                 turso_assert!(total_sz == res, "failed to write expected size");
@@ -1040,6 +1049,9 @@ pub fn write_pages_vectored(
                 Err(e) => {
                     if runs_left.fetch_sub(1, Ordering::AcqRel) == 1 {
                         done.store(true, Ordering::Release);
+                    }
+                    for c in completions {
+                        c.abort();
                     }
                     return Err(e);
                 }
@@ -1589,7 +1601,10 @@ pub fn read_entire_wal_dumb(file: &Arc<dyn File>) -> Result<Arc<UnsafeCell<WalFi
     }));
     let wal_file_shared_for_completion = wal_file_shared_ret.clone();
 
-    let complete: Box<ReadComplete> = Box::new(move |buf: Arc<Buffer>, bytes_read: i32| {
+    let complete: Box<ReadComplete> = Box::new(move |res: Result<(Arc<Buffer>, i32), _>| {
+        let Ok((buf, bytes_read)) = res else {
+            return;
+        };
         let buf_slice = buf.as_slice();
         turso_assert!(
             bytes_read == buf_slice.len() as i32,
@@ -1871,7 +1886,10 @@ pub fn begin_write_wal_header(io: &Arc<dyn File>, header: &WalHeader) -> Result<
     };
 
     let cloned = buffer.clone();
-    let write_complete = move |bytes_written: i32| {
+    let write_complete = move |res: Result<i32, CompletionError>| {
+        let Ok(bytes_written) = res else {
+            return;
+        };
         // make sure to reference buffer so it's alive for async IO
         let _buf = cloned.clone();
         turso_assert!(

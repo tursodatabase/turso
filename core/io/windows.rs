@@ -1,4 +1,3 @@
-use super::MemoryIO;
 use crate::{Clock, Completion, File, Instant, LimboError, OpenFlags, Result, IO};
 use parking_lot::RwLock;
 use std::io::{Read, Seek, Write};
@@ -32,28 +31,8 @@ impl IO for WindowsIO {
     }
 
     #[instrument(err, skip_all, level = Level::TRACE)]
-    fn wait_for_completion(&self, c: Completion) -> Result<()> {
-        while !c.is_completed() {
-            self.run_once()?;
-        }
-        Ok(())
-    }
-
-    #[instrument(err, skip_all, level = Level::TRACE)]
     fn run_once(&self) -> Result<()> {
         Ok(())
-    }
-
-    #[instrument(skip_all, level = Level::TRACE)]
-    fn generate_random_number(&self) -> i64 {
-        let mut buf = [0u8; 8];
-        getrandom::getrandom(&mut buf).unwrap();
-        i64::from_ne_bytes(buf)
-    }
-
-    #[instrument(skip_all, level = Level::TRACE)]
-    fn get_memory_io(&self) -> Arc<MemoryIO> {
-        Arc::new(MemoryIO::new())
     }
 }
 
@@ -110,7 +89,7 @@ impl File for WindowsFile {
     #[instrument(err, skip_all, level = Level::TRACE)]
     fn sync(&self, c: Completion) -> Result<Completion> {
         let file = self.file.write();
-        file.sync_all().map_err(LimboError::IOError)?;
+        file.sync_all()?;
         c.complete(0);
         Ok(c)
     }
@@ -118,7 +97,7 @@ impl File for WindowsFile {
     #[instrument(err, skip_all, level = Level::TRACE)]
     fn truncate(&self, len: usize, c: Completion) -> Result<Completion> {
         let file = self.file.write();
-        file.set_len(len as u64).map_err(LimboError::IOError)?;
+        file.set_len(len as u64)?;
         c.complete(0);
         Ok(c)
     }

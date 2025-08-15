@@ -1,17 +1,14 @@
 use std::error;
 use std::fmt;
-use std::io;
 
 use crate::lexer::scan::ScanError;
 use crate::parser::ParserError;
 
 /// SQL lexer and parser errors
 #[non_exhaustive]
-#[derive(Debug, miette::Diagnostic)]
+#[derive(Debug, Clone, miette::Diagnostic)]
 #[diagnostic()]
 pub enum Error {
-    /// I/O Error
-    Io(io::Error),
     /// Lexer error
     UnrecognizedToken(
         Option<(u64, usize)>,
@@ -73,7 +70,6 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
-            Self::Io(ref err) => err.fmt(f),
             Self::UnrecognizedToken(pos, _) => {
                 write!(f, "unrecognized token at {:?}", pos.unwrap())
             }
@@ -103,12 +99,6 @@ impl fmt::Display for Error {
 
 impl error::Error for Error {}
 
-impl From<io::Error> for Error {
-    fn from(err: io::Error) -> Self {
-        Self::Io(err)
-    }
-}
-
 impl From<ParserError> for Error {
     fn from(err: ParserError) -> Self {
         Self::ParserError(err, None, None)
@@ -118,7 +108,6 @@ impl From<ParserError> for Error {
 impl ScanError for Error {
     fn position(&mut self, line: u64, column: usize, offset: usize) {
         match *self {
-            Self::Io(_) => {}
             Self::UnrecognizedToken(ref mut pos, ref mut src) => {
                 *pos = Some((line, column));
                 *src = Some((offset).into());

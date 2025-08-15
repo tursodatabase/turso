@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-#[derive(Debug, Error, miette::Diagnostic)]
+#[derive(Debug, Clone, Error, miette::Diagnostic)]
 pub enum LimboError {
     #[error("Corrupt database: {0}")]
     Corrupt(String),
@@ -23,16 +23,10 @@ pub enum LimboError {
     EnvVarError(#[from] std::env::VarError),
     #[error("Transaction error: {0}")]
     TxError(String),
-    #[error("I/O error: {0}")]
-    IOError(#[from] std::io::Error),
-    #[cfg(all(target_os = "linux", feature = "io_uring"))]
-    #[error("I/O error: {0}")]
-    UringIOError(String),
+    #[error(transparent)]
+    CompletionError(#[from] CompletionError),
     #[error("Locking error: {0}")]
     LockingError(String),
-    #[cfg(target_family = "unix")]
-    #[error("I/O error: {0}")]
-    RustixIOError(#[from] rustix::io::Errno),
     #[error("Parse error: {0}")]
     ParseIntError(#[from] std::num::ParseIntError),
     #[error("Parse error: {0}")]
@@ -83,6 +77,49 @@ pub enum LimboError {
     InvalidBlobSize(usize),
     #[error("Planning error: {0}")]
     PlanningError(String),
+}
+
+// We only propagate the error kind so we can avoid string allocation in hot path and copying/cloning enums is cheaper
+impl From<std::io::Error> for LimboError {
+    fn from(value: std::io::Error) -> Self {
+        Self::CompletionError(CompletionError::IOError(value.kind()))
+    }
+}
+
+#[cfg(target_family = "unix")]
+impl From<rustix::io::Errno> for LimboError {
+    fn from(value: rustix::io::Errno) -> Self {
+        CompletionError::from(value).into()
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "io_uring"))]
+impl From<&'static str> for LimboError {
+    fn from(value: &'static str) -> Self {
+        CompletionError::UringIOError(value).into()
+    }
+}
+
+// We only propagate the error kind
+impl From<std::io::Error> for CompletionError {
+    fn from(value: std::io::Error) -> Self {
+        CompletionError::IOError(value.kind())
+    }
+}
+
+#[derive(Debug, Copy, Clone, Error)]
+pub enum CompletionError {
+    #[error("I/O error: {0}")]
+    IOError(std::io::ErrorKind),
+    #[cfg(target_family = "unix")]
+    #[error("I/O error: {0}")]
+    RustixIOError(#[from] rustix::io::Errno),
+    #[cfg(all(target_os = "linux", feature = "io_uring"))]
+    #[error("I/O error: {0}")]
+    // TODO: if needed create an enum for IO Uring errors so that we don't have to pass strings around
+    UringIOError(&'static str),
+    #[error("Completion was aborted")]
+    Aborted,
 }
 
 #[macro_export]

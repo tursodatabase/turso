@@ -49,7 +49,7 @@ use crate::types::WalFrameInfo;
 use crate::util::{OpenMode, OpenOptions};
 use crate::vtab::VirtualTable;
 use core::str;
-pub use error::LimboError;
+pub use error::{CompletionError, LimboError};
 use fallible_iterator::FallibleIterator;
 pub use io::clock::{Clock, Instant};
 #[cfg(all(feature = "fs", target_family = "unix"))]
@@ -445,7 +445,7 @@ impl Database {
             "header read must be a multiple of 512 for O_DIRECT"
         );
         let buf = Arc::new(Buffer::new_temporary(PageSize::MIN as usize));
-        let c = Completion::new_read(buf.clone(), move |_buf, _| {});
+        let c = Completion::new_read(buf.clone(), move |_res| {});
         let c = self.db_file.read_header(c)?;
         self.io.wait_for_completion(c)?;
         let page_size = u16::from_be_bytes(buf.as_slice()[16..18].try_into().unwrap());
@@ -1301,9 +1301,9 @@ impl Connection {
             Ok(result) => result,
             // on windows, zero read will trigger UnexpectedEof
             #[cfg(target_os = "windows")]
-            Err(LimboError::IOError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                return Ok(false)
-            }
+            Err(LimboError::CompletionError(CompletionError::IOError(
+                std::io::ErrorKind::UnexpectedEof,
+            ))) => return Ok(false),
             Err(err) => return Err(err),
         };
 

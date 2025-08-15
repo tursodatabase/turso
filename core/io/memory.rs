@@ -1,5 +1,5 @@
 use super::{Buffer, Clock, Completion, File, OpenFlags, IO};
-use crate::{LimboError, Result};
+use crate::Result;
 
 use crate::io::clock::Instant;
 use std::{
@@ -48,10 +48,9 @@ impl IO for MemoryIO {
     fn open_file(&self, path: &str, flags: OpenFlags, _direct: bool) -> Result<Arc<dyn File>> {
         let mut files = self.files.lock().unwrap();
         if !files.contains_key(path) && !flags.contains(OpenFlags::Create) {
-            return Err(LimboError::IOError(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "file not found",
-            )));
+            return Err(
+                crate::error::CompletionError::IOError(std::io::ErrorKind::NotFound).into(),
+            );
         }
         if !files.contains_key(path) {
             files.insert(
@@ -69,23 +68,6 @@ impl IO for MemoryIO {
     fn run_once(&self) -> Result<()> {
         // nop
         Ok(())
-    }
-
-    fn wait_for_completion(&self, c: Completion) -> Result<()> {
-        while !c.is_completed() {
-            self.run_once()?;
-        }
-        Ok(())
-    }
-
-    fn generate_random_number(&self) -> i64 {
-        let mut buf = [0u8; 8];
-        getrandom::getrandom(&mut buf).unwrap();
-        i64::from_ne_bytes(buf)
-    }
-
-    fn get_memory_io(&self) -> Arc<MemoryIO> {
-        Arc::new(MemoryIO::new())
     }
 }
 

@@ -3,7 +3,7 @@
 use super::{common, Completion, CompletionInner, File, OpenFlags, IO};
 use crate::io::clock::{Clock, Instant};
 use crate::storage::wal::CKPT_BATCH_PAGES;
-use crate::{turso_assert, LimboError, MemoryIO, Result};
+use crate::{turso_assert, LimboError, Result};
 use rustix::fs::{self, FlockOperation, OFlags};
 use std::ptr::NonNull;
 use std::{
@@ -260,9 +260,10 @@ impl InnerUringIO {
                 .register_files_update(slot, &[fd.as_raw_fd()])?;
             return Ok(slot);
         }
-        Err(LimboError::UringIOError(
-            "unable to register file, no free slots available".to_string(),
-        ))
+        Err(crate::error::CompletionError::UringIOError(
+            "unable to register file, no free slots available",
+        )
+        .into())
     }
     fn unregister_file(&mut self, id: u32) -> Result<()> {
         self.ring
@@ -314,7 +315,7 @@ impl WrappedIOUring {
             if available_space == 0 {
                 // No space available, always return error if we dont flush all overflow entries
                 // to prevent out of order I/O operations
-                return Err(LimboError::UringIOError("squeue full".into()));
+                return Err(crate::error::CompletionError::UringIOError("squeue full").into());
             }
             // Push as many as we can
             let to_push = std::cmp::min(available_space, self.overflow.len());
@@ -327,7 +328,9 @@ impl WrappedIOUring {
                         self.overflow.push_front(entry);
                         // No space available, always return error if we dont flush all overflow entries
                         // to prevent out of order I/O operations
-                        return Err(LimboError::UringIOError("squeue full".into()));
+                        return Err(
+                            crate::error::CompletionError::UringIOError("squeue full").into()
+                        );
                     }
                     self.pending_ops += 1;
                 }
@@ -499,13 +502,6 @@ impl IO for UringIO {
         Ok(uring_file)
     }
 
-    fn wait_for_completion(&self, c: Completion) -> Result<()> {
-        while !c.is_completed() {
-            self.run_once()?;
-        }
-        Ok(())
-    }
-
     fn run_once(&self) -> Result<()> {
         trace!("run_once()");
         let mut inner = self.inner.borrow_mut();
@@ -535,27 +531,15 @@ impl IO for UringIO {
         }
     }
 
-    fn generate_random_number(&self) -> i64 {
-        let mut buf = [0u8; 8];
-        getrandom::getrandom(&mut buf).unwrap();
-        i64::from_ne_bytes(buf)
-    }
-
-    fn get_memory_io(&self) -> Arc<MemoryIO> {
-        Arc::new(MemoryIO::new())
-    }
-
     fn register_fixed_buffer(&self, ptr: std::ptr::NonNull<u8>, len: usize) -> Result<u32> {
         turso_assert!(
             len % 512 == 0,
             "fixed buffer length must be logical block aligned"
         );
         let mut inner = self.inner.borrow_mut();
-        let slot = inner
-            .free_arenas
-            .iter()
-            .position(|e| e.is_none())
-            .ok_or_else(|| LimboError::UringIOError("no free fixed buffer slots".into()))?;
+        let slot = inner.free_arenas.iter().position(|e| e.is_none()).ok_or(
+            crate::error::CompletionError::UringIOError("no free fixed buffer slots"),
+        )?;
         unsafe {
             inner.ring.ring.submitter().register_buffers_update(
                 slot as u32,

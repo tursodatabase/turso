@@ -5,7 +5,7 @@ use std::{
 
 use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
-use turso_core::{Clock, Instant, MemoryIO, OpenFlags, PlatformIO, Result, IO};
+use turso_core::{Clock, Instant, OpenFlags, PlatformIO, Result, IO};
 
 use crate::{
     model::FAULT_ERROR_MSG,
@@ -104,13 +104,6 @@ impl IO for SimulatorIO {
         Ok(file)
     }
 
-    fn wait_for_completion(&self, c: turso_core::Completion) -> Result<()> {
-        while !c.is_completed() {
-            self.run_once()?;
-        }
-        Ok(())
-    }
-
     fn run_once(&self) -> Result<()> {
         if self.fault.get() {
             self.nr_run_once_faults
@@ -129,9 +122,5 @@ impl IO for SimulatorIO {
 
     fn generate_random_number(&self) -> i64 {
         self.rng.borrow_mut().next_u64() as i64
-    }
-
-    fn get_memory_io(&self) -> Arc<turso_core::MemoryIO> {
-        Arc::new(MemoryIO::new())
     }
 }

@@ -7,7 +7,6 @@ use std::rc::Rc;
 use std::sync::Arc;
 use tempfile;
 
-use crate::return_if_io;
 use crate::types::IOCompletions;
 use crate::util::IOExt;
 use crate::{
@@ -19,6 +18,7 @@ use crate::{
     types::{IOResult, ImmutableRecord, KeyInfo, RecordCursor, RefValue},
     Result,
 };
+use crate::{return_if_io, CompletionError};
 
 #[derive(Debug, Clone, Copy)]
 enum SortState {
@@ -236,9 +236,13 @@ impl Sorter {
     fn init_chunk_heap(&mut self) -> Result<IOResult<()>> {
         match self.init_chunk_heap_state {
             InitChunkHeapState::Start => {
-                let mut completions = Vec::with_capacity(self.chunks.len());
+                let mut completions: Vec<Completion> = Vec::with_capacity(self.chunks.len());
                 for chunk in self.chunks.iter_mut() {
-                    let c = chunk.read()?;
+                    let c = chunk.read().inspect_err(|_| {
+                        for c in completions.iter() {
+                            c.abort();
+                        }
+                    })?;
                     completions.push(c);
                 }
                 self.init_chunk_heap_state = InitChunkHeapState::PushChunk;
@@ -313,7 +317,7 @@ impl Sorter {
         let chunk_file = match &self.temp_file {
             Some(temp_file) => temp_file.file.clone(),
             None => {
-                let temp_dir = tempfile::tempdir().map_err(LimboError::IOError)?;
+                let temp_dir = tempfile::tempdir()?;
                 let chunk_file_path = temp_dir.as_ref().join("chunk_file");
                 let chunk_file = self.io.open_file(
                     chunk_file_path.to_str().unwrap(),
@@ -489,7 +493,10 @@ impl SortedChunk {
         let stored_buffer_copy = self.buffer.clone();
         let stored_buffer_len_copy = self.buffer_len.clone();
         let total_bytes_read_copy = self.total_bytes_read.clone();
-        let read_complete = Box::new(move |buf: Arc<Buffer>, bytes_read: i32| {
+        let read_complete = Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
+            let Ok((buf, bytes_read)) = res else {
+                return;
+            };
             let read_buf_ref = buf.clone();
             let read_buf = read_buf_ref.as_slice();
 
@@ -547,7 +554,10 @@ impl SortedChunk {
 
         let buffer_ref_copy = buffer_ref.clone();
         let chunk_io_state_copy = self.io_state.clone();
-        let write_complete = Box::new(move |bytes_written: i32| {
+        let write_complete = Box::new(move |res: Result<i32, CompletionError>| {
+            let Ok(bytes_written) = res else {
+                return;
+            };
             chunk_io_state_copy.set(SortedChunkIOState::WriteComplete);
             let buf_len = buffer_ref_copy.len();
             if bytes_written < buf_len as i32 {
