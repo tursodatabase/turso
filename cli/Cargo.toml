@@ -27,8 +27,10 @@ csv = "1.3.1"
 ctrlc = "3.4.4"
 dirs = "5.0.1"
 env_logger = "0.10.1"
+fallible-iterator = "0.3"
 libc = "0.2.172"
 turso_core = { path = "../core", default-features = true, features = [] }
+turso_sqlite3_parser = { workspace = true }
 limbo_completion = { path = "../extensions/completion", features = ["static"] }
 miette = { version = "7.4.0", features = ["fancy"] }
 nu-ansi-term = {version = "0.50.1", features = ["serde", "derive_serde_style"]}

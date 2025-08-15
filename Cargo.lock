@@ -3826,6 +3826,7 @@ dependencies = [
  "ctrlc",
  "dirs 5.0.1",
  "env_logger 0.10.2",
+ "fallible-iterator",
  "libc",
  "limbo_completion",
  "miette",
@@ -3843,6 +3844,7 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "turso_core",
+ "turso_sqlite3_parser",
  "validator",
 ]
 

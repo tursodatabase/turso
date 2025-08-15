@@ -241,6 +241,63 @@ impl Limbo {
         };
     }
 
+    // Check if an SQL statement is complete and ready to execute.
+    //
+    // Returns true if:
+    // - The statement ends with a semicolon AND the parser successfully parses it
+    //   (or returns a syntax error that isn't about needing more input)
+    //
+    // Returns false if:
+    // - No semicolon at the end
+    // - Has semicolon but parser indicates it needs more input (e.g., incomplete CREATE TRIGGER)
+    fn is_statement_complete(sql: &str) -> bool {
+        use fallible_iterator::FallibleIterator;
+        use turso_sqlite3_parser::lexer::sql::Parser;
+
+        let sql = sql.trim();
+
+        // Empty or whitespace-only input is not a complete statement
+        if sql.is_empty() {
+            return false;
+        }
+
+        // No semicolon = not complete, always buffer for more
+        if !sql.ends_with(';') {
+            return false;
+        }
+
+        // Has semicolon - check if the parser thinks it's actually complete
+        // (handles cases like CREATE TRIGGER with multiple semicolons)
+        let mut parser = Parser::new(sql.as_bytes());
+        match parser.next() {
+            Ok(Some(_)) => {
+                // Successfully parsed a statement - it's complete
+                true
+            }
+            Ok(None) => {
+                // No statement found (shouldn't happen with semicolon, but be safe)
+                false
+            }
+            Err(e) => {
+                // Check if the error indicates we need more input
+                let error_str = e.to_string().to_lowercase();
+
+                // These patterns indicate the statement is incomplete (even with semicolon)
+                if error_str.contains("at end of input")
+                    || error_str.contains("unexpected end")
+                    || error_str.contains("incomplete")
+                    || (error_str.contains("syntax error") && error_str.contains("eof"))
+                {
+                    false // Need more input (e.g., incomplete CREATE TRIGGER)
+                } else {
+                    // Other syntax error - statement is complete but invalid
+                    // Let it through so the user sees the error
+                    true
+                }
+            }
+        }
+    }
+
     #[cfg(not(target_family = "wasm"))]
     fn handle_load_extension(&mut self, path: &str) -> Result<(), String> {
         let ext_path = turso_core::resolve_ext_path(path).map_err(|e| e.to_string())?;
@@ -453,8 +510,10 @@ impl Limbo {
     }
 
     fn buffer_input(&mut self, line: &str) {
+        if !self.input_buff.is_empty() && !self.input_buff.ends_with('\n') {
+            self.input_buff.push('\n');
+        }
         self.input_buff.push_str(line);
-        self.input_buff.push(' ');
     }
 
     fn run_query(&mut self, input: &str) {
@@ -589,12 +648,17 @@ impl Limbo {
             return Ok(());
         }
         self.reset_line(line)?;
-        if line.ends_with(';') {
-            self.buffer_input(line);
+
+        // First, add the line to our buffer
+        self.buffer_input(line);
+
+        // Check if we have a complete statement
+        if Self::is_statement_complete(&self.input_buff) {
             let buff = self.input_buff.clone();
             self.run_query(buff.as_str());
+            self.reset_input(); // Clear buffer after executing
         } else {
-            self.buffer_input(format!("{line}\n").as_str());
+            // Not complete yet, keep buffering
             self.set_multiline_prompt();
         }
         Ok(())
@@ -1359,8 +1423,43 @@ impl Limbo {
             return;
         }
 
-        let buff = self.input_buff.clone();
-        self.run_query(buff.as_str());
+        // At EOF, we're more lenient - execute if either:
+        // 1. Statement is complete (has semicolon and parses)
+        // 2. Statement parses successfully even without semicolon
+        let buff_trimmed = self.input_buff.trim().to_string();
+        if !buff_trimmed.is_empty() {
+            // Try to parse it - if it parses, execute it
+            use fallible_iterator::FallibleIterator;
+            use turso_sqlite3_parser::lexer::sql::Parser;
+
+            let mut parser = Parser::new(buff_trimmed.as_bytes());
+            match parser.next() {
+                Ok(Some(_)) => {
+                    // Successfully parsed - execute it
+                    let buff = self.input_buff.clone();
+                    self.run_query(buff.as_str());
+                }
+                Ok(None) => {
+                    // No statement found
+                    eprintln!("Error: incomplete SQL statement at end of input");
+                }
+                Err(e) => {
+                    // Check if it's an incomplete statement error
+                    let error_str = e.to_string().to_lowercase();
+                    if error_str.contains("at end of input")
+                        || error_str.contains("unexpected end")
+                        || error_str.contains("incomplete")
+                        || (error_str.contains("syntax error") && error_str.contains("eof"))
+                    {
+                        eprintln!("Error: incomplete SQL statement at end of input");
+                    } else {
+                        // Other error - let it execute so user sees the proper error
+                        let buff = self.input_buff.clone();
+                        self.run_query(buff.as_str());
+                    }
+                }
+            }
+        }
         self.reset_input();
     }
 
