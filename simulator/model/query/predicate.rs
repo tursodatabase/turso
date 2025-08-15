@@ -3,7 +3,7 @@ use std::fmt::Display;
 use serde::{Deserialize, Serialize};
 use turso_sqlite3_parser::ast::{self, fmt::ToTokens};
 
-use crate::model::table::{SimValue, Table};
+use crate::model::table::{SimValue, Table, TableContext};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Predicate(pub ast::Expr);
@@ -78,7 +78,7 @@ impl Predicate {
         expr_to_value(&self.0, row, table)
     }
 
-    pub(crate) fn test(&self, row: &[SimValue], table: &Table) -> bool {
+    pub(crate) fn test<T: TableContext>(&self, row: &[SimValue], table: &T) -> bool {
         let value = expr_to_value(&self.0, row, table);
         value.is_some_and(|value| value.as_bool())
     }
@@ -88,19 +88,23 @@ impl Predicate {
 // This function attempts to convert an simpler easily computable expression into values
 // TODO: In the future, we can try to expand this computation if we want to support harder properties that require us
 // to already know more values before hand
-pub fn expr_to_value(expr: &ast::Expr, row: &[SimValue], table: &Table) -> Option<SimValue> {
+pub fn expr_to_value<T: TableContext>(
+    expr: &ast::Expr,
+    row: &[SimValue],
+    table: &T,
+) -> Option<SimValue> {
     match expr {
         ast::Expr::DoublyQualified(_, _, ast::Name::Ident(col_name))
         | ast::Expr::DoublyQualified(_, _, ast::Name::Quoted(col_name))
         | ast::Expr::Qualified(_, ast::Name::Ident(col_name))
         | ast::Expr::Qualified(_, ast::Name::Quoted(col_name))
         | ast::Expr::Id(ast::Name::Ident(col_name)) => {
-            assert_eq!(row.len(), table.columns.len());
-            table
-                .columns
+            let columns = table.columns().collect::<Vec<_>>();
+            assert_eq!(row.len(), columns.len());
+            columns
                 .iter()
                 .zip(row.iter())
-                .find(|(column, _)| column.name == *col_name)
+                .find(|(column, _)| column.column.name == *col_name)
                 .map(|(_, value)| value)
                 .cloned()
         }

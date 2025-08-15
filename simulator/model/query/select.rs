@@ -10,7 +10,7 @@ use crate::{
     generation::Shadow,
     model::{
         query::EmptyContext,
-        table::{SimValue, Table},
+        table::{JoinTable, JoinType, JoinedTable, SimValue, Table, TableContext},
     },
     runner::env::SimulatorTables,
 };
@@ -239,51 +239,6 @@ impl FromClause {
         deps
     }
 }
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct JoinedTable {
-    /// table name
-    pub table: String,
-    /// `JOIN` type
-    pub join_type: JoinType,
-    /// `ON` clause
-    pub on: Predicate,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub enum JoinType {
-    Inner,
-    Left,
-    Right,
-    Full,
-    Cross,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct JoinTable {
-    pub tables: Vec<Table>,
-    pub rows: Vec<Vec<SimValue>>,
-}
-
-impl JoinTable {
-    pub(crate) fn into_table(self) -> Table {
-        let t = Table {
-            name: "".to_string(),
-            columns: self
-                .tables
-                .iter()
-                .flat_map(|t| {
-                    t.columns.iter().map(|c| {
-                        let mut c = c.clone();
-                        c.name = format!("{}.{}", t.name, c.name);
-                        c
-                    })
-                })
-                .collect(),
-            rows: self.rows,
-        };
-        t
-    }
-}
 
 impl Shadow for FromClause {
     type Result = anyhow::Result<JoinTable>;
@@ -327,8 +282,7 @@ impl Shadow for FromClause {
                     for (row1, row2) in all_row_pairs {
                         let row = row1.iter().chain(row2.iter()).cloned().collect::<Vec<_>>();
 
-                        let as_table = join_table.clone().into_table();
-                        let is_in = join.on.test(&row, &as_table);
+                        let is_in = join.on.test(&row, &join_table);
 
                         if is_in {
                             join_table.rows.push(row);
@@ -348,18 +302,19 @@ impl Shadow for SelectInner {
     fn shadow(&self, env: &mut SimulatorTables) -> Self::Result {
         if let Some(from) = &self.from {
             let mut join_table = from.shadow(env)?;
-            let as_table = join_table.clone().into_table();
+            let col_count = join_table.columns().count();
             for row in &mut join_table.rows {
                 assert_eq!(
                     row.len(),
-                    as_table.columns.len(),
+                    col_count,
                     "Row length does not match column length after join"
                 );
             }
+            let join_clone = join_table.clone();
 
             join_table
                 .rows
-                .retain(|row| self.where_clause.test(row, &as_table));
+                .retain(|row| self.where_clause.test(row, &join_clone));
 
             if self.distinctness == Distinctness::Distinct {
                 join_table.rows.sort_unstable();
@@ -414,7 +369,7 @@ impl Shadow for Select {
     fn shadow(&self, env: &mut SimulatorTables) -> Self::Result {
         let first_result = self.body.select.shadow(env)?;
 
-        let mut rows = first_result.into_table().rows;
+        let mut rows = first_result.rows;
 
         for compound in self.body.compounds.iter() {
             let compound_results = compound.select.shadow(env)?;
@@ -422,7 +377,7 @@ impl Shadow for Select {
             match compound.operator {
                 CompoundOperator::Union => {
                     // Union means we need to combine the results, removing duplicates
-                    let mut new_rows = compound_results.into_table().rows;
+                    let mut new_rows = compound_results.rows;
                     new_rows.extend(rows.clone());
                     new_rows.sort_unstable();
                     new_rows.dedup();

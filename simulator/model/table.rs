@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 use turso_core::{numeric::Numeric, types};
 use turso_sqlite3_parser::ast;
 
+use crate::model::query::predicate::Predicate;
+
 pub(crate) struct Name(pub(crate) String);
 
 impl Deref for Name {
@@ -14,11 +16,35 @@ impl Deref for Name {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct ContextColumn<'a> {
+    pub table_name: &'a str,
+    pub column: &'a Column,
+}
+
+pub trait TableContext {
+    fn columns<'a>(&'a self) -> impl Iterator<Item = ContextColumn<'a>>;
+    fn rows(&self) -> &Vec<Vec<SimValue>>;
+}
+
+impl TableContext for Table {
+    fn columns<'a>(&'a self) -> impl Iterator<Item = ContextColumn<'a>> {
+        self.columns.iter().map(|col| ContextColumn {
+            column: col,
+            table_name: &self.name,
+        })
+    }
+
+    fn rows(&self) -> &Vec<Vec<SimValue>> {
+        &self.rows
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct Table {
-    pub(crate) rows: Vec<Vec<SimValue>>,
     pub(crate) name: String,
     pub(crate) columns: Vec<Column>,
+    pub(crate) rows: Vec<Vec<SimValue>>,
 }
 
 impl Table {
@@ -71,6 +97,41 @@ impl Display for ColumnType {
             Self::Blob => write!(f, "BLOB"),
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct JoinedTable {
+    /// table name
+    pub table: String,
+    /// `JOIN` type
+    pub join_type: JoinType,
+    /// `ON` clause
+    pub on: Predicate,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum JoinType {
+    Inner,
+    Left,
+    Right,
+    Full,
+    Cross,
+}
+
+impl TableContext for JoinTable {
+    fn columns<'a>(&'a self) -> impl Iterator<Item = ContextColumn<'a>> {
+        self.tables.iter().flat_map(|table| table.columns())
+    }
+
+    fn rows(&self) -> &Vec<Vec<SimValue>> {
+        &self.rows
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct JoinTable {
+    pub tables: Vec<Table>,
+    pub rows: Vec<Vec<SimValue>>,
 }
 
 fn float_to_string<S>(float: &f64, serializer: S) -> Result<S::Ok, S::Error>

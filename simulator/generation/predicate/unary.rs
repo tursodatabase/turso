@@ -8,7 +8,7 @@ use crate::{
     generation::{backtrack, pick, predicate::SimplePredicate, ArbitraryFromMaybe},
     model::{
         query::predicate::Predicate,
-        table::{SimValue, Table},
+        table::{SimValue, TableContext},
     },
 };
 
@@ -99,10 +99,15 @@ impl ArbitraryFromMaybe<(&Vec<&SimValue>, bool)> for BitNotValue {
 
 // TODO: have some more complex generation with columns names here as well
 impl SimplePredicate {
-    /// Generates a true [ast::Expr::Unary] [SimplePredicate] from a [Table] for some values in the table
-    pub fn true_unary<R: rand::Rng>(rng: &mut R, table: &Table, row: &[SimValue]) -> Self {
+    /// Generates a true [ast::Expr::Unary] [SimplePredicate] from a [TableContext] for some values in the table
+    pub fn true_unary<R: rand::Rng, T: TableContext>(
+        rng: &mut R,
+        table: &T,
+        row: &[SimValue],
+    ) -> Self {
+        let columns = table.columns().collect::<Vec<_>>();
         // Pick a random column
-        let column_index = rng.gen_range(0..table.columns.len());
+        let column_index = rng.gen_range(0..columns.len());
         let column_value = &row[column_index];
         let num_retries = row.len();
         // Avoid creation of NULLs
@@ -160,10 +165,15 @@ impl SimplePredicate {
         ))
     }
 
-    /// Generates a false [ast::Expr::Unary] [SimplePredicate] from a [Table] for a row in the table
-    pub fn false_unary<R: rand::Rng>(rng: &mut R, table: &Table, row: &[SimValue]) -> Self {
+    /// Generates a false [ast::Expr::Unary] [SimplePredicate] from a [TableContext] for a row in the table
+    pub fn false_unary<R: rand::Rng, T: TableContext>(
+        rng: &mut R,
+        table: &T,
+        row: &[SimValue],
+    ) -> Self {
+        let columns = table.columns().collect::<Vec<_>>();
         // Pick a random column
-        let column_index = rng.gen_range(0..table.columns.len());
+        let column_index = rng.gen_range(0..columns.len());
         let column_value = &row[column_index];
         let num_retries = row.len();
         // Avoid creation of NULLs

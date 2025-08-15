@@ -1,12 +1,12 @@
 use crate::generation::{Arbitrary, ArbitraryFrom, ArbitrarySizedFrom, Shadow};
 use crate::model::query::predicate::Predicate;
 use crate::model::query::select::{
-    CompoundOperator, CompoundSelect, Distinctness, FromClause, JoinTable, JoinType, JoinedTable,
-    OrderBy, ResultColumn, SelectBody, SelectInner,
+    CompoundOperator, CompoundSelect, Distinctness, FromClause, OrderBy, ResultColumn, SelectBody,
+    SelectInner,
 };
 use crate::model::query::update::Update;
 use crate::model::query::{Create, Delete, Drop, Insert, Query, Select};
-use crate::model::table::{SimValue, Table};
+use crate::model::table::{JoinTable, JoinType, JoinedTable, SimValue, Table, TableContext};
 use crate::SimulatorEnv;
 use itertools::Itertools;
 use rand::Rng;
@@ -39,27 +39,32 @@ impl ArbitraryFrom<&Vec<Table>> for FromClause {
 
         let name = table.name.clone();
 
+        let mut table_context = JoinTable {
+            tables: Vec::new(),
+            rows: Vec::new(),
+        };
+
         let joins: Vec<_> = (0..num_joins)
             .filter_map(|_| {
                 if tables.is_empty() {
                     return None;
                 }
                 let join_table = pick(&tables, rng).clone();
+                let joined_table_name = join_table.name.clone();
+
                 tables.retain(|t| t.name != join_table.name);
-                table = JoinTable {
-                    tables: vec![table.clone(), join_table.clone()],
-                    rows: table
-                        .rows
-                        .iter()
-                        .cartesian_product(join_table.rows.iter())
-                        .map(|(t_row, j_row)| {
-                            let mut row = t_row.clone();
-                            row.extend(j_row.clone());
-                            row
-                        })
-                        .collect(),
-                }
-                .into_table();
+                table_context.rows = table_context
+                    .rows
+                    .iter()
+                    .cartesian_product(join_table.rows.iter())
+                    .map(|(t_row, j_row)| {
+                        let mut row = t_row.clone();
+                        row.extend(j_row.clone());
+                        row
+                    })
+                    .collect();
+                // TODO: inneficient. use a Deque to push_front?
+                table_context.tables.insert(0, join_table);
                 for row in &mut table.rows {
                     assert_eq!(
                         row.len(),
@@ -70,7 +75,7 @@ impl ArbitraryFrom<&Vec<Table>> for FromClause {
 
                 let predicate = Predicate::arbitrary_from(rng, &table);
                 Some(JoinedTable {
-                    table: join_table.name.clone(),
+                    table: joined_table_name,
                     join_type: JoinType::Inner,
                     on: predicate,
                 })
@@ -87,8 +92,8 @@ impl ArbitraryFrom<&SimulatorEnv> for SelectInner {
         // todo: this is a temporary hack because env is not separated from the tables
         let join_table = from
             .shadow(&mut tables)
-            .expect("Failed to shadow FromClause")
-            .into_table();
+            .expect("Failed to shadow FromClause");
+        let cuml_col_count = join_table.columns().count();
 
         let order_by = 'order_by: {
             if rng.gen_bool(0.3) {
@@ -98,7 +103,6 @@ impl ArbitraryFrom<&SimulatorEnv> for SelectInner {
                     .map(|j| j.table.clone())
                     .chain(std::iter::once(from.table.clone()))
                     .collect::<Vec<_>>();
-                let cuml_col_count = join_table.columns.len();
                 let order_by_col_count =
                     (rng.gen::<f64>() * rng.gen::<f64>() * (cuml_col_count as f64)) as usize; // skew towards 0
                 if order_by_col_count == 0 {

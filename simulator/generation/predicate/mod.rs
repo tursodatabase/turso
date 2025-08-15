@@ -3,7 +3,7 @@ use turso_sqlite3_parser::ast::{self, Expr};
 
 use crate::model::{
     query::predicate::Predicate,
-    table::{SimValue, Table},
+    table::{SimValue, Table, TableContext},
 };
 
 use super::{one_of, ArbitraryFrom};
@@ -17,11 +17,8 @@ struct CompoundPredicate(Predicate);
 #[derive(Debug)]
 struct SimplePredicate(Predicate);
 
-impl<A: AsRef<[SimValue]>> ArbitraryFrom<(&Table, A, bool)> for SimplePredicate {
-    fn arbitrary_from<R: Rng>(
-        rng: &mut R,
-        (table, row, predicate_value): (&Table, A, bool),
-    ) -> Self {
+impl<A: AsRef<[SimValue]>, T: TableContext> ArbitraryFrom<(&T, A, bool)> for SimplePredicate {
+    fn arbitrary_from<R: Rng>(rng: &mut R, (table, row, predicate_value): (&T, A, bool)) -> Self {
         let row = row.as_ref();
         // Pick an operator
         let choice = rng.gen_range(0..2);
@@ -41,21 +38,21 @@ impl<A: AsRef<[SimValue]>> ArbitraryFrom<(&Table, A, bool)> for SimplePredicate 
     }
 }
 
-impl ArbitraryFrom<(&Table, bool)> for CompoundPredicate {
-    fn arbitrary_from<R: Rng>(rng: &mut R, (table, predicate_value): (&Table, bool)) -> Self {
+impl<T: TableContext> ArbitraryFrom<(&T, bool)> for CompoundPredicate {
+    fn arbitrary_from<R: Rng>(rng: &mut R, (table, predicate_value): (&T, bool)) -> Self {
         CompoundPredicate::from_table_binary(rng, table, predicate_value)
     }
 }
 
-impl ArbitraryFrom<&Table> for Predicate {
-    fn arbitrary_from<R: Rng>(rng: &mut R, table: &Table) -> Self {
+impl<T: TableContext> ArbitraryFrom<&T> for Predicate {
+    fn arbitrary_from<R: Rng>(rng: &mut R, table: &T) -> Self {
         let predicate_value = rng.gen_bool(0.5);
         Predicate::arbitrary_from(rng, (table, predicate_value)).parens()
     }
 }
 
-impl ArbitraryFrom<(&Table, bool)> for Predicate {
-    fn arbitrary_from<R: Rng>(rng: &mut R, (table, predicate_value): (&Table, bool)) -> Self {
+impl<T: TableContext> ArbitraryFrom<(&T, bool)> for Predicate {
+    fn arbitrary_from<R: Rng>(rng: &mut R, (table, predicate_value): (&T, bool)) -> Self {
         CompoundPredicate::arbitrary_from(rng, (table, predicate_value)).0
     }
 }
