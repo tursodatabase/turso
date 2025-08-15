@@ -1579,7 +1579,6 @@ pub fn read_entire_wal_dumb(file: &Arc<dyn File>) -> Result<Arc<UnsafeCell<WalFi
         max_frame: AtomicU64::new(0),
         nbackfills: AtomicU64::new(0),
         frame_cache: Arc::new(SpinLock::new(HashMap::new())),
-        pages_in_frames: Arc::new(SpinLock::new(Vec::new())),
         last_checksum: (0, 0),
         file: file.clone(),
         read_locks,
@@ -1742,10 +1741,6 @@ pub fn read_entire_wal_dumb(file: &Arc<dyn File>) -> Result<Arc<UnsafeCell<WalFi
                     .entry(frame_h_page_number as u64)
                     .or_default()
                     .push(frame_idx);
-                wfs_data
-                    .pages_in_frames
-                    .lock()
-                    .push(frame_h_page_number as u64);
 
                 let is_commit_record = frame_h_db_size > 0;
                 if is_commit_record {
@@ -1760,20 +1755,23 @@ pub fn read_entire_wal_dumb(file: &Arc<dyn File>) -> Result<Arc<UnsafeCell<WalFi
 
         let max_frame = wfs_data.max_frame.load(Ordering::SeqCst);
 
-        // cleanup in-memory index from tail frames which was written after the last commited frame
-        let mut pages_in_frames = wfs_data.pages_in_frames.lock();
+        // cleanup in-memory index from tail frames which was written after the last committed frame
         let mut frame_cache = wfs_data.frame_cache.lock();
-        for i in max_frame as usize..pages_in_frames.len() {
-            let page = pages_in_frames[i];
-            let Some(cached) = frame_cache.get_mut(&page) else {
-                panic!("page from pages_in_frames must be in the frame_cache");
-            };
-            while !cached.is_empty() && *cached.last().unwrap() > max_frame {
-                cached.pop();
+        for (page, frames) in frame_cache.iter_mut() {
+            // remove any frame IDs > max_frame
+            let original_len = frames.len();
+            frames.retain(|&frame_id| frame_id <= max_frame);
+            if frames.len() < original_len {
+                tracing::debug!(
+                    "removed {} frame(s) from page {} from the in-memory WAL index because they were written after the last committed frame {}",
+                    original_len - frames.len(),
+                    page,
+                    max_frame
+                );
             }
-            tracing::debug!("remove page {page} from the in-memory WAL index because it was written after the last commited frame");
         }
-        pages_in_frames.truncate(max_frame as usize);
+        // also remove any pages that now have no frames
+        frame_cache.retain(|_page, frames| !frames.is_empty());
 
         wfs_data.nbackfills.store(0, Ordering::SeqCst);
         wfs_data.loaded.store(true, Ordering::SeqCst);

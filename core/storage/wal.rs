@@ -642,8 +642,6 @@ pub struct WalFileShared {
     // we don't need WAL's index file. So we can do stuff like this without shared memory.
     // TODO: this will need refactoring because this is incredible memory inefficient.
     pub frame_cache: Arc<SpinLock<HashMap<u64, Vec<u64>>>>,
-    // Another memory inefficient array made to just keep track of pages that are in frame_cache.
-    pub pages_in_frames: Arc<SpinLock<Vec<u64>>>,
     pub last_checksum: (u32, u32), // Check of last frame in WAL, this is a cumulative checksum over all frames in the WAL
     pub file: Arc<dyn File>,
 
@@ -671,7 +669,6 @@ impl fmt::Debug for WalFileShared {
             .field("max_frame", &self.max_frame)
             .field("nbackfills", &self.nbackfills)
             .field("frame_cache", &self.frame_cache)
-            .field("pages_in_frames", &self.pages_in_frames)
             .field("last_checksum", &self.last_checksum)
             // Excluding `file`, `read_locks`, and `write_lock`
             .finish()
@@ -1281,10 +1278,6 @@ impl Wal for WalFile {
                     }
                     frames.truncate(last_valid_frame);
                 }
-                let mut pages_in_frames = shared.pages_in_frames.lock();
-                pages_in_frames.retain(|page| {
-                    frame_cache.contains_key(page) && !frame_cache.get(page).unwrap().is_empty()
-                });
             }
             self.last_checksum = shared.last_checksum;
         }
@@ -1396,15 +1389,10 @@ impl WalFile {
             let mut frame_cache = shared.frame_cache.lock();
             match frame_cache.get_mut(&page_id) {
                 Some(frames) => {
-                    if frames.is_empty() {
-                        let mut pages_in_frames = shared.pages_in_frames.lock();
-                        pages_in_frames.push(page_id);
-                    }
                     frames.push(frame_id);
                 }
                 None => {
                     frame_cache.insert(page_id, vec![frame_id]);
-                    shared.pages_in_frames.lock().push(page_id);
                 }
             }
         }
@@ -1496,6 +1484,8 @@ impl WalFile {
                         let frame_cache = shared.frame_cache.lock();
                         let mut list = Vec::new();
                         for (&page_id, frames) in frame_cache.iter() {
+                            // for each page in the frame cache, grab the last (latest) frame for
+                            // that page that falls in the range of our safe min..max frame
                             if let Some(&frame) = frames.iter().rev().find(|&&f| {
                                 f >= self.ongoing_checkpoint.min_frame
                                     && f <= self.ongoing_checkpoint.max_frame
@@ -1942,7 +1932,6 @@ impl WalFileShared {
             frame_cache: Arc::new(SpinLock::new(HashMap::new())),
             last_checksum: (0, 0),
             file,
-            pages_in_frames: Arc::new(SpinLock::new(Vec::new())),
             read_locks,
             write_lock: TursoRwLock::new(),
             checkpoint_lock: TursoRwLock::new(),
@@ -1988,8 +1977,6 @@ impl WalFileShared {
         }
 
         self.frame_cache.lock().clear();
-        self.pages_in_frames.lock().clear();
-
         // read-marks
         self.read_locks[0].set_value_exclusive(0);
         self.read_locks[1].set_value_exclusive(0);
