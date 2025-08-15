@@ -717,28 +717,18 @@ fn reopen_database(env: &mut SimulatorEnv) {
             }
         }
         SimulationType::Default | SimulationType::Doublecheck => {
-            let db = match turso_core::Database::open_file(
+            env.reopen_database(
                 env.io.clone(),
                 env.get_db_path().to_str().expect("path should be 'to_str'"),
-                false,
-                true,
-            ) {
-                Ok(db) => db,
-                Err(e) => {
-                    tracing::error!(
-                        "Failed to open database at {}: {}",
-                        env.get_db_path().display(),
-                        e
-                    );
-                    panic!("Failed to open database: {e}");
-                }
-            };
-
-            env.db = db;
-
+            );
             for _ in 0..num_conns {
-                env.connections
-                    .push(SimConnection::LimboConnection(env.db.connect().unwrap()));
+                env.connections.push(SimConnection::LimboConnection(
+                    env.db
+                        .as_ref()
+                        .expect("db should be Some")
+                        .connect()
+                        .unwrap(),
+                ));
             }
         }
     };
