@@ -60,7 +60,7 @@ use crate::storage::btree::{payload_overflow_threshold_max, payload_overflow_thr
 use crate::storage::buffer_pool::BufferPool;
 use crate::storage::database::DatabaseStorage;
 use crate::storage::pager::Pager;
-use crate::storage::wal::{PendingFlush, READMARK_NOT_USED};
+use crate::storage::wal::READMARK_NOT_USED;
 use crate::types::{RawSlice, RefValue, SerialType, SerialTypeKind, TextRef, TextSubtype};
 use crate::{bail_corrupt_error, turso_assert, File, Result, WalFileShared};
 use std::cell::{RefCell, UnsafeCell};
@@ -905,6 +905,9 @@ pub fn finish_read_page(page_idx: usize, buffer_ref: Arc<Buffer>, page: PageRef)
         page.get().contents.replace(inner);
         page.clear_locked();
         page.set_loaded();
+        // we set the wal tag only when reading page from log, or in allocate_page,
+        // we clear it here for safety in case page is being re-loaded.
+        page.clear_wal_tag();
     }
     Ok(())
 }
@@ -955,9 +958,10 @@ pub fn begin_write_btree_page(pager: &Pager, page: &PageRef) -> Result<Completio
 pub fn write_pages_vectored(
     pager: &Pager,
     batch: BTreeMap<usize, Arc<Buffer>>,
-    flush: &PendingFlush,
+    done_flag: Arc<AtomicBool>,
 ) -> Result<Vec<Completion>> {
     if batch.is_empty() {
+        done_flag.store(true, Ordering::Relaxed);
         return Ok(Vec::new());
     }
 
@@ -982,8 +986,7 @@ pub fn write_pages_vectored(
 
     // Create the atomic counters
     let runs_left = Arc::new(AtomicUsize::new(run_count));
-    flush.new_flush();
-    let done = flush.done.clone();
+    let done = done_flag.clone();
     // we know how many runs, but we don't know how many buffers per run, so we can only give an
     // estimate of the capacity
     const EST_BUFF_CAPACITY: usize = 32;
@@ -994,21 +997,21 @@ pub fn write_pages_vectored(
     let mut run_start_id: Option<usize> = None;
 
     // Iterate through the batch
-    let mut iter = batch.into_iter().peekable();
+    let mut iter = batch.iter().peekable();
 
     let mut completions = Vec::new();
     while let Some((id, item)) = iter.next() {
         // Track the start of the run
         if run_start_id.is_none() {
-            run_start_id = Some(id);
+            run_start_id = Some(*id);
         }
 
         // Add this page to the current run
-        run_bufs.push(item);
+        run_bufs.push(item.clone());
 
         // Check if this is the end of a run
         let is_end_of_run = match iter.peek() {
-            Some(&(next_id, _)) => next_id != id + 1,
+            Some(&(next_id, _)) => *next_id != id + 1,
             None => true,
         };
 
@@ -1579,7 +1582,6 @@ pub fn read_entire_wal_dumb(file: &Arc<dyn File>) -> Result<Arc<UnsafeCell<WalFi
         max_frame: AtomicU64::new(0),
         nbackfills: AtomicU64::new(0),
         frame_cache: Arc::new(SpinLock::new(HashMap::new())),
-        pages_in_frames: Arc::new(SpinLock::new(Vec::new())),
         last_checksum: (0, 0),
         file: file.clone(),
         read_locks,
@@ -1742,10 +1744,6 @@ pub fn read_entire_wal_dumb(file: &Arc<dyn File>) -> Result<Arc<UnsafeCell<WalFi
                     .entry(frame_h_page_number as u64)
                     .or_default()
                     .push(frame_idx);
-                wfs_data
-                    .pages_in_frames
-                    .lock()
-                    .push(frame_h_page_number as u64);
 
                 let is_commit_record = frame_h_db_size > 0;
                 if is_commit_record {
@@ -1760,20 +1758,23 @@ pub fn read_entire_wal_dumb(file: &Arc<dyn File>) -> Result<Arc<UnsafeCell<WalFi
 
         let max_frame = wfs_data.max_frame.load(Ordering::SeqCst);
 
-        // cleanup in-memory index from tail frames which was written after the last commited frame
-        let mut pages_in_frames = wfs_data.pages_in_frames.lock();
+        // cleanup in-memory index from tail frames which was written after the last committed frame
         let mut frame_cache = wfs_data.frame_cache.lock();
-        for i in max_frame as usize..pages_in_frames.len() {
-            let page = pages_in_frames[i];
-            let Some(cached) = frame_cache.get_mut(&page) else {
-                panic!("page from pages_in_frames must be in the frame_cache");
-            };
-            while !cached.is_empty() && *cached.last().unwrap() > max_frame {
-                cached.pop();
+        for (page, frames) in frame_cache.iter_mut() {
+            // remove any frame IDs > max_frame
+            let original_len = frames.len();
+            frames.retain(|&frame_id| frame_id <= max_frame);
+            if frames.len() < original_len {
+                tracing::debug!(
+                    "removed {} frame(s) from page {} from the in-memory WAL index because they were written after the last committed frame {}",
+                    original_len - frames.len(),
+                    page,
+                    max_frame
+                );
             }
-            tracing::debug!("remove page {page} from the in-memory WAL index because it was written after the last commited frame");
         }
-        pages_in_frames.truncate(max_frame as usize);
+        // also remove any pages that now have no frames
+        frame_cache.retain(|_page, frames| !frames.is_empty());
 
         wfs_data.nbackfills.store(0, Ordering::SeqCst);
         wfs_data.loaded.store(true, Ordering::SeqCst);
