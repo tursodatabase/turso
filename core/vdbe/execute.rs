@@ -1907,9 +1907,16 @@ pub fn halt(
             )));
         }
     }
-    program
-        .commit_txn(pager.clone(), state, mv_store, false)
-        .map(Into::into)
+
+    let auto_commit = program.connection.auto_commit.get();
+    tracing::trace!("halt(auto_commit={})", auto_commit);
+    if auto_commit {
+        program
+            .commit_txn(pager.clone(), state, mv_store, false)
+            .map(Into::into)
+    } else {
+        Ok(InsnFunctionStepResult::Done)
+    }
 }
 
 pub fn op_halt(
@@ -1926,37 +1933,7 @@ pub fn op_halt(
         },
         insn
     );
-    if *err_code > 0 {
-        // invalidate page cache in case of error
-        pager.clear_page_cache();
-    }
-    match *err_code {
-        0 => {}
-        SQLITE_CONSTRAINT_PRIMARYKEY => {
-            return Err(LimboError::Constraint(format!(
-                "UNIQUE constraint failed: {description} (19)"
-            )));
-        }
-        SQLITE_CONSTRAINT_NOTNULL => {
-            return Err(LimboError::Constraint(format!(
-                "NOTNULL constraint failed: {description} (19)"
-            )));
-        }
-        _ => {
-            return Err(LimboError::Constraint(format!(
-                "undocumented halt error code {description}"
-            )));
-        }
-    }
-    let auto_commit = program.connection.auto_commit.get();
-    tracing::trace!("op_halt(auto_commit={})", auto_commit);
-    if auto_commit {
-        program
-            .commit_txn(pager.clone(), state, mv_store, false)
-            .map(Into::into)
-    } else {
-        Ok(InsnFunctionStepResult::Done)
-    }
+    halt(program, state, pager, mv_store, *err_code, description)
 }
 
 pub fn op_halt_if_null(
