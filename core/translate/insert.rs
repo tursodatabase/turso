@@ -112,13 +112,20 @@ pub fn translate_insert(
                 }
                 let mut param_idx = 1;
                 for expr in values_expr.iter_mut().flat_map(|v| v.iter_mut()) {
-                    if let Expr::Id(name) = expr {
-                        if name.is_double_quoted() {
-                            *expr = Expr::Literal(ast::Literal::String(format!("{name}")));
-                        } else {
-                            // an INSERT INTO ... VALUES (...) cannot reference columns
-                            crate::bail_parse_error!("no such column: {name}");
+                    match expr {
+                        Expr::Id(name) => {
+                            if name.is_double_quoted() {
+                                *expr = Expr::Literal(ast::Literal::String(format!("{name}")));
+                            } else {
+                                // an INSERT INTO ... VALUES (...) cannot reference columns
+                                crate::bail_parse_error!("no such column: {name}");
+                            }
                         }
+                        Expr::Qualified(first_name, second_name) => {
+                            // an INSERT INTO ... VALUES (...) cannot reference columns
+                            crate::bail_parse_error!("no such column: {first_name}.{second_name}");
+                        }
+                        _ => {}
                     }
                     rewrite_expr(expr, &mut param_idx)?;
                 }

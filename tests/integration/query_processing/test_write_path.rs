@@ -769,6 +769,27 @@ fn test_read_wal_dumb_no_frames() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[test]
+fn test_insert_with_column_names() -> anyhow::Result<()> {
+    let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE a(z)", false);
+    let conn = tmp_db.connect_limbo();
+    let result = conn.execute("INSERT INTO a VALUES (b.x)");
+
+    match result {
+        Ok(_) => panic!("Expected error but query succeeded."),
+        Err(error) => {
+            let error_msg = match error {
+                LimboError::ParseError(msg) => msg,
+                _ => panic!("Unexpected {error}"),
+            };
+
+            assert_eq!(error_msg, "no such column: b.x")
+        }
+    }
+
+    Ok(())
+}
+
 pub fn run_query(tmp_db: &TempDatabase, conn: &Arc<Connection>, query: &str) -> anyhow::Result<()> {
     run_query_core(tmp_db, conn, query, None::<fn(&Row)>)
 }
