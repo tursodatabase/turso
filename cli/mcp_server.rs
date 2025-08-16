@@ -2,12 +2,13 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io::{self, BufRead, BufReader, Write};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
-use turso_core::{Connection, StepResult, Value as DbValue};
+use turso_core::{Connection, Database, OpenFlags, StepResult, Value as DbValue};
 
 #[derive(Debug, Serialize, Deserialize)]
 struct JsonRpcRequest {
@@ -51,15 +52,17 @@ struct CallToolRequest {
 }
 
 pub struct TursoMcpServer {
-    conn: Arc<Connection>,
+    conn: Arc<Mutex<Arc<Connection>>>,
     interrupt_count: Arc<AtomicUsize>,
+    current_db_path: Arc<Mutex<Option<String>>>,
 }
 
 impl TursoMcpServer {
     pub fn new(conn: Arc<Connection>, interrupt_count: Arc<AtomicUsize>) -> Self {
         Self {
-            conn,
+            conn: Arc::new(Mutex::new(conn)),
             interrupt_count,
+            current_db_path: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -177,6 +180,29 @@ impl TursoMcpServer {
             id: request.id,
             result: Some(json!({
                 "tools": [
+                    {
+                        "name": "open_database",
+                        "description": "Open or create a database file. Creates parent directories if needed.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "path": {
+                                    "type": "string",
+                                    "description": "Path to the database file (absolute or relative). Use ':memory:' for in-memory database."
+                                }
+                            },
+                            "required": ["path"]
+                        }
+                    },
+                    {
+                        "name": "current_database",
+                        "description": "Get the path of the currently open database",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {},
+                            "required": []
+                        }
+                    },
                     {
                         "name": "list_tables",
                         "description": "List all tables in the database",
@@ -308,6 +334,8 @@ impl TursoMcpServer {
         };
 
         let result = match tool_request.name.as_str() {
+            "open_database" => self.open_database(&tool_request.arguments),
+            "current_database" => self.current_database(),
             "list_tables" => self.list_tables(),
             "describe_table" => self.describe_table(&tool_request.arguments),
             "execute_query" => self.execute_query(&tool_request.arguments),
@@ -342,10 +370,69 @@ impl TursoMcpServer {
         }
     }
 
+    fn open_database(&self, arguments: &Option<Value>) -> String {
+        let path = match arguments {
+            Some(args) => match args.get("path") {
+                Some(Value::String(p)) => p.clone(),
+                _ => return "Missing or invalid path parameter".to_string(),
+            },
+            None => return "Missing path parameter".to_string(),
+        };
+
+        // Create parent directories if needed
+        if path != ":memory:" {
+            let db_path = PathBuf::from(&path);
+            if let Some(parent) = db_path.parent() {
+                if !parent.exists() {
+                    if let Err(e) = std::fs::create_dir_all(parent) {
+                        return format!("Failed to create parent directories: {}", e);
+                    }
+                }
+            }
+        }
+
+        // Open the new database connection
+        let conn = if path == ":memory:" || path.contains([':', '?', '&', '#']) {
+            match Connection::from_uri(&path, true, false, false) {
+                Ok((_io, c)) => c,
+                Err(e) => return format!("Failed to open database '{}': {}", path, e),
+            }
+        } else {
+            match Database::open_new(
+                &path,
+                None::<&str>,
+                OpenFlags::default(),
+                true,
+                false,
+                false,
+            ) {
+                Ok((_io, db)) => match db.connect() {
+                    Ok(c) => c,
+                    Err(e) => return format!("Failed to connect to database '{}': {}", path, e),
+                },
+                Err(e) => return format!("Failed to open database '{}': {}", path, e),
+            }
+        };
+
+        // Update the connection and path
+        *self.conn.lock().unwrap() = conn;
+        *self.current_db_path.lock().unwrap() = Some(path.clone());
+
+        format!("Successfully opened database: {}", path)
+    }
+
+    fn current_database(&self) -> String {
+        match &*self.current_db_path.lock().unwrap() {
+            Some(path) => format!("Current database: {}", path),
+            None => "Current database: :memory: (default)".to_string(),
+        }
+    }
+
     fn list_tables(&self) -> String {
         let query = "SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY 1";
 
-        match self.conn.query(query) {
+        let conn = self.conn.lock().unwrap().clone();
+        match conn.query(query) {
             Ok(Some(mut rows)) => {
                 let mut tables = Vec::new();
 
@@ -395,7 +482,8 @@ impl TursoMcpServer {
 
         let query = format!("PRAGMA table_info({table_name})");
 
-        match self.conn.query(&query) {
+        let conn = self.conn.lock().unwrap().clone();
+        match conn.query(&query) {
             Ok(Some(mut rows)) => {
                 let mut columns = Vec::new();
 
@@ -486,7 +574,8 @@ impl TursoMcpServer {
             return "Only SELECT queries are allowed".to_string();
         }
 
-        match self.conn.query(query) {
+        let conn = self.conn.lock().unwrap().clone();
+        match conn.query(query) {
             Ok(Some(mut rows)) => {
                 let mut results = Vec::new();
 
@@ -564,7 +653,8 @@ impl TursoMcpServer {
             return "Only INSERT statements are allowed".to_string();
         }
 
-        match self.conn.execute(query) {
+        let conn = self.conn.lock().unwrap().clone();
+        match conn.execute(query) {
             Ok(()) => "INSERT successful.".to_string(),
             Err(e) => format!("Error executing INSERT: {e}"),
         }
@@ -585,7 +675,8 @@ impl TursoMcpServer {
             return "Only UPDATE statements are allowed".to_string();
         }
 
-        match self.conn.execute(query) {
+        let conn = self.conn.lock().unwrap().clone();
+        match conn.execute(query) {
             Ok(()) => "UPDATE successful.".to_string(),
             Err(e) => format!("Error executing UPDATE: {e}"),
         }
@@ -606,7 +697,8 @@ impl TursoMcpServer {
             return "Only DELETE statements are allowed".to_string();
         }
 
-        match self.conn.execute(query) {
+        let conn = self.conn.lock().unwrap().clone();
+        match conn.execute(query) {
             Ok(()) => "DELETE successful.".to_string(),
             Err(e) => format!("Error executing DELETE: {e}"),
         }
@@ -630,7 +722,8 @@ impl TursoMcpServer {
             return "Only CREATE, ALTER, and DROP statements are allowed".to_string();
         }
 
-        match self.conn.execute(query) {
+        let conn = self.conn.lock().unwrap().clone();
+        match conn.execute(query) {
             Ok(()) => "Schema change successful.".to_string(),
             Err(e) => format!("Error executing schema change: {e}"),
         }
