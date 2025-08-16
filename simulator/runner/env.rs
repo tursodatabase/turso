@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
-use turso_core::Database;
+use turso_core::{Database, IO};
 
 use crate::model::table::Table;
 
@@ -62,7 +62,7 @@ pub(crate) struct SimulatorEnv {
     pub(crate) opts: SimulatorOpts,
     pub(crate) connections: Vec<SimConnection>,
     pub(crate) io: Arc<SimulatorIO>,
-    pub(crate) db: Arc<Database>,
+    pub(crate) db: Option<Arc<Database>>,
     pub(crate) rng: ChaCha8Rng,
     pub(crate) paths: Paths,
     pub(crate) type_: SimulationType,
@@ -116,9 +116,16 @@ impl SimulatorEnv {
             std::fs::remove_file(&wal_path).unwrap();
         }
 
+        self.reopen_database(io.clone(), db_path.to_str().unwrap());
+        self.io = io;
+    }
+
+    pub fn reopen_database(&mut self, io: Arc<dyn IO>, db_path: &str) {
+        self.db = None;
+
         let db = match Database::open_file(
             io.clone(),
-            db_path.to_str().unwrap(),
+            db_path,
             self.opts.experimental_mvcc,
             self.opts.experimental_indexes,
         ) {
@@ -128,8 +135,8 @@ impl SimulatorEnv {
                 panic!("error opening simulator test file {db_path:?}: {e:?}");
             }
         };
-        self.io = io;
-        self.db = db;
+
+        self.db = Some(db);
     }
 
     pub(crate) fn get_db_path(&self) -> PathBuf {
@@ -240,7 +247,7 @@ impl SimulatorEnv {
             disable_union_all_preserves_cardinality: cli_opts
                 .disable_union_all_preserves_cardinality,
             disable_fsync_no_wait: cli_opts.disable_fsync_no_wait,
-            enable_faulty_query: cli_opts.enable_faulty_query,
+            disable_faulty_query: cli_opts.disable_faulty_query,
             page_size: 4096, // TODO: randomize this too
             max_interactions: rng.gen_range(cli_opts.minimum_tests..=cli_opts.maximum_tests),
             max_time_simulation: cli_opts.maximum_time,
@@ -298,7 +305,7 @@ impl SimulatorEnv {
             paths,
             rng,
             io,
-            db,
+            db: Some(db),
             type_: simulation_type,
             phase: SimulationPhase::Test,
         }
@@ -320,6 +327,8 @@ impl SimulatorEnv {
             SimulationType::Default | SimulationType::Doublecheck => {
                 self.connections[connection_index] = SimConnection::LimboConnection(
                     self.db
+                        .as_ref()
+                        .expect("db should be Some")
                         .connect()
                         .expect("Failed to connect to Limbo database"),
                 );
@@ -411,7 +420,7 @@ pub(crate) struct SimulatorOpts {
     pub(crate) disable_where_true_false_null: bool,
     pub(crate) disable_union_all_preserves_cardinality: bool,
     pub(crate) disable_fsync_no_wait: bool,
-    pub(crate) enable_faulty_query: bool,
+    pub(crate) disable_faulty_query: bool,
     pub(crate) disable_reopen_database: bool,
 
     pub(crate) max_interactions: usize,

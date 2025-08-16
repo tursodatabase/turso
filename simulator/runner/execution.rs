@@ -123,8 +123,13 @@ fn execute_plan(
 
     if let SimConnection::Disconnected = connection {
         tracing::debug!("connecting {}", connection_index);
-        env.connections[connection_index] =
-            SimConnection::LimboConnection(env.db.connect().unwrap());
+        env.connections[connection_index] = SimConnection::LimboConnection(
+            env.db
+                .as_ref()
+                .expect("db should be Some")
+                .connect()
+                .unwrap(),
+        );
     } else {
         tracing::debug!("connection {} already connected", connection_index);
         match execute_interaction(env, connection_index, interaction, &mut state.stack) {

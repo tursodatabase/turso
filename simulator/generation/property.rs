@@ -1509,7 +1509,7 @@ impl ArbitraryFrom<(&SimulatorEnv, &InteractionStats)> for Property {
                     Box::new(|rng: &mut R| property_fsync_no_wait(rng, env, &remaining_)),
                 ),
                 (
-                    if env.opts.enable_faulty_query {
+                    if !env.opts.disable_faulty_query {
                         20.0
                     } else {
                         0.0
