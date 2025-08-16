@@ -298,6 +298,11 @@ impl Page {
     }
 
     #[inline]
+    pub fn clear_wal_tag(&self) {
+        self.get().wal_tag.store(TAG_UNSET, Ordering::Release)
+    }
+
+    #[inline]
     /// Fast predicate for checkpoint selection:
     /// valid if the cached page exactly matches (target_frame, seq)
     /// and is not dirty.
@@ -1084,19 +1089,14 @@ impl Pager {
             return Ok((page, c));
         };
 
-        let seq = wal.borrow().checkpoint_seq();
         if let Some(frame_id) = wal.borrow().find_frame(page_idx as u64, frame_watermark)? {
             let c = wal
                 .borrow()
                 .read_frame(frame_id, page.clone(), self.buffer_pool.clone())?;
-            // reading from the WAL, so set the frame_id on the page
-            page.set_wal_tag(frame_id, seq);
             // TODO(pere) should probably first insert to page cache, and if successful,
             // read frame or page
             return Ok((page, c));
         }
-        let nbackfills = wal.borrow().get_nbackfills_in_wal();
-        page.set_wal_tag(nbackfills, seq);
         let c = self.begin_read_disk_page(page_idx, page.clone(), allow_empty_read)?;
         Ok((page, c))
     }

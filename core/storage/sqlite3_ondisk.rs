@@ -905,6 +905,9 @@ pub fn finish_read_page(page_idx: usize, buffer_ref: Arc<Buffer>, page: PageRef)
         page.get().contents.replace(inner);
         page.clear_locked();
         page.set_loaded();
+        // we set the wal tag only when reading page from log, or in allocate_page,
+        // we clear it here for safety in case page is being re-loaded.
+        page.clear_wal_tag();
     }
     Ok(())
 }

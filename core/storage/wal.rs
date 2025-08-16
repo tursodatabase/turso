@@ -769,6 +769,12 @@ impl Drop for CheckpointLocks {
     }
 }
 
+static DISABLE_CKPT_CACHE: AtomicBool = AtomicBool::new(false);
+
+pub fn set_disable_ckpt_cache(v: bool) {
+    DISABLE_CKPT_CACHE.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
 impl Wal for WalFile {
     /// Begin a read transaction. The caller must ensure that there is not already
     /// an ongoing read transaction.
@@ -1024,9 +1030,10 @@ impl Wal for WalFile {
                 bytes_read == buf_len as i32,
                 "read({bytes_read}) less than expected({buf_len}): frame_id={frame_id}"
             );
-            let frame = frame.clone();
+            let cloned = frame.clone();
+            finish_read_page(page.get().id, buf, cloned).unwrap();
+            // here, since we are reading a frame specifically we can set the wal tag
             frame.set_wal_tag(frame_id, seq);
-            finish_read_page(page.get().id, buf, frame).unwrap();
         });
         begin_read_wal_frame(
             &self.get_shared().file,
@@ -1322,14 +1329,11 @@ impl WalFile {
         shared: Arc<UnsafeCell<WalFileShared>>,
         buffer_pool: Arc<BufferPool>,
     ) -> Self {
-        let checkpoint_page = Arc::new(Page::new(0));
-        let buffer = buffer_pool.get_page();
-        {
-            checkpoint_page.get().contents = Some(PageContent::new(0, Arc::new(buffer)));
-        }
-
         let header = unsafe { shared.get().as_mut().unwrap().wal_header.lock() };
         let last_checksum = unsafe { (*shared.get()).last_checksum };
+        let disable_checkpoint_cache =
+            std::env::var("TURSO_DISABLE_CHECKPOINT_CACHE").unwrap_or_default() != "";
+        set_disable_ckpt_cache(disable_checkpoint_cache);
         Self {
             io,
             // default to max frame in WAL, so that when we read schema we can read from WAL too if it's there.
@@ -1535,17 +1539,33 @@ impl WalFile {
                         let (page_id, target_frame) = self.ongoing_checkpoint.pages_to_checkpoint
                             [self.ongoing_checkpoint.current_page as usize];
 
-                        // Try cache first
-                        if let Some(cached_page) =
-                            pager.cache_get_for_checkpoint(page_id as usize, target_frame, seq)
-                        {
-                            let contents = cached_page.get_contents();
-                            let buffer = contents.buffer.clone();
-                            self.ongoing_checkpoint
-                                .pending_writes
-                                .insert(page_id as usize, buffer);
-                            self.ongoing_checkpoint.current_page += 1;
-                            continue;
+                        // Try cache first, if enabled
+                        if !DISABLE_CKPT_CACHE.load(Ordering::Relaxed) {
+                            if let Some(cached_page) =
+                                pager.cache_get_for_checkpoint(page_id as usize, target_frame, seq)
+                            {
+                                let contents = cached_page.get_contents();
+                                let buffer = contents.buffer.clone();
+                                #[cfg(debug_assertions)]
+                                {
+                                    let mut raw = vec![
+                                        0u8;
+                                        self.page_size() as usize
+                                            + WAL_FRAME_HEADER_SIZE
+                                    ];
+                                    let c = self.read_frame_raw(target_frame, &mut raw)?; // WAL bytes
+                                    self.io.wait_for_completion(c)?;
+                                    let (_, wal_page) =
+                                        sqlite3_ondisk::parse_wal_frame_header(&raw);
+                                    let cached = cached_page.get_contents().buffer.as_slice();
+                                    debug_assert_eq!(wal_page, cached, "cache fast-path returned wrong content for page {page_id} frame {target_frame}");
+                                }
+                                self.ongoing_checkpoint
+                                    .pending_writes
+                                    .insert(page_id as usize, buffer);
+                                self.ongoing_checkpoint.current_page += 1;
+                                continue;
+                            }
                         }
                         // Issue read if page wasn't found in the page cache or doesnt meet
                         // the frame requirements
@@ -1809,6 +1829,8 @@ impl WalFile {
                 shared.read_locks[idx].unlock();
             }
         }
+        let header = { *self.get_shared().wal_header.lock() };
+        self.header = header;
 
         self.last_checksum = self.get_shared().last_checksum;
         self.max_frame = 0;
