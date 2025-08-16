@@ -451,6 +451,9 @@ impl Interaction {
                     &query_str[0..query_str.len().min(4096)],
                     err
                 );
+                if let Some(turso_core::LimboError::ParseError(e)) = err {
+                    panic!("Unexpected parse error: {e}");
+                }
                 return Err(err.unwrap());
             }
             let rows = rows?;

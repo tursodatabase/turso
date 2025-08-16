@@ -237,11 +237,19 @@ impl ArbitraryFrom<&SimulatorEnv> for Select {
 
         let num_result_columns = rng.gen_range(1..=min_column_count_across_tables);
 
-        let first = SelectInner::arbitrary_sized_from(rng, env, num_result_columns);
+        let mut first = SelectInner::arbitrary_sized_from(rng, env, num_result_columns);
 
-        let rest: Vec<SelectInner> = (0..num_compound_selects)
+        let mut rest: Vec<SelectInner> = (0..num_compound_selects)
             .map(|_| SelectInner::arbitrary_sized_from(rng, env, num_result_columns))
             .collect();
+
+        if !rest.is_empty() {
+            // ORDER BY is not supported in compound selects yet
+            first.order_by = None;
+            for s in &mut rest {
+                s.order_by = None;
+            }
+        }
 
         Self {
             body: SelectBody {
