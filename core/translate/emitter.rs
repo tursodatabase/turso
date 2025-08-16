@@ -825,13 +825,19 @@ fn emit_update_insns(
         None
     };
 
-    let check_rowid_not_exists_label = if has_user_provided_rowid {
+    let check_rowid_not_exists_label = if has_user_provided_rowid || temp_cursor_id.is_some() {
         Some(program.allocate_label())
     } else {
         None
     };
 
-    if has_user_provided_rowid {
+    if let Some(temp_cursor_id) = temp_cursor_id {
+        program.emit_insn(Insn::NotExists {
+            cursor: temp_cursor_id,
+            rowid_reg: beg,
+            target_pc: check_rowid_not_exists_label.unwrap(),
+        });
+    } else if has_user_provided_rowid {
         program.emit_insn(Insn::NotExists {
             cursor: cursor_id,
             rowid_reg: beg,
