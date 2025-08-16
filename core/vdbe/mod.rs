@@ -702,7 +702,9 @@ fn get_indent_counts(insns: &[(Insn, InsnFunction)]) -> Vec<usize> {
         let mut start = 0;
         let mut end = 0;
         match insn {
-            Insn::Next { pc_if_next, .. } | Insn::VNext { pc_if_next, .. } => {
+            Insn::Next { pc_if_next, .. }
+            | Insn::VNext { pc_if_next, .. }
+            | Insn::SorterNext { pc_if_next, .. } => {
                 let dest = pc_if_next.as_debug_int() as usize;
                 if dest < i {
                     start = dest;
