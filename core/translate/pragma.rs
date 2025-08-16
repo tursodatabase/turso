@@ -451,6 +451,10 @@ fn query_pragma(
                 } else if let Some(view_mutex) = schema.get_materialized_view(&name) {
                     let view = view_mutex.lock().unwrap();
                     emit_columns_for_table_info(&mut program, &view.columns, base_reg);
+                } else if let Some(view) = schema.get_view(&name) {
+                    if let Some(ref columns) = view.columns {
+                        emit_columns_for_table_info(&mut program, columns, base_reg);
+                    }
                 }
             }
             let col_names = ["cid", "name", "type", "notnull", "dflt_value", "pk"];

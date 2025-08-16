@@ -229,20 +229,30 @@ pub fn parse_schema_rows(
                                 }
                                 Stmt::CreateView {
                                     view_name: _,
-                                    columns,
+                                    columns: column_names,
                                     select,
                                     ..
                                 } => {
+                                    // Extract actual columns from the SELECT statement
+                                    let view_columns = extract_view_columns(&select, schema);
+
+                                    // If column names were provided in CREATE VIEW (col1, col2, ...),
+                                    // use them to rename the columns
+                                    let mut final_columns = view_columns;
+                                    if let Some(ref names) = column_names {
+                                        for (i, indexed_col) in names.iter().enumerate() {
+                                            if let Some(col) = final_columns.get_mut(i) {
+                                                col.name = Some(indexed_col.col_name.to_string());
+                                            }
+                                        }
+                                    }
+
                                     // Create regular view
                                     let view = View {
                                         name: name.to_string(),
                                         sql: sql.to_string(),
                                         select_stmt: *select,
-                                        columns: columns.map(|cols| {
-                                            cols.into_iter()
-                                                .map(|c| c.col_name.to_string())
-                                                .collect()
-                                        }),
+                                        columns: Some(final_columns),
                                     };
                                     schema.add_view(view);
                                 }
