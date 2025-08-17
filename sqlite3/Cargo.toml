@@ -13,6 +13,8 @@ build = "build.rs"
 capi = []
 lfs = []
 sqlite3 = []
+tcl = []
+tcl9 = []
 
 [package.metadata.dist]
 dist = true

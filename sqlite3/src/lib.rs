@@ -8,6 +8,13 @@ use turso_core::{CheckpointMode, LimboError, Value};
 
 use std::sync::{Arc, Mutex};
 
+// Tcl integration module
+#[cfg(feature = "tcl")]
+mod tcl;
+
+#[cfg(feature = "tcl")]
+pub use tcl::*;
+
 macro_rules! stub {
     () => {
         todo!("{} is not implemented", stringify!($fn));
@@ -35,6 +42,12 @@ pub const SQLITE_CHECKPOINT_PASSIVE: ffi::c_int = 0;
 pub const SQLITE_CHECKPOINT_FULL: ffi::c_int = 1;
 pub const SQLITE_CHECKPOINT_RESTART: ffi::c_int = 2;
 pub const SQLITE_CHECKPOINT_TRUNCATE: ffi::c_int = 3;
+
+pub const SQLITE_INTEGER: ffi::c_int = 1;
+pub const SQLITE_FLOAT: ffi::c_int = 2;
+pub const SQLITE_TEXT: ffi::c_int = 3;
+pub const SQLITE_BLOB: ffi::c_int = 4;
+pub const SQLITE_NULL: ffi::c_int = 5;
 
 pub struct sqlite3 {
     pub(crate) inner: Arc<Mutex<sqlite3Inner>>,
@@ -170,6 +183,7 @@ pub unsafe extern "C" fn sqlite3_close(db: *mut sqlite3) -> ffi::c_int {
     let _ = Box::from_raw(db);
     SQLITE_OK
 }
+
 
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_close_v2(db: *mut sqlite3) -> ffi::c_int {
