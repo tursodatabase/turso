@@ -385,7 +385,7 @@ pub struct Pager {
     /// Source of the database pages.
     pub db_file: Arc<dyn DatabaseStorage>,
     /// The write-ahead log (WAL) for the database.
-    /// in-memory databases, ephemeral tables and ephemeral indexes do not have a WAL.
+    /// in-memory databases do not have a WAL.
     pub(crate) wal: Option<Rc<RefCell<dyn Wal>>>,
     /// A page cache for the database.
     page_cache: Arc<RwLock<DumbLruPageCache>>,
@@ -1128,8 +1128,6 @@ impl Pager {
     #[instrument(skip_all, level = Level::INFO)]
     pub fn cacheflush(&self) -> Result<Vec<Completion>> {
         let Some(wal) = self.wal.as_ref() else {
-            // TODO: when ephemeral table spills to disk, it should cacheflush pages directly to the temporary database file.
-            // This handling is not yet implemented, but it should be when spilling is implemented.
             return Err(LimboError::InternalError(
                 "cacheflush() called on database without WAL".to_string(),
             ));

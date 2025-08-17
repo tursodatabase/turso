@@ -534,7 +534,7 @@ pub struct WalFileShared {
     // Frame cache maps a Page to all the frames it has stored in WAL in ascending order.
     // This is to easily find the frame it must checkpoint each connection if a checkpoint is
     // necessary.
-    // One difference between SQLite and limbo is that we will never support multi process, meaning
+    // One difference between SQLite and TursoDB is that we will never support multi process, meaning
     // we don't need WAL's index file. So we can do stuff like this without shared memory.
     // TODO: this will need refactoring because this is incredible memory inefficient.
     pub frame_cache: Arc<SpinLock<HashMap<u64, Vec<u64>>>>,
@@ -1626,7 +1626,7 @@ impl WalFile {
     /// because we might overwrite content the reader is reading from the database file.
     ///
     /// A checkpoint must never overwrite a page in the main DB file if some
-    /// active reader might still need to read that page from the WAL.  
+    /// active reader might still need to read that page from the WAL.
     /// Concretely: the checkpoint may only copy frames `<= aReadMark[k]` for
     /// every in-use reader slot `k > 0`.
     ///
