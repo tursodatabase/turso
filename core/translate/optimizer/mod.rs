@@ -102,13 +102,14 @@ fn optimize_delete_plan(plan: &mut DeletePlan, _schema: &Schema) -> Result<()> {
 
     // FIXME: don't use indexes for delete right now because it's buggy. See for example:
     // https://github.com/tursodatabase/turso/issues/1714
-    // let _ = optimize_table_access(
-    //     &mut plan.table_references,
-    //     &schema.indexes,
-    //     &mut plan.where_clause,
-    //     &mut plan.order_by,
-    //     &mut None,
-    // )?;
+    let _ = optimize_table_access(
+        _schema,
+        &mut plan.table_references,
+        &_schema.indexes,
+        &mut plan.where_clause,
+        &mut plan.order_by,
+        &mut None,
+    )?;
 
     Ok(())
 }
