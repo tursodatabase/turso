@@ -10,9 +10,7 @@ const DEFAULT_PAGE_CACHE_SIZE_IN_PAGES_MAKE_ME_SMALLER_ONCE_WAL_SPILL_IS_IMPLEME
     100000;
 
 #[derive(Debug, Eq, Hash, PartialEq, Clone)]
-pub struct PageCacheKey {
-    pgno: usize,
-}
+pub struct PageCacheKey(pub usize);
 
 #[allow(dead_code)]
 struct PageCacheEntry {
@@ -61,11 +59,6 @@ pub enum CacheResizeResult {
     PendingEvictions,
 }
 
-impl PageCacheKey {
-    pub fn new(pgno: usize) -> Self {
-        Self { pgno }
-    }
-}
 impl DumbLruPageCache {
     pub fn new(capacity: usize) -> Self {
         assert!(capacity > 0, "capacity of cache should be at least 1");
@@ -605,9 +598,9 @@ impl PageHashMap {
 
     fn hash(&self, key: &PageCacheKey) -> usize {
         if self.capacity.is_power_of_two() {
-            key.pgno & (self.capacity - 1)
+            key.0 & (self.capacity - 1)
         } else {
-            key.pgno % self.capacity
+            key.0 % self.capacity
         }
     }
 
@@ -637,10 +630,6 @@ mod tests {
         ChaCha8Rng,
     };
 
-    fn create_key(id: usize) -> PageCacheKey {
-        PageCacheKey::new(id)
-    }
-
     static TEST_BUFFER_POOL: OnceLock<Arc<BufferPool>> = OnceLock::new();
 
     #[allow(clippy::arc_with_non_send_sync)]
@@ -663,7 +652,7 @@ mod tests {
     }
 
     fn insert_page(cache: &mut DumbLruPageCache, id: usize) -> PageCacheKey {
-        let key = create_key(id);
+        let key = PageCacheKey(id);
         let page = page_with_content(id);
         assert!(cache.insert(key.clone(), page).is_ok());
         key
@@ -677,7 +666,7 @@ mod tests {
         cache: &mut DumbLruPageCache,
         id: usize,
     ) -> (PageCacheKey, NonNull<PageCacheEntry>) {
-        let key = create_key(id);
+        let key = PageCacheKey(id);
         let page = page_with_content(id);
         assert!(cache.insert(key.clone(), page).is_ok());
         let entry = cache.get_ptr(&key).expect("Entry should exist");
@@ -860,7 +849,7 @@ mod tests {
     #[ignore = "for now let's not track active refs"]
     fn test_detach_via_delete() {
         let mut cache = DumbLruPageCache::default();
-        let key1 = create_key(1);
+        let key1 = PageCacheKey(1);
         let page1 = page_with_content(1);
         assert!(cache.insert(key1.clone(), page1.clone()).is_ok());
         assert!(page_has_content(&page1));
@@ -882,7 +871,7 @@ mod tests {
     #[should_panic(expected = "Attempted to insert different page with same key")]
     fn test_insert_existing_key_fail() {
         let mut cache = DumbLruPageCache::default();
-        let key1 = create_key(1);
+        let key1 = PageCacheKey(1);
         let page1_v1 = page_with_content(1);
         let page1_v2 = page_with_content(1);
         assert!(cache.insert(key1.clone(), page1_v1.clone()).is_ok());
@@ -894,7 +883,7 @@ mod tests {
     #[test]
     fn test_detach_nonexistent_key() {
         let mut cache = DumbLruPageCache::default();
-        let key_nonexist = create_key(99);
+        let key_nonexist = PageCacheKey(99);
 
         assert!(cache.delete(key_nonexist.clone()).is_ok()); // no-op
     }
@@ -1045,7 +1034,7 @@ mod tests {
                 0 => {
                     // add
                     let id_page = rng.next_u64() % max_pages;
-                    let key = PageCacheKey::new(id_page as usize);
+                    let key = PageCacheKey(id_page as usize);
                     #[allow(clippy::arc_with_non_send_sync)]
                     let page = Arc::new(Page::new(id_page as usize));
                     if cache.peek(&key, false).is_some() {
@@ -1070,7 +1059,7 @@ mod tests {
                     let key = if random || lru.is_empty() {
                         let id_page: u64 = rng.next_u64() % max_pages;
 
-                        PageCacheKey::new(id_page as usize)
+                        PageCacheKey(id_page as usize)
                     } else {
                         let i = rng.next_u64() as usize % lru.len();
                         let key: PageCacheKey = lru.iter().nth(i).unwrap().0.clone();
@@ -1091,7 +1080,7 @@ mod tests {
             for (key, page) in &lru {
                 println!("getting page {key:?}");
                 cache.peek(key, false).unwrap();
-                assert_eq!(page.get().id, key.pgno);
+                assert_eq!(page.get().id, key.0);
             }
         }
     }
@@ -1169,7 +1158,7 @@ mod tests {
         assert_eq!(result, CacheResizeResult::Done);
         assert_eq!(cache.len(), 3);
         assert_eq!(cache.capacity, 3);
-        assert!(cache.insert(create_key(6), page_with_content(6)).is_ok());
+        assert!(cache.insert(PageCacheKey(6), page_with_content(6)).is_ok());
     }
 
     #[test]
@@ -1183,14 +1172,14 @@ mod tests {
         assert_eq!(result, CacheResizeResult::Done);
         assert_eq!(cache.len(), 2);
         assert_eq!(cache.capacity, 5);
-        assert!(cache.get(&create_key(1)).is_some());
-        assert!(cache.get(&create_key(2)).is_some());
+        assert!(cache.get(&PageCacheKey(1)).is_some());
+        assert!(cache.get(&PageCacheKey(2)).is_some());
         for i in 3..=5 {
             let _ = insert_page(&mut cache, i);
         }
         assert_eq!(cache.len(), 5);
         // FIXME: For now this will assert because we cannot insert a page with same id but different contents of page.
-        assert!(cache.insert(create_key(4), page_with_content(4)).is_err());
+        assert!(cache.insert(PageCacheKey(4), page_with_content(4)).is_err());
         cache.verify_list_integrity();
     }
 
@@ -1201,9 +1190,9 @@ mod tests {
         let page1 = page_with_content(1);
         let page2 = page_with_content(2);
         let page3 = page_with_content(3);
-        assert!(cache.insert(create_key(1), page1.clone()).is_ok());
-        assert!(cache.insert(create_key(2), page2.clone()).is_ok());
-        assert!(cache.insert(create_key(3), page3.clone()).is_ok());
+        assert!(cache.insert(PageCacheKey(1), page1.clone()).is_ok());
+        assert!(cache.insert(PageCacheKey(2), page2.clone()).is_ok());
+        assert!(cache.insert(PageCacheKey(3), page3.clone()).is_ok());
         assert_eq!(cache.len(), 3);
         cache.verify_list_integrity();
         assert_eq!(cache.resize(2), CacheResizeResult::PendingEvictions);
@@ -1213,7 +1202,7 @@ mod tests {
         drop(page3);
         assert_eq!(cache.resize(1), CacheResizeResult::Done); // Evicted 2 and 3
         assert_eq!(cache.len(), 1);
-        assert!(cache.insert(create_key(4), page_with_content(4)).is_err());
+        assert!(cache.insert(PageCacheKey(4), page_with_content(4)).is_err());
         cache.verify_list_integrity();
     }
 
@@ -1228,7 +1217,7 @@ mod tests {
         assert_eq!(cache.len(), 3);
         assert_eq!(cache.capacity, 3);
         cache.verify_list_integrity();
-        assert!(cache.insert(create_key(4), page_with_content(4)).is_ok());
+        assert!(cache.insert(PageCacheKey(4), page_with_content(4)).is_ok());
     }
 
     #[test]
@@ -1240,7 +1229,7 @@ mod tests {
             let mut cache = DumbLruPageCache::new(1000);
 
             for i in 0..1000 {
-                let key = create_key(i);
+                let key = PageCacheKey(i);
                 let page = page_with_content(i);
                 cache.insert(key, page).unwrap();
             }

@@ -1043,7 +1043,7 @@ impl Pager {
     pub fn read_page(&self, page_idx: usize) -> Result<(PageRef, Completion)> {
         tracing::trace!("read_page(page_idx = {})", page_idx);
         let mut page_cache = self.page_cache.write();
-        let page_key = PageCacheKey::new(page_idx);
+        let page_key = PageCacheKey(page_idx);
         if let Some(page) = page_cache.get(&page_key) {
             tracing::trace!("read_page(page_idx = {}) = cached", page_idx);
             // Dummy completion being passed, as we do not need to read from database or wal
@@ -1077,7 +1077,7 @@ impl Pager {
         page: PageRef,
         page_cache: &mut DumbLruPageCache,
     ) -> Result<()> {
-        let page_key = PageCacheKey::new(page_idx);
+        let page_key = PageCacheKey(page_idx);
         match page_cache.insert(page_key, page.clone()) {
             Ok(_) => {}
             Err(CacheError::Full) => return Err(LimboError::CacheFull),
@@ -1097,7 +1097,7 @@ impl Pager {
     pub fn cache_get(&self, page_idx: usize) -> Option<PageRef> {
         tracing::trace!("read_page(page_idx = {})", page_idx);
         let mut page_cache = self.page_cache.write();
-        let page_key = PageCacheKey::new(page_idx);
+        let page_key = PageCacheKey(page_idx);
         page_cache.get(&page_key)
     }
 
@@ -1207,7 +1207,7 @@ impl Pager {
 
                         let page = {
                             let mut cache = self.page_cache.write();
-                            let page_key = PageCacheKey::new(page_id);
+                            let page_key = PageCacheKey(page_id);
                             let page = cache.get(&page_key).unwrap_or_else(|| {
                                 panic!(
                                     "we somehow added a page to dirty list but we didn't mark it as dirty, causing cache to drop it. page={page_id}"
@@ -1324,7 +1324,7 @@ impl Pager {
         }
         if header.is_commit_frame() {
             for page_id in self.dirty_pages.borrow().iter() {
-                let page_key = PageCacheKey::new(*page_id);
+                let page_key = PageCacheKey(*page_id);
                 let mut cache = self.page_cache.write();
                 let page = cache.get(&page_key).expect("we somehow added a page to dirty list but we didn't mark it as dirty, causing cache to drop it.");
                 page.clear_dirty();
@@ -1628,7 +1628,7 @@ impl Pager {
                 let page1_ref = page.get();
                 turso_assert!(page1_ref.is_loaded(), "page should be loaded");
                 tracing::trace!("allocate_page1(Writing done)");
-                let page_key = PageCacheKey::new(page1_ref.get().id);
+                let page_key = PageCacheKey(page1_ref.get().id);
                 let mut cache = self.page_cache.write();
                 cache.insert(page_key, page1_ref.clone()).map_err(|e| {
                     LimboError::InternalError(format!("Failed to insert page 1 into cache: {e:?}"))
@@ -1691,7 +1691,7 @@ impl Pager {
                             let page =
                                 allocate_new_page(new_db_size as usize, &self.buffer_pool, 0);
                             self.add_dirty(&page);
-                            let page_key = PageCacheKey::new(page.get().id);
+                            let page_key = PageCacheKey(page.get().id);
                             let mut cache = self.page_cache.write();
                             match cache.insert(page_key, page.clone()) {
                                 Ok(_) => (),
@@ -1777,7 +1777,7 @@ impl Pager {
                         trunk_page.get().id
                     );
                     trunk_page.get().contents.as_ref().unwrap().as_ptr().fill(0);
-                    let page_key = PageCacheKey::new(trunk_page.get().id);
+                    let page_key = PageCacheKey(trunk_page.get().id);
                     {
                         let mut page_cache = self.page_cache.write();
                         turso_assert!(
@@ -1809,7 +1809,7 @@ impl Pager {
                         leaf_page.get().id
                     );
                     leaf_page.get().contents.as_ref().unwrap().as_ptr().fill(0);
-                    let page_key = PageCacheKey::new(leaf_page.get().id);
+                    let page_key = PageCacheKey(leaf_page.get().id);
                     {
                         let mut page_cache = self.page_cache.write();
                         turso_assert!(
@@ -1863,7 +1863,7 @@ impl Pager {
                         // setup page and add to cache
                         self.add_dirty(&page);
 
-                        let page_key = PageCacheKey::new(page.get().id);
+                        let page_key = PageCacheKey(page.get().id);
                         {
                             // Run in separate block to avoid deadlock on page cache write lock
                             let mut cache = self.page_cache.write();
@@ -1892,7 +1892,7 @@ impl Pager {
         page: PageRef,
     ) -> Result<(), LimboError> {
         let mut cache = self.page_cache.write();
-        let page_key = PageCacheKey::new(id);
+        let page_key = PageCacheKey(id);
 
         // FIXME: use specific page key for writer instead of max frame, this will make readers not conflict
         assert!(page.is_dirty());
@@ -2209,13 +2209,13 @@ mod tests {
             let cache = cache.clone();
             std::thread::spawn(move || {
                 let mut cache = cache.write();
-                let page_key = PageCacheKey::new(1);
+                let page_key = PageCacheKey(1);
                 cache.insert(page_key, Arc::new(Page::new(1))).unwrap();
             })
         };
         let _ = thread.join();
         let mut cache = cache.write();
-        let page_key = PageCacheKey::new(1);
+        let page_key = PageCacheKey(1);
         let page = cache.get(&page_key);
         assert_eq!(page.unwrap().get().id, 1);
     }
