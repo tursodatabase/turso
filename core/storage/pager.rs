@@ -2040,16 +2040,18 @@ impl Pager {
                 assert!(page.is_dirty());
                 page
             };
+            tracing::trace!("spilling page {}", page_id);
             let c = wal.borrow_mut().append_frame(
                 page.clone(),
                 self.page_size.get().expect("page size not set"),
                 0,
             )?;
+            page_cache.delete(PageCacheKey(page_id)).unwrap();
+            dirty_pages.remove(&page_id);
+
             // TODO: invalidade previous completions if this one fails
             completions.push(c);
-            page_cache.delete(PageCacheKey(page_id)).unwrap();
         }
-        dirty_pages.clear();
 
         // Making the API sync for now
         for c in completions {
