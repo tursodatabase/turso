@@ -15,6 +15,7 @@ use crate::{
     return_if_io, turso_assert, types::WalFrameInfo, Completion, Connection, IOResult, LimboError,
     Result, TransactionState,
 };
+use bitflags::bitflags;
 use parking_lot::RwLock;
 use std::cell::{Cell, OnceCell, RefCell, UnsafeCell};
 use std::collections::HashSet;
@@ -35,6 +36,40 @@ const DEFAULT_MAX_PAGE_COUNT: u32 = 0xfffffffe;
 
 #[cfg(not(feature = "omit_autovacuum"))]
 use ptrmap::*;
+
+#[derive(Debug, Copy, Clone)]
+pub struct SpillFlag(u8);
+
+bitflags! {
+    impl SpillFlag: u8 {
+        /// Allow spilling cache. Default behavior.
+        const ALLOWED = 0b00;
+        /// Never spill cache. Set via pragma
+        const OFF = 0b01;
+        /// Current rolling back, so do not spill
+        const ROLLBACK = 0b10;
+        /// Spill is ok, but do not sync
+        const NO_SYNC = 0b11;
+    }
+}
+
+impl SpillFlag {
+    pub fn can_spill(&self) -> bool {
+        self.contains(SpillFlag::NO_SYNC) || self.is_empty()
+    }
+
+    pub fn is_off(&self) -> bool {
+        self.contains(SpillFlag::OFF)
+    }
+
+    pub fn disable(&mut self, toggle: bool) {
+        if toggle {
+            self.remove(SpillFlag::OFF);
+        } else {
+            *self = SpillFlag::OFF;
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct HeaderRef(PageRef);
@@ -389,12 +424,13 @@ pub struct Pager {
     /// in-memory databases do not have a WAL.
     pub(crate) wal: Option<Rc<RefCell<dyn Wal>>>,
     /// A page cache for the database.
-    page_cache: Arc<RwLock<DumbLruPageCache>>,
+    pub(crate) page_cache: Arc<RwLock<DumbLruPageCache>>,
     /// Buffer pool for temporary data storage.
     pub buffer_pool: Arc<BufferPool>,
     /// I/O interface for input/output operations.
     pub io: Arc<dyn crate::io::IO>,
     dirty_pages: Rc<RefCell<HashSet<usize, hash::BuildHasherDefault<hash::DefaultHasher>>>>,
+    pub spill_flag: RefCell<SpillFlag>,
 
     commit_info: RefCell<CommitInfo>,
     checkpoint_state: RefCell<CheckpointState>,
@@ -519,6 +555,7 @@ impl Pager {
             allocate_page1_state,
             page_size: Cell::new(None),
             reserved_space: OnceCell::new(),
+            spill_flag: RefCell::new(SpillFlag::empty()),
             free_page_state: RefCell::new(FreePageState::Start),
             allocate_page_state: RefCell::new(AllocatePageState::Start),
             max_page_count: Cell::new(DEFAULT_MAX_PAGE_COUNT),
@@ -1940,6 +1977,9 @@ impl Pager {
         is_write: bool,
     ) -> Result<()> {
         tracing::debug!(schema_did_change);
+        {
+            *self.spill_flag.borrow_mut() = SpillFlag::ROLLBACK;
+        }
         if is_write {
             self.dirty_pages.borrow_mut().clear();
         } else {
@@ -2017,6 +2057,10 @@ impl Pager {
         }
 
         Ok(())
+    }
+
+    pub fn disable_cache_spill(&self, toggle: bool) {
+        self.spill_flag.borrow_mut().disable(toggle);
     }
 
     fn reset_internal_states(&self) {

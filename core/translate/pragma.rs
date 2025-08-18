@@ -17,7 +17,9 @@ use crate::storage::sqlite3_ondisk::CacheSize;
 use crate::storage::wal::CheckpointMode;
 use crate::translate::emitter::TransactionMode;
 use crate::translate::schema::translate_create_table;
-use crate::util::{normalize_ident, parse_signed_number, parse_string, IOExt as _};
+use crate::util::{
+    normalize_ident, parse_pragma_bool, parse_signed_number, parse_string, IOExt as _,
+};
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
 use crate::vdbe::insn::{Cookie, Insn};
 use crate::{bail_parse_error, CaptureDataChangesMode, LimboError, SymbolTable, Value};
@@ -315,6 +317,18 @@ fn update_pragma(
             connection.set_encryption_key(Some(key));
             Ok((program, TransactionMode::None))
         }
+        PragmaName::CacheSpill => {
+            if let Ok(toggle) = parse_pragma_bool(&value) {
+                pager.disable_cache_spill(toggle);
+            } else if let Ok(v) = parse_signed_number(&value) {
+                let usable_size = pager.usable_space();
+                let mut page_cache = pager.page_cache.write();
+                let threshold = v.to_int().unwrap();
+                page_cache.set_spill_threshold(threshold, usable_size);
+            }
+
+            Ok((program, TransactionMode::Read))
+        }
     }
 }
 
@@ -584,6 +598,18 @@ fn query_pragma(
             program.emit_string8(msg.to_string(), register);
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
+            Ok((program, TransactionMode::None))
+        }
+        PragmaName::CacheSpill => {
+            let register = program.alloc_register();
+            if pager.spill_flag.borrow().is_off() {
+                program.emit_int(0, register);
+                program.emit_result_row(register, 1);
+            } else {
+                program.emit_int(pager.page_cache.read().spill_threshold as i64, register);
+                program.emit_result_row(register, 1);
+            }
+
             Ok((program, TransactionMode::None))
         }
     }

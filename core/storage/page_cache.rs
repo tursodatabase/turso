@@ -5,11 +5,9 @@ use tracing::{debug, trace};
 
 use super::pager::PageRef;
 
-/// FIXME: https://github.com/tursodatabase/turso/issues/1661
-const DEFAULT_PAGE_CACHE_SIZE_IN_PAGES_MAKE_ME_SMALLER_ONCE_WAL_SPILL_IS_IMPLEMENTED: usize =
-    100000;
+const DEFAULT_PAGE_CACHE_SIZE_IN_PAGES: usize = 2_000;
 
-#[derive(Debug, Eq, Hash, PartialEq, Clone)]
+#[derive(Debug, Eq, Hash, PartialEq, Clone, Copy)]
 pub struct PageCacheKey(pub usize);
 
 #[allow(dead_code)]
@@ -25,6 +23,7 @@ pub struct DumbLruPageCache {
     map: RefCell<PageHashMap>,
     head: RefCell<Option<NonNull<PageCacheEntry>>>,
     tail: RefCell<Option<NonNull<PageCacheEntry>>>,
+    pub spill_threshold: usize,
 }
 unsafe impl Send for DumbLruPageCache {}
 unsafe impl Sync for DumbLruPageCache {}
@@ -49,7 +48,7 @@ pub enum CacheError {
     Dirty { pgno: usize },
     Pinned { pgno: usize },
     ActiveRefs,
-    Full,
+    Full { should_spill: bool },
     KeyExists,
 }
 
@@ -67,6 +66,15 @@ impl DumbLruPageCache {
             map: RefCell::new(PageHashMap::new(capacity)),
             head: RefCell::new(None),
             tail: RefCell::new(None),
+            spill_threshold: 483, // Same as SQLite, TODO: see if it's calculated
+        }
+    }
+
+    pub fn set_spill_threshold(&mut self, threshold: i64, usable_space: usize) {
+        self.spill_threshold = if threshold < 0 {
+            ((-1024 * threshold) / usable_space as i64) as usize
+        } else {
+            threshold as usize
         }
     }
 
@@ -105,7 +113,7 @@ impl DumbLruPageCache {
         }
         self.make_room_for(1)?;
         let entry = Box::new(PageCacheEntry {
-            key: key.clone(),
+            key: key,
             next: None,
             prev: None,
             page: value,
@@ -272,7 +280,9 @@ impl DumbLruPageCache {
 
     pub fn make_room_for(&mut self, n: usize) -> Result<(), CacheError> {
         if n > self.capacity {
-            return Err(CacheError::Full);
+            return Err(CacheError::Full {
+                should_spill: self.map.borrow().size > self.spill_threshold,
+            });
         }
 
         let len = self.len();
@@ -299,15 +309,21 @@ impl DumbLruPageCache {
             let entry = unsafe { current.as_ref() };
             // Pick prev before modifying entry
             current_opt = entry.prev;
-            match self.delete(entry.key.clone()) {
-                Err(_) => {}
-                Ok(_) => need_to_evict -= 1,
+
+            if entry.page.is_dirty() || entry.page.is_pinned() {
+                continue;
+            }
+            if self.delete(entry.key).is_ok() {
+                need_to_evict -= 1;
             }
         }
 
-        match need_to_evict > 0 {
-            true => Err(CacheError::Full),
-            false => Ok(()),
+        if need_to_evict > 0 {
+            Err(CacheError::Full {
+                should_spill: self.map.borrow().size > self.spill_threshold,
+            })
+        } else {
+            Ok(())
         }
     }
 
@@ -506,9 +522,7 @@ impl DumbLruPageCache {
 
 impl Default for DumbLruPageCache {
     fn default() -> Self {
-        DumbLruPageCache::new(
-            DEFAULT_PAGE_CACHE_SIZE_IN_PAGES_MAKE_ME_SMALLER_ONCE_WAL_SPILL_IS_IMPLEMENTED,
-        )
+        DumbLruPageCache::new(DEFAULT_PAGE_CACHE_SIZE_IN_PAGES)
     }
 }
 
@@ -607,7 +621,7 @@ impl PageHashMap {
     pub fn rehash(&self, new_capacity: usize) -> PageHashMap {
         let mut new_hash_map = PageHashMap::new(new_capacity);
         for node in self.iter() {
-            new_hash_map.insert(node.key.clone(), node.value);
+            new_hash_map.insert(node.key, node.value);
         }
         new_hash_map
     }
@@ -1042,7 +1056,7 @@ mod tests {
                     }
                     tracing::debug!("inserting page {:?}", key);
                     match cache.insert(key.clone(), page.clone()) {
-                        Err(CacheError::Full | CacheError::ActiveRefs) => {} // Ignore
+                        Err(CacheError::Full { .. } | CacheError::ActiveRefs) => {} // Ignore
                         Err(err) => {
                             // Any other error should fail the test
                             panic!("Cache insertion failed: {err:?}");

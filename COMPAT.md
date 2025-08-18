@@ -108,7 +108,7 @@ Turso aims to be fully compatible with SQLite, with opt-in features not supporte
 | PRAGMA busy_timeout              | No         |                                              |
 | PRAGMA busy_timeout              | No         |                                              |
 | PRAGMA cache_size                | Yes        |                                              |
-| PRAGMA cache_spill               | No         |                                              |
+| PRAGMA cache_spill               | Yes        |                                              |
 | PRAGMA case_sensitive_like       | Not Needed | deprecated in SQLite                         |
 | PRAGMA cell_size_check           | No         |                                              |
 | PRAGMA checkpoint_fullsync       | No         |                                              |
