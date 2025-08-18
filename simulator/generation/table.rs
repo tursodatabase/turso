@@ -18,7 +18,7 @@ impl Arbitrary for Name {
 impl Arbitrary for Table {
     fn arbitrary<R: Rng>(rng: &mut R) -> Self {
         let name = Name::arbitrary(rng).0;
-        let columns = loop {
+        let mut columns = loop {
             let large_table = rng.gen_bool(0.1);
             let column_size = if large_table {
                 rng.gen_range(64..125) // todo: make this higher (128+)
@@ -38,6 +38,27 @@ impl Arbitrary for Table {
             break columns;
         };
 
+        // If there are unique column(s), sometimes make one of them a primary key
+        let has_unique = columns.iter().any(|c| c.unique);
+        if has_unique {
+            let random_unique_col = pick(
+                &columns
+                    .iter()
+                    .filter(|c| c.unique)
+                    .map(|c| c.name.clone())
+                    .collect::<Vec<_>>(),
+                rng,
+            )
+            .clone();
+            if rng.gen_bool(0.5) {
+                columns
+                    .iter_mut()
+                    .find(|c| c.name == random_unique_col)
+                    .unwrap()
+                    .primary = true;
+            }
+        }
+
         Table {
             rows: Vec::new(),
             name,
@@ -51,11 +72,13 @@ impl Arbitrary for Column {
     fn arbitrary<R: Rng>(rng: &mut R) -> Self {
         let name = Name::arbitrary(rng).0;
         let column_type = ColumnType::arbitrary(rng);
+
+        let unique = rng.gen_bool(0.1);
         Self {
             name,
             column_type,
             primary: false,
-            unique: false,
+            unique,
         }
     }
 }
