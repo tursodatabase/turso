@@ -1734,7 +1734,6 @@ impl Pager {
                             new_db_size += 1;
                             let page =
                                 allocate_new_page(new_db_size as usize, &self.buffer_pool, 0);
-                            self.add_dirty(&page);
                             let page_key = PageCacheKey(page.get().id);
                             let mut cache = self.page_cache.write();
                             match cache.insert(page_key, page.clone()) {
@@ -1757,6 +1756,7 @@ impl Pager {
                                     ))
                                 }
                             }
+                            self.add_dirty(&page);
                         }
                     }
 
@@ -1915,9 +1915,6 @@ impl Pager {
                     // FIXME: should reserve page cache entry before modifying the database
                     let page = allocate_new_page(new_db_size as usize, &self.buffer_pool, 0);
                     {
-                        // setup page and add to cache
-                        self.add_dirty(&page);
-
                         let page_key = PageCacheKey(page.get().id);
                         {
                             // Run in separate block to avoid deadlock on page cache write lock
@@ -1943,6 +1940,9 @@ impl Pager {
                                 Ok(_) => {}
                             };
                         }
+
+                        // setup page and add to cache
+                        self.add_dirty(&page);
                         header.database_size = new_db_size.into();
                         *state = AllocatePageState::Start;
                         return Ok(IOResult::Done(page));
