@@ -6853,8 +6853,8 @@ pub fn op_open_ephemeral(
                 .begin_read_tx() // we have to begin a read tx before beginning a write
                 .expect("Failed to start read transaction");
 
-            pager.begin_write_tx()?;
-            pager.allocate_page1();
+            let _ = pager.begin_write_tx()?;
+            let _ = pager.allocate_page1();
             state.op_open_ephemeral_state = OpOpenEphemeralState::CreateBtree {
                 pager: pager.clone(),
             };

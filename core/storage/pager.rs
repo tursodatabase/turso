@@ -2033,7 +2033,7 @@ impl Pager {
             let page = {
                 let page_key = PageCacheKey(page_id);
                 let page = page_cache.get(&page_key)
-                    .expect(format!("we somehow added a page {} to dirty list but we didn't mark it as dirty, causing page_cache to drop it.", page_id).as_str());
+                    .unwrap_or_else(|| panic!("we somehow added a page {page_id} to dirty list but we didn't mark it as dirty, causing page_cache to drop it."));
                 if page.is_pinned() {
                     continue;
                 }
