@@ -6811,7 +6811,7 @@ pub fn op_open_ephemeral(
             };
             let main_file = io.open_file(rand_path_str, OpenFlags::Create, false)?;
             let db_file = Arc::new(DatabaseFile::new(main_file));
-            let wal_path = format!("{}-wal", rand_path_str);
+            let wal_path = format!("{rand_path_str}-wal");
             let wal_file = io.open_file(&wal_path, OpenFlags::Create, false)?;
             let real_shared_wal = WalFileShared::new_shared(wal_file)?;
 
@@ -6852,14 +6852,15 @@ pub fn op_open_ephemeral(
             pager
                 .begin_read_tx() // we have to begin a read tx before beginning a write
                 .expect("Failed to start read transaction");
-            return_if_io!(pager.begin_write_tx());
+
+            pager.begin_write_tx()?;
+            pager.allocate_page1();
             state.op_open_ephemeral_state = OpOpenEphemeralState::CreateBtree {
                 pager: pager.clone(),
             };
         }
         OpOpenEphemeralState::CreateBtree { pager } => {
             tracing::trace!("CreateBtree");
-            // FIXME: handle page cache is full
             let flag = if is_table {
                 &CreateBTreeFlags::new_table()
             } else {

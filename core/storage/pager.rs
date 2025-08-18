@@ -111,6 +111,7 @@ impl HeaderRefMut {
     }
 }
 
+#[derive(Debug)]
 pub struct PageInner {
     pub flags: AtomicUsize,
     pub contents: Option<PageContent>,
@@ -1080,7 +1081,18 @@ impl Pager {
         let page_key = PageCacheKey(page_idx);
         match page_cache.insert(page_key, page.clone()) {
             Ok(_) => {}
-            Err(CacheError::Full) => return Err(LimboError::CacheFull),
+            Err(CacheError::Full { should_spill }) => {
+                if should_spill {
+                    self.spill_dirty_pages(page_cache)?;
+                    page_cache.insert(page_key, page.clone()).map_err(|e| {
+                        LimboError::InternalError(format!(
+                            "failed to insert loaded page {page_key:?} into cache: {e:?}"
+                        ))
+                    })?;
+                } else {
+                    return Err(LimboError::CacheFull);
+                }
+            }
             Err(CacheError::KeyExists) => {
                 unreachable!("Page should not exist in cache after get() miss")
             }
@@ -1132,17 +1144,12 @@ impl Pager {
                 "cacheflush() called on database without WAL".to_string(),
             ));
         };
-        let dirty_pages = self
-            .dirty_pages
-            .borrow()
-            .iter()
-            .copied()
-            .collect::<Vec<usize>>();
-        let mut completions: Vec<Completion> = Vec::with_capacity(dirty_pages.len());
-        for page_id in dirty_pages {
+        let dirty_pages = self.dirty_pages.borrow();
+        let mut completions = Vec::with_capacity(dirty_pages.len());
+        for page_id in dirty_pages.iter() {
             let page = {
                 let mut cache = self.page_cache.write();
-                let page_key = PageCacheKey::new(page_id);
+                let page_key = PageCacheKey(*page_id);
                 let page = cache.get(&page_key).expect("we somehow added a page to dirty list but we didn't mark it as dirty, causing cache to drop it.");
                 let page_type = page.get().contents.as_ref().unwrap().maybe_page_type();
                 trace!(
@@ -1168,6 +1175,7 @@ impl Pager {
             completions.push(c);
         }
         // Pages are cleared dirty on callback completion
+        // Shouldn't pages.dirty be also cleared?
         Ok(completions)
     }
 
@@ -1655,7 +1663,6 @@ impl Pager {
     ///        SQLite's allocate_page() equivalent has a parameter 'nearby' which is a hint about the page number we want to have for the allocated page.
     ///        We should use this parameter to allocate the page in the same way as SQLite does; instead now we just either take the first available freelist page
     ///        or allocate a new page.
-    /// FIXME: handle no room in page cache
     #[allow(clippy::readonly_write_lock)]
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn allocate_page(&self) -> Result<IOResult<PageRef>> {
@@ -1695,7 +1702,18 @@ impl Pager {
                             let mut cache = self.page_cache.write();
                             match cache.insert(page_key, page.clone()) {
                                 Ok(_) => (),
-                                Err(CacheError::Full) => return Err(LimboError::CacheFull),
+                                Err(CacheError::Full { should_spill }) => {
+                                    if should_spill {
+                                        self.spill_dirty_pages(&mut cache)?;
+                                        cache.insert(page_key, page.clone()).map_err(|e| {
+                                                 LimboError::InternalError(format!(
+                                                     "failed to insert loaded page {page_key:?} into cache: {e:?}"
+                                                 ))
+                                             })?;
+                                    } else {
+                                        return Err(LimboError::CacheFull);
+                                    }
+                                }
                                 Err(_) => {
                                     return Err(LimboError::InternalError(
                                         "Unknown error inserting page to cache".into(),
@@ -1868,7 +1886,18 @@ impl Pager {
                             // Run in separate block to avoid deadlock on page cache write lock
                             let mut cache = self.page_cache.write();
                             match cache.insert(page_key, page.clone()) {
-                                Err(CacheError::Full) => return Err(LimboError::CacheFull),
+                                Err(CacheError::Full { should_spill }) => {
+                                    if should_spill {
+                                        self.spill_dirty_pages(&mut cache)?;
+                                        cache
+                                            .insert(page_key, page.clone())
+                                            .map_err(|e| LimboError::InternalError(format!(
+                                                "Failed to insert loaded page {page_key:?} into cache: {e:?}"
+                                            )))?;
+                                    } else {
+                                        return Err(LimboError::CacheFull);
+                                    }
+                                }
                                 Err(_) => {
                                     return Err(LimboError::InternalError(
                                         "Unknown error inserting page to cache".into(),
@@ -1886,11 +1915,7 @@ impl Pager {
         }
     }
 
-    pub fn update_dirty_loaded_page_in_cache(
-        &self,
-        id: usize,
-        page: PageRef,
-    ) -> Result<(), LimboError> {
+    pub fn update_dirty_loaded_page_in_cache(&self, id: usize, page: PageRef) -> Result<()> {
         let mut cache = self.page_cache.write();
         let page_key = PageCacheKey(id);
 
@@ -1913,7 +1938,7 @@ impl Pager {
         schema_did_change: bool,
         connection: &Connection,
         is_write: bool,
-    ) -> Result<(), LimboError> {
+    ) -> Result<()> {
         tracing::debug!(schema_did_change);
         if is_write {
             self.dirty_pages.borrow_mut().clear();
@@ -1936,6 +1961,59 @@ impl Pager {
             if let Some(wal) = self.wal.as_ref() {
                 wal.borrow_mut().rollback()?;
             }
+        }
+
+        *self.spill_flag.borrow_mut() = SpillFlag::ALLOWED;
+        Ok(())
+    }
+
+    /// This function is called by the cache layer when it has reached some soft memory limit.
+    /// The pager must be purgeable (not in-memory)
+    // TODO: SQLite spills one page at time when cache is full, OTOH we spill all dirty pages at the same time
+    // which approach is better?
+    #[instrument(skip_all, level = Level::INFO)]
+    pub fn spill_dirty_pages(&self, page_cache: &mut DumbLruPageCache) -> Result<()> {
+        if !self.spill_flag.borrow().can_spill() {
+            return Err(LimboError::SpillNotAllowed);
+        }
+
+        let Some(wal) = self.wal.as_ref() else {
+            return Err(LimboError::InternalError(
+                "cacheflush() called on database without WAL".to_string(),
+            ));
+        };
+        let mut dirty_pages = self.dirty_pages.borrow_mut();
+        let page_ids = dirty_pages
+            .iter()
+            .filter(|&page_id| *page_id != DatabaseHeader::PAGE_ID)
+            .copied()
+            .collect::<Vec<usize>>();
+        let mut completions = Vec::with_capacity(dirty_pages.len());
+        for page_id in page_ids {
+            let page = {
+                let page_key = PageCacheKey(page_id);
+                let page = page_cache.get(&page_key)
+                    .expect(format!("we somehow added a page {} to dirty list but we didn't mark it as dirty, causing page_cache to drop it.", page_id).as_str());
+                if page.is_pinned() {
+                    continue;
+                }
+                assert!(page.is_dirty());
+                page
+            };
+            let c = wal.borrow_mut().append_frame(
+                page.clone(),
+                self.page_size.get().expect("page size not set"),
+                0,
+            )?;
+            // TODO: invalidade previous completions if this one fails
+            completions.push(c);
+            page_cache.delete(PageCacheKey(page_id)).unwrap();
+        }
+        dirty_pages.clear();
+
+        // Making the API sync for now
+        for c in completions {
+            self.io.wait_for_completion(c).unwrap();
         }
 
         Ok(())
