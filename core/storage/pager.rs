@@ -1182,7 +1182,7 @@ impl Pager {
             ));
         };
         let dirty_pages = self.dirty_pages.borrow();
-        let mut completions = Vec::with_capacity(dirty_pages.len());
+        let mut completions: Vec<Completion> = Vec::with_capacity(dirty_pages.len());
         for page_id in dirty_pages.iter() {
             let page = {
                 let mut cache = self.page_cache.write();
@@ -2009,7 +2009,7 @@ impl Pager {
 
     /// This function is called by the cache layer when it has reached some soft memory limit.
     /// The pager must be purgeable (not in-memory)
-    // TODO: SQLite spills one page at time when cache is full, OTOH we spill all dirty pages at the same time
+    // TODO: SQLite spills one page at time when cache is full, OTOH we spill 25% of dirty pages at the same time
     // which approach is better?
     #[instrument(skip_all, level = Level::INFO)]
     pub fn spill_dirty_pages(&self, page_cache: &mut DumbLruPageCache) -> Result<()> {
@@ -2023,12 +2023,14 @@ impl Pager {
             ));
         };
         let mut dirty_pages = self.dirty_pages.borrow_mut();
+        assert!(!dirty_pages.is_empty());
         let page_ids = dirty_pages
             .iter()
+            .take(dirty_pages.len() / 4)
             .filter(|&page_id| *page_id != DatabaseHeader::PAGE_ID)
             .copied()
             .collect::<Vec<usize>>();
-        let mut completions = Vec::with_capacity(dirty_pages.len());
+        let mut completions = Vec::with_capacity(dirty_pages.len() / 4);
         for page_id in page_ids {
             let page = {
                 let page_key = PageCacheKey(page_id);
