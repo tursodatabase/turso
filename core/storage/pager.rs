@@ -1304,6 +1304,18 @@ impl Pager {
             );
             self.add_dirty(&page);
         }
+        if header.page_number == 1 {
+            let db_size = self
+                .io
+                .block(|| self.with_header(|header| header.database_size))?;
+            tracing::debug!("db_size: {}", db_size);
+            let mut page_cache = self.page_cache.write();
+            tracing::debug!("ready to truncate!");
+            page_cache.truncate(db_size.get() as usize).map_err(|e| {
+                LimboError::InternalError(format!("Failed to truncate page cache: {e:?}"))
+            })?;
+            tracing::debug!("truncated!");
+        }
         if header.is_commit_frame() {
             for page_id in self.dirty_pages.borrow().iter() {
                 let page_key = PageCacheKey::new(*page_id);

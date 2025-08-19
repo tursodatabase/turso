@@ -1,7 +1,10 @@
+use std::sync::atomic::Ordering;
 use std::{cell::RefCell, ptr::NonNull};
 
 use std::sync::Arc;
 use tracing::{debug, trace};
+
+use crate::turso_assert;
 
 use super::pager::PageRef;
 
@@ -341,13 +344,48 @@ impl DumbLruPageCache {
         Ok(())
     }
 
+    pub fn truncate(&mut self, len: usize) -> Result<(), CacheError> {
+        let head_ptr = *self.head.borrow();
+        let mut current = head_ptr;
+        let mut has_non_removed = false;
+        while let Some(node) = current {
+            let node_ref = unsafe { node.as_ref() };
+
+            current = node_ref.next;
+            if node_ref.key.pgno <= len {
+                has_non_removed = true;
+                continue;
+            }
+
+            self.map.borrow_mut().remove(&node_ref.key);
+            turso_assert!(!node_ref.page.is_dirty(), "page must be clean");
+            turso_assert!(!node_ref.page.is_locked(), "page must be unlocked");
+            turso_assert!(!node_ref.page.is_pinned(), "page must be unpinned");
+            self.detach(node, true)?;
+
+            unsafe {
+                let _ = Box::from_raw(node.as_ptr());
+            }
+        }
+        if !has_non_removed {
+            let _ = self.head.take();
+            let _ = self.tail.take();
+        }
+        Ok(())
+    }
+
     pub fn print(&self) {
         tracing::debug!("page_cache_len={}", self.map.borrow().len());
         let head_ptr = *self.head.borrow();
         let mut current = head_ptr;
         while let Some(node) = current {
             unsafe {
-                tracing::debug!("page={:?}", node.as_ref().key);
+                tracing::debug!(
+                    "page={:?}, flags={}, pin_count={}",
+                    node.as_ref().key,
+                    node.as_ref().page.get().flags.load(Ordering::SeqCst),
+                    node.as_ref().page.get().pin_count.load(Ordering::SeqCst),
+                );
                 let node_ref = node.as_ref();
                 current = node_ref.next;
             }

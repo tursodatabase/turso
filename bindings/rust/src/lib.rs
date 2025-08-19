@@ -233,12 +233,12 @@ impl Connection {
     }
 
     #[cfg(feature = "conn_raw_api")]
-    pub fn wal_insert_end(&self) -> Result<()> {
+    pub fn wal_insert_end(&self, force_commit: bool) -> Result<()> {
         let conn = self
             .inner
             .lock()
             .map_err(|e| Error::MutexError(e.to_string()))?;
-        conn.wal_insert_end()
+        conn.wal_insert_end(force_commit)
             .map_err(|e| Error::WalOperationError(format!("wal_insert_end failed: {e}")))
     }
 

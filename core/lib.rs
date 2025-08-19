@@ -896,15 +896,14 @@ impl Connection {
     #[allow(dead_code)]
     fn maybe_reparse_schema(self: &Arc<Connection>) -> Result<()> {
         let pager = self.pager.borrow().clone();
-        let conn_schema_version = self.schema.borrow().schema_version;
 
         // first, quickly read schema_version from the root page in order to check if schema changed
         pager.begin_read_tx()?;
-        let db_schema_version = pager
+        let on_disk_schema_version = pager
             .io
             .block(|| pager.with_header(|header| header.schema_cookie));
 
-        let db_schema_version = match db_schema_version {
+        let on_disk_schema_version = match on_disk_schema_version {
             Ok(db_schema_version) => db_schema_version.get(),
             Err(LimboError::Page1NotAlloc) => {
                 // this means this is a fresh db, so return a schema version of 0
@@ -915,16 +914,12 @@ impl Connection {
                 return Err(err);
             }
         };
-        turso_assert!(
-            conn_schema_version <= db_schema_version,
-            "connection schema_version can't be larger than db schema_version: {} vs {}",
-            conn_schema_version,
-            db_schema_version
-        );
         pager.end_read_tx().expect("read txn must be finished");
 
+        let db_schema_version = self._db.schema.lock().unwrap().schema_version;
+        tracing::debug!("{db_schema_version} vs {on_disk_schema_version}");
         // if schema_versions matches - exit early
-        if conn_schema_version == db_schema_version {
+        if db_schema_version == on_disk_schema_version {
             return Ok(());
         }
         // maybe_reparse_schema must be called outside of any transaction
@@ -932,55 +927,6 @@ impl Connection {
             self.transaction_state.get() == TransactionState::None,
             "unexpected start transaction"
         );
-        self.reparse_schema()
-    }
-
-    fn reparse_schema(self: &Arc<Connection>) -> Result<()> {
-        let pager = self.pager.borrow().clone();
-
-        // reparse logic extracted to the function in order to not accidentally propagate error from it before closing transaction
-        let reparse = || -> Result<()> {
-            // read cookie before consuming statement program - otherwise we can end up reading cookie with closed transaction state
-            let cookie = pager
-                .io
-                .block(|| pager.with_header(|header| header.schema_cookie))?
-                .get();
-
-            // create fresh schema as some objects can be deleted
-            let mut fresh = Schema::new(self.schema.borrow().indexes_enabled);
-            fresh.schema_version = cookie;
-
-            // Preserve existing views to avoid expensive repopulation.
-            // TODO: We may not need to do this if we materialize our views.
-            let existing_views = self.schema.borrow().materialized_views.clone();
-
-            // TODO: this is hack to avoid a cyclical problem with schema reprepare
-            // The problem here is that we prepare a statement here, but when the statement tries
-            // to execute it, it first checks the schema cookie to see if it needs to reprepare the statement.
-            // But in this occasion it will always reprepare, and we get an error. So we trick the statement by swapping our schema
-            // with a new clean schema that has the same header cookie.
-            self.with_schema_mut(|schema| {
-                *schema = fresh.clone();
-            });
-
-            let stmt = self.prepare("SELECT * FROM sqlite_schema")?;
-
-            // TODO: This function below is synchronous, make it async
-            parse_schema_rows(stmt, &mut fresh, &self.syms.borrow(), None, existing_views)?;
-
-            self.with_schema_mut(|schema| {
-                *schema = fresh;
-            });
-
-            {
-                let schema = self.schema.borrow();
-                pager
-                    .io
-                    .block(|| schema.populate_materialized_views(self))?;
-            }
-            Result::Ok(())
-        };
-
         // start read transaction manually, because we will read schema cookie once again and
         // we must be sure that it will consistent with schema content
         //
@@ -989,7 +935,7 @@ impl Connection {
         pager.begin_read_tx()?;
         self.transaction_state.replace(TransactionState::Read);
 
-        let reparse_result = reparse();
+        let reparse_result = self.reparse_schema();
 
         let previous = self.transaction_state.replace(TransactionState::None);
         turso_assert!(
@@ -1001,12 +947,55 @@ impl Connection {
         if previous == TransactionState::Read {
             pager.end_read_tx().expect("read txn must be finished");
         }
-        // now we can safely propagate error after ensured that transaction state is reset
+
         reparse_result?;
 
         let schema = self.schema.borrow().clone();
-        self._db.update_schema_if_newer(schema)?;
-        Ok(())
+        self._db.update_schema_if_newer(schema)
+    }
+
+    fn reparse_schema(self: &Arc<Connection>) -> Result<()> {
+        let pager = self.pager.borrow().clone();
+
+        // read cookie before consuming statement program - otherwise we can end up reading cookie with closed transaction state
+        let cookie = pager
+            .io
+            .block(|| pager.with_header(|header| header.schema_cookie))?
+            .get();
+
+        // create fresh schema as some objects can be deleted
+        let mut fresh = Schema::new(self.schema.borrow().indexes_enabled);
+        fresh.schema_version = cookie;
+
+        // Preserve existing views to avoid expensive repopulation.
+        // TODO: We may not need to do this if we materialize our views.
+        let existing_views = self.schema.borrow().materialized_views.clone();
+
+        // TODO: this is hack to avoid a cyclical problem with schema reprepare
+        // The problem here is that we prepare a statement here, but when the statement tries
+        // to execute it, it first checks the schema cookie to see if it needs to reprepare the statement.
+        // But in this occasion it will always reprepare, and we get an error. So we trick the statement by swapping our schema
+        // with a new clean schema that has the same header cookie.
+        self.with_schema_mut(|schema| {
+            *schema = fresh.clone();
+        });
+
+        let stmt = self.prepare("SELECT * FROM sqlite_schema")?;
+
+        // TODO: This function below is synchronous, make it async
+        parse_schema_rows(stmt, &mut fresh, &self.syms.borrow(), None, existing_views)?;
+
+        self.with_schema_mut(|schema| {
+            *schema = fresh;
+        });
+
+        {
+            let schema = self.schema.borrow();
+            pager
+                .io
+                .block(|| schema.populate_materialized_views(self))?;
+        }
+        Result::Ok(())
     }
 
     #[instrument(skip_all, level = Level::INFO)]
@@ -1287,6 +1276,7 @@ impl Connection {
                 header.schema_cookie = version.into();
             })
         })?;
+        self.reparse_schema()?;
         Ok(())
     }
 
@@ -1372,13 +1362,20 @@ impl Connection {
             }
             result::LimboResult::Ok => {}
         }
+
+        // start write transaction and disable auto-commit mode as SQL can be executed within WAL session (at caller own risk)
+        self.transaction_state.replace(TransactionState::Write {
+            schema_did_change: false,
+        });
+        self.auto_commit.replace(false);
+
         Ok(())
     }
 
     /// Finish WAL session by ending read+write transaction taken in the [Self::wal_insert_begin] method
     /// All frames written after last commit frame (db_size > 0) within the session will be rolled back
     #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
-    pub fn wal_insert_end(self: &Arc<Connection>) -> Result<()> {
+    pub fn wal_insert_end(self: &Arc<Connection>, force_commit: bool) -> Result<()> {
         {
             let pager = self.pager.borrow();
 
@@ -1388,13 +1385,29 @@ impl Connection {
                 ));
             };
 
+            let commit_err = if force_commit {
+                pager.io.block(|| pager.commit_dirty_pages(true)).err()
+            } else {
+                None
+            };
+
+            self.auto_commit.replace(true);
+            self.transaction_state.replace(TransactionState::None);
             {
                 let wal = wal.borrow_mut();
                 wal.end_write_tx();
                 wal.end_read_tx();
             }
-            // remove all non-commited changes in case if WAL session left some suffix without commit frame
-            pager.rollback(false, self, true)?;
+
+            let rollback_err = if !force_commit {
+                // remove all non-commited changes in case if WAL session left some suffix without commit frame
+                pager.rollback(false, self, true).err()
+            } else {
+                None
+            };
+            if let Some(err) = commit_err.or(rollback_err) {
+                return Err(err);
+            }
         }
 
         // let's re-parse schema from scratch if schema cookie changed compared to the our in-memory view of schema

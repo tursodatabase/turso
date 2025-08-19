@@ -50,7 +50,7 @@ fn test_wal_frame_transfer_no_schema_changes() {
         conn2.wal_insert_frame(frame_id, &frame).unwrap();
     }
 
-    conn2.wal_insert_end().unwrap();
+    conn2.wal_insert_end(false).unwrap();
     assert_eq!(conn2.wal_frame_count().unwrap(), 15);
     assert_eq!(
         limbo_exec_rows(&db2, &conn2, "SELECT x, length(y) FROM t"),
@@ -81,7 +81,7 @@ fn test_wal_frame_transfer_various_schema_changes() {
             conn1.wal_get_frame(frame_id, &mut frame).unwrap();
             conn2.wal_insert_frame(frame_id, &frame).unwrap();
         }
-        conn2.wal_insert_end().unwrap();
+        conn2.wal_insert_end(false).unwrap();
         synced_frame = last_frame;
     };
 
@@ -147,7 +147,7 @@ fn test_wal_frame_transfer_schema_changes() {
             commits += 1;
         }
     }
-    conn2.wal_insert_end().unwrap();
+    conn2.wal_insert_end(false).unwrap();
     assert_eq!(commits, 3);
     assert_eq!(conn2.wal_frame_count().unwrap(), 15);
     assert_eq!(
@@ -183,7 +183,7 @@ fn test_wal_frame_transfer_no_schema_changes_rollback() {
         conn1.wal_get_frame(frame_id, &mut frame).unwrap();
         conn2.wal_insert_frame(frame_id, &frame).unwrap();
     }
-    conn2.wal_insert_end().unwrap();
+    conn2.wal_insert_end(false).unwrap();
     assert_eq!(conn2.wal_frame_count().unwrap(), 2);
     assert_eq!(
         limbo_exec_rows(&db2, &conn2, "SELECT x, length(y) FROM t"),
@@ -218,7 +218,7 @@ fn test_wal_frame_transfer_schema_changes_rollback() {
         conn1.wal_get_frame(frame_id, &mut frame).unwrap();
         conn2.wal_insert_frame(frame_id, &frame).unwrap();
     }
-    conn2.wal_insert_end().unwrap();
+    conn2.wal_insert_end(false).unwrap();
     assert_eq!(conn2.wal_frame_count().unwrap(), 2);
     assert_eq!(
         limbo_exec_rows(&db2, &conn2, "SELECT x, length(y) FROM t"),
@@ -317,7 +317,7 @@ fn test_wal_frame_api_no_schema_changes_fuzz() {
                     conn1.wal_get_frame(frame_no, &mut frame).unwrap();
                     conn2.wal_insert_frame(frame_no, &frame[..]).unwrap();
                 }
-                conn2.wal_insert_end().unwrap();
+                conn2.wal_insert_end(false).unwrap();
                 for (i, committed) in commit_frames.iter().enumerate() {
                     if *committed <= next_frame {
                         size = size.max(i);
@@ -410,7 +410,7 @@ fn revert_to(conn: &Arc<turso_core::Connection>, frame_watermark: u64) -> turso_
         frame_no += 1;
         conn.wal_insert_frame(frame_no, &frame)?;
     }
-    conn.wal_insert_end()?;
+    conn.wal_insert_end(false)?;
 
     Ok(())
 }
@@ -537,4 +537,182 @@ fn test_wal_upper_bound_truncate() {
         writer.checkpoint(mode).err().unwrap(),
         LimboError::Busy
     ));
+}
+
+#[test]
+fn test_wal_api_exec_commit() {
+    let db = TempDatabase::new_empty(false);
+    let writer = db.connect_limbo();
+
+    writer
+        .execute("create table test(id integer primary key, value text)")
+        .unwrap();
+
+    writer.wal_insert_begin().unwrap();
+
+    writer
+        .execute("insert into test values (1, 'hello')")
+        .unwrap();
+    writer
+        .execute("insert into test values (2, 'turso')")
+        .unwrap();
+
+    writer.wal_insert_end(true).unwrap();
+
+    let mut stmt = writer.prepare("select * from test").unwrap();
+    let mut rows: Vec<Vec<turso_core::types::Value>> = Vec::new();
+    loop {
+        let result = stmt.step();
+        match result {
+            Ok(StepResult::Row) => rows.push(stmt.row().unwrap().get_values().cloned().collect()),
+            Ok(StepResult::IO) => db.io.run_once().unwrap(),
+            Ok(StepResult::Done) => break,
+            result => panic!("unexpected step result: {result:?}"),
+        }
+    }
+    tracing::info!("rows: {:?}", rows);
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                turso_core::types::Value::Integer(1),
+                turso_core::types::Value::Text(turso_core::types::Text::new("hello")),
+            ],
+            vec![
+                turso_core::types::Value::Integer(2),
+                turso_core::types::Value::Text(turso_core::types::Text::new("turso")),
+            ],
+        ]
+    );
+}
+
+#[test]
+fn test_wal_api_exec_rollback() {
+    let db = TempDatabase::new_empty(false);
+    let writer = db.connect_limbo();
+
+    writer
+        .execute("create table test(id integer primary key, value text)")
+        .unwrap();
+
+    writer.wal_insert_begin().unwrap();
+
+    writer
+        .execute("insert into test values (1, 'hello')")
+        .unwrap();
+    writer
+        .execute("insert into test values (2, 'turso')")
+        .unwrap();
+
+    writer.wal_insert_end(false).unwrap();
+
+    let mut stmt = writer.prepare("select * from test").unwrap();
+    let mut rows: Vec<Vec<turso_core::types::Value>> = Vec::new();
+    loop {
+        let result = stmt.step();
+        match result {
+            Ok(StepResult::Row) => rows.push(stmt.row().unwrap().get_values().cloned().collect()),
+            Ok(StepResult::IO) => db.io.run_once().unwrap(),
+            Ok(StepResult::Done) => break,
+            result => panic!("unexpected step result: {result:?}"),
+        }
+    }
+    tracing::info!("rows: {:?}", rows);
+    assert_eq!(rows, vec![] as Vec<Vec<turso_core::types::Value>>);
+}
+
+#[test]
+fn test_wal_api_insert_exec_mix() {
+    let db = TempDatabase::new_empty(false);
+    let conn = db.connect_limbo();
+
+    conn.execute("create table a(x, y)").unwrap();
+    conn.execute("insert into a values (1, randomblob(1 * 4096))")
+        .unwrap();
+    let watermark = conn.wal_frame_count().unwrap();
+    conn.execute("create table b(x, y)").unwrap();
+    conn.execute("insert into b values (2, randomblob(2 * 4096))")
+        .unwrap();
+
+    let pages = conn.wal_changed_pages_after(watermark).unwrap();
+    let mut frames = Vec::new();
+    let mut frame = [0u8; 4096 + 24];
+    for page_no in pages {
+        let page = &mut frame[24..];
+        if !conn
+            .try_wal_watermark_read_page(page_no, page, Some(watermark))
+            .unwrap()
+        {
+            continue;
+        }
+        let info = WalFrameInfo {
+            db_size: 0,
+            page_no: page_no,
+        };
+        info.put_to_frame_header(&mut frame);
+        frames.push(frame);
+    }
+
+    let schema_version = conn.read_schema_version().unwrap();
+    conn.wal_insert_begin().unwrap();
+
+    let frames_cnt = conn.wal_frame_count().unwrap();
+    for (i, frame) in frames.iter().enumerate() {
+        conn.wal_insert_frame(frames_cnt + i as u64 + 1, frame)
+            .unwrap();
+    }
+    conn.write_schema_version(schema_version + 1).unwrap();
+    conn.execute("insert into a values (3, randomblob(3 * 4096))")
+        .unwrap();
+    conn.execute("create table b(x, y)").unwrap();
+    conn.execute("insert into b values (4, randomblob(4 * 4096))")
+        .unwrap();
+
+    conn.wal_insert_end(true).unwrap();
+
+    let mut stmt = conn.prepare("select x, length(y) from a").unwrap();
+    let mut rows: Vec<Vec<turso_core::types::Value>> = Vec::new();
+    loop {
+        let result = stmt.step();
+        match result {
+            Ok(StepResult::Row) => rows.push(stmt.row().unwrap().get_values().cloned().collect()),
+            Ok(StepResult::IO) => db.io.run_once().unwrap(),
+            Ok(StepResult::Done) => break,
+            result => panic!("unexpected step result: {result:?}"),
+        }
+    }
+    tracing::info!("rows: {:?}", rows);
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                turso_core::types::Value::Integer(1),
+                turso_core::types::Value::Integer(1 * 4096),
+            ],
+            vec![
+                turso_core::types::Value::Integer(3),
+                turso_core::types::Value::Integer(3 * 4096),
+            ],
+        ]
+    );
+
+    let mut stmt = conn.prepare("select x, length(y) from b").unwrap();
+    let mut rows: Vec<Vec<turso_core::types::Value>> = Vec::new();
+    loop {
+        let result = stmt.step();
+        match result {
+            Ok(StepResult::Row) => rows.push(stmt.row().unwrap().get_values().cloned().collect()),
+            Ok(StepResult::IO) => db.io.run_once().unwrap(),
+            Ok(StepResult::Done) => break,
+            result => panic!("unexpected step result: {result:?}"),
+        }
+    }
+    tracing::info!("rows: {:?}", rows);
+    assert_eq!(
+        rows,
+        vec![vec![
+            turso_core::types::Value::Integer(4),
+            turso_core::types::Value::Integer(4 * 4096),
+        ]]
+    );
 }

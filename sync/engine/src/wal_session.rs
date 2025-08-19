@@ -40,7 +40,7 @@ impl WalSession {
     }
     pub fn end(&mut self) -> Result<()> {
         assert!(self.in_txn);
-        self.conn.wal_insert_end()?;
+        self.conn.wal_insert_end(false)?;
         self.in_txn = false;
         Ok(())
     }
