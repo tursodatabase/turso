@@ -841,6 +841,18 @@ impl JsonbHeader {
     }
 }
 
+pub struct ArrayIteratorState {
+    cursor: usize,
+    end: usize,
+    index: usize,
+}
+
+pub struct ObjectIteratorState {
+    cursor: usize,
+    end: usize,
+    index: usize,
+}
+
 impl Jsonb {
     pub fn new(capacity: usize, data: Option<&[u8]>) -> Self {
         if let Some(data) = data {
@@ -2871,6 +2883,94 @@ impl Jsonb {
         }
 
         Ok(())
+    }
+
+    pub fn array_iterator(&self) -> Result<ArrayIteratorState> {
+        let (hdr, off) = self.read_header(0)?;
+        match hdr {
+            JsonbHeader(ElementType::ARRAY, len) => Ok(ArrayIteratorState {
+                cursor: off,
+                end: off + len,
+                index: 0,
+            }),
+            _ => bail_parse_error!("jsonb.array_iterator(): not an array"),
+        }
+    }
+
+    pub fn array_iterator_next(
+        &self,
+        st: &ArrayIteratorState,
+    ) -> Option<((usize, Jsonb), ArrayIteratorState)> {
+        if st.cursor >= st.end {
+            return None;
+        }
+
+        let (JsonbHeader(_, payload_len), header_len) = self.read_header(st.cursor).ok()?;
+        let start = st.cursor;
+        let stop = start.checked_add(header_len + payload_len)?;
+
+        if stop > st.end || stop > self.data.len() {
+            return None;
+        }
+
+        let elem = Jsonb::new(stop - start, Some(&self.data[start..stop]));
+        let next = ArrayIteratorState {
+            cursor: stop,
+            end: st.end,
+            index: st.index + 1,
+        };
+
+        Some(((st.index, elem), next))
+    }
+
+    pub fn object_iterator(&self) -> Result<ObjectIteratorState> {
+        let (hdr, off) = self.read_header(0)?;
+        match hdr {
+            JsonbHeader(ElementType::OBJECT, len) => Ok(ObjectIteratorState {
+                cursor: off,
+                end: off + len,
+                index: 0,
+            }),
+            _ => bail_parse_error!("jsonb.object_iterator(): not an object"),
+        }
+    }
+
+    pub fn object_iterator_next(
+        &self,
+        st: &ObjectIteratorState,
+    ) -> Option<((usize, Jsonb, Jsonb), ObjectIteratorState)> {
+        if st.cursor >= st.end {
+            return None;
+        }
+
+        // key
+        let (JsonbHeader(key_ty, key_len), key_hdr_len) = self.read_header(st.cursor).ok()?;
+        if !key_ty.is_valid_key() {
+            return None;
+        }
+        let key_start = st.cursor;
+        let key_stop = key_start.checked_add(key_hdr_len + key_len)?;
+        if key_stop > st.end || key_stop > self.data.len() {
+            return None;
+        }
+
+        // value
+        let (JsonbHeader(_, val_len), val_hdr_len) = self.read_header(key_stop).ok()?;
+        let val_start = key_stop;
+        let val_stop = val_start.checked_add(val_hdr_len + val_len)?;
+        if val_stop > st.end || val_stop > self.data.len() {
+            return None;
+        }
+
+        let key = Jsonb::new(key_stop - key_start, Some(&self.data[key_start..key_stop]));
+        let value = Jsonb::new(val_stop - val_start, Some(&self.data[val_start..val_stop]));
+        let next = ObjectIteratorState {
+            cursor: val_stop,
+            end: st.end,
+            index: st.index + 1,
+        };
+
+        Some(((st.index, key, value), next))
     }
 }
 
