@@ -396,7 +396,9 @@ fn query_pragma(
                         LimboError::ParseError(format!("Unknown Checkpoint Mode: {e}"))
                     })?
                 }
-                _ => CheckpointMode::Passive,
+                _ => CheckpointMode::Passive {
+                    upper_bound_inclusive: None,
+                },
             };
 
             program.alloc_registers(2);

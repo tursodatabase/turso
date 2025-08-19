@@ -1319,9 +1319,13 @@ pub unsafe extern "C" fn sqlite3_wal_checkpoint_v2(
     let db: &mut sqlite3 = &mut *db;
     let db = db.inner.lock().unwrap();
     let chkptmode = match mode {
-        SQLITE_CHECKPOINT_PASSIVE => CheckpointMode::Passive,
+        SQLITE_CHECKPOINT_PASSIVE => CheckpointMode::Passive {
+            upper_bound_inclusive: None,
+        },
         SQLITE_CHECKPOINT_RESTART => CheckpointMode::Restart,
-        SQLITE_CHECKPOINT_TRUNCATE => CheckpointMode::Truncate,
+        SQLITE_CHECKPOINT_TRUNCATE => CheckpointMode::Truncate {
+            upper_bound_inclusive: None,
+        },
         SQLITE_CHECKPOINT_FULL => CheckpointMode::Full,
         _ => return SQLITE_MISUSE, // Unsupported mode
     };

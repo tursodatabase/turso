@@ -287,7 +287,9 @@ fn test_wal_checkpoint() -> anyhow::Result<()> {
     for i in 0..iterations {
         let insert_query = format!("INSERT INTO test VALUES ({i})");
         do_flush(&conn, &tmp_db)?;
-        conn.checkpoint(CheckpointMode::Passive)?;
+        conn.checkpoint(CheckpointMode::Passive {
+            upper_bound_inclusive: None,
+        })?;
         run_query(&tmp_db, &conn, &insert_query)?;
     }
 

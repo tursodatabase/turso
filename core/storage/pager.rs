@@ -1331,8 +1331,12 @@ impl Pager {
             trace!(?state);
             match state {
                 CheckpointState::Checkpoint => {
-                    let res =
-                        return_if_io!(wal.borrow_mut().checkpoint(self, CheckpointMode::Passive));
+                    let res = return_if_io!(wal.borrow_mut().checkpoint(
+                        self,
+                        CheckpointMode::Passive {
+                            upper_bound_inclusive: None
+                        }
+                    ));
                     self.checkpoint_state
                         .replace(CheckpointState::SyncDbFile { res });
                 }
@@ -1379,7 +1383,9 @@ impl Pager {
             self.io.wait_for_completion(c)?;
         }
         if !wal_auto_checkpoint_disabled {
-            self.wal_checkpoint(CheckpointMode::Passive)?;
+            self.wal_checkpoint(CheckpointMode::Passive {
+                upper_bound_inclusive: None,
+            })?;
         }
         Ok(())
     }

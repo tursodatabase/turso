@@ -1,9 +1,9 @@
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::HashSet, path::PathBuf, sync::Arc};
 
 use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use rusqlite::types::Value;
-use turso_core::types::WalFrameInfo;
+use turso_core::{types::WalFrameInfo, CheckpointMode, LimboError, StepResult};
 
 use crate::common::{limbo_exec_rows, rng_from_time, TempDatabase};
 
@@ -457,4 +457,84 @@ fn test_wal_api_revert_pages() {
         limbo_exec_rows(&db1, &conn1, "SELECT x, length(y) FROM t"),
         vec![] as Vec<Vec<Value>>,
     );
+}
+
+#[test]
+fn test_wal_upper_bound_passive() {
+    let db = TempDatabase::new_empty(false);
+    let writer = db.connect_limbo();
+
+    writer
+        .execute("create table test(id integer primary key, value text)")
+        .unwrap();
+    let watermark0 = writer.wal_frame_count().unwrap();
+    writer
+        .execute("insert into test values (1, 'hello')")
+        .unwrap();
+    let watermark1 = writer.wal_frame_count().unwrap();
+    writer
+        .execute("insert into test values (2, 'turso')")
+        .unwrap();
+    let watermark2 = writer.wal_frame_count().unwrap();
+    let expected = vec![
+        vec![
+            turso_core::types::Value::Integer(1),
+            turso_core::types::Value::Text(turso_core::types::Text::new("hello")),
+        ],
+        vec![
+            turso_core::types::Value::Integer(2),
+            turso_core::types::Value::Text(turso_core::types::Text::new("turso")),
+        ],
+    ];
+
+    for (prefix, watermark) in [(0, watermark0), (1, watermark1), (2, watermark2)] {
+        let mode = CheckpointMode::Passive {
+            upper_bound_inclusive: Some(watermark),
+        };
+        writer.checkpoint(mode).unwrap();
+
+        let db_path_copy = format!("{}-{}-copy", db.path.to_str().unwrap(), watermark);
+        std::fs::copy(&db.path, db_path_copy.clone()).unwrap();
+        let db_copy = TempDatabase::new_with_existent(&PathBuf::from(db_path_copy), false);
+        let conn = db_copy.connect_limbo();
+        let mut stmt = conn.prepare("select * from test").unwrap();
+        let mut rows: Vec<Vec<turso_core::types::Value>> = Vec::new();
+        loop {
+            let result = stmt.step();
+            match result {
+                Ok(StepResult::Row) => {
+                    rows.push(stmt.row().unwrap().get_values().cloned().collect())
+                }
+                Ok(StepResult::IO) => db_copy.io.run_once().unwrap(),
+                Ok(StepResult::Done) => break,
+                result => panic!("unexpected step result: {result:?}"),
+            }
+        }
+        assert_eq!(rows, expected[0..prefix]);
+    }
+}
+
+#[test]
+fn test_wal_upper_bound_truncate() {
+    let db = TempDatabase::new_empty(false);
+    let writer = db.connect_limbo();
+
+    writer
+        .execute("create table test(id integer primary key, value text)")
+        .unwrap();
+    writer
+        .execute("insert into test values (1, 'hello')")
+        .unwrap();
+    let watermark = writer.wal_frame_count().unwrap();
+    writer
+        .execute("insert into test values (2, 'turso')")
+        .unwrap();
+
+    let mode = CheckpointMode::Truncate {
+        upper_bound_inclusive: Some(watermark),
+    };
+    assert!(matches!(
+        writer.checkpoint(mode).err().unwrap(),
+        LimboError::Busy
+    ));
 }
