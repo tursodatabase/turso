@@ -371,6 +371,26 @@ do_execsql_test datetime-with-multiple-modifiers {
 select datetime('2024-01-31', '+1 month', '+13 hours', '+5 minutes', '+62 seconds');
 } {{2024-03-02 13:06:02}}
 
+do_execsql_test datetime-with-modifier-ceiling {
+  SELECT datetime('2023-05-18 15:30:45', 'ceiling');
+} {{2023-05-18 15:30:45}}
+
+do_execsql_test datetime-with-modifier-ceiling-already-ceiled {
+  SELECT datetime('2023-05-18 23:59:59', 'ceiling');
+} {{2023-05-18 23:59:59}}
+
+do_execsql_test datetime-with-ceiling-modifier-invalid-input {
+  SELECT datetime('not-a-date', 'ceiling');
+} {{}}
+
+do_execsql_test datetime-with-ceiling-modifier-stacked {
+  SELECT datetime('2023-05-18 15:30:45', '+1 day', 'ceiling');
+} {{2023-05-19 15:30:45}}
+
+do_execsql_test date-with-ceiling-modifier-basic {
+  SELECT date('2023-05-18 15:30:45', 'ceiling');
+} {2023-05-18}
+
 do_execsql_test datetime-with-weekday {
   SELECT datetime('2023-05-18', 'weekday 3');
 } {{2023-05-24 00:00:00}}

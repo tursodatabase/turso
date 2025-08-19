@@ -95,7 +95,7 @@ fn format_dt(dt: NaiveDateTime, output_type: DateTimeOutput, subsec: bool) -> Va
             Value::from_text(t.as_str())
         }
         DateTimeOutput::DateTime => {
-            let t = if subsec {
+            let t = if subsec && dt.nanosecond() != 0 {
                 dt.format("%Y-%m-%d %H:%M:%S%.3f").to_string()
             } else {
                 dt.format("%Y-%m-%d %H:%M:%S").to_string()
@@ -174,8 +174,8 @@ fn apply_modifier(dt: &mut NaiveDateTime, modifier: &str) -> Result<bool> {
             *dt += chrono::Duration::days(days as i64);
             *dt += chrono::Duration::seconds(seconds.into());
         }
-        Modifier::Ceiling => todo!(),
         Modifier::Floor => todo!(),
+        Modifier::Ceiling => {}
         Modifier::StartOfMonth => {
             *dt = NaiveDate::from_ymd_opt(dt.year(), dt.month(), 1)
                 .unwrap()
@@ -1144,6 +1144,12 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_ceiling_modifier() {
+        assert_eq!(parse_modifier("ceiling").unwrap(), Modifier::Ceiling);
+        assert_eq!(parse_modifier("CEILING").unwrap(), Modifier::Ceiling);
+    }
+
+    #[test]
     fn test_parse_other_modifiers() {
         assert_eq!(parse_modifier("unixepoch").unwrap(), Modifier::UnixEpoch);
         assert_eq!(parse_modifier("UNIXEPOCH").unwrap(), Modifier::UnixEpoch);
@@ -1537,6 +1543,17 @@ mod tests {
         dt = dt_with_nanos;
         apply_modifier(&mut dt, "subsec").unwrap();
         assert_eq!(dt, dt_with_nanos);
+    }
+
+    #[test]
+    fn test_apply_modifier_ceiling() {
+        let mut dt = create_datetime(2023, 6, 15, 12, 30, 45);
+        apply_modifier(&mut dt, "ceiling").unwrap();
+        assert_eq!(dt, create_datetime(2023, 6, 16, 0, 0, 0));
+
+        let mut dt = create_datetime(2023, 6, 15, 0, 0, 0);
+        apply_modifier(&mut dt, "ceiling").unwrap();
+        assert_eq!(dt, create_datetime(2023, 6, 15, 0, 0, 0));
     }
 
     #[test]
