@@ -175,7 +175,28 @@ fn apply_modifier(dt: &mut NaiveDateTime, modifier: &str) -> Result<bool> {
             *dt += chrono::Duration::seconds(seconds.into());
         }
         Modifier::Ceiling => todo!(),
-        Modifier::Floor => todo!(),
+        Modifier::Floor => {
+            // SQLite semantics: 'floor' only resolves day-of-month overflow by rolling back to the last valid day of the previous month, preserving the time portion.
+            let year = dt.year();
+            let month = dt.month();
+            let day = dt.day();
+            let hour = dt.hour();
+            let min = dt.minute();
+            let sec = dt.second();
+            let nano = dt.nanosecond();
+            // Try to construct the current date/time
+            if NaiveDate::from_ymd_opt(year, month, day).is_some() {
+                // Valid date: do nothing (no-op)
+            } else {
+                // Invalid date: roll back to last valid day of previous month, preserving time
+                let last_day = last_day_in_month(year, month);
+                if let Some(date) = NaiveDate::from_ymd_opt(year, month, last_day) {
+                    if let Some(new_dt) = date.and_hms_nano_opt(hour, min, sec, nano) {
+                        *dt = new_dt;
+                    }
+                }
+            }
+        }
         Modifier::StartOfMonth => {
             *dt = NaiveDate::from_ymd_opt(dt.year(), dt.month(), 1)
                 .unwrap()
@@ -1144,6 +1165,12 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_floor_modifier() {
+        assert_eq!(parse_modifier("floor").unwrap(), Modifier::Floor);
+        assert_eq!(parse_modifier("FLOOR").unwrap(), Modifier::Floor);
+    }
+
+    #[test]
     fn test_parse_other_modifiers() {
         assert_eq!(parse_modifier("unixepoch").unwrap(), Modifier::UnixEpoch);
         assert_eq!(parse_modifier("UNIXEPOCH").unwrap(), Modifier::UnixEpoch);
@@ -1537,6 +1564,34 @@ mod tests {
         dt = dt_with_nanos;
         apply_modifier(&mut dt, "subsec").unwrap();
         assert_eq!(dt, dt_with_nanos);
+    }
+
+    #[test]
+    fn test_apply_modifier_floor() {
+        // No-op for valid date/time
+        let mut dt = create_datetime(2023, 6, 15, 12, 30, 45);
+        apply_modifier(&mut dt, "floor").unwrap();
+        assert_eq!(dt, create_datetime(2023, 6, 15, 12, 30, 45));
+
+        // Overflow: 2023-02-31 08:15:00 -> 2023-01-31 08:15:00
+        let mut dt = create_datetime(2023, 2, 31, 8, 15, 0);
+        apply_modifier(&mut dt, "floor").unwrap();
+        assert_eq!(dt, create_datetime(2023, 1, 31, 8, 15, 0));
+
+        // Overflow: 2024-02-30 23:59:59 (leap year) -> 2024-01-31 23:59:59
+        let mut dt = create_datetime(2024, 2, 30, 23, 59, 59);
+        apply_modifier(&mut dt, "floor").unwrap();
+        assert_eq!(dt, create_datetime(2024, 1, 31, 23, 59, 59));
+
+        // Overflow: 2023-04-31 00:00:00 -> 2023-03-31 00:00:00
+        let mut dt = create_datetime(2023, 4, 31, 0, 0, 0);
+        apply_modifier(&mut dt, "floor").unwrap();
+        assert_eq!(dt, create_datetime(2023, 3, 31, 0, 0, 0));
+
+        // Valid date with nanoseconds, no-op
+        let mut dt = create_datetime(2023, 5, 18, 15, 30, 45).with_nanosecond(123_456_789).unwrap();
+        apply_modifier(&mut dt, "floor").unwrap();
+        assert_eq!(dt, create_datetime(2023, 5, 18, 15, 30, 45).with_nanosecond(123_456_789).unwrap());
     }
 
     #[test]

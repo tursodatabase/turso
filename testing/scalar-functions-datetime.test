@@ -371,6 +371,34 @@ do_execsql_test datetime-with-multiple-modifiers {
 select datetime('2024-01-31', '+1 month', '+13 hours', '+5 minutes', '+62 seconds');
 } {{2024-03-02 13:06:02}}
 
+do_execsql_test datetime-with-floor-modifier-basic {
+  SELECT datetime('2023-05-18 15:30:45', 'floor');
+} {{2023-05-18 15:30:45}}
+
+do_execsql_test datetime-with-floor-modifier-already-floor {
+  SELECT datetime('2023-05-18 00:00:00', 'floor');
+} {{2023-05-18 00:00:00}}
+
+do_execsql_test datetime-with-floor-modifier-invalid-input {
+  SELECT datetime('not-a-date', 'floor');
+} {{}}
+
+do_execsql_test datetime-with-floor-modifier-stacked {
+  SELECT datetime('2023-05-18 15:30:45', '+1 day', 'floor');
+} {{2023-05-19 15:30:45}}
+
+do_execsql_test date-with-floor-modifier-basic {
+  SELECT date('2023-05-18 15:30:45', 'floor');
+} {2023-05-18}
+
+do_execsql_test datetime-with-floor-modifier-month-overflow-leap {
+  SELECT datetime('2024-01-31', '+1 month', 'floor');
+} {{2024-02-29 00:00:00}}
+
+do_execsql_test datetime-with-floor-modifier-month-overflow-nonleap {
+  SELECT datetime('2023-01-31', '+1 month', 'floor');
+} {{2023-02-28 00:00:00}}
+
 do_execsql_test datetime-with-weekday {
   SELECT datetime('2023-05-18', 'weekday 3');
 } {{2023-05-24 00:00:00}}
