@@ -10,7 +10,7 @@ use crate::{
     },
     errors::Error,
     protocol_io::{DataCompletion, DataPollResult, ProtocolIO},
-    server_proto::{self, ExecuteStreamReq, Stmt, StreamRequest},
+    server_proto::{self, ExecuteStreamReq, Stmt, StmtResult, StreamRequest},
     types::{
         Coro, DatabaseTapeOperation, DatabaseTapeRowChangeType, DbSyncInfo, DbSyncStatus,
         ProtocolCommand,
@@ -265,11 +265,9 @@ const TURSO_SYNC_CREATE_TABLE: &str =
 const TURSO_SYNC_SELECT_LAST_CHANGE_ID: &str =
     "SELECT pull_gen, change_id FROM turso_sync_last_change_id WHERE client_id = ?";
 const TURSO_SYNC_INSERT_LAST_CHANGE_ID: &str =
-    "INSERT INTO turso_sync_last_change_id(client_id, pull_gen, change_id) VALUES (?, 0, 0)";
+    "INSERT INTO turso_sync_last_change_id(client_id, pull_gen, change_id) VALUES (?, 0, 0) ON CONFLICT(client_id) DO NOTHING";
 const TURSO_SYNC_UPDATE_LAST_CHANGE_ID: &str =
     "UPDATE turso_sync_last_change_id SET pull_gen = ?, change_id = ? WHERE client_id = ?";
-const TURSO_SYNC_UPSERT_LAST_CHANGE_ID: &str =
-    "INSERT INTO turso_sync_last_change_id(client_id, pull_gen, change_id) VALUES (?, ?, ?) ON CONFLICT(client_id) DO UPDATE SET pull_gen=excluded.pull_gen, change_id=excluded.change_id";
 
 /// Transfers row changes from source DB to target DB
 /// In order to guarantee atomicity and avoid conflicts - method maintain last_change_id counter in the target db table turso_sync_last_change_id
@@ -447,12 +445,10 @@ pub async fn push_logical_changes<C: ProtocolIO>(
     coro: &Coro,
     client: &C,
     source: &DatabaseTape,
-    target: &DatabaseTape,
     client_id: &str,
 ) -> Result<()> {
     tracing::info!("push_logical_changes: client_id={client_id}");
     let source_conn = connect_untracked(source)?;
-    let target_conn = connect_untracked(target)?;
 
     // fetch last_change_id from the target DB in order to guarantee atomic replay of changes and avoid conflicts in case of failure
     let source_pull_gen = 'source_pull_gen: {
@@ -481,42 +477,86 @@ pub async fn push_logical_changes<C: ProtocolIO>(
     );
 
     // fetch last_change_id from the target DB in order to guarantee atomic replay of changes and avoid conflicts in case of failure
-    let mut schema_stmt = target_conn.prepare(TURSO_SYNC_CREATE_TABLE)?;
-    exec_stmt(coro, &mut schema_stmt).await?;
+    let init_hrana_request = server_proto::PipelineReqBody {
+        baton: None,
+        requests: vec![
+            // create 'turso_sync_last_change_id' table if not exists
+            StreamRequest::Execute(ExecuteStreamReq {
+                stmt: Stmt {
+                    sql: Some(TURSO_SYNC_CREATE_TABLE.to_string()),
+                    sql_id: None,
+                    args: Vec::new(),
+                    named_args: Vec::new(),
+                    want_rows: Some(false),
+                    replication_index: None,
+                },
+            }),
+            // read pull_gen, change_id values for current client if they were set before
+            StreamRequest::Execute(ExecuteStreamReq {
+                stmt: Stmt {
+                    sql: Some(TURSO_SYNC_SELECT_LAST_CHANGE_ID.to_string()),
+                    sql_id: None,
+                    args: vec![server_proto::Value::Text {
+                        value: client_id.to_string(),
+                    }],
+                    named_args: Vec::new(),
+                    want_rows: Some(true),
+                    replication_index: None,
+                },
+            }),
+            // initialize pull_gen, change_id for current client if the entry was absent
+            StreamRequest::Execute(ExecuteStreamReq {
+                stmt: Stmt {
+                    sql: Some(TURSO_SYNC_INSERT_LAST_CHANGE_ID.to_string()),
+                    sql_id: None,
+                    args: vec![server_proto::Value::Text {
+                        value: client_id.to_string(),
+                    }],
+                    named_args: Vec::new(),
+                    want_rows: Some(false),
+                    replication_index: None,
+                },
+            }),
+        ]
+        .into(),
+    };
 
-    let mut select_last_change_id_stmt = target_conn.prepare(TURSO_SYNC_SELECT_LAST_CHANGE_ID)?;
-    select_last_change_id_stmt.bind_at(1.try_into().unwrap(), Value::Text(Text::new(client_id)));
-
-    let mut last_change_id = match run_stmt_expect_one_row(coro, &mut select_last_change_id_stmt)
-        .await?
-    {
-        Some(row) => {
-            let target_pull_gen = row[0].as_int().ok_or_else(|| {
-                Error::DatabaseSyncEngineError("unexpected target pull_gen type".to_string())
-            })?;
-            let target_change_id = row[1].as_int().ok_or_else(|| {
-                Error::DatabaseSyncEngineError("unexpected target change_id type".to_string())
-            })?;
-            tracing::debug!(
-                "push_logical_changes: client_id={client_id}, target_pull_gen={target_pull_gen}, target_change_id={target_change_id}"
-            );
-            if target_pull_gen > source_pull_gen {
-                return Err(Error::DatabaseSyncEngineError(format!("protocol error: target_pull_gen > source_pull_gen: {target_pull_gen} > {source_pull_gen}")));
-            }
-            if target_pull_gen == source_pull_gen {
-                Some(target_change_id)
-            } else {
-                Some(0)
-            }
+    let response = sql_execute_http(coro, client, init_hrana_request).await?;
+    tracing::info!("response: {:?}", response);
+    assert!(response.len() == 3);
+    let last_change_id_response = &response[1];
+    assert!(last_change_id_response.rows.len() <= 1);
+    let mut last_change_id = if !last_change_id_response.rows.is_empty() {
+        let row = &last_change_id_response.rows[0].values;
+        let server_proto::Value::Integer {
+            value: target_pull_gen,
+        } = row[0]
+        else {
+            return Err(Error::DatabaseSyncEngineError(
+                "unexpected target pull_gen type".to_string(),
+            ));
+        };
+        let server_proto::Value::Integer {
+            value: target_change_id,
+        } = row[1]
+        else {
+            return Err(Error::DatabaseSyncEngineError(
+                "unexpected target change_id type".to_string(),
+            ));
+        };
+        tracing::debug!(
+            "push_logical_changes: client_id={client_id}, target_pull_gen={target_pull_gen}, target_change_id={target_change_id}"
+        );
+        if target_pull_gen > source_pull_gen {
+            return Err(Error::DatabaseSyncEngineError(format!("protocol error: target_pull_gen > source_pull_gen: {target_pull_gen} > {source_pull_gen}")));
         }
-        None => {
-            let mut insert_last_change_id_stmt =
-                target_conn.prepare(TURSO_SYNC_INSERT_LAST_CHANGE_ID)?;
-            insert_last_change_id_stmt
-                .bind_at(1.try_into().unwrap(), Value::Text(Text::new(client_id)));
-            exec_stmt(coro, &mut insert_last_change_id_stmt).await?;
-            None
+        if target_pull_gen == source_pull_gen {
+            Some(target_change_id)
+        } else {
+            Some(0)
         }
+    } else {
+        None
     };
 
     tracing::debug!("push_logical_changes: last_change_id={:?}", last_change_id);
@@ -524,8 +564,7 @@ pub async fn push_logical_changes<C: ProtocolIO>(
         use_implicit_rowid: false,
     };
 
-    let conn = connect_untracked(target)?;
-    let generator = DatabaseReplayGenerator::new(conn, replay_opts);
+    let generator = DatabaseReplayGenerator::new(source_conn, replay_opts);
 
     let iterate_opts = DatabaseChangesIteratorOpts {
         first_change_id: last_change_id.map(|x| x + 1),
@@ -681,19 +720,19 @@ pub async fn push_logical_changes<C: ProtocolIO>(
                     // update turso_sync_last_change_id table with new value before commit
                     let (next_pull_gen, next_change_id) =
                         (source_pull_gen, last_change_id.unwrap_or(0));
-                    tracing::info!("transfer_logical_changes: client_id={client_id}, set pull_gen={next_pull_gen}, change_id={next_change_id}, rows_changed={rows_changed}");
+                    tracing::info!("push_logical_changes: client_id={client_id}, set pull_gen={next_pull_gen}, change_id={next_change_id}, rows_changed={rows_changed}");
                     sql_over_http_requests.push(Stmt {
-                        sql: Some(TURSO_SYNC_UPSERT_LAST_CHANGE_ID.to_string()),
+                        sql: Some(TURSO_SYNC_UPDATE_LAST_CHANGE_ID.to_string()),
                         sql_id: None,
                         args: vec![
-                            server_proto::Value::Text {
-                                value: client_id.to_string(),
-                            },
                             server_proto::Value::Integer {
                                 value: next_pull_gen,
                             },
                             server_proto::Value::Integer {
                                 value: next_change_id,
+                            },
+                            server_proto::Value::Text {
+                                value: client_id.to_string(),
                             },
                         ],
                         named_args: Vec::new(),
@@ -714,7 +753,7 @@ pub async fn push_logical_changes<C: ProtocolIO>(
     }
 
     tracing::debug!("hrana request: {:?}", sql_over_http_requests);
-    let request = server_proto::PipelineReqBody {
+    let replay_hrana_request = server_proto::PipelineReqBody {
         baton: None,
         requests: sql_over_http_requests
             .into_iter()
@@ -722,7 +761,7 @@ pub async fn push_logical_changes<C: ProtocolIO>(
             .collect(),
     };
 
-    sql_execute_http(coro, client, request).await?;
+    let _ = sql_execute_http(coro, client, replay_hrana_request).await?;
     tracing::info!("push_logical_changes: rows_changed={:?}", rows_changed);
     Ok(())
 }
@@ -832,7 +871,7 @@ async fn sql_execute_http<C: ProtocolIO>(
     coro: &Coro,
     client: &C,
     request: server_proto::PipelineReqBody,
-) -> Result<()> {
+) -> Result<Vec<StmtResult>> {
     let body = serde_json::to_vec(&request)?;
     let completion = client.http("POST", "/v2/pipeline", Some(body))?;
     let status = wait_status(coro, &completion).await?;
@@ -842,14 +881,27 @@ async fn sql_execute_http<C: ProtocolIO>(
     }
     let response = wait_full_body(coro, &completion).await?;
     let response: server_proto::PipelineRespBody = serde_json::from_slice(&response)?;
+    let mut results = Vec::new();
     for result in response.results {
-        if let server_proto::StreamResult::Error { error } = result {
-            return Err(Error::DatabaseSyncEngineError(format!(
-                "failed to execute sql: {error:?}"
-            )));
+        match result {
+            server_proto::StreamResult::Error { error } => {
+                return Err(Error::DatabaseSyncEngineError(format!(
+                    "failed to execute sql: {error:?}"
+                )))
+            }
+            server_proto::StreamResult::None => {
+                return Err(Error::DatabaseSyncEngineError(
+                    "unexpected None result".to_string(),
+                ));
+            }
+            server_proto::StreamResult::Ok { response } => match response {
+                server_proto::StreamResponse::Execute(execute) => {
+                    results.push(execute.result);
+                }
+            },
         }
     }
-    Ok(())
+    Ok(results)
 }
 
 async fn wal_pull_http<C: ProtocolIO>(

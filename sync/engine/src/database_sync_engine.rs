@@ -197,34 +197,10 @@ impl<C: ProtocolIO> DatabaseSyncEngine<C> {
     /// This method will **not** pull remote changes to the local DB
     /// This method will **not** block writes for the period of sync
     pub async fn push(&mut self, coro: &Coro) -> Result<()> {
-        tracing::info!(
-            "push: draft={}, synced={}",
-            self.draft_path,
-            self.synced_path
-        );
+        tracing::info!("push: draft={}", self.draft_path);
 
-        // reset Synced DB if it wasn't properly cleaned-up on previous "sync-method" attempt
-        self.reset_synced_if_dirty(coro).await?;
-
-        // update Synced DB with fresh changes from remote in order to avoid WAL frame conflicts
-        self.pull_synced_from_remote(coro).await?;
-
-        // we will push Synced WAL to the remote
-        // so, we pass 'capture: false' as we don't need to preserve changes made to Synced WAL in turso_cdc
-        let synced = self.io.open_tape(&self.synced_path, false)?;
-
-        self.synced_is_dirty = true;
         let client_id = &self.meta().client_unique_id;
-        push_logical_changes(
-            coro,
-            self.protocol.as_ref(),
-            &self.draft_tape,
-            &synced,
-            client_id,
-        )
-        .await?;
-
-        self.reset_synced_if_dirty(coro).await?;
+        push_logical_changes(coro, self.protocol.as_ref(), &self.draft_tape, client_id).await?;
 
         Ok(())
     }
