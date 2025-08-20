@@ -543,30 +543,43 @@ fn emit_delete_insns(
 
         if let Some(index_refs) = index_refs_opt {
             for (index, index_cursor_id) in index_refs {
-                let num_regs = index.columns.len() + 1;
-                let start_reg = program.alloc_registers(num_regs);
-                // Emit columns that are part of the index
-                index
-                    .columns
-                    .iter()
-                    .enumerate()
-                    .for_each(|(reg_offset, column_index)| {
-                        program.emit_column(
-                            main_table_cursor_id,
-                            column_index.pos_in_table,
-                            start_reg + reg_offset,
-                        );
+                // Check if cursors are positioned from index seek operations
+                let is_cursor_positioned = matches!(
+                    &table_reference.op,
+                    Operation::Search(Search::Seek { index: Some(_), .. })
+                );
+
+                if is_cursor_positioned {
+                    program.emit_insn(Insn::Delete {
+                        cursor_id: index_cursor_id,
+                        table_name: table_reference.table.get_name().to_string(),
                     });
-                program.emit_insn(Insn::RowId {
-                    cursor_id: main_table_cursor_id,
-                    dest: start_reg + num_regs - 1,
-                });
-                program.emit_insn(Insn::IdxDelete {
-                    start_reg,
-                    num_regs,
-                    cursor_id: index_cursor_id,
-                    raise_error_if_no_matching_entry: true,
-                });
+                } else {
+                    let num_regs = index.columns.len() + 1;
+                    let start_reg = program.alloc_registers(num_regs);
+                    // Emit columns that are part of the index
+                    index
+                        .columns
+                        .iter()
+                        .enumerate()
+                        .for_each(|(reg_offset, column_index)| {
+                            program.emit_column(
+                                main_table_cursor_id,
+                                column_index.pos_in_table,
+                                start_reg + reg_offset,
+                            );
+                        });
+                    program.emit_insn(Insn::RowId {
+                        cursor_id: main_table_cursor_id,
+                        dest: start_reg + num_regs - 1,
+                    });
+                    program.emit_insn(Insn::IdxDelete {
+                        start_reg,
+                        num_regs,
+                        cursor_id: index_cursor_id,
+                        raise_error_if_no_matching_entry: true,
+                    });
+                }
             }
         }
 
