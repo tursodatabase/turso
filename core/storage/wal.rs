@@ -36,6 +36,7 @@ pub struct CheckpointResult {
     pub num_attempted: u64,
     /// number of frames moved successfully from WAL to db file after checkpoint
     pub num_backfilled: u64,
+    pub max_frame: u64,
     /// In the case of everything backfilled, we need to hold the locks until the db
     /// file is truncated.
     maybe_guard: Option<CheckpointLocks>,
@@ -48,10 +49,11 @@ impl Drop for CheckpointResult {
 }
 
 impl CheckpointResult {
-    pub fn new(n_frames: u64, n_ckpt: u64) -> Self {
+    pub fn new(n_frames: u64, n_ckpt: u64, max_frame: u64) -> Self {
         Self {
             num_attempted: n_frames,
             num_backfilled: n_ckpt,
+            max_frame,
             maybe_guard: None,
         }
     }
@@ -287,6 +289,7 @@ pub trait Wal: Debug {
     fn sync(&mut self) -> Result<Completion>;
     fn is_syncing(&self) -> bool;
     fn get_max_frame_in_wal(&self) -> u64;
+    fn get_checkpoint_seq(&self) -> u32;
     fn get_max_frame(&self) -> u64;
     fn get_min_frame(&self) -> u64;
     fn rollback(&mut self) -> Result<()>;
@@ -972,7 +975,7 @@ impl Wal for WalFile {
         };
         self.ensure_header_if_needed(page_size)?;
         tracing::debug!("write_raw_frame({})", frame_id);
-        if page.len() != self.page_size() as usize {
+        if self.page_size() != 0 && page.len() != self.page_size() as usize {
             return Err(LimboError::InvalidArgument(format!(
                 "unexpected page size in frame: got={}, expected={}",
                 page.len(),
@@ -1036,7 +1039,8 @@ impl Wal for WalFile {
             db_size as u32,
             page,
         );
-        let c = Completion::new_write(|_| {});
+        let frame_bytes_len = frame_bytes.len();
+        let c = Completion::new_write(move |res| assert!(res == frame_bytes_len as i32));
         let c = shared.file.pwrite(offset, frame_bytes, c)?;
         self.io.wait_for_completion(c)?;
         self.complete_append_frame(page_id, frame_id, checksums);
@@ -1143,6 +1147,10 @@ impl Wal for WalFile {
 
     fn get_max_frame_in_wal(&self) -> u64 {
         self.get_shared().max_frame.load(Ordering::Acquire)
+    }
+
+    fn get_checkpoint_seq(&self) -> u32 {
+        self.header.checkpoint_seq
     }
 
     fn get_max_frame(&self) -> u64 {
@@ -1383,7 +1391,12 @@ impl WalFile {
                     {
                         // there are no frames to copy over and we don't need to reset
                         // the log so we can return early success.
-                        return Ok(IOResult::Done(self.prev_checkpoint.clone()));
+                        return Ok(IOResult::Done(CheckpointResult {
+                            num_attempted: self.prev_checkpoint.num_attempted,
+                            num_backfilled: self.prev_checkpoint.num_backfilled,
+                            max_frame: nbackfills,
+                            maybe_guard: None,
+                        }));
                     }
                     // acquire the appropriate exclusive locks depending on the checkpoint mode
                     self.acquire_proper_checkpoint_guard(mode)?;
@@ -1403,6 +1416,21 @@ impl WalFile {
                     } = mode
                     {
                         max_frame = max_frame.min(upper_bound);
+                    }
+
+                    if max_frame <= nbackfills {
+                        tracing::debug!(
+                            "no need in checkpoint: max_frame={}, nbackfills={}, prev={:?}",
+                            max_frame,
+                            nbackfills,
+                            self.prev_checkpoint
+                        );
+                        return Ok(IOResult::Done(CheckpointResult {
+                            num_attempted: self.prev_checkpoint.num_attempted,
+                            num_backfilled: self.prev_checkpoint.num_backfilled,
+                            max_frame: nbackfills,
+                            maybe_guard: None,
+                        }));
                     }
 
                     self.ongoing_checkpoint.max_frame = max_frame;
@@ -1532,13 +1560,12 @@ impl WalFile {
                         // Record two num pages fields to return as checkpoint result to caller.
                         // Ref: pnLog, pnCkpt on https://www.sqlite.org/c3ref/wal_checkpoint_v2.html
 
-                        // the total # of frames we could have possibly backfilled
+                        // the total # of possibly backfill frames we could haveed
                         let frames_possible = current_mx.saturating_sub(nbackfills);
 
                         // the total # of frames we actually backfilled
-                        let frames_checkpointed = self
-                            .ongoing_checkpoint
-                            .max_frame
+                        let checkpoint_max_frame = self.ongoing_checkpoint.max_frame;
+                        let frames_checkpointed = checkpoint_max_frame
                             .saturating_sub(self.ongoing_checkpoint.min_frame - 1);
 
                         if matches!(mode, CheckpointMode::Truncate { .. }) {
@@ -1553,9 +1580,15 @@ impl WalFile {
                         } else {
                             // otherwise return the normal result of the total # of possible frames
                             // we could have backfilled, and the number we actually did.
-                            CheckpointResult::new(frames_possible, frames_checkpointed)
+                            CheckpointResult::new(
+                                frames_possible,
+                                frames_checkpointed,
+                                checkpoint_max_frame,
+                            )
                         }
                     };
+
+                    tracing::debug!("checkpoint_result={:?}", checkpoint_result);
 
                     // store the max frame we were able to successfully checkpoint.
                     self.get_shared()
@@ -1572,6 +1605,7 @@ impl WalFile {
                     // store a copy of the checkpoint result to return in the future if pragma
                     // wal_checkpoint is called and we haven't backfilled again since.
                     self.prev_checkpoint = checkpoint_result.clone();
+                    tracing::debug!("prev_checkpoint={:?}", checkpoint_result);
 
                     // we cannot truncate the db file here because we are currently inside a
                     // mut borrow of pager.wal, and accessing the header will attempt a borrow
@@ -1981,7 +2015,7 @@ pub mod test {
         );
         drop(wal);
 
-        assert_eq!(pager.wal_frame_count().unwrap(), 0);
+        assert_eq!(pager.wal_state().unwrap().max_frame, 0);
 
         tracing::info!("wal filepath: {walpath:?}, size: {}", stat.len());
         let meta_after = std::fs::metadata(&walpath).unwrap();

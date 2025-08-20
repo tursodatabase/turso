@@ -40,6 +40,8 @@ pub mod value;
 use transaction::TransactionBehavior;
 #[cfg(feature = "conn_raw_api")]
 use turso_core::types::WalFrameInfo;
+#[cfg(feature = "conn_raw_api")]
+use turso_core::types::WalState;
 pub use value::Value;
 
 pub use params::params_from_iter;
@@ -186,12 +188,12 @@ impl Connection {
     }
 
     #[cfg(feature = "conn_raw_api")]
-    pub fn wal_frame_count(&self) -> Result<u64> {
+    pub fn wal_frame_count(&self) -> Result<WalState> {
         let conn = self
             .inner
             .lock()
             .map_err(|e| Error::MutexError(e.to_string()))?;
-        conn.wal_frame_count()
+        conn.wal_state()
             .map_err(|e| Error::WalOperationError(format!("wal_insert_begin failed: {e}")))
     }
 

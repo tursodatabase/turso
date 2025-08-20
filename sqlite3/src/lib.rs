@@ -1378,8 +1378,8 @@ pub unsafe extern "C" fn libsql_wal_frame_count(
     }
     let db: &mut sqlite3 = &mut *db;
     let db = db.inner.lock().unwrap();
-    let frame_count = match db.conn.wal_frame_count() {
-        Ok(count) => count as u32,
+    let frame_count = match db.conn.wal_state() {
+        Ok(state) => state.max_frame as u32,
         Err(_) => return SQLITE_ERROR,
     };
     *p_frame_count = frame_count;

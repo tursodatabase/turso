@@ -272,6 +272,11 @@ impl IO for UnixIO {
         Ok(unix_file)
     }
 
+    fn remove_file(&self, path: &str) -> Result<()> {
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
     #[instrument(err, skip_all, level = Level::TRACE)]
     fn run_once(&self) -> Result<()> {
         if self.callbacks.is_empty() {

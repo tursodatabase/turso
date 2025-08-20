@@ -65,6 +65,11 @@ impl IO for MemoryIO {
         }
         Ok(files.get(path).unwrap().clone())
     }
+    fn remove_file(&self, path: &str) -> Result<()> {
+        let mut files = self.files.lock().unwrap();
+        files.remove(path);
+        Ok(())
+    }
 
     fn run_once(&self) -> Result<()> {
         // nop

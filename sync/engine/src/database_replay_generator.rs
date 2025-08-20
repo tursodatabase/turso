@@ -229,24 +229,25 @@ impl DatabaseReplayGenerator {
             }
         }
 
-        let (query, pk_column_indices) = if self.opts.use_implicit_rowid {
-            (
-                format!(
-                    "UPDATE {table_name} SET {} WHERE rowid = ?",
-                    column_updates.join(", ")
-                ),
-                None,
-            )
-        } else {
-            (
-                format!(
-                    "UPDATE {table_name} SET {} WHERE {}",
-                    column_updates.join(", "),
-                    pk_predicates.join(" AND ")
-                ),
-                Some(pk_column_indices),
-            )
-        };
+        let (query, pk_column_indices) =
+            if self.opts.use_implicit_rowid || pk_column_indices.is_empty() {
+                (
+                    format!(
+                        "UPDATE {table_name} SET {} WHERE rowid = ?",
+                        column_updates.join(", ")
+                    ),
+                    None,
+                )
+            } else {
+                (
+                    format!(
+                        "UPDATE {table_name} SET {} WHERE {}",
+                        column_updates.join(", "),
+                        pk_predicates.join(" AND ")
+                    ),
+                    Some(pk_column_indices),
+                )
+            };
         Ok(ReplayInfo {
             change_type: DatabaseChangeType::Update,
             query,

@@ -54,6 +54,7 @@ pub struct VfsImpl {
     pub name: *const c_char,
     pub vfs: *const c_void,
     pub open: VfsOpen,
+    pub remove: VfsRemove,
     pub close: VfsClose,
     pub read: VfsRead,
     pub write: VfsWrite,
@@ -196,6 +197,8 @@ pub type VfsRunOnce = unsafe extern "C" fn(file: *const c_void) -> ResultCode;
 pub type VfsGetCurrentTime = unsafe extern "C" fn() -> *const c_char;
 
 pub type VfsGenerateRandomNumber = unsafe extern "C" fn() -> i64;
+
+pub type VfsRemove = unsafe extern "C" fn(ctx: *const c_void, path: *const c_char) -> ResultCode;
 
 #[repr(C)]
 pub struct VfsFileImpl {

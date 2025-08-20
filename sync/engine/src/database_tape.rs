@@ -3,7 +3,7 @@ use std::{
     sync::Arc,
 };
 
-use turso_core::{types::WalFrameInfo, StepResult};
+use turso_core::{types::WalFrameInfo, LimboError, StepResult};
 
 use crate::{
     database_replay_generator::{DatabaseReplayGenerator, ReplayInfo},
@@ -28,7 +28,7 @@ pub struct DatabaseTape {
 const DEFAULT_CDC_TABLE_NAME: &str = "turso_cdc";
 const DEFAULT_CDC_MODE: &str = "full";
 const DEFAULT_CHANGES_BATCH_SIZE: usize = 100;
-const CDC_PRAGMA_NAME: &str = "unstable_capture_data_changes_conn";
+pub const CDC_PRAGMA_NAME: &str = "unstable_capture_data_changes_conn";
 
 #[derive(Debug, Clone)]
 pub struct DatabaseTapeOpts {
@@ -142,14 +142,15 @@ impl DatabaseTape {
     ) -> Result<DatabaseChangesIterator> {
         tracing::debug!("opening changes iterator with options {:?}", opts);
         let conn = self.inner.connect()?;
-        let query = opts.mode.query(&self.cdc_table, opts.batch_size);
-        let query_stmt = conn.prepare(&query)?;
         Ok(DatabaseChangesIterator {
+            conn,
+            cdc_table: self.cdc_table.clone(),
             first_change_id: opts.first_change_id,
             batch: VecDeque::with_capacity(opts.batch_size),
-            query_stmt,
+            query_stmt: None,
             txn_boundary_returned: false,
             mode: opts.mode,
+            batch_size: opts.batch_size,
             ignore_schema_changes: opts.ignore_schema_changes,
         })
     }
@@ -184,14 +185,14 @@ impl DatabaseTape {
 pub struct DatabaseWalSession {
     page_size: usize,
     next_wal_frame_no: u64,
-    wal_session: WalSession,
+    pub wal_session: WalSession,
     prepared_frame: Option<(u32, Vec<u8>)>,
 }
 
 impl DatabaseWalSession {
     pub async fn new(coro: &Coro, wal_session: WalSession) -> Result<Self> {
         let conn = wal_session.conn();
-        let frames_count = conn.wal_frame_count()?;
+        let frames_count = conn.wal_state()?.max_frame;
         let mut page_size_stmt = conn.prepare("PRAGMA page_size")?;
         let Some(row) = run_stmt_expect_one_row(coro, &mut page_size_stmt).await? else {
             return Err(Error::DatabaseTapeError(
@@ -217,7 +218,7 @@ impl DatabaseWalSession {
     }
 
     pub fn frames_count(&self) -> Result<u64> {
-        Ok(self.wal_session.conn().wal_frame_count()?)
+        Ok(self.wal_session.conn().wal_state()?.max_frame)
     }
 
     pub fn append_page(&mut self, page_no: u32, page: &[u8]) -> Result<()> {
@@ -259,13 +260,15 @@ impl DatabaseWalSession {
         Ok(())
     }
 
-    pub fn rollback_changes_after(&mut self, frame_watermark: u64) -> Result<()> {
+    pub fn rollback_changes_after(&mut self, frame_watermark: u64) -> Result<usize> {
         let conn = self.wal_session.conn();
         let pages = conn.wal_changed_pages_after(frame_watermark)?;
+        tracing::info!("rolling back {} pages", pages.len());
+        let pages_cnt = pages.len();
         for page_no in pages {
             self.rollback_page(page_no, frame_watermark)?;
         }
-        Ok(())
+        Ok(pages_cnt)
     }
 
     pub fn db_size(&self) -> Result<u32> {
@@ -352,11 +355,14 @@ impl Default for DatabaseChangesIteratorOpts {
 }
 
 pub struct DatabaseChangesIterator {
-    query_stmt: turso_core::Statement,
+    conn: Arc<turso_core::Connection>,
+    cdc_table: Arc<String>,
+    query_stmt: Option<turso_core::Statement>,
     first_change_id: Option<i64>,
     batch: VecDeque<DatabaseTapeRowChange>,
     txn_boundary_returned: bool,
     mode: DatabaseChangesIteratorMode,
+    batch_size: usize,
     ignore_schema_changes: bool,
 }
 
@@ -387,14 +393,25 @@ impl DatabaseChangesIterator {
         }
     }
     async fn refill(&mut self, coro: &Coro) -> Result<()> {
+        if self.query_stmt.is_none() {
+            let query = self.mode.query(&self.cdc_table, self.batch_size);
+            let stmt = match self.conn.prepare(&query) {
+                Ok(stmt) => stmt,
+                Err(LimboError::ParseError(err)) if err.contains("no such table") => return Ok(()),
+                Err(err) => return Err(err.into()),
+            };
+            self.query_stmt = Some(stmt);
+        }
+        let query_stmt = self.query_stmt.as_mut().unwrap();
+
         let change_id_filter = self.first_change_id.unwrap_or(self.mode.first_id());
-        self.query_stmt.reset();
-        self.query_stmt.bind_at(
+        query_stmt.reset();
+        query_stmt.bind_at(
             1.try_into().unwrap(),
             turso_core::Value::Integer(change_id_filter),
         );
 
-        while let Some(row) = run_stmt_once(coro, &mut self.query_stmt).await? {
+        while let Some(row) = run_stmt_once(coro, query_stmt).await? {
             let database_change: DatabaseChange = row.try_into()?;
             let tape_change = match self.mode {
                 DatabaseChangesIteratorMode::Apply => database_change.into_apply()?,
@@ -415,18 +432,18 @@ pub struct DatabaseReplaySessionOpts {
     pub use_implicit_rowid: bool,
 }
 
-struct CachedStmt {
+pub(crate) struct CachedStmt {
     stmt: turso_core::Statement,
     info: ReplayInfo,
 }
 
 pub struct DatabaseReplaySession {
-    conn: Arc<turso_core::Connection>,
-    cached_delete_stmt: HashMap<String, CachedStmt>,
-    cached_insert_stmt: HashMap<(String, usize), CachedStmt>,
-    cached_update_stmt: HashMap<(String, Vec<bool>), CachedStmt>,
-    in_txn: bool,
-    generator: DatabaseReplayGenerator,
+    pub(crate) conn: Arc<turso_core::Connection>,
+    pub(crate) cached_delete_stmt: HashMap<String, CachedStmt>,
+    pub(crate) cached_insert_stmt: HashMap<(String, usize), CachedStmt>,
+    pub(crate) cached_update_stmt: HashMap<(String, Vec<bool>), CachedStmt>,
+    pub(crate) in_txn: bool,
+    pub(crate) generator: DatabaseReplayGenerator,
 }
 
 async fn replay_stmt(

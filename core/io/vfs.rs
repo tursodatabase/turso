@@ -32,6 +32,19 @@ impl IO for VfsMod {
         Ok(Arc::new(turso_ext::VfsFileImpl::new(file, self.ctx)?))
     }
 
+    fn remove_file(&self, path: &str) -> Result<()> {
+        let c_path = CString::new(path).map_err(|_| {
+            LimboError::ExtensionError("Failed to convert path to CString".to_string())
+        })?;
+        let ctx = self.ctx as *mut c_void;
+        let vfs = unsafe { &*self.ctx };
+        let result = unsafe { (vfs.remove)(ctx, c_path.as_ptr()) };
+        if !result.is_ok() {
+            return Err(LimboError::ExtensionError(result.to_string()));
+        }
+        Ok(())
+    }
+
     fn run_once(&self) -> Result<()> {
         if self.ctx.is_null() {
             return Err(LimboError::ExtensionError("VFS is null".to_string()));

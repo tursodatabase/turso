@@ -17,6 +17,17 @@ pub struct DbSyncStatus {
     pub max_frame_no: u64,
 }
 
+#[derive(Debug)]
+pub struct DbChangesStatus {
+    pub generation: u64,
+    pub max_frame_no: u64,
+    pub file_path: String,
+}
+
+pub struct DbLocalChangesCount {
+    pub cdc_operations: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum DatabaseChangeType {
     Delete,
@@ -33,8 +44,8 @@ pub struct DatabaseMetadata {
     /// Latest frame number from remote which was pulled locally to the Synced DB
     pub synced_frame_no: Option<u64>,
     /// pair of frame_no for Draft and Synced DB such that content of the database file up to these frames is identical
-    pub draft_wal_match_watermark: u64,
-    pub synced_wal_match_watermark: u64,
+    pub revert_since_wal_checkpoint_seq: u32,
+    pub revert_since_wal_watermark: u64,
 }
 
 impl DatabaseMetadata {

@@ -499,6 +499,11 @@ impl IO for UringIO {
         Ok(uring_file)
     }
 
+    fn remove_file(&self, path: &str) -> Result<()> {
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
     fn wait_for_completion(&self, c: Completion) -> Result<()> {
         while !c.is_completed() {
             self.run_once()?;

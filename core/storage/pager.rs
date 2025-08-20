@@ -8,7 +8,7 @@ use crate::storage::{
     },
     wal::{CheckpointResult, Wal},
 };
-use crate::types::IOCompletions;
+use crate::types::{IOCompletions, WalState};
 use crate::util::IOExt as _;
 use crate::{io_yield_many, io_yield_one};
 use crate::{
@@ -1108,13 +1108,16 @@ impl Pager {
         page.set_dirty();
     }
 
-    pub fn wal_frame_count(&self) -> Result<u64> {
+    pub fn wal_state(&self) -> Result<WalState> {
         let Some(wal) = self.wal.as_ref() else {
             return Err(LimboError::InternalError(
-                "wal_frame_count() called on database without WAL".to_string(),
+                "wal_state() called on database without WAL".to_string(),
             ));
         };
-        Ok(wal.borrow().get_max_frame())
+        Ok(WalState {
+            checkpoint_seq_no: wal.borrow().get_checkpoint_seq(),
+            max_frame: wal.borrow().get_max_frame(),
+        })
     }
 
     /// Flush all dirty pages to disk.
@@ -1302,7 +1305,6 @@ impl Pager {
                 page.get().id == header.page_number as usize,
                 "page has unexpected id"
             );
-            self.add_dirty(&page);
         }
         if header.page_number == 1 {
             let db_size = self
@@ -1665,6 +1667,11 @@ impl Pager {
 
         let header_ref = self.io.block(|| HeaderRefMut::from_pager(self))?;
         let header = header_ref.borrow_mut();
+        tracing::debug!(
+            "allocate_page: db_size={}, free_list={}",
+            header.database_size.get(),
+            header.freelist_pages.get()
+        );
 
         loop {
             let mut state = self.allocate_page_state.borrow_mut();

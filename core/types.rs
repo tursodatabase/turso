@@ -2638,9 +2638,20 @@ pub struct WalFrameInfo {
     pub db_size: u32,
 }
 
+#[derive(Debug)]
+pub struct WalState {
+    pub checkpoint_seq_no: u32,
+    pub max_frame: u64,
+}
+
 impl WalFrameInfo {
     pub fn is_commit_frame(&self) -> bool {
         self.db_size > 0
+    }
+    pub fn from_frame_header(frame: &[u8]) -> Self {
+        let page_no = u32::from_be_bytes(frame[0..4].try_into().unwrap());
+        let db_size = u32::from_be_bytes(frame[4..8].try_into().unwrap());
+        Self { page_no, db_size }
     }
     pub fn put_to_frame_header(&self, frame: &mut [u8]) {
         frame[0..4].copy_from_slice(&self.page_no.to_be_bytes());

@@ -20,7 +20,7 @@ mod schema;
 #[cfg(feature = "series")]
 mod series;
 pub mod state_machine;
-mod storage;
+pub mod storage;
 #[allow(dead_code)]
 #[cfg(feature = "time")]
 mod time;
@@ -44,7 +44,7 @@ use crate::incremental::view::ViewTransactionState;
 use crate::translate::optimizer::optimize_plan;
 use crate::translate::pragma::TURSO_CDC_DEFAULT_TABLE_NAME;
 #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
-use crate::types::WalFrameInfo;
+use crate::types::{WalFrameInfo, WalState};
 #[cfg(feature = "fs")]
 use crate::util::{OpenMode, OpenOptions};
 use crate::vdbe::metrics::ConnectionMetrics;
@@ -125,6 +125,7 @@ pub struct Database {
     schema: Mutex<Arc<Schema>>,
     db_file: Arc<dyn DatabaseStorage>,
     path: String,
+    wal_path: String,
     pub io: Arc<dyn IO>,
     buffer_pool: Arc<BufferPool>,
     // Shared structures of a Database are the parts that are common to multiple threads that might
@@ -260,9 +261,10 @@ impl Database {
         // turso-sync-engine create 2 databases with different names in the same IO if MemoryIO is used
         // in this case we need to bypass registry (as this is MemoryIO DB) but also preserve original distinction in names (e.g. :memory:-draft and :memory:-synced)
         if path.starts_with(":memory:") {
-            return Self::open_with_flags_bypass_registry(
+            return Self::open_with_flags_bypass_registry_internal(
                 io,
                 path,
+                &format!("{path}-wal"),
                 db_file,
                 flags,
                 enable_mvcc,
@@ -281,9 +283,10 @@ impl Database {
         if let Some(db) = registry.get(&canonical_path).and_then(Weak::upgrade) {
             return Ok(db);
         }
-        let db = Self::open_with_flags_bypass_registry(
+        let db = Self::open_with_flags_bypass_registry_internal(
             io,
             path,
+            &format!("{path}-wal"),
             db_file,
             flags,
             enable_mvcc,
@@ -295,17 +298,41 @@ impl Database {
     }
 
     #[allow(clippy::arc_with_non_send_sync)]
-    fn open_with_flags_bypass_registry(
+    #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
+    pub fn open_with_flags_bypass_registry(
         io: Arc<dyn IO>,
         path: &str,
+        wal_path: &str,
         db_file: Arc<dyn DatabaseStorage>,
         flags: OpenFlags,
         enable_mvcc: bool,
         enable_indexes: bool,
         enable_views: bool,
     ) -> Result<Arc<Database>> {
-        let wal_path = format!("{path}-wal");
-        let maybe_shared_wal = WalFileShared::open_shared_if_exists(&io, wal_path.as_str())?;
+        Self::open_with_flags_bypass_registry_internal(
+            io,
+            path,
+            wal_path,
+            db_file,
+            flags,
+            enable_mvcc,
+            enable_indexes,
+            enable_views,
+        )
+    }
+
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn open_with_flags_bypass_registry_internal(
+        io: Arc<dyn IO>,
+        path: &str,
+        wal_path: &str,
+        db_file: Arc<dyn DatabaseStorage>,
+        flags: OpenFlags,
+        enable_mvcc: bool,
+        enable_indexes: bool,
+        enable_views: bool,
+    ) -> Result<Arc<Database>> {
+        let maybe_shared_wal = WalFileShared::open_shared_if_exists(&io, wal_path)?;
 
         let mv_store = if enable_mvcc {
             Some(Arc::new(MvStore::new(
@@ -333,6 +360,7 @@ impl Database {
         let db = Arc::new(Database {
             mv_store,
             path: path.to_string(),
+            wal_path: wal_path.to_string(),
             schema: Mutex::new(Arc::new(Schema::new(enable_indexes))),
             _shared_page_cache: shared_page_cache.clone(),
             maybe_shared_wal: RwLock::new(maybe_shared_wal),
@@ -541,8 +569,9 @@ impl Database {
         )?;
 
         pager.page_size.set(Some(page_size));
-        let wal_path = format!("{}-wal", self.path);
-        let file = self.io.open_file(&wal_path, OpenFlags::Create, false)?;
+        let file = self
+            .io
+            .open_file(&self.wal_path, OpenFlags::Create, false)?;
         let real_shared_wal = WalFileShared::new_shared(file)?;
         // Modify Database::maybe_shared_wal to point to the new WAL file so that other connections
         // can open the existing WAL.
@@ -917,7 +946,12 @@ impl Connection {
         pager.end_read_tx().expect("read txn must be finished");
 
         let db_schema_version = self._db.schema.lock().unwrap().schema_version;
-        tracing::debug!("{db_schema_version} vs {on_disk_schema_version}");
+        tracing::debug!(
+            "path: {}, db_schema_version={} vs on_disk_schema_version={}",
+            self._db.path,
+            db_schema_version,
+            on_disk_schema_version
+        );
         // if schema_versions matches - exit early
         if db_schema_version == on_disk_schema_version {
             return Ok(());
@@ -985,6 +1019,11 @@ impl Connection {
         // TODO: This function below is synchronous, make it async
         parse_schema_rows(stmt, &mut fresh, &self.syms.borrow(), None, existing_views)?;
 
+        tracing::debug!(
+            "reparse_schema: schema_version={}, tables={:?}",
+            fresh.schema_version,
+            fresh.tables.keys()
+        );
         self.with_schema_mut(|schema| {
             *schema = fresh;
         });
@@ -1320,8 +1359,8 @@ impl Connection {
     }
 
     #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
-    pub fn wal_frame_count(&self) -> Result<u64> {
-        self.pager.borrow().wal_frame_count()
+    pub fn wal_state(&self) -> Result<WalState> {
+        self.pager.borrow().wal_state()
     }
 
     #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
@@ -1615,21 +1654,7 @@ impl Connection {
         }
         let pragma = format!("PRAGMA {pragma_name}");
         let mut stmt = self.prepare(pragma)?;
-        let mut results = Vec::new();
-        loop {
-            match stmt.step()? {
-                vdbe::StepResult::Row => {
-                    let row: Vec<Value> = stmt.row().unwrap().get_values().cloned().collect();
-                    results.push(row);
-                }
-                vdbe::StepResult::Interrupt | vdbe::StepResult::Busy => {
-                    return Err(LimboError::Busy);
-                }
-                _ => break,
-            }
-        }
-
-        Ok(results)
+        stmt.run_collect_rows()
     }
 
     /// Set a new value to `pragma_name`.
@@ -1646,21 +1671,7 @@ impl Connection {
         }
         let pragma = format!("PRAGMA {pragma_name} = {pragma_value}");
         let mut stmt = self.prepare(pragma)?;
-        let mut results = Vec::new();
-        loop {
-            match stmt.step()? {
-                vdbe::StepResult::Row => {
-                    let row: Vec<Value> = stmt.row().unwrap().get_values().cloned().collect();
-                    results.push(row);
-                }
-                vdbe::StepResult::Interrupt | vdbe::StepResult::Busy => {
-                    return Err(LimboError::Busy);
-                }
-                _ => break,
-            }
-        }
-
-        Ok(results)
+        stmt.run_collect_rows()
     }
 
     pub fn experimental_views_enabled(&self) -> bool {
@@ -2010,6 +2021,23 @@ impl Statement {
                 vdbe::StepResult::Done => return Ok(()),
                 vdbe::StepResult::IO => self.run_once()?,
                 vdbe::StepResult::Row => continue,
+                vdbe::StepResult::Interrupt | vdbe::StepResult::Busy => {
+                    return Err(LimboError::Busy)
+                }
+            }
+        }
+    }
+
+    pub(crate) fn run_collect_rows(&mut self) -> Result<Vec<Vec<Value>>> {
+        let mut values = Vec::new();
+        loop {
+            match self.step()? {
+                vdbe::StepResult::Done => return Ok(values),
+                vdbe::StepResult::IO => self.run_once()?,
+                vdbe::StepResult::Row => {
+                    values.push(self.row().unwrap().get_values().cloned().collect());
+                    continue;
+                }
                 vdbe::StepResult::Interrupt | vdbe::StepResult::Busy => {
                     return Err(LimboError::Busy)
                 }
