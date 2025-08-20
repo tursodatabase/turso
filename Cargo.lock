@@ -2132,6 +2132,7 @@ dependencies = [
  "dirs 6.0.0",
  "env_logger 0.10.2",
  "hex",
+ "indexmap 2.10.0",
  "itertools 0.14.0",
  "log",
  "notify",

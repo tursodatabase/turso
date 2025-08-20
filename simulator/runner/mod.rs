@@ -8,6 +8,7 @@ pub mod execution;
 #[allow(dead_code)]
 pub mod file;
 pub mod io;
+pub mod memory;
 pub mod watch;
 
 pub trait SimIO: turso_core::IO {
