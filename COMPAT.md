@@ -344,7 +344,7 @@ Modifiers:
 | DateOffset	 | Yes   |                                 |
 | DateTimeOffset | Yes   |                                 |
 | Ceiling	     | No    |                                 |
-| Floor          | No    |                                 |
+| Floor          | Yes   |                                 |
 | StartOfMonth	 | Yes	 |                                 |
 | StartOfYear	 | Yes	 |                                 |
 | StartOfDay	 | Yes	 |                                 |
