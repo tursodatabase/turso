@@ -11,3 +11,13 @@ pub mod io;
 pub mod watch;
 
 pub const FAULT_ERROR_MSG: &str = "Injected Fault";
+
+pub trait SimIO: turso_core::IO {
+    fn inject_fault(&self, fault: bool);
+
+    fn print_stats(&self);
+
+    fn syncing(&self) -> bool;
+
+    fn close_files(&self);
+}
