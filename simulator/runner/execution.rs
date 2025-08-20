@@ -183,6 +183,7 @@ pub(crate) fn execute_interaction(
 ) -> Result<ExecutionContinuation> {
     // Leave this empty info! here to print the span of the execution
     tracing::info!("");
+    let mut success = true;
     match interaction {
         Interaction::Query(_) => {
             let conn = match &mut env.connections[connection_index] {
@@ -193,6 +194,7 @@ pub(crate) fn execute_interaction(
             tracing::debug!(?interaction);
             let results = interaction.execute_query(conn, &env.io);
             if results.is_err() {
+                success = false;
                 tracing::error!(?results);
             }
             stack.push(results);
@@ -207,6 +209,7 @@ pub(crate) fn execute_interaction(
 
             let results = interaction.execute_fsync_query(conn.clone(), env);
             if results.is_err() {
+                success = false;
                 tracing::error!(?results);
             }
             stack.push(results);
@@ -240,6 +243,7 @@ pub(crate) fn execute_interaction(
 
             let results = interaction.execute_faulty_query(&conn, env);
             if results.is_err() {
+                success = false;
                 tracing::error!(?results);
             }
             stack.push(results);
@@ -248,7 +252,10 @@ pub(crate) fn execute_interaction(
             limbo_integrity_check(&conn)?;
         }
     }
-    let _ = interaction.shadow(&mut env.tables);
+
+    if success {
+        let _ = interaction.shadow(&mut env.tables);
+    }
     Ok(ExecutionContinuation::NextInteraction)
 }
 
