@@ -38,3 +38,4 @@ hex = "0.4.3"
 itertools = "0.14.0"
 sql_generation = { workspace = true }
 turso_parser = { workspace = true }
+parking_lot = { workspace = true }
