@@ -102,6 +102,7 @@ pub async fn wal_apply_from_file(
     let size = frames_file.size()?;
     assert!(size % WAL_FRAME_SIZE as u64 == 0);
     let buffer = Arc::new(Buffer::new_temporary(WAL_FRAME_SIZE));
+    tracing::debug!("wal_apply_from_file: size={}", size);
     let mut db_size = 0;
     for offset in (0..size).step_by(WAL_FRAME_SIZE) {
         let c = Completion::new_read(buffer.clone(), move |_, size| {

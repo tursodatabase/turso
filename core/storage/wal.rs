@@ -1560,7 +1560,7 @@ impl WalFile {
                         // Record two num pages fields to return as checkpoint result to caller.
                         // Ref: pnLog, pnCkpt on https://www.sqlite.org/c3ref/wal_checkpoint_v2.html
 
-                        // the total # of possibly backfill frames we could haveed
+                        // the total # of frames we could have possibly backfilled
                         let frames_possible = current_mx.saturating_sub(nbackfills);
 
                         // the total # of frames we actually backfilled
@@ -1588,8 +1588,6 @@ impl WalFile {
                         }
                     };
 
-                    tracing::debug!("checkpoint_result={:?}", checkpoint_result);
-
                     // store the max frame we were able to successfully checkpoint.
                     self.get_shared()
                         .nbackfills
@@ -1605,7 +1603,6 @@ impl WalFile {
                     // store a copy of the checkpoint result to return in the future if pragma
                     // wal_checkpoint is called and we haven't backfilled again since.
                     self.prev_checkpoint = checkpoint_result.clone();
-                    tracing::debug!("prev_checkpoint={:?}", checkpoint_result);
 
                     // we cannot truncate the db file here because we are currently inside a
                     // mut borrow of pager.wal, and accessing the header will attempt a borrow

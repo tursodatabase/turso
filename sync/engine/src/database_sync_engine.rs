@@ -333,7 +333,7 @@ impl<C: ProtocolIO> DatabaseSyncEngine<C> {
         )
         .await?;
 
-        if generation == synced_generation && Some(max_frame_no) == synced_frame_no {
+        if file.size()? == 0 {
             tracing::info!(
                 "wait_changes(path={}): no changes detected, removing changes file {}",
                 self.main_db_path,
@@ -342,6 +342,15 @@ impl<C: ProtocolIO> DatabaseSyncEngine<C> {
             self.io.remove_file(&file_path)?;
             return Ok(None);
         }
+
+        tracing::debug!(
+            "wait_changes_from_remote(path={}): generation: {} -> {}, frame_no: {:?} -> {}",
+            self.main_db_path,
+            synced_generation,
+            generation,
+            synced_frame_no,
+            max_frame_no
+        );
 
         Ok(Some(DbChangesStatus {
             generation,
@@ -554,12 +563,11 @@ impl<C: ProtocolIO> DatabaseSyncEngine<C> {
     pub async fn push_changes_to_remote(&self, coro: &Coro) -> Result<()> {
         tracing::info!("push_changes(path={})", self.main_db_path);
 
-        let client_id = &self.meta().client_unique_id;
         let (_, change_id) = push_logical_changes(
             coro,
             self.protocol.as_ref(),
             &self.main_tape,
-            client_id,
+            &self.meta().client_unique_id,
             &self.opts.tables_ignore_changes,
         )
         .await?;
@@ -675,6 +683,7 @@ impl<C: ProtocolIO> DatabaseSyncEngine<C> {
             revert_since_wal_checkpoint_seq: 0,
             revert_since_wal_watermark: 0,
             last_pushed_change_id_hint: 0,
+            last_pushed_pull_gen_hint: 0,
         })
     }
 
