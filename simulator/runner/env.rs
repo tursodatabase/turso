@@ -12,6 +12,7 @@ use turso_core::Database;
 use crate::model::table::Table;
 
 use crate::runner::io::SimulatorIO;
+use crate::runner::SimIO;
 
 use super::cli::SimulatorCLI;
 
@@ -61,7 +62,7 @@ impl Deref for SimulatorTables {
 pub(crate) struct SimulatorEnv {
     pub(crate) opts: SimulatorOpts,
     pub(crate) connections: Vec<SimConnection>,
-    pub(crate) io: Arc<SimulatorIO>,
+    pub(crate) io: Arc<dyn SimIO>,
     pub(crate) db: Option<Arc<Database>>,
     pub(crate) rng: ChaCha8Rng,
     pub(crate) paths: Paths,
