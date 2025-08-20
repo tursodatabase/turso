@@ -340,6 +340,23 @@ pub async fn has_table(
     Ok(count > 0)
 }
 
+pub async fn count_local_changes(
+    coro: &Coro,
+    conn: &Arc<turso_core::Connection>,
+    change_id: i64,
+) -> Result<i64> {
+    let mut stmt = conn.prepare("SELECT COUNT(*) FROM turso_cdc WHERE change_id > ?")?;
+    stmt.bind_at(1.try_into().unwrap(), Value::Integer(change_id));
+
+    let count = match run_stmt_expect_one_row(coro, &mut stmt).await? {
+        Some(row) => row[0]
+            .as_int()
+            .ok_or_else(|| Error::DatabaseSyncEngineError("unexpected column type".to_string()))?,
+        _ => panic!("expected single row"),
+    };
+    Ok(count)
+}
+
 pub async fn update_last_change_id(
     coro: &Coro,
     conn: &Arc<turso_core::Connection>,
@@ -492,7 +509,8 @@ pub async fn push_logical_changes<C: ProtocolIO>(
     client: &C,
     source: &DatabaseTape,
     client_id: &str,
-) -> Result<()> {
+    tables_to_ignore: &[String],
+) -> Result<(i64, i64)> {
     tracing::info!("push_logical_changes: client_id={client_id}");
     let source_conn = connect_untracked(source)?;
 
@@ -542,6 +560,9 @@ pub async fn push_logical_changes<C: ProtocolIO>(
                     change.change_id
                 );
                 if change.table_name == TURSO_SYNC_TABLE_NAME {
+                    continue;
+                }
+                if tables_to_ignore.iter().any(|x| &change.table_name == x) {
                     continue;
                 }
                 rows_changed += 1;
@@ -658,9 +679,8 @@ pub async fn push_logical_changes<C: ProtocolIO>(
                 if rows_changed > 0 {
                     tracing::info!("prepare update stmt for turso_sync_last_change_id table with client_id={} and last_change_id={:?}", client_id, last_change_id);
                     // update turso_sync_last_change_id table with new value before commit
-                    let (next_pull_gen, next_change_id) =
-                        (source_pull_gen, last_change_id.unwrap_or(0));
-                    tracing::info!("push_logical_changes: client_id={client_id}, set pull_gen={next_pull_gen}, change_id={next_change_id}, rows_changed={rows_changed}");
+                    let next_change_id = last_change_id.unwrap_or(0);
+                    tracing::info!("push_logical_changes: client_id={client_id}, set pull_gen={source_pull_gen}, change_id={next_change_id}, rows_changed={rows_changed}");
                     sql_over_http_requests.push(Stmt {
                         sql: Some(TURSO_SYNC_UPSERT_LAST_CHANGE_ID.to_string()),
                         sql_id: None,
@@ -669,7 +689,7 @@ pub async fn push_logical_changes<C: ProtocolIO>(
                                 value: client_id.to_string(),
                             },
                             server_proto::Value::Integer {
-                                value: next_pull_gen,
+                                value: source_pull_gen,
                             },
                             server_proto::Value::Integer {
                                 value: next_change_id,
@@ -703,7 +723,7 @@ pub async fn push_logical_changes<C: ProtocolIO>(
 
     let _ = sql_execute_http(coro, client, replay_hrana_request).await?;
     tracing::info!("push_logical_changes: rows_changed={:?}", rows_changed);
-    Ok(())
+    Ok((source_pull_gen, last_change_id.unwrap_or(0)))
 }
 
 pub async fn checkpoint_wal_file(coro: &Coro, conn: &Arc<turso_core::Connection>) -> Result<()> {

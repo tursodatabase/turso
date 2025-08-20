@@ -1,4 +1,5 @@
 use std::{
+    cell::RefCell,
     collections::{HashMap, HashSet},
     sync::Arc,
 };
@@ -9,10 +10,9 @@ use uuid::Uuid;
 use crate::{
     database_replay_generator::DatabaseReplayGenerator,
     database_sync_operations::{
-        connect_untracked, db_bootstrap, fetch_last_change_id, has_table, push_logical_changes,
-        reset_wal_file, update_last_change_id, wait_full_body, wal_apply_from_file,
-        wal_pull_to_file, PAGE_SIZE,
-        WAL_FRAME_HEADER, WAL_FRAME_SIZE,
+        connect_untracked, count_local_changes, db_bootstrap, fetch_last_change_id, has_table,
+        push_logical_changes, reset_wal_file, update_last_change_id, wait_full_body,
+        wal_apply_from_file, wal_pull_to_file, PAGE_SIZE, WAL_FRAME_HEADER, WAL_FRAME_SIZE,
     },
     database_tape::{
         DatabaseChangesIteratorMode, DatabaseChangesIteratorOpts, DatabaseReplaySession,
@@ -33,6 +33,7 @@ use crate::{
 #[derive(Debug, Clone)]
 pub struct DatabaseSyncEngineOpts {
     pub client_name: String,
+    pub tables_ignore_changes: Vec<String>,
     pub wal_pull_batch_size: u64,
 }
 
@@ -45,7 +46,7 @@ pub struct DatabaseSyncEngine<P: ProtocolIO> {
     main_db_path: String,
     meta_path: String,
     opts: DatabaseSyncEngineOpts,
-    meta: Option<DatabaseMetadata>,
+    meta: RefCell<Option<DatabaseMetadata>>,
 }
 
 async fn update_meta<IO: ProtocolIO>(
@@ -122,7 +123,7 @@ impl<C: ProtocolIO> DatabaseSyncEngine<C> {
             main_db_path: main_db_path.to_string(),
             meta_path: format!("{main_db_path}-info"),
             opts,
-            meta: None,
+            meta: RefCell::new(None),
         };
         db.init(coro).await?;
         Ok(db)
@@ -165,7 +166,7 @@ impl<C: ProtocolIO> DatabaseSyncEngine<C> {
                 coro,
                 self.protocol.as_ref(),
                 &self.meta_path,
-                &mut self.meta,
+                &mut self.meta.borrow_mut(),
                 |meta| {
                     meta.revert_since_wal_watermark = 0;
                     meta.revert_since_wal_checkpoint_seq = main_wal_state.checkpoint_seq_no;
@@ -194,7 +195,10 @@ impl<C: ProtocolIO> DatabaseSyncEngine<C> {
 
     pub async fn count_local_changes(&self, coro: &Coro) -> Result<DbLocalChangesCount> {
         let main_conn = connect_untracked(&self.main_tape)?;
-        todo!()
+        let change_id = self.meta().last_pushed_change_id_hint;
+        Ok(DbLocalChangesCount {
+            cdc_operations: count_local_changes(coro, &main_conn, change_id).await?,
+        })
     }
 
     pub async fn checkpoint(&mut self, coro: &Coro) -> Result<()> {
@@ -283,7 +287,7 @@ impl<C: ProtocolIO> DatabaseSyncEngine<C> {
             coro,
             self.protocol.as_ref(),
             &self.meta_path,
-            &mut self.meta,
+            &mut self.meta.borrow_mut(),
             |meta| {
                 meta.revert_since_wal_checkpoint_seq = main_wal_state.checkpoint_seq_no;
                 meta.revert_since_wal_watermark = main_wal_state.max_frame;
@@ -354,7 +358,7 @@ impl<C: ProtocolIO> DatabaseSyncEngine<C> {
         coro: &Coro,
         remote_changes: DbChangesStatus,
     ) -> Result<()> {
-        let pull_result = self.pull_changes_internal(coro, &remote_changes).await;
+        let pull_result = self.apply_changes_internal(coro, &remote_changes).await;
         let cleanup_result: Result<()> = self
             .io
             .remove_file(&remote_changes.file_path)
@@ -375,24 +379,25 @@ impl<C: ProtocolIO> DatabaseSyncEngine<C> {
             coro,
             self.protocol.as_ref(),
             &self.meta_path,
-            &mut self.meta,
+            &mut self.meta.borrow_mut(),
             |meta| {
                 meta.revert_since_wal_watermark = revert_since_wal_watermark;
                 meta.synced_frame_no = Some(remote_changes.max_frame_no);
                 meta.synced_generation = remote_changes.generation;
+                meta.last_pushed_change_id_hint = 0;
             },
         )
         .await?;
 
         cleanup_result
     }
-    async fn pull_changes_internal(
+    async fn apply_changes_internal(
         &mut self,
         coro: &Coro,
         remote_changes: &DbChangesStatus,
     ) -> Result<u64> {
         tracing::info!(
-            "pull_changes(path={}, changes={:?})",
+            "apply_changes(path={}, changes={:?})",
             self.main_db_path,
             remote_changes
         );
@@ -447,14 +452,14 @@ impl<C: ProtocolIO> DatabaseSyncEngine<C> {
             }
         }
         tracing::info!(
-            "pull_changes(path={}): collected {} changes",
+            "apply_changes(path={}): collected {} changes",
             self.main_db_path,
             local_changes.len()
         );
 
         // rollback local changes not checkpointed to the revert-db
         tracing::info!(
-            "pull_changes(path={}): rolling back frames after {} watermark, max_frame={}",
+            "apply_changes(path={}): rolling back frames after {} watermark, max_frame={}",
             self.main_db_path,
             watermark,
             main_conn.wal_state()?.max_frame
@@ -463,7 +468,7 @@ impl<C: ProtocolIO> DatabaseSyncEngine<C> {
         let mut frame = [0u8; WAL_FRAME_SIZE];
 
         tracing::info!(
-            "pull_changes(path={}): rolling back {} frames from revert DB",
+            "apply_changes(path={}): rolling back {} frames from revert DB",
             self.main_db_path,
             revert_conn.wal_state()?.max_frame
         );
@@ -478,7 +483,7 @@ impl<C: ProtocolIO> DatabaseSyncEngine<C> {
         // after rollback - WAL state is aligned with remote - let's apply changes from it
         let db_size = wal_apply_from_file(coro, changes_file, &mut main_session).await?;
         tracing::info!(
-            "pull_changes(path={}): applied changes from remote: db_size={}",
+            "apply_changes(path={}): applied changes from remote: db_size={}",
             self.main_db_path,
             db_size,
         );
@@ -497,7 +502,7 @@ impl<C: ProtocolIO> DatabaseSyncEngine<C> {
             let final_schema_version = current_schema_version.max(main_conn_schema_version) + 1;
             main_conn.write_schema_version(final_schema_version)?;
             tracing::info!(
-                "pull_changes(path={}): updated schema version to {}",
+                "apply_changes(path={}): updated schema version to {}",
                 self.main_db_path,
                 final_schema_version
             );
@@ -513,7 +518,7 @@ impl<C: ProtocolIO> DatabaseSyncEngine<C> {
 
             if has_cdc_table {
                 tracing::info!(
-                    "pull_changes(path={}): initiate CDC pragma again in order to recreate CDC table",
+                    "apply_changes(path={}): initiate CDC pragma again in order to recreate CDC table",
                     self.main_db_path,
                 );
                 let _ = main_conn.pragma_update(CDC_PRAGMA_NAME, "'full'")?;
@@ -550,7 +555,25 @@ impl<C: ProtocolIO> DatabaseSyncEngine<C> {
         tracing::info!("push_changes(path={})", self.main_db_path);
 
         let client_id = &self.meta().client_unique_id;
-        push_logical_changes(coro, self.protocol.as_ref(), &self.main_tape, client_id).await?;
+        let (_, change_id) = push_logical_changes(
+            coro,
+            self.protocol.as_ref(),
+            &self.main_tape,
+            client_id,
+            &self.opts.tables_ignore_changes,
+        )
+        .await?;
+
+        update_meta(
+            coro,
+            self.protocol.as_ref(),
+            &self.meta_path,
+            &mut self.meta.borrow_mut(),
+            |m| {
+                m.last_pushed_change_id_hint = change_id;
+            },
+        )
+        .await?;
 
         Ok(())
     }
@@ -587,7 +610,7 @@ impl<C: ProtocolIO> DatabaseSyncEngine<C> {
 
         match meta {
             Some(meta) => {
-                self.meta = Some(meta);
+                self.meta.replace(Some(meta));
             }
             None => {
                 let meta = self.bootstrap_db_file(coro).await?;
@@ -596,7 +619,7 @@ impl<C: ProtocolIO> DatabaseSyncEngine<C> {
                     coro,
                     self.protocol.as_ref(),
                     &self.meta_path,
-                    &mut self.meta,
+                    &mut self.meta.borrow_mut(),
                     meta,
                 )
                 .await?;
@@ -620,7 +643,7 @@ impl<C: ProtocolIO> DatabaseSyncEngine<C> {
 
     async fn bootstrap_db_file(&mut self, coro: &Coro) -> Result<DatabaseMetadata> {
         assert!(
-            self.meta.is_none(),
+            self.meta.borrow().is_none(),
             "bootstrap_db_file must be called only when meta is not set"
         );
         tracing::info!("bootstrap_db_file(path={})", self.main_db_path);
@@ -651,10 +674,13 @@ impl<C: ProtocolIO> DatabaseSyncEngine<C> {
             synced_frame_no: None,
             revert_since_wal_checkpoint_seq: 0,
             revert_since_wal_watermark: 0,
+            last_pushed_change_id_hint: 0,
         })
     }
 
-    fn meta(&self) -> &DatabaseMetadata {
-        self.meta.as_ref().expect("metadata must be set")
+    fn meta(&self) -> std::cell::Ref<'_, DatabaseMetadata> {
+        std::cell::Ref::map(self.meta.borrow(), |x| {
+            x.as_ref().expect("metadata must be set")
+        })
     }
 }

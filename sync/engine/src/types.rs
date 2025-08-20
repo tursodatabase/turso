@@ -25,7 +25,7 @@ pub struct DbChangesStatus {
 }
 
 pub struct DbLocalChangesCount {
-    pub cdc_operations: u64,
+    pub cdc_operations: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -46,6 +46,8 @@ pub struct DatabaseMetadata {
     /// pair of frame_no for Draft and Synced DB such that content of the database file up to these frames is identical
     pub revert_since_wal_checkpoint_seq: u32,
     pub revert_since_wal_watermark: u64,
+    pub last_pushed_pull_gen_hint: i64,
+    pub last_pushed_change_id_hint: i64,
 }
 
 impl DatabaseMetadata {
