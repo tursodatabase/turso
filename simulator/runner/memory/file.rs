@@ -14,6 +14,8 @@ use crate::runner::{
 };
 
 pub struct MemorySimFile {
+    // TODO: maybe have a pending queue which is fast to append
+    // and then we just do a mem swap the pending with the callback to minimize lock contention on callback queue
     pub callbacks: CallbackQueue,
     pub fd: Arc<Fd>,
     pub buffer: RefCell<Vec<u8>>,
@@ -158,6 +160,15 @@ impl File for MemorySimFile {
     }
 
     fn truncate(&self, len: usize, c: Completion) -> Result<Completion> {
-        todo!()
+        let op = OperationType::Truncate {
+            fd: self.fd.clone(),
+            completion: c.clone(),
+            len,
+        };
+        self.callbacks.lock().push(Operation {
+            time: self.generate_latency(),
+            op,
+        });
+        Ok(c)
     }
 }
