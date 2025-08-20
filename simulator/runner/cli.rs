@@ -135,6 +135,12 @@ pub struct SimulatorCLI {
         default_value_t = false
     )]
     pub keep_files: bool,
+    #[clap(
+        long,
+        help = "Use memory IO for complex simulations",
+        default_value_t = false
+    )]
+    pub memory_io: bool,
 }
 
 #[derive(Parser, Debug, Clone, Serialize, Deserialize, PartialEq, PartialOrd, Eq, Ord)]
