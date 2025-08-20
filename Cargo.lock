@@ -3957,6 +3957,7 @@ name = "turso_cli"
 version = "0.1.4"
 dependencies = [
  "anyhow",
+ "base64",
  "cfg-if",
  "clap",
  "clap_complete",
