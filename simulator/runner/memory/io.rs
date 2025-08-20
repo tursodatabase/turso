@@ -152,12 +152,12 @@ impl MemorySimIO {
         latency_probability: usize,
         min_tick: u64,
         max_tick: u64,
-    ) -> Result<Self> {
+    ) -> Self {
         let fault = Cell::new(false);
         let files = RefCell::new(IndexMap::new());
         let rng = RefCell::new(ChaCha8Rng::seed_from_u64(seed));
         let nr_run_once_faults = Cell::new(0);
-        Ok(Self {
+        Self {
             callbacks: Arc::new(Mutex::new(Vec::new())),
             timeouts: Arc::new(Mutex::new(Vec::new())),
             fault,
@@ -172,7 +172,7 @@ impl MemorySimIO {
                 min_tick,
                 max_tick,
             )),
-        })
+        }
     }
 }
 
