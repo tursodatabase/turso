@@ -30,6 +30,11 @@ pub enum OperationType {
         fd: Arc<Fd>,
         completion: Completion,
     },
+    Truncate {
+        fd: Arc<Fd>,
+        completion: Completion,
+        len: usize,
+    },
 }
 
 impl OperationType {
@@ -37,7 +42,8 @@ impl OperationType {
         match self {
             OperationType::Read { fd, .. }
             | OperationType::Write { fd, .. }
-            | OperationType::Sync { fd, .. } => fd,
+            | OperationType::Sync { fd, .. }
+            | OperationType::Truncate { fd, .. } => fd,
         }
     }
 }
@@ -45,6 +51,7 @@ impl OperationType {
 pub struct Operation {
     pub time: Option<turso_core::Instant>,
     pub op: OperationType,
+    // TODO: add a fault field here to signal if an Operation should fault
 }
 
 impl Operation {
@@ -96,6 +103,16 @@ impl Operation {
             }
             OperationType::Sync { completion, .. } => {
                 // There is no Sync for in memory
+                completion.complete(0);
+            }
+            OperationType::Truncate {
+                fd,
+                completion,
+                len,
+            } => {
+                let file = files.get(fd.as_str()).unwrap();
+                let mut file_buf = file.buffer.borrow_mut();
+                file_buf.truncate(len);
                 completion.complete(0);
             }
         }
@@ -223,11 +240,6 @@ impl IO for MemorySimIO {
         if self.fault.get() {
             self.nr_run_once_faults
                 .replace(self.nr_run_once_faults.get() + 1);
-            // TODO: currently we only deal with single threaded execution in one file
-            // When we support multiple db files, we need to only remove callbacks not relevant to the current file
-            // and maybe connection
-            callbacks.clear();
-            timeouts.clear();
             return Err(turso_core::LimboError::InternalError(
                 FAULT_ERROR_MSG.into(),
             ));
@@ -239,6 +251,7 @@ impl IO for MemorySimIO {
 
         while let Some(callback) = callbacks.pop() {
             if callback.time.is_none() || callback.time.is_some_and(|time| time < now) {
+                // TODO: check if we should inject fault in operation here
                 callback.do_operation(&files);
             } else {
                 timeouts.push(callback);
