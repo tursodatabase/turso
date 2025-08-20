@@ -17,7 +17,7 @@ use crate::vdbe::insn::Insn;
 use crate::{schema::Schema, vdbe::builder::ProgramBuilder, Result};
 use crate::{Connection, SymbolTable};
 use std::sync::Arc;
-use turso_sqlite3_parser::ast::{self, CompoundSelect, Expr, SortOrder};
+use turso_sqlite3_parser::ast::{self, CompoundSelect, Expr, SortOrder, SortedColumn};
 use turso_sqlite3_parser::ast::{ResultColumn, SelectInner};
 
 pub struct TranslateSelectResult {
@@ -119,7 +119,7 @@ pub fn prepare_select_plan(
                 schema,
                 *select.body.select,
                 None,
-                None,
+                select.order_by.clone(),
                 None,
                 syms,
                 outer_query_refs,
@@ -129,13 +129,17 @@ pub fn prepare_select_plan(
             )?;
 
             let mut left = Vec::with_capacity(compounds.len());
-            for CompoundSelect { select, operator } in compounds {
+            for CompoundSelect {
+                select: s,
+                operator,
+            } in compounds
+            {
                 left.push((last, operator));
                 last = prepare_one_select_plan(
                     schema,
-                    *select,
+                    *s,
                     None,
-                    None,
+                    select.order_by.clone(),
                     None,
                     syms,
                     outer_query_refs,
@@ -154,10 +158,8 @@ pub fn prepare_select_plan(
             }
             let (limit, offset) = select.limit.map_or(Ok((None, None)), |l| parse_limit(&l))?;
 
-            // FIXME: handle ORDER BY for compound selects
-            if select.order_by.is_some() {
-                crate::bail_parse_error!("ORDER BY is not supported for compound SELECTs yet");
-            }
+            let order_by = parse_order_by(&mut last, schema, select.order_by, connection)?;
+
             // FIXME: handle WITH for compound selects
             if select.with.is_some() {
                 crate::bail_parse_error!("WITH is not supported for compound SELECTs yet");
@@ -167,7 +169,7 @@ pub fn prepare_select_plan(
                 right_most: last,
                 limit,
                 offset,
-                order_by: None,
+                order_by,
             })
         }
     }
@@ -600,28 +602,7 @@ fn prepare_one_select_plan(
 
             plan.aggregates = aggregate_expressions;
 
-            // Parse the ORDER BY clause
-            if let Some(order_by) = order_by {
-                let mut key = Vec::new();
-
-                for mut o in order_by {
-                    replace_column_number_with_copy_of_column_expr(
-                        &mut o.expr,
-                        &plan.result_columns,
-                    )?;
-
-                    bind_column_references(
-                        &mut o.expr,
-                        &mut plan.table_references,
-                        Some(&plan.result_columns),
-                        connection,
-                    )?;
-                    resolve_aggregates(schema, &o.expr, &mut plan.aggregates)?;
-
-                    key.push((o.expr, o.order.unwrap_or(ast::SortOrder::Asc)));
-                }
-                plan.order_by = Some(key);
-            }
+            plan.order_by = parse_order_by(&mut plan, schema, order_by, connection)?;
 
             // Parse the LIMIT/OFFSET clause
             (plan.limit, plan.offset) = limit.map_or(Ok((None, None)), parse_limit)?;
@@ -659,6 +640,34 @@ fn prepare_one_select_plan(
             Ok(plan)
         }
     }
+}
+
+fn parse_order_by(
+    plan: &mut SelectPlan,
+    schema: &Schema,
+    order_by: Option<Vec<SortedColumn>>,
+    connection: &Arc<Connection>,
+) -> Result<Option<Vec<(Expr, SortOrder)>>> {
+    if let Some(order_by) = order_by {
+        let mut key = Vec::new();
+
+        for mut o in order_by {
+            replace_column_number_with_copy_of_column_expr(&mut o.expr, &plan.result_columns)?;
+
+            bind_column_references(
+                &mut o.expr,
+                &mut plan.table_references,
+                Some(&plan.result_columns),
+                connection,
+            )?;
+            resolve_aggregates(schema, &o.expr, &mut plan.aggregates)?;
+
+            key.push((o.expr, o.order.unwrap_or(SortOrder::Asc)));
+        }
+
+        return Ok(Some(key));
+    }
+    Ok(None)
 }
 
 fn add_vtab_predicates_to_where_clause(
