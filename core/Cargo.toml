@@ -61,7 +61,7 @@ libm = "0.2"
 turso_macros = { workspace = true }
 miette = "7.6.0"
 strum = { workspace = true }
-parking_lot = "0.12.3"
+parking_lot = { workspace = true }
 crossbeam-skiplist = "0.1.3"
 tracing = "0.1.41"
 ryu = "1.0.19"

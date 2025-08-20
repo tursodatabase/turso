@@ -63,6 +63,7 @@ serde_json = "1.0"
 anyhow = "1.0.98"
 mimalloc = { version = "0.1.47", default-features = false }
 rusqlite = { version = "0.37.0", features = ["bundled"] }
+parking_lot = "0.12.4"
 
 [profile.release]
 debug = "line-tables-only"
