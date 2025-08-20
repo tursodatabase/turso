@@ -26,6 +26,12 @@ pub enum OperationType {
         completion: Completion,
         offset: usize,
     },
+    WriteV {
+        fd: Arc<Fd>,
+        buffers: Vec<Arc<turso_core::Buffer>>,
+        completion: Completion,
+        offset: usize,
+    },
     Sync {
         fd: Arc<Fd>,
         completion: Completion,
@@ -42,6 +48,7 @@ impl OperationType {
         match self {
             OperationType::Read { fd, .. }
             | OperationType::Write { fd, .. }
+            | OperationType::WriteV { fd, .. }
             | OperationType::Sync { fd, .. }
             | OperationType::Truncate { fd, .. } => fd,
         }
@@ -81,25 +88,26 @@ impl Operation {
                 offset,
             } => {
                 let file = files.get(fd.as_str()).unwrap();
-                let buf_size = {
-                    let mut file_buf = file.buffer.borrow_mut();
-                    let buf = buffer.as_slice();
-                    let more_space = if file_buf.len() < offset {
-                        (offset + buf.len()) - file_buf.len()
-                    } else {
-                        buf.len().saturating_sub(file_buf.len() - offset)
-                    };
-                    if more_space > 0 {
-                        file_buf.reserve(more_space);
-                        for _ in 0..more_space {
-                            file_buf.push(0);
-                        }
-                    }
-
-                    file_buf[offset..][0..buf.len()].copy_from_slice(buf);
-                    buf.len() as i32
-                };
-                completion.complete(buf_size);
+                let buf_size = file.write_buf(buffer.as_slice(), offset);
+                completion.complete(buf_size as i32);
+            }
+            OperationType::WriteV {
+                fd,
+                buffers,
+                completion,
+                offset,
+            } => {
+                if buffers.is_empty() {
+                    return;
+                }
+                let file = files.get(fd.as_str()).unwrap();
+                let mut pos = offset;
+                let written = buffers.into_iter().fold(0, |written, buffer| {
+                    let buf_size = file.write_buf(buffer.as_slice(), pos);
+                    pos += buf_size;
+                    written + buf_size
+                });
+                completion.complete(written as i32);
             }
             OperationType::Sync { completion, .. } => {
                 // There is no Sync for in memory
