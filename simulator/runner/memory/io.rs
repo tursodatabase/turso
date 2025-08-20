@@ -186,8 +186,12 @@ impl SimIO for MemorySimIO {
 
     fn print_stats(&self) {
         tracing::info!("run_once faults: {}", self.nr_run_once_faults.get());
-        for file in self.files.borrow().values() {
-            tracing::info!("\n===========================\n{}", file.stats_table());
+        for (path, file) in self.files.borrow().iter() {
+            tracing::info!(
+                "\n===========================\n\nPath: {}\n{}",
+                path,
+                file.stats_table()
+            );
         }
     }
 
