@@ -4869,7 +4869,11 @@ impl BTreeCursor {
                         self.overflow_state = OverflowState::ProcessPage {
                             next_page: page.get(),
                         };
-                        io_yield_one!(c);
+                        if c.is_completed() {
+                            continue;
+                        } else {
+                            io_yield_one!(c);
+                        }
                     } else {
                         self.overflow_state = OverflowState::Done;
                     }
@@ -4901,7 +4905,11 @@ impl BTreeCursor {
                         self.overflow_state = OverflowState::ProcessPage {
                             next_page: page.get(),
                         };
-                        io_yield_one!(c);
+                        if c.is_completed() {
+                            continue;
+                        } else {
+                            io_yield_one!(c);
+                        }
                     } else {
                         self.overflow_state = OverflowState::Done;
                     }
