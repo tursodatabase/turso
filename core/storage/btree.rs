@@ -2114,7 +2114,11 @@ impl BTreeCursor {
                     self.move_to_state = MoveToState::MoveToPage;
                     if matches!(self.seek_state, CursorSeekState::Start) {
                         let c = self.move_to_root()?;
-                        io_yield_one!(c);
+                        if c.is_completed() {
+                            continue;
+                        } else {
+                            io_yield_one!(c);
+                        }
                     }
                 }
                 MoveToState::MoveToPage => {
