@@ -10,7 +10,7 @@ use uuid::Uuid;
 use crate::{
     database_replay_generator::DatabaseReplayGenerator,
     database_sync_operations::{
-        connect_untracked, count_local_changes, db_bootstrap, fetch_last_change_id, has_table,
+        bootstrap_db_file, connect_untracked, count_local_changes, fetch_last_change_id, has_table,
         push_logical_changes, reset_wal_file, update_last_change_id, wait_full_body,
         wal_apply_from_file, wal_pull_to_file, PAGE_SIZE, WAL_FRAME_HEADER, WAL_FRAME_SIZE,
     },
@@ -23,21 +23,37 @@ use crate::{
     io_operations::IoOperations,
     protocol_io::ProtocolIO,
     types::{
-        Coro, DatabaseMetadata, DatabaseTapeOperation, DbChangesStatus, DbLocalChangesCount,
-        DbSyncStatus,
+        Coro, DatabaseMetadata, DatabaseRowMutation, DatabaseRowStatement, DatabaseTapeOperation,
+        DbChangesStatus, DbLocalChangesCount, DbSyncStatus,
     },
     wal_session::WalSession,
     Result,
 };
 
-#[derive(Debug, Clone)]
-pub struct DatabaseSyncEngineOpts {
+#[derive(Clone)]
+pub struct DatabaseSyncEngineOpts<Ctx> {
     pub client_name: String,
     pub tables_ignore_changes: Vec<String>,
+    pub transform_mutation:
+        Option<Arc<dyn Fn(&Ctx, DatabaseRowMutation) -> Option<DatabaseRowStatement> + 'static>>,
     pub wal_pull_batch_size: u64,
 }
 
-pub struct DatabaseSyncEngine<P: ProtocolIO> {
+impl<Ctx> std::fmt::Debug for DatabaseSyncEngineOpts<Ctx> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DatabaseSyncEngineOpts")
+            .field("client_name", &self.client_name)
+            .field("tables_ignore_changes", &self.tables_ignore_changes)
+            .field(
+                "transform_mutation.is_some()",
+                &self.transform_mutation.is_some(),
+            )
+            .field("wal_pull_batch_size", &self.wal_pull_batch_size)
+            .finish()
+    }
+}
+
+pub struct DatabaseSyncEngine<P: ProtocolIO, Ctx> {
     io: Arc<dyn turso_core::IO>,
     protocol: Arc<P>,
     db_file: Arc<dyn turso_core::DatabaseStorage>,
@@ -45,59 +61,65 @@ pub struct DatabaseSyncEngine<P: ProtocolIO> {
     revert_db_wal_path: String,
     main_db_path: String,
     meta_path: String,
-    opts: DatabaseSyncEngineOpts,
-    meta: RefCell<Option<DatabaseMetadata>>,
-}
-
-async fn update_meta<IO: ProtocolIO>(
-    coro: &Coro,
-    io: &IO,
-    meta_path: &str,
-    orig: &mut Option<DatabaseMetadata>,
-    update: impl FnOnce(&mut DatabaseMetadata),
-) -> Result<()> {
-    let mut meta = orig.as_ref().unwrap().clone();
-    update(&mut meta);
-    tracing::info!("update_meta: {meta:?}");
-    let completion = io.full_write(meta_path, meta.dump()?)?;
-    // todo: what happen if we will actually update the metadata on disk but fail and so in memory state will not be updated
-    wait_full_body(coro, &completion).await?;
-    *orig = Some(meta);
-    Ok(())
-}
-
-async fn set_meta<IO: ProtocolIO>(
-    coro: &Coro,
-    io: &IO,
-    meta_path: &str,
-    orig: &mut Option<DatabaseMetadata>,
-    meta: DatabaseMetadata,
-) -> Result<()> {
-    tracing::info!("set_meta: {meta:?}");
-    let completion = io.full_write(meta_path, meta.dump()?)?;
-    // todo: what happen if we will actually update the metadata on disk but fail and so in memory state will not be updated
-    wait_full_body(coro, &completion).await?;
-    *orig = Some(meta);
-    Ok(())
+    opts: DatabaseSyncEngineOpts<Ctx>,
+    meta: RefCell<DatabaseMetadata>,
 }
 
 fn db_size_from_page(page: &[u8]) -> u32 {
     u32::from_be_bytes(page[28..28 + 4].try_into().unwrap())
 }
 
-impl<C: ProtocolIO> DatabaseSyncEngine<C> {
+impl<P: ProtocolIO, Ctx> DatabaseSyncEngine<P, Ctx> {
     /// Creates new instance of SyncEngine and initialize it immediately if no consistent local data exists
     pub async fn new(
-        coro: &Coro,
+        coro: &Coro<Ctx>,
         io: Arc<dyn turso_core::IO>,
-        protocol: Arc<C>,
+        protocol: Arc<P>,
         main_db_path: &str,
-        opts: DatabaseSyncEngineOpts,
+        opts: DatabaseSyncEngineOpts<Ctx>,
     ) -> Result<Self> {
         let revert_db_wal_path = format!("{main_db_path}-wal-revert");
+        let meta_path = format!("{main_db_path}-info");
 
         let db_file = io.open_file(main_db_path, turso_core::OpenFlags::Create, false)?;
         let db_file = Arc::new(turso_core::storage::database::DatabaseFile::new(db_file));
+
+        tracing::info!("init(path={}): opts={:?}", main_db_path, opts);
+
+        let completion = protocol.full_read(&meta_path)?;
+        let data = wait_full_body(coro, &completion).await?;
+        let meta = if data.is_empty() {
+            None
+        } else {
+            Some(DatabaseMetadata::load(&data)?)
+        };
+
+        let meta = match meta {
+            Some(meta) => meta,
+            None => {
+                let client_unique_id = format!("{}-{}", opts.client_name, uuid::Uuid::new_v4());
+                let meta = bootstrap_db_file(
+                    coro,
+                    protocol.as_ref(),
+                    &io,
+                    client_unique_id,
+                    &main_db_path,
+                )
+                .await?;
+                tracing::info!("write meta after successful bootstrap: meta={meta:?}");
+                let completion = protocol.full_write(&meta_path, meta.dump()?)?;
+                // todo: what happen if we will actually update the metadata on disk but fail and so in memory state will not be updated
+                wait_full_body(coro, &completion).await?;
+                meta
+            }
+        };
+
+        let main_exists = io.try_open(&main_db_path)?.is_some();
+        if !main_exists {
+            let error = "main DB file doesn't exists, but metadata is".to_string();
+            return Err(Error::DatabaseSyncEngineError(error));
+        }
+
         let main_db = turso_core::Database::open_with_flags(
             io.clone(),
             main_db_path,
@@ -123,9 +145,15 @@ impl<C: ProtocolIO> DatabaseSyncEngine<C> {
             main_db_path: main_db_path.to_string(),
             meta_path: format!("{main_db_path}-info"),
             opts,
-            meta: RefCell::new(None),
+            meta: RefCell::new(meta),
         };
-        db.init(coro).await?;
+
+        if db.meta().synced_frame_no.is_none() {
+            // sync WAL from the remote in case of bootstrap - all subsequent initializations will be fast
+            if let Some(changes) = db.wait_changes_from_remote(coro).await? {
+                db.apply_changes_from_remote(coro, changes).await?;
+            }
+        }
         Ok(db)
     }
 
@@ -145,7 +173,7 @@ impl<C: ProtocolIO> DatabaseSyncEngine<C> {
         Ok(conn)
     }
 
-    async fn checkpoint_passive(&mut self, coro: &Coro) -> Result<u64> {
+    async fn checkpoint_passive(&mut self, coro: &Coro<Ctx>) -> Result<u64> {
         let watermark = self.meta().revert_since_wal_watermark as u64;
         tracing::debug!(
             "checkpoint(path={:?}): revert_since_wal_watermark={}",
@@ -162,16 +190,10 @@ impl<C: ProtocolIO> DatabaseSyncEngine<C> {
         assert!(main_wal_state.checkpoint_seq_no >= self.meta().revert_since_wal_checkpoint_seq);
 
         if main_wal_state.checkpoint_seq_no > self.meta().revert_since_wal_checkpoint_seq {
-            update_meta(
-                coro,
-                self.protocol.as_ref(),
-                &self.meta_path,
-                &mut self.meta.borrow_mut(),
-                |meta| {
-                    meta.revert_since_wal_watermark = 0;
-                    meta.revert_since_wal_checkpoint_seq = main_wal_state.checkpoint_seq_no;
-                },
-            )
+            self.update_meta(coro, |meta| {
+                meta.revert_since_wal_watermark = 0;
+                meta.revert_since_wal_checkpoint_seq = main_wal_state.checkpoint_seq_no;
+            })
             .await?;
             return Ok(0);
         }
@@ -193,7 +215,7 @@ impl<C: ProtocolIO> DatabaseSyncEngine<C> {
         Ok(watermark)
     }
 
-    pub async fn count_local_changes(&self, coro: &Coro) -> Result<DbLocalChangesCount> {
+    pub async fn count_local_changes(&self, coro: &Coro<Ctx>) -> Result<DbLocalChangesCount> {
         let main_conn = connect_untracked(&self.main_tape)?;
         let change_id = self.meta().last_pushed_change_id_hint;
         Ok(DbLocalChangesCount {
@@ -201,7 +223,7 @@ impl<C: ProtocolIO> DatabaseSyncEngine<C> {
         })
     }
 
-    pub async fn checkpoint(&mut self, coro: &Coro) -> Result<()> {
+    pub async fn checkpoint(&mut self, coro: &Coro<Ctx>) -> Result<()> {
         let watermark = self.checkpoint_passive(coro).await?;
 
         let main_conn = connect_untracked(&self.main_tape)?;
@@ -283,16 +305,10 @@ impl<C: ProtocolIO> DatabaseSyncEngine<C> {
             revert_session.commit(db_size)?;
             revert_session.wal_session.end(false)?;
         }
-        update_meta(
-            coro,
-            self.protocol.as_ref(),
-            &self.meta_path,
-            &mut self.meta.borrow_mut(),
-            |meta| {
-                meta.revert_since_wal_checkpoint_seq = main_wal_state.checkpoint_seq_no;
-                meta.revert_since_wal_watermark = main_wal_state.max_frame;
-            },
-        )
+        self.update_meta(coro, |meta| {
+            meta.revert_since_wal_checkpoint_seq = main_wal_state.checkpoint_seq_no;
+            meta.revert_since_wal_watermark = main_wal_state.max_frame;
+        })
         .await?;
 
         let result = main_conn.checkpoint(turso_core::CheckpointMode::Truncate {
@@ -307,7 +323,10 @@ impl<C: ProtocolIO> DatabaseSyncEngine<C> {
         Ok(())
     }
 
-    pub async fn wait_changes_from_remote(&self, coro: &Coro) -> Result<Option<DbChangesStatus>> {
+    pub async fn wait_changes_from_remote(
+        &self,
+        coro: &Coro<Ctx>,
+    ) -> Result<Option<DbChangesStatus>> {
         let file_path = format!("{}-frames-{}", self.main_db_path, Uuid::new_v4());
         tracing::info!(
             "wait_changes(path={}): file_path={}",
@@ -364,7 +383,7 @@ impl<C: ProtocolIO> DatabaseSyncEngine<C> {
     /// This method will block writes for the period of pull
     pub async fn apply_changes_from_remote(
         &mut self,
-        coro: &Coro,
+        coro: &Coro<Ctx>,
         remote_changes: DbChangesStatus,
     ) -> Result<()> {
         let pull_result = self.apply_changes_internal(coro, &remote_changes).await;
@@ -384,25 +403,19 @@ impl<C: ProtocolIO> DatabaseSyncEngine<C> {
         )?;
         reset_wal_file(coro, revert_wal_file, 0).await?;
 
-        update_meta(
-            coro,
-            self.protocol.as_ref(),
-            &self.meta_path,
-            &mut self.meta.borrow_mut(),
-            |meta| {
-                meta.revert_since_wal_watermark = revert_since_wal_watermark;
-                meta.synced_frame_no = Some(remote_changes.max_frame_no);
-                meta.synced_generation = remote_changes.generation;
-                meta.last_pushed_change_id_hint = 0;
-            },
-        )
+        self.update_meta(coro, |meta| {
+            meta.revert_since_wal_watermark = revert_since_wal_watermark;
+            meta.synced_frame_no = Some(remote_changes.max_frame_no);
+            meta.synced_generation = remote_changes.generation;
+            meta.last_pushed_change_id_hint = 0;
+        })
         .await?;
 
         cleanup_result
     }
     async fn apply_changes_internal(
         &mut self,
-        coro: &Coro,
+        coro: &Coro<Ctx>,
         remote_changes: &DbChangesStatus,
     ) -> Result<u64> {
         tracing::info!(
@@ -428,7 +441,7 @@ impl<C: ProtocolIO> DatabaseSyncEngine<C> {
         let mut main_session = WalSession::new(main_conn.clone());
         main_session.begin()?;
 
-        let has_cdc_table = has_table(coro, &main_conn, "turso_cdc").await?;
+        let had_cdc_table = has_table(coro, &main_conn, "turso_cdc").await?;
 
         // read schema version after initiating WAL session (in order to read it with consistent max_frame_no)
         let main_conn_schema_version = main_conn.read_schema_version()?;
@@ -498,11 +511,11 @@ impl<C: ProtocolIO> DatabaseSyncEngine<C> {
         );
 
         let revert_since_wal_watermark;
-        if local_changes.is_empty() && local_rollback == 0 && remote_rollback == 0 && !has_cdc_table
+        if local_changes.is_empty() && local_rollback == 0 && remote_rollback == 0 && !had_cdc_table
         {
             main_session.commit(db_size)?;
             revert_since_wal_watermark = main_session.frames_count()?;
-            main_session.wal_session.end(true)?;
+            main_session.wal_session.end(false)?;
         } else {
             main_session.commit(0)?;
 
@@ -525,7 +538,7 @@ impl<C: ProtocolIO> DatabaseSyncEngine<C> {
             )
             .await?;
 
-            if has_cdc_table {
+            if had_cdc_table {
                 tracing::info!(
                     "apply_changes(path={}): initiate CDC pragma again in order to recreate CDC table",
                     self.main_db_path,
@@ -539,10 +552,11 @@ impl<C: ProtocolIO> DatabaseSyncEngine<C> {
                 cached_insert_stmt: HashMap::new(),
                 cached_update_stmt: HashMap::new(),
                 in_txn: true,
-                generator: DatabaseReplayGenerator {
+                generator: DatabaseReplayGenerator::<Ctx> {
                     conn: main_conn.clone(),
-                    opts: DatabaseReplaySessionOpts {
+                    opts: DatabaseReplaySessionOpts::<Ctx> {
                         use_implicit_rowid: false,
+                        transform_mutation: self.opts.transform_mutation.clone(),
                     },
                 },
             };
@@ -560,7 +574,7 @@ impl<C: ProtocolIO> DatabaseSyncEngine<C> {
     /// Sync local changes to remote DB
     /// This method will **not** pull remote changes to the local DB
     /// This method will **not** block writes for the period of sync
-    pub async fn push_changes_to_remote(&self, coro: &Coro) -> Result<()> {
+    pub async fn push_changes_to_remote(&self, coro: &Coro<Ctx>) -> Result<()> {
         tracing::info!("push_changes(path={})", self.main_db_path);
 
         let (_, change_id) = push_logical_changes(
@@ -568,26 +582,20 @@ impl<C: ProtocolIO> DatabaseSyncEngine<C> {
             self.protocol.as_ref(),
             &self.main_tape,
             &self.meta().client_unique_id,
-            &self.opts.tables_ignore_changes,
+            &self.opts,
         )
         .await?;
 
-        update_meta(
-            coro,
-            self.protocol.as_ref(),
-            &self.meta_path,
-            &mut self.meta.borrow_mut(),
-            |m| {
-                m.last_pushed_change_id_hint = change_id;
-            },
-        )
+        self.update_meta(coro, |m| {
+            m.last_pushed_change_id_hint = change_id;
+        })
         .await?;
 
         Ok(())
     }
 
     /// Create read/write database connection and appropriately configure it before use
-    pub async fn connect_rw(&self, coro: &Coro) -> Result<Arc<turso_core::Connection>> {
+    pub async fn connect_rw(&self, coro: &Coro<Ctx>) -> Result<Arc<turso_core::Connection>> {
         let conn = self.main_tape.connect(coro).await?;
         conn.wal_auto_checkpoint_disable();
         Ok(conn)
@@ -595,7 +603,7 @@ impl<C: ProtocolIO> DatabaseSyncEngine<C> {
 
     /// Sync local changes to remote DB and bring new changes from remote to local
     /// This method will block writes for the period of sync
-    pub async fn sync(&mut self, coro: &Coro) -> Result<()> {
+    pub async fn sync(&mut self, coro: &Coro<Ctx>) -> Result<()> {
         // todo(sivukhin): this is bit suboptimal as both 'push' and 'pull' will call pull_synced_from_remote
         // but for now - keep it simple
         self.push_changes_to_remote(coro).await?;
@@ -605,91 +613,22 @@ impl<C: ProtocolIO> DatabaseSyncEngine<C> {
         Ok(())
     }
 
-    async fn init(&mut self, coro: &Coro) -> Result<()> {
-        tracing::info!("init(path={}): opts={:?}", self.main_db_path, self.opts);
-
-        let completion = self.protocol.full_read(&self.meta_path)?;
-        let data = wait_full_body(coro, &completion).await?;
-        let meta = if data.is_empty() {
-            None
-        } else {
-            Some(DatabaseMetadata::load(&data)?)
-        };
-
-        match meta {
-            Some(meta) => {
-                self.meta.replace(Some(meta));
-            }
-            None => {
-                let meta = self.bootstrap_db_file(coro).await?;
-                tracing::info!("write meta after successful bootstrap: meta={meta:?}");
-                set_meta(
-                    coro,
-                    self.protocol.as_ref(),
-                    &self.meta_path,
-                    &mut self.meta.borrow_mut(),
-                    meta,
-                )
-                .await?;
-            }
-        };
-
-        let main_exists = self.io.try_open(&self.main_db_path)?.is_some();
-        if !main_exists {
-            let error = "main DB file doesn't exists, but metadata is".to_string();
-            return Err(Error::DatabaseSyncEngineError(error));
-        }
-
-        if self.meta().synced_frame_no.is_none() {
-            // sync WAL from the remote in case of bootstrap - all subsequent initializations will be fast
-            if let Some(changes) = self.wait_changes_from_remote(coro).await? {
-                self.apply_changes_from_remote(coro, changes).await?;
-            }
-        }
-        Ok(())
-    }
-
-    async fn bootstrap_db_file(&mut self, coro: &Coro) -> Result<DatabaseMetadata> {
-        assert!(
-            self.meta.borrow().is_none(),
-            "bootstrap_db_file must be called only when meta is not set"
-        );
-        tracing::info!("bootstrap_db_file(path={})", self.main_db_path);
-
-        let start_time = std::time::Instant::now();
-        // cleanup all files left from previous attempt to bootstrap
-        // we shouldn't write any WAL files - but let's truncate them too for safety
-        if let Some(file) = self.io.try_open(&self.main_db_path)? {
-            self.io.truncate(coro, file, 0).await?;
-        }
-        if let Some(file) = self.io.try_open(&format!("{}-wal", self.main_db_path))? {
-            self.io.truncate(coro, file, 0).await?;
-        }
-
-        let file = self.io.create(&self.main_db_path)?;
-        let db_info = db_bootstrap(coro, self.protocol.as_ref(), file).await?;
-
-        let elapsed = std::time::Instant::now().duration_since(start_time);
-        tracing::info!(
-            "bootstrap_db_files(path={}): finished: elapsed={:?}",
-            self.main_db_path,
-            elapsed
-        );
-
-        Ok(DatabaseMetadata {
-            client_unique_id: format!("{}-{}", self.opts.client_name, uuid::Uuid::new_v4()),
-            synced_generation: db_info.current_generation,
-            synced_frame_no: None,
-            revert_since_wal_checkpoint_seq: 0,
-            revert_since_wal_watermark: 0,
-            last_pushed_change_id_hint: 0,
-            last_pushed_pull_gen_hint: 0,
-        })
-    }
-
     fn meta(&self) -> std::cell::Ref<'_, DatabaseMetadata> {
-        std::cell::Ref::map(self.meta.borrow(), |x| {
-            x.as_ref().expect("metadata must be set")
-        })
+        self.meta.borrow()
+    }
+
+    async fn update_meta(
+        &self,
+        coro: &Coro<Ctx>,
+        update: impl FnOnce(&mut DatabaseMetadata),
+    ) -> Result<()> {
+        let mut meta = self.meta().clone();
+        update(&mut meta);
+        tracing::info!("update_meta: {meta:?}");
+        let completion = self.protocol.full_write(&self.meta_path, meta.dump()?)?;
+        // todo: what happen if we will actually update the metadata on disk but fail and so in memory state will not be updated
+        wait_full_body(coro, &completion).await?;
+        self.meta.replace(meta);
+        Ok(())
     }
 }

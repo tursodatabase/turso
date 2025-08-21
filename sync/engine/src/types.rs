@@ -1,8 +1,36 @@
+use std::{cell::RefCell, collections::HashMap};
+
 use serde::{Deserialize, Serialize};
 
 use crate::{errors::Error, Result};
 
-pub type Coro = genawaiter::sync::Co<ProtocolCommand, Result<()>>;
+pub struct Coro<Ctx> {
+    pub ctx: RefCell<Ctx>,
+    gen: genawaiter::sync::Co<ProtocolCommand, Result<Ctx>>,
+}
+
+impl<Ctx> Coro<Ctx> {
+    pub fn new(ctx: Ctx, gen: genawaiter::sync::Co<ProtocolCommand, Result<Ctx>>) -> Self {
+        Self {
+            ctx: RefCell::new(ctx),
+            gen,
+        }
+    }
+    pub async fn yield_(&self, value: ProtocolCommand) -> Result<()> {
+        let ctx = self.gen.yield_(value).await?;
+        self.ctx.replace(ctx);
+        Ok(())
+    }
+}
+
+impl From<genawaiter::sync::Co<ProtocolCommand, Result<()>>> for Coro<()> {
+    fn from(value: genawaiter::sync::Co<ProtocolCommand, Result<()>>) -> Self {
+        Self {
+            gen: value,
+            ctx: RefCell::new(()),
+        }
+    }
+}
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct DbSyncInfo {
@@ -210,6 +238,21 @@ impl TryFrom<&turso_core::Row> for DatabaseChange {
             updates,
         })
     }
+}
+
+pub struct DatabaseRowMutation {
+    pub change_time: u64,
+    pub table_name: String,
+    pub id: i64,
+    pub change_type: DatabaseChangeType,
+    pub before: Option<HashMap<String, turso_core::Value>>,
+    pub after: Option<HashMap<String, turso_core::Value>>,
+    pub updates: Option<HashMap<String, turso_core::Value>>,
+}
+
+pub struct DatabaseRowStatement {
+    pub sql: String,
+    pub values: Vec<turso_core::Value>,
 }
 
 pub enum DatabaseTapeRowChangeType {
