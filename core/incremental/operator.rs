@@ -2,13 +2,15 @@
 // Operator DAG for DBSP-style incremental computation
 // Based on Feldera DBSP design but adapted for Turso's architecture
 
+use crate::incremental::expr_compiler::CompiledExpression;
 use crate::incremental::hashable_row::HashableRow;
 use crate::types::Text;
-use crate::Value;
+use crate::{Connection, Database, SymbolTable, Value};
 use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Debug, Display};
 use std::sync::Arc;
 use std::sync::Mutex;
+use turso_sqlite3_parser::ast::*;
 
 /// Tracks computation counts to verify incremental behavior (for tests now), and in the future
 /// should be used to provide statistics.
@@ -339,14 +341,13 @@ impl FilterPredicate {
 }
 
 #[derive(Debug, Clone)]
-pub enum ProjectColumn {
-    /// Direct column reference
-    Column(String),
-    /// Computed expression
-    Expression {
-        expr: turso_sqlite3_parser::ast::Expr,
-        alias: Option<String>,
-    },
+pub struct ProjectColumn {
+    /// The original SQL expression (for debugging/fallback)
+    pub expr: turso_sqlite3_parser::ast::Expr,
+    /// Optional alias for the column
+    pub alias: Option<String>,
+    /// Compiled expression (handles both trivial columns and complex expressions)
+    pub compiled: CompiledExpression,
 }
 
 #[derive(Debug, Clone)]
@@ -581,34 +582,189 @@ impl IncrementalOperator for FilterOperator {
 }
 
 /// Project operator - selects/transforms columns
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ProjectOperator {
     columns: Vec<ProjectColumn>,
     input_column_names: Vec<String>,
     output_column_names: Vec<String>,
     current_state: Delta,
     tracker: Option<Arc<Mutex<ComputationTracker>>>,
+    // Internal in-memory connection for expression evaluation
+    // Programs are very dependent on having a connection, so give it one.
+    //
+    // We could in theory pass the current connection, but there are a host of problems with that.
+    // For example: during a write transaction, where views are usually updated, we have autocommit
+    // on. When the program we are executing calls Halt, it will try to commit the current
+    // transaction, which is absolutely incorrect.
+    //
+    // There are other ways to solve this, but a read-only connection to an empty in-memory
+    // database gives us the closest environment we need to execute expressions.
+    internal_conn: Arc<Connection>,
+}
+
+impl std::fmt::Debug for ProjectOperator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProjectOperator")
+            .field("columns", &self.columns)
+            .field("input_column_names", &self.input_column_names)
+            .field("output_column_names", &self.output_column_names)
+            .field("current_state", &self.current_state)
+            .field("tracker", &self.tracker)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ProjectOperator {
-    pub fn new(columns: Vec<ProjectColumn>, input_column_names: Vec<String>) -> Self {
+    /// Create a new ProjectOperator from a SELECT statement, extracting projection columns
+    pub fn from_select(
+        select: &turso_sqlite3_parser::ast::Select,
+        input_column_names: Vec<String>,
+        schema: &crate::schema::Schema,
+    ) -> crate::Result<Self> {
+        use turso_sqlite3_parser::ast::*;
+
+        // Set up internal connection for expression evaluation
+        let io = Arc::new(crate::MemoryIO::new());
+        let db = Database::open_file(
+            io, ":memory:", false, // no MVCC needed for expression evaluation
+            false, // no indexes needed
+        )?;
+        let internal_conn = db.connect()?;
+        // Set to read-only mode and disable auto-commit since we're only evaluating expressions
+        internal_conn.query_only.set(true);
+        internal_conn.auto_commit.set(false);
+
+        let temp_syms = SymbolTable::new();
+
+        // Extract columns from SELECT statement
+        let columns = if let OneSelect::Select(ref select_stmt) = &*select.body.select {
+            let mut columns = Vec::new();
+            for result_col in &select_stmt.columns {
+                match result_col {
+                    ResultColumn::Expr(expr, alias) => {
+                        let alias_str = if let Some(As::As(alias_name)) = alias {
+                            Some(alias_name.as_str().to_string())
+                        } else {
+                            None
+                        };
+                        // Try to compile the expression (handles both columns and complex expressions)
+                        match CompiledExpression::compile(
+                            expr,
+                            &input_column_names,
+                            schema,
+                            &temp_syms,
+                            internal_conn.clone(),
+                        ) {
+                            Ok(compiled) => {
+                                columns.push(ProjectColumn {
+                                    expr: expr.clone(),
+                                    alias: alias_str,
+                                    compiled,
+                                });
+                            }
+                            Err(_) => {
+                                // If compilation fails, skip this column for now
+                                // In the future we might want to handle this better
+                            }
+                        }
+                    }
+                    ResultColumn::Star => {
+                        // Select all columns - create trivial column references
+                        for name in &input_column_names {
+                            // Create an Id expression for the column
+                            let expr = Expr::Id(Name::Ident(name.clone()));
+                            // This should always compile successfully as a trivial column reference
+                            if let Ok(compiled) = CompiledExpression::compile(
+                                &expr,
+                                &input_column_names,
+                                schema,
+                                &temp_syms,
+                                internal_conn.clone(),
+                            ) {
+                                columns.push(ProjectColumn {
+                                    expr,
+                                    alias: None,
+                                    compiled,
+                                });
+                            }
+                        }
+                    }
+                    _ => {
+                        // For now, skip TableStar and other cases
+                    }
+                }
+            }
+
+            if columns.is_empty() {
+                // If no columns were extracted, default to projecting all input columns
+                input_column_names
+                    .iter()
+                    .filter_map(|name| {
+                        let expr = Expr::Id(Name::Ident(name.clone()));
+                        CompiledExpression::compile(
+                            &expr,
+                            &input_column_names,
+                            schema,
+                            &temp_syms,
+                            internal_conn.clone(),
+                        )
+                        .ok()
+                        .map(|compiled| ProjectColumn {
+                            expr,
+                            alias: None,
+                            compiled,
+                        })
+                    })
+                    .collect()
+            } else {
+                columns
+            }
+        } else {
+            // Not a simple SELECT statement, default to projecting all columns
+            input_column_names
+                .iter()
+                .filter_map(|name| {
+                    let expr = Expr::Id(Name::Ident(name.clone()));
+                    CompiledExpression::compile(
+                        &expr,
+                        &input_column_names,
+                        schema,
+                        &temp_syms,
+                        internal_conn.clone(),
+                    )
+                    .ok()
+                    .map(|compiled| ProjectColumn {
+                        expr,
+                        alias: None,
+                        compiled,
+                    })
+                })
+                .collect()
+        };
+
+        // Generate output column names based on aliases or expressions
         let output_column_names = columns
             .iter()
-            .map(|c| match c {
-                ProjectColumn::Column(name) => name.clone(),
-                ProjectColumn::Expression { alias, .. } => {
-                    alias.clone().unwrap_or_else(|| "expr".to_string())
-                }
+            .map(|c| {
+                c.alias.clone().unwrap_or_else(|| {
+                    // For simple column references, use the column name
+                    if let Expr::Id(name) = &c.expr {
+                        name.as_str().to_string()
+                    } else {
+                        "expr".to_string()
+                    }
+                })
             })
             .collect();
 
-        Self {
+        Ok(Self {
             columns,
             input_column_names,
             output_column_names,
             current_state: Delta::new(),
             tracker: None,
-        }
+            internal_conn,
+        })
     }
 
     /// Get the columns for this projection
@@ -620,24 +776,19 @@ impl ProjectOperator {
         let mut output = Vec::new();
 
         for col in &self.columns {
-            match col {
-                ProjectColumn::Column(name) => {
-                    if let Some(idx) = self.input_column_names.iter().position(|c| c == name) {
-                        if let Some(v) = values.get(idx) {
-                            output.push(v.clone());
-                        } else {
-                            output.push(Value::Null);
-                        }
-                    } else {
-                        output.push(Value::Null);
-                    }
-                }
-                ProjectColumn::Expression { expr, .. } => {
-                    // Evaluate the expression
-                    let result = self.evaluate_expression(expr, values);
-                    output.push(result);
-                }
-            }
+            // Use the internal connection's pager for expression evaluation
+            let internal_pager = self.internal_conn.pager.borrow().clone();
+
+            // Execute the compiled expression (handles both columns and complex expressions)
+            let result = col
+                .compiled
+                .execute(values, internal_pager)
+                .unwrap_or_else(|_| {
+                    // Fall back to manual evaluation on error
+                    // This can happen for expressions with unsupported operations
+                    self.evaluate_expression(&col.expr, values)
+                });
+            output.push(result);
         }
 
         output
@@ -648,8 +799,6 @@ impl ProjectOperator {
         expr: &turso_sqlite3_parser::ast::Expr,
         values: &[Value],
     ) -> Value {
-        use turso_sqlite3_parser::ast::*;
-
         match expr {
             Expr::Id(name) => {
                 if let Some(idx) = self

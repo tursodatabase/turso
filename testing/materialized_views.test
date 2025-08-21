@@ -368,3 +368,20 @@ do_execsql_test_on_specific_db {:memory:} matview-mixed-operations-sequence {
 100|25|1
 200|100|1
 300|150|1}
+
+do_execsql_test_on_specific_db {:memory:} matview-projections {
+    CREATE TABLE t(a,b);
+
+    CREATE MATERIALIZED VIEW v AS
+        SELECT b, a, b + a as c , (b * a) + 10 as d , min(a,b) as e
+        FROM t
+        where b > 2;
+
+    INSERT INTO t VALUES (1, 1);
+    INSERT INTO t VALUES (2, 2);
+    INSERT INTO t VALUES (3, 4);
+    INSERT INTO t VALUES (4, 3);
+
+    SELECT * from v;
+} {4|3|7|22|3
+3|4|7|22|3}

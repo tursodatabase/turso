@@ -1,7 +1,7 @@
 use super::dbsp::{RowKeyStream, RowKeyZSet};
 use super::operator::{
     AggregateFunction, AggregateOperator, ComputationTracker, Delta, FilterOperator,
-    FilterPredicate, IncrementalOperator, ProjectColumn, ProjectOperator,
+    FilterPredicate, IncrementalOperator, ProjectOperator,
 };
 use crate::schema::{BTreeTable, Column, Schema};
 use crate::types::{IOCompletions, IOResult, Value};
@@ -96,42 +96,13 @@ pub struct IncrementalView {
 impl IncrementalView {
     /// Validate that a CREATE MATERIALIZED VIEW statement can be handled by IncrementalView
     /// This should be called early, before updating sqlite_master
-    pub fn can_create_view(
-        select: &turso_sqlite3_parser::ast::Select,
-        schema: &Schema,
-    ) -> Result<()> {
-        // Check for aggregations
-        let (group_by_columns, aggregate_functions, _) = Self::extract_aggregation_info(select);
-
+    pub fn can_create_view(select: &turso_sqlite3_parser::ast::Select) -> Result<()> {
         // Check for JOINs
         let (join_tables, join_condition) = Self::extract_join_info(select);
         if join_tables.is_some() || join_condition.is_some() {
             return Err(LimboError::ParseError(
                 "JOINs in views are not yet supported".to_string(),
             ));
-        }
-
-        // Check that we have a base table
-        let base_table_name = Self::extract_base_table(select).ok_or_else(|| {
-            LimboError::ParseError("views without a base table not supported yet".to_string())
-        })?;
-
-        // Get the base table
-        let base_table = schema.get_btree_table(&base_table_name).ok_or_else(|| {
-            LimboError::ParseError(format!("Table '{base_table_name}' not found in schema"))
-        })?;
-
-        // Get base table column names for validation
-        let base_table_column_names: Vec<String> = base_table
-            .columns
-            .iter()
-            .enumerate()
-            .map(|(i, col)| col.name.clone().unwrap_or_else(|| format!("column_{i}")))
-            .collect();
-
-        // For non-aggregated views, validate columns are a strict subset
-        if group_by_columns.is_empty() && aggregate_functions.is_empty() {
-            Self::validate_view_columns(select, &base_table_column_names)?;
         }
 
         Ok(())
@@ -245,6 +216,7 @@ impl IncrementalView {
             view_columns,
             group_by_columns,
             aggregate_functions,
+            schema,
         )
     }
 
@@ -259,6 +231,7 @@ impl IncrementalView {
         columns: Vec<Column>,
         group_by_columns: Vec<String>,
         aggregate_functions: Vec<AggregateFunction>,
+        schema: &Schema,
     ) -> Result<Self> {
         let mut records = BTreeMap::new();
 
@@ -305,15 +278,11 @@ impl IncrementalView {
 
         // Only create project operator for non-aggregated views
         let project_operator = if !is_aggregated {
-            let columns = Self::extract_project_columns(&select_stmt, &base_table_column_names)
-                .unwrap_or_else(|| {
-                    // If we can't extract columns, default to projecting all columns
-                    base_table_column_names
-                        .iter()
-                        .map(|name| ProjectColumn::Column(name.to_string()))
-                        .collect()
-                });
-            let mut proj_op = ProjectOperator::new(columns, base_table_column_names.clone());
+            let mut proj_op = ProjectOperator::from_select(
+                &select_stmt,
+                base_table_column_names.clone(),
+                schema,
+            )?;
             proj_op.set_tracker(tracker.clone());
             Some(proj_op)
         } else {
@@ -350,51 +319,6 @@ impl IncrementalView {
         vec![self.base_table.clone()]
     }
 
-    /// Validate that view columns are a strict subset of the base table columns
-    /// No duplicates, no complex expressions, only simple column references
-    fn validate_view_columns(
-        select: &turso_sqlite3_parser::ast::Select,
-        base_table_column_names: &[String],
-    ) -> Result<()> {
-        if let turso_sqlite3_parser::ast::OneSelect::Select(ref select_stmt) = &*select.body.select
-        {
-            let mut seen_columns = std::collections::HashSet::new();
-
-            for result_col in &select_stmt.columns {
-                match result_col {
-                    turso_sqlite3_parser::ast::ResultColumn::Expr(
-                        turso_sqlite3_parser::ast::Expr::Id(name),
-                        _,
-                    ) => {
-                        let col_name = name.as_str();
-
-                        // Check for duplicates
-                        if !seen_columns.insert(col_name) {
-                            return Err(LimboError::ParseError(format!(
-                                "Duplicate column '{col_name}' in view. Views must have columns as a strict subset of the base table (no duplicates)"
-                            )));
-                        }
-
-                        // Check that column exists in base table
-                        if !base_table_column_names.iter().any(|n| n == col_name) {
-                            return Err(LimboError::ParseError(format!(
-                                "Column '{col_name}' not found in base table. Views must have columns as a strict subset of the base table"
-                            )));
-                        }
-                    }
-                    turso_sqlite3_parser::ast::ResultColumn::Star => {
-                        // SELECT * is allowed - it's the full set
-                    }
-                    _ => {
-                        // Any other expression is not allowed
-                        return Err(LimboError::ParseError("Complex expressions, functions, or computed columns are not supported in views. Views must have columns as a strict subset of the base table".to_string()));
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
     /// Extract the base table name from a SELECT statement (for non-join cases)
     fn extract_base_table(select: &turso_sqlite3_parser::ast::Select) -> Option<String> {
         if let turso_sqlite3_parser::ast::OneSelect::Select(ref select_stmt) = &*select.body.select
@@ -422,16 +346,14 @@ impl IncrementalView {
             // Get the columns used by the projection operator
             let mut columns = Vec::new();
             for col in project_op.columns() {
-                match col {
-                    ProjectColumn::Column(name) => {
-                        columns.push(name.clone());
-                    }
-                    ProjectColumn::Expression { .. } => {
-                        // For expressions, we need all columns (for now)
-                        columns.clear();
-                        columns.push("*".to_string());
-                        break;
-                    }
+                // Check if it's a simple column reference
+                if let turso_sqlite3_parser::ast::Expr::Id(name) = &col.expr {
+                    columns.push(name.as_str().to_string());
+                } else {
+                    // For expressions, we need all columns (for now)
+                    columns.clear();
+                    columns.push("*".to_string());
+                    break;
                 }
             }
             if columns.is_empty() || columns.contains(&"*".to_string()) {
@@ -823,58 +745,6 @@ impl IncrementalView {
         None
     }
 
-    /// Extract projection columns from SELECT statement
-    fn extract_project_columns(
-        select: &turso_sqlite3_parser::ast::Select,
-        column_names: &[String],
-    ) -> Option<Vec<ProjectColumn>> {
-        use turso_sqlite3_parser::ast::*;
-
-        if let OneSelect::Select(ref select_stmt) = &*select.body.select {
-            let mut columns = Vec::new();
-
-            for result_col in &select_stmt.columns {
-                match result_col {
-                    ResultColumn::Expr(expr, alias) => {
-                        match expr {
-                            Expr::Id(name) => {
-                                // Simple column reference
-                                columns.push(ProjectColumn::Column(name.as_str().to_string()));
-                            }
-                            _ => {
-                                // Expression - store it for evaluation
-                                let alias_str = if let Some(As::As(alias_name)) = alias {
-                                    Some(alias_name.as_str().to_string())
-                                } else {
-                                    None
-                                };
-                                columns.push(ProjectColumn::Expression {
-                                    expr: expr.clone(),
-                                    alias: alias_str,
-                                });
-                            }
-                        }
-                    }
-                    ResultColumn::Star => {
-                        // Select all columns
-                        for name in column_names {
-                            columns.push(ProjectColumn::Column(name.as_str().to_string()));
-                        }
-                    }
-                    _ => {
-                        // For now, skip TableStar and other cases
-                    }
-                }
-            }
-
-            if !columns.is_empty() {
-                return Some(columns);
-            }
-        }
-
-        None
-    }
-
     /// Get the current records as an iterator - for cursor-based access
     pub fn iter(&self) -> impl Iterator<Item = (i64, Vec<Value>)> + '_ {
         self.stream.to_vec().into_iter().filter_map(move |row| {
@@ -938,6 +808,12 @@ impl IncrementalView {
         // Apply operators in pipeline
         let mut current_delta = delta.clone();
         current_delta = self.apply_filter_to_delta(current_delta);
+
+        // Apply projection operator if present (for non-aggregated views)
+        if let Some(ref mut project_op) = self.project_operator {
+            current_delta = project_op.process_delta(current_delta);
+        }
+
         current_delta = self.apply_aggregation_to_delta(current_delta);
 
         // Update records and stream with the processed delta
@@ -1094,7 +970,7 @@ mod tests {
     #[test]
     fn test_projection_function_call() {
         let schema = create_test_schema();
-        let sql = "CREATE MATERIALIZED VIEW v AS SELECT hex(a) as hex_a, b FROM t";
+        let sql = "CREATE MATERIALIZED VIEW v AS SELECT abs(a - 300) as abs_diff, b FROM t";
 
         let view = IncrementalView::from_sql(sql, &schema).unwrap();
 
@@ -1112,10 +988,8 @@ mod tests {
         let result = temp_project.get_current_state();
 
         let (output, _weight) = result.changes.first().unwrap();
-        assert_eq!(
-            output.values,
-            vec![Value::Text("FF".into()), Value::Integer(20),]
-        );
+        // abs(255 - 300) = abs(-45) = 45
+        assert_eq!(output.values, vec![Value::Integer(45), Value::Integer(20),]);
     }
 
     #[test]
@@ -1225,12 +1099,12 @@ mod tests {
         assert_eq!(
             output.values,
             vec![
-                Value::Integer(5),       // a
-                Value::Integer(2),       // b
-                Value::Integer(10),      // a * 2
-                Value::Integer(6),       // b * 3
-                Value::Integer(7),       // a + b
-                Value::Text("F".into()), // hex(15)
+                Value::Integer(5),          // a
+                Value::Integer(2),          // b
+                Value::Integer(10),         // a * 2
+                Value::Integer(6),          // b * 3
+                Value::Integer(7),          // a + b
+                Value::Text("3135".into()), // hex(15) - SQLite converts to string "15" then hex encodes
             ]
         );
     }

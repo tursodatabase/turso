@@ -315,6 +315,14 @@ impl ProgramState {
         }
     }
 
+    pub fn set_register(&mut self, idx: usize, value: Register) {
+        self.registers[idx] = value;
+    }
+
+    pub fn get_register(&self, idx: usize) -> &Register {
+        &self.registers[idx]
+    }
+
     pub fn column_count(&self) -> usize {
         self.registers.len()
     }
