@@ -189,17 +189,25 @@ impl std::fmt::Debug for CompiledExpression {
     }
 }
 
+#[derive(PartialEq)]
+enum TrivialType {
+    Integer,
+    Float,
+    Text,
+    Null,
+}
+
 impl CompiledExpression {
     /// Get the "type" of a trivial expression for type checking
     /// Returns None if type can't be determined statically
-    fn get_trivial_type(expr: &TrivialExpression) -> Option<&'static str> {
+    fn get_trivial_type(expr: &TrivialExpression) -> Option<TrivialType> {
         match expr {
             TrivialExpression::Column(_) => None, // Can't know column type statically
             TrivialExpression::Immediate(val) => match val {
-                Value::Integer(_) => Some("integer"),
-                Value::Float(_) => Some("float"),
-                Value::Text(_) => Some("text"),
-                Value::Null => Some("null"),
+                Value::Integer(_) => Some(TrivialType::Integer),
+                Value::Float(_) => Some(TrivialType::Float),
+                Value::Text(_) => Some(TrivialType::Text),
+                Value::Null => Some(TrivialType::Null),
                 _ => None,
             },
             TrivialExpression::Binary { left, right, .. } => {
@@ -215,9 +223,12 @@ impl CompiledExpression {
         }
     }
 
-    /// Check if an expression is trivial (columns, immediates, and simple arithmetic)
-    /// Only considers expressions trivial if they don't require type coercion
-    fn is_trivial_expr(expr: &Expr, input_column_names: &[String]) -> Option<TrivialExpression> {
+    // Validates if an expression is trivial (columns, immediates, and simple arithmetic)
+    // Only considers expressions trivial if they don't require type coercion
+    fn try_get_trivial_expr(
+        expr: &Expr,
+        input_column_names: &[String],
+    ) -> Option<TrivialExpression> {
         match expr {
             // Column reference or register
             Expr::Id(name) => input_column_names
@@ -254,8 +265,8 @@ impl CompiledExpression {
                 match op {
                     Operator::Add | Operator::Subtract | Operator::Multiply | Operator::Divide => {
                         // Both operands must be trivial
-                        let left_trivial = Self::is_trivial_expr(left, input_column_names)?;
-                        let right_trivial = Self::is_trivial_expr(right, input_column_names)?;
+                        let left_trivial = Self::try_get_trivial_expr(left, input_column_names)?;
+                        let right_trivial = Self::try_get_trivial_expr(right, input_column_names)?;
 
                         // Check if we can determine types statically
                         // If both are immediates, they must have the same type
@@ -267,8 +278,8 @@ impl CompiledExpression {
                         ) {
                             // Both types are known - they must match (or one is null)
                             if left_type != right_type
-                                && left_type != "null"
-                                && right_type != "null"
+                                && left_type != TrivialType::Null
+                                && right_type != TrivialType::Null
                             {
                                 return None; // Type mismatch - not trivial
                             }
@@ -288,7 +299,7 @@ impl CompiledExpression {
 
             // Parenthesized expressions with single element
             Expr::Parenthesized(exprs) if exprs.len() == 1 => {
-                Self::is_trivial_expr(&exprs[0], input_column_names)
+                Self::try_get_trivial_expr(&exprs[0], input_column_names)
             }
 
             _ => None,
@@ -309,7 +320,7 @@ impl CompiledExpression {
         let input_count = input_column_names.len();
 
         // First, check if this is a trivial expression
-        if let Some(trivial) = Self::is_trivial_expr(expr, input_column_names) {
+        if let Some(trivial) = Self::try_get_trivial_expr(expr, input_column_names) {
             return Ok(CompiledExpression {
                 executor: ExpressionExecutor::Trivial(trivial),
                 input_count,
@@ -389,7 +400,14 @@ impl CompiledExpression {
                 let mut state = ProgramState::new(program.max_registers, 0);
 
                 // Load input values into registers
-                for (idx, value) in values.iter().take(self.input_count).enumerate() {
+                assert_eq!(
+                    values.len(),
+                    self.input_count,
+                    "Mismatch in number of registers! Got {}, expected {}",
+                    values.len(),
+                    self.input_count
+                );
+                for (idx, value) in values.iter().enumerate() {
                     state.set_register(idx, Register::Value(value.clone()));
                 }
 

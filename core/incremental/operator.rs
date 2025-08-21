@@ -648,111 +648,71 @@ impl ProjectOperator {
                             None
                         };
                         // Try to compile the expression (handles both columns and complex expressions)
-                        match CompiledExpression::compile(
+                        let compiled = CompiledExpression::compile(
                             expr,
                             &input_column_names,
                             schema,
                             &temp_syms,
                             internal_conn.clone(),
-                        ) {
-                            Ok(compiled) => {
-                                columns.push(ProjectColumn {
-                                    expr: expr.clone(),
-                                    alias: alias_str,
-                                    compiled,
-                                });
-                            }
-                            Err(_) => {
-                                // If compilation fails, skip this column for now
-                                // In the future we might want to handle this better
-                            }
-                        }
+                        )?;
+                        columns.push(ProjectColumn {
+                            expr: expr.clone(),
+                            alias: alias_str,
+                            compiled,
+                        });
                     }
                     ResultColumn::Star => {
                         // Select all columns - create trivial column references
                         for name in &input_column_names {
                             // Create an Id expression for the column
                             let expr = Expr::Id(Name::Ident(name.clone()));
-                            // This should always compile successfully as a trivial column reference
-                            if let Ok(compiled) = CompiledExpression::compile(
+                            let compiled = CompiledExpression::compile(
                                 &expr,
                                 &input_column_names,
                                 schema,
                                 &temp_syms,
                                 internal_conn.clone(),
-                            ) {
-                                columns.push(ProjectColumn {
-                                    expr,
-                                    alias: None,
-                                    compiled,
-                                });
-                            }
+                            )?;
+                            columns.push(ProjectColumn {
+                                expr,
+                                alias: None,
+                                compiled,
+                            });
                         }
                     }
-                    _ => {
-                        // For now, skip TableStar and other cases
+                    x => {
+                        return Err(crate::LimboError::ParseError(format!(
+                            "Unsupported {x:?} clause when compiling project operator",
+                        )));
                     }
                 }
             }
 
             if columns.is_empty() {
-                // If no columns were extracted, default to projecting all input columns
-                input_column_names
-                    .iter()
-                    .filter_map(|name| {
-                        let expr = Expr::Id(Name::Ident(name.clone()));
-                        CompiledExpression::compile(
-                            &expr,
-                            &input_column_names,
-                            schema,
-                            &temp_syms,
-                            internal_conn.clone(),
-                        )
-                        .ok()
-                        .map(|compiled| ProjectColumn {
-                            expr,
-                            alias: None,
-                            compiled,
-                        })
-                    })
-                    .collect()
-            } else {
-                columns
+                return Err(crate::LimboError::ParseError(
+                    "No columns found when compiling project operator".to_string(),
+                ));
             }
+            columns
         } else {
-            // Not a simple SELECT statement, default to projecting all columns
-            input_column_names
-                .iter()
-                .filter_map(|name| {
-                    let expr = Expr::Id(Name::Ident(name.clone()));
-                    CompiledExpression::compile(
-                        &expr,
-                        &input_column_names,
-                        schema,
-                        &temp_syms,
-                        internal_conn.clone(),
-                    )
-                    .ok()
-                    .map(|compiled| ProjectColumn {
-                        expr,
-                        alias: None,
-                        compiled,
-                    })
-                })
-                .collect()
+            return Err(crate::LimboError::ParseError(
+                "Expression is not a valid SELECT expression".to_string(),
+            ));
         };
 
         // Generate output column names based on aliases or expressions
         let output_column_names = columns
             .iter()
             .map(|c| {
-                c.alias.clone().unwrap_or_else(|| {
-                    // For simple column references, use the column name
-                    if let Expr::Id(name) = &c.expr {
-                        name.as_str().to_string()
-                    } else {
-                        "expr".to_string()
+                c.alias.clone().unwrap_or_else(|| match &c.expr {
+                    Expr::Id(name) => name.as_str().to_string(),
+                    Expr::Qualified(table, column) => {
+                        format!("{}.{}", table.as_str(), column.as_str())
                     }
+                    Expr::DoublyQualified(db, table, column) => {
+                        format!("{}.{}.{}", db.as_str(), table.as_str(), column.as_str())
+                    }
+                    _ => c.expr.to_string(),
                 })
             })
             .collect();
@@ -783,11 +743,7 @@ impl ProjectOperator {
             let result = col
                 .compiled
                 .execute(values, internal_pager)
-                .unwrap_or_else(|_| {
-                    // Fall back to manual evaluation on error
-                    // This can happen for expressions with unsupported operations
-                    self.evaluate_expression(&col.expr, values)
-                });
+                .expect("Failed to execute compiled expression for the Project operator");
             output.push(result);
         }
 
