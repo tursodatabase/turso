@@ -2171,7 +2171,19 @@ pub fn op_auto_commit(
     if *auto_commit != conn.auto_commit.get() {
         if *rollback {
             // TODO(pere): add rollback I/O logic once we implement rollback journal
-            return_if_io!(pager.end_tx(true, &conn, false));
+            if let Some(mv_store) = &mv_store {
+                let tx_id = program.connection.mv_tx_id.get().unwrap();
+                let schema_did_change = matches!(
+                    conn.transaction_state.get(),
+                    TransactionState::Write {
+                        schema_did_change: true
+                    }
+                );
+                // Note that we don't start write transactions on pager until we commit them.
+                mv_store.rollback_tx(tx_id, pager.clone(), &conn, schema_did_change, false);
+            } else {
+                return_if_io!(pager.end_tx(true, &conn, false));
+            }
             conn.transaction_state.replace(TransactionState::None);
             conn.auto_commit.replace(true);
         } else {

@@ -1144,7 +1144,15 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     /// # Arguments
     ///
     /// * `tx_id` - The ID of the transaction to abort.
-    pub fn rollback_tx(&self, tx_id: TxID, pager: Rc<Pager>) {
+    pub fn rollback_tx(
+        &self,
+        tx_id: TxID,
+        pager: Rc<Pager>,
+        connection: &Connection,
+        schema_did_change: bool, // Rollback connection's internal memory for schema if it changed
+        is_write: bool, // Whether the transaction was a write transaction. This means we were commiting a transaction and it failed in the middle
+                        // note that we don't start write transactions on pager until we commit them.
+    ) {
         let tx_unlocked = self.txs.get(&tx_id).unwrap();
         let tx = tx_unlocked.value().write();
         assert_eq!(tx.state, TransactionState::Active);
@@ -1166,7 +1174,12 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         let tx = tx_unlocked.value().read();
         tx.state.store(TransactionState::Terminated);
         tracing::trace!("terminate(tx_id={})", tx_id);
-        pager.end_read_tx().unwrap();
+
+        assert!(matches!(
+            pager.end_tx(true, connection, false).unwrap(),
+            IOResult::Done(PagerCommitResult::Rollback)
+        ));
+
         // FIXME: verify that we can already remove the transaction here!
         // Maybe it's fine for snapshot isolation, but too early for serializable?
         self.txs.remove(&tx_id);
