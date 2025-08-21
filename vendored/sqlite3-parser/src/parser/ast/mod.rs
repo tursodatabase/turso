@@ -365,6 +365,9 @@ pub enum Expr {
     },
     /// binary expression
     Binary(Box<Expr>, Operator, Box<Expr>),
+    /// Register reference for DBSP expression compilation
+    /// This is not part of SQL syntax but used internally for incremental computation
+    Register(usize),
     /// `CASE` expression
     Case {
         /// operand
