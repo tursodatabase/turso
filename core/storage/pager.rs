@@ -1340,14 +1340,19 @@ impl Pager {
                     // Nothing to append
                     if completions.is_empty() {
                         return Ok(IOResult::Done(PagerCommitResult::WalWritten));
-                    } else {
-                        self.commit_info.borrow_mut().state = CommitState::SyncWal;
-                        io_yield_many!(completions);
                     }
+                    self.commit_info.borrow_mut().state = CommitState::SyncWal;
+                    if completions.iter().all(|c| c.is_completed()) {
+                        continue;
+                    }
+                    io_yield_many!(completions);
                 }
                 CommitState::SyncWal => {
                     self.commit_info.borrow_mut().state = CommitState::AfterSyncWal;
                     let c = wal.borrow_mut().sync()?;
+                    if c.is_completed() {
+                        continue;
+                    }
                     io_yield_one!(c);
                 }
                 CommitState::AfterSyncWal => {
@@ -1365,6 +1370,9 @@ impl Pager {
                 CommitState::SyncDbFile => {
                     let c = sqlite3_ondisk::begin_sync(self.db_file.clone(), self.syncing.clone())?;
                     self.commit_info.borrow_mut().state = CommitState::AfterSyncDbFile;
+                    if c.is_completed() {
+                        continue;
+                    }
                     io_yield_one!(c);
                 }
                 CommitState::AfterSyncDbFile => {
