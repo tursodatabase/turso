@@ -41,26 +41,31 @@ pub struct HeaderRef(PageRef);
 
 impl HeaderRef {
     pub fn from_pager(pager: &Pager) -> Result<IOResult<Self>> {
-        let state = pager.header_ref_state.borrow().clone();
-        tracing::trace!(?state);
-        match state {
-            HeaderRefState::Start => {
-                if !pager.db_state.is_initialized() {
-                    return Err(LimboError::Page1NotAlloc);
-                }
+        loop {
+            let state = pager.header_ref_state.borrow().clone();
+            tracing::trace!(?state);
+            match state {
+                HeaderRefState::Start => {
+                    if !pager.db_state.is_initialized() {
+                        return Err(LimboError::Page1NotAlloc);
+                    }
 
-                let (page, c) = pager.read_page(DatabaseHeader::PAGE_ID)?;
-                *pager.header_ref_state.borrow_mut() = HeaderRefState::CreateHeader { page };
-                io_yield_one!(c);
-            }
-            HeaderRefState::CreateHeader { page } => {
-                turso_assert!(page.is_loaded(), "page should be loaded");
-                turso_assert!(
-                    page.get().id == DatabaseHeader::PAGE_ID,
-                    "incorrect header page id"
-                );
-                *pager.header_ref_state.borrow_mut() = HeaderRefState::Start;
-                Ok(IOResult::Done(Self(page)))
+                    let (page, c) = pager.read_page(DatabaseHeader::PAGE_ID)?;
+                    *pager.header_ref_state.borrow_mut() = HeaderRefState::CreateHeader { page };
+                    if c.is_completed() {
+                        continue;
+                    }
+                    io_yield_one!(c);
+                }
+                HeaderRefState::CreateHeader { page } => {
+                    turso_assert!(page.is_loaded(), "page should be loaded");
+                    turso_assert!(
+                        page.get().id == DatabaseHeader::PAGE_ID,
+                        "incorrect header page id"
+                    );
+                    *pager.header_ref_state.borrow_mut() = HeaderRefState::Start;
+                    return Ok(IOResult::Done(Self(page)));
+                }
             }
         }
     }
@@ -77,28 +82,34 @@ pub struct HeaderRefMut(PageRef);
 
 impl HeaderRefMut {
     pub fn from_pager(pager: &Pager) -> Result<IOResult<Self>> {
-        let state = pager.header_ref_state.borrow().clone();
-        tracing::trace!(?state);
-        match state {
-            HeaderRefState::Start => {
-                if !pager.db_state.is_initialized() {
-                    return Err(LimboError::Page1NotAlloc);
+        loop {
+            let state = pager.header_ref_state.borrow().clone();
+            tracing::trace!(?state);
+            match state {
+                HeaderRefState::Start => {
+                    if !pager.db_state.is_initialized() {
+                        return Err(LimboError::Page1NotAlloc);
+                    }
+
+                    let (page, c) = pager.read_page(DatabaseHeader::PAGE_ID)?;
+                    *pager.header_ref_state.borrow_mut() = HeaderRefState::CreateHeader { page };
+                    if c.is_completed() {
+                        continue;
+                    } else {
+                        io_yield_one!(c);
+                    }
                 }
+                HeaderRefState::CreateHeader { page } => {
+                    turso_assert!(page.is_loaded(), "page should be loaded");
+                    turso_assert!(
+                        page.get().id == DatabaseHeader::PAGE_ID,
+                        "incorrect header page id"
+                    );
 
-                let (page, c) = pager.read_page(DatabaseHeader::PAGE_ID)?;
-                *pager.header_ref_state.borrow_mut() = HeaderRefState::CreateHeader { page };
-                io_yield_one!(c);
-            }
-            HeaderRefState::CreateHeader { page } => {
-                turso_assert!(page.is_loaded(), "page should be loaded");
-                turso_assert!(
-                    page.get().id == DatabaseHeader::PAGE_ID,
-                    "incorrect header page id"
-                );
-
-                pager.add_dirty(&page);
-                *pager.header_ref_state.borrow_mut() = HeaderRefState::Start;
-                Ok(IOResult::Done(Self(page)))
+                    pager.add_dirty(&page);
+                    *pager.header_ref_state.borrow_mut() = HeaderRefState::Start;
+                    return Ok(IOResult::Done(Self(page)));
+                }
             }
         }
     }
@@ -1334,14 +1345,19 @@ impl Pager {
                     // Nothing to append
                     if completions.is_empty() {
                         return Ok(IOResult::Done(PagerCommitResult::WalWritten));
-                    } else {
-                        self.commit_info.borrow_mut().state = CommitState::SyncWal;
-                        io_yield_many!(completions);
                     }
+                    self.commit_info.borrow_mut().state = CommitState::SyncWal;
+                    if completions.iter().all(|c| c.is_completed()) {
+                        continue;
+                    }
+                    io_yield_many!(completions);
                 }
                 CommitState::SyncWal => {
                     self.commit_info.borrow_mut().state = CommitState::AfterSyncWal;
                     let c = wal.borrow_mut().sync()?;
+                    if c.is_completed() {
+                        continue;
+                    }
                     io_yield_one!(c);
                 }
                 CommitState::AfterSyncWal => {
@@ -1359,6 +1375,9 @@ impl Pager {
                 CommitState::SyncDbFile => {
                     let c = sqlite3_ondisk::begin_sync(self.db_file.clone(), self.syncing.clone())?;
                     self.commit_info.borrow_mut().state = CommitState::AfterSyncDbFile;
+                    if c.is_completed() {
+                        continue;
+                    }
                     io_yield_one!(c);
                 }
                 CommitState::AfterSyncDbFile => {
@@ -1464,6 +1483,9 @@ impl Pager {
                     let c = sqlite3_ondisk::begin_sync(self.db_file.clone(), self.syncing.clone())?;
                     self.checkpoint_state
                         .replace(CheckpointState::CheckpointDone { res });
+                    if c.is_completed() {
+                        continue;
+                    }
                     io_yield_one!(c);
                 }
                 CheckpointState::CheckpointDone { res } => {
