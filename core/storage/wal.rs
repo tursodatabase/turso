@@ -1670,7 +1670,8 @@ impl WalFile {
                         }
                     }
 
-                    if !completions.is_empty() {
+                    let done = completions.iter().all(|c| c.is_completed());
+                    if !completions.is_empty() && !done {
                         io_yield_many!(completions);
                     } else if self.ongoing_checkpoint.complete() {
                         // if we are completely done backfilling, we need to unpin any pages we used from the page cache.
