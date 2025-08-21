@@ -1709,6 +1709,15 @@ pub fn insn_to_str(
                 0,
                 format!("collation={collation}"),
             ),
+            Insn::IfNeg { reg, target_pc } => (
+                "IfNeg",
+                *reg as i32,
+                target_pc.as_debug_int(),
+                0,
+                Value::build_text(""),
+                0,
+                format!("if (r[{}] < 0) goto {}", reg, target_pc.as_debug_int()),
+            ),
         };
     format!(
         "{:<4}  {:<17}  {:<4}  {:<4}  {:<4}  {:<13}  {:<2}  {}",

@@ -7336,6 +7336,33 @@ pub fn op_rename_column(
     Ok(InsnFunctionStepResult::Step)
 }
 
+pub fn op_if_neg(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Rc<Pager>,
+    mv_store: Option<&Arc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(IfNeg { reg, target_pc }, insn);
+
+    match &state.registers[*reg] {
+        Register::Value(Value::Integer(i)) if *i < 0 => {
+            state.pc = target_pc.as_offset_int();
+        }
+        Register::Value(Value::Float(f)) if *f < 0.0 => {
+            state.pc = target_pc.as_offset_int();
+        }
+        Register::Value(Value::Null) => {
+            state.pc += 1;
+        }
+        _ => {
+            state.pc += 1;
+        }
+    }
+
+    Ok(InsnFunctionStepResult::Step)
+}
+
 impl Value {
     pub fn exec_lower(&self) -> Option<Self> {
         match self {
