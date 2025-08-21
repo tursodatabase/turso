@@ -53,6 +53,16 @@ impl OperationType {
             | OperationType::Truncate { fd, .. } => fd,
         }
     }
+
+    fn get_completion(&self) -> &Completion {
+        match self {
+            OperationType::Read { completion, .. }
+            | OperationType::Write { completion, .. }
+            | OperationType::WriteV { completion, .. }
+            | OperationType::Sync { completion, .. }
+            | OperationType::Truncate { completion, .. } => completion,
+        }
+    }
 }
 
 pub struct Operation {
@@ -262,6 +272,10 @@ impl IO for MemorySimIO {
         callbacks.append(&mut timeouts);
 
         while let Some(callback) = callbacks.pop() {
+            let completion = callback.op.get_completion();
+            if completion.finished() {
+                continue;
+            }
             if callback.time.is_none() || callback.time.is_some_and(|time| time < now) {
                 // TODO: check if we should inject fault in operation here
                 callback.do_operation(&files);
@@ -274,5 +288,10 @@ impl IO for MemorySimIO {
 
     fn generate_random_number(&self) -> i64 {
         self.rng.borrow_mut().next_u64() as i64
+    }
+
+    fn remove_file(&self, path: &str) -> Result<()> {
+        self.files.borrow_mut().shift_remove(path);
+        Ok(())
     }
 }
