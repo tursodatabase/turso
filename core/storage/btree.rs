@@ -680,21 +680,27 @@ impl BTreeCursor {
     /// This is done by checking if the root page has no cells.
     #[instrument(skip_all, level = Level::DEBUG)]
     fn is_empty_table(&self) -> Result<IOResult<bool>> {
-        let state = self.is_empty_table_state.borrow().clone();
-        match state {
-            EmptyTableState::Start => {
-                if let Some(mv_cursor) = &self.mv_cursor {
-                    let mv_cursor = mv_cursor.borrow();
-                    return Ok(IOResult::Done(mv_cursor.is_empty()));
+        loop {
+            let state = self.is_empty_table_state.borrow().clone();
+            match state {
+                EmptyTableState::Start => {
+                    if let Some(mv_cursor) = &self.mv_cursor {
+                        let mv_cursor = mv_cursor.borrow();
+                        return Ok(IOResult::Done(mv_cursor.is_empty()));
+                    }
+                    let (page, c) = self.pager.read_page(self.root_page)?;
+                    *self.is_empty_table_state.borrow_mut() = EmptyTableState::ReadPage { page };
+                    if c.is_completed() {
+                        continue;
+                    } else {
+                        io_yield_one!(c);
+                    }
                 }
-                let (page, c) = self.pager.read_page(self.root_page)?;
-                *self.is_empty_table_state.borrow_mut() = EmptyTableState::ReadPage { page };
-                io_yield_one!(c);
-            }
-            EmptyTableState::ReadPage { page } => {
-                turso_assert!(page.is_loaded(), "page should be loaded");
-                let cell_count = page.get().contents.as_ref().unwrap().cell_count();
-                Ok(IOResult::Done(cell_count == 0))
+                EmptyTableState::ReadPage { page } => {
+                    turso_assert!(page.is_loaded(), "page should be loaded");
+                    let cell_count = page.get().contents.as_ref().unwrap().cell_count();
+                    return Ok(IOResult::Done(cell_count == 0));
+                }
             }
         }
     }
