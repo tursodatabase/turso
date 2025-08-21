@@ -729,7 +729,11 @@ impl BTreeCursor {
                     self.stack.set_cell_index(past_rightmost_pointer);
                     let (page, c) = self.read_page(rightmost_pointer as usize)?;
                     self.stack.push_backwards(page);
-                    io_yield_one!(c);
+                    if c.is_completed() {
+                        continue;
+                    } else {
+                        io_yield_one!(c);
+                    }
                 }
             }
             if cell_idx >= cell_count as i32 {
@@ -793,7 +797,11 @@ impl BTreeCursor {
 
             let (mem_page, c) = self.read_page(left_child_page as usize)?;
             self.stack.push_backwards(mem_page);
-            io_yield_one!(c);
+            if c.is_completed() {
+                continue;
+            } else {
+                io_yield_one!(c);
+            }
         }
     }
 
