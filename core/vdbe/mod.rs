@@ -29,14 +29,16 @@ use crate::{
     error::LimboError,
     function::{AggFunc, FuncCtx},
     state_machine::StateTransition,
-    storage::sqlite3_ondisk::SmallVec,
+    storage::{pager::PagerCommitResult, sqlite3_ondisk::SmallVec},
     translate::{collate::CollationSeq, plan::TableReferences},
     types::{IOCompletions, IOResult, RawSlice, TextRef},
-    vdbe::execute::{
-        OpColumnState, OpDeleteState, OpDeleteSubState, OpIdxInsertState, OpInsertState,
-        OpInsertSubState, OpNewRowidState, OpNoConflictState, OpRowIdState, OpSeekState,
+    vdbe::{
+        execute::{
+            OpColumnState, OpDeleteState, OpDeleteSubState, OpIdxInsertState, OpInsertState,
+            OpInsertSubState, OpNewRowidState, OpNoConflictState, OpRowIdState, OpSeekState,
+        },
+        metrics::StatementMetrics,
     },
-    vdbe::metrics::StatementMetrics,
     IOExt, RefValue,
 };
 
@@ -270,6 +272,7 @@ pub struct ProgramState {
     current_collation: Option<CollationSeq>,
     op_column_state: OpColumnState,
     op_row_id_state: OpRowIdState,
+    commiting_mvcc_tx: bool,
 }
 
 impl ProgramState {
@@ -312,6 +315,7 @@ impl ProgramState {
             current_collation: None,
             op_column_state: OpColumnState::Start,
             op_row_id_state: OpRowIdState::Start,
+            commiting_mvcc_tx: false,
         }
     }
 
@@ -481,7 +485,7 @@ impl Program {
                     return Ok(StepResult::Busy);
                 }
                 Err(err) => {
-                    handle_program_error(&pager, &self.connection, &err)?;
+                    handle_program_error(&pager, &self.connection, mv_store.as_ref(), &err, state)?;
                     return Err(err);
                 }
             }
@@ -526,7 +530,11 @@ impl Program {
             let conn = self.connection.clone();
             let auto_commit = conn.auto_commit.get();
             if auto_commit {
+                if rollback {
+                    return Ok(IOResult::Done(()));
+                }
                 // FIXME: we don't want to commit stuff from other programs.
+                program_state.commiting_mvcc_tx = true;
                 let mut mv_transactions = conn.mv_transactions.borrow_mut();
                 for tx_id in mv_transactions.iter() {
                     let mut state_machine =
@@ -547,6 +555,7 @@ impl Program {
                 conn.mv_tx_id.set(None);
                 conn.transaction_state.replace(TransactionState::None);
                 mv_transactions.clear();
+                program_state.commiting_mvcc_tx = false;
             }
             Ok(IOResult::Done(()))
         } else {
@@ -851,17 +860,46 @@ impl Row {
 pub fn handle_program_error(
     pager: &Rc<Pager>,
     connection: &Connection,
+    mv_store: Option<&Arc<MvStore>>,
     err: &LimboError,
+    state: &mut ProgramState,
 ) -> Result<()> {
     match err {
         // Transaction errors, e.g. trying to start a nested transaction, do not cause a rollback.
         LimboError::TxError(_) => {}
         // Table locked errors, e.g. trying to checkpoint in an interactive transaction, do not cause a rollback.
         LimboError::TableLocked => {}
-        _ => {
+        e => {
+            tracing::error!("handle_program_error: {e:?}");
             pager
                 .io
-                .block(|| pager.end_tx(true, connection, false))
+                .block(|| {
+                    if let Some(mv_store) = &mv_store {
+                        // MVCC rollbacks are handled by the MvccStore. We need to remember whether we were commiting a transaction and it failed in the middle
+                        // so that internally, we call pager.rollback with the correct arguments.
+                        let is_write = state.commiting_mvcc_tx;
+                        let tx_id = connection.mv_tx_id.get().unwrap();
+                        let schema_did_change = matches!(
+                            connection.transaction_state.get(),
+                            TransactionState::Write {
+                                schema_did_change: true
+                            }
+                        );
+                        mv_store.rollback_tx(
+                            tx_id,
+                            pager.clone(),
+                            connection,
+                            schema_did_change,
+                            is_write,
+                        );
+                        connection.mv_tx_id.set(None);
+                        state.commiting_mvcc_tx = false;
+                        connection.mv_transactions.borrow_mut().clear();
+                        Ok(IOResult::Done(PagerCommitResult::Rollback))
+                    } else {
+                        pager.end_tx(true, connection, false)
+                    }
+                })
                 .inspect_err(|e| {
                     tracing::error!("end_tx failed: {e}");
                 })?;
