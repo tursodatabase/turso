@@ -217,14 +217,13 @@ pub fn parse_schema_rows(
 
                                     if should_create_new {
                                         // Create a new IncrementalView
-                                        if let Ok(incremental_view) =
-                                            IncrementalView::from_sql(sql, schema)
-                                        {
-                                            let referenced_tables =
-                                                incremental_view.get_referenced_table_names();
-                                            schema.add_materialized_view(incremental_view);
-                                            views_to_process.push((view_name, referenced_tables));
-                                        }
+                                        // If this fails, we should propagate the error so the transaction rolls back
+                                        let incremental_view =
+                                            IncrementalView::from_sql(sql, schema)?;
+                                        let referenced_tables =
+                                            incremental_view.get_referenced_table_names();
+                                        schema.add_materialized_view(incremental_view);
+                                        views_to_process.push((view_name, referenced_tables));
                                     }
                                 }
                                 Stmt::CreateView {
