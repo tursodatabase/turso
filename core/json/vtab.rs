@@ -1,86 +1,49 @@
-use turso_ext::{
-    ConstraintUsage, ResultCode, VTabCursor, VTabModule, VTabModuleDerive, VTable, Value,
-};
+use std::{cell::RefCell, result::Result, sync::Arc};
 
-use crate::json::{
-    convert_dbtype_to_jsonb,
-    jsonb::{ArrayIteratorState, Jsonb, ObjectIteratorState},
-    vtab::columns::Columns,
-    Conv,
+use turso_ext::{ConstraintUsage, ResultCode};
+
+use crate::{
+    json::{
+        convert_dbtype_to_jsonb,
+        jsonb::{ArrayIteratorState, Jsonb, ObjectIteratorState},
+        vtab::columns::Columns,
+        Conv,
+    },
+    types::Text,
+    vtab::{InternalVirtualTable, InternalVirtualTableCursor},
+    Connection, LimboError, Value,
 };
 
 use super::jsonb;
 
-macro_rules! try_result {
-    ($msg:expr, $expr:expr) => {
-        try_result!($msg, $expr, |x| x)
-    };
-    ($msg:expr, $expr:expr, $fn:expr) => {
-        match $expr {
-            Ok(val) => val,
-            Err(err) => {
-                eprintln!("Error: {}: {}", $msg, err);
-                return $fn(ResultCode::Error);
-            }
-        }
-    };
-}
-
-#[derive(VTabModuleDerive)]
 pub struct JsonEachVirtualTable;
 
-const COL_KEY: u32 = 0;
-const COL_VALUE: u32 = 1;
-const COL_TYPE: u32 = 2;
-const COL_ATOM: u32 = 3;
-const COL_ID: u32 = 4;
-const COL_PARENT: u32 = 5;
-const COL_FULLKEY: u32 = 6;
-const COL_PATH: u32 = 7;
-const COL_JSON: u32 = 8;
-const COL_ROOT: u32 = 9;
+const COL_KEY: usize = 0;
+const COL_VALUE: usize = 1;
+const COL_TYPE: usize = 2;
+const COL_ATOM: usize = 3;
+const COL_ID: usize = 4;
+const COL_PARENT: usize = 5;
+const COL_FULLKEY: usize = 6;
+const COL_PATH: usize = 7;
+const COL_JSON: usize = 8;
+const COL_ROOT: usize = 9;
 
-impl VTabModule for JsonEachVirtualTable {
-    type Table = JsonEachVirtualTable;
-
-    const VTAB_KIND: turso_ext::VTabKind = turso_ext::VTabKind::TableValuedFunction;
-
-    const NAME: &'static str = "json_each";
-
-    fn create(_args: &[Value]) -> Result<(String, Self::Table), turso_ext::ResultCode> {
-        Ok((
-            "CREATE TABLE json_each(
-            key ANY,             -- key for current element relative to its parent
-            value ANY,           -- value for the current element
-            type TEXT,           -- 'object','array','string','integer', etc.
-            atom ANY,            -- value for primitive types, null for array & object
-            id INTEGER,          -- integer ID for this element
-            parent INTEGER,      -- integer ID for the parent of this element
-            fullkey TEXT,        -- full path describing the current element
-            path TEXT,           -- path to the container of the current row
-            json JSON HIDDEN,    -- 1st input parameter: the raw JSON
-            root TEXT HIDDEN     -- 2nd input parameter: the PATH at which to start
-        );"
-            .to_owned(),
-            JsonEachVirtualTable {},
-        ))
+impl InternalVirtualTable for JsonEachVirtualTable {
+    fn name(&self) -> String {
+        "json_each".to_owned()
     }
-}
-
-impl VTable for JsonEachVirtualTable {
-    type Cursor = JsonEachCursor;
-
-    type Error = ResultCode;
 
     fn open(
         &self,
-        _conn: Option<std::sync::Arc<turso_ext::Connection>>,
-    ) -> Result<Self::Cursor, Self::Error> {
-        Ok(JsonEachCursor::default())
+        _conn: Arc<Connection>,
+    ) -> crate::Result<std::sync::Arc<RefCell<(dyn InternalVirtualTableCursor + 'static)>>> {
+        Ok(Arc::new(RefCell::new(JsonEachCursor::default())))
     }
 
     fn best_index(
-        _constraints: &[turso_ext::ConstraintInfo],
+        &self,
+        constraints: &[turso_ext::ConstraintInfo],
         _order_by: &[turso_ext::OrderByInfo],
     ) -> Result<turso_ext::IndexInfo, ResultCode> {
         use turso_ext::ConstraintOp;
@@ -90,12 +53,12 @@ impl VTable for JsonEachVirtualTable {
                 argv_index: None,
                 omit: false
             };
-            _constraints.len()
+            constraints.len()
         ];
         let mut have_json = false;
 
-        for (i, c) in _constraints.iter().enumerate() {
-            if c.usable && c.op == ConstraintOp::Eq && c.column_index == COL_JSON {
+        for (i, c) in constraints.iter().enumerate() {
+            if c.usable && c.op == ConstraintOp::Eq && c.column_index as usize == COL_JSON {
                 usages[i] = ConstraintUsage {
                     argv_index: Some(1),
                     omit: true,
@@ -113,6 +76,28 @@ impl VTable for JsonEachVirtualTable {
             estimated_rows: if have_json { 100 } else { u32::MAX },
             constraint_usages: usages,
         })
+    }
+
+    fn sql(&self) -> String {
+        "CREATE TABLE json_each(
+            key ANY,             -- key for current element relative to its parent
+            value ANY,           -- value for the current element
+            type TEXT,           -- 'object','array','string','integer', etc.
+            atom ANY,            -- value for primitive types, null for array & object
+            id INTEGER,          -- integer ID for this element
+            parent INTEGER,      -- integer ID for the parent of this element
+            fullkey TEXT,        -- full path describing the current element
+            path TEXT,           -- path to the container of the current row
+            json JSON HIDDEN,    -- 1st input parameter: the raw JSON
+            root TEXT HIDDEN     -- 2nd input parameter: the PATH at which to start
+        );"
+        .to_owned()
+    }
+}
+
+impl std::fmt::Debug for JsonEachVirtualTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JsonEachVirtualTable").finish()
     }
 }
 
@@ -143,37 +128,41 @@ impl Default for JsonEachCursor {
     }
 }
 
-impl VTabCursor for JsonEachCursor {
-    type Error = ResultCode;
-
-    fn filter(&mut self, args: &[Value], _idx_info: Option<(&str, i32)>) -> ResultCode {
+impl InternalVirtualTableCursor for JsonEachCursor {
+    fn filter(
+        &mut self,
+        args: &[Value],
+        _idx_str: Option<String>,
+        _idx_num: i32,
+    ) -> Result<bool, LimboError> {
         if args.is_empty() {
-            return ResultCode::EOF;
+            return Ok(false);
+        }
+        if args.len() == 2 {
+            return Err(LimboError::InvalidArgument(
+                "2-arg json_each is not supported yet".to_owned(),
+            ));
         }
         if args.len() != 1 && args.len() != 2 {
-            return ResultCode::InvalidArgs;
+            return Err(LimboError::InvalidArgument(
+                "json_each accepts 1 or 2 arguments".to_owned(),
+            ));
         }
 
-        let db_value = try_result!(
-            "converting ext value to db value",
-            convert_ext_value_to_db_value(&args[0])
-        );
+        let db_value = &args[0];
 
-        let jsonb = try_result!(
-            "converting to jsonb",
-            convert_dbtype_to_jsonb(&db_value, Conv::Strict)
-        );
+        let jsonb = convert_dbtype_to_jsonb(db_value, Conv::Strict)?;
 
-        let element_type = try_result!("checking jsonb element type", jsonb.element_type());
+        let element_type = jsonb.element_type()?;
         self.json = jsonb;
 
         match element_type {
             jsonb::ElementType::ARRAY => {
-                let iter = try_result!("getting array iterator", self.json.array_iterator());
+                let iter = self.json.array_iterator()?;
                 self.iterator_state = IteratorState::Array(iter);
             }
             jsonb::ElementType::OBJECT => {
-                let iter = try_result!("getting object iterator", self.json.object_iterator());
+                let iter = self.json.object_iterator()?;
                 self.iterator_state = IteratorState::Object(iter);
             }
             jsonb::ElementType::NULL
@@ -192,25 +181,24 @@ impl VTabCursor for JsonEachCursor {
             jsonb::ElementType::RESERVED1
             | jsonb::ElementType::RESERVED2
             | jsonb::ElementType::RESERVED3 => {
-                eprintln!("Error: received unexpected element type {element_type:?}");
-                return ResultCode::Error;
+                unreachable!("element type not supported: {element_type:?}");
             }
-        }
+        };
 
         self.next()
     }
 
-    fn next(&mut self) -> ResultCode {
+    fn next(&mut self) -> Result<bool, LimboError> {
         self.rowid += 1;
         if self.no_more_rows {
-            return ResultCode::EOF;
+            return Ok(false);
         }
 
         match &self.iterator_state {
             IteratorState::Array(state) => {
                 let Some(((idx, jsonb), new_state)) = self.json.array_iterator_next(state) else {
                     self.no_more_rows = true;
-                    return ResultCode::EOF;
+                    return Ok(false);
                 };
                 self.iterator_state = IteratorState::Array(new_state);
                 self.columns = Columns::new(columns::Key::Integer(idx as i64), jsonb);
@@ -221,11 +209,11 @@ impl VTabCursor for JsonEachCursor {
                     ObjectIteratorState,
                 )> = self.json.object_iterator_next(state) else {
                     self.no_more_rows = true;
-                    return ResultCode::EOF;
+                    return Ok(false);
                 };
 
                 self.iterator_state = IteratorState::Object(new_state);
-                let key = try_result!("converting key to db value", key.to_string());
+                let key = key.to_string()?;
                 self.columns = Columns::new(columns::Key::String(key), value);
             }
             IteratorState::Primitive => {
@@ -236,65 +224,41 @@ impl VTabCursor for JsonEachCursor {
             IteratorState::None => unreachable!(),
         };
 
-        ResultCode::OK
+        Ok(true)
     }
 
     fn rowid(&self) -> i64 {
         self.rowid
     }
 
-    fn column(&self, idx: u32) -> Result<Value, Self::Error> {
+    fn column(&self, idx: usize) -> Result<Value, LimboError> {
         Ok(match idx {
             COL_KEY => self.columns.key(),
-            COL_VALUE => {
-                try_result!(
-                    "converting value column to ext value",
-                    self.columns.value(),
-                    Err
-                )
-            }
+            COL_VALUE => self.columns.value()?,
             COL_TYPE => self.columns.ttype(),
             COL_ATOM => self.columns.atom()?,
-            COL_ID => Value::from_integer(self.rowid),
+            COL_ID => Value::Integer(self.rowid),
             COL_PARENT => self.columns.parent(),
             COL_FULLKEY => self.columns.fullkey(),
             COL_PATH => self.columns.path(),
-            COL_ROOT => Value::from_text("json, todo".to_owned()),
+            COL_ROOT => Value::Text(Text::new("json, todo")),
             num => {
                 println!("was asked for column {num}");
-                Value::null()
+                Value::Null
             }
         })
     }
-
-    fn eof(&self) -> bool {
-        self.no_more_rows
-    }
-}
-
-fn convert_ext_value_to_db_value(ext_value: &turso_ext::Value) -> Result<crate::Value, ResultCode> {
-    Ok(match ext_value.value_type() {
-        turso_ext::ValueType::Null => crate::Value::Null,
-        turso_ext::ValueType::Text if ext_value.is_json() => crate::Value::Text(
-            crate::types::Text::json(ext_value.to_text().unwrap().to_owned()),
-        ),
-        turso_ext::ValueType::Text => {
-            crate::Value::Text(crate::types::Text::new(ext_value.to_text().unwrap()))
-        }
-        turso_ext::ValueType::Integer => crate::Value::Integer(ext_value.to_integer().unwrap()),
-        turso_ext::ValueType::Float => crate::Value::Float(ext_value.to_float().unwrap()),
-        turso_ext::ValueType::Blob => crate::Value::Blob(ext_value.to_blob().unwrap()),
-        turso_ext::ValueType::Error => return Err(ResultCode::InvalidArgs),
-    })
 }
 
 mod columns {
-    use turso_ext::{ResultCode, Value};
-
-    use crate::json::{
-        json_string_to_ext_value,
-        jsonb::{self, ElementType, Jsonb},
-        OutputVariant,
+    use crate::{
+        json::{
+            json_string_to_db_type,
+            jsonb::{self, ElementType, Jsonb},
+            OutputVariant,
+        },
+        types::Text,
+        LimboError, Value,
     };
 
     #[derive(Debug)]
@@ -310,7 +274,7 @@ mod columns {
 
         fn fullkey_representation(&self) -> Value {
             match self {
-                Key::Integer(ref i) => Value::from_text(format!("$[{i}]")),
+                Key::Integer(ref i) => Value::Text(Text::new(&format!("$[{i}]"))),
                 Key::String(ref text) => {
                     let mut needs_quoting: bool = false;
 
@@ -324,17 +288,17 @@ mod columns {
                     }
                     let s = format!("$.{text}");
 
-                    Value::from_text(s)
+                    Value::Text(Text::new(&s))
                 }
             }
         }
 
         fn key_representation(&self) -> Value {
             match self {
-                Key::Integer(ref i) => Value::from_integer(*i),
-                Key::String(ref s) => {
-                    Value::from_text(s[1..s.len() - 1].to_owned().replace("\\\"", "\""))
-                }
+                Key::Integer(ref i) => Value::Integer(*i),
+                Key::String(ref s) => Value::Text(Text::new(
+                    &s[1..s.len() - 1].to_owned().replace("\\\"", "\""),
+                )),
             }
         }
     }
@@ -372,39 +336,33 @@ mod columns {
             }
         }
 
-        pub(super) fn atom(&self) -> Result<Value, ResultCode> {
+        pub(super) fn atom(&self) -> Result<Value, LimboError> {
             Self::atom_from_value(&self.value)
         }
 
-        pub(super) fn value(&self) -> Result<Value, ResultCode> {
-            Ok(
-                match try_result!("reading element type", self.value.element_type(), Err) {
-                    ElementType::ARRAY | ElementType::OBJECT => {
-                        let value = try_result!(
-                            "converting value to extension value",
-                            json_string_to_ext_value(self.value.clone(), OutputVariant::String),
-                            Err
-                        );
-                        value
-                    }
-                    _ => Self::atom_from_value(&self.value)?,
-                },
-            )
+        pub(super) fn value(&self) -> Result<Value, LimboError> {
+            let element_type = self.value.element_type()?;
+            Ok(match element_type {
+                ElementType::ARRAY | ElementType::OBJECT => {
+                    json_string_to_db_type(self.value.clone(), element_type, OutputVariant::String)?
+                }
+                _ => Self::atom_from_value(&self.value)?,
+            })
         }
 
         pub(super) fn key(&self) -> Value {
             if self.is_primitive {
-                return Value::null();
+                return Value::Null;
             }
             self.key.key_representation()
         }
 
-        fn atom_from_value(value: &Jsonb) -> Result<Value, ResultCode> {
+        fn atom_from_value(value: &Jsonb) -> Result<Value, LimboError> {
             let element_type = value.element_type().expect("invalid value");
-            let string: Result<Value, turso_ext::ResultCode> = match element_type {
-                jsonb::ElementType::NULL => Ok(Value::null()),
-                jsonb::ElementType::TRUE => Ok(Value::from_integer(1)),
-                jsonb::ElementType::FALSE => Ok(Value::from_integer(0)),
+            let string: Result<Value, LimboError> = match element_type {
+                jsonb::ElementType::NULL => Ok(Value::Null),
+                jsonb::ElementType::TRUE => Ok(Value::Integer(1)),
+                jsonb::ElementType::FALSE => Ok(Value::Integer(0)),
                 jsonb::ElementType::INT | jsonb::ElementType::INT5 => Self::jsonb_to_integer(value),
                 jsonb::ElementType::FLOAT | jsonb::ElementType::FLOAT5 => {
                     Self::jsonb_to_float(value)
@@ -413,47 +371,47 @@ mod columns {
                 | jsonb::ElementType::TEXTJ
                 | jsonb::ElementType::TEXT5
                 | jsonb::ElementType::TEXTRAW => {
-                    let s = try_result!("converting value to string", value.to_string(), Err);
+                    let s = value.to_string()?;
                     let s = (s[1..s.len() - 1]).to_string();
-                    Ok(Value::from_text(s))
+                    Ok(Value::Text(Text::new(&s)))
                 }
-                jsonb::ElementType::ARRAY => Ok(Value::null()),
-                jsonb::ElementType::OBJECT => Ok(Value::null()),
-                jsonb::ElementType::RESERVED1 => Ok(Value::null()),
-                jsonb::ElementType::RESERVED2 => Ok(Value::null()),
-                jsonb::ElementType::RESERVED3 => Ok(Value::null()),
+                jsonb::ElementType::ARRAY => Ok(Value::Null),
+                jsonb::ElementType::OBJECT => Ok(Value::Null),
+                jsonb::ElementType::RESERVED1 => Ok(Value::Null),
+                jsonb::ElementType::RESERVED2 => Ok(Value::Null),
+                jsonb::ElementType::RESERVED3 => Ok(Value::Null),
             };
 
-            string.map_err(|_| ResultCode::Error)
+            string
         }
 
-        fn jsonb_to_integer(value: &Jsonb) -> Result<Value, ResultCode> {
-            let string = try_result!("converting jsonb to integer", value.to_string(), Err);
-            let int = try_result!("parsing int", string.parse::<i64>(), Err);
+        fn jsonb_to_integer(value: &Jsonb) -> Result<Value, LimboError> {
+            let string = value.to_string()?;
+            let int = string.parse::<i64>()?;
 
-            Ok(Value::from_integer(int))
+            Ok(Value::Integer(int))
         }
 
-        fn jsonb_to_float(value: &Jsonb) -> Result<Value, ResultCode> {
-            let string = try_result!("converting jsonb to integer", value.to_string(), Err);
-            let float = try_result!("parsing float", string.parse::<f64>(), Err);
+        fn jsonb_to_float(value: &Jsonb) -> Result<Value, LimboError> {
+            let string = value.to_string()?;
+            let float = string.parse::<f64>()?;
 
-            Ok(Value::from_float(float))
+            Ok(Value::Float(float))
         }
 
         pub(super) fn fullkey(&self) -> Value {
             if self.is_primitive {
-                return Value::from_text("$".to_owned());
+                return Value::Text(Text::new("$"));
             }
             self.key.fullkey_representation()
         }
 
         pub(super) fn path(&self) -> Value {
-            Value::from_text("$".to_owned())
+            Value::Text(Text::new("$"))
         }
 
         pub(super) fn parent(&self) -> Value {
-            Value::null()
+            Value::Null
         }
 
         pub(super) fn ttype(&self) -> Value {
@@ -475,7 +433,7 @@ mod columns {
                 | jsonb::ElementType::RESERVED3 => unreachable!(),
             };
 
-            Value::from_text(ttype.to_owned())
+            Value::Text(Text::new(ttype))
         }
     }
 }

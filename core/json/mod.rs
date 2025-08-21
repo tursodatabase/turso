@@ -19,13 +19,6 @@ use jsonb::{ElementType, Jsonb, JsonbHeader, PathOperationMode, SearchOperation,
 use std::borrow::Cow;
 use std::str::FromStr;
 
-pub fn register_extension(ext_api: &mut turso_ext::ExtensionApi) {
-    // FIXME: Add macro magic to register functions automatically.
-    unsafe {
-        vtab::JsonEachVirtualTable::register_JsonEachVirtualTable(ext_api);
-    }
-}
-
 #[derive(Debug, Clone, Copy)]
 pub enum Conv {
     Strict,
@@ -485,50 +478,6 @@ pub fn json_string_to_db_type(
         ElementType::TRUE => Ok(Value::Integer(1)),
         ElementType::FALSE => Ok(Value::Integer(0)),
         ElementType::NULL => Ok(Value::Null),
-        _ => unreachable!(),
-    }
-}
-
-pub fn json_string_to_ext_value(
-    json: Jsonb,
-    //TODO remove when I figure out which one I need
-    flag: OutputVariant,
-) -> crate::Result<turso_ext::Value> {
-    let element_type = json.element_type()?;
-
-    let mut json_string = json.to_string()?;
-    if matches!(flag, OutputVariant::Binary) {
-        return Ok(turso_ext::Value::from_blob(json.data()));
-    }
-    match element_type {
-        ElementType::ARRAY | ElementType::OBJECT => Ok(turso_ext::Value::from_json(json_string)),
-        ElementType::TEXT | ElementType::TEXT5 | ElementType::TEXTJ | ElementType::TEXTRAW => {
-            if matches!(flag, OutputVariant::ElementType) {
-                json_string.remove(json_string.len() - 1);
-                json_string.remove(0);
-                Ok(turso_ext::Value::from_json(json_string))
-            } else {
-                Ok(turso_ext::Value::from_text(json_string))
-            }
-        }
-        ElementType::FLOAT5 | ElementType::FLOAT => Ok(turso_ext::Value::from_float(
-            json_string.parse().expect("Should be valid f64"),
-        )),
-        ElementType::INT | ElementType::INT5 => {
-            let result = i64::from_str(&json_string);
-            if let Ok(int) = result {
-                Ok(turso_ext::Value::from_integer(int))
-            } else {
-                let res = f64::from_str(&json_string);
-                match res {
-                    Ok(num) => Ok(turso_ext::Value::from_float(num)),
-                    Err(_) => Ok(turso_ext::Value::null()),
-                }
-            }
-        }
-        ElementType::TRUE => Ok(turso_ext::Value::from_integer(1)),
-        ElementType::FALSE => Ok(turso_ext::Value::from_integer(1)),
-        ElementType::NULL => Ok(turso_ext::Value::null()),
         _ => unreachable!(),
     }
 }
