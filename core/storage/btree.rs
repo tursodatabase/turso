@@ -1323,49 +1323,60 @@ impl BTreeCursor {
     /// Move the cursor to the rightmost record in the btree.
     #[instrument(skip(self), level = Level::DEBUG)]
     fn move_to_rightmost(&mut self) -> Result<IOResult<bool>> {
-        let (move_to_right_state, rightmost_page_id) = &self.move_to_right_state;
-        match *move_to_right_state {
-            MoveToRightState::Start => {
-                if let Some(rightmost_page_id) = rightmost_page_id {
-                    // If we know the rightmost page and are already on it, we can skip a seek.
-                    let current_page = self.stack.top();
-                    let current_page = current_page.get();
-                    if current_page.get().id == *rightmost_page_id {
-                        let contents = current_page.get_contents();
-                        let cell_count = contents.cell_count();
-                        self.stack.set_cell_index(cell_count as i32 - 1);
-                        return Ok(IOResult::Done(cell_count > 0));
+        loop {
+            let (move_to_right_state, rightmost_page_id) = &self.move_to_right_state;
+            match *move_to_right_state {
+                MoveToRightState::Start => {
+                    if let Some(rightmost_page_id) = rightmost_page_id {
+                        // If we know the rightmost page and are already on it, we can skip a seek.
+                        let current_page = self.stack.top();
+                        let current_page = current_page.get();
+                        if current_page.get().id == *rightmost_page_id {
+                            let contents = current_page.get_contents();
+                            let cell_count = contents.cell_count();
+                            self.stack.set_cell_index(cell_count as i32 - 1);
+                            return Ok(IOResult::Done(cell_count > 0));
+                        }
                     }
-                }
-                let rightmost_page_id = *rightmost_page_id;
-                let c = self.move_to_root()?;
-                self.move_to_right_state = (MoveToRightState::ProcessPage, rightmost_page_id);
-                io_yield_one!(c);
-            }
-            MoveToRightState::ProcessPage => {
-                let mem_page = self.stack.top();
-                let page = mem_page.get();
-                let page_idx = page.get().id;
-                let contents = page.get().contents.as_ref().unwrap();
-                if contents.is_leaf() {
-                    self.move_to_right_state = (MoveToRightState::Start, Some(page_idx));
-                    if contents.cell_count() > 0 {
-                        self.stack.set_cell_index(contents.cell_count() as i32 - 1);
-                        return Ok(IOResult::Done(true));
-                    }
-                    return Ok(IOResult::Done(false));
-                }
-
-                match contents.rightmost_pointer() {
-                    Some(right_most_pointer) => {
-                        self.stack.set_cell_index(contents.cell_count() as i32 + 1);
-                        let (mem_page, c) = self.read_page(right_most_pointer as usize)?;
-                        self.stack.push(mem_page);
+                    let rightmost_page_id = *rightmost_page_id;
+                    let c = self.move_to_root()?;
+                    self.move_to_right_state = (MoveToRightState::ProcessPage, rightmost_page_id);
+                    if c.is_completed() {
+                        // Continue to ProcessPage immediately if completion is done
+                        continue;
+                    } else {
                         io_yield_one!(c);
                     }
+                }
+                MoveToRightState::ProcessPage => {
+                    let mem_page = self.stack.top();
+                    let page = mem_page.get();
+                    let page_idx = page.get().id;
+                    let contents = page.get().contents.as_ref().unwrap();
+                    if contents.is_leaf() {
+                        self.move_to_right_state = (MoveToRightState::Start, Some(page_idx));
+                        if contents.cell_count() > 0 {
+                            self.stack.set_cell_index(contents.cell_count() as i32 - 1);
+                            return Ok(IOResult::Done(true));
+                        }
+                        return Ok(IOResult::Done(false));
+                    }
 
-                    None => {
-                        unreachable!("interior page should have a rightmost pointer");
+                    match contents.rightmost_pointer() {
+                        Some(right_most_pointer) => {
+                            self.stack.set_cell_index(contents.cell_count() as i32 + 1);
+                            let (mem_page, c) = self.read_page(right_most_pointer as usize)?;
+                            self.stack.push(mem_page);
+                            if c.is_completed() {
+                                continue;
+                            } else {
+                                io_yield_one!(c);
+                            }
+                        }
+
+                        None => {
+                            unreachable!("interior page should have a rightmost pointer");
+                        }
                     }
                 }
             }
