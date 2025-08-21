@@ -1249,7 +1249,11 @@ impl BTreeCursor {
                         self.stack.advance();
                         let (mem_page, c) = self.read_page(right_most_pointer as usize)?;
                         self.stack.push(mem_page);
-                        io_yield_one!(c);
+                        if c.is_completed() {
+                            continue;
+                        } else {
+                            io_yield_one!(c);
+                        }
                     }
                     _ => {
                         if self.ancestor_pages_have_more_children() {
@@ -1287,7 +1291,11 @@ impl BTreeCursor {
             let left_child_page = contents.cell_interior_read_left_child_page(cell_idx);
             let (mem_page, c) = self.read_page(left_child_page as usize)?;
             self.stack.push(mem_page);
-            io_yield_one!(c);
+            if c.is_completed() {
+                continue;
+            } else {
+                io_yield_one!(c);
+            }
         }
     }
 
