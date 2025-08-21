@@ -4185,7 +4185,11 @@ impl BTreeCursor {
                         mv_cursor.rewind();
                     } else {
                         let c = self.move_to_root()?;
-                        io_yield_one!(c);
+                        if c.is_completed() {
+                            continue;
+                        } else {
+                            io_yield_one!(c);
+                        }
                     }
                 }
                 RewindState::NextRecord => {
