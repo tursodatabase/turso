@@ -2637,7 +2637,8 @@ impl BTreeCursor {
                         first_divider_cell: first_cell_divider,
                     });
                     *sub_state = BalanceSubState::NonRootDoBalancing;
-                    if !completions.is_empty() {
+                    let done = completions.iter().all(|c| c.is_completed());
+                    if !completions.is_empty() && !done {
                         // TODO: when tracking IO return all the completions here
                         io_yield_many!(completions);
                     }
