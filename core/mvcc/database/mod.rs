@@ -5,6 +5,7 @@ use crate::state_machine::StateTransition;
 use crate::state_machine::TransitionResult;
 use crate::storage::btree::BTreeCursor;
 use crate::storage::btree::BTreeKey;
+use crate::storage::pager::PagerCommitResult;
 use crate::types::IOResult;
 use crate::types::ImmutableRecord;
 use crate::IOExt;
@@ -876,9 +877,9 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     /// # Returns
     ///
     /// Returns `true` if the row was successfully updated, and `false` otherwise.
-    pub fn update(&self, tx_id: TxID, row: Row, pager: Rc<Pager>) -> Result<bool> {
+    pub fn update(&self, tx_id: TxID, row: Row) -> Result<bool> {
         tracing::trace!("update(tx_id={}, row.id={:?})", tx_id, row.id);
-        if !self.delete(tx_id, row.id, pager)? {
+        if !self.delete(tx_id, row.id)? {
             return Ok(false);
         }
         self.insert(tx_id, row)?;
@@ -887,9 +888,9 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
     /// Inserts a row in the database with new values, previously deleting
     /// any old data if it existed. Bails on a delete error, e.g. write-write conflict.
-    pub fn upsert(&self, tx_id: TxID, row: Row, pager: Rc<Pager>) -> Result<()> {
+    pub fn upsert(&self, tx_id: TxID, row: Row) -> Result<()> {
         tracing::trace!("upsert(tx_id={}, row.id={:?})", tx_id, row.id);
-        self.delete(tx_id, row.id, pager)?;
+        self.delete(tx_id, row.id)?;
         self.insert(tx_id, row)
     }
 
@@ -907,7 +908,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     ///
     /// Returns `true` if the row was successfully deleted, and `false` otherwise.
     ///
-    pub fn delete(&self, tx_id: TxID, id: RowID, pager: Rc<Pager>) -> Result<bool> {
+    pub fn delete(&self, tx_id: TxID, id: RowID) -> Result<bool> {
         tracing::trace!("delete(tx_id={}, id={:?})", tx_id, id);
         let row_versions_opt = self.rows.get(&id);
         if let Some(ref row_versions) = row_versions_opt {
@@ -928,7 +929,6 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                     drop(row_versions);
                     drop(row_versions_opt);
                     drop(tx);
-                    self.rollback_tx(tx_id, pager);
                     return Err(LimboError::WriteWriteConflict);
                 }
 
