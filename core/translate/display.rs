@@ -217,7 +217,7 @@ impl fmt::Display for UpdatePlan {
                 )?;
             }
         }
-        if let Some(limit) = self.limit {
+        if let Some(limit) = self.limit.clone() {
             writeln!(f, "LIMIT: {limit}")?;
         }
         if let Some(ret) = &self.returning {

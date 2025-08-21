@@ -1,7 +1,10 @@
+use turso_sqlite3_parser::ast::{Expr, Literal, Operator, UnaryOperator};
+
 use crate::{
+    error::SQLITE_CONSTRAINT,
     vdbe::{
         builder::ProgramBuilder,
-        insn::{IdxInsertFlags, InsertFlags, Insn},
+        insn::{CmpInsFlags, IdxInsertFlags, InsertFlags, Insn},
         BranchOffset,
     },
     Result,
@@ -164,15 +167,172 @@ pub fn emit_offset(
     jump_to: BranchOffset,
     reg_offset: Option<usize>,
 ) {
-    match plan.offset {
-        Some(offset) if offset > 0 => {
-            program.add_comment(program.offset(), "OFFSET");
+    let Some(offset_expr) = &plan.offset else {
+        return;
+    };
+
+    if let Some(val) = try_fold_expr_to_i64(offset_expr) {
+        if val > 0 {
+            program.add_comment(program.offset(), "OFFSET const");
             program.emit_insn(Insn::IfPos {
                 reg: reg_offset.expect("reg_offset must be Some"),
                 target_pc: jump_to,
                 decrement_by: 1,
             });
         }
-        _ => {}
+        return;
+    }
+
+    let r = reg_offset.expect("reg_offset must be Some");
+
+    program.add_comment(program.offset(), "OFFSET expr");
+
+    let label_zero = program.allocate_label();
+
+    build_limit_offset_expr(program, r, offset_expr);
+
+    program.emit_insn(Insn::MustBeInt { reg: r });
+
+    program.emit_insn(Insn::IfNeg {
+        reg: r,
+        target_pc: label_zero,
+    });
+    program.emit_insn(Insn::IsNull {
+        reg: r,
+        target_pc: label_zero,
+    });
+
+    program.emit_insn(Insn::IfPos {
+        reg: r,
+        target_pc: jump_to,
+        decrement_by: 1,
+    });
+
+    program.preassign_label_to_next_insn(label_zero);
+    program.emit_insn(Insn::Integer { value: 0, dest: r });
+}
+
+pub fn build_limit_offset_expr(program: &mut ProgramBuilder, r: usize, expr: &Expr) {
+    match expr {
+        Expr::Literal(Literal::Numeric(n)) => {
+            let value = n.parse::<i64>().unwrap_or_else(|_| {
+                program.emit_insn(Insn::Halt {
+                    err_code: SQLITE_CONSTRAINT,
+                    description: "invalid numeric literal".into(),
+                });
+                0
+            });
+            program.emit_int(value, r);
+        }
+        Expr::Unary(UnaryOperator::Negative, inner) => {
+            let inner_reg = program.alloc_register();
+            build_limit_offset_expr(program, inner_reg, inner);
+
+            let neg_one_reg = program.alloc_register();
+            program.emit_int(-1, neg_one_reg);
+
+            program.emit_insn(Insn::Multiply {
+                lhs: inner_reg,
+                rhs: neg_one_reg,
+                dest: r,
+            });
+        }
+        Expr::Unary(UnaryOperator::Positive, inner) => {
+            let inner_reg = program.alloc_register();
+            build_limit_offset_expr(program, inner_reg, inner);
+            program.emit_insn(Insn::Copy {
+                src_reg: inner_reg,
+                dst_reg: r,
+                extra_amount: 0,
+            });
+        }
+        Expr::Binary(left, op, right) => {
+            let left_reg = program.alloc_register();
+            let right_reg = program.alloc_register();
+            build_limit_offset_expr(program, left_reg, left);
+            build_limit_offset_expr(program, right_reg, right);
+
+            match op {
+                Operator::Add => {
+                    program.emit_insn(Insn::Add {
+                        lhs: left_reg,
+                        rhs: right_reg,
+                        dest: r,
+                    });
+                }
+                Operator::Subtract => {
+                    program.emit_insn(Insn::Subtract {
+                        lhs: left_reg,
+                        rhs: right_reg,
+                        dest: r,
+                    });
+                }
+                Operator::Multiply => {
+                    program.emit_insn(Insn::Multiply {
+                        lhs: left_reg,
+                        rhs: right_reg,
+                        dest: r,
+                    });
+                }
+                Operator::Divide => {
+                    let zero_reg = program.alloc_register();
+                    program.emit_int(0, zero_reg);
+
+                    let ok_pc = program.allocate_label();
+                    program.emit_insn(Insn::Ne {
+                        lhs: right_reg,
+                        rhs: zero_reg,
+                        target_pc: ok_pc,
+                        flags: CmpInsFlags::default().jump_if_null(),
+                        collation: None,
+                    });
+
+                    program.emit_insn(Insn::Halt {
+                        err_code: SQLITE_CONSTRAINT,
+                        description: "divide by zero".into(),
+                    });
+
+                    program.resolve_label(ok_pc, program.offset());
+                    program.emit_insn(Insn::Divide {
+                        lhs: left_reg,
+                        rhs: right_reg,
+                        dest: r,
+                    });
+                }
+                _ => {
+                    program.emit_insn(Insn::Halt {
+                        err_code: SQLITE_CONSTRAINT,
+                        description: "unsupported operator in offset expr".into(),
+                    });
+                }
+            }
+        }
+        _ => {
+            program.emit_insn(Insn::Halt {
+                err_code: SQLITE_CONSTRAINT,
+                description: "non-integer expression in offset".into(),
+            });
+        }
+    }
+}
+
+pub fn try_fold_expr_to_i64(expr: &Expr) -> Option<i64> {
+    match expr {
+        Expr::Literal(Literal::Numeric(n)) => n.parse::<i64>().ok(),
+        Expr::Unary(UnaryOperator::Negative, inner) => try_fold_expr_to_i64(inner).map(|v| -v),
+        Expr::Unary(UnaryOperator::Positive, inner) => try_fold_expr_to_i64(inner),
+        Expr::Binary(left, op, right) => {
+            let l = try_fold_expr_to_i64(left)?;
+            let r = try_fold_expr_to_i64(right)?;
+            match op {
+                Operator::Add => Some(l.saturating_add(r)),
+                Operator::Subtract => Some(l.saturating_sub(r)),
+                Operator::Multiply => Some(l.saturating_mul(r)),
+                Operator::Divide if r != 0 => Some(l.saturating_div(r)),
+                _ => None,
+            }
+        }
+
+        _ => None,
     }
 }

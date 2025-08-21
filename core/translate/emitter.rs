@@ -26,6 +26,7 @@ use crate::schema::{BTreeTable, Column, Schema, Table};
 use crate::translate::compound_select::emit_program_for_compound_select;
 use crate::translate::expr::{emit_returning_results, ReturningValueRegisters};
 use crate::translate::plan::{DeletePlan, Plan, QueryDestination, Search};
+use crate::translate::result_row::{build_limit_offset_expr, try_fold_expr_to_i64};
 use crate::translate::values::emit_values;
 use crate::util::exprs_are_equivalent;
 use crate::vdbe::builder::{CursorKey, CursorType, ProgramBuilder};
@@ -227,8 +228,8 @@ fn emit_program_for_select(
     );
 
     // Trivial exit on LIMIT 0
-    if let Some(limit) = plan.limit {
-        if limit == 0 {
+    if let Some(limit) = plan.limit.as_ref().and_then(try_fold_expr_to_i64) {
+        if limit <= 0 {
             program.result_columns = plan.result_columns;
             program.table_references.extend(plan.table_references);
             return Ok(());
@@ -256,7 +257,7 @@ pub fn emit_query<'a>(
     // Emit subqueries first so the results can be read in the main query loop.
     emit_subqueries(program, t_ctx, &mut plan.table_references)?;
 
-    init_limit(program, t_ctx, plan.limit, plan.offset);
+    init_limit(program, t_ctx, plan.limit.clone(), plan.offset.clone());
 
     // No rows will be read from source table loops if there is a constant false condition eg. WHERE 0
     // however an aggregation might still happen,
@@ -404,10 +405,12 @@ fn emit_program_for_delete(
     );
 
     // exit early if LIMIT 0
-    if let Some(0) = plan.limit {
-        program.result_columns = plan.result_columns;
-        program.table_references.extend(plan.table_references);
-        return Ok(());
+    if let Some(limit) = plan.limit.as_ref().and_then(try_fold_expr_to_i64) {
+        if limit <= 0 {
+            program.result_columns = plan.result_columns;
+            program.table_references.extend(plan.table_references);
+            return Ok(());
+        }
     }
 
     init_limit(program, &mut t_ctx, plan.limit, None);
@@ -660,13 +663,15 @@ fn emit_program_for_update(
     );
 
     // Exit on LIMIT 0
-    if let Some(0) = plan.limit {
-        program.result_columns = plan.returning.unwrap_or_default();
-        program.table_references.extend(plan.table_references);
-        return Ok(());
+    if let Some(limit) = plan.limit.as_ref().and_then(try_fold_expr_to_i64) {
+        if limit <= 0 {
+            program.result_columns = plan.returning.unwrap_or_default();
+            program.table_references.extend(plan.table_references);
+            return Ok(());
+        }
     }
 
-    init_limit(program, &mut t_ctx, plan.limit, plan.offset);
+    init_limit(program, &mut t_ctx, plan.limit.clone(), plan.offset.clone());
     let after_main_loop_label = program.allocate_label();
     t_ctx.label_main_loop_end = Some(after_main_loop_label);
     if plan.contains_constant_false_condition {
@@ -1541,41 +1546,90 @@ pub fn emit_cdc_insns(
     });
     Ok(())
 }
-
 /// Initialize the limit/offset counters and registers.
 /// In case of compound SELECTs, the limit counter is initialized only once,
 /// hence [LimitCtx::initialize_counter] being false in those cases.
 fn init_limit(
     program: &mut ProgramBuilder,
     t_ctx: &mut TranslateCtx,
-    limit: Option<isize>,
-    offset: Option<isize>,
+    limit: Option<Expr>,
+    offset: Option<Expr>,
 ) {
-    if t_ctx.limit_ctx.is_none() {
-        t_ctx.limit_ctx = limit.map(|_| LimitCtx::new(program));
+    if t_ctx.limit_ctx.is_none() && limit.is_some() {
+        t_ctx.limit_ctx = Some(LimitCtx::new(program));
     }
-    let Some(limit_ctx) = t_ctx.limit_ctx else {
+    let Some(limit_ctx) = &t_ctx.limit_ctx else {
         return;
     };
     if limit_ctx.initialize_counter {
-        program.emit_insn(Insn::Integer {
-            value: limit.expect("limit must be Some if limit_ctx is Some") as i64,
-            dest: limit_ctx.reg_limit,
-        });
+        if let Some(expr) = limit {
+            if let Some(value) = try_fold_expr_to_i64(&expr) {
+                program.emit_insn(Insn::Integer {
+                    value,
+                    dest: limit_ctx.reg_limit,
+                });
+            } else {
+                let r = limit_ctx.reg_limit;
+                program.add_comment(program.offset(), "OFFSET expr");
+                let label_zero = program.allocate_label();
+                build_limit_offset_expr(program, r, &expr);
+                program.emit_insn(Insn::MustBeInt { reg: r });
+                program.emit_insn(Insn::IfNeg {
+                    reg: r,
+                    target_pc: label_zero, 
+                });
+                program.emit_insn(Insn::IsNull {
+                    reg: r,
+                    target_pc: label_zero,
+                });
+                program.preassign_label_to_next_insn(label_zero);
+                program.emit_insn(Insn::Integer { value: 0, dest: r });
+            }
+        }
     }
-    if t_ctx.reg_offset.is_none() && offset.is_some_and(|n| n.ne(&0)) {
-        let reg = program.alloc_register();
-        t_ctx.reg_offset = Some(reg);
-        program.emit_insn(Insn::Integer {
-            value: offset.unwrap() as i64,
-            dest: reg,
-        });
-        let combined_reg = program.alloc_register();
-        t_ctx.reg_limit_offset_sum = Some(combined_reg);
-        program.emit_insn(Insn::OffsetLimit {
-            limit_reg: t_ctx.limit_ctx.unwrap().reg_limit,
-            offset_reg: reg,
-            combined_reg,
-        });
+
+    if t_ctx.reg_offset.is_none() {
+        if let Some(expr) = offset {
+            if let Some(value) = try_fold_expr_to_i64(&expr) {
+                if value != 0 {
+                    let reg = program.alloc_register();
+                    t_ctx.reg_offset = Some(reg);
+                    program.emit_insn(Insn::Integer { value, dest: reg });
+                    let combined_reg = program.alloc_register();
+                    t_ctx.reg_limit_offset_sum = Some(combined_reg);
+                    program.emit_insn(Insn::OffsetLimit {
+                        limit_reg: limit_ctx.reg_limit,
+                        offset_reg: reg,
+                        combined_reg,
+                    });
+                }
+            } else {
+
+                let reg = program.alloc_register();
+                t_ctx.reg_offset = Some(reg);
+                let r = reg;
+                program.add_comment(program.offset(), "OFFSET expr");
+                let label_zero = program.allocate_label();
+                build_limit_offset_expr(program, r, &expr);
+                program.emit_insn(Insn::MustBeInt { reg: r });
+                program.emit_insn(Insn::IfNeg {
+                    reg: r,
+                    target_pc: label_zero,
+                });
+                program.emit_insn(Insn::IsNull {
+                    reg: r,
+                    target_pc: label_zero,
+                });
+                program.preassign_label_to_next_insn(label_zero);
+                program.emit_insn(Insn::Integer { value: 0, dest: r });
+                let combined_reg = program.alloc_register();
+                t_ctx.reg_limit_offset_sum = Some(combined_reg);
+                program.emit_insn(Insn::OffsetLimit {
+                    limit_reg: limit_ctx.reg_limit,
+                    offset_reg: reg,
+                    combined_reg,
+                });
+            }
+        }
     }
 }

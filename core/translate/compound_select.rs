@@ -1,6 +1,7 @@
 use crate::schema::{Index, IndexColumn, Schema};
 use crate::translate::emitter::{emit_query, LimitCtx, TranslateCtx};
 use crate::translate::plan::{Plan, QueryDestination, SelectPlan};
+use crate::translate::result_row::{build_limit_offset_expr, try_fold_expr_to_i64};
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::Insn;
 use crate::vdbe::BranchOffset;
@@ -31,8 +32,8 @@ pub fn emit_program_for_compound_select(
 
     let right_plan = right_most.clone();
     // Trivial exit on LIMIT 0
-    if let Some(limit) = limit {
-        if *limit == 0 {
+    if let Some(expr) = limit {
+        if let Some(0) = try_fold_expr_to_i64(expr) {
             program.result_columns = right_plan.result_columns;
             program.table_references.extend(right_plan.table_references);
             return Ok(());
@@ -41,26 +42,79 @@ pub fn emit_program_for_compound_select(
 
     // Each subselect shares the same limit_ctx and offset, because the LIMIT, OFFSET applies to
     // the entire compound select, not just a single subselect.
-    let limit_ctx = limit.map(|limit| {
+    let limit_ctx = limit.clone().map(|limit| {
         let reg = program.alloc_register();
-        program.emit_insn(Insn::Integer {
-            value: limit as i64,
-            dest: reg,
-        });
+        if let Some(val) = try_fold_expr_to_i64(&limit) {
+            // Compile-time constant limit
+            program.emit_insn(Insn::Integer {
+                value: val,
+                dest: reg,
+            });
+        } else {
+            program.add_comment(program.offset(), "OFFSET expr");
+
+            let label_zero = program.allocate_label();
+
+            build_limit_offset_expr(program, reg, &limit);
+
+            program.emit_insn(Insn::MustBeInt { reg });
+
+            program.emit_insn(Insn::IfNeg {
+                reg,
+                target_pc: label_zero,
+            });
+            program.emit_insn(Insn::IsNull {
+                reg,
+                target_pc: label_zero,
+            });
+
+            program.preassign_label_to_next_insn(label_zero);
+            program.emit_insn(Insn::Integer {
+                value: 0,
+                dest: reg,
+            });
+        }
         LimitCtx::new_shared(reg)
     });
-    let offset_reg = offset.map(|offset| {
+    let offset_reg = offset.as_ref().map(|offset_expr| {
         let reg = program.alloc_register();
-        program.emit_insn(Insn::Integer {
-            value: offset as i64,
-            dest: reg,
-        });
+
+        if let Some(val) = try_fold_expr_to_i64(offset_expr) {
+            // Compile-time constant offset
+            program.emit_insn(Insn::Integer {
+                value: val,
+                dest: reg,
+            });
+        } else {
+            program.add_comment(program.offset(), "OFFSET expr");
+
+            let label_zero = program.allocate_label();
+
+            build_limit_offset_expr(program, reg, &offset_expr);
+
+            program.emit_insn(Insn::MustBeInt { reg });
+
+            program.emit_insn(Insn::IfNeg {
+                reg,
+                target_pc: label_zero,
+            });
+            program.emit_insn(Insn::IsNull {
+                reg,
+                target_pc: label_zero,
+            });
+
+            program.preassign_label_to_next_insn(label_zero);
+            program.emit_insn(Insn::Integer {
+                value: 0,
+                dest: reg,
+            });
+        }
 
         let combined_reg = program.alloc_register();
         program.emit_insn(Insn::OffsetLimit {
             offset_reg: reg,
             combined_reg,
-            limit_reg: limit_ctx.unwrap().reg_limit,
+            limit_reg: limit_ctx.as_ref().unwrap().reg_limit,
         });
 
         reg
@@ -137,8 +191,8 @@ fn emit_compound_select(
                 let compound_select = Plan::CompoundSelect {
                     left,
                     right_most: plan,
-                    limit,
-                    offset,
+                    limit: limit.clone(),
+                    offset: offset.clone(),
                     order_by,
                 };
                 emit_compound_select(
