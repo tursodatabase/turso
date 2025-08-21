@@ -1917,10 +1917,6 @@ pub fn halt(
     err_code: usize,
     description: &str,
 ) -> Result<InsnFunctionStepResult> {
-    if err_code > 0 {
-        // invalidate page cache in case of error
-        pager.clear_page_cache();
-    }
     match err_code {
         0 => {}
         SQLITE_CONSTRAINT_PRIMARYKEY => {

@@ -858,6 +858,8 @@ pub fn handle_program_error(
         LimboError::TxError(_) => {}
         // Table locked errors, e.g. trying to checkpoint in an interactive transaction, do not cause a rollback.
         LimboError::TableLocked => {}
+        // Table constraints, e.g NOT NULL, UNIQUE etc. Check issue #2713
+        LimboError::Constraint(_) => {}
         _ => {
             pager
                 .io

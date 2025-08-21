@@ -24,3 +24,39 @@ fn test_txn_error_doesnt_rollback_txn() -> Result<()> {
 
     Ok(())
 }
+
+// https://github.com/tursodatabase/turso/issues/2713
+#[test]
+fn test_constraint_error_doesnt_rollback_txn() -> Result<()> {
+    let tmp_db = TempDatabase::new_with_rusqlite("create table t (x integer primary key);", false);
+    let conn = tmp_db.connect_limbo();
+    conn.execute("insert into t values (1)")?;
+
+    conn.execute("begin")?;
+    conn.execute("create table t2(x integer primary key)")?;
+
+    // should fail
+    assert!(conn
+        .execute("insert into t values (1)")
+        .inspect_err(|e| assert!(matches!(e, LimboError::Constraint(_))))
+        .is_err());
+
+    conn.execute("commit")?;
+    let mut stmt = conn.query("select count(*) from sqlite_schema")?.unwrap();
+    loop {
+        match stmt.step()? {
+            StepResult::Row => {
+                let row = stmt.row().unwrap();
+                // should be 2 tables => t, t1
+                assert_eq!(*row.get::<&Value>(0).unwrap(), Value::Integer(2));
+            }
+            StepResult::Done => break,
+            StepResult::IO => {
+                stmt.run_once().unwrap();
+            }
+            step => panic!("unexpected step result {step:?}"),
+        }
+    }
+
+    Ok(())
+}
