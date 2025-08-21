@@ -133,7 +133,7 @@ pub fn emit_order_by(
             .get(i)
             .expect("remapping must exist for all result columns")
             .orderby_sorter_idx;
-        program.emit_column(cursor_id, column_idx, reg);
+        program.emit_column_or_rowid(cursor_id, column_idx, reg);
     }
 
     emit_result_row_and_limit(

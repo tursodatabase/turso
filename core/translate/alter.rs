@@ -125,7 +125,7 @@ pub fn translate_alter_table(
                                 continue;
                             }
 
-                            program.emit_column(cursor_id, i, iter);
+                            program.emit_column_or_rowid(cursor_id, i, iter);
 
                             iter += 1;
                         }
@@ -264,7 +264,7 @@ pub fn translate_alter_table(
                 let first_column = program.alloc_registers(sqlite_schema_column_len);
 
                 for i in 0..sqlite_schema_column_len {
-                    program.emit_column(cursor_id, i, first_column + i);
+                    program.emit_column_or_rowid(cursor_id, i, first_column + i);
                 }
 
                 program.emit_string8_new_reg(table_name.to_string());
@@ -354,7 +354,7 @@ pub fn translate_alter_table(
                 let first_column = program.alloc_registers(sqlite_schema_column_len);
 
                 for i in 0..sqlite_schema_column_len {
-                    program.emit_column(cursor_id, i, first_column + i);
+                    program.emit_column_or_rowid(cursor_id, i, first_column + i);
                 }
 
                 program.emit_string8_new_reg(table_name.to_string());

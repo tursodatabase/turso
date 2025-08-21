@@ -220,8 +220,8 @@ pub fn translate_drop_view(
     let col0_reg = program.alloc_register();
     let col1_reg = program.alloc_register();
 
-    program.emit_column(sqlite_schema_cursor_id, 0, col0_reg);
-    program.emit_column(sqlite_schema_cursor_id, 1, col1_reg);
+    program.emit_column_or_rowid(sqlite_schema_cursor_id, 0, col0_reg);
+    program.emit_column_or_rowid(sqlite_schema_cursor_id, 1, col1_reg);
 
     // Check if type == 'view' and name == view_name
     let skip_delete_label = program.allocate_label();

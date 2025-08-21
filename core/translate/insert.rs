@@ -830,7 +830,7 @@ fn populate_columns_multiple_rows(
                 column_register
             };
             if let Some(temp_table_ctx) = temp_table_ctx {
-                program.emit_column(temp_table_ctx.cursor_id, value_index, write_reg);
+                program.emit_column_or_rowid(temp_table_ctx.cursor_id, value_index, write_reg);
             } else {
                 program.emit_insn(Insn::Copy {
                     src_reg: yield_reg + value_index,

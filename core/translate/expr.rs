@@ -2012,7 +2012,7 @@ pub fn translate_expr(
                             *column
                         };
 
-                        program.emit_column(read_cursor, column, target_register);
+                        program.emit_column_or_rowid(read_cursor, column, target_register);
                     }
                     let Some(column) = table.get_column_at(*column) else {
                         crate::bail_parse_error!("column index out of bounds");

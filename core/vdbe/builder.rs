@@ -836,7 +836,27 @@ impl ProgramBuilder {
         self.preassign_label_to_next_insn(loop_end);
     }
 
-    pub fn emit_column(&mut self, cursor_id: CursorID, column: usize, out: usize) {
+    pub fn emit_column_or_rowid(&mut self, cursor_id: CursorID, column: usize, out: usize) {
+        let (_, cursor_type) = self.cursor_ref.get(cursor_id).unwrap();
+        if let CursorType::BTreeTable(btree) = cursor_type {
+            let column_def = btree
+                .columns
+                .get(column)
+                .expect("column index out of bounds");
+            if column_def.is_rowid_alias {
+                self.emit_insn(Insn::RowId {
+                    cursor_id,
+                    dest: out,
+                });
+            } else {
+                self.emit_column(cursor_id, column, out);
+            }
+        } else {
+            self.emit_column(cursor_id, column, out);
+        }
+    }
+
+    fn emit_column(&mut self, cursor_id: CursorID, column: usize, out: usize) {
         let (_, cursor_type) = self.cursor_ref.get(cursor_id).unwrap();
 
         use crate::translate::expr::sanitize_string;

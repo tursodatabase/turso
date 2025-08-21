@@ -479,7 +479,7 @@ impl<'a> GroupByAggArgumentSource<'a> {
                 dest_reg_start,
                 ..
             } => {
-                program.emit_column(*cursor_id, *col_start, dest_reg_start + arg_idx);
+                program.emit_column_or_rowid(*cursor_id, *col_start, dest_reg_start + arg_idx);
                 Ok(dest_reg_start + arg_idx)
             }
             GroupByAggArgumentSource::Register {
@@ -525,7 +525,7 @@ pub fn group_by_process_single_group(
             for i in 0..group_by.exprs.len() {
                 let sorter_column_index = i;
                 let group_reg = groups_start_reg + i;
-                program.emit_column(*pseudo_cursor, sorter_column_index, group_reg);
+                program.emit_column_or_rowid(*pseudo_cursor, sorter_column_index, group_reg);
             }
             groups_start_reg
         }
@@ -648,7 +648,7 @@ pub fn group_by_process_single_group(
                 t_ctx.non_aggregate_expressions.iter().enumerate()
             {
                 if *in_result {
-                    program.emit_column(*pseudo_cursor, sorter_column_index, next_reg);
+                    program.emit_column_or_rowid(*pseudo_cursor, sorter_column_index, next_reg);
                     t_ctx.resolver.expr_to_reg_cache.push((expr, next_reg));
                     next_reg += 1;
                 }

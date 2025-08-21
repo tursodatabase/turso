@@ -1404,7 +1404,7 @@ fn emit_autoindex(
     let ephemeral_cols_start_reg = program.alloc_registers(num_regs_to_reserve);
     for (i, col) in index.columns.iter().enumerate() {
         let reg = ephemeral_cols_start_reg + i;
-        program.emit_column(table_cursor_id, col.pos_in_table, reg);
+        program.emit_column_or_rowid(table_cursor_id, col.pos_in_table, reg);
     }
     if table_has_rowid {
         program.emit_insn(Insn::RowId {

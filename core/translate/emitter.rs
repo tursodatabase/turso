@@ -551,7 +551,7 @@ fn emit_delete_insns(
                     .iter()
                     .enumerate()
                     .for_each(|(reg_offset, column_index)| {
-                        program.emit_column(
+                        program.emit_column_or_rowid(
                             main_table_cursor_id,
                             column_index.pos_in_table,
                             start_reg + reg_offset,
@@ -615,7 +615,7 @@ fn emit_delete_insns(
 
             // Read all column values from the row to be deleted
             for (i, _column) in table_reference.columns().iter().enumerate() {
-                program.emit_column(main_table_cursor_id, i, columns_start_reg + i);
+                program.emit_column_or_rowid(main_table_cursor_id, i, columns_start_reg + i);
             }
 
             // Emit RETURNING results using the values we just read
@@ -967,7 +967,11 @@ fn emit_update_insns(
                         }
                     })
                     .unwrap_or(&cursor_id);
-                program.emit_column(cursor_id, column_idx_in_index.unwrap_or(idx), target_reg);
+                program.emit_column_or_rowid(
+                    cursor_id,
+                    column_idx_in_index.unwrap_or(idx),
+                    target_reg,
+                );
             }
 
             if let Some(cdc_updates_register) = cdc_updates_register {
@@ -1146,7 +1150,7 @@ fn emit_update_insns(
                 .iter()
                 .enumerate()
                 .for_each(|(reg_offset, column_index)| {
-                    program.emit_column(
+                    program.emit_column_or_rowid(
                         cursor_id,
                         column_index.pos_in_table,
                         start_reg + reg_offset,
@@ -1406,7 +1410,7 @@ pub fn emit_cdc_full_record(
                 extra_amount: 0,
             });
         } else {
-            program.emit_column(table_cursor_id, i, columns_reg + 1 + i);
+            program.emit_column_or_rowid(table_cursor_id, i, columns_reg + 1 + i);
         }
     }
     program.emit_insn(Insn::MakeRecord {
