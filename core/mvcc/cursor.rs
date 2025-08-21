@@ -17,12 +17,12 @@ enum CursorPosition {
     /// We have reached the end of the table.
     End,
 }
+#[derive(Debug)]
 pub struct MvccLazyCursor<Clock: LogicalClock> {
     pub db: Arc<MvStore<Clock>>,
     current_pos: CursorPosition,
     table_id: u64,
     tx_id: u64,
-    pager: Rc<Pager>,
 }
 
 impl<Clock: LogicalClock> MvccLazyCursor<Clock> {
@@ -38,7 +38,6 @@ impl<Clock: LogicalClock> MvccLazyCursor<Clock> {
             tx_id,
             current_pos: CursorPosition::BeforeFirst,
             table_id,
-            pager,
         };
         Ok(cursor)
     }
@@ -249,16 +248,5 @@ impl<Clock: LogicalClock> MvccLazyCursor<Clock> {
             });
         }
         Ok(IOResult::Done(exists))
-    }
-}
-
-impl<Clock: LogicalClock> Debug for MvccLazyCursor<Clock> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MvccLazyCursor")
-            .field("db", &"...")
-            .field("current_pos", &self.current_pos)
-            .field("table_id", &self.table_id)
-            .field("tx_id", &self.tx_id)
-            .finish()
     }
 }
