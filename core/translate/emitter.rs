@@ -1576,7 +1576,7 @@ fn init_limit(
                 program.emit_insn(Insn::MustBeInt { reg: r });
                 program.emit_insn(Insn::IfNeg {
                     reg: r,
-                    target_pc: label_zero, 
+                    target_pc: label_zero,
                 });
                 program.emit_insn(Insn::IsNull {
                     reg: r,
@@ -1604,7 +1604,6 @@ fn init_limit(
                     });
                 }
             } else {
-
                 let reg = program.alloc_register();
                 t_ctx.reg_offset = Some(reg);
                 let r = reg;

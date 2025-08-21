@@ -32,12 +32,10 @@ pub fn emit_program_for_compound_select(
 
     let right_plan = right_most.clone();
     // Trivial exit on LIMIT 0
-    if let Some(expr) = limit {
-        if let Some(0) = try_fold_expr_to_i64(expr) {
-            program.result_columns = right_plan.result_columns;
-            program.table_references.extend(right_plan.table_references);
-            return Ok(());
-        }
+    if matches!(limit.as_ref().and_then(try_fold_expr_to_i64), Some(v) if v <= 0) {
+        program.result_columns = right_plan.result_columns;
+        program.table_references.extend(right_plan.table_references);
+        return Ok(());
     }
 
     // Each subselect shares the same limit_ctx and offset, because the LIMIT, OFFSET applies to
@@ -45,7 +43,6 @@ pub fn emit_program_for_compound_select(
     let limit_ctx = limit.clone().map(|limit| {
         let reg = program.alloc_register();
         if let Some(val) = try_fold_expr_to_i64(&limit) {
-            // Compile-time constant limit
             program.emit_insn(Insn::Integer {
                 value: val,
                 dest: reg,
@@ -90,7 +87,7 @@ pub fn emit_program_for_compound_select(
 
             let label_zero = program.allocate_label();
 
-            build_limit_offset_expr(program, reg, &offset_expr);
+            build_limit_offset_expr(program, reg, offset_expr);
 
             program.emit_insn(Insn::MustBeInt { reg });
 
