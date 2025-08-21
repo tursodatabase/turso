@@ -1469,6 +1469,9 @@ impl Pager {
                     let c = sqlite3_ondisk::begin_sync(self.db_file.clone(), self.syncing.clone())?;
                     self.checkpoint_state
                         .replace(CheckpointState::CheckpointDone { res });
+                    if c.is_completed() {
+                        continue;
+                    }
                     io_yield_one!(c);
                 }
                 CheckpointState::CheckpointDone { res } => {
