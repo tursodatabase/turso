@@ -41,26 +41,31 @@ pub struct HeaderRef(PageRef);
 
 impl HeaderRef {
     pub fn from_pager(pager: &Pager) -> Result<IOResult<Self>> {
-        let state = pager.header_ref_state.borrow().clone();
-        tracing::trace!(?state);
-        match state {
-            HeaderRefState::Start => {
-                if !pager.db_state.is_initialized() {
-                    return Err(LimboError::Page1NotAlloc);
-                }
+        loop {
+            let state = pager.header_ref_state.borrow().clone();
+            tracing::trace!(?state);
+            match state {
+                HeaderRefState::Start => {
+                    if !pager.db_state.is_initialized() {
+                        return Err(LimboError::Page1NotAlloc);
+                    }
 
-                let (page, c) = pager.read_page(DatabaseHeader::PAGE_ID)?;
-                *pager.header_ref_state.borrow_mut() = HeaderRefState::CreateHeader { page };
-                io_yield_one!(c);
-            }
-            HeaderRefState::CreateHeader { page } => {
-                turso_assert!(page.is_loaded(), "page should be loaded");
-                turso_assert!(
-                    page.get().id == DatabaseHeader::PAGE_ID,
-                    "incorrect header page id"
-                );
-                *pager.header_ref_state.borrow_mut() = HeaderRefState::Start;
-                Ok(IOResult::Done(Self(page)))
+                    let (page, c) = pager.read_page(DatabaseHeader::PAGE_ID)?;
+                    *pager.header_ref_state.borrow_mut() = HeaderRefState::CreateHeader { page };
+                    if c.is_completed() {
+                        continue;
+                    }
+                    io_yield_one!(c);
+                }
+                HeaderRefState::CreateHeader { page } => {
+                    turso_assert!(page.is_loaded(), "page should be loaded");
+                    turso_assert!(
+                        page.get().id == DatabaseHeader::PAGE_ID,
+                        "incorrect header page id"
+                    );
+                    *pager.header_ref_state.borrow_mut() = HeaderRefState::Start;
+                    return Ok(IOResult::Done(Self(page)));
+                }
             }
         }
     }
