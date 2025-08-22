@@ -2480,8 +2480,15 @@ impl IOCompletions {
         match self {
             IOCompletions::Single(c) => io.wait_for_completion(c),
             IOCompletions::Many(completions) => {
-                for c in completions {
-                    io.wait_for_completion(c)?;
+                let mut completions = completions.into_iter();
+                while let Some(c) = completions.next() {
+                    let res = io.wait_for_completion(c);
+                    if res.is_err() {
+                        for c in completions {
+                            c.abort();
+                        }
+                        return res;
+                    }
                 }
                 Ok(())
             }
