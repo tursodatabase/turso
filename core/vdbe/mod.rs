@@ -26,7 +26,7 @@ pub mod metrics;
 pub mod sorter;
 
 use crate::{
-    error::LimboError,
+    error::TursoError,
     function::{AggFunc, FuncCtx},
     state_machine::StateTransition,
     storage::sqlite3_ondisk::SmallVec,
@@ -434,7 +434,7 @@ impl Program {
                         .io
                         .block(|| pager.end_tx(true, &self.connection, false))?;
                 }
-                return Err(LimboError::InternalError("Connection closed".to_string()));
+                return Err(TursoError::InternalError("Connection closed".to_string()));
             }
             if state.is_interrupted() {
                 return Ok(StepResult::Interrupt);
@@ -779,7 +779,7 @@ impl<'a> FromValueRow<'a> for i64 {
     fn from_value(value: &'a Value) -> Result<Self> {
         match value {
             Value::Integer(i) => Ok(*i),
-            _ => Err(LimboError::ConversionError("Expected integer value".into())),
+            _ => Err(TursoError::ConversionError("Expected integer value".into())),
         }
     }
 }
@@ -788,7 +788,7 @@ impl<'a> FromValueRow<'a> for f64 {
     fn from_value(value: &'a Value) -> Result<Self> {
         match value {
             Value::Float(f) => Ok(*f),
-            _ => Err(LimboError::ConversionError("Expected integer value".into())),
+            _ => Err(TursoError::ConversionError("Expected integer value".into())),
         }
     }
 }
@@ -797,7 +797,7 @@ impl<'a> FromValueRow<'a> for String {
     fn from_value(value: &'a Value) -> Result<Self> {
         match value {
             Value::Text(s) => Ok(s.as_str().to_string()),
-            _ => Err(LimboError::ConversionError("Expected text value".into())),
+            _ => Err(TursoError::ConversionError("Expected text value".into())),
         }
     }
 }
@@ -806,7 +806,7 @@ impl<'a> FromValueRow<'a> for &'a str {
     fn from_value(value: &'a Value) -> Result<Self> {
         match value {
             Value::Text(s) => Ok(s.as_str()),
-            _ => Err(LimboError::ConversionError("Expected text value".into())),
+            _ => Err(TursoError::ConversionError("Expected text value".into())),
         }
     }
 }
@@ -851,13 +851,13 @@ impl Row {
 pub fn handle_program_error(
     pager: &Rc<Pager>,
     connection: &Connection,
-    err: &LimboError,
+    err: &TursoError,
 ) -> Result<()> {
     match err {
         // Transaction errors, e.g. trying to start a nested transaction, do not cause a rollback.
-        LimboError::TxError(_) => {}
+        TursoError::TxError(_) => {}
         // Table locked errors, e.g. trying to checkpoint in an interactive transaction, do not cause a rollback.
-        LimboError::TableLocked => {}
+        TursoError::TableLocked => {}
         _ => {
             pager
                 .io

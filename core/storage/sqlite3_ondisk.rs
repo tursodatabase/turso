@@ -49,7 +49,7 @@ use tracing::{instrument, Level};
 
 use super::pager::PageRef;
 use super::wal::TursoRwLock;
-use crate::error::LimboError;
+use crate::error::TursoError;
 use crate::fast_lock::SpinLock;
 use crate::io::{Buffer, Completion, ReadComplete};
 use crate::storage::btree::offset::{
@@ -424,7 +424,7 @@ impl PageType {
 }
 
 impl TryFrom<u8> for PageType {
-    type Error = LimboError;
+    type Error = TursoError;
 
     fn try_from(value: u8) -> Result<Self> {
         match value {
@@ -432,7 +432,7 @@ impl TryFrom<u8> for PageType {
             5 => Ok(Self::TableInterior),
             10 => Ok(Self::IndexLeaf),
             13 => Ok(Self::TableLeaf),
-            _ => Err(LimboError::Corrupt(format!("Invalid page type: {value}"))),
+            _ => Err(TursoError::Corrupt(format!("Invalid page type: {value}"))),
         }
     }
 }

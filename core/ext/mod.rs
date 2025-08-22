@@ -7,7 +7,7 @@ use crate::UringIO;
 use crate::{function::ExternalFunc, Connection, Database};
 use crate::{vtab::VirtualTable, SymbolTable};
 #[cfg(feature = "fs")]
-use crate::{LimboError, IO};
+use crate::{TursoError, IO};
 #[cfg(feature = "fs")]
 pub use dynamic::{add_builtin_vfs_extensions, add_vfs_module, list_vfs_modules, VfsMod};
 use std::{
@@ -152,7 +152,7 @@ impl Database {
             other => match get_vfs_modules().iter().find(|v| v.0 == vfs) {
                 Some((_, vfs)) => vfs.clone(),
                 None => {
-                    return Err(LimboError::InvalidArgument(format!("no such VFS: {other}")));
+                    return Err(TursoError::InvalidArgument(format!("no such VFS: {other}")));
                 }
             },
         };

@@ -3,12 +3,12 @@ use crate::{
     LimboConn,
 };
 use std::ffi::{c_char, c_void};
-use turso_core::{LimboError, Statement, StepResult, Value};
+use turso_core::{Statement, StepResult, TursoError, Value};
 
 pub struct LimboRows<'conn> {
     stmt: Box<Statement>,
     _conn: &'conn mut LimboConn,
-    err: Option<LimboError>,
+    err: Option<TursoError>,
 }
 
 impl<'conn> LimboRows<'conn> {

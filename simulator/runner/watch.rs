@@ -70,7 +70,7 @@ pub(crate) fn execute_plans(
         if now.elapsed().as_secs() >= env.opts.max_time_simulation as u64 {
             return ExecutionResult::new(
                 history,
-                Some(turso_core::LimboError::InternalError(
+                Some(turso_core::TursoError::InternalError(
                     "maximum time for simulation reached".into(),
                 )),
             );

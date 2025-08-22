@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use turso_core::{types::Text, Buffer, Completion, LimboError, Value};
+use turso_core::{types::Text, Buffer, Completion, TursoError, Value};
 
 use crate::{
     database_replay_generator::DatabaseReplayGenerator,
@@ -292,7 +292,7 @@ pub async fn transfer_logical_changes(
         let mut select_last_change_id_stmt =
             match source_conn.prepare(TURSO_SYNC_SELECT_LAST_CHANGE_ID) {
                 Ok(stmt) => stmt,
-                Err(LimboError::ParseError(..)) => break 'source_pull_gen 0,
+                Err(TursoError::ParseError(..)) => break 'source_pull_gen 0,
                 Err(err) => return Err(err.into()),
             };
 
@@ -462,7 +462,7 @@ pub async fn push_logical_changes<C: ProtocolIO>(
         let mut select_last_change_id_stmt =
             match source_conn.prepare(TURSO_SYNC_SELECT_LAST_CHANGE_ID) {
                 Ok(stmt) => stmt,
-                Err(LimboError::ParseError(..)) => break 'source_pull_gen 0,
+                Err(TursoError::ParseError(..)) => break 'source_pull_gen 0,
                 Err(err) => return Err(err.into()),
             };
 

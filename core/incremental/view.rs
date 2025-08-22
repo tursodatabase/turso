@@ -6,7 +6,7 @@ use super::operator::{
 use crate::schema::{BTreeTable, Column, Schema};
 use crate::types::{IOCompletions, IOResult, Value};
 use crate::util::{extract_column_name_from_expr, extract_view_columns};
-use crate::{io_yield_one, Completion, LimboError, Result, Statement};
+use crate::{io_yield_one, Completion, Result, Statement, TursoError};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::{Arc, Mutex};
@@ -103,19 +103,19 @@ impl IncrementalView {
         // Check for JOINs
         let (join_tables, join_condition) = Self::extract_join_info(select);
         if join_tables.is_some() || join_condition.is_some() {
-            return Err(LimboError::ParseError(
+            return Err(TursoError::ParseError(
                 "JOINs in views are not yet supported".to_string(),
             ));
         }
 
         // Check that we have a base table
         let base_table_name = Self::extract_base_table(select).ok_or_else(|| {
-            LimboError::ParseError("views without a base table not supported yet".to_string())
+            TursoError::ParseError("views without a base table not supported yet".to_string())
         })?;
 
         // Get the base table
         let base_table = schema.get_btree_table(&base_table_name).ok_or_else(|| {
-            LimboError::ParseError(format!("Table '{base_table_name}' not found in schema"))
+            TursoError::ParseError(format!("Table '{base_table_name}' not found in schema"))
         })?;
 
         // Get base table column names for validation
@@ -181,7 +181,7 @@ impl IncrementalView {
                 columns: _,
                 select,
             }) => IncrementalView::from_stmt(view_name, select, schema),
-            _ => Err(LimboError::ParseError(format!(
+            _ => Err(TursoError::ParseError(format!(
                 "View is not a CREATE MATERIALIZED VIEW statement: {sql}"
             ))),
         }
@@ -205,7 +205,7 @@ impl IncrementalView {
 
         let (join_tables, join_condition) = Self::extract_join_info(&select);
         if join_tables.is_some() || join_condition.is_some() {
-            return Err(LimboError::ParseError(
+            return Err(TursoError::ParseError(
                 "JOINs in views are not yet supported".to_string(),
             ));
         }
@@ -215,12 +215,12 @@ impl IncrementalView {
             if let Some(table) = schema.get_btree_table(&base_table_name) {
                 table.clone()
             } else {
-                return Err(LimboError::ParseError(format!(
+                return Err(TursoError::ParseError(format!(
                     "Table '{base_table_name}' not found in schema"
                 )));
             }
         } else {
-            return Err(LimboError::ParseError(
+            return Err(TursoError::ParseError(
                 "views without a base table not supported yet".to_string(),
             ));
         };
@@ -368,14 +368,14 @@ impl IncrementalView {
 
                         // Check for duplicates
                         if !seen_columns.insert(col_name) {
-                            return Err(LimboError::ParseError(format!(
+                            return Err(TursoError::ParseError(format!(
                                 "Duplicate column '{col_name}' in view. Views must have columns as a strict subset of the base table (no duplicates)"
                             )));
                         }
 
                         // Check that column exists in base table
                         if !base_table_column_names.iter().any(|n| n == col_name) {
-                            return Err(LimboError::ParseError(format!(
+                            return Err(TursoError::ParseError(format!(
                                 "Column '{col_name}' not found in base table. Views must have columns as a strict subset of the base table"
                             )));
                         }
@@ -385,7 +385,7 @@ impl IncrementalView {
                     }
                     _ => {
                         // Any other expression is not allowed
-                        return Err(LimboError::ParseError("Complex expressions, functions, or computed columns are not supported in views. Views must have columns as a strict subset of the base table".to_string()));
+                        return Err(TursoError::ParseError("Complex expressions, functions, or computed columns are not supported in views. Views must have columns as a strict subset of the base table".to_string()));
                     }
                 }
             }
@@ -598,7 +598,7 @@ impl IncrementalView {
                                 return Ok(IOResult::Done(()));
                             }
                             crate::vdbe::StepResult::Interrupt | crate::vdbe::StepResult::Busy => {
-                                return Err(LimboError::Busy);
+                                return Err(TursoError::Busy);
                             }
                             crate::vdbe::StepResult::IO => {
                                 // Process current batch before yielding

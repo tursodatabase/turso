@@ -1,6 +1,6 @@
 use crate::types::Value;
 use crate::vdbe::Register;
-use crate::LimboError;
+use crate::TursoError;
 
 // TODO: Support %!.3s %i, %x, %X, %o, %e, %E, %c. flags: - + 0 ! ,
 #[inline(always)]
@@ -30,7 +30,7 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
             }
             Some('d') | Some('i') => {
                 if args_index >= values.len() {
-                    return Err(LimboError::InvalidArgument("not enough arguments".into()));
+                    return Err(TursoError::InvalidArgument("not enough arguments".into()));
                 }
                 let value = &values[args_index].get_value();
                 match value {
@@ -42,7 +42,7 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
             }
             Some('s') => {
                 if args_index >= values.len() {
-                    return Err(LimboError::InvalidArgument("not enough arguments".into()));
+                    return Err(TursoError::InvalidArgument("not enough arguments".into()));
                 }
                 match &values[args_index].get_value() {
                     Value::Text(t) => result.push_str(t.as_str()),
@@ -53,7 +53,7 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
             }
             Some('f') => {
                 if args_index >= values.len() {
-                    return Err(LimboError::InvalidArgument("not enough arguments".into()));
+                    return Err(TursoError::InvalidArgument("not enough arguments".into()));
                 }
                 let value = &values[args_index].get_value();
                 match value {
@@ -64,12 +64,12 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
                 args_index += 1;
             }
             None => {
-                return Err(LimboError::InvalidArgument(
+                return Err(TursoError::InvalidArgument(
                     "incomplete format specifier".into(),
                 ))
             }
             _ => {
-                return Err(LimboError::InvalidFormatter(
+                return Err(TursoError::InvalidFormatter(
                     "this formatter is not supported".into(),
                 ));
             }

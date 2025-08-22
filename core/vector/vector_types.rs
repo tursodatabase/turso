@@ -1,6 +1,6 @@
 use crate::types::{Value, ValueType};
 use crate::vdbe::Register;
-use crate::{LimboError, Result};
+use crate::{Result, TursoError};
 
 #[derive(Debug, Clone, PartialEq, Copy)]
 pub enum VectorType {
@@ -91,14 +91,14 @@ impl Vector {
 /// ```
 pub fn parse_string_vector(vector_type: VectorType, value: &Value) -> Result<Vector> {
     let Some(text) = value.to_text() else {
-        return Err(LimboError::ConversionError(
+        return Err(TursoError::ConversionError(
             "Invalid vector value".to_string(),
         ));
     };
     let text = text.trim();
     let mut chars = text.chars();
     if chars.next() != Some('[') || chars.last() != Some(']') {
-        return Err(LimboError::ConversionError(
+        return Err(TursoError::ConversionError(
             "Invalid vector value".to_string(),
         ));
     }
@@ -115,7 +115,7 @@ pub fn parse_string_vector(vector_type: VectorType, value: &Value) -> Result<Vec
     for x in xs {
         let x = x.trim();
         if x.is_empty() {
-            return Err(LimboError::ConversionError(
+            return Err(TursoError::ConversionError(
                 "Invalid vector value".to_string(),
             ));
         }
@@ -123,9 +123,9 @@ pub fn parse_string_vector(vector_type: VectorType, value: &Value) -> Result<Vec
             VectorType::Float32 => {
                 let x = x
                     .parse::<f32>()
-                    .map_err(|_| LimboError::ConversionError("Invalid vector value".to_string()))?;
+                    .map_err(|_| TursoError::ConversionError("Invalid vector value".to_string()))?;
                 if !x.is_finite() {
-                    return Err(LimboError::ConversionError(
+                    return Err(TursoError::ConversionError(
                         "Invalid vector value".to_string(),
                     ));
                 }
@@ -134,9 +134,9 @@ pub fn parse_string_vector(vector_type: VectorType, value: &Value) -> Result<Vec
             VectorType::Float64 => {
                 let x = x
                     .parse::<f64>()
-                    .map_err(|_| LimboError::ConversionError("Invalid vector value".to_string()))?;
+                    .map_err(|_| TursoError::ConversionError("Invalid vector value".to_string()))?;
                 if !x.is_finite() {
-                    return Err(LimboError::ConversionError(
+                    return Err(TursoError::ConversionError(
                         "Invalid vector value".to_string(),
                     ));
                 }
@@ -159,21 +159,21 @@ pub fn parse_vector(value: &Register, vec_ty: Option<VectorType>) -> Result<Vect
         }
         ValueType::Blob => {
             let Some(blob) = value.get_value().to_blob() else {
-                return Err(LimboError::ConversionError(
+                return Err(TursoError::ConversionError(
                     "Invalid vector value".to_string(),
                 ));
             };
             let vector_type = vector_type(blob)?;
             if let Some(vec_ty) = vec_ty {
                 if vec_ty != vector_type {
-                    return Err(LimboError::ConversionError(
+                    return Err(TursoError::ConversionError(
                         "Invalid vector type".to_string(),
                     ));
                 }
             }
             vector_deserialize(vector_type, blob)
         }
-        _ => Err(LimboError::ConversionError(
+        _ => Err(TursoError::ConversionError(
             "Invalid vector type".to_string(),
         )),
     }
@@ -249,12 +249,12 @@ pub fn do_vector_distance_cos(v1: &Vector, v2: &Vector) -> Result<f64> {
 
 pub fn vector_f32_distance_cos(v1: &Vector, v2: &Vector) -> Result<f64> {
     if v1.dims != v2.dims {
-        return Err(LimboError::ConversionError(
+        return Err(TursoError::ConversionError(
             "Invalid vector dimensions".to_string(),
         ));
     }
     if v1.vector_type != v2.vector_type {
-        return Err(LimboError::ConversionError(
+        return Err(TursoError::ConversionError(
             "Invalid vector type".to_string(),
         ));
     }
@@ -264,7 +264,7 @@ pub fn vector_f32_distance_cos(v1: &Vector, v2: &Vector) -> Result<f64> {
 
     // Check for non-finite values
     if v1_data.iter().any(|x| !x.is_finite()) || v2_data.iter().any(|x| !x.is_finite()) {
-        return Err(LimboError::ConversionError(
+        return Err(TursoError::ConversionError(
             "Invalid vector value".to_string(),
         ));
     }
@@ -279,7 +279,7 @@ pub fn vector_f32_distance_cos(v1: &Vector, v2: &Vector) -> Result<f64> {
 
     // Check for zero norms to avoid division by zero
     if norm1 == 0.0 || norm2 == 0.0 {
-        return Err(LimboError::ConversionError(
+        return Err(TursoError::ConversionError(
             "Invalid vector value".to_string(),
         ));
     }
@@ -289,12 +289,12 @@ pub fn vector_f32_distance_cos(v1: &Vector, v2: &Vector) -> Result<f64> {
 
 pub fn vector_f64_distance_cos(v1: &Vector, v2: &Vector) -> Result<f64> {
     if v1.dims != v2.dims {
-        return Err(LimboError::ConversionError(
+        return Err(TursoError::ConversionError(
             "Invalid vector dimensions".to_string(),
         ));
     }
     if v1.vector_type != v2.vector_type {
-        return Err(LimboError::ConversionError(
+        return Err(TursoError::ConversionError(
             "Invalid vector type".to_string(),
         ));
     }
@@ -304,7 +304,7 @@ pub fn vector_f64_distance_cos(v1: &Vector, v2: &Vector) -> Result<f64> {
 
     // Check for non-finite values
     if v1_data.iter().any(|x| !x.is_finite()) || v2_data.iter().any(|x| !x.is_finite()) {
-        return Err(LimboError::ConversionError(
+        return Err(TursoError::ConversionError(
             "Invalid vector value".to_string(),
         ));
     }
@@ -319,7 +319,7 @@ pub fn vector_f64_distance_cos(v1: &Vector, v2: &Vector) -> Result<f64> {
 
     // Check for zero norms
     if norm1 == 0.0 || norm2 == 0.0 {
-        return Err(LimboError::ConversionError(
+        return Err(TursoError::ConversionError(
             "Invalid vector value".to_string(),
         ));
     }
@@ -338,7 +338,7 @@ pub fn vector_type(blob: &[u8]) -> Result<VectorType> {
     match vector_type {
         1 => {
             if data_blob.len() % 4 != 0 {
-                return Err(LimboError::ConversionError(
+                return Err(TursoError::ConversionError(
                     "Invalid vector value".to_string(),
                 ));
             }
@@ -346,13 +346,13 @@ pub fn vector_type(blob: &[u8]) -> Result<VectorType> {
         }
         2 => {
             if data_blob.len() % 8 != 0 {
-                return Err(LimboError::ConversionError(
+                return Err(TursoError::ConversionError(
                     "Invalid vector value".to_string(),
                 ));
             }
             Ok(VectorType::Float64)
         }
-        _ => Err(LimboError::ConversionError(
+        _ => Err(TursoError::ConversionError(
             "Invalid vector type".to_string(),
         )),
     }
@@ -360,7 +360,7 @@ pub fn vector_type(blob: &[u8]) -> Result<VectorType> {
 
 pub fn vector_concat(v1: &Vector, v2: &Vector) -> Result<Vector> {
     if v1.vector_type != v2.vector_type {
-        return Err(LimboError::ConversionError(
+        return Err(TursoError::ConversionError(
             "Mismatched vector types".into(),
         ));
     }
@@ -384,12 +384,12 @@ pub fn vector_slice(vector: &Vector, start_idx: usize, end_idx: usize) -> Result
         to_bytes: impl Fn(&T) -> [u8; N],
     ) -> Result<Vec<u8>> {
         if start > end {
-            return Err(LimboError::InvalidArgument(
+            return Err(TursoError::InvalidArgument(
                 "start index must not be greater than end index".into(),
             ));
         }
         if end > slice.len() || end < start {
-            return Err(LimboError::ConversionError(
+            return Err(TursoError::ConversionError(
                 "vector_slice range out of bounds".into(),
             ));
         }

@@ -74,7 +74,7 @@ pub fn translate_create_materialized_view(
 ) -> Result<ProgramBuilder> {
     // Check if experimental views are enabled
     if !connection.experimental_views_enabled() {
-        return Err(crate::LimboError::ParseError(
+        return Err(crate::TursoError::ParseError(
             "CREATE MATERIALIZED VIEW is an experimental feature. Enable with --experimental-views flag"
                 .to_string(),
         ));
@@ -87,7 +87,7 @@ pub fn translate_create_materialized_view(
         .get_materialized_view(&normalized_view_name)
         .is_some()
     {
-        return Err(crate::LimboError::ParseError(format!(
+        return Err(crate::TursoError::ParseError(format!(
             "View {normalized_view_name} already exists"
         )));
     }
@@ -133,7 +133,7 @@ pub fn translate_create_view(
             .get_materialized_view(&normalized_view_name)
             .is_some()
     {
-        return Err(crate::LimboError::ParseError(format!(
+        return Err(crate::TursoError::ParseError(format!(
             "View {normalized_view_name} already exists"
         )));
     }
@@ -170,7 +170,7 @@ pub fn translate_drop_view(
             .is_some();
 
     if !view_exists && !if_exists {
-        return Err(crate::LimboError::ParseError(format!(
+        return Err(crate::TursoError::ParseError(format!(
             "no such view: {normalized_view_name}"
         )));
     }

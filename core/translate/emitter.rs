@@ -476,7 +476,7 @@ fn emit_delete_insns(
         .virtual_table()
         .is_some_and(|t| t.readonly())
     {
-        return Err(crate::LimboError::ReadOnly);
+        return Err(crate::TursoError::ReadOnly);
     }
 
     let cursor_id = match &table_reference.op {

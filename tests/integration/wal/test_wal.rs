@@ -3,7 +3,7 @@ use std::cell::RefCell;
 use std::ops::Deref;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
-use turso_core::{Connection, LimboError, Result, StepResult};
+use turso_core::{Connection, Result, StepResult, TursoError};
 
 #[allow(clippy::arc_with_non_send_sync)]
 #[test]
@@ -148,7 +148,7 @@ pub(crate) fn execute_and_get_ints(conn: &Arc<Connection>, sql: &str) -> Result<
                     let out = match value {
                         turso_core::Value::Integer(i) => i,
                         _ => {
-                            return Err(LimboError::ConversionError(format!(
+                            return Err(TursoError::ConversionError(format!(
                                 "cannot convert {value} to int"
                             )))
                         }
