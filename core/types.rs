@@ -2472,7 +2472,9 @@ impl IOCompletions {
     pub fn get_error(&self) -> Option<CompletionError> {
         match self {
             IOCompletions::Single(c) => c.get_error(),
-            IOCompletions::Many(completions) => completions.iter().find_map(|c| c.get_error()),
+            IOCompletions::Many { completions, .. } => {
+                completions.iter().find_map(|c| c.get_error())
+            }
         }
     }
 }

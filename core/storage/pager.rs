@@ -538,6 +538,11 @@ enum AllocatePageState {
     AllocateNewPage {
         current_db_size: u32,
     },
+    // Separate state in case insertion to page cache spilled and IO is needed to finish the operation
+    Finish {
+        new_db_size: u32,
+        page: PageRef,
+    },
 }
 
 #[derive(Clone)]
@@ -1019,6 +1024,95 @@ impl Pager {
         Ok(IOResult::Done(()))
     }
 
+    #[instrument(skip_all, level = Level::INFO)]
+    /// Spill dirty pages to disk.
+    /// Accepts a callback to be called after spilling is successful, due to spilling
+    /// being potentially asynchronous depending on the IO backend.
+    pub fn spill(
+        &self,
+        page_cache: &mut PageCache,
+        done_cb: impl FnOnce(&mut PageCache) -> Result<()>,
+    ) -> Result<Option<IOCompletions>> {
+        let page_ids: Vec<_> = self
+            .dirty_pages
+            .borrow()
+            .iter()
+            .filter(|&page_id| {
+                *page_id != 1 // never spill page 1. TODO: set page 1 as perma-pinned.
+                    && page_cache
+                        .get(&PageCacheKey::new(*page_id))
+                        .is_ok_and(|p| p.is_some_and(|p| !p.is_pinned()))
+            })
+            .copied()
+            .collect();
+        let mut dirty_pages = self.dirty_pages.borrow_mut();
+
+        tracing::debug!("Spilling {} pages", page_ids.len());
+
+        let mut completions = Vec::new();
+
+        for page_id in page_ids.iter().cloned() {
+            let cache_key = PageCacheKey::new(page_id);
+            if let Some(page) = page_cache.get(&cache_key)? {
+                turso_assert!(!page.is_pinned(), "attempt to spill pinned page {page_id}");
+                turso_assert!(page.is_dirty(), "attempt to spill clean page {page_id}");
+                let completion = match self.wal.as_ref().map(|wal| wal.borrow_mut()) {
+                    Some(mut wal) => wal.append_frame(
+                        page.clone(),
+                        self.page_size.get().expect("page size not set"),
+                        0,
+                    ),
+                    None => begin_write_btree_page(self, &page),
+                }?;
+
+                if completion.is_completed() {
+                    page.clear_dirty();
+                    page_cache
+                        .delete(cache_key)
+                        .expect("should be able to delete unpinned clean page");
+                    dirty_pages.remove(&page_id);
+                    continue;
+                }
+
+                completions.push(completion);
+            }
+        }
+
+        if completions.is_empty() {
+            // If we synchronously spilled everything, we can now finally insert the page into the cache
+            drop(dirty_pages);
+            done_cb(page_cache)?;
+            return Ok(None);
+        }
+
+        Ok(Some(IOCompletions::Many {
+            completions,
+            done_cb: Some(Box::new(unsafe {
+                // Safety: we know the pager will not be dropped before the callback is called,
+                // since it will be called by the VDBE which owns the pager.
+                std::mem::transmute::<
+                    Box<dyn FnOnce() -> Result<()>>,
+                    Box<dyn FnOnce() -> Result<()> + 'static>,
+                >(Box::new(move || {
+                    let dirty_pages = self.dirty_pages.clone();
+                    let mut page_cache = self.page_cache.write();
+                    for page_id in page_ids.iter() {
+                        let cache_key = PageCacheKey::new(*page_id);
+                        let Some(page) = page_cache.get(&cache_key)? else {
+                            panic!("attempt to spill page that is not in the cache: {page_id}");
+                        };
+                        page.clear_dirty();
+                        page_cache
+                            .delete(cache_key)
+                            .expect("should be able to delete unpinned clean page");
+                        dirty_pages.borrow_mut().remove(page_id);
+                    }
+                    done_cb(&mut page_cache)
+                }))
+            })),
+        }))
+    }
+
     #[inline(always)]
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn begin_write_tx(&self) -> Result<IOResult<LimboResult>> {
@@ -1170,19 +1264,57 @@ impl Pager {
         )
     }
 
+    /// Insert a page into the cache.
+    /// Allow dirty pages to be spilled to disk if the cache is full.
     fn cache_insert(
         &self,
         page_idx: usize,
         page: PageRef,
         page_cache: &mut PageCache,
     ) -> Result<Option<IOCompletions>> {
+        self._cache_insert(page_idx, page, page_cache, true)
+    }
+
+    /// Insert a page into the cache.
+    /// Do not allow dirty pages to be spilled to disk if the cache is full.
+    fn cache_insert_disallow_spill(
+        &self,
+        page_idx: usize,
+        page: PageRef,
+        page_cache: &mut PageCache,
+    ) -> Result<()> {
+        let res = self._cache_insert(page_idx, page, page_cache, false)?;
+        turso_assert!(
+            res.is_none(),
+            "cache_insert_disallow_spill should not spill and thus should not return IOCompletions"
+        );
+        Ok(())
+    }
+
+    /// Insert a page into the cache. Internal variant called by [Pager::cache_insert] and [Pager::cache_insert_disallow_spill].
+    fn _cache_insert(
+        &self,
+        page_idx: usize,
+        page: PageRef,
+        page_cache: &mut PageCache,
+        allow_spill: bool,
+    ) -> Result<Option<IOCompletions>> {
         let page_key = PageCacheKey::new(page_idx);
+        page.pin();
         let insert_result = page_cache.insert(page_key, page.clone());
         if let Err(CacheError::Full { should_spill: true }) = insert_result {
-            return Err(LimboError::InternalError(
-                "Page cache is full, but spill is not implemented yet".to_string(),
-            ));
+            if !allow_spill {
+                page.unpin();
+                return Err(LimboError::CacheError(CacheError::Full {
+                    should_spill: true,
+                }));
+            }
+            self.spill(page_cache, |cache_mut| {
+                page.unpin();
+                self.cache_insert_disallow_spill(page_idx, page, cache_mut)
+            })
         } else {
+            page.unpin();
             insert_result.map_err(|e| {
                 LimboError::InternalError(format!("Failed to insert page into cache: {e:?}"))
             })?;
@@ -1214,7 +1346,6 @@ impl Pager {
                     page_idx,
                     target_frame
                 );
-                page.pin();
                 Some(page.clone())
             } else {
                 tracing::trace!(
@@ -1857,11 +1988,15 @@ impl Pager {
             AllocatePage1State::Writing { page } => {
                 turso_assert!(page.is_loaded(), "page should be loaded");
                 tracing::trace!("allocate_page1(Writing done)");
-                let page_key = PageCacheKey::new(page.get().id);
                 let mut cache = self.page_cache.write();
-                cache.insert(page_key, page.clone()).map_err(|e| {
-                    LimboError::InternalError(format!("Failed to insert page 1 into cache: {e:?}"))
-                })?;
+                let Ok(cache_insert_result) =
+                    self.cache_insert(page.get().id, page.clone(), &mut cache)
+                else {
+                    return Err(LimboError::InternalError(
+                        "Failed to insert page 1 into cache".into(),
+                    ));
+                };
+                turso_assert!(cache_insert_result.is_none(), "cache insert of page 1 should not spill and thus should not return IOCompletions");
                 self.db_state.set(DbState::Initialized);
                 self.allocate_page1_state.replace(AllocatePage1State::Done);
                 Ok(IOResult::Done(page.clone()))
@@ -1920,9 +2055,9 @@ impl Pager {
                             let page =
                                 allocate_new_page(new_db_size as usize, &self.buffer_pool, 0);
                             self.add_dirty(&page);
-                            let page_key = PageCacheKey::new(page.get().id);
                             let mut cache = self.page_cache.write();
-                            cache.insert(page_key, page.clone())?;
+                            // FIXME: this may return completions and is now incorrect, please fix this when AUTOVACUUM support is fully added
+                            turso_assert!(self.cache_insert(page.get().id, page.clone(), &mut cache).unwrap().is_none(), "cache insert of ptrmap page returned completions, which is allowed, but we are not handling this case right now");
                         }
                     }
 
@@ -2089,16 +2224,27 @@ impl Pager {
                         // setup page and add to cache
                         self.add_dirty(&page);
 
-                        let page_key = PageCacheKey::new(page.get().id);
                         {
                             // Run in separate block to avoid deadlock on page cache write lock
                             let mut cache = self.page_cache.write();
-                            cache.insert(page_key, page.clone())?;
+                            if let Some(completions) =
+                                self.cache_insert(page.get().id, page.clone(), &mut cache)?
+                            {
+                                *state = AllocatePageState::Finish { new_db_size, page };
+                                return Ok(IOResult::IO(completions));
+                            }
                         }
                         header.database_size = new_db_size.into();
                         *state = AllocatePageState::Start;
                         return Ok(IOResult::Done(page));
                     }
+                }
+                AllocatePageState::Finish { new_db_size, page } => {
+                    let new_db_size = *new_db_size;
+                    let page = page.clone();
+                    header.database_size = new_db_size.into();
+                    *state = AllocatePageState::Start;
+                    return Ok(IOResult::Done(page));
                 }
             }
         }
