@@ -229,7 +229,7 @@ fn emit_program_for_select(
 
     // Trivial exit on LIMIT 0
     if let Some(limit) = plan.limit.as_ref().and_then(try_fold_expr_to_i64) {
-        if limit <= 0 {
+        if limit == 0 {
             program.result_columns = plan.result_columns;
             program.table_references.extend(plan.table_references);
             return Ok(());
@@ -406,7 +406,7 @@ fn emit_program_for_delete(
 
     // exit early if LIMIT 0
     if let Some(limit) = plan.limit.as_ref().and_then(try_fold_expr_to_i64) {
-        if limit <= 0 {
+        if limit == 0 {
             program.result_columns = plan.result_columns;
             program.table_references.extend(plan.table_references);
             return Ok(());
@@ -664,7 +664,7 @@ fn emit_program_for_update(
 
     // Exit on LIMIT 0
     if let Some(limit) = plan.limit.as_ref().and_then(try_fold_expr_to_i64) {
-        if limit <= 0 {
+        if limit == 0 {
             program.result_columns = plan.returning.unwrap_or_default();
             program.table_references.extend(plan.table_references);
             return Ok(());

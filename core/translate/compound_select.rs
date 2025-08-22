@@ -32,7 +32,7 @@ pub fn emit_program_for_compound_select(
 
     let right_plan = right_most.clone();
     // Trivial exit on LIMIT 0
-    if matches!(limit.as_ref().and_then(try_fold_expr_to_i64), Some(v) if v <= 0) {
+    if matches!(limit.as_ref().and_then(try_fold_expr_to_i64), Some(v) if v == 0) {
         program.result_columns = right_plan.result_columns;
         program.table_references.extend(right_plan.table_references);
         return Ok(());
