@@ -214,6 +214,10 @@ impl Completion {
         self.inner.result.get().is_some_and(|val| val.is_some())
     }
 
+    pub fn get_error(&self) -> Option<CompletionError> {
+        self.inner.result.get().and_then(|res| *res)
+    }
+
     /// Checks if the Completion completed or errored
     pub fn finished(&self) -> bool {
         self.inner.result.get().is_some()
