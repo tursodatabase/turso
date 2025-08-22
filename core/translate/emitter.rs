@@ -1552,8 +1552,8 @@ pub fn emit_cdc_insns(
 fn init_limit(
     program: &mut ProgramBuilder,
     t_ctx: &mut TranslateCtx,
-    limit: Option<Expr>,
-    offset: Option<Expr>,
+    limit: Option<Box<Expr>>,
+    offset: Option<Box<Expr>>,
 ) {
     if t_ctx.limit_ctx.is_none() && limit.is_some() {
         t_ctx.limit_ctx = Some(LimitCtx::new(program));

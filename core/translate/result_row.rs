@@ -1,4 +1,4 @@
-use turso_sqlite3_parser::ast::{Expr, Literal, Name, Operator, UnaryOperator};
+use turso_parser::ast::{Expr, Literal, Name, Operator, UnaryOperator};
 
 use crate::{
     error::SQLITE_CONSTRAINT,
@@ -171,7 +171,7 @@ pub fn emit_offset(
         return;
     };
 
-    if let Some(val) = try_fold_expr_to_i64(offset_expr) {
+    if let Some(val) = try_fold_expr_to_i64(&offset_expr.clone()) {
         if val > 0 {
             program.add_comment(program.offset(), "OFFSET const");
             program.emit_insn(Insn::IfPos {
@@ -332,12 +332,10 @@ pub fn build_limit_offset_expr(program: &mut ProgramBuilder, r: usize, expr: &Ex
     }
 }
 
-pub fn try_fold_expr_to_i64(expr: &Expr) -> Option<i64> {
-    match expr {
+pub fn try_fold_expr_to_i64(expr: &Box<Expr>) -> Option<i64> {
+    match expr.as_ref() {
         Expr::Literal(Literal::Numeric(n)) => n.parse::<i64>().ok(),
-        Expr::Literal(Literal::Null) => {
-            Some(0)
-        }
+        Expr::Literal(Literal::Null) => Some(0),
         Expr::Id(Name::Ident(s)) => {
             let lowered = s.to_ascii_lowercase();
             if lowered == "true" {

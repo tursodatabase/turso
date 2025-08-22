@@ -1106,7 +1106,7 @@ fn parse_join(
     Ok(())
 }
 
-pub fn parse_limit(limit: &Limit) -> Result<(Option<Expr>, Option<Expr>)> {
+pub fn parse_limit(limit: &Limit) -> Result<(Option<Box<Expr>>, Option<Box<Expr>>)> {
     let limit_expr = Some(limit.expr.clone());
 
     let offset_expr = limit.offset.clone();
