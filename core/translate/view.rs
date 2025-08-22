@@ -96,7 +96,7 @@ pub fn translate_create_materialized_view(
     // This validation happens before updating sqlite_master to prevent
     // storing invalid view definitions
     use crate::incremental::view::IncrementalView;
-    IncrementalView::can_create_view(select_stmt, schema)?;
+    IncrementalView::can_create_view(select_stmt)?;
 
     // Reconstruct the SQL string
     let sql = create_materialized_view_to_str(view_name, select_stmt);

@@ -680,6 +680,7 @@ impl Optimizable for ast::Expr {
             Expr::Subquery(..) => false,
             Expr::Unary(_, expr) => expr.is_nonnull(tables),
             Expr::Variable(..) => false,
+            Expr::Register(..) => false, // Register values can be null
         }
     }
     /// Returns true if the expression is a constant i.e. does not depend on variables or columns etc.
@@ -764,6 +765,7 @@ impl Optimizable for ast::Expr {
             Expr::Subquery(_) => false,
             Expr::Unary(_, expr) => expr.is_constant(resolver),
             Expr::Variable(_) => false,
+            Expr::Register(_) => false, // Register values are not constants
         }
     }
     /// Returns true if the expression is a constant expression that, when evaluated as a condition, is always true or false

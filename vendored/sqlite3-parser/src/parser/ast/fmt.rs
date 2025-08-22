@@ -890,6 +890,11 @@ impl ToTokens for Expr {
                 Some(_) => s.append(TK_VARIABLE, Some(&("?".to_owned() + var))),
                 None => s.append(TK_VARIABLE, Some("?")),
             },
+            Self::Register(reg) => {
+                // This is for internal use only, not part of SQL syntax
+                // Use a special notation that won't conflict with SQL
+                s.append(TK_VARIABLE, Some(&format!("$r{reg}")))
+            }
         }
     }
 }

@@ -2309,6 +2309,15 @@ pub fn translate_expr(
             });
             Ok(target_register)
         }
+        ast::Expr::Register(src_reg) => {
+            // For DBSP expression compilation: copy from source register to target
+            program.emit_insn(Insn::Copy {
+                src_reg: *src_reg,
+                dst_reg: target_register,
+                extra_amount: 0,
+            });
+            Ok(target_register)
+        }
     }?;
 
     if let Some(span) = constant_span {
@@ -2951,7 +2960,8 @@ where
                 | ast::Expr::DoublyQualified(..)
                 | ast::Expr::Name(_)
                 | ast::Expr::Qualified(..)
-                | ast::Expr::Variable(_) => {
+                | ast::Expr::Variable(_)
+                | ast::Expr::Register(_) => {
                     // No nested expressions
                 }
             }
@@ -3147,7 +3157,8 @@ where
         | ast::Expr::DoublyQualified(..)
         | ast::Expr::Name(_)
         | ast::Expr::Qualified(..)
-        | ast::Expr::Variable(_) => {
+        | ast::Expr::Variable(_)
+        | ast::Expr::Register(_) => {
             // No nested expressions
         }
     }
