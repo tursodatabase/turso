@@ -453,6 +453,11 @@ impl Program {
                 if !io.finished() {
                     return Ok(StepResult::IO);
                 }
+                if let Some(err) = io.get_error() {
+                    let err = err.into();
+                    handle_program_error(&pager, &self.connection, &err)?;
+                    return Err(err);
+                }
                 state.io_completions = None;
             }
             // invalidate row

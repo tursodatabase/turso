@@ -14,7 +14,7 @@ use crate::translate::plan::IterationDirection;
 use crate::vdbe::sorter::Sorter;
 use crate::vdbe::Register;
 use crate::vtab::VirtualTableCursor;
-use crate::{turso_assert, Completion, Result, IO};
+use crate::{turso_assert, Completion, CompletionError, Result, IO};
 use std::fmt::{Debug, Display};
 
 const MAX_REAL_SIZE: u8 = 15;
@@ -2500,6 +2500,13 @@ impl IOCompletions {
         match self {
             IOCompletions::Single(c) => c.abort(),
             IOCompletions::Many(completions) => completions.iter().for_each(|c| c.abort()),
+        }
+    }
+
+    pub fn get_error(&self) -> Option<CompletionError> {
+        match self {
+            IOCompletions::Single(c) => c.get_error(),
+            IOCompletions::Many(completions) => completions.iter().find_map(|c| c.get_error()),
         }
     }
 }
