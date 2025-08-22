@@ -8,8 +8,8 @@ use rand_chacha::ChaCha8Rng;
 use turso_core::{Clock, Completion, Instant, OpenFlags, Result, IO};
 
 use crate::runner::clock::SimulatorClock;
+use crate::runner::memory::file::MemorySimFile;
 use crate::runner::SimIO;
-use crate::{model::FAULT_ERROR_MSG, runner::memory::file::MemorySimFile};
 
 /// File descriptor
 pub type Fd = String;
@@ -68,7 +68,7 @@ impl OperationType {
 pub struct Operation {
     pub time: Option<turso_core::Instant>,
     pub op: OperationType,
-    // TODO: add a fault field here to signal if an Operation should fault
+    pub fault: bool,
 }
 
 impl Operation {
@@ -142,7 +142,6 @@ pub type CallbackQueue = Arc<Mutex<Vec<Operation>>>;
 pub struct MemorySimIO {
     callbacks: CallbackQueue,
     timeouts: CallbackQueue,
-    pub fault: Cell<bool>,
     pub files: RefCell<IndexMap<Fd, Arc<MemorySimFile>>>,
     pub rng: RefCell<ChaCha8Rng>,
     pub nr_run_once_faults: Cell<usize>,
@@ -163,14 +162,12 @@ impl MemorySimIO {
         min_tick: u64,
         max_tick: u64,
     ) -> Self {
-        let fault = Cell::new(false);
         let files = RefCell::new(IndexMap::new());
         let rng = RefCell::new(ChaCha8Rng::seed_from_u64(seed));
         let nr_run_once_faults = Cell::new(0);
         Self {
             callbacks: Arc::new(Mutex::new(Vec::new())),
             timeouts: Arc::new(Mutex::new(Vec::new())),
-            fault,
             files,
             rng,
             nr_run_once_faults,
@@ -188,14 +185,15 @@ impl MemorySimIO {
 
 impl SimIO for MemorySimIO {
     fn inject_fault(&self, fault: bool) {
-        self.fault.replace(fault);
+        for file in self.files.borrow().values() {
+            file.inject_fault(fault);
+        }
         if fault {
             tracing::debug!("fault injected");
         }
     }
 
     fn print_stats(&self) {
-        tracing::info!("run_once faults: {}", self.nr_run_once_faults.get());
         for (path, file) in self.files.borrow().iter() {
             tracing::info!(
                 "\n===========================\n\nPath: {}\n{}",
@@ -259,13 +257,6 @@ impl IO for MemorySimIO {
             callbacks.len = callbacks.len(),
             timeouts.len = timeouts.len()
         );
-        if self.fault.get() {
-            self.nr_run_once_faults
-                .replace(self.nr_run_once_faults.get() + 1);
-            return Err(turso_core::LimboError::InternalError(
-                FAULT_ERROR_MSG.into(),
-            ));
-        }
         let files = self.files.borrow_mut();
         let now = self.now();
 
@@ -276,8 +267,13 @@ impl IO for MemorySimIO {
             if completion.finished() {
                 continue;
             }
+
             if callback.time.is_none() || callback.time.is_some_and(|time| time < now) {
-                // TODO: check if we should inject fault in operation here
+                if callback.fault {
+                    // Inject the fault by aborting the completion
+                    completion.abort();
+                    continue;
+                }
                 callback.do_operation(&files);
             } else {
                 timeouts.push(callback);
