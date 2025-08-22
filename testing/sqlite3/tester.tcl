@@ -114,7 +114,7 @@ proc exec_sql {sql {db_name ""}} {
   foreach statement $statements {
     if {[string trim $statement] eq ""} continue
     
-    if {[catch {exec echo $statement | $limbo_sqlite3 $db_name 2>&1} output errcode]} {
+    if {[catch {exec echo $statement | $limbo_sqlite3 $db_name 2>@1} output errcode]} {
       # Command failed - this might be an error or just stderr output
       
       # Handle process crashes more gracefully
