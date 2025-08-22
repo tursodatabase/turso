@@ -87,6 +87,10 @@ impl PageCacheEntry {
 pub struct PageCache {
     /// Capacity in pages
     capacity: usize,
+    // Note: if PRAGMA cache_size is a positive integer in sqlite (meaning the page cache size is in pages, rather than bytes),
+    // then the output of PRAGMA cache_spill is equal to the capacity. If OTOH PRAGMA cache_size is negative, meaning the page cache size is in kB,
+    // then the output of PRAGMA cache_spill is some kind of calculation. But to make things simple, let's use the capacity as the spill threshold.
+    spill_threshold: usize,
     /// Map of Key -> usize in entries array
     map: PageHashMap,
     clock_hand: usize,
@@ -117,8 +121,11 @@ pub enum CacheError {
     Pinned { pgno: usize },
     #[error("cache active refs")]
     ActiveRefs,
-    #[error("Page cache is full")]
-    Full,
+    #[error("Page cache is full: should_spill={should_spill}")]
+    /// The page cache is full.
+    /// The `should_spill` field is true if we should attempt to spill pages to disk
+    /// (either to WAL or to an ephemeral database file)
+    Full { should_spill: bool },
     #[error("key already exists")]
     KeyExists,
 }
@@ -141,6 +148,7 @@ impl PageCache {
         let freelist = (0..capacity).rev().collect::<Vec<usize>>();
         Self {
             capacity,
+            spill_threshold: capacity,
             map: PageHashMap::new(capacity),
             clock_hand: NULL,
             entries: vec![PageCacheEntry::empty(); capacity],
@@ -381,7 +389,7 @@ impl PageCache {
             while evicted < need {
                 match self.make_room_for(1) {
                     Ok(()) => evicted += 1,
-                    Err(CacheError::Full) => return CacheResizeResult::PendingEvictions,
+                    Err(CacheError::Full { .. }) => return CacheResizeResult::PendingEvictions,
                     Err(_) => return CacheResizeResult::PendingEvictions,
                 }
             }
@@ -462,7 +470,9 @@ impl PageCache {
     /// Returns `CacheError::Full` if not enough pages can be evicted
     pub fn make_room_for(&mut self, n: usize) -> Result<(), CacheError> {
         if n > self.capacity {
-            return Err(CacheError::Full);
+            return Err(CacheError::Full {
+                should_spill: false, // User is requesting more room than we can possibly hold, so spilling will not help
+            });
         }
         let available = self.capacity - self.len();
         if n <= available {
@@ -475,7 +485,9 @@ impl PageCache {
 
         let mut cur = self.clock_hand;
         if cur == NULL || cur >= self.capacity || self.entries[cur].page.is_none() {
-            return Err(CacheError::Full);
+            return Err(CacheError::Full {
+                should_spill: self.len() >= self.spill_threshold,
+            });
         }
 
         while need > 0 && examined < max_examinations {
@@ -513,7 +525,9 @@ impl PageCache {
                     if need == 0 {
                         break;
                     }
-                    return Err(CacheError::Full);
+                    return Err(CacheError::Full {
+                        should_spill: self.len() >= self.spill_threshold,
+                    });
                 }
             } else {
                 // keep sweeping
@@ -522,7 +536,9 @@ impl PageCache {
         }
         self.clock_hand = cur;
         if need > 0 {
-            return Err(CacheError::Full);
+            return Err(CacheError::Full {
+                should_spill: self.len() >= self.spill_threshold,
+            });
         }
         Ok(())
     }
@@ -1098,7 +1114,12 @@ mod tests {
         let page3 = page_with_content(3);
         let result = cache.insert(key3, page3);
 
-        assert_eq!(result, Err(CacheError::Full));
+        assert_eq!(
+            result,
+            Err(CacheError::Full {
+                should_spill: false,
+            })
+        );
         assert_eq!(cache.len(), 2);
         cache.verify_cache_integrity();
     }
@@ -1327,7 +1348,7 @@ mod tests {
 
                     tracing::debug!("inserting page {:?}", key);
                     match cache.insert(key, page.clone()) {
-                        Err(CacheError::Full | CacheError::ActiveRefs) => {} // Expected, ignore
+                        Err(CacheError::Full { .. } | CacheError::ActiveRefs) => {} // Expected, ignore
                         Err(err) => {
                             panic!("Cache insertion failed unexpectedly: {err:?}");
                         }
