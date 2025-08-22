@@ -59,6 +59,12 @@ do_execsql_test_error select-doubly-qualified-wrong-column {
   SELECT main.users.wrong FROM users LIMIT 0;
 } {.*}
 
+do_execsql_test select-limit-expression {
+  select price from products limit 2 + 1 - 1;
+} {79.0
+82.0}
+
+
 # ORDER BY id here because sqlite uses age_idx here and we (yet) don't so force it to evaluate in ID order
 do_execsql_test select-limit-true {
   SELECT id FROM users ORDER BY id LIMIT true;
