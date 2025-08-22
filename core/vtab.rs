@@ -38,16 +38,6 @@ impl VirtualTable {
     }
 
     pub(crate) fn builtin_functions() -> Vec<Arc<VirtualTable>> {
-        let json_each = JsonEachVirtualTable {};
-
-        let json_each_virtual_table = VirtualTable {
-            name: json_each.name(),
-            columns: Self::resolve_columns(json_each.sql())
-                .expect("internal table-valued function schema resolution should not fail"),
-            kind: VTabKind::TableValuedFunction,
-            vtab_type: VirtualTableType::Internal(Arc::new(RefCell::new(json_each))),
-        };
-
         let mut vtables: Vec<Arc<VirtualTable>> = PragmaVirtualTable::functions()
             .into_iter()
             .map(|(tab, schema)| {
@@ -62,9 +52,25 @@ impl VirtualTable {
             })
             .collect();
 
-        vtables.push(Arc::new(json_each_virtual_table));
+        #[cfg(feature = "json")]
+        vtables.extend(Self::json_virtual_tables());
 
         vtables
+    }
+
+    #[cfg(feature = "json")]
+    fn json_virtual_tables() -> Vec<Arc<VirtualTable>> {
+        let json_each = JsonEachVirtualTable {};
+
+        let json_each_virtual_table = VirtualTable {
+            name: json_each.name(),
+            columns: Self::resolve_columns(json_each.sql())
+                .expect("internal table-valued function schema resolution should not fail"),
+            kind: VTabKind::TableValuedFunction,
+            vtab_type: VirtualTableType::Internal(Arc::new(RefCell::new(json_each))),
+        };
+
+        vec![Arc::new(json_each_virtual_table)]
     }
 
     pub(crate) fn function(name: &str, syms: &SymbolTable) -> crate::Result<Arc<VirtualTable>> {
