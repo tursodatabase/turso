@@ -13,6 +13,35 @@ use crate::runner::{
     memory::io::{CallbackQueue, Fd, Operation, OperationType},
 };
 
+/// Tracks IO calls and faults for each type of I/O operation
+#[derive(Debug, Default)]
+struct IOTracker {
+    pread_calls: usize,
+    pread_faults: usize,
+
+    pwrite_calls: usize,
+    pwrite_faults: usize,
+
+    pwritev_calls: usize,
+    pwritev_faults: usize,
+
+    sync_calls: usize,
+    sync_faults: usize,
+
+    truncate_calls: usize,
+    truncate_faults: usize,
+}
+
+impl IOTracker {
+    fn total_calls(&self) -> usize {
+        self.pread_calls
+            + self.pwrite_calls
+            + self.pwritev_calls
+            + self.sync_calls
+            + self.truncate_calls
+    }
+}
+
 pub struct MemorySimFile {
     // TODO: maybe have a pending queue which is fast to append
     // and then we just do a mem swap the pending with the callback to minimize lock contention on callback queue
@@ -21,25 +50,11 @@ pub struct MemorySimFile {
     pub buffer: RefCell<Vec<u8>>,
     // TODO: add fault map later here
     pub closed: Cell<bool>,
-
-    /// Number of `pread` function calls (both success and failures).
-    pub nr_pread_calls: Cell<usize>,
-    /// Number of `pwrite` function calls (both success and failures).
-    pub nr_pwrite_calls: Cell<usize>,
-    /// Number of `sync` function calls (both success and failures).
-    pub nr_sync_calls: Cell<usize>,
-
+    io_tracker: RefCell<IOTracker>,
     pub rng: RefCell<ChaCha8Rng>,
-
     pub latency_probability: usize,
     clock: Arc<SimulatorClock>,
-}
-
-type IoOperation = Box<dyn FnOnce(OperationType) -> Result<Arc<turso_core::Completion>>>;
-
-pub struct DelayedIo {
-    pub time: turso_core::Instant,
-    pub op: IoOperation,
+    fault: Cell<bool>,
 }
 
 unsafe impl Send for MemorySimFile {}
@@ -58,24 +73,44 @@ impl MemorySimFile {
             fd: Arc::new(fd),
             buffer: RefCell::new(Vec::new()),
             closed: Cell::new(false),
-            nr_pread_calls: Cell::new(0),
-            nr_pwrite_calls: Cell::new(0),
-            nr_sync_calls: Cell::new(0),
+            io_tracker: RefCell::new(IOTracker::default()),
             rng: RefCell::new(ChaCha8Rng::seed_from_u64(seed)),
             latency_probability,
             clock,
+            fault: Cell::new(false),
         }
     }
 
+    pub fn inject_fault(&self, fault: bool) {
+        self.fault.set(fault);
+    }
+
     pub fn stats_table(&self) -> String {
-        let sum_calls =
-            self.nr_pread_calls.get() + self.nr_pwrite_calls.get() + self.nr_sync_calls.get();
+        let io_tracker = self.io_tracker.borrow();
+        let sum_calls = io_tracker.total_calls();
         let stats_table = [
-            "op        calls   ".to_string(),
-            "--------- --------".to_string(),
-            format!("pread     {:8}", self.nr_pread_calls.get()),
-            format!("pwrite    {:8}", self.nr_pwrite_calls.get()),
-            format!("sync      {:8}", self.nr_sync_calls.get()),
+            "op        calls    faults  ".to_string(),
+            "--------- -------- --------".to_string(),
+            format!(
+                "pread     {:8} {:8}",
+                io_tracker.pread_calls, io_tracker.pread_faults
+            ),
+            format!(
+                "pwrite    {:8} {:8}",
+                io_tracker.pwrite_calls, io_tracker.pwrite_faults
+            ),
+            format!(
+                "pwritev   {:8} {:8}",
+                io_tracker.pwritev_calls, io_tracker.pwritev_faults
+            ),
+            format!(
+                "sync      {:8} {:8}",
+                io_tracker.sync_calls, io_tracker.sync_faults
+            ),
+            format!(
+                "truncate  {:8} {:8}",
+                io_tracker.truncate_calls, io_tracker.truncate_faults
+            ),
             "--------- -------- --------".to_string(),
             format!("total     {sum_calls:8}"),
         ];
@@ -96,9 +131,22 @@ impl MemorySimFile {
     }
 
     fn insert_op(&self, op: OperationType) {
+        let fault = self.fault.get();
+        if fault {
+            let mut io_tracker = self.io_tracker.borrow_mut();
+            match &op {
+                OperationType::Read { .. } => io_tracker.pread_faults += 1,
+                OperationType::Write { .. } => io_tracker.pwrite_faults += 1,
+                OperationType::WriteV { .. } => io_tracker.pwritev_faults += 1,
+                OperationType::Sync { .. } => io_tracker.sync_faults += 1,
+                OperationType::Truncate { .. } => io_tracker.truncate_faults += 1,
+            }
+        }
+
         self.callbacks.lock().push(Operation {
             time: self.generate_latency(),
             op,
+            fault,
         });
     }
 
@@ -134,7 +182,7 @@ impl File for MemorySimFile {
     }
 
     fn pread(&self, pos: usize, c: Completion) -> Result<Completion> {
-        self.nr_pread_calls.set(self.nr_pread_calls.get() + 1);
+        self.io_tracker.borrow_mut().pread_calls += 1;
 
         let op = OperationType::Read {
             fd: self.fd.clone(),
@@ -151,7 +199,7 @@ impl File for MemorySimFile {
         buffer: Arc<turso_core::Buffer>,
         c: Completion,
     ) -> Result<Completion> {
-        self.nr_pwrite_calls.set(self.nr_pwrite_calls.get() + 1);
+        self.io_tracker.borrow_mut().pwrite_calls += 1;
         let op = OperationType::Write {
             fd: self.fd.clone(),
             buffer,
@@ -171,6 +219,7 @@ impl File for MemorySimFile {
         if buffers.len() == 1 {
             return self.pwrite(pos, buffers[0].clone(), c);
         }
+        self.io_tracker.borrow_mut().pwritev_calls += 1;
         let op = OperationType::WriteV {
             fd: self.fd.clone(),
             buffers,
@@ -182,7 +231,7 @@ impl File for MemorySimFile {
     }
 
     fn sync(&self, c: Completion) -> Result<Completion> {
-        self.nr_sync_calls.set(self.nr_sync_calls.get() + 1);
+        self.io_tracker.borrow_mut().sync_calls += 1;
         let op = OperationType::Sync {
             fd: self.fd.clone(),
             completion: c.clone(),
@@ -198,6 +247,7 @@ impl File for MemorySimFile {
     }
 
     fn truncate(&self, len: usize, c: Completion) -> Result<Completion> {
+        self.io_tracker.borrow_mut().truncate_calls += 1;
         let op = OperationType::Truncate {
             fd: self.fd.clone(),
             completion: c.clone(),
