@@ -30,6 +30,12 @@ macro_rules! io_yield_many {
         return Ok(IOResult::IO(IOCompletions::Many($v)));
     };
 }
+#[macro_export]
+macro_rules! io_yield {
+    ($ioc:expr) => {
+        return Ok(IOResult::IO($ioc));
+    };
+}
 
 pub trait IOExt {
     fn block<T>(&self, f: impl FnMut() -> Result<IOResult<T>>) -> Result<T>;
