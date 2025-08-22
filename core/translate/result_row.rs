@@ -1,4 +1,4 @@
-use turso_sqlite3_parser::ast::{Expr, Literal, Operator, UnaryOperator};
+use turso_sqlite3_parser::ast::{Expr, Literal, Name, Operator, UnaryOperator};
 
 use crate::{
     error::SQLITE_CONSTRAINT,
@@ -224,6 +224,22 @@ pub fn build_limit_offset_expr(program: &mut ProgramBuilder, r: usize, expr: &Ex
             });
             program.emit_int(value, r);
         }
+        Expr::Literal(Literal::Null) => {
+            program.emit_int(0, r);
+        }
+        Expr::Id(Name::Ident(s)) => {
+            let lowered = s.to_ascii_lowercase();
+            if lowered == "true" {
+                program.emit_int(1, r);
+            } else if lowered == "false" {
+                program.emit_int(0, r);
+            } else {
+                program.emit_insn(Insn::Halt {
+                    err_code: SQLITE_CONSTRAINT,
+                    description: format!("invalid boolean string literal: {}", s),
+                });
+            }
+        }
         Expr::Unary(UnaryOperator::Negative, inner) => {
             let inner_reg = program.alloc_register();
             build_limit_offset_expr(program, inner_reg, inner);
@@ -319,6 +335,19 @@ pub fn build_limit_offset_expr(program: &mut ProgramBuilder, r: usize, expr: &Ex
 pub fn try_fold_expr_to_i64(expr: &Expr) -> Option<i64> {
     match expr {
         Expr::Literal(Literal::Numeric(n)) => n.parse::<i64>().ok(),
+        Expr::Literal(Literal::Null) => {
+            Some(0)
+        }
+        Expr::Id(Name::Ident(s)) => {
+            let lowered = s.to_ascii_lowercase();
+            if lowered == "true" {
+                Some(1)
+            } else if lowered == "false" {
+                Some(0)
+            } else {
+                None
+            }
+        }
         Expr::Unary(UnaryOperator::Negative, inner) => try_fold_expr_to_i64(inner).map(|v| -v),
         Expr::Unary(UnaryOperator::Positive, inner) => try_fold_expr_to_i64(inner),
         Expr::Binary(left, op, right) => {
