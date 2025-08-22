@@ -33,6 +33,12 @@ macro_rules! io_yield_many {
         return Ok(IOResult::IO(IOCompletions::Many($v)));
     };
 }
+#[macro_export]
+macro_rules! io_yield {
+    ($ioc:expr) => {
+        return Ok(IOResult::IO($ioc));
+    };
+}
 
 #[macro_export]
 macro_rules! eq_ignore_ascii_case {

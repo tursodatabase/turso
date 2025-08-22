@@ -10,7 +10,7 @@ use crate::storage::{
 };
 use crate::types::{IOCompletions, WalState};
 use crate::util::IOExt as _;
-use crate::{io_yield_many, io_yield_one, IOContext};
+use crate::{io_yield_many, io_yield_one, io_yield, IOContext};
 use crate::{
     return_if_io, turso_assert, types::WalFrameInfo, Completion, Connection, IOResult, LimboError,
     Result, TransactionState,
@@ -53,7 +53,7 @@ impl HeaderRef {
                     let (page, c) = pager.read_page(DatabaseHeader::PAGE_ID)?;
                     *pager.header_ref_state.borrow_mut() = HeaderRefState::CreateHeader { page };
                     if let Some(c) = c {
-                        io_yield_one!(c);
+                        io_yield!(c);
                     }
                 }
                 HeaderRefState::CreateHeader { page } => {
@@ -93,7 +93,7 @@ impl HeaderRefMut {
                     let (page, c) = pager.read_page(DatabaseHeader::PAGE_ID)?;
                     *pager.header_ref_state.borrow_mut() = HeaderRefState::CreateHeader { page };
                     if let Some(c) = c {
-                        io_yield_one!(c);
+                        io_yield!(c);
                     }
                 }
                 HeaderRefState::CreateHeader { page } => {
@@ -678,7 +678,7 @@ impl Pager {
                         offset_in_ptrmap_page,
                     });
                     if let Some(c) = c {
-                        io_yield_one!(c);
+                        io_yield!(c);
                     }
                 }
                 PtrMapGetState::Deserialize {
@@ -782,7 +782,7 @@ impl Pager {
                         offset_in_ptrmap_page,
                     });
                     if let Some(c) = c {
-                        io_yield_one!(c);
+                        io_yield!(c);
                     }
                 }
                 PtrMapPutState::Deserialize {
@@ -1119,7 +1119,7 @@ impl Pager {
 
     /// Reads a page from the database.
     #[tracing::instrument(skip_all, level = Level::DEBUG)]
-    pub fn read_page(&self, page_idx: usize) -> Result<(PageRef, Option<Completion>)> {
+    pub fn read_page(&self, page_idx: usize) -> Result<(PageRef, Option<IOCompletions>)> {
         tracing::trace!("read_page(page_idx = {})", page_idx);
         let mut page_cache = self.page_cache.write();
         let page_key = PageCacheKey::new(page_idx);
@@ -1138,8 +1138,15 @@ impl Pager {
             "attempted to read page {page_idx} but got page {}",
             page.get().id
         );
-        self.cache_insert(page_idx, page.clone(), &mut page_cache)?;
-        Ok((page, Some(c)))
+        if let Some(mut completions) = self.cache_insert(page_idx, page.clone(), &mut page_cache)? {
+            let IOCompletions::Many(ref mut c_list) = completions else {
+                unreachable!("cache_insert should only return IOCompletions::Many");
+            };
+            c_list.push(c);
+            Ok((page, Some(completions)))
+        } else {
+            Ok((page, Some(IOCompletions::Single(c))))
+        }
     }
 
     fn begin_read_disk_page(
@@ -1164,16 +1171,19 @@ impl Pager {
         page_idx: usize,
         page: PageRef,
         page_cache: &mut PageCache,
-    ) -> Result<()> {
+    ) -> Result<Option<IOCompletions>> {
         let page_key = PageCacheKey::new(page_idx);
-        match page_cache.insert(page_key, page.clone()) {
-            Ok(_) => {}
-            Err(CacheError::KeyExists) => {
-                unreachable!("Page should not exist in cache after get() miss")
-            }
-            Err(e) => return Err(e.into()),
+        let insert_result = page_cache.insert(page_key, page.clone());
+        if let Err(CacheError::Full { should_spill: true }) = insert_result {
+            return Err(LimboError::InternalError(
+                "Page cache is full, but spill is not implemented yet".to_string(),
+            ));
+        } else {
+            insert_result.map_err(|e| {
+                LimboError::InternalError(format!("Failed to insert page into cache: {e:?}"))
+            })?;
+            Ok(None)
         }
-        Ok(())
     }
 
     // Get a page from the cache, if it exists.
@@ -1736,7 +1746,7 @@ impl Pager {
                         let (page, c) = self.read_page(trunk_page_id as usize)?;
                         trunk_page.replace(page);
                         if let Some(c) = c {
-                            io_yield_one!(c);
+                            io_yield!(c);
                         }
                     }
                     let trunk_page = trunk_page.as_ref().unwrap();
@@ -1925,7 +1935,7 @@ impl Pager {
                         current_db_size: new_db_size,
                     };
                     if let Some(c) = c {
-                        io_yield_one!(c);
+                        io_yield!(c);
                     }
                 }
                 AllocatePageState::SearchAvailableFreeListLeaf {
@@ -1963,7 +1973,7 @@ impl Pager {
                             number_of_freelist_leaves,
                         };
                         if let Some(c) = c {
-                            io_yield_one!(c);
+                            io_yield!(c);
                         }
                         continue;
                     }
