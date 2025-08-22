@@ -1135,9 +1135,13 @@ impl Pager {
         tracing::trace!("read_page(page_idx = {})", page_idx);
         let mut page_cache = self.page_cache.write();
         let page_key = PageCacheKey::new(page_idx);
-        if let Some(page) = page_cache.get(&page_key) {
-            tracing::trace!("read_page(page_idx = {}) = cached", page_idx);
-            return Ok((page.clone(), None));
+        if let Some(page) = page_cache.get(&page_key)? {
+            if page.is_loaded() {
+                tracing::trace!("read_page(page_idx = {}) = cached", page_idx);
+                return Ok((page.clone(), None));
+            } else if !page.is_locked() {
+                page_cache.delete(page_key)?;
+            }
         }
         let (page, c) = self.read_page_no_cache(page_idx, None, false)?;
         self.cache_insert(page_idx, page.clone(), &mut page_cache)?;
@@ -1179,11 +1183,11 @@ impl Pager {
     }
 
     // Get a page from the cache, if it exists.
-    pub fn cache_get(&self, page_idx: usize) -> Option<PageRef> {
+    pub fn cache_get(&self, page_idx: usize) -> Result<Option<PageRef>> {
         tracing::trace!("read_page(page_idx = {})", page_idx);
         let mut page_cache = self.page_cache.write();
         let page_key = PageCacheKey::new(page_idx);
-        page_cache.get(&page_key)
+        Ok(page_cache.get(&page_key)?)
     }
 
     /// Get a page from cache only if it matches the target frame
@@ -1192,10 +1196,10 @@ impl Pager {
         page_idx: usize,
         target_frame: u64,
         seq: u32,
-    ) -> Option<PageRef> {
+    ) -> Result<Option<PageRef>> {
         let mut page_cache = self.page_cache.write();
         let page_key = PageCacheKey::new(page_idx);
-        page_cache.get(&page_key).and_then(|page| {
+        let page = page_cache.get(&page_key)?.and_then(|page| {
             if page.is_valid_for_checkpoint(target_frame, seq) {
                 tracing::trace!(
                     "cache_get_for_checkpoint: page {} frame {} is valid",
@@ -1214,7 +1218,8 @@ impl Pager {
                 );
                 None
             }
-        })
+        });
+        Ok(page)
     }
 
     /// Changes the size of the page cache.
@@ -1268,7 +1273,7 @@ impl Pager {
             let page = {
                 let mut cache = self.page_cache.write();
                 let page_key = PageCacheKey::new(*page_id);
-                let page = cache.get(&page_key).expect("we somehow added a page to dirty list but we didn't mark it as dirty, causing cache to drop it.");
+                let page = cache.get(&page_key)?.expect("we somehow added a page to dirty list but we didn't mark it as dirty, causing cache to drop it.");
                 let page_type = page.get().contents.as_ref().unwrap().maybe_page_type();
                 trace!("cacheflush(page={}, page_type={:?}", page_id, page_type);
                 page
@@ -1350,7 +1355,7 @@ impl Pager {
                         let page = {
                             let mut cache = self.page_cache.write();
                             let page_key = PageCacheKey::new(page_id);
-                            let page = cache.get(&page_key).expect(
+                            let page = cache.get(&page_key)?.expect(
                                 "dirty list contained a page that cache dropped (page={page_id})",
                             );
                             trace!(
@@ -1478,7 +1483,7 @@ impl Pager {
                 header.db_size as u64,
                 raw_page,
             )?;
-            if let Some(page) = self.cache_get(header.page_number as usize) {
+            if let Some(page) = self.cache_get(header.page_number as usize)? {
                 let content = page.get_contents();
                 content.as_ptr().copy_from_slice(raw_page);
                 turso_assert!(
@@ -1501,7 +1506,7 @@ impl Pager {
             for page_id in self.dirty_pages.borrow().iter() {
                 let page_key = PageCacheKey::new(*page_id);
                 let mut cache = self.page_cache.write();
-                let page = cache.get(&page_key).expect("we somehow added a page to dirty list but we didn't mark it as dirty, causing cache to drop it.");
+                let page = cache.get(&page_key)?.expect("we somehow added a page to dirty list but we didn't mark it as dirty, causing cache to drop it.");
                 page.clear_dirty();
             }
             self.dirty_pages.borrow_mut().clear();
@@ -2406,13 +2411,16 @@ mod tests {
             std::thread::spawn(move || {
                 let mut cache = cache.write();
                 let page_key = PageCacheKey::new(1);
-                cache.insert(page_key, Arc::new(Page::new(1))).unwrap();
+                let page = Page::new(1);
+                // Set loaded so that we avoid eviction due to the pagi
+                page.set_loaded();
+                cache.insert(page_key, Arc::new(page)).unwrap();
             })
         };
         let _ = thread.join();
         let mut cache = cache.write();
         let page_key = PageCacheKey::new(1);
-        let page = cache.get(&page_key);
+        let page = cache.get(&page_key).unwrap();
         assert_eq!(page.unwrap().get().id, 1);
     }
 }

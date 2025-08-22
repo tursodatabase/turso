@@ -1753,7 +1753,7 @@ impl WalFile {
 
                         // Try cache first, if enabled
                         if let Some(cached_page) =
-                            pager.cache_get_for_checkpoint(page_id as usize, target_frame, seq)
+                            pager.cache_get_for_checkpoint(page_id as usize, target_frame, seq)?
                         {
                             let contents = cached_page.get_contents();
                             let buffer = contents.buffer.clone();
@@ -1815,7 +1815,7 @@ impl WalFile {
                             self.ongoing_checkpoint.pages_to_checkpoint.iter()
                         {
                             if *cached {
-                                let page = pager.cache_get((*page_id) as usize);
+                                let page = pager.cache_get((*page_id) as usize)?;
                                 turso_assert!(
                                     page.is_some(),
                                     "page should still exist in the page cache"
