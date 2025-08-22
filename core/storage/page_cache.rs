@@ -27,6 +27,7 @@ struct PageCacheEntry {
 
 pub struct DumbLruPageCache {
     capacity: usize,
+    spill_threshold: usize,
     map: RefCell<PageHashMap>,
     head: RefCell<Option<NonNull<PageCacheEntry>>>,
     tail: RefCell<Option<NonNull<PageCacheEntry>>>,
@@ -50,11 +51,22 @@ struct HashMapNode {
 #[derive(Debug, PartialEq)]
 pub enum CacheError {
     InternalError(String),
-    Locked { pgno: usize },
-    Dirty { pgno: usize },
-    Pinned { pgno: usize },
+    Locked {
+        pgno: usize,
+    },
+    Dirty {
+        pgno: usize,
+    },
+    Pinned {
+        pgno: usize,
+    },
     ActiveRefs,
-    Full,
+    /// The page cache is full.
+    /// The `should_spill` field is true if we should attempt to spill pages to disk
+    /// (either to WAL or to an ephemeral database file)
+    Full {
+        should_spill: bool,
+    },
     KeyExists,
 }
 
@@ -69,11 +81,16 @@ impl PageCacheKey {
         Self { pgno }
     }
 }
+
 impl DumbLruPageCache {
     pub fn new(capacity: usize) -> Self {
         assert!(capacity > 0, "capacity of cache should be at least 1");
         Self {
             capacity,
+            // Note: if PRAGMA cache_size is a positive integer in sqlite (meaning the page cache size is in pages, rather than bytes),
+            // then the output of PRAGMA cache_spill is equal to the capacity. If OTOH PRAGMA cache_size is negative, meaning the page cache size is in kB,
+            // then the output of PRAGMA cache_spill is some kind of calculation. But to make things simple, let's use the capacity as the spill threshold.
+            spill_threshold: capacity,
             map: RefCell::new(PageHashMap::new(capacity)),
             head: RefCell::new(None),
             tail: RefCell::new(None),
@@ -282,7 +299,9 @@ impl DumbLruPageCache {
 
     pub fn make_room_for(&mut self, n: usize) -> Result<(), CacheError> {
         if n > self.capacity {
-            return Err(CacheError::Full);
+            return Err(CacheError::Full {
+                should_spill: false, // User is requesting more room than we can possibly hold, so spilling will not help
+            });
         }
 
         let len = self.len();
@@ -316,7 +335,9 @@ impl DumbLruPageCache {
         }
 
         match need_to_evict > 0 {
-            true => Err(CacheError::Full),
+            true => Err(CacheError::Full {
+                should_spill: self.len() >= self.spill_threshold,
+            }),
             false => Ok(()),
         }
     }
@@ -1086,7 +1107,7 @@ mod tests {
                     }
                     tracing::debug!("inserting page {:?}", key);
                     match cache.insert(key.clone(), page.clone()) {
-                        Err(CacheError::Full | CacheError::ActiveRefs) => {} // Ignore
+                        Err(CacheError::Full { .. } | CacheError::ActiveRefs) => {} // Ignore
                         Err(err) => {
                             // Any other error should fail the test
                             panic!("Cache insertion failed: {err:?}");

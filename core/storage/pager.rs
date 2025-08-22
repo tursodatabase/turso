@@ -1160,7 +1160,7 @@ impl Pager {
         let page_key = PageCacheKey::new(page_idx);
         match page_cache.insert(page_key, page.clone()) {
             Ok(_) => {}
-            Err(CacheError::Full) => return Err(LimboError::CacheFull),
+            Err(CacheError::Full { .. }) => return Err(LimboError::CacheFull),
             Err(CacheError::KeyExists) => {
                 unreachable!("Page should not exist in cache after get() miss")
             }
@@ -1897,7 +1897,7 @@ impl Pager {
                             let mut cache = self.page_cache.write();
                             match cache.insert(page_key, page.clone()) {
                                 Ok(_) => (),
-                                Err(CacheError::Full) => return Err(LimboError::CacheFull),
+                                Err(CacheError::Full { .. }) => return Err(LimboError::CacheFull),
                                 Err(_) => {
                                     return Err(LimboError::InternalError(
                                         "Unknown error inserting page to cache".into(),
@@ -2075,7 +2075,7 @@ impl Pager {
                             // Run in separate block to avoid deadlock on page cache write lock
                             let mut cache = self.page_cache.write();
                             match cache.insert(page_key, page.clone()) {
-                                Err(CacheError::Full) => return Err(LimboError::CacheFull),
+                                Err(CacheError::Full { .. }) => return Err(LimboError::CacheFull),
                                 Err(_) => {
                                     return Err(LimboError::InternalError(
                                         "Unknown error inserting page to cache".into(),
