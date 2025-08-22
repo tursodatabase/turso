@@ -47,14 +47,21 @@ struct HashMapNode {
     value: NonNull<PageCacheEntry>,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum CacheError {
+    #[error("{0}")]
     InternalError(String),
+    #[error("page {pgno} is locked")]
     Locked { pgno: usize },
+    #[error("page {pgno} is dirty")]
     Dirty { pgno: usize },
+    #[error("page {pgno} is pinned")]
     Pinned { pgno: usize },
+    #[error("cache active refs")]
     ActiveRefs,
+    #[error("Page cache is full")]
     Full,
+    #[error("key already exists")]
     KeyExists,
 }
 
