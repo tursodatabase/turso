@@ -12,7 +12,7 @@ use super::pager::PageRef;
 const DEFAULT_PAGE_CACHE_SIZE_IN_PAGES_MAKE_ME_SMALLER_ONCE_WAL_SPILL_IS_IMPLEMENTED: usize =
     100000;
 
-#[derive(Debug, Eq, Hash, PartialEq, Clone)]
+#[derive(Debug, Eq, Hash, PartialEq, Clone, Copy)]
 pub struct PageCacheKey {
     pgno: usize,
 }
@@ -112,7 +112,7 @@ impl DumbLruPageCache {
         trace!("insert(key={:?})", key);
         // Check first if page already exists in cache
         if !ignore_exists {
-            if let Some(existing_page_ref) = self.get(&key) {
+            if let Some(existing_page_ref) = self.get(&key)? {
                 assert!(
                     Arc::ptr_eq(&value, &existing_page_ref),
                     "Attempted to insert different page with same key: {key:?}"
@@ -163,8 +163,17 @@ impl DumbLruPageCache {
         ptr.copied()
     }
 
-    pub fn get(&mut self, key: &PageCacheKey) -> Option<PageRef> {
-        self.peek(key, true)
+    pub fn get(&mut self, key: &PageCacheKey) -> Result<Option<PageRef>, CacheError> {
+        if let Some(page) = self.peek(key, true) {
+            if !page.is_loaded() && !page.is_locked() {
+                self.delete(*key)?;
+                Ok(None)
+            } else {
+                Ok(Some(page))
+            }
+        } else {
+            Ok(None)
+        }
     }
 
     /// Get page without promoting entry
@@ -944,8 +953,8 @@ mod tests {
         let mut cache = DumbLruPageCache::new(1);
         let key1 = insert_page(&mut cache, 1);
         let key2 = insert_page(&mut cache, 2);
-        assert_eq!(cache.get(&key2).unwrap().get().id, 2);
-        assert!(cache.get(&key1).is_none());
+        assert_eq!(cache.get(&key2).unwrap().unwrap().get().id, 2);
+        assert!(cache.get(&key1).unwrap().is_none());
     }
 
     #[test]
@@ -1009,7 +1018,7 @@ mod tests {
     fn test_detach_with_cleaning() {
         let mut cache = DumbLruPageCache::default();
         let (key, entry) = insert_and_get_entry(&mut cache, 1);
-        let page = cache.get(&key).expect("Page should exist");
+        let page = cache.get(&key).unwrap().expect("Page should exist");
         assert!(page_has_content(&page));
         drop(page);
         assert!(cache.detach(entry, true).is_ok());
@@ -1156,8 +1165,8 @@ mod tests {
         let mut cache = DumbLruPageCache::default();
         let key1 = insert_page(&mut cache, 1);
         let key2 = insert_page(&mut cache, 2);
-        assert_eq!(cache.get(&key1).unwrap().get().id, 1);
-        assert_eq!(cache.get(&key2).unwrap().get().id, 2);
+        assert_eq!(cache.get(&key1).unwrap().unwrap().get().id, 1);
+        assert_eq!(cache.get(&key2).unwrap().unwrap().get().id, 2);
     }
 
     #[test]
@@ -1166,9 +1175,9 @@ mod tests {
         let key1 = insert_page(&mut cache, 1);
         let key2 = insert_page(&mut cache, 2);
         let key3 = insert_page(&mut cache, 3);
-        assert!(cache.get(&key1).is_none());
-        assert_eq!(cache.get(&key2).unwrap().get().id, 2);
-        assert_eq!(cache.get(&key3).unwrap().get().id, 3);
+        assert!(cache.get(&key1).unwrap().is_none());
+        assert_eq!(cache.get(&key2).unwrap().unwrap().get().id, 2);
+        assert_eq!(cache.get(&key3).unwrap().unwrap().get().id, 3);
     }
 
     #[test]
@@ -1176,7 +1185,7 @@ mod tests {
         let mut cache = DumbLruPageCache::default();
         let key1 = insert_page(&mut cache, 1);
         assert!(cache.delete(key1.clone()).is_ok());
-        assert!(cache.get(&key1).is_none());
+        assert!(cache.get(&key1).unwrap().is_none());
     }
 
     #[test]
@@ -1185,8 +1194,8 @@ mod tests {
         let key1 = insert_page(&mut cache, 1);
         let key2 = insert_page(&mut cache, 2);
         assert!(cache.clear().is_ok());
-        assert!(cache.get(&key1).is_none());
-        assert!(cache.get(&key2).is_none());
+        assert!(cache.get(&key1).unwrap().is_none());
+        assert!(cache.get(&key2).unwrap().is_none());
     }
 
     #[test]
@@ -1223,8 +1232,8 @@ mod tests {
         assert_eq!(result, CacheResizeResult::Done);
         assert_eq!(cache.len(), 2);
         assert_eq!(cache.capacity, 5);
-        assert!(cache.get(&create_key(1)).is_some());
-        assert!(cache.get(&create_key(2)).is_some());
+        assert!(cache.get(&create_key(1)).unwrap().is_some());
+        assert!(cache.get(&create_key(2)).unwrap().is_some());
         for i in 3..=5 {
             let _ = insert_page(&mut cache, i);
         }
