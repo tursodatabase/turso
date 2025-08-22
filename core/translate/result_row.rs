@@ -236,7 +236,7 @@ pub fn build_limit_offset_expr(program: &mut ProgramBuilder, r: usize, expr: &Ex
             } else {
                 program.emit_insn(Insn::Halt {
                     err_code: SQLITE_CONSTRAINT,
-                    description: format!("invalid boolean string literal: {}", s),
+                    description: format!("invalid boolean string literal: {s}"),
                 });
             }
         }
@@ -332,6 +332,7 @@ pub fn build_limit_offset_expr(program: &mut ProgramBuilder, r: usize, expr: &Ex
     }
 }
 
+#[allow(clippy::borrowed_box)]
 pub fn try_fold_expr_to_i64(expr: &Box<Expr>) -> Option<i64> {
     match expr.as_ref() {
         Expr::Literal(Literal::Numeric(n)) => n.parse::<i64>().ok(),

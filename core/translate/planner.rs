@@ -1106,6 +1106,7 @@ fn parse_join(
     Ok(())
 }
 
+#[allow(clippy::type_complexity)]
 pub fn parse_limit(limit: &Limit) -> Result<(Option<Box<Expr>>, Option<Box<Expr>>)> {
     let limit_expr = Some(limit.expr.clone());
 
