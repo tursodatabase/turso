@@ -2556,6 +2556,7 @@ impl BTreeCursor {
                     let mut pgno: u32 = unsafe { right_pointer.cast::<u32>().read().swap_bytes() };
                     let current_sibling = sibling_pointer;
                     let mut completions: Vec<Completion> = Vec::with_capacity(current_sibling + 1);
+                    let mut callbacks = vec![];
                     for i in (0..=current_sibling).rev() {
                         let (page, c) =
                             btree_read_page(&self.pager, pgno as usize).inspect_err(|_| {
@@ -2568,12 +2569,20 @@ impl BTreeCursor {
                             self.pager.add_dirty(&page);
                         }
                         if let Some(c) = c {
-                            let IOCompletions::Many(c_list) = c else {
-                                unreachable!(
-                                    "btree_read_page should only return IOCompletions::Many"
-                                );
-                            };
-                            completions.extend(c_list);
+                            match c {
+                                IOCompletions::Single(c) => {
+                                    completions.push(c);
+                                }
+                                IOCompletions::Many {
+                                    completions: c_list,
+                                    done_cb,
+                                } => {
+                                    completions.extend(c_list);
+                                    if let Some(callback) = done_cb {
+                                        callbacks.push(callback);
+                                    }
+                                }
+                            }
                         }
                         pages_to_balance[i].replace(page);
                         if i == 0 {
@@ -2640,7 +2649,15 @@ impl BTreeCursor {
                     });
                     *sub_state = BalanceSubState::NonRootDoBalancing;
                     if !completions.is_empty() {
-                        io_yield!(IOCompletions::Many(completions));
+                        return Ok(IOResult::IO(IOCompletions::Many {
+                            completions,
+                            done_cb: Some(Box::new(move || {
+                                for callback in callbacks.drain(..) {
+                                    callback()?;
+                                }
+                                Ok(())
+                            })),
+                        }));
                     }
                 }
                 BalanceSubState::NonRootDoBalancing => {

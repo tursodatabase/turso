@@ -2413,11 +2413,25 @@ impl Cursor {
     }
 }
 
-#[derive(Debug)]
 #[must_use]
 pub enum IOCompletions {
     Single(Completion),
-    Many(Vec<Completion>),
+    Many {
+        completions: Vec<Completion>,
+        /// An optional function to be called when all completions are successfully completed.
+        done_cb: Option<Box<dyn FnOnce() -> Result<()>>>,
+    },
+}
+
+impl std::fmt::Debug for IOCompletions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            IOCompletions::Single(c) => write!(f, "IOCompletions::Single({c:?})"),
+            IOCompletions::Many { completions, .. } => {
+                write!(f, "IOCompletions::Many({completions:?})")
+            }
+        }
+    }
 }
 
 impl IOCompletions {
@@ -2425,16 +2439,15 @@ impl IOCompletions {
     pub fn wait<I: ?Sized + IO>(self, io: &I) -> Result<()> {
         match self {
             IOCompletions::Single(c) => io.wait_for_completion(c),
-            IOCompletions::Many(completions) => {
-                let mut completions = completions.into_iter();
-                while let Some(c) = completions.next() {
-                    let res = io.wait_for_completion(c);
-                    if res.is_err() {
-                        for c in completions {
-                            c.abort();
-                        }
-                        return res;
-                    }
+            IOCompletions::Many {
+                completions,
+                done_cb: callback,
+            } => {
+                for c in completions {
+                    io.wait_for_completion(c)?;
+                }
+                if let Some(callback) = callback {
+                    callback()?;
                 }
                 Ok(())
             }
@@ -2444,7 +2457,7 @@ impl IOCompletions {
     pub fn finished(&self) -> bool {
         match self {
             IOCompletions::Single(c) => c.finished(),
-            IOCompletions::Many(completions) => completions.iter().all(|c| c.finished()),
+            IOCompletions::Many { completions, .. } => completions.iter().all(|c| c.finished()),
         }
     }
 
@@ -2452,7 +2465,7 @@ impl IOCompletions {
     pub fn abort(&self) {
         match self {
             IOCompletions::Single(c) => c.abort(),
-            IOCompletions::Many(completions) => completions.iter().for_each(|c| c.abort()),
+            IOCompletions::Many { completions, .. } => completions.iter().for_each(|c| c.abort()),
         }
     }
 

@@ -10,7 +10,7 @@ use crate::storage::{
 };
 use crate::types::{IOCompletions, WalState};
 use crate::util::IOExt as _;
-use crate::{io_yield_many, io_yield_one, io_yield, IOContext};
+use crate::{io_yield, io_yield_many, io_yield_one, IOContext};
 use crate::{
     return_if_io, turso_assert, types::WalFrameInfo, Completion, Connection, IOResult, LimboError,
     Result, TransactionState,
@@ -1139,7 +1139,11 @@ impl Pager {
             page.get().id
         );
         if let Some(mut completions) = self.cache_insert(page_idx, page.clone(), &mut page_cache)? {
-            let IOCompletions::Many(ref mut c_list) = completions else {
+            let IOCompletions::Many {
+                completions: ref mut c_list,
+                ..
+            } = completions
+            else {
                 unreachable!("cache_insert should only return IOCompletions::Many");
             };
             c_list.push(c);

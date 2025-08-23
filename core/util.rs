@@ -30,7 +30,10 @@ macro_rules! io_yield_one {
 #[macro_export]
 macro_rules! io_yield_many {
     ($v:expr) => {
-        return Ok(IOResult::IO(IOCompletions::Many($v)));
+        return Ok(IOResult::IO(IOCompletions::Many {
+            completions: $v,
+            done_cb: None,
+        }));
     };
 }
 #[macro_export]
