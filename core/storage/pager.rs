@@ -1131,7 +1131,11 @@ impl Pager {
         }
         let (page, c) = self.read_page_no_cache(page_idx, None, false)?;
         if let Some(mut completions) = self.cache_insert(page_idx, page.clone(), &mut page_cache)? {
-            let IOCompletions::Many(ref mut c_list) = completions else {
+            let IOCompletions::Many {
+                completions: ref mut c_list,
+                ..
+            } = completions
+            else {
                 unreachable!("cache_insert should only return IOCompletions::Many");
             };
             c_list.push(c);
