@@ -65,6 +65,8 @@ pub enum CacheError {
     /// The `should_spill` field is true if we should attempt to spill pages to disk
     /// (either to WAL or to an ephemeral database file)
     Full {
+        cache_capacity: usize,
+        cache_len: usize,
         should_spill: bool,
     },
     KeyExists,
@@ -300,6 +302,8 @@ impl DumbLruPageCache {
     pub fn make_room_for(&mut self, n: usize) -> Result<(), CacheError> {
         if n > self.capacity {
             return Err(CacheError::Full {
+                cache_capacity: self.capacity,
+                cache_len: self.len(),
                 should_spill: false, // User is requesting more room than we can possibly hold, so spilling will not help
             });
         }
@@ -336,6 +340,8 @@ impl DumbLruPageCache {
 
         match need_to_evict > 0 {
             true => Err(CacheError::Full {
+                cache_capacity: self.capacity,
+                cache_len: self.len(),
                 should_spill: self.len() >= self.spill_threshold,
             }),
             false => Ok(()),
