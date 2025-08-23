@@ -519,6 +519,7 @@ Modifiers:
 | RealAffinity   | Yes    |         |
 | Remainder      | Yes    |         |
 | ResetCount     | No     |         |
+| ResetSorter    | Partial| sorter cursors are not supported yet; only ephemeral tables are |
 | ResultRow      | Yes    |         |
 | Return         | Yes    |         |
 | Rewind         | Yes    |         |

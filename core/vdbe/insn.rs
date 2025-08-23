@@ -840,6 +840,18 @@ pub enum Insn {
         is_temp: usize,
     },
 
+    /// Deletes all contents from the ephemeral table that the cursor points to.
+    ///
+    /// In Turso, we do not currently distinguish strictly between ephemeral
+    /// and standard tables at the type level. Therefore, it is the caller’s
+    /// responsibility to ensure that `ResetSorter` is applied only to ephemeral
+    /// tables.
+    ///
+    /// SQLite also supports sorter cursors, but this is not yet implemented in Turso.
+    ResetSorter {
+        cursor_id: CursorID,
+    },
+
     ///  Drop a table
     DropTable {
         ///  The database within which this b-tree needs to be dropped (P1).
@@ -1207,6 +1219,7 @@ impl Insn {
             Insn::Copy { .. } => execute::op_copy,
             Insn::CreateBtree { .. } => execute::op_create_btree,
             Insn::Destroy { .. } => execute::op_destroy,
+            Insn::ResetSorter { .. } => execute::op_reset_sorter,
 
             Insn::DropTable { .. } => execute::op_drop_table,
             Insn::DropView { .. } => execute::op_drop_view,

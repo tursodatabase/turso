@@ -1271,6 +1271,15 @@ pub fn insn_to_row(
                     "root iDb={root} former_root={former_root_reg} is_temp={is_temp}"
                 ),
             ),
+            Insn::ResetSorter { cursor_id } => (
+                "ResetSorter",
+                *cursor_id as i32,
+                0,
+                0,
+                Value::build_text(""),
+                0,
+                format!("cursor={cursor_id}"),
+            ),
             Insn::DropTable {
                 db,
                 _p2,

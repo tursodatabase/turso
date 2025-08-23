@@ -6500,6 +6500,33 @@ pub fn op_destroy(
     Ok(InsnFunctionStepResult::Step)
 }
 
+pub fn op_reset_sorter(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Rc<Pager>,
+    mv_store: Option<&Arc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(ResetSorter { cursor_id }, insn);
+
+    let (_, cursor_type) = program.cursor_ref.get(*cursor_id).unwrap();
+    let cursor = state.get_cursor(*cursor_id);
+
+    match cursor_type {
+        CursorType::BTreeTable(table) => {
+            let cursor = cursor.as_btree_mut();
+            return_if_io!(cursor.clear_btree());
+        }
+        CursorType::Sorter => {
+            unimplemented!("ResetSorter is not supported for sorter cursors yet")
+        }
+        _ => panic!("ResetSorter is not supported for {cursor_type:?}"),
+    }
+
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
 pub fn op_drop_table(
     program: &Program,
     state: &mut ProgramState,
