@@ -2098,6 +2098,8 @@ impl Pager {
                         let page_contents = trunk_page.get_contents();
                         let next_leaf_page_id =
                             page_contents.read_u32_no_offset(FREELIST_TRUNK_OFFSET_FIRST_LEAF);
+
+                        trunk_page.pin(); // Pin the page so that it cannot be evicted from the cache if the read_page() call spills cache pages to disk.
                         let (leaf_page, c) = self.read_page(next_leaf_page_id as usize)?;
 
                         turso_assert!(
@@ -2161,6 +2163,12 @@ impl Pager {
                         "Leaf page {} is not loaded",
                         leaf_page.get().id
                     );
+                    turso_assert!(
+                        trunk_page.is_loaded(),
+                        "Trunk page {} is not loaded",
+                        trunk_page.get().id
+                    );
+                    trunk_page.unpin(); // Unpin the trunk page so that it can be evicted from the cache again, now that we don't need a guarantee it's in memory.
                     let page_contents = trunk_page.get_contents();
                     self.add_dirty(leaf_page);
                     // zero out the page
