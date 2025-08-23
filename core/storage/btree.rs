@@ -2431,6 +2431,7 @@ impl BTreeCursor {
                     // Since we are going to change the btree structure, let's forget our cached knowledge of the rightmost page.
                     let _ = self.move_to_right_state.1.take();
                     let parent_page = self.stack.top();
+                    parent_page.pin(); // Pin the parent page to prevent it from being evicted from the cache due to cache spilling during any of the read_page()/cache insert operations during balance.
                     let parent_contents = parent_page.get_contents();
                     let page_type = parent_contents.page_type();
                     turso_assert!(
@@ -2558,15 +2559,16 @@ impl BTreeCursor {
                     let mut completions: Vec<Completion> = Vec::with_capacity(current_sibling + 1);
                     let mut callbacks = vec![];
                     for i in (0..=current_sibling).rev() {
-                        let (page, c) =
-                            btree_read_page(&self.pager, pgno as usize).inspect_err(|_| {
+                        let (sibling_page, c) = btree_read_page(&self.pager, pgno as usize)
+                            .inspect_err(|_| {
                                 for c in completions.iter() {
                                     c.abort();
                                 }
                             })?;
                         {
-                            // mark as dirty
-                            self.pager.add_dirty(&page);
+                            // mark as dirty and pin
+                            sibling_page.pin(); // Pin the page to prevent it from being evicted from the cache due to cache spilling during any of the read_page()/cache insert operations during balance.
+                            self.pager.add_dirty(&sibling_page);
                         }
                         if let Some(c) = c {
                             match c {
@@ -2584,7 +2586,7 @@ impl BTreeCursor {
                                 }
                             }
                         }
-                        pages_to_balance[i].replace(page);
+                        pages_to_balance[i].replace(sibling_page);
                         if i == 0 {
                             break;
                         }
@@ -3161,6 +3163,7 @@ impl BTreeCursor {
                             let page = pager.io.block(|| {
                                 pager.do_allocate_page(page_type, 0, BtreePageAllocMode::Any)
                             })?;
+                            page.pin(); // existing siblings are already pinned, but we must pin the new one too.
                             pages_to_balance_new[i].replace(page);
                             // Since this page didn't exist before, we can set it to cells length as it
                             // marks them as empty since it is a prefix sum of cells.
@@ -3193,6 +3196,11 @@ impl BTreeCursor {
                                 self.pager.upsert_page_in_cache(*new_id, page.clone())?;
                             }
                         }
+
+                        for page in pages_to_balance_new.iter().take(sibling_count_new) {
+                            page.as_ref().unwrap().unpin();
+                        }
+                        parent_page.unpin();
 
                         #[cfg(debug_assertions)]
                         {
