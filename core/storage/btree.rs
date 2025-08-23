@@ -2472,6 +2472,7 @@ impl BTreeCursor {
                     let _ = self.move_to_right_state.1.take();
                     let parent_page = self.stack.top();
                     let parent_page = parent_page.get();
+                    parent_page.pin(); // Pin the parent page to prevent it from being evicted from the cache due to cache spilling during any of the read_page()/cache insert operations during balance.
                     let parent_contents = parent_page.get_contents();
                     let page_type = parent_contents.page_type();
                     turso_assert!(
@@ -2606,9 +2607,10 @@ impl BTreeCursor {
                                 }
                             })?;
                         {
-                            // mark as dirty
+                            // mark as dirty and pin
                             let sibling_page = page.get();
                             self.pager.add_dirty(&sibling_page);
+                            sibling_page.pin(); // Pin the page to prevent it from being evicted from the cache due to cache spilling during any of the read_page()/cache insert operations during balance.
                         }
                         if let Some(c) = c {
                             match c {
@@ -3210,6 +3212,7 @@ impl BTreeCursor {
                             let page = pager.io.block(|| {
                                 pager.do_allocate_page(page_type, 0, BtreePageAllocMode::Any)
                             })?;
+                            page.get().pin(); // existing siblings are already pinned, but we must pin the new one too.
                             pages_to_balance_new[i].replace(page);
                             // Since this page didn't exist before, we can set it to cells length as it
                             // marks them as empty since it is a prefix sum of cells.
@@ -3246,6 +3249,11 @@ impl BTreeCursor {
                                 }
                             }
                         }
+
+                        for page in pages_to_balance_new.iter().take(sibling_count_new) {
+                            page.as_ref().unwrap().get().unpin();
+                        }
+                        parent_page.unpin();
 
                         #[cfg(debug_assertions)]
                         {
