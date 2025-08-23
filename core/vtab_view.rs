@@ -1,5 +1,5 @@
 use crate::incremental::view::IncrementalView;
-use crate::{Connection, LimboError, Value, VirtualTable};
+use crate::{Connection, TursoError, Value, VirtualTable};
 use std::sync::{Arc, Mutex};
 
 /// Create a virtual table wrapper for a view
@@ -9,7 +9,7 @@ pub fn create_view_virtual_table(
 ) -> crate::Result<Arc<VirtualTable>> {
     // Use the VirtualTable::view method we added
     let view_locked = view.lock().map_err(|_| {
-        LimboError::InternalError("Failed to lock view for virtual table creation".to_string())
+        TursoError::InternalError("Failed to lock view for virtual table creation".to_string())
     })?;
     let columns = view_locked.columns.clone();
     drop(view_locked); // Release the lock before passing the Arc
@@ -40,7 +40,7 @@ impl ViewVirtualTable {
         // so we just get the current data from the view.
 
         let view = self.view.lock().map_err(|_| {
-            LimboError::InternalError("Failed to lock view for reading".to_string())
+            TursoError::InternalError("Failed to lock view for reading".to_string())
         })?;
 
         let tx_states = conn.view_transaction_states.borrow();

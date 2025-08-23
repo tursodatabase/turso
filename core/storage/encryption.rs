@@ -1,7 +1,7 @@
 #![allow(unused_variables, dead_code)]
-#[cfg(not(feature = "encryption"))]
-use crate::LimboError;
 use crate::Result;
+#[cfg(not(feature = "encryption"))]
+use crate::TursoError;
 use aes_gcm::{
     aead::{Aead, AeadCore, KeyInit, OsRng},
     Aes256Gcm, Key, Nonce,
@@ -73,7 +73,7 @@ impl Drop for EncryptionKey {
 
 #[cfg(not(feature = "encryption"))]
 pub fn encrypt_page(page: &[u8], page_id: usize, key: &EncryptionKey) -> Result<Vec<u8>> {
-    Err(LimboError::InvalidArgument(
+    Err(TursoError::InvalidArgument(
         "encryption is not enabled, cannot encrypt page. enable via passing `--features encryption`".into(),
     ))
 }
@@ -117,7 +117,7 @@ pub fn encrypt_page(page: &[u8], page_id: usize, key: &EncryptionKey) -> Result<
 
 #[cfg(not(feature = "encryption"))]
 pub fn decrypt_page(encrypted_page: &[u8], page_id: usize, key: &EncryptionKey) -> Result<Vec<u8>> {
-    Err(LimboError::InvalidArgument(
+    Err(TursoError::InvalidArgument(
         "encryption is not enabled, cannot decrypt page. enable via passing `--features encryption`".into(),
     ))
 }

@@ -3,7 +3,7 @@ use crate::types::{AllocPool, LimboValue, ResultCode};
 use crate::LimboConn;
 use std::ffi::{c_char, c_void};
 use std::num::NonZero;
-use turso_core::{LimboError, Statement, StepResult};
+use turso_core::{Statement, StepResult, TursoError};
 
 #[no_mangle]
 pub extern "C" fn db_prepare(ctx: *mut c_void, query: *const c_char) -> *mut c_void {
@@ -90,7 +90,7 @@ pub extern "C" fn stmt_parameter_count(ctx: *mut c_void) -> i32 {
     }
     let stmt = LimboStatement::from_ptr(ctx);
     let Some(statement) = stmt.statement.as_ref() else {
-        stmt.err = Some(LimboError::InternalError("Statement is closed".to_string()));
+        stmt.err = Some(TursoError::InternalError("Statement is closed".to_string()));
         return -1;
     };
     statement.parameters_count() as i32
@@ -127,7 +127,7 @@ pub struct LimboStatement<'conn> {
     /// If 'query' is ran on the statement, ownership is transferred to the LimboRows object
     pub statement: Option<Statement>,
     pub conn: &'conn mut LimboConn,
-    pub err: Option<LimboError>,
+    pub err: Option<TursoError>,
 }
 
 #[no_mangle]

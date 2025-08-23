@@ -3,7 +3,7 @@ use serde::Deserialize;
 use turso_ext::{AggCtx, FinalizeFunction, StepFunction};
 use turso_parser::ast::SortOrder;
 
-use crate::error::LimboError;
+use crate::error::TursoError;
 use crate::ext::{ExtValue, ExtValueType};
 use crate::pseudo::PseudoCursor;
 use crate::schema::Index;
@@ -575,8 +575,8 @@ impl Value {
                     return Ok(Value::Null);
                 };
                 match err {
-                    (_, Some(msg)) => Err(LimboError::ExtensionError(msg)),
-                    (code, None) => Err(LimboError::ExtensionError(code.to_string())),
+                    (_, Some(msg)) => Err(TursoError::ExtensionError(msg)),
+                    (code, None) => Err(TursoError::ExtensionError(code.to_string())),
                 }
             }
         };
@@ -604,7 +604,7 @@ macro_rules! impl_int_from_value {
         impl FromValue for $ty {
             fn from_sql(val: Value) -> Result<Self> {
                 match val {
-                    Value::Null => Err(LimboError::NullValue),
+                    Value::Null => Err(TursoError::NullValue),
                     Value::Integer(i) => Ok($cast(i)),
                     _ => unreachable!("invalid value type"),
                 }
@@ -623,7 +623,7 @@ impl_int_from_value!(u64, |i| i as u64);
 impl FromValue for f64 {
     fn from_sql(val: Value) -> Result<Self> {
         match val {
-            Value::Null => Err(LimboError::NullValue),
+            Value::Null => Err(TursoError::NullValue),
             Value::Float(f) => Ok(f),
             _ => unreachable!("invalid value type"),
         }
@@ -634,7 +634,7 @@ impl Sealed for f64 {}
 impl FromValue for Vec<u8> {
     fn from_sql(val: Value) -> Result<Self> {
         match val {
-            Value::Null => Err(LimboError::NullValue),
+            Value::Null => Err(TursoError::NullValue),
             Value::Blob(blob) => Ok(blob),
             _ => unreachable!("invalid value type"),
         }
@@ -645,8 +645,8 @@ impl Sealed for Vec<u8> {}
 impl<const N: usize> FromValue for [u8; N] {
     fn from_sql(val: Value) -> Result<Self> {
         match val {
-            Value::Null => Err(LimboError::NullValue),
-            Value::Blob(blob) => blob.try_into().map_err(|_| LimboError::InvalidBlobSize(N)),
+            Value::Null => Err(TursoError::NullValue),
+            Value::Blob(blob) => blob.try_into().map_err(|_| TursoError::InvalidBlobSize(N)),
             _ => unreachable!("invalid value type"),
         }
     }
@@ -656,7 +656,7 @@ impl<const N: usize> Sealed for [u8; N] {}
 impl FromValue for String {
     fn from_sql(val: Value) -> Result<Self> {
         match val {
-            Value::Null => Err(LimboError::NullValue),
+            Value::Null => Err(TursoError::NullValue),
             Value::Text(s) => Ok(s.to_string()),
             _ => unreachable!("invalid value type"),
         }
@@ -667,11 +667,11 @@ impl Sealed for String {}
 impl FromValue for bool {
     fn from_sql(val: Value) -> Result<Self> {
         match val {
-            Value::Null => Err(LimboError::NullValue),
+            Value::Null => Err(TursoError::NullValue),
             Value::Integer(i) => match i {
                 0 => Ok(false),
                 1 => Ok(true),
-                _ => Err(LimboError::InvalidColumnType),
+                _ => Err(TursoError::InvalidColumnType),
             },
             _ => unreachable!("invalid value type"),
         }
@@ -944,34 +944,34 @@ impl std::ops::DivAssign<Value> for Value {
 }
 
 impl<'a> TryFrom<&'a RefValue> for i64 {
-    type Error = LimboError;
+    type Error = TursoError;
 
     fn try_from(value: &'a RefValue) -> Result<Self, Self::Error> {
         match value {
             RefValue::Integer(i) => Ok(*i),
-            _ => Err(LimboError::ConversionError("Expected integer value".into())),
+            _ => Err(TursoError::ConversionError("Expected integer value".into())),
         }
     }
 }
 
 impl<'a> TryFrom<&'a RefValue> for String {
-    type Error = LimboError;
+    type Error = TursoError;
 
     fn try_from(value: &'a RefValue) -> Result<Self, Self::Error> {
         match value {
             RefValue::Text(s) => Ok(s.as_str().to_string()),
-            _ => Err(LimboError::ConversionError("Expected text value".into())),
+            _ => Err(TursoError::ConversionError("Expected text value".into())),
         }
     }
 }
 
 impl<'a> TryFrom<&'a RefValue> for &'a str {
-    type Error = LimboError;
+    type Error = TursoError;
 
     fn try_from(value: &'a RefValue) -> Result<Self, Self::Error> {
         match value {
             RefValue::Text(s) => Ok(s.as_str()),
-            _ => Err(LimboError::ConversionError("Expected text value".into())),
+            _ => Err(TursoError::ConversionError("Expected text value".into())),
         }
     }
 }
@@ -1244,7 +1244,7 @@ impl ImmutableRecord {
     // inside the function.
     pub fn last_value(&self, record_cursor: &mut RecordCursor) -> Option<Result<RefValue>> {
         if self.is_invalidated() {
-            return Some(Err(LimboError::InternalError(
+            return Some(Err(TursoError::InternalError(
                 "Record is invalidated".into(),
             )));
         }
@@ -1359,7 +1359,7 @@ impl RecordCursor {
     /// # Returns
     ///
     /// * `Ok(())` - Parsing completed successfully
-    /// * `Err(LimboError)` - Parsing failed due to corrupt data or I/O error
+    /// * `Err(TursoError)` - Parsing failed due to corrupt data or I/O error
     ///
     /// # Behavior
     ///
@@ -1419,7 +1419,7 @@ impl RecordCursor {
     /// # Returns
     ///
     /// * `Ok(RefValue)` - The deserialized value (may reference record data)
-    /// * `Err(LimboError)` - Deserialization failed
+    /// * `Err(TursoError)` - Deserialization failed
     ///
     /// # Special Cases
     ///
@@ -1465,12 +1465,12 @@ impl RecordCursor {
     /// # Returns
     ///
     /// * `Ok(RefValue)` - The value at the specified index
-    /// * `Err(LimboError)` - Access failed due to invalid record or parsing error
+    /// * `Err(TursoError)` - Access failed due to invalid record or parsing error
     ///
     #[inline(always)]
     pub fn get_value(&mut self, record: &ImmutableRecord, idx: usize) -> Result<RefValue> {
         if record.is_invalidated() {
-            return Err(LimboError::InternalError("Record not initialized".into()));
+            return Err(TursoError::InternalError("Record not initialized".into()));
         }
 
         self.ensure_parsed_upto(record, idx)?;
@@ -1487,7 +1487,7 @@ impl RecordCursor {
     /// # Returns
     ///
     /// * `Some(Ok(RefValue))` - Successfully read value
-    /// * `Some(Err(LimboError))` - Parsing succeeded but deserialization failed
+    /// * `Some(Err(TursoError))` - Parsing succeeded but deserialization failed
     /// * `None` - Record is invalid or index is out of bounds
     ///
     pub fn get_value_opt(
@@ -1551,7 +1551,7 @@ impl RecordCursor {
     /// # Returns
     ///
     /// * `Ok(Vec<RefValue>)` - All values in column order
-    /// * `Err(LimboError)` - Parsing or deserialization failed
+    /// * `Err(TursoError)` - Parsing or deserialization failed
     ///
     pub fn get_values(&mut self, record: &ImmutableRecord) -> Result<Vec<RefValue>> {
         if record.is_invalidated() {
@@ -1887,7 +1887,7 @@ fn compare_records_int(
     let header_size = header_size as usize;
 
     if payload.len() < header_size {
-        return Err(LimboError::Corrupt(format!(
+        return Err(TursoError::Corrupt(format!(
             "Record payload too short: claimed header size {} but payload only {} bytes",
             header_size,
             payload.len()
@@ -1980,7 +1980,7 @@ fn compare_records_string(
     let header_size = header_size as usize;
 
     if payload.len() < header_size {
-        return Err(LimboError::Corrupt(format!(
+        return Err(TursoError::Corrupt(format!(
             "Record payload too short: claimed header size {} but payload only {} bytes",
             header_size,
             payload.len()
@@ -2325,11 +2325,11 @@ impl From<SerialType> for u64 {
 }
 
 impl TryFrom<u64> for SerialType {
-    type Error = LimboError;
+    type Error = TursoError;
 
     fn try_from(uint: u64) -> Result<Self> {
         if uint == 10 || uint == 11 {
-            return Err(LimboError::Corrupt(format!("Invalid serial type: {uint}")));
+            return Err(TursoError::Corrupt(format!("Invalid serial type: {uint}")));
         }
         Ok(SerialType(uint))
     }

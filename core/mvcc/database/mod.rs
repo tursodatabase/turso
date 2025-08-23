@@ -8,8 +8,8 @@ use crate::storage::btree::BTreeKey;
 use crate::types::IOResult;
 use crate::types::ImmutableRecord;
 use crate::IOExt;
-use crate::LimboError;
 use crate::Result;
+use crate::TursoError;
 use crate::{Connection, Pager};
 use crossbeam_skiplist::{SkipMap, SkipSet};
 use parking_lot::RwLock;
@@ -340,11 +340,11 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 let tx = mvcc_store
                     .txs
                     .get(&self.tx_id)
-                    .ok_or(LimboError::TxTerminated)?;
+                    .ok_or(TursoError::TxTerminated)?;
                 let tx = tx.value().write();
                 match tx.state.load() {
                     TransactionState::Terminated => {
-                        return Err(LimboError::TxTerminated);
+                        return Err(TursoError::TxTerminated);
                     }
                     _ => {
                         assert_eq!(tx.state, TransactionState::Active);
@@ -442,7 +442,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 //
                 let result = self.pager.io.block(|| self.pager.begin_write_tx())?;
                 if let crate::result::LimboResult::Busy = result {
-                    return Err(LimboError::InternalError(
+                    return Err(TursoError::InternalError(
                         "Pager write transaction busy".to_string(),
                     ));
                 }
@@ -548,7 +548,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                             &self.connection,
                             self.connection.wal_auto_checkpoint_disabled.get(),
                         )
-                        .map_err(|e| LimboError::InternalError(e.to_string()))
+                        .map_err(|e| TursoError::InternalError(e.to_string()))
                         .unwrap();
                     match result {
                         crate::types::IOResult::Done(_) => {
@@ -682,7 +682,7 @@ impl StateTransition for WriteRowStateMachine {
 
                 match cursor
                     .insert(&key)
-                    .map_err(|e| LimboError::InternalError(e.to_string()))?
+                    .map_err(|e| TursoError::InternalError(e.to_string()))?
                 {
                     IOResult::Done(()) => {
                         tracing::trace!(
@@ -756,7 +756,7 @@ impl StateTransition for DeleteRowStateMachine {
 
                 match cursor
                     .delete()
-                    .map_err(|e| LimboError::InternalError(e.to_string()))?
+                    .map_err(|e| TursoError::InternalError(e.to_string()))?
                 {
                     IOResult::Done(()) => {
                         tracing::trace!(
@@ -843,7 +843,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         let tx = self
             .txs
             .get(&tx_id)
-            .ok_or(LimboError::NoSuchTransactionID(tx_id.to_string()))?;
+            .ok_or(TursoError::NoSuchTransactionID(tx_id.to_string()))?;
         let mut tx = tx.value().write();
         assert_eq!(tx.state, TransactionState::Active);
         let id = row.id;
@@ -916,7 +916,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 let tx = self
                     .txs
                     .get(&tx_id)
-                    .ok_or(LimboError::NoSuchTransactionID(tx_id.to_string()))?;
+                    .ok_or(TursoError::NoSuchTransactionID(tx_id.to_string()))?;
                 let tx = tx.value().read();
                 assert_eq!(tx.state, TransactionState::Active);
                 // A transaction cannot delete a version that it cannot see,
@@ -929,7 +929,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                     drop(row_versions_opt);
                     drop(tx);
                     self.rollback_tx(tx_id, pager);
-                    return Err(LimboError::WriteWriteConflict);
+                    return Err(TursoError::WriteWriteConflict);
                 }
 
                 rv.end = Some(TxTimestampOrID::TxID(tx.tx_id));
@@ -939,7 +939,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 let tx = self
                     .txs
                     .get(&tx_id)
-                    .ok_or(LimboError::NoSuchTransactionID(tx_id.to_string()))?;
+                    .ok_or(TursoError::NoSuchTransactionID(tx_id.to_string()))?;
                 let mut tx = tx.value().write();
                 tx.insert_to_write_set(id);
                 return Ok(true);
@@ -1359,7 +1359,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         loop {
             match cursor
                 .rewind()
-                .map_err(|e| LimboError::InternalError(e.to_string()))?
+                .map_err(|e| TursoError::InternalError(e.to_string()))?
             {
                 IOResult::Done(()) => break,
                 IOResult::IO(io) => {
@@ -1371,7 +1371,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         loop {
             let rowid_result = cursor
                 .rowid()
-                .map_err(|e| LimboError::InternalError(e.to_string()))?;
+                .map_err(|e| TursoError::InternalError(e.to_string()))?;
             let row_id = match rowid_result {
                 IOResult::Done(Some(row_id)) => row_id,
                 IOResult::Done(None) => break,

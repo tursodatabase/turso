@@ -1,5 +1,5 @@
 use super::MemoryIO;
-use crate::{Clock, Completion, CompletionType, File, Instant, LimboError, OpenFlags, Result, IO};
+use crate::{Clock, Completion, CompletionType, File, Instant, TursoError, OpenFlags, Result, IO};
 use std::cell::RefCell;
 use std::io::{Read, Seek, Write};
 use std::sync::Arc;

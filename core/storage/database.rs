@@ -1,4 +1,4 @@
-use crate::error::LimboError;
+use crate::error::TursoError;
 use crate::storage::encryption::{decrypt_page, encrypt_page, EncryptionKey};
 use crate::{io::Completion, Buffer, CompletionError, Result};
 use std::sync::Arc;
@@ -66,7 +66,7 @@ impl DatabaseStorage for DatabaseFile {
         let size = r.buf().len();
         assert!(page_idx > 0);
         if !(512..=65536).contains(&size) || size & (size - 1) != 0 {
-            return Err(LimboError::NotADB);
+            return Err(TursoError::NotADB);
         }
         let pos = (page_idx - 1) * size;
 

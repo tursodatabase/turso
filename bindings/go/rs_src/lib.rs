@@ -6,7 +6,7 @@ use std::{
     ffi::{c_char, c_void},
     sync::Arc,
 };
-use turso_core::{Connection, LimboError};
+use turso_core::{Connection, TursoError};
 
 /// # Safety
 /// Safe to be called from Go with null terminated DSN string.
@@ -30,7 +30,7 @@ pub unsafe extern "C" fn db_open(path: *const c_char) -> *mut c_void {
 struct LimboConn {
     conn: Arc<Connection>,
     io: Arc<dyn turso_core::IO>,
-    err: Option<LimboError>,
+    err: Option<TursoError>,
 }
 
 impl LimboConn {
