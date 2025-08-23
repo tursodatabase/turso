@@ -134,6 +134,12 @@ pub enum CacheResizeResult {
     PendingEvictions,
 }
 
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum CacheInsertOnConflict {
+    Overwrite,
+    Error,
+}
+
 impl PageCacheKey {
     pub fn new(pgno: usize) -> Self {
         Self(pgno)
@@ -207,20 +213,25 @@ impl PageCache {
     }
 
     #[inline]
-    pub fn insert(&mut self, key: PageCacheKey, value: PageRef) -> Result<(), CacheError> {
-        self._insert(key, value, false)
+    pub fn insert(
+        &mut self,
+        key: PageCacheKey,
+        value: PageRef,
+        on_conflict: CacheInsertOnConflict,
+    ) -> Result<(), CacheError> {
+        self._insert(key, value, on_conflict)
     }
 
     #[inline]
     pub fn upsert_page(&mut self, key: PageCacheKey, value: PageRef) -> Result<(), CacheError> {
-        self._insert(key, value, true)
+        self._insert(key, value, CacheInsertOnConflict::Overwrite)
     }
 
     pub fn _insert(
         &mut self,
         key: PageCacheKey,
         value: PageRef,
-        update_in_place: bool,
+        on_conflict: CacheInsertOnConflict,
     ) -> Result<(), CacheError> {
         trace!("insert(key={:?})", key);
         let slot = self.map.get(&key);
@@ -245,7 +256,7 @@ impl PageCache {
 
             let existing = &mut self.entries[slot];
             existing.bump_ref();
-            if update_in_place {
+            if on_conflict == CacheInsertOnConflict::Overwrite {
                 existing.page = Some(value);
                 return Ok(());
             } else {
@@ -893,7 +904,9 @@ mod tests {
     fn insert_page(cache: &mut PageCache, id: usize) -> PageCacheKey {
         let key = create_key(id);
         let page = page_with_content(id);
-        assert!(cache.insert(key, page).is_ok());
+        assert!(cache
+            .insert(key, page, CacheInsertOnConflict::Error)
+            .is_ok());
         key
     }
 
@@ -944,11 +957,13 @@ mod tests {
         let page1_v1 = page_with_content(1);
         let page1_v2 = page1_v1.clone(); // Same Arc instance
 
-        assert!(cache.insert(key1, page1_v1.clone()).is_ok());
+        assert!(cache
+            .insert(key1, page1_v1.clone(), CacheInsertOnConflict::Error)
+            .is_ok());
         assert_eq!(cache.len(), 1);
 
         // Inserting same page instance should return KeyExists error
-        let result = cache.insert(key1, page1_v2.clone());
+        let result = cache.insert(key1, page1_v2.clone(), CacheInsertOnConflict::Error);
         assert_eq!(result, Err(CacheError::KeyExists));
         assert_eq!(cache.len(), 1);
 
@@ -965,12 +980,14 @@ mod tests {
         let page1_v1 = page_with_content(1);
         let page1_v2 = page_with_content(1); // Different Arc instance
 
-        assert!(cache.insert(key1, page1_v1.clone()).is_ok());
+        assert!(cache
+            .insert(key1, page1_v1.clone(), CacheInsertOnConflict::Error)
+            .is_ok());
         assert_eq!(cache.len(), 1);
         cache.verify_cache_integrity();
 
         // This should panic because it's a different page instance
-        let _ = cache.insert(key1, page1_v2.clone());
+        let _ = cache.insert(key1, page1_v2.clone(), CacheInsertOnConflict::Error);
     }
 
     #[test]
@@ -1108,7 +1125,7 @@ mod tests {
         // Try to insert a third page, should fail because can't evict dirty pages
         let key3 = create_key(3);
         let page3 = page_with_content(3);
-        let result = cache.insert(key3, page3);
+        let result = cache.insert(key3, page3, CacheInsertOnConflict::Error);
 
         assert_eq!(
             result,
@@ -1189,7 +1206,13 @@ mod tests {
         assert_eq!(cache.capacity(), 3);
 
         // Should still be able to insert after resize
-        assert!(cache.insert(create_key(6), page_with_content(6)).is_ok());
+        assert!(cache
+            .insert(
+                create_key(6),
+                page_with_content(6),
+                CacheInsertOnConflict::Error
+            )
+            .is_ok());
         assert_eq!(cache.len(), 3); // One was evicted to make room
         cache.verify_cache_integrity();
     }
@@ -1343,7 +1366,7 @@ mod tests {
                     }
 
                     tracing::debug!("inserting page {:?}", key);
-                    match cache.insert(key, page.clone()) {
+                    match cache.insert(key, page.clone(), CacheInsertOnConflict::Error) {
                         Err(CacheError::Full { .. } | CacheError::ActiveRefs) => {} // Expected, ignore
                         Err(err) => {
                             panic!("Cache insertion failed unexpectedly: {err:?}");
@@ -1454,7 +1477,9 @@ mod tests {
             for i in 0..1000 {
                 let key = create_key(i);
                 let page = page_with_content(i);
-                cache.insert(key, page).unwrap();
+                cache
+                    .insert(key, page, CacheInsertOnConflict::Error)
+                    .unwrap();
             }
 
             cache.clear().unwrap();

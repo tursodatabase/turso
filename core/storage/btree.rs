@@ -3190,8 +3190,7 @@ impl BTreeCursor {
                             let page = page.as_ref().unwrap();
                             if *new_id != page.get().id {
                                 page.get().id = *new_id;
-                                self.pager
-                                    .update_dirty_loaded_page_in_cache(*new_id, page.clone())?;
+                                self.pager.upsert_page_in_cache(*new_id, page.clone())?;
                             }
                         }
 
