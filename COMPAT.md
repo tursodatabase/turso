@@ -502,6 +502,7 @@ Modifiers:
 | NullRow        | Yes    |         |
 | Once           | Yes     |         |
 | OpenAutoindex  | Yes     |         |
+| OpenDup        | Yes     |         |
 | OpenEphemeral  | Yes     |         |
 | OpenPseudo     | Yes    |         |
 | OpenRead       | Yes    |         |

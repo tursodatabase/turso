@@ -7202,6 +7202,69 @@ pub fn op_open_ephemeral(
     Ok(InsnFunctionStepResult::Step)
 }
 
+pub fn op_open_dup(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Rc<Pager>,
+    mv_store: Option<&Arc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        OpenDup {
+            new_cursor_id,
+            original_cursor_id,
+        },
+        insn
+    );
+
+    let original_cursor = state.get_cursor(*original_cursor_id);
+    let original_cursor = original_cursor.as_btree_mut();
+
+    let root_page = original_cursor.root_page();
+    // We use the pager from the original cursor instead of the one attached to
+    // the connection because each ephemeral table creates its own pager (and
+    // a separate database file).
+    let pager = &original_cursor.pager;
+
+    let mv_cursor = match program.connection.mv_tx_id.get() {
+        Some(tx_id) => {
+            let table_id = root_page as u64;
+            let mv_store = mv_store.unwrap().clone();
+            let mv_cursor = Rc::new(RefCell::new(MvCursor::new(
+                mv_store,
+                tx_id,
+                table_id,
+                pager.clone(),
+            )?));
+            Some(mv_cursor)
+        }
+        None => None,
+    };
+
+    let (_, cursor_type) = program.cursor_ref.get(*original_cursor_id).unwrap();
+    match cursor_type {
+        CursorType::BTreeTable(table) => {
+            let cursor =
+                BTreeCursor::new_table(mv_cursor, pager.clone(), root_page, table.columns.len());
+            let cursors = &mut state.cursors;
+            cursors
+                .get_mut(*new_cursor_id)
+                .unwrap()
+                .replace(Cursor::new_btree(cursor));
+        }
+        CursorType::BTreeIndex(table) => {
+            // In principle, we could implement OpenDup for BTreeIndex,
+            // but doing so now would create dead code since we have no use case,
+            // and it wouldn't be possible to test it.
+            unimplemented!("OpenDup is not supported for BTreeIndex yet")
+        }
+        _ => panic!("OpenDup is not supported for {cursor_type:?}"),
+    }
+
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
 /// Execute the [Insn::Once] instruction.
 ///
 /// This instruction is used to execute a block of code only once.

@@ -993,6 +993,17 @@ pub enum Insn {
     OpenAutoindex {
         cursor_id: usize,
     },
+    /// Opens a new cursor that points to the same table as the original.
+    /// In SQLite, this is restricted to cursors opened by `OpenEphemeral`
+    /// (i.e., ephemeral tables), and only ephemeral cursors may be duplicated.
+    /// In Turso, we currently do not strictly distinguish between ephemeral
+    /// and standard tables at the type level. Therefore, it is the caller’s
+    /// responsibility to ensure that `OpenDup` is applied only to ephemeral
+    /// cursors.
+    OpenDup {
+        new_cursor_id: CursorID,
+        original_cursor_id: CursorID,
+    },
     /// Fall through to the next instruction on the first invocation, otherwise jump to target_pc
     Once {
         target_pc_when_reentered: BranchOffset,
@@ -1218,6 +1229,7 @@ impl Insn {
             Insn::ReadCookie { .. } => execute::op_read_cookie,
             Insn::SetCookie { .. } => execute::op_set_cookie,
             Insn::OpenEphemeral { .. } | Insn::OpenAutoindex { .. } => execute::op_open_ephemeral,
+            Insn::OpenDup { .. } => execute::op_open_dup,
             Insn::Once { .. } => execute::op_once,
             Insn::Found { .. } | Insn::NotFound { .. } => execute::op_found,
             Insn::Affinity { .. } => execute::op_affinity,

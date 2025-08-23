@@ -1516,6 +1516,15 @@ pub fn insn_to_row(
                 0,
                 format!("cursor={cursor_id}"),
             ),
+            Insn::OpenDup { new_cursor_id, original_cursor_id } => (
+                "OpenDup",
+                *new_cursor_id as i32,
+                *original_cursor_id as i32,
+                0,
+                Value::build_text(""),
+                0,
+                format!("new_cursor={new_cursor_id}, original_cursor={original_cursor_id}"),
+            ),
             Insn::Once {
                 target_pc_when_reentered,
             } => (
