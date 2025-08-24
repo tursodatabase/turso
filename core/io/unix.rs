@@ -263,18 +263,30 @@ impl File for UnixFile {
 
     #[instrument(err, skip_all, level = Level::TRACE)]
     fn sync(&self, kind: FsyncKind, c: Completion) -> Result<Completion> {
-        let file = self.file.lock();
-        let result = match kind {
-            FsyncKind::Data => unsafe { libc::fdatasync(file.as_raw_fd()) },
-            FsyncKind::Full => unsafe { libc::fsync(file.as_raw_fd()) },
-        };
-        if result == -1 {
-            let e = std::io::Error::last_os_error();
-            Err(e.into())
-        } else {
-            trace!("fsync");
+        use std::os::fd::AsRawFd;
+        let fd = self.file.lock().as_raw_fd();
+
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        {
+            // macOS/iOS: no fdatasync
+            let rc = unsafe { libc::fsync(fd) };
+            if rc == -1 {
+                return Err(std::io::Error::last_os_error().into());
+            }
             c.complete(0);
-            Ok(c)
+            return Ok(c);
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        {
+            let rc = match kind {
+                FsyncKind::Data => unsafe { libc::fdatasync(fd) },
+                FsyncKind::Full => unsafe { libc::fsync(fd) },
+            };
+            if rc == -1 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            c.complete(0);
+            return Ok(c);
         }
     }
 
