@@ -132,6 +132,9 @@ impl SimulatorFile {
 }
 
 impl File for SimulatorFile {
+    fn path(&self) -> &std::path::Path {
+        self.inner.path()
+    }
     fn lock_file(&self, exclusive: bool) -> Result<()> {
         if self.fault.get() {
             return Err(turso_core::LimboError::InternalError(
