@@ -9,13 +9,20 @@ use std::ptr::NonNull;
 use std::sync::{Arc, OnceLock};
 use std::{fmt::Debug, pin::Pin};
 
+#[derive(Debug, Default)]
+pub enum FsyncKind {
+    Data,
+    #[default]
+    Full,
+}
+
 pub trait File: Send + Sync {
     fn path(&self) -> &std::path::Path;
     fn lock_file(&self, exclusive: bool) -> Result<()>;
     fn unlock_file(&self) -> Result<()>;
     fn pread(&self, pos: usize, c: Completion) -> Result<Completion>;
     fn pwrite(&self, pos: usize, buffer: Arc<Buffer>, c: Completion) -> Result<Completion>;
-    fn sync(&self, c: Completion) -> Result<Completion>;
+    fn sync(&self, kind: FsyncKind, c: Completion) -> Result<Completion>;
     fn pwritev(&self, pos: usize, buffers: Vec<Arc<Buffer>>, c: Completion) -> Result<Completion> {
         use std::sync::atomic::{AtomicUsize, Ordering};
         if buffers.is_empty() {
@@ -65,6 +72,47 @@ pub trait File: Send + Sync {
     fn truncate(&self, len: usize, c: Completion) -> Result<Completion>;
 }
 
+#[cfg(unix)]
+fn sync_dir(dir: &std::path::Path) -> Result<()> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let dir_file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .open(dir)?;
+
+    let rc = unsafe { libc::fsync(dir_file.as_raw_fd()) };
+    if rc == -1 {
+        Err(std::io::Error::last_os_error().into())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn sync_dir(dir: &Path) -> Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::BOOL;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FlushFileBuffers, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE,
+    };
+
+    // On Windows, we must open a directory with FILE_FLAG_BACKUP_SEMANTICS
+    let dir_file = OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(dir)?;
+    let ok: BOOL = unsafe { FlushFileBuffers(dir_file.as_raw_handle() as _) };
+    if ok == 0 {
+        Err(std::io::Error::last_os_error().into())
+    } else {
+        Ok(())
+    }
+}
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub struct OpenFlags(i32);
 
