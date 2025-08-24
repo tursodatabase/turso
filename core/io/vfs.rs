@@ -1,7 +1,7 @@
 use super::{Buffer, Completion, File, OpenFlags, IO};
 use crate::ext::VfsMod;
 use crate::io::clock::{Clock, Instant};
-use crate::io::CompletionInner;
+use crate::io::{CompletionInner, FsyncKind};
 use crate::{LimboError, Result};
 use std::ffi::{c_void, CString};
 use std::ptr::NonNull;
@@ -179,14 +179,18 @@ impl File for VfsFile {
         Ok(c)
     }
 
-    fn sync(&self, c: Completion) -> Result<Completion> {
+    fn sync(&self, kind: FsyncKind, c: Completion) -> Result<Completion> {
         if self.inner.vfs.is_null() {
             c.complete(-1);
             return Err(LimboError::ExtensionError("VFS is null".to_string()));
         }
         let vfs = unsafe { &*self.inner.vfs };
         let cb = to_callback(c.clone());
-        let res = unsafe { (vfs.sync)(self.inner.file, cb) };
+        let typ = match kind {
+            FsyncKind::Data => turso_ext::FsyncKind::Data,
+            FsyncKind::Full => turso_ext::FsyncKind::Full,
+        };
+        let res = unsafe { (vfs.sync)(self.inner.file, typ, cb) };
         if res.is_error() {
             return Err(LimboError::ExtensionError("sync failed".to_string()));
         }

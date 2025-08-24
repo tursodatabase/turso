@@ -14,8 +14,8 @@ pub use turso_macros::{register_extension, scalar, AggregateDerive, VTabModuleDe
 pub use types::{ResultCode, StepResult, Value, ValueType};
 #[cfg(feature = "vfs")]
 pub use vfs_modules::{
-    BufferRef, Callback, IOCallback, RegisterVfsFn, SendPtr, VfsExtension, VfsFile, VfsFileImpl,
-    VfsImpl, VfsInterface,
+    BufferRef, Callback, FsyncKind, IOCallback, RegisterVfsFn, SendPtr, VfsExtension, VfsFile,
+    VfsFileImpl, VfsImpl, VfsInterface,
 };
 use vtabs::RegisterModuleFn;
 pub use vtabs::{

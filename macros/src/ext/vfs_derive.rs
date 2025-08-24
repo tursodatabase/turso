@@ -206,7 +206,7 @@ pub fn derive_vfs_module(input: TokenStream) -> TokenStream {
         }
 
         #[no_mangle]
-        pub unsafe extern "C" fn #sync_fn_name(file_ptr: *const ::std::ffi::c_void, cb: ::turso_ext::IOCallback) -> ::turso_ext::ResultCode {
+        pub unsafe extern "C" fn #sync_fn_name(file_ptr: *const ::std::ffi::c_void, kind: ::turso_ext::FsyncKind, cb: ::turso_ext::IOCallback) -> ::turso_ext::ResultCode {
             if file_ptr.is_null() {
                 return ::turso_ext::ResultCode::Error;
             }
@@ -214,7 +214,7 @@ pub fn derive_vfs_module(input: TokenStream) -> TokenStream {
             let vfs_file: &mut ::turso_ext::VfsFileImpl = &mut *(file_ptr as *mut ::turso_ext::VfsFileImpl);
             let file: &mut <#struct_name as ::turso_ext::VfsExtension>::File =
                 &mut *(vfs_file.file as *mut <#struct_name as ::turso_ext::VfsExtension>::File);
-            if <#struct_name as ::turso_ext::VfsExtension>::File::sync(file, callback).is_err() {
+            if <#struct_name as ::turso_ext::VfsExtension>::File::sync(file, kind, callback).is_err() {
                 return ::turso_ext::ResultCode::Error;
             }
             ::turso_ext::ResultCode::OK
