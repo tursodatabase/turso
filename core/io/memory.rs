@@ -5,6 +5,7 @@ use crate::io::clock::Instant;
 use std::{
     cell::{Cell, UnsafeCell},
     collections::{BTreeMap, HashMap},
+    path::PathBuf,
     sync::{Arc, Mutex},
 };
 use tracing::debug;
@@ -56,7 +57,7 @@ impl IO for MemoryIO {
             files.insert(
                 path.to_string(),
                 Arc::new(MemoryFile {
-                    path: path.to_string(),
+                    path: path.to_string().into(),
                     pages: BTreeMap::new().into(),
                     size: 0.into(),
                 }),
@@ -77,7 +78,7 @@ impl IO for MemoryIO {
 }
 
 pub struct MemoryFile {
-    path: String,
+    path: PathBuf,
     pages: UnsafeCell<BTreeMap<usize, MemPage>>,
     size: Cell<usize>,
 }
@@ -85,6 +86,9 @@ unsafe impl Send for MemoryFile {}
 unsafe impl Sync for MemoryFile {}
 
 impl File for MemoryFile {
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
     fn lock_file(&self, _exclusive: bool) -> Result<()> {
         Ok(())
     }
@@ -93,7 +97,7 @@ impl File for MemoryFile {
     }
 
     fn pread(&self, pos: usize, c: Completion) -> Result<Completion> {
-        tracing::debug!("pread(path={}): pos={}", self.path, pos);
+        tracing::debug!("pread(path={:?}): pos={}", self.path, pos);
         let r = c.as_read();
         let buf_len = r.buf().len();
         if buf_len == 0 {
@@ -136,7 +140,7 @@ impl File for MemoryFile {
 
     fn pwrite(&self, pos: usize, buffer: Arc<Buffer>, c: Completion) -> Result<Completion> {
         tracing::debug!(
-            "pwrite(path={}): pos={}, size={}",
+            "pwrite(path={:?}): pos={}, size={}",
             self.path,
             pos,
             buffer.len()
@@ -176,14 +180,14 @@ impl File for MemoryFile {
     }
 
     fn sync(&self, c: Completion) -> Result<Completion> {
-        tracing::debug!("sync(path={})", self.path);
+        tracing::debug!("sync(path={:?})", self.path);
         // no-op
         c.complete(0);
         Ok(c)
     }
 
     fn truncate(&self, len: usize, c: Completion) -> Result<Completion> {
-        tracing::debug!("truncate(path={}): len={}", self.path, len);
+        tracing::debug!("truncate(path={:?}): len={}", self.path, len);
         if len < self.size.get() {
             // Truncate pages
             unsafe {
@@ -198,7 +202,7 @@ impl File for MemoryFile {
 
     fn pwritev(&self, pos: usize, buffers: Vec<Arc<Buffer>>, c: Completion) -> Result<Completion> {
         tracing::debug!(
-            "pwritev(path={}): pos={}, buffers={:?}",
+            "pwritev(path={:?}): pos={}, buffers={:?}",
             self.path,
             pos,
             buffers.iter().map(|x| x.len()).collect::<Vec<_>>()
@@ -240,7 +244,7 @@ impl File for MemoryFile {
     }
 
     fn size(&self) -> Result<u64> {
-        tracing::debug!("size(path={}): {}", self.path, self.size.get());
+        tracing::debug!("size(path={:?}): {}", self.path, self.size.get());
         Ok(self.size.get() as u64)
     }
 }
