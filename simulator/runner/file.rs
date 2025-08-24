@@ -200,7 +200,11 @@ impl File for SimulatorFile {
         }
     }
 
-    fn sync(&self, c: turso_core::Completion) -> Result<turso_core::Completion> {
+    fn sync(
+        &self,
+        kind: turso_core::FsyncKind,
+        c: turso_core::Completion,
+    ) -> Result<turso_core::Completion> {
         self.nr_sync_calls.set(self.nr_sync_calls.get() + 1);
         if self.fault.get() {
             // TODO: Enable this when https://github.com/tursodatabase/turso/issues/2091 is fixed.
@@ -210,7 +214,7 @@ impl File for SimulatorFile {
         let c = if let Some(latency) = self.generate_latency_duration() {
             let cloned_c = c.clone();
             let op = Box::new(|file: &SimulatorFile| -> Result<_> {
-                let c = file.inner.sync(cloned_c)?;
+                let c = file.inner.sync(kind, cloned_c)?;
                 *file.sync_completion.borrow_mut() = Some(c.clone());
                 Ok(c)
             });
@@ -219,7 +223,7 @@ impl File for SimulatorFile {
                 .push(DelayedIo { time: latency, op });
             c
         } else {
-            let c = self.inner.sync(c)?;
+            let c = self.inner.sync(kind, c)?;
             *self.sync_completion.borrow_mut() = Some(c.clone());
             c
         };
