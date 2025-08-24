@@ -2,6 +2,7 @@
 
 use super::{common, Completion, CompletionInner, File, OpenFlags, IO};
 use crate::io::clock::{Clock, Instant};
+use crate::io::FsyncKind;
 use crate::storage::wal::CKPT_BATCH_PAGES;
 use crate::{turso_assert, LimboError, Result};
 use rustix::fs::{self, FlockOperation, OFlags};
@@ -719,11 +720,16 @@ impl File for UringFile {
         Ok(c)
     }
 
-    fn sync(&self, c: Completion) -> Result<Completion> {
+    fn sync(&self, kind: FsyncKind, c: Completion) -> Result<Completion> {
         let mut io = self.io.borrow_mut();
         trace!("sync()");
         let sync = with_fd!(self, |fd| {
             io_uring::opcode::Fsync::new(fd)
+                .flags(if matches!(kind, FsyncKind::Full) {
+                    io_uring::types::FsyncFlags::empty()
+                } else {
+                    io_uring::types::FsyncFlags::DATASYNC
+                })
                 .build()
                 .user_data(get_key(c.clone()))
         });
