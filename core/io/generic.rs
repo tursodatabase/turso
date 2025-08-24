@@ -1,5 +1,7 @@
 use super::MemoryIO;
-use crate::{Clock, Completion, CompletionType, File, Instant, LimboError, OpenFlags, Result, IO};
+use crate::{
+    Clock, Completion, CompletionType, File, FsyncKind, Instant, LimboError, OpenFlags, Result, IO,
+};
 use std::cell::RefCell;
 use std::io::{Read, Seek, Write};
 use std::sync::Arc;
@@ -30,11 +32,12 @@ impl IO for GenericIO {
 
         let file = file.open(path)?;
         Ok(Arc::new(GenericFile {
+            path: std::path::PathBuf::from(path),
             file: RefCell::new(file),
             memory_io: Arc::new(MemoryIO::new()),
         }))
     }
-    
+
     fn remove_file(&self, path: &str) -> Result<()> {
         trace!("remove_file(path = {})", path);
         std::fs::remove_file(path)?;
@@ -57,6 +60,7 @@ impl Clock for GenericIO {
 }
 
 pub struct GenericFile {
+    path: std::path::PathBuf,
     file: RefCell<std::fs::File>,
     memory_io: Arc<MemoryIO>,
 }
@@ -97,9 +101,16 @@ impl File for GenericFile {
         Ok(c)
     }
 
-    fn sync(&self, c: Completion) -> Result<Completion> {
+    fn sync(&self, kind: FsyncKind, c: Completion) -> Result<Completion> {
         let mut file = self.file.borrow_mut();
-        file.sync_all()?;
+        match kind {
+            FsyncKind::Full => {
+                file.sync_all()?;
+            }
+            FsyncKind::Data => {
+                file.sync_data()?;
+            }
+        }
         c.complete(0);
         Ok(c)
     }

@@ -14,7 +14,7 @@ use super::buffer_pool::BufferPool;
 use super::pager::{PageRef, Pager};
 use super::sqlite3_ondisk::{self, checksum_wal, WalHeader, WAL_MAGIC_BE, WAL_MAGIC_LE};
 use crate::fast_lock::SpinLock;
-use crate::io::{clock, File, IO};
+use crate::io::{clock, File, FsyncKind, IO};
 use crate::result::LimboResult;
 use crate::storage::encryption::EncryptionContext;
 use crate::storage::sqlite3_ondisk::{
@@ -285,7 +285,7 @@ pub trait Wal: Debug {
         pager: &Pager,
         mode: CheckpointMode,
     ) -> Result<IOResult<CheckpointResult>>;
-    fn sync(&mut self) -> Result<Completion>;
+    fn sync(&mut self, kind: FsyncKind) -> Result<Completion>;
     fn is_syncing(&self) -> bool;
     fn get_max_frame_in_wal(&self) -> u64;
     fn get_checkpoint_seq(&self) -> u32;
@@ -1281,16 +1281,16 @@ impl Wal for WalFile {
     }
 
     #[instrument(err, skip_all, level = Level::DEBUG)]
-    fn sync(&mut self) -> Result<Completion> {
-        tracing::debug!("wal_sync");
+    fn sync(&mut self, kind: FsyncKind) -> Result<Completion> {
+        tracing::debug!("wal_sync: {kind:?}");
         let syncing = self.syncing.clone();
         let completion = Completion::new_sync(move |_| {
-            tracing::debug!("wal_sync finish");
+            tracing::debug!("wal_sync: {kind:?} finish");
             syncing.set(false);
         });
         let shared = self.get_shared();
         self.syncing.set(true);
-        let c = shared.file.sync(completion)?;
+        let c = shared.file.sync(kind, completion)?;
         Ok(c)
     }
 
@@ -1496,8 +1496,11 @@ impl WalFile {
                 &shared.file,
                 &shared.wal_header.lock(),
             )?)?;
-        self.io
-            .wait_for_completion(shared.file.sync(Completion::new_sync(|_| {}))?)?;
+        self.io.wait_for_completion(
+            shared
+                .file
+                .sync(FsyncKind::Full, Completion::new_sync(|_| {}))?,
+        )?;
         Ok(())
     }
 
@@ -1917,9 +1920,12 @@ impl WalFile {
                 .wait_for_completion(
                     shared
                         .file
-                        .sync(Completion::new_sync(|_| {
-                            tracing::trace!("WAL file synced after reset/truncation");
-                        }))
+                        .sync(
+                            FsyncKind::Data,
+                            Completion::new_sync(|_| {
+                                tracing::trace!("WAL file synced after reset/truncation");
+                            }),
+                        )
                         .inspect_err(|e| unlock(Some(e)))?,
                 )
                 .inspect_err(|e| unlock(Some(e)))?;

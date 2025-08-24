@@ -11,7 +11,7 @@ use turso_ext::{
     VTabModuleDerive, VTable, Value,
 };
 #[cfg(not(target_family = "wasm"))]
-use turso_ext::{BufferRef, Callback, VfsDerive, VfsExtension, VfsFile};
+use turso_ext::{BufferRef, Callback, FsyncKind, VfsDerive, VfsExtension, VfsFile};
 
 register_extension! {
     vtabs: { KVStoreVTabModule, TableStatsVtabModule },
@@ -385,9 +385,16 @@ impl VfsFile for TestFile {
         Ok(())
     }
 
-    fn sync(&self, cb: Callback) -> ExtResult<()> {
+    fn sync(&self, kind: FsyncKind, cb: Callback) -> ExtResult<()> {
         log::debug!("syncing file with testing VFS");
-        self.file.sync_all().map_err(|_| ResultCode::Error)?;
+        match kind {
+            FsyncKind::Full => {
+                self.file.sync_all().map_err(|_| ResultCode::Error)?;
+            }
+            FsyncKind::Data => {
+                self.file.sync_data().map_err(|_| ResultCode::Error)?;
+            }
+        }
         self.io.enqueue(cb, 0);
         Ok(())
     }

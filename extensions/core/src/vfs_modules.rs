@@ -36,6 +36,14 @@ pub trait VfsExtension: Default + Send + Sync {
     }
 }
 
+#[derive(Debug, Default)]
+#[repr(u8)]
+pub enum FsyncKind {
+    #[default]
+    Full = 0,
+    Data = 1,
+}
+
 pub trait VfsFile: Send + Sync {
     fn lock(&mut self, _exclusive: bool) -> ExtResult<()> {
         Ok(())
@@ -45,7 +53,7 @@ pub trait VfsFile: Send + Sync {
     }
     fn read(&mut self, buf: BufferRef, offset: i64, cb: Callback) -> ExtResult<()>;
     fn write(&mut self, buf: BufferRef, offset: i64, cb: Callback) -> ExtResult<()>;
-    fn sync(&self, cb: Callback) -> ExtResult<()>;
+    fn sync(&self, kind: FsyncKind, cb: Callback) -> ExtResult<()>;
     fn truncate(&self, len: i64, cb: Callback) -> ExtResult<()>;
     fn size(&self) -> i64;
 }
@@ -182,7 +190,8 @@ pub type VfsWrite = unsafe extern "C" fn(
     cb: IOCallback,
 ) -> ResultCode;
 
-pub type VfsSync = unsafe extern "C" fn(file: *const c_void, cb: IOCallback) -> ResultCode;
+pub type VfsSync =
+    unsafe extern "C" fn(file: *const c_void, kind: FsyncKind, cb: IOCallback) -> ResultCode;
 
 pub type VfsTruncate =
     unsafe extern "C" fn(file: *const c_void, len: i64, cb: IOCallback) -> ResultCode;

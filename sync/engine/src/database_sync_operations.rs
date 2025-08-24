@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use turso_core::{types::Text, Buffer, Completion, LimboError, Value};
+use turso_core::{types::Text, Buffer, Completion, FsyncKind, LimboError, Value};
 
 use crate::{
     database_replay_generator::DatabaseReplayGenerator,
@@ -100,7 +100,7 @@ pub async fn db_bootstrap<C: ProtocolIO>(
         let c = Completion::new_sync(move |_| {
             // todo(sivukhin): we need to error out in case of failed sync
         });
-        completions.push(db.sync(c)?);
+        completions.push(db.sync(FsyncKind::Full, c)?);
     }
     while !completions.iter().all(|x| x.is_completed()) {
         coro.yield_(ProtocolCommand::IO).await?;

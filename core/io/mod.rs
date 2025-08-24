@@ -9,12 +9,38 @@ use std::ptr::NonNull;
 use std::sync::{Arc, OnceLock};
 use std::{fmt::Debug, pin::Pin};
 
+#[derive(Debug, Default, Clone, Copy)]
+pub enum FsyncKind {
+    Data,
+    #[default]
+    Full,
+}
+
 pub trait File: Send + Sync {
+    fn path(&self) -> &std::path::Path;
+    fn is_persistent(&self) -> bool {
+        true
+    }
+    fn sync_parent(&self) -> Result<()> {
+        if !self.is_persistent() {
+            return Ok(());
+        }
+        if let Some(parent) = self.path().parent() {
+            let parent = if parent.as_os_str().is_empty() {
+                // in the case of "./file.db", the parent will be empty, so fsync PWD
+                std::path::Path::new(".")
+            } else {
+                parent
+            };
+            sync_dir(parent)?;
+        }
+        Ok(())
+    }
     fn lock_file(&self, exclusive: bool) -> Result<()>;
     fn unlock_file(&self) -> Result<()>;
     fn pread(&self, pos: usize, c: Completion) -> Result<Completion>;
     fn pwrite(&self, pos: usize, buffer: Arc<Buffer>, c: Completion) -> Result<Completion>;
-    fn sync(&self, c: Completion) -> Result<Completion>;
+    fn sync(&self, kind: FsyncKind, c: Completion) -> Result<Completion>;
     fn pwritev(&self, pos: usize, buffers: Vec<Arc<Buffer>>, c: Completion) -> Result<Completion> {
         use std::sync::atomic::{AtomicUsize, Ordering};
         if buffers.is_empty() {
@@ -62,6 +88,58 @@ pub trait File: Send + Sync {
     }
     fn size(&self) -> Result<u64>;
     fn truncate(&self, len: usize, c: Completion) -> Result<Completion>;
+}
+
+#[cfg(unix)]
+fn sync_dir(dir: &std::path::Path) -> Result<()> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let dir_file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY)
+        .open(dir)?;
+
+    let rc = unsafe { libc::fsync(dir_file.as_raw_fd()) };
+    if rc == -1 {
+        let err = std::io::Error::last_os_error();
+        // some filesystems return EINVAL|ENOTSUP for fsync dir, so treat as best-effort success
+        match err.raw_os_error() {
+            Some(libc::EINVAL) | Some(libc::ENOTSUP) => Ok(()),
+            _ => Err(err.into()),
+        }
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn sync_dir(dir: &std::path::Path) -> Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    // https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilea
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x02000000;
+
+    // On Windows, we must open a directory with FILE_FLAG_BACKUP_SEMANTICS
+    let dir_file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(dir)?;
+
+    match dir_file.sync_all() {
+        Ok(()) => Ok(()),
+        // Some older filesystems/drivers don’t support flushing directory handles.
+        // Treat these as a best-effort no-op.
+        Err(e)
+            if matches!(
+                e.raw_os_error(),
+                Some(1 /*ERROR_INVALID_FUNCTION*/) | Some(6 /*ERROR_INVALID_HANDLE*/)
+            ) =>
+        {
+            Ok(())
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 #[derive(Debug, Copy, Clone, PartialEq)]

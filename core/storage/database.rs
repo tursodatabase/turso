@@ -1,6 +1,9 @@
 use crate::error::LimboError;
 use crate::storage::encryption::EncryptionContext;
-use crate::{io::Completion, Buffer, CompletionError, Result};
+use crate::{
+    io::{Completion, FsyncKind},
+    Buffer, CompletionError, Result,
+};
 use std::sync::Arc;
 use tracing::{instrument, Level};
 
@@ -162,7 +165,7 @@ impl DatabaseStorage for DatabaseFile {
 
     #[instrument(skip_all, level = Level::DEBUG)]
     fn sync(&self, c: Completion) -> Result<Completion> {
-        self.file.sync(c)
+        self.file.sync(FsyncKind::Data, c)
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]

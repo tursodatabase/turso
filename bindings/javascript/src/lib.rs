@@ -18,6 +18,7 @@ use std::{
     num::NonZeroUsize,
     sync::Arc,
 };
+use turso_core::FsyncKind;
 
 /// Step result constants
 const STEP_ROW: u32 = 1;
@@ -608,7 +609,7 @@ impl turso_core::DatabaseStorage for DatabaseFile {
     }
 
     fn sync(&self, c: turso_core::Completion) -> turso_core::Result<turso_core::Completion> {
-        self.file.sync(c)
+        self.file.sync(FsyncKind::Data, c)
     }
 
     fn size(&self) -> turso_core::Result<u64> {

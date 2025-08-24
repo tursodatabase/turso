@@ -1,7 +1,7 @@
 use super::{Completion, File, OpenFlags, IO};
 use crate::error::LimboError;
 use crate::io::clock::{Clock, Instant};
-use crate::io::common;
+use crate::io::{common, FsyncKind};
 use crate::Result;
 use parking_lot::Mutex;
 use rustix::{
@@ -108,6 +108,7 @@ impl IO for UnixIO {
 
         #[allow(clippy::arc_with_non_send_sync)]
         let unix_file = Arc::new(UnixFile {
+            path: std::path::PathBuf::from(path),
             file: Arc::new(Mutex::new(file)),
         });
         if std::env::var(common::ENV_DISABLE_FILE_LOCK).is_err() {
@@ -146,12 +147,16 @@ impl IO for UnixIO {
 // }
 
 pub struct UnixFile {
+    path: std::path::PathBuf,
     file: Arc<Mutex<std::fs::File>>,
 }
 unsafe impl Send for UnixFile {}
 unsafe impl Sync for UnixFile {}
 
 impl File for UnixFile {
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
     fn lock_file(&self, exclusive: bool) -> Result<()> {
         let fd = self.file.lock();
         let fd = fd.as_fd();
@@ -257,16 +262,31 @@ impl File for UnixFile {
     }
 
     #[instrument(err, skip_all, level = Level::TRACE)]
-    fn sync(&self, c: Completion) -> Result<Completion> {
-        let file = self.file.lock();
-        let result = unsafe { libc::fsync(file.as_raw_fd()) };
-        if result == -1 {
-            let e = std::io::Error::last_os_error();
-            Err(e.into())
-        } else {
-            trace!("fsync");
+    fn sync(&self, kind: FsyncKind, c: Completion) -> Result<Completion> {
+        use std::os::fd::AsRawFd;
+        let fd = self.file.lock().as_raw_fd();
+
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        {
+            // macOS/iOS: no fdatasync
+            let rc = unsafe { libc::fsync(fd) };
+            if rc == -1 {
+                return Err(std::io::Error::last_os_error().into());
+            }
             c.complete(0);
-            Ok(c)
+            return Ok(c);
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        {
+            let rc = match kind {
+                FsyncKind::Data => unsafe { libc::fdatasync(fd) },
+                FsyncKind::Full => unsafe { libc::fsync(fd) },
+            };
+            if rc == -1 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            c.complete(0);
+            return Ok(c);
         }
     }
 
