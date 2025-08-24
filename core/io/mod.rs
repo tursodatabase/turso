@@ -9,7 +9,7 @@ use std::ptr::NonNull;
 use std::sync::{Arc, OnceLock};
 use std::{fmt::Debug, pin::Pin};
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Copy)]
 pub enum FsyncKind {
     Data,
     #[default]
@@ -22,10 +22,16 @@ pub trait File: Send + Sync {
         true
     }
     fn sync_parent(&self) -> Result<()> {
-        if self.is_persistent() {
+        if !self.is_persistent() {
             return Ok(());
         }
         if let Some(parent) = self.path().parent() {
+            let parent = if parent.as_os_str().is_empty() {
+                // in the case of "./file.db", the parent will be empty, so fsync PWD
+                std::path::Path::new(".")
+            } else {
+                parent
+            };
             sync_dir(parent)?;
         }
         Ok(())
@@ -91,12 +97,17 @@ fn sync_dir(dir: &std::path::Path) -> Result<()> {
 
     let dir_file = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .custom_flags(libc::O_DIRECTORY)
         .open(dir)?;
 
     let rc = unsafe { libc::fsync(dir_file.as_raw_fd()) };
     if rc == -1 {
-        Err(std::io::Error::last_os_error().into())
+        let err = std::io::Error::last_os_error();
+        // some filesystems return EINVAL|ENOTSUP for fsync dir, so treat as best-effort success
+        match err.raw_os_error() {
+            Some(libc::EINVAL) | Some(libc::ENOTSUP) => Ok(()),
+            _ => Err(err.into()),
+        }
     } else {
         Ok(())
     }

@@ -10,7 +10,7 @@ use crate::storage::{
 };
 use crate::types::{IOCompletions, WalState};
 use crate::util::IOExt as _;
-use crate::{io_yield_many, io_yield_one};
+use crate::{io_yield_many, io_yield_one, FsyncKind, Instant};
 use crate::{
     return_if_io, turso_assert, types::WalFrameInfo, Completion, Connection, IOResult, LimboError,
     Result, TransactionState,
@@ -348,6 +348,7 @@ pub enum BtreePageAllocMode {
 /// This will keep track of the state of current cache commit in order to not repeat work
 struct CommitInfo {
     state: Cell<CommitState>,
+    time: Cell<Instant>,
 }
 
 /// Track the state of the auto-vacuum mode.
@@ -563,6 +564,7 @@ impl Pager {
         } else {
             RefCell::new(AllocatePage1State::Done)
         };
+        let now = io.now();
         Ok(Self {
             db_file,
             wal,
@@ -573,6 +575,7 @@ impl Pager {
             ))),
             commit_info: CommitInfo {
                 state: CommitState::Start.into(),
+                time: now.into(),
             },
             syncing: Rc::new(Cell::new(false)),
             checkpoint_state: RefCell::new(CheckpointState::Checkpoint),
@@ -1360,7 +1363,7 @@ impl Pager {
                 }
                 CommitState::SyncWal => {
                     self.commit_info.state.set(CommitState::AfterSyncWal);
-                    let c = wal.borrow_mut().sync()?;
+                    let c = wal.borrow_mut().sync(FsyncKind::Data)?;
                     io_yield_one!(c);
                 }
                 CommitState::AfterSyncWal => {
@@ -1377,11 +1380,20 @@ impl Pager {
                 }
                 CommitState::SyncDbFile => {
                     let c = sqlite3_ondisk::begin_sync(self.db_file.clone(), self.syncing.clone())?;
+                    let now = self.io.now();
+                    self.commit_info.time.set(now);
                     self.commit_info.state.set(CommitState::AfterSyncDbFile);
                     io_yield_one!(c);
                 }
                 CommitState::AfterSyncDbFile => {
                     turso_assert!(!self.syncing.get(), "should have finished syncing");
+                    let duration = self
+                        .io
+                        .now()
+                        .to_system_time()
+                        .duration_since(self.commit_info.time.get().to_system_time())
+                        .unwrap();
+                    tracing::debug!("total time syncing: {:?}", duration.as_micros());
                     self.commit_info.state.set(CommitState::Start);
                     break PagerCommitResult::Checkpointed(checkpoint_result);
                 }
@@ -1518,7 +1530,7 @@ impl Pager {
             // fsync the wal syncronously before beginning checkpoint
             // TODO: for now forget about timeouts as they fail regularly in SIM
             // need to think of a better way to do this
-            let c = wal.sync()?;
+            let c = wal.sync(FsyncKind::Full)?;
             self.io.wait_for_completion(c)?;
         }
         if !wal_auto_checkpoint_disabled {

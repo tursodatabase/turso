@@ -610,7 +610,7 @@ unsafe impl Sync for UringFile {}
 
 impl File for UringFile {
     fn path(&self) -> &std::path::Path {
-        &self.path.as_path()
+        self.path.as_path()
     }
     fn lock_file(&self, exclusive: bool) -> Result<()> {
         let fd = self.file.as_fd();

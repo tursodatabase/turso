@@ -286,7 +286,7 @@ pub trait Wal: Debug {
         pager: &Pager,
         mode: CheckpointMode,
     ) -> Result<IOResult<CheckpointResult>>;
-    fn sync(&mut self) -> Result<Completion>;
+    fn sync(&mut self, kind: FsyncKind) -> Result<Completion>;
     fn is_syncing(&self) -> bool;
     fn get_max_frame_in_wal(&self) -> u64;
     fn get_checkpoint_seq(&self) -> u32;
@@ -1282,16 +1282,16 @@ impl Wal for WalFile {
     }
 
     #[instrument(err, skip_all, level = Level::DEBUG)]
-    fn sync(&mut self) -> Result<Completion> {
-        tracing::debug!("wal_sync");
+    fn sync(&mut self, kind: FsyncKind) -> Result<Completion> {
+        tracing::debug!("wal_sync: {kind:?}");
         let syncing = self.syncing.clone();
         let completion = Completion::new_sync(move |_| {
-            tracing::debug!("wal_sync finish");
+            tracing::debug!("wal_sync: {kind:?} finish");
             syncing.set(false);
         });
         let shared = self.get_shared();
         self.syncing.set(true);
-        let c = shared.file.sync(FsyncKind::Data, completion)?;
+        let c = shared.file.sync(kind, completion)?;
         Ok(c)
     }
 

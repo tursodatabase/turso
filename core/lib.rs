@@ -216,9 +216,12 @@ impl Database {
         enable_indexes: bool,
         enable_views: bool,
     ) -> Result<Arc<Database>> {
+        let exists = std::fs::exists(path)?;
         let file = io.open_file(path, flags, true)?;
-        // fully fsync the parent directory in case we created the file
-        file.sync_parent()?;
+        if !exists {
+            // fully fsync the parent directory in case we created the file
+            file.sync_parent()?;
+        }
         let db_file = Arc::new(DatabaseFile::new(file));
         Self::open_with_flags(
             io,
@@ -577,6 +580,8 @@ impl Database {
         let file = self
             .io
             .open_file(&self.wal_path, OpenFlags::Create, false)?;
+        // we created the file, so fsync the parent directory
+        file.sync_parent()?;
         let real_shared_wal = WalFileShared::new_shared(file)?;
         // Modify Database::maybe_shared_wal to point to the new WAL file so that other connections
         // can open the existing WAL.
