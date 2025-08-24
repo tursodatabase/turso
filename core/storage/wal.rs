@@ -15,7 +15,7 @@ use super::buffer_pool::BufferPool;
 use super::pager::{PageRef, Pager};
 use super::sqlite3_ondisk::{self, checksum_wal, WalHeader, WAL_MAGIC_BE, WAL_MAGIC_LE};
 use crate::fast_lock::SpinLock;
-use crate::io::{clock, File, IO};
+use crate::io::{clock, File, FsyncKind, IO};
 use crate::result::LimboResult;
 use crate::storage::encryption::EncryptionContext;
 use crate::storage::sqlite3_ondisk::{
@@ -1291,7 +1291,7 @@ impl Wal for WalFile {
         });
         let shared = self.get_shared();
         self.syncing.set(true);
-        let c = shared.file.sync(completion)?;
+        let c = shared.file.sync(FsyncKind::Data, completion)?;
         Ok(c)
     }
 
@@ -1497,8 +1497,11 @@ impl WalFile {
                 &shared.file,
                 &shared.wal_header.lock(),
             )?)?;
-        self.io
-            .wait_for_completion(shared.file.sync(Completion::new_sync(|_| {}))?)?;
+        self.io.wait_for_completion(
+            shared
+                .file
+                .sync(FsyncKind::Full, Completion::new_sync(|_| {}))?,
+        )?;
         Ok(())
     }
 
@@ -1918,9 +1921,12 @@ impl WalFile {
                 .wait_for_completion(
                     shared
                         .file
-                        .sync(Completion::new_sync(|_| {
-                            tracing::trace!("WAL file synced after reset/truncation");
-                        }))
+                        .sync(
+                            FsyncKind::Data,
+                            Completion::new_sync(|_| {
+                                tracing::trace!("WAL file synced after reset/truncation");
+                            }),
+                        )
                         .inspect_err(|e| unlock(Some(e)))?,
                 )
                 .inspect_err(|e| unlock(Some(e)))?;

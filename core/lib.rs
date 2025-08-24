@@ -57,8 +57,8 @@ pub use io::UnixIO;
 #[cfg(all(feature = "fs", target_os = "linux", feature = "io_uring"))]
 pub use io::UringIO;
 pub use io::{
-    Buffer, Completion, CompletionType, File, MemoryIO, OpenFlags, PlatformIO, SyscallIO,
-    WriteCompletion, IO,
+    Buffer, Completion, CompletionType, File, FsyncKind, MemoryIO, OpenFlags, PlatformIO,
+    SyscallIO, WriteCompletion, IO,
 };
 use parking_lot::RwLock;
 use schema::Schema;
@@ -217,6 +217,8 @@ impl Database {
         enable_views: bool,
     ) -> Result<Arc<Database>> {
         let file = io.open_file(path, flags, true)?;
+        // fully fsync the parent directory in case we created the file
+        file.sync_parent()?;
         let db_file = Arc::new(DatabaseFile::new(file));
         Self::open_with_flags(
             io,
