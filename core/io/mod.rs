@@ -18,6 +18,18 @@ pub enum FsyncKind {
 
 pub trait File: Send + Sync {
     fn path(&self) -> &std::path::Path;
+    fn is_persistent(&self) -> bool {
+        true
+    }
+    fn sync_parent(&self) -> Result<()> {
+        if self.is_persistent() {
+            return Ok(());
+        }
+        if let Some(parent) = self.path().parent() {
+            sync_dir(parent)?;
+        }
+        Ok(())
+    }
     fn lock_file(&self, exclusive: bool) -> Result<()>;
     fn unlock_file(&self) -> Result<()>;
     fn pread(&self, pos: usize, c: Completion) -> Result<Completion>;
