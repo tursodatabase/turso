@@ -1,7 +1,8 @@
 use crate::schema::{Index, IndexColumn, Schema};
 use crate::translate::emitter::{emit_query, LimitCtx, TranslateCtx};
+use crate::translate::expr::translate_expr;
 use crate::translate::plan::{Plan, QueryDestination, SelectPlan};
-use crate::translate::result_row::{build_limit_offset_expr, try_fold_expr_to_i64};
+use crate::translate::result_row::try_fold_expr_to_i64;
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::Insn;
 use crate::vdbe::BranchOffset;
@@ -38,11 +39,18 @@ pub fn emit_program_for_compound_select(
         return Ok(());
     }
 
+    let right_most_ctx = TranslateCtx::new(
+        program,
+        schema,
+        syms,
+        right_most.table_references.joined_tables().len(),
+    );
+
     // Each subselect shares the same limit_ctx and offset, because the LIMIT, OFFSET applies to
     // the entire compound select, not just a single subselect.
-    let limit_ctx = limit.clone().map(|limit| {
+    let limit_ctx = limit.as_ref().map(|limit| {
         let reg = program.alloc_register();
-        if let Some(val) = try_fold_expr_to_i64(&limit) {
+        if let Some(val) = try_fold_expr_to_i64(limit) {
             program.emit_insn(Insn::Integer {
                 value: val,
                 dest: reg,
@@ -52,7 +60,7 @@ pub fn emit_program_for_compound_select(
 
             let label_zero = program.allocate_label();
 
-            build_limit_offset_expr(program, reg, &limit);
+            _ = translate_expr(program, None, limit, reg, &right_most_ctx.resolver);
 
             program.emit_insn(Insn::MustBeInt { reg });
 
@@ -87,7 +95,7 @@ pub fn emit_program_for_compound_select(
 
             let label_zero = program.allocate_label();
 
-            build_limit_offset_expr(program, reg, offset_expr);
+            _ = translate_expr(program, None, offset_expr, reg, &right_most_ctx.resolver);
 
             program.emit_insn(Insn::MustBeInt { reg });
 

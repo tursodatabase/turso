@@ -26,7 +26,7 @@ use crate::schema::{BTreeTable, Column, Schema, Table};
 use crate::translate::compound_select::emit_program_for_compound_select;
 use crate::translate::expr::{emit_returning_results, ReturningValueRegisters};
 use crate::translate::plan::{DeletePlan, Plan, QueryDestination, Search};
-use crate::translate::result_row::{build_limit_offset_expr, try_fold_expr_to_i64};
+use crate::translate::result_row::try_fold_expr_to_i64;
 use crate::translate::values::emit_values;
 use crate::util::exprs_are_equivalent;
 use crate::vdbe::builder::{CursorKey, CursorType, ProgramBuilder};
@@ -257,7 +257,7 @@ pub fn emit_query<'a>(
     // Emit subqueries first so the results can be read in the main query loop.
     emit_subqueries(program, t_ctx, &mut plan.table_references)?;
 
-    init_limit(program, t_ctx, plan.limit.clone(), plan.offset.clone());
+    init_limit(program, t_ctx, &plan.limit, &plan.offset);
 
     // No rows will be read from source table loops if there is a constant false condition eg. WHERE 0
     // however an aggregation might still happen,
@@ -413,7 +413,7 @@ fn emit_program_for_delete(
         }
     }
 
-    init_limit(program, &mut t_ctx, plan.limit, None);
+    init_limit(program, &mut t_ctx, &plan.limit, &None);
 
     // No rows will be read from source table loops if there is a constant false condition eg. WHERE 0
     let after_main_loop_label = program.allocate_label();
@@ -671,7 +671,7 @@ fn emit_program_for_update(
         }
     }
 
-    init_limit(program, &mut t_ctx, plan.limit.clone(), plan.offset.clone());
+    init_limit(program, &mut t_ctx, &plan.limit, &plan.offset);
     let after_main_loop_label = program.allocate_label();
     t_ctx.label_main_loop_end = Some(after_main_loop_label);
     if plan.contains_constant_false_condition {
@@ -1552,8 +1552,8 @@ pub fn emit_cdc_insns(
 fn init_limit(
     program: &mut ProgramBuilder,
     t_ctx: &mut TranslateCtx,
-    limit: Option<Box<Expr>>,
-    offset: Option<Box<Expr>>,
+    limit: &Option<Box<Expr>>,
+    offset: &Option<Box<Expr>>,
 ) {
     if t_ctx.limit_ctx.is_none() && limit.is_some() {
         t_ctx.limit_ctx = Some(LimitCtx::new(program));
@@ -1563,7 +1563,7 @@ fn init_limit(
     };
     if limit_ctx.initialize_counter {
         if let Some(expr) = limit {
-            if let Some(value) = try_fold_expr_to_i64(&expr) {
+            if let Some(value) = try_fold_expr_to_i64(expr) {
                 program.emit_insn(Insn::Integer {
                     value,
                     dest: limit_ctx.reg_limit,
@@ -1572,7 +1572,8 @@ fn init_limit(
                 let r = limit_ctx.reg_limit;
                 program.add_comment(program.offset(), "OFFSET expr");
                 let label_zero = program.allocate_label();
-                build_limit_offset_expr(program, r, &expr);
+
+                _ = translate_expr(program, None, expr, r, &t_ctx.resolver);
                 program.emit_insn(Insn::MustBeInt { reg: r });
                 program.emit_insn(Insn::IfNeg {
                     reg: r,
@@ -1590,7 +1591,7 @@ fn init_limit(
 
     if t_ctx.reg_offset.is_none() {
         if let Some(expr) = offset {
-            if let Some(value) = try_fold_expr_to_i64(&expr) {
+            if let Some(value) = try_fold_expr_to_i64(expr) {
                 if value != 0 {
                     let reg = program.alloc_register();
                     t_ctx.reg_offset = Some(reg);
@@ -1609,7 +1610,8 @@ fn init_limit(
                 let r = reg;
                 program.add_comment(program.offset(), "OFFSET expr");
                 let label_zero = program.allocate_label();
-                build_limit_offset_expr(program, r, &expr);
+
+                _ = translate_expr(program, None, expr, r, &t_ctx.resolver);
                 program.emit_insn(Insn::MustBeInt { reg: r });
                 program.emit_insn(Insn::IfNeg {
                     reg: r,

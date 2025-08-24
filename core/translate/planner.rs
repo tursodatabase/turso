@@ -21,8 +21,8 @@ use crate::{
 };
 use turso_parser::ast::Literal::Null;
 use turso_parser::ast::{
-    self, As, Expr, FromClause, JoinType, Limit, Literal, Materialized, QualifiedName,
-    TableInternalId, With,
+    self, As, Expr, FromClause, JoinType, Literal, Materialized, QualifiedName, TableInternalId,
+    With,
 };
 
 pub const ROWID: &str = "rowid";
@@ -1104,15 +1104,6 @@ fn parse_join(
     rightmost_table.join_info = Some(JoinInfo { outer, using });
 
     Ok(())
-}
-
-#[allow(clippy::type_complexity)]
-pub fn parse_limit(limit: &Limit) -> Result<(Option<Box<Expr>>, Option<Box<Expr>>)> {
-    let limit_expr = Some(limit.expr.clone());
-
-    let offset_expr = limit.offset.clone();
-
-    Ok((limit_expr, offset_expr))
 }
 
 pub fn break_predicate_at_and_boundaries(predicate: &Expr, out_predicates: &mut Vec<Expr>) {

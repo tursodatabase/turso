@@ -2,7 +2,7 @@ use crate::schema::Table;
 use crate::translate::emitter::emit_program;
 use crate::translate::optimizer::optimize_plan;
 use crate::translate::plan::{DeletePlan, Operation, Plan};
-use crate::translate::planner::{parse_limit, parse_where};
+use crate::translate::planner::parse_where;
 use crate::util::normalize_ident;
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts, TableRefIdCounter};
 use crate::{schema::Schema, Result, SymbolTable};
@@ -107,7 +107,8 @@ pub fn prepare_delete_plan(
     )?;
 
     // Parse the LIMIT/OFFSET clause
-    let (resolved_limit, resolved_offset) = limit.map_or(Ok((None, None)), |l| parse_limit(&l))?;
+    let (resolved_limit, resolved_offset) =
+        limit.map_or((None, None), |l| (Some(l.expr), l.offset));
 
     let plan = DeletePlan {
         table_references,

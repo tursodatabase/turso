@@ -1,10 +1,9 @@
 use turso_parser::ast::{Expr, Literal, Name, Operator, UnaryOperator};
 
 use crate::{
-    error::SQLITE_CONSTRAINT,
     vdbe::{
         builder::ProgramBuilder,
-        insn::{CmpInsFlags, IdxInsertFlags, InsertFlags, Insn},
+        insn::{IdxInsertFlags, InsertFlags, Insn},
         BranchOffset,
     },
     Result,
@@ -33,7 +32,7 @@ pub fn emit_select_result(
     limit_ctx: Option<LimitCtx>,
 ) -> Result<()> {
     if let (Some(jump_to), Some(_)) = (offset_jump_to, label_on_limit_reached) {
-        emit_offset(program, plan, jump_to, reg_offset);
+        emit_offset(program, plan, jump_to, reg_offset, resolver);
     }
 
     let start_reg = reg_result_cols_start;
@@ -166,12 +165,13 @@ pub fn emit_offset(
     plan: &SelectPlan,
     jump_to: BranchOffset,
     reg_offset: Option<usize>,
+    resolver: &Resolver,
 ) {
     let Some(offset_expr) = &plan.offset else {
         return;
     };
 
-    if let Some(val) = try_fold_expr_to_i64(&offset_expr.clone()) {
+    if let Some(val) = try_fold_expr_to_i64(offset_expr) {
         if val > 0 {
             program.add_comment(program.offset(), "OFFSET const");
             program.emit_insn(Insn::IfPos {
@@ -189,7 +189,7 @@ pub fn emit_offset(
 
     let label_zero = program.allocate_label();
 
-    build_limit_offset_expr(program, r, offset_expr);
+    _ = translate_expr(program, None, offset_expr, r, resolver);
 
     program.emit_insn(Insn::MustBeInt { reg: r });
 
@@ -210,126 +210,6 @@ pub fn emit_offset(
 
     program.preassign_label_to_next_insn(label_zero);
     program.emit_insn(Insn::Integer { value: 0, dest: r });
-}
-
-pub fn build_limit_offset_expr(program: &mut ProgramBuilder, r: usize, expr: &Expr) {
-    match expr {
-        Expr::Literal(Literal::Numeric(n)) => {
-            let value = n.parse::<i64>().unwrap_or_else(|_| {
-                program.emit_insn(Insn::Halt {
-                    err_code: SQLITE_CONSTRAINT,
-                    description: "invalid numeric literal".into(),
-                });
-                0
-            });
-            program.emit_int(value, r);
-        }
-        Expr::Literal(Literal::Null) => {
-            program.emit_int(0, r);
-        }
-        Expr::Id(Name::Ident(s)) => {
-            let lowered = s.to_ascii_lowercase();
-            if lowered == "true" {
-                program.emit_int(1, r);
-            } else if lowered == "false" {
-                program.emit_int(0, r);
-            } else {
-                program.emit_insn(Insn::Halt {
-                    err_code: SQLITE_CONSTRAINT,
-                    description: format!("invalid boolean string literal: {s}"),
-                });
-            }
-        }
-        Expr::Unary(UnaryOperator::Negative, inner) => {
-            let inner_reg = program.alloc_register();
-            build_limit_offset_expr(program, inner_reg, inner);
-
-            let neg_one_reg = program.alloc_register();
-            program.emit_int(-1, neg_one_reg);
-
-            program.emit_insn(Insn::Multiply {
-                lhs: inner_reg,
-                rhs: neg_one_reg,
-                dest: r,
-            });
-        }
-        Expr::Unary(UnaryOperator::Positive, inner) => {
-            let inner_reg = program.alloc_register();
-            build_limit_offset_expr(program, inner_reg, inner);
-            program.emit_insn(Insn::Copy {
-                src_reg: inner_reg,
-                dst_reg: r,
-                extra_amount: 0,
-            });
-        }
-        Expr::Binary(left, op, right) => {
-            let left_reg = program.alloc_register();
-            let right_reg = program.alloc_register();
-            build_limit_offset_expr(program, left_reg, left);
-            build_limit_offset_expr(program, right_reg, right);
-
-            match op {
-                Operator::Add => {
-                    program.emit_insn(Insn::Add {
-                        lhs: left_reg,
-                        rhs: right_reg,
-                        dest: r,
-                    });
-                }
-                Operator::Subtract => {
-                    program.emit_insn(Insn::Subtract {
-                        lhs: left_reg,
-                        rhs: right_reg,
-                        dest: r,
-                    });
-                }
-                Operator::Multiply => {
-                    program.emit_insn(Insn::Multiply {
-                        lhs: left_reg,
-                        rhs: right_reg,
-                        dest: r,
-                    });
-                }
-                Operator::Divide => {
-                    let zero_reg = program.alloc_register();
-                    program.emit_int(0, zero_reg);
-
-                    let ok_pc = program.allocate_label();
-                    program.emit_insn(Insn::Ne {
-                        lhs: right_reg,
-                        rhs: zero_reg,
-                        target_pc: ok_pc,
-                        flags: CmpInsFlags::default().jump_if_null(),
-                        collation: None,
-                    });
-
-                    program.emit_insn(Insn::Halt {
-                        err_code: SQLITE_CONSTRAINT,
-                        description: "divide by zero".into(),
-                    });
-
-                    program.resolve_label(ok_pc, program.offset());
-                    program.emit_insn(Insn::Divide {
-                        lhs: left_reg,
-                        rhs: right_reg,
-                        dest: r,
-                    });
-                }
-                _ => {
-                    program.emit_insn(Insn::Halt {
-                        err_code: SQLITE_CONSTRAINT,
-                        description: "unsupported operator in offset expr".into(),
-                    });
-                }
-            }
-        }
-        _ => {
-            program.emit_insn(Insn::Halt {
-                err_code: SQLITE_CONSTRAINT,
-                description: "non-integer expression in offset".into(),
-            });
-        }
-    }
 }
 
 #[allow(clippy::borrowed_box)]
