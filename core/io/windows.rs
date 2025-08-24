@@ -26,6 +26,7 @@ impl IO for WindowsIO {
 
         let file = file.open(path)?;
         Ok(Arc::new(WindowsFile {
+            path: std::path::PathBuf::from(path),
             file: RwLock::new(file),
         }))
     }
@@ -53,10 +54,14 @@ impl Clock for WindowsIO {
 }
 
 pub struct WindowsFile {
+    path: std::path::PathBuf,
     file: RwLock<std::fs::File>,
 }
 
 impl File for WindowsFile {
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
     #[instrument(err, skip_all, level = Level::TRACE)]
     fn lock_file(&self, exclusive: bool) -> Result<()> {
         unimplemented!()
