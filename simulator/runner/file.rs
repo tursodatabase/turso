@@ -213,7 +213,7 @@ impl File for SimulatorFile {
         }
         let c = if let Some(latency) = self.generate_latency_duration() {
             let cloned_c = c.clone();
-            let op = Box::new(|file: &SimulatorFile| -> Result<_> {
+            let op = Box::new(move |file: &SimulatorFile| -> Result<_> {
                 let c = file.inner.sync(kind, cloned_c)?;
                 *file.sync_completion.borrow_mut() = Some(c.clone());
                 Ok(c)
