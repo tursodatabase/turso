@@ -1,5 +1,5 @@
 use super::{Buffer, Clock, Completion, File, OpenFlags, IO};
-use crate::Result;
+use crate::{io::FsyncKind, Result};
 
 use crate::io::clock::Instant;
 use std::{
@@ -88,6 +88,9 @@ unsafe impl Sync for MemoryFile {}
 impl File for MemoryFile {
     fn path(&self) -> &std::path::Path {
         &self.path
+    }
+    fn is_persistent(&self) -> bool {
+        false
     }
     fn lock_file(&self, _exclusive: bool) -> Result<()> {
         Ok(())
@@ -179,7 +182,7 @@ impl File for MemoryFile {
         Ok(c)
     }
 
-    fn sync(&self, c: Completion) -> Result<Completion> {
+    fn sync(&self, _kind: FsyncKind, c: Completion) -> Result<Completion> {
         tracing::debug!("sync(path={:?})", self.path);
         // no-op
         c.complete(0);
