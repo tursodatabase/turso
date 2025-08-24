@@ -22,7 +22,6 @@ use crate::storage::sqlite3_ondisk::{
     begin_read_wal_frame, begin_read_wal_frame_raw, finish_read_page, prepare_wal_frame,
     write_pages_vectored, PageSize, WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE,
 };
-use crate::storage::wal;
 use crate::types::{IOCompletions, IOResult};
 use crate::{
     bail_corrupt_error, io_yield_many, turso_assert, Buffer, Completion, CompletionError,
