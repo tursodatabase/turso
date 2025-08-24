@@ -1,4 +1,4 @@
-use crate::{Clock, Completion, File, Instant, LimboError, OpenFlags, Result, IO};
+use crate::{Clock, Completion, File, FsyncKind, Instant, LimboError, OpenFlags, Result, IO};
 use parking_lot::RwLock;
 use std::io::{Read, Seek, Write};
 use std::sync::Arc;
@@ -98,9 +98,16 @@ impl File for WindowsFile {
     }
 
     #[instrument(err, skip_all, level = Level::TRACE)]
-    fn sync(&self, c: Completion) -> Result<Completion> {
+    fn sync(&self, kind: FsyncKind, c: Completion) -> Result<Completion> {
         let file = self.file.write();
-        file.sync_all()?;
+        match kind {
+            FsyncKind::Full => {
+                file.sync_all()?;
+            }
+            FsyncKind::Data => {
+                file.sync_data()?;
+            }
+        }
         c.complete(0);
         Ok(c)
     }

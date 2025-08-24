@@ -1,5 +1,7 @@
 use super::MemoryIO;
-use crate::{Clock, Completion, CompletionType, File, Instant, LimboError, OpenFlags, Result, IO};
+use crate::{
+    Clock, Completion, CompletionType, File, FsyncKind, Instant, LimboError, OpenFlags, Result, IO,
+};
 use std::cell::RefCell;
 use std::io::{Read, Seek, Write};
 use std::sync::Arc;
@@ -99,9 +101,16 @@ impl File for GenericFile {
         Ok(c)
     }
 
-    fn sync(&self, c: Completion) -> Result<Completion> {
+    fn sync(&self, kind: FsyncKind, c: Completion) -> Result<Completion> {
         let mut file = self.file.borrow_mut();
-        file.sync_all()?;
+        match kind {
+            FsyncKind::Full => {
+                file.sync_all()?;
+            }
+            FsyncKind::Data => {
+                file.sync_data()?;
+            }
+        }
         c.complete(0);
         Ok(c)
     }
