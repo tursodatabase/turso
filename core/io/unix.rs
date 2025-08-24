@@ -1,7 +1,7 @@
 use super::{Completion, File, OpenFlags, IO};
 use crate::error::LimboError;
 use crate::io::clock::{Clock, Instant};
-use crate::io::common;
+use crate::io::{common, FsyncKind};
 use crate::Result;
 use parking_lot::Mutex;
 use rustix::{
@@ -262,9 +262,12 @@ impl File for UnixFile {
     }
 
     #[instrument(err, skip_all, level = Level::TRACE)]
-    fn sync(&self, c: Completion) -> Result<Completion> {
+    fn sync(&self, kind: FsyncKind, c: Completion) -> Result<Completion> {
         let file = self.file.lock();
-        let result = unsafe { libc::fsync(file.as_raw_fd()) };
+        let result = match kind {
+            FsyncKind::Data => unsafe { libc::fdatasync(file.as_raw_fd()) },
+            FsyncKind::Full => unsafe { libc::fsync(file.as_raw_fd()) },
+        };
         if result == -1 {
             let e = std::io::Error::last_os_error();
             Err(e.into())
