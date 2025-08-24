@@ -492,6 +492,7 @@ impl IO for UringIO {
         }
         let id = self.inner.borrow_mut().register_file(file.as_raw_fd()).ok();
         let uring_file = Arc::new(UringFile {
+            path: std::path::PathBuf::from(path),
             io: self.inner.clone(),
             file,
             id,
@@ -585,6 +586,7 @@ fn completion_from_key(key: u64) -> Completion {
 }
 
 pub struct UringFile {
+    path: std::path::PathBuf,
     io: Rc<RefCell<InnerUringIO>>,
     file: std::fs::File,
     id: Option<u32>,
@@ -606,6 +608,9 @@ unsafe impl Send for UringFile {}
 unsafe impl Sync for UringFile {}
 
 impl File for UringFile {
+    fn path(&self) -> &std::path::Path {
+        &self.path.as_path()
+    }
     fn lock_file(&self, exclusive: bool) -> Result<()> {
         let fd = self.file.as_fd();
         // F_SETLK is a non-blocking lock. The lock will be released when the file is closed
