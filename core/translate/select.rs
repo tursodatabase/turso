@@ -8,8 +8,8 @@ use crate::schema::Table;
 use crate::translate::optimizer::optimize_plan;
 use crate::translate::plan::{Aggregate, GroupBy, Plan, ResultSetColumn, SelectPlan};
 use crate::translate::planner::{
-    bind_column_references, break_predicate_at_and_boundaries, parse_from, parse_where,
-    resolve_aggregates,
+    bind_column_references, break_predicate_at_and_boundaries, parse_from, parse_limit,
+    parse_where, resolve_aggregates,
 };
 use crate::util::normalize_ident;
 use crate::vdbe::builder::{ProgramBuilderOpts, TableRefIdCounter};
@@ -151,7 +151,7 @@ pub fn prepare_select_plan(
             }
             let (limit, offset) = select
                 .limit
-                .map_or((None, None), |l| (Some(l.expr), l.offset));
+                .map_or(Ok((None, None)), |mut l| parse_limit(&mut l, connection))?;
 
             // FIXME: handle ORDER BY for compound selects
             if !select.order_by.is_empty() {
@@ -617,8 +617,8 @@ fn prepare_one_select_plan(
             plan.order_by = key;
 
             // Parse the LIMIT/OFFSET clause
-            (plan.limit, plan.offset) = limit.map_or((None, None), |l| (Some(l.expr), l.offset));
-
+            (plan.limit, plan.offset) =
+                limit.map_or(Ok((None, None)), |mut l| parse_limit(&mut l, connection))?;
             // Return the unoptimized query plan
             Ok(plan)
         }

@@ -4,6 +4,7 @@ use std::sync::Arc;
 use crate::schema::{BTreeTable, Column, Type};
 use crate::translate::optimizer::optimize_select_plan;
 use crate::translate::plan::{Operation, QueryDestination, Scan, Search, SelectPlan};
+use crate::translate::planner::parse_limit;
 use crate::vdbe::builder::CursorType;
 use crate::{
     bail_parse_error,
@@ -332,8 +333,8 @@ pub fn prepare_update_plan(
     // Parse the LIMIT/OFFSET clause
     let (limit, offset) = body
         .limit
-        .as_ref()
-        .map_or((None, None), |l| (Some(l.expr.clone()), l.offset.clone()));
+        .as_mut()
+        .map_or(Ok((None, None)), |l| parse_limit(l, connection))?;
 
     // Check what indexes will need to be updated by checking set_clauses and see
     // if a column is contained in an index.

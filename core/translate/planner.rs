@@ -12,6 +12,7 @@ use super::{
 };
 use crate::translate::expr::WalkControl;
 use crate::{
+    ast::Limit,
     function::Func,
     schema::{Schema, Table},
     translate::expr::walk_expr_mut,
@@ -1137,4 +1138,17 @@ where
         }));
     }
     Ok(None)
+}
+
+#[allow(clippy::type_complexity)]
+pub fn parse_limit(
+    limit: &mut Limit,
+    connection: &std::sync::Arc<crate::Connection>,
+) -> Result<(Option<Box<Expr>>, Option<Box<Expr>>)> {
+    let mut empty_refs = TableReferences::new(Vec::new(), Vec::new());
+    bind_column_references(&mut limit.expr, &mut empty_refs, None, connection)?;
+    if let Some(ref mut off_expr) = limit.offset {
+        bind_column_references(off_expr, &mut empty_refs, None, connection)?;
+    }
+    Ok((Some(limit.expr.clone()), limit.offset.clone()))
 }
