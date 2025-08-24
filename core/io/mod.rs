@@ -114,28 +114,34 @@ fn sync_dir(dir: &std::path::Path) -> Result<()> {
 }
 
 #[cfg(windows)]
-fn sync_dir(dir: &Path) -> Result<()> {
+fn sync_dir(dir: &std::path::Path) -> Result<()> {
     use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Foundation::BOOL;
-    use windows_sys::Win32::Storage::FileSystem::{
-        FlushFileBuffers, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE, FILE_SHARE_READ,
-        FILE_SHARE_WRITE,
-    };
+    // https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilea
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x02000000;
 
     // On Windows, we must open a directory with FILE_FLAG_BACKUP_SEMANTICS
-    let dir_file = OpenOptions::new()
+    let dir_file = std::fs::OpenOptions::new()
         .read(true)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
         .open(dir)?;
-    let ok: BOOL = unsafe { FlushFileBuffers(dir_file.as_raw_handle() as _) };
-    if ok == 0 {
-        Err(std::io::Error::last_os_error().into())
-    } else {
-        Ok(())
+
+    match dir_file.sync_all() {
+        Ok(()) => Ok(()),
+        // Some older filesystems/drivers don’t support flushing directory handles.
+        // Treat these as a best-effort no-op.
+        Err(e)
+            if matches!(
+                e.raw_os_error(),
+                Some(1 /*ERROR_INVALID_FUNCTION*/) | Some(6 /*ERROR_INVALID_HANDLE*/)
+            ) =>
+        {
+            Ok(())
+        }
+        Err(e) => Err(e.into()),
     }
 }
+
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub struct OpenFlags(i32);
 
