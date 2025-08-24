@@ -30,11 +30,12 @@ impl IO for GenericIO {
 
         let file = file.open(path)?;
         Ok(Arc::new(GenericFile {
+            path: std::path::PathBuf::from(path),
             file: RefCell::new(file),
             memory_io: Arc::new(MemoryIO::new()),
         }))
     }
-    
+
     fn remove_file(&self, path: &str) -> Result<()> {
         trace!("remove_file(path = {})", path);
         std::fs::remove_file(path)?;
@@ -57,6 +58,7 @@ impl Clock for GenericIO {
 }
 
 pub struct GenericFile {
+    path: std::path::PathBuf,
     file: RefCell<std::fs::File>,
     memory_io: Arc<MemoryIO>,
 }
