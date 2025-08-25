@@ -47,7 +47,7 @@
     "artifacts": "napi artifacts",
     "build": "npm exec tsc && napi build --platform --release --esm",
     "build:debug": "npm exec tsc && napi build --platform",
-    "prepublishOnly": "npm exec tsc && napi prepublish -t npm",
+    "prepublishOnly": "node scripts/copy-optional-deps.js && npm exec tsc && napi prepublish -t npm",
     "test": "true",
     "universal": "napi universalize",
     "version": "napi version"
@@ -59,5 +59,11 @@
       "browser": "./browser.js",
       "node": "./index.js"
     }
+  },
+  "optionalDependencies": {
+    "@tursodatabase/database-linux-x64-gnu": "0.1.4-pre.6",
+    "@tursodatabase/database-win32-x64-msvc": "0.1.4-pre.6",
+    "@tursodatabase/database-darwin-universal": "0.1.4-pre.6",
+    "@tursodatabase/database-wasm32-wasi": "0.1.4-pre.6"
   }
 }
