@@ -128,13 +128,13 @@ impl BufferPool {
     /// 3MB Default size for each `Arena`. Any higher and
     /// it will fail to register the second arena with io_uring due
     /// to `RL_MEMLOCK` limit for un-privileged processes being 8MB total.
-    pub const DEFAULT_ARENA_SIZE: usize = 3 * 1024 * 1024;
+    pub const DEFAULT_ARENA_SIZE: usize = 64 * 1024 * 1024;
     /// 1MB size For testing/CI
     pub const TEST_ARENA_SIZE: usize = 1024 * 1024;
     /// 4KB default page_size
     pub const DEFAULT_PAGE_SIZE: usize = 4096;
-    /// Maximum size for each Arena (64MB total)
-    const MAX_ARENA_SIZE: usize = 32 * 1024 * 1024;
+    /// Maximum size for each Arena (128MB total)
+    const MAX_ARENA_SIZE: usize = 128 * 1024 * 1024;
     /// 64kb Minimum arena size
     const MIN_ARENA_SIZE: usize = 1024 * 64;
     fn new(arena_size: usize) -> Self {
