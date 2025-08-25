@@ -57,27 +57,8 @@ pub fn emit_program_for_compound_select(
             });
         } else {
             program.add_comment(program.offset(), "OFFSET expr");
-
-            let label_zero = program.allocate_label();
-
             _ = translate_expr(program, None, limit, reg, &right_most_ctx.resolver);
-
             program.emit_insn(Insn::MustBeInt { reg });
-
-            program.emit_insn(Insn::IfNeg {
-                reg,
-                target_pc: label_zero,
-            });
-            program.emit_insn(Insn::IsNull {
-                reg,
-                target_pc: label_zero,
-            });
-
-            program.preassign_label_to_next_insn(label_zero);
-            program.emit_insn(Insn::Integer {
-                value: 0,
-                dest: reg,
-            });
         }
         LimitCtx::new_shared(reg)
     });
@@ -92,27 +73,8 @@ pub fn emit_program_for_compound_select(
             });
         } else {
             program.add_comment(program.offset(), "OFFSET expr");
-
-            let label_zero = program.allocate_label();
-
             _ = translate_expr(program, None, offset_expr, reg, &right_most_ctx.resolver);
-
             program.emit_insn(Insn::MustBeInt { reg });
-
-            program.emit_insn(Insn::IfNeg {
-                reg,
-                target_pc: label_zero,
-            });
-            program.emit_insn(Insn::IsNull {
-                reg,
-                target_pc: label_zero,
-            });
-
-            program.preassign_label_to_next_insn(label_zero);
-            program.emit_insn(Insn::Integer {
-                value: 0,
-                dest: reg,
-            });
         }
 
         let combined_reg = program.alloc_register();

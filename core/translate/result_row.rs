@@ -187,29 +187,15 @@ pub fn emit_offset(
 
     program.add_comment(program.offset(), "OFFSET expr");
 
-    let label_zero = program.allocate_label();
-
     _ = translate_expr(program, None, offset_expr, r, resolver);
 
     program.emit_insn(Insn::MustBeInt { reg: r });
-
-    program.emit_insn(Insn::IfNeg {
-        reg: r,
-        target_pc: label_zero,
-    });
-    program.emit_insn(Insn::IsNull {
-        reg: r,
-        target_pc: label_zero,
-    });
 
     program.emit_insn(Insn::IfPos {
         reg: r,
         target_pc: jump_to,
         decrement_by: 1,
     });
-
-    program.preassign_label_to_next_insn(label_zero);
-    program.emit_insn(Insn::Integer { value: 0, dest: r });
 }
 
 #[allow(clippy::borrowed_box)]

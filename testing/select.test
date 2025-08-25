@@ -749,3 +749,59 @@ do_execsql_test_on_specific_db {:memory:} select-in-complex {
   SELECT * FROM test_table WHERE category IN ('A', 'B') AND value IN (10, 30, 40);
 } {1|A|10
 3|A|30}
+
+do_execsql_test_on_specific_db {:memory:} limit-complex-exprs {
+  CREATE TABLE t (x INTEGER);
+  INSERT INTO t VALUES (10),(20),(30),(40),(50);
+  SELECT x FROM t ORDER BY x LIMIT 1;
+  SELECT x FROM t ORDER BY x LIMIT '2';
+  SELECT x FROM t ORDER BY x LIMIT true;
+  SELECT x FROM t ORDER BY x LIMIT 1+2+3;
+  SELECT x FROM t ORDER BY x LIMIT 1-2-3;
+  SELECT x FROM t ORDER BY x LIMIT (2+3)*2;
+  SELECT x FROM t ORDER BY x LIMIT true + 2;
+  SELECT x FROM t ORDER BY x LIMIT '2' * 2 + 1;
+  SELECT x FROM t ORDER BY x LIMIT false + 4;
+  SELECT x FROM t ORDER BY x LIMIT (1 + '2') * (1 + 3) - (5/5);
+  SELECT x FROM t ORDER BY x LIMIT ('false' + 2);
+  SELECT * FROM t LIMIT COALESCE(NULL, 0+1);
+
+} {10
+10
+20
+10
+10
+20
+30
+40
+50
+10
+20
+30
+40
+50
+10
+20
+30
+40
+50
+10
+20
+30
+10
+20
+30
+40
+50
+10
+20
+30
+40
+10
+20
+30
+40
+50
+10
+20
+10}

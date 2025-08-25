@@ -1571,20 +1571,8 @@ fn init_limit(
             } else {
                 let r = limit_ctx.reg_limit;
                 program.add_comment(program.offset(), "OFFSET expr");
-                let label_zero = program.allocate_label();
-
                 _ = translate_expr(program, None, expr, r, &t_ctx.resolver);
                 program.emit_insn(Insn::MustBeInt { reg: r });
-                program.emit_insn(Insn::IfNeg {
-                    reg: r,
-                    target_pc: label_zero,
-                });
-                program.emit_insn(Insn::IsNull {
-                    reg: r,
-                    target_pc: label_zero,
-                });
-                program.preassign_label_to_next_insn(label_zero);
-                program.emit_insn(Insn::Integer { value: 0, dest: r });
             }
         }
     }
@@ -1608,21 +1596,11 @@ fn init_limit(
                 let reg = program.alloc_register();
                 t_ctx.reg_offset = Some(reg);
                 let r = reg;
-                program.add_comment(program.offset(), "OFFSET expr");
-                let label_zero = program.allocate_label();
 
+                program.add_comment(program.offset(), "OFFSET expr");
                 _ = translate_expr(program, None, expr, r, &t_ctx.resolver);
                 program.emit_insn(Insn::MustBeInt { reg: r });
-                program.emit_insn(Insn::IfNeg {
-                    reg: r,
-                    target_pc: label_zero,
-                });
-                program.emit_insn(Insn::IsNull {
-                    reg: r,
-                    target_pc: label_zero,
-                });
-                program.preassign_label_to_next_insn(label_zero);
-                program.emit_insn(Insn::Integer { value: 0, dest: r });
+
                 let combined_reg = program.alloc_register();
                 t_ctx.reg_limit_offset_sum = Some(combined_reg);
                 program.emit_insn(Insn::OffsetLimit {
