@@ -301,10 +301,50 @@ impl Property {
                         "updated rows should be found and have the updated values for table {}",
                         table.clone()
                     ),
-                    func: Box::new(move |stack: &Vec<ResultSet>, _| {
+                    func: Box::new(move |stack: &Vec<ResultSet>, env| {
+                        let update_result = stack.get(stack.len() - 2).unwrap();
                         let rows = stack.last().unwrap();
                         match rows {
                             Ok(rows) => {
+                                let update_failed = update_result.is_err();
+                                if update_failed {
+                                    // Expect whatever we have in the env to be correct
+                                    let sim_table = env
+                                        .tables
+                                        .iter()
+                                        .find(|t| t.name == table.clone())
+                                        .unwrap();
+                                    let table_col_indexes = update
+                                        .set_values
+                                        .iter()
+                                        .map(|(col, _)| {
+                                            sim_table
+                                                .columns
+                                                .iter()
+                                                .position(|c| c.name == *col)
+                                                .unwrap()
+                                        })
+                                        .collect::<Vec<usize>>();
+                                    let sim_table_rows = sim_table
+                                        .rows
+                                        .iter()
+                                        .map(|r| {
+                                            let mut mapped_row = vec![];
+                                            for col in table_col_indexes.iter() {
+                                                mapped_row.push(r[*col].clone());
+                                            }
+                                            mapped_row
+                                        })
+                                        .collect::<Vec<Vec<SimValue>>>();
+                                    for row in rows {
+                                        if !sim_table_rows.contains(row) {
+                                            return Ok(Err(format!("UPDATE FAILED. Expected to find existing row {:?} in table {}, but did not.", print_row(row), table)));
+                                        }
+                                    }
+                                    return Ok(Ok(()));
+                                }
+
+                                // Otherwise expect whatever we did in the UPDATE query is now retrieved in the SELECT
                                 for row in rows {
                                     for (i, (col, val)) in update.set_values.iter().enumerate() {
                                         if &row[i] != val {
@@ -379,7 +419,12 @@ impl Property {
                             .map(|i| !i.end_with_commit)
                             .unwrap_or(false),
                     ),
-                    func: Box::new(move |stack: &Vec<ResultSet>, _| {
+                    func: Box::new(move |stack: &Vec<ResultSet>, _: &mut SimulatorEnv| {
+                        let insert_failed = stack.first().unwrap().is_err();
+                        if insert_failed {
+                            // If the insert failed just ignore this whole assertion
+                            return Ok(Ok(()));
+                        }
                         let rows = stack.last().unwrap();
                         match rows {
                             Ok(rows) => {
@@ -550,6 +595,11 @@ impl Property {
                 let assertion = Interaction::Assertion(Assertion {
                     name: format!("`{select}` should return no values for table `{table}`",),
                     func: Box::new(move |stack: &Vec<ResultSet>, _| {
+                        let delete_failed = stack.first().unwrap().is_err();
+                        if delete_failed {
+                            // If the delete failed just ignore this whole assertion
+                            return Ok(Ok(()));
+                        }
                         let rows = stack.last().unwrap();
                         match rows {
                             Ok(rows) => {
