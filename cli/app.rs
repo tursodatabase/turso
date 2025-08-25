@@ -70,6 +70,14 @@ pub struct Opts {
     pub tracing_output: Option<String>,
     #[clap(long, help = "Start MCP server instead of interactive shell")]
     pub mcp: bool,
+    #[clap(long, help = "Start SQL over HTTP server")]
+    pub server: bool,
+    #[clap(
+        long,
+        help = "Address to listen on for SQL server",
+        default_value = "127.0.0.1:8080"
+    )]
+    pub server_listen_addr: String,
 }
 
 const PROMPT: &str = "turso> ";
@@ -177,8 +185,8 @@ impl Limbo {
     }
 
     fn first_run(&mut self, sql: Option<String>, quiet: bool) -> Result<(), LimboError> {
-        // Skip startup messages and SQL execution in MCP mode
-        if self.is_mcp_mode() {
+        // Skip startup messages and SQL execution in MCP or server mode
+        if self.is_mcp_mode() || self.is_server_mode() {
             return Ok(());
         }
 
@@ -289,6 +297,18 @@ impl Limbo {
 
     pub fn is_mcp_mode(&self) -> bool {
         self.opts.mcp
+    }
+
+    pub fn is_server_mode(&self) -> bool {
+        self.opts.server
+    }
+
+    pub fn get_server_address(&self) -> &String {
+        &self.opts.server_listen_addr
+    }
+
+    pub fn get_database_file_display(&self) -> String {
+        self.opts.db_file.clone()
     }
 
     pub fn get_interrupt_count(&self) -> Arc<AtomicUsize> {

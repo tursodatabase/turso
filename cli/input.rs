@@ -86,6 +86,8 @@ pub struct Settings {
     pub headers: bool,
     pub mcp: bool,
     pub stats: bool,
+    pub server: bool,
+    pub server_listen_addr: String,
 }
 
 impl From<Opts> for Settings {
@@ -112,6 +114,8 @@ impl From<Opts> for Settings {
             headers: false,
             mcp: opts.mcp,
             stats: false,
+            server: opts.server,
+            server_listen_addr: opts.server_listen_addr,
         }
     }
 }

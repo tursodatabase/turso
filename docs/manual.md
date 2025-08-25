@@ -665,3 +665,328 @@ This implies that when a function returns an `IOResult`, it must be called again
 Per-Åke Larson et al. "High-Performance Concurrency Control Mechanisms for Main-Memory Databases." In _VLDB '11_
 
 [SQLite]: https://www.sqlite.org/
+
+## Appendix B: SQL over HTTP Protocol Specification
+
+The SQL over HTTP protocol enables remote SQL execution for Turso databases via HTTP requests. This specification documents a stateless yet stream-aware protocol for executing SQL statements over HTTP with JSON encoding.
+
+### Overview
+
+SQL over HTTP provides a way to execute SQL statements remotely using standard HTTP requests and responses. Unlike traditional database connections, HTTP is stateless, but the protocol maintains stream state using an opaque baton mechanism similar to session cookies.
+
+Key characteristics:
+- **Stateless Transport**: Each HTTP request is independent
+- **Stateful Sessions**: Stream state maintained via baton exchange
+- **Stream Serialization**: Requests on the same stream must be processed serially
+- **Automatic Cleanup**: Abandoned streams are closed after inactivity timeout
+
+### Protocol Endpoints
+
+The protocol defines several HTTP endpoints for different operations:
+
+#### Version Check
+```
+GET /v3
+```
+Returns 2xx response if the server supports SQL over HTTP protocol version 3 with JSON encoding.
+
+#### Pipeline Execution
+```
+POST /v3/pipeline
+Content-Type: application/json
+Authorization: Bearer <jwt-token>
+```
+Executes a pipeline of SQL operations on a stream.
+
+#### Cursor Execution  
+```
+POST /v3/cursor
+Content-Type: application/json
+Authorization: Bearer <jwt-token>
+```
+Executes a batch of statements using a streaming cursor for incremental result processing.
+
+### Authentication
+
+The protocol supports JWT-based authentication using the `Authorization` header:
+```
+Authorization: Bearer <jwt-token>
+```
+
+### Stream Management
+
+#### Baton Mechanism
+Streams are identified and managed using an opaque baton value exchanged between client and server:
+
+- **New Stream**: Client sends `baton: null` to create a new stream
+- **Existing Stream**: Client includes the baton from the previous response
+- **Stream Closure**: Server returns `baton: null` to indicate stream closure
+- **Sticky Routing**: Server may return `base_url` to direct future requests
+
+#### Request Format
+```typescript
+{
+  "baton": string | null,
+  "requests": Array<StreamRequest>
+}
+```
+
+#### Response Format
+```typescript
+{
+  "baton": string | null,
+  "base_url": string | null,
+  "results": Array<StreamResult>
+}
+```
+
+### Request Types
+
+#### Execute Statement
+Executes a single SQL statement:
+
+```typescript
+{
+  "type": "execute",
+  "stmt": {
+    "sql": "SELECT * FROM users WHERE id = ?",
+    "args": [{"type": "integer", "value": "123"}],
+    "named_args": [],
+    "want_rows": true
+  }
+}
+```
+
+#### Execute Batch
+Executes multiple SQL statements with conditional execution:
+
+```typescript
+{
+  "type": "batch", 
+  "batch": {
+    "steps": [
+      {
+        "condition": {"type": "ok", "step": 0},
+        "stmt": {
+          "sql": "INSERT INTO users (name) VALUES (?)",
+          "args": [{"type": "text", "value": "Alice"}],
+          "named_args": [],
+          "want_rows": false
+        }
+      }
+    ]
+  }
+}
+```
+
+#### Execute Sequence
+Executes multiple SQL statements separated by semicolons:
+
+```typescript
+{
+  "type": "sequence",
+  "sql": "CREATE TABLE test (id INTEGER); INSERT INTO test VALUES (1);"
+}
+```
+
+#### Describe Statement
+Gets metadata about a SQL statement:
+
+```typescript
+{
+  "type": "describe", 
+  "sql": "SELECT * FROM users"
+}
+```
+
+#### Close Stream
+Explicitly closes the current stream:
+
+```typescript
+{
+  "type": "close"
+}
+```
+
+#### Get Autocommit State
+Checks if the stream is in autocommit mode:
+
+```typescript
+{
+  "type": "get_autocommit"
+}
+```
+
+### Data Types
+
+Values are encoded using a tagged union structure:
+
+```typescript
+type Value = 
+  | { "type": "null" }
+  | { "type": "integer", "value": string }  // 64-bit integer as string
+  | { "type": "float", "value": number }
+  | { "type": "text", "value": string }
+  | { "type": "blob", "base64": string }    // Base64-encoded binary data
+```
+
+### Results
+
+#### Statement Results
+```typescript
+{
+  "type": "execute",
+  "result": {
+    "cols": [
+      {"name": "id", "decltype": "INTEGER"},
+      {"name": "name", "decltype": "TEXT"}
+    ],
+    "rows": [
+      [{"type": "integer", "value": "1"}, {"type": "text", "value": "Alice"}]
+    ],
+    "affected_row_count": 1,
+    "last_insert_rowid": "1"
+  }
+}
+```
+
+#### Batch Results  
+```typescript
+{
+  "type": "batch",
+  "result": {
+    "step_results": [/* StmtResult | null */],
+    "step_errors": [/* Error | null */]
+  }
+}
+```
+
+#### Describe Results
+```typescript
+{
+  "type": "describe",
+  "result": {
+    "params": [{"name": "?1"}],
+    "cols": [{"name": "id", "decltype": "INTEGER"}],
+    "is_explain": false,
+    "is_readonly": true
+  }
+}
+```
+
+### Cursor Streaming
+
+The cursor endpoint supports streaming large result sets:
+
+#### Cursor Request
+```typescript
+{
+  "baton": string | null,
+  "batch": {
+    "steps": [/* batch steps */]
+  }
+}
+```
+
+#### Cursor Response
+The response is a stream of newline-delimited JSON:
+```
+{"baton": "...", "base_url": null}
+{"type": "step_begin", "step": 0, "cols": [...]}
+{"type": "row", "row": [...]}
+{"type": "step_end", "affected_row_count": 1}
+```
+
+#### Cursor Entry Types
+- `step_begin`: Start of statement execution with column metadata
+- `row`: Individual result row  
+- `step_end`: End of statement with execution statistics
+- `step_error`: Statement execution error
+- `error`: Batch execution error
+
+### Error Handling
+
+Errors are returned in a consistent format:
+
+```typescript
+{
+  "type": "error",
+  "error": {
+    "message": "Table 'users' doesn't exist",
+    "code": "SQLITE_ERROR"
+  }
+}
+```
+
+HTTP-level errors (4xx/5xx) indicate the stream is no longer valid and should be recreated.
+
+### Batch Conditions
+
+Conditional execution in batches is supported:
+
+```typescript
+type BatchCondition = 
+  | {"type": "ok", "step": number}          // Previous step succeeded
+  | {"type": "error", "step": number}       // Previous step failed  
+  | {"type": "not", "cond": BatchCondition} // Logical NOT
+  | {"type": "and", "conds": BatchCondition[]} // Logical AND
+  | {"type": "or", "conds": BatchCondition[]}  // Logical OR
+  | {"type": "is_autocommit"}               // Stream is in autocommit mode
+```
+
+### Example Session
+
+```bash
+# 1. Create new stream and execute statement
+curl -X POST https://db.turso.io/v3/pipeline \
+  -H "Authorization: Bearer ${TOKEN}" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "baton": null,
+    "requests": [{
+      "type": "execute",
+      "stmt": {
+        "sql": "SELECT COUNT(*) FROM users",
+        "args": [],
+        "named_args": [], 
+        "want_rows": true
+      }
+    }]
+  }'
+
+# Response:
+{
+  "baton": "abc123...",
+  "base_url": null,
+  "results": [{
+    "type": "ok",
+    "response": {
+      "type": "execute", 
+      "result": {
+        "cols": [{"name": "COUNT(*)", "decltype": ""}],
+        "rows": [[{"type": "integer", "value": "5"}]],
+        "affected_row_count": 0,
+        "last_insert_rowid": null
+      }
+    }
+  }]
+}
+
+# 2. Continue on same stream  
+curl -X POST https://db.turso.io/v3/pipeline \
+  -H "Authorization: Bearer ${TOKEN}" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "baton": "abc123...",
+    "requests": [{"type": "close"}]
+  }'
+```
+
+### Implementation Notes
+
+- Servers must ensure baton values are unpredictable and unforgeable
+- Stream requests must be processed serially for consistency  
+- Abandoned streams should timeout after reasonable inactivity period
+- The protocol supports forward compatibility through unknown field tolerance
+- Base64 encoding is used for binary blob data in JSON
+- Integer values are encoded as strings to preserve 64-bit precision
