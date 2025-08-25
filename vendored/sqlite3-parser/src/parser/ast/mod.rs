@@ -1815,10 +1815,12 @@ pub type PragmaValue = Expr; // TODO
 pub enum PragmaName {
     /// Returns the application ID of the database file.
     ApplicationId,
-    /// set the autovacuum mode
+    /// Set the autovacuum mode
     AutoVacuum,
     /// `cache_size` pragma
     CacheSize,
+    /// Enables or disables the pager cache spilling in the middle of a transaction.
+    CacheSpill,
     /// List databases
     DatabaseList,
     /// Encoding - only support utf8

@@ -16,7 +16,6 @@ use crate::util::{normalize_ident, IOExt as _};
 use crate::vdbe::insn::InsertFlags;
 use crate::vdbe::registers_to_ref_values;
 use crate::vector::{vector_concat, vector_slice};
-use crate::MvCursor;
 use crate::{
     error::{
         LimboError, SQLITE_CONSTRAINT, SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY,
@@ -30,6 +29,7 @@ use crate::{
         printf::exec_printf,
     },
 };
+use crate::{MvCursor, WalFile, WalFileShared};
 use std::env::temp_dir;
 use std::ops::DerefMut;
 use std::{
@@ -6793,8 +6793,11 @@ pub fn op_open_ephemeral(
                     "Failed to convert path to string".to_string(),
                 ));
             };
-            let file = io.open_file(rand_path_str, OpenFlags::Create, false)?;
-            let db_file = Arc::new(DatabaseFile::new(file));
+            let main_file = io.open_file(rand_path_str, OpenFlags::Create, false)?;
+            let db_file = Arc::new(DatabaseFile::new(main_file));
+            let wal_path = format!("{rand_path_str}-wal");
+            let wal_file = io.open_file(&wal_path, OpenFlags::Create, false)?;
+            let real_shared_wal = WalFileShared::new_shared(wal_file)?;
 
             let page_size = pager
                 .io
@@ -6804,12 +6807,17 @@ pub fn op_open_ephemeral(
             let buffer_pool = program.connection._db.buffer_pool.clone();
             let page_cache = Arc::new(RwLock::new(DumbLruPageCache::default()));
 
+            let wal = Rc::new(RefCell::new(WalFile::new(
+                io.clone(),
+                real_shared_wal,
+                buffer_pool.clone(),
+            )));
             let pager = Rc::new(Pager::new(
                 db_file,
-                None,
+                Some(wal),
                 io,
                 page_cache,
-                buffer_pool.clone(),
+                buffer_pool,
                 Arc::new(AtomicDbState::new(DbState::Uninitialized)),
                 Arc::new(Mutex::new(())),
             )?);
@@ -6828,14 +6836,15 @@ pub fn op_open_ephemeral(
             pager
                 .begin_read_tx() // we have to begin a read tx before beginning a write
                 .expect("Failed to start read transaction");
-            return_if_io!(pager.begin_write_tx());
+
+            let _ = pager.begin_write_tx()?;
+            let _ = pager.allocate_page1();
             state.op_open_ephemeral_state = OpOpenEphemeralState::CreateBtree {
                 pager: pager.clone(),
             };
         }
         OpOpenEphemeralState::CreateBtree { pager } => {
             tracing::trace!("CreateBtree");
-            // FIXME: handle page cache is full
             let flag = if is_table {
                 &CreateBTreeFlags::new_table()
             } else {
