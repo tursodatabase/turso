@@ -167,7 +167,6 @@ fn test_delete() {
                 table_id: 1,
                 row_id: 1,
             },
-            db.conn.pager.borrow().clone(),
         )
         .unwrap();
     let row = db
@@ -209,7 +208,6 @@ fn test_delete_nonexistent() {
                 table_id: 1,
                 row_id: 1
             },
-            db.conn.pager.borrow().clone(),
         )
         .unwrap());
 }
@@ -233,9 +231,7 @@ fn test_commit() {
         .unwrap();
     assert_eq!(tx1_row, row);
     let tx1_updated_row = generate_simple_string_row(1, 1, "World");
-    db.mvcc_store
-        .update(tx1, tx1_updated_row.clone(), db.conn.pager.borrow().clone())
-        .unwrap();
+    db.mvcc_store.update(tx1, tx1_updated_row.clone()).unwrap();
     let row = db
         .mvcc_store
         .read(
@@ -286,9 +282,7 @@ fn test_rollback() {
         .unwrap();
     assert_eq!(row1, row2);
     let row3 = generate_simple_string_row(1, 1, "World");
-    db.mvcc_store
-        .update(tx1, row3.clone(), db.conn.pager.borrow().clone())
-        .unwrap();
+    db.mvcc_store.update(tx1, row3.clone()).unwrap();
     let row4 = db
         .mvcc_store
         .read(
@@ -302,7 +296,7 @@ fn test_rollback() {
         .unwrap();
     assert_eq!(row3, row4);
     db.mvcc_store
-        .rollback_tx(tx1, db.conn.pager.borrow().clone());
+        .rollback_tx(tx1, db.conn.pager.borrow().clone(), &db.conn, false, false);
     let tx2 = db.mvcc_store.begin_tx(db.conn.pager.borrow().clone());
     let row5 = db
         .mvcc_store
@@ -342,10 +336,7 @@ fn test_dirty_write() {
     // T2 attempts to delete row with ID 1, but fails because T1 has not committed.
     let tx2 = db.mvcc_store.begin_tx(conn2.pager.borrow().clone());
     let tx2_row = generate_simple_string_row(1, 1, "World");
-    assert!(!db
-        .mvcc_store
-        .update(tx2, tx2_row, conn2.pager.borrow().clone())
-        .unwrap());
+    assert!(!db.mvcc_store.update(tx2, tx2_row).unwrap());
 
     let row = db
         .mvcc_store
@@ -407,7 +398,6 @@ fn test_dirty_read_deleted() {
                 table_id: 1,
                 row_id: 1
             },
-            conn2.pager.borrow().clone(),
         )
         .unwrap());
 
@@ -470,9 +460,7 @@ fn test_fuzzy_read() {
     let conn3 = db.db.connect().unwrap();
     let tx3 = db.mvcc_store.begin_tx(conn3.pager.borrow().clone());
     let tx3_row = generate_simple_string_row(1, 1, "Second");
-    db.mvcc_store
-        .update(tx3, tx3_row, conn3.pager.borrow().clone())
-        .unwrap();
+    db.mvcc_store.update(tx3, tx3_row).unwrap();
     commit_tx(db.mvcc_store.clone(), &conn3, tx3).unwrap();
 
     // T2 still reads the same version of the row as before.
@@ -492,9 +480,7 @@ fn test_fuzzy_read() {
     // T2 tries to update the row, but fails because T3 has already committed an update to the row,
     // so T2 trying to write would violate snapshot isolation if it succeeded.
     let tx2_newrow = generate_simple_string_row(1, 1, "Third");
-    let update_result = db
-        .mvcc_store
-        .update(tx2, tx2_newrow, conn2.pager.borrow().clone());
+    let update_result = db.mvcc_store.update(tx2, tx2_newrow);
     assert!(matches!(update_result, Err(LimboError::WriteWriteConflict)));
 }
 
@@ -524,20 +510,19 @@ fn test_lost_update() {
     let conn2 = db.db.connect().unwrap();
     let tx2 = db.mvcc_store.begin_tx(conn2.pager.borrow().clone());
     let tx2_row = generate_simple_string_row(1, 1, "World");
-    assert!(db
-        .mvcc_store
-        .update(tx2, tx2_row.clone(), conn2.pager.borrow().clone())
-        .unwrap());
+    assert!(db.mvcc_store.update(tx2, tx2_row.clone()).unwrap());
 
     // T3 also attempts to update row ID 1 within an active transaction.
     let conn3 = db.db.connect().unwrap();
     let tx3 = db.mvcc_store.begin_tx(conn3.pager.borrow().clone());
     let tx3_row = generate_simple_string_row(1, 1, "Hello, world!");
     assert!(matches!(
-        db.mvcc_store
-            .update(tx3, tx3_row, conn3.pager.borrow().clone(),),
+        db.mvcc_store.update(tx3, tx3_row),
         Err(LimboError::WriteWriteConflict)
     ));
+    // Since tx3 failed, it should be terminated. We handle this on program error in vdbe so we need to simulate it here.
+    db.mvcc_store
+        .rollback_tx(tx3, conn3.pager.borrow().clone(), &conn3, false, false);
 
     commit_tx(db.mvcc_store.clone(), &conn2, tx2).unwrap();
     assert!(matches!(
@@ -577,10 +562,7 @@ fn test_committed_visibility() {
     let conn2 = db.db.connect().unwrap();
     let tx2 = db.mvcc_store.begin_tx(conn2.pager.borrow().clone());
     let tx2_row = generate_simple_string_row(1, 1, "20");
-    assert!(db
-        .mvcc_store
-        .update(tx2, tx2_row.clone(), conn2.pager.borrow().clone())
-        .unwrap());
+    assert!(db.mvcc_store.update(tx2, tx2_row.clone()).unwrap());
     let row = db
         .mvcc_store
         .read(
@@ -653,7 +635,7 @@ fn test_future_row() {
 
 use crate::mvcc::cursor::MvccLazyCursor;
 use crate::mvcc::database::{MvStore, Row, RowID};
-use crate::types::Text;
+use crate::types::{Text, TextSubtype};
 use crate::MemoryIO;
 use crate::RefValue;
 use crate::Value;
@@ -906,6 +888,10 @@ fn test_cursor_modification_during_scan() {
     let new_row_id = RowID::new(table_id, 3);
     let new_row = generate_simple_string_row(table_id, new_row_id.row_id, "new_row");
 
+    println!(
+        "Cursor insert(tx_id={}, new_row.id={:?})",
+        tx_id, new_row.id
+    );
     cursor.insert(new_row).unwrap();
     let row = db.mvcc_store.read(tx_id, new_row_id).unwrap().unwrap();
     let mut record = ImmutableRecord::new(1024);
@@ -1231,6 +1217,83 @@ fn test_commit_without_tx() {
     } else {
         panic!("Expected TxError");
     }
+}
+
+#[test]
+fn test_mvcc_update_visibility() {
+    // The test scenario:
+    // Connection 0: BEGIN
+    // Connection 1: SELECT * FROM test_table
+    // Connection 0: UPDATE test_table SET text='updated_b' WHERE id = id
+    // Connection 1: DELETE FROM test_table WHERE id = id
+    // Connection 0: SELECT * FROM test_table
+
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn0 = db.connect();
+    let conn1 = db.connect();
+
+    let id = 1i64;
+    let text0 = "text_1";
+    let updated_a = "updated_a";
+    let updated_b = "updated_b";
+
+    // Connection 0: BEGIN
+    conn0.execute("BEGIN").unwrap();
+
+    // Connection 1: INSERT
+    conn1
+        .execute("CREATE TABLE test_table (id INTEGER PRIMARY KEY, text TEXT)")
+        .unwrap();
+    println!("Connection 1: INSERT");
+    conn1
+        .execute(format!(
+            "INSERT INTO test_table (id, text) VALUES ({id}, '{text0}')"
+        ))
+        .unwrap();
+
+    // Connection 0: UPDATE
+    println!("Connection 0: UPDATE");
+    conn0
+        .execute(format!(
+            "UPDATE test_table SET text='{updated_a}' WHERE id = {id}"
+        ))
+        .unwrap();
+
+    // Connection 1: SELECT
+    println!("Connection 1: SELECT");
+    let rows1 = get_rows(&conn1, "SELECT * FROM test_table ORDER BY id");
+    assert_eq!(
+        rows1,
+        vec![vec![
+            Value::Integer(id),
+            Value::Text(Text {
+                value: text0.as_bytes().to_vec(),
+                subtype: TextSubtype::Text,
+            })
+        ]],
+        "Connection 1 should see the original text"
+    );
+
+    // Connection 0: UPDATE again
+    println!("Connection 0: UPDATE again");
+    conn0
+        .execute(format!(
+            "UPDATE test_table SET text='{updated_b}' WHERE id = {id}"
+        ))
+        .unwrap();
+
+    // Connection 1: DELETE
+    println!("Connection 1: DELETE");
+    conn1
+        .execute(format!("DELETE FROM test_table WHERE id = {id}"))
+        .unwrap();
+
+    // Connection 0: SELECT
+    // this should be visible to itself
+    println!("Connection 0: SELECT");
+    let rows0 = get_rows(&conn0, "SELECT * FROM test_table ORDER BY id");
+    let first_text = rows0[0][1].to_text().unwrap();
+    assert_eq!(first_text, text0);
 }
 
 fn get_rows(conn: &Arc<Connection>, query: &str) -> Vec<Vec<Value>> {

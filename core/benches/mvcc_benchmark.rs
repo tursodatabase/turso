@@ -36,7 +36,8 @@ fn bench(c: &mut Criterion) {
         b.to_async(FuturesExecutor).iter(|| async {
             let conn = db.conn.clone();
             let tx_id = db.mvcc_store.begin_tx(conn.get_pager().clone());
-            db.mvcc_store.rollback_tx(tx_id, conn.get_pager().clone())
+            db.mvcc_store
+                .rollback_tx(tx_id, conn.get_pager().clone(), &conn, false, false)
         })
     });
 
@@ -109,7 +110,6 @@ fn bench(c: &mut Criterion) {
                         data: record_data.clone(),
                         column_count: 1,
                     },
-                    conn.get_pager().clone(),
                 )
                 .unwrap();
             let mv_store = &db.mvcc_store;
@@ -186,7 +186,6 @@ fn bench(c: &mut Criterion) {
                         data: record_data.clone(),
                         column_count: 1,
                     },
-                    conn.get_pager().clone(),
                 )
                 .unwrap();
         })

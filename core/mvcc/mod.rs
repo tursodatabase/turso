@@ -134,8 +134,7 @@ mod tests {
                         row_id: id,
                     };
                     let row = generate_simple_string_row(1, id.row_id, &format!("{prefix} @{tx}"));
-                    if let Err(e) = mvcc_store.upsert(tx, row.clone(), conn.pager.borrow().clone())
-                    {
+                    if let Err(e) = mvcc_store.upsert(tx, row.clone()) {
                         tracing::trace!("upsert failed: {e}");
                         failed_upserts += 1;
                         continue;

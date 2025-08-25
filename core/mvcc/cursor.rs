@@ -32,7 +32,7 @@ impl<Clock: LogicalClock> MvccLazyCursor<Clock> {
         table_id: u64,
         pager: Rc<Pager>,
     ) -> Result<MvccLazyCursor<Clock>> {
-        db.maybe_initialize_table(table_id, pager)?;
+        db.maybe_initialize_table(table_id, pager.clone())?;
         let cursor = Self {
             db,
             tx_id,
@@ -46,14 +46,28 @@ impl<Clock: LogicalClock> MvccLazyCursor<Clock> {
     /// Sets the cursor to the inserted row.
     pub fn insert(&mut self, row: Row) -> Result<()> {
         self.current_pos = CursorPosition::Loaded(row.id);
-        self.db.insert(self.tx_id, row).inspect_err(|_| {
-            self.current_pos = CursorPosition::BeforeFirst;
-        })?;
+        let res = self
+            .db
+            .seek_rowid(Bound::Included(&row.id), true, self.tx_id);
+        if res.is_some() && res.unwrap() == row.id {
+            // There is a row with the same id, so we need to update it.
+            self.db.update(self.tx_id, row).inspect_err(|e| {
+                tracing::error!("update failed: {e}");
+                self.current_pos = CursorPosition::BeforeFirst;
+            })?;
+        } else {
+            self.db.insert(self.tx_id, row).inspect_err(|e| {
+                tracing::error!("insert failed: {e}");
+                self.current_pos = CursorPosition::BeforeFirst;
+            })?;
+        }
         Ok(())
     }
 
-    pub fn delete(&mut self, rowid: RowID, pager: Rc<Pager>) -> Result<()> {
-        self.db.delete(self.tx_id, rowid, pager)?;
+    pub fn delete(&mut self, rowid: RowID) -> Result<()> {
+        self.db.delete(self.tx_id, rowid).inspect_err(|e| {
+            tracing::error!("delete failed: {e}");
+        })?;
         Ok(())
     }
 
