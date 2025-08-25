@@ -122,7 +122,7 @@ impl DumbLruPageCache {
         }
         self.make_room_for(1)?;
         let entry = Box::new(PageCacheEntry {
-            key: key.clone(),
+            key,
             next: None,
             prev: None,
             page: value,
@@ -325,7 +325,7 @@ impl DumbLruPageCache {
             let entry = unsafe { current.as_ref() };
             // Pick prev before modifying entry
             current_opt = entry.prev;
-            match self.delete(entry.key.clone()) {
+            match self.delete(entry.key) {
                 Err(_) => {}
                 Ok(_) => need_to_evict -= 1,
             }
@@ -412,7 +412,7 @@ impl DumbLruPageCache {
         let mut current = head_ptr;
         while let Some(node) = current {
             unsafe {
-                this_keys.push(node.as_ref().key.clone());
+                this_keys.push(node.as_ref().key);
                 let node_ref = node.as_ref();
                 current = node_ref.next;
             }
@@ -663,7 +663,7 @@ impl PageHashMap {
     pub fn rehash(&self, new_capacity: usize) -> PageHashMap {
         let mut new_hash_map = PageHashMap::new(new_capacity);
         for node in self.iter() {
-            new_hash_map.insert(node.key.clone(), node.value);
+            new_hash_map.insert(node.key, node.value);
         }
         new_hash_map
     }
@@ -714,7 +714,7 @@ mod tests {
     fn insert_page(cache: &mut DumbLruPageCache, id: usize) -> PageCacheKey {
         let key = create_key(id);
         let page = page_with_content(id);
-        assert!(cache.insert(key.clone(), page).is_ok());
+        assert!(cache.insert(key, page).is_ok());
         key
     }
 
@@ -728,7 +728,7 @@ mod tests {
     ) -> (PageCacheKey, NonNull<PageCacheEntry>) {
         let key = create_key(id);
         let page = page_with_content(id);
-        assert!(cache.insert(key.clone(), page).is_ok());
+        assert!(cache.insert(key, page).is_ok());
         let entry = cache.get_ptr(&key).expect("Entry should exist");
         (key, entry)
     }
@@ -743,7 +743,7 @@ mod tests {
         assert!(cache.tail.borrow().is_some());
         assert_eq!(*cache.head.borrow(), *cache.tail.borrow());
 
-        assert!(cache.delete(key1.clone()).is_ok());
+        assert!(cache.delete(key1).is_ok());
 
         assert_eq!(
             cache.len(),
@@ -775,7 +775,7 @@ mod tests {
             "Initial head check"
         );
 
-        assert!(cache.delete(key3.clone()).is_ok());
+        assert!(cache.delete(key3).is_ok());
 
         assert_eq!(cache.len(), 2, "Length should be 2 after deleting head");
         assert!(
@@ -819,7 +819,7 @@ mod tests {
             "Initial tail check"
         );
 
-        assert!(cache.delete(key1.clone()).is_ok()); // Delete tail
+        assert!(cache.delete(key1).is_ok()); // Delete tail
 
         assert_eq!(cache.len(), 2, "Length should be 2 after deleting tail");
         assert!(
@@ -870,7 +870,7 @@ mod tests {
         let head_ptr_before = cache.head.borrow().unwrap();
         let tail_ptr_before = cache.tail.borrow().unwrap();
 
-        assert!(cache.delete(key2.clone()).is_ok()); // Detach a middle element (key2)
+        assert!(cache.delete(key2).is_ok()); // Detach a middle element (key2)
 
         assert_eq!(cache.len(), 3, "Length should be 3 after deleting middle");
         assert!(
@@ -911,11 +911,11 @@ mod tests {
         let mut cache = DumbLruPageCache::default();
         let key1 = create_key(1);
         let page1 = page_with_content(1);
-        assert!(cache.insert(key1.clone(), page1.clone()).is_ok());
+        assert!(cache.insert(key1, page1.clone()).is_ok());
         assert!(page_has_content(&page1));
         cache.verify_list_integrity();
 
-        let result = cache.delete(key1.clone());
+        let result = cache.delete(key1);
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), CacheError::ActiveRefs);
         assert_eq!(cache.len(), 1);
@@ -934,10 +934,10 @@ mod tests {
         let key1 = create_key(1);
         let page1_v1 = page_with_content(1);
         let page1_v2 = page_with_content(1);
-        assert!(cache.insert(key1.clone(), page1_v1.clone()).is_ok());
+        assert!(cache.insert(key1, page1_v1.clone()).is_ok());
         assert_eq!(cache.len(), 1);
         cache.verify_list_integrity();
-        let _ = cache.insert(key1.clone(), page1_v2.clone()); // Panic
+        let _ = cache.insert(key1, page1_v2.clone()); // Panic
     }
 
     #[test]
@@ -945,7 +945,7 @@ mod tests {
         let mut cache = DumbLruPageCache::default();
         let key_nonexist = create_key(99);
 
-        assert!(cache.delete(key_nonexist.clone()).is_ok()); // no-op
+        assert!(cache.delete(key_nonexist).is_ok()); // no-op
     }
 
     #[test]
@@ -1050,8 +1050,8 @@ mod tests {
         let (key1, _) = insert_and_get_entry(&mut cache, 1);
         let (key2, entry2) = insert_and_get_entry(&mut cache, 2);
         let (key3, _) = insert_and_get_entry(&mut cache, 3);
-        let head_key = unsafe { cache.head.borrow().unwrap().as_ref().key.clone() };
-        let tail_key = unsafe { cache.tail.borrow().unwrap().as_ref().key.clone() };
+        let head_key = unsafe { cache.head.borrow().unwrap().as_ref().key };
+        let tail_key = unsafe { cache.tail.borrow().unwrap().as_ref().key };
         assert_eq!(head_key, key3, "Head should be key3");
         assert_eq!(tail_key, key1, "Tail should be key1");
         assert!(cache.detach(entry2, false).is_ok());
@@ -1060,12 +1060,12 @@ mod tests {
         assert_eq!(head_entry.key, key3, "Head should still be key3");
         assert_eq!(tail_entry.key, key1, "Tail should still be key1");
         assert_eq!(
-            unsafe { head_entry.next.unwrap().as_ref().key.clone() },
+            unsafe { head_entry.next.unwrap().as_ref().key },
             key1,
             "Head's next should point to tail after middle element detached"
         );
         assert_eq!(
-            unsafe { tail_entry.prev.unwrap().as_ref().key.clone() },
+            unsafe { tail_entry.prev.unwrap().as_ref().key },
             key3,
             "Tail's prev should point to head after middle element detached"
         );
@@ -1101,7 +1101,7 @@ mod tests {
                         continue; // skip duplicate page ids
                     }
                     tracing::debug!("inserting page {:?}", key);
-                    match cache.insert(key.clone(), page.clone()) {
+                    match cache.insert(key, page.clone()) {
                         Err(CacheError::Full | CacheError::ActiveRefs) => {} // Ignore
                         Err(err) => {
                             // Any other error should fail the test
@@ -1122,7 +1122,7 @@ mod tests {
                         PageCacheKey::new(id_page as usize)
                     } else {
                         let i = rng.next_u64() as usize % lru.len();
-                        let key: PageCacheKey = lru.iter().nth(i).unwrap().0.clone();
+                        let key: PageCacheKey = *lru.iter().nth(i).unwrap().0;
                         key
                     };
                     tracing::debug!("removing page {:?}", key);
@@ -1149,7 +1149,7 @@ mod tests {
         let this_keys = cache.keys();
         let mut lru_keys = Vec::new();
         for (lru_key, _) in lru {
-            lru_keys.push(lru_key.clone());
+            lru_keys.push(*lru_key);
         }
         if this_keys != lru_keys {
             cache.print();
@@ -1184,7 +1184,7 @@ mod tests {
     fn test_page_cache_delete() {
         let mut cache = DumbLruPageCache::default();
         let key1 = insert_page(&mut cache, 1);
-        assert!(cache.delete(key1.clone()).is_ok());
+        assert!(cache.delete(key1).is_ok());
         assert!(cache.get(&key1).unwrap().is_none());
     }
 
