@@ -120,6 +120,8 @@ pub enum CompletionError {
     UringIOError(&'static str),
     #[error("Completion was aborted")]
     Aborted,
+    #[error("I/O error: partial write")]
+    ShortWrite,
 }
 
 #[macro_export]
