@@ -750,58 +750,20 @@ do_execsql_test_on_specific_db {:memory:} select-in-complex {
 } {1|A|10
 3|A|30}
 
-do_execsql_test_on_specific_db {:memory:} limit-complex-exprs {
-  CREATE TABLE t (x INTEGER);
-  INSERT INTO t VALUES (10),(20),(30),(40),(50);
-  SELECT x FROM t ORDER BY x LIMIT 1;
-  SELECT x FROM t ORDER BY x LIMIT '2';
-  SELECT x FROM t ORDER BY x LIMIT true;
-  SELECT x FROM t ORDER BY x LIMIT 1+2+3;
-  SELECT x FROM t ORDER BY x LIMIT 1-2-3;
-  SELECT x FROM t ORDER BY x LIMIT (2+3)*2;
-  SELECT x FROM t ORDER BY x LIMIT true + 2;
-  SELECT x FROM t ORDER BY x LIMIT '2' * 2 + 1;
-  SELECT x FROM t ORDER BY x LIMIT false + 4;
-  SELECT x FROM t ORDER BY x LIMIT (1 + '2') * (1 + 3) - (5/5);
-  SELECT x FROM t ORDER BY x LIMIT ('false' + 2);
-  SELECT * FROM t LIMIT COALESCE(NULL, 0+1);
-
-} {10
-10
-20
-10
-10
-20
-30
-40
-50
-10
-20
-30
-40
-50
-10
-20
-30
-40
-50
-10
-20
-30
-10
-20
-30
-40
-50
-10
-20
-30
-40
-10
-20
-30
-40
-50
-10
-20
-10}
+foreach {testname limit ans} {
+  limit-const-1             1                      {1}
+  limit-text-2              '2'                    {1 2}
+  limit-bool-true           true                   {1}
+  limit-expr-add            1+2+3                  {1 2 3 4 5 6}
+  limit-expr-sub            5-2-3                  {}
+  limit-expr-paren          (1+1)*2                {1 2 3 4}
+  limit-bool-add            true+2                 {1 2 3}
+  limit-text-math           '2'*2+1                {1 2 3 4 5}
+  limit-bool-false-add      false+4                {1 2 3 4}
+  limit-mixed-math          (1+'1')*(1+1)-(5/5)    {1 2 3}
+  limit-text-bool           ('false'+2)            {1 2}
+  limit-coalesce            COALESCE(NULL,0+1)     {1}
+} {
+  do_execsql_test limit-complex-exprs-$testname \
+    "SELECT id FROM users ORDER BY id LIMIT $limit" $ans
+}
