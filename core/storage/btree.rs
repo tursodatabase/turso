@@ -2547,20 +2547,22 @@ impl BTreeCursor {
                     let current_sibling = sibling_pointer;
                     let mut completions: Vec<Completion> = Vec::with_capacity(current_sibling + 1);
                     for i in (0..=current_sibling).rev() {
-                        let (page, c) =
-                            btree_read_page(&self.pager, pgno as usize).inspect_err(|_| {
-                                for c in completions.iter() {
-                                    c.abort();
+                        match btree_read_page(&self.pager, pgno as usize) {
+                            Err(e) => {
+                                tracing::error!("error reading page {}: {}", pgno, e);
+                                self.pager.io.cancel(&completions)?;
+                                self.pager.io.drain()?;
+                                return Err(e);
+                            }
+                            Ok((page, c)) => {
+                                // mark as dirty
+                                self.pager.add_dirty(&page);
+                                pages_to_balance[i].replace(page);
+                                if let Some(c) = c {
+                                    completions.push(c);
                                 }
-                            })?;
-                        {
-                            // mark as dirty
-                            self.pager.add_dirty(&page);
+                            }
                         }
-                        if let Some(c) = c {
-                            completions.push(c);
-                        }
-                        pages_to_balance[i].replace(page);
                         if i == 0 {
                             break;
                         }

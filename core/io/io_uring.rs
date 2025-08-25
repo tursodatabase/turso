@@ -465,7 +465,7 @@ impl WrappedIOUring {
             completion_from_key(user_data).error(CompletionError::ShortWrite);
             return;
         }
-        state.advance(written);
+        state.advance(written as u64);
 
         match state.remaining() {
             0 => {
@@ -529,22 +529,51 @@ impl IO for UringIO {
         Ok(())
     }
 
+    /// Drain calls `run_once` in a loop until the ring is empty.
+    /// To prevent mutex churn of checking if ring.empty() on each iteration, we violate DRY
     fn drain(&self) -> Result<()> {
         trace!("drain()");
+        let mut inner = self.inner.lock();
+        let ring = &mut inner.ring;
         loop {
-            {
-                let inner = self.inner.borrow();
-                if inner.ring.empty() {
-                    break;
+            ring.flush_overflow()?;
+            if ring.empty() {
+                return Ok(());
+            }
+            ring.submit_and_wait()?;
+            'inner: loop {
+                let Some(cqe) = ring.ring.completion().next() else {
+                    break 'inner;
+                };
+                ring.pending_ops -= 1;
+                let user_data = cqe.user_data();
+                if user_data == CANCEL_TAG {
+                    // ignore if this is a cancellation CQE
+                    continue 'inner;
+                }
+                let result = cqe.result();
+                turso_assert!(
+                user_data != 0,
+                "user_data must not be zero, we dont submit linked timeouts that would cause this"
+            );
+                if let Some(state) = ring.writev_states.remove(&user_data) {
+                    // if we have ongoing writev state, handle it separately and don't call completion
+                    ring.handle_writev_completion(state, user_data, result);
+                    continue 'inner;
+                }
+                if result < 0 {
+                    let errno = -result;
+                    let err = std::io::Error::from_raw_os_error(errno);
+                    completion_from_key(user_data).error(err.into());
+                } else {
+                    completion_from_key(user_data).complete(result)
                 }
             }
-            self.run_once()?;
         }
-        Ok(())
     }
 
     fn cancel(&self, completions: &[Completion]) -> Result<()> {
-        let mut inner = self.inner.borrow_mut();
+        let mut inner = self.inner.lock();
         for c in completions {
             c.abort();
             let e = io_uring::opcode::AsyncCancel::new(get_key(c.clone()))

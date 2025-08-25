@@ -238,12 +238,15 @@ impl Sorter {
             InitChunkHeapState::Start => {
                 let mut completions: Vec<Completion> = Vec::with_capacity(self.chunks.len());
                 for chunk in self.chunks.iter_mut() {
-                    let c = chunk.read().inspect_err(|_| {
-                        for c in completions.iter() {
-                            c.abort();
+                    match chunk.read() {
+                        Err(e) => {
+                            tracing::error!("Failed to read chunk: {e}");
+                            self.io.cancel(&completions)?;
+                            self.io.drain()?;
+                            return Err(e);
                         }
-                    })?;
-                    completions.push(c);
+                        Ok(c) => completions.push(c),
+                    };
                 }
                 self.init_chunk_heap_state = InitChunkHeapState::PushChunk;
                 io_yield_many!(completions);
