@@ -316,7 +316,7 @@ impl EncryptionContext {
         }
     }
 
-    fn decrypt_raw(&self, ciphertext: &[u8], nonce: &[u8]) -> Result<Vec<u8>> {
+    pub fn decrypt_raw(&self, ciphertext: &[u8], nonce: &[u8]) -> Result<Vec<u8>> {
         match &self.cipher {
             Cipher::Aes256Gcm(cipher) => {
                 let nonce = Nonce::from_slice(nonce);

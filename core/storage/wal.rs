@@ -1105,20 +1105,36 @@ impl Wal for WalFile {
         tracing::debug!("read_frame({})", frame_id);
         let offset = self.frame_offset(frame_id);
         let (frame_ptr, frame_len) = (frame.as_mut_ptr(), frame.len());
-        let complete = Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
-            let Ok((buf, bytes_read)) = res else {
-                return;
-            };
-            let buf_len = buf.len();
-            turso_assert!(
-                bytes_read == buf_len as i32,
-                "read({bytes_read}) != expected({buf_len})"
-            );
-            let buf_ptr = buf.as_mut_ptr();
-            unsafe {
-                std::ptr::copy_nonoverlapping(buf_ptr, frame_ptr, frame_len);
-            }
-        });
+        let complete = {
+            let encryption_ctx = self.encryption_ctx.borrow().clone();
+            let frame = frame as *mut [u8];
+            Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
+                let Ok((buf, bytes_read)) = res else {
+                    return;
+                };
+                let buf_len = buf.len();
+                turso_assert!(
+                    bytes_read == buf_len as i32,
+                    "read({bytes_read}) != expected({buf_len})"
+                );
+                let frame: &mut [u8] = unsafe { &mut *frame };
+                if let Some(ctx) = encryption_ctx.clone() {
+                    match ctx.decrypt_raw(buf.as_slice(), frame) {
+                        Ok(decrypted_data) => {
+                            buf.as_mut_slice().copy_from_slice(&decrypted_data);
+                        }
+                        Err(_) => {
+                            tracing::error!("Failed to decrypt page data for frame_id={frame_id}");
+                            return;
+                        }
+                    }
+                }
+                let buf_ptr = buf.as_mut_ptr();
+                unsafe {
+                    std::ptr::copy_nonoverlapping(buf_ptr, frame_ptr, frame_len);
+                }
+            })
+        };
         let c =
             begin_read_wal_frame_raw(&self.buffer_pool, &self.get_shared().file, offset, complete)?;
         Ok(c)
