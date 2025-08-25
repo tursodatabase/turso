@@ -859,13 +859,6 @@ pub struct QualifiedName {
     pub alias: Option<Name>, // FIXME restrict alias usage (fullname vs xfullname)
 }
 
-impl std::fmt::Display for QualifiedName {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        use fmt::ToTokens as _;
-        self.to_fmt(f)
-    }
-}
-
 /// `ALTER TABLE` body
 // https://sqlite.org/lang_altertable.html
 #[derive(Clone, Debug, PartialEq, Eq)]

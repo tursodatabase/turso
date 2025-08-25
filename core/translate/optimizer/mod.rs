@@ -54,7 +54,8 @@ pub fn optimize_plan(plan: &mut Plan, schema: &Schema) -> Result<()> {
     // When debug tracing is enabled, print the optimized plan as a SQL string for debugging
     tracing::debug!(
         plan_sql = plan
-            .format_with_context(&crate::translate::display::PlanContext(&[]))
+            .displayer(&crate::translate::display::PlanContext(&[]))
+            .to_string()
             .unwrap()
     );
     Ok(())

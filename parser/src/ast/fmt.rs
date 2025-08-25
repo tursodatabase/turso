@@ -2,72 +2,61 @@
 use std::fmt::{self, Display, Formatter, Write};
 
 use crate::ast::*;
+use crate::error::Error;
 use crate::token::TokenType;
 use crate::token::TokenType::*;
+use crate::Result;
 
 use crate::ast::TableInternalId;
 
 /// Context to be used in ToSqlString
 pub trait ToSqlContext {
     /// Given an id, get the table name
+    /// First Option indicates whether the table exists
     ///
     /// Currently not considering aliases
-    fn get_table_name(&self, id: TableInternalId) -> &str;
+    fn get_table_name(&self, _id: TableInternalId) -> Option<&str> {
+        None
+    }
+
     /// Given a table id and a column index, get the column name
-    fn get_column_name(&self, table_id: TableInternalId, col_idx: usize) -> String;
-}
+    /// First Option indicates whether the column exists
+    /// Second Option indicates whether the column has a name
+    fn get_column_name(&self, _table_id: TableInternalId, _col_idx: usize) -> Option<Option<&str>> {
+        None
+    }
 
-struct FmtTokenStream<'a, 'b> {
-    f: &'a mut Formatter<'b>,
-    spaced: bool,
-}
-
-impl TokenStream for FmtTokenStream<'_, '_> {
-    type Error = fmt::Error;
-
-    fn append(&mut self, ty: TokenType, value: Option<&str>) -> fmt::Result {
-        if !self.spaced {
-            match ty {
-                TK_COMMA | TK_SEMI | TK_RP | TK_DOT => {}
-                _ => {
-                    self.f.write_char(' ')?;
-                    self.spaced = true;
-                }
-            };
-        }
-        if ty == TK_BLOB {
-            self.f.write_char('X')?;
-            self.f.write_char('\'')?;
-            if let Some(str) = value {
-                self.f.write_str(str)?;
-            }
-            return self.f.write_char('\'');
-        } else if let Some(str) = ty.as_str() {
-            self.f.write_str(str)?;
-            self.spaced = ty == TK_LP || ty == TK_DOT; // str should not be whitespace
-        }
-        if let Some(str) = value {
-            // trick for pretty-print
-            self.spaced = str.bytes().all(|b| b.is_ascii_whitespace());
-            /*if !self.spaced {
-                self.f.write_char(' ')?;
-            }*/
-            self.f.write_str(str)
-        } else {
-            Ok(())
+    /// Helper to get a flat column name
+    /// If the column exists and has a name, return the name
+    /// If the column exists but has no name, return the index as string
+    fn get_flat_column_name(&self, table_id: TableInternalId, col_idx: usize) -> Option<String> {
+        match self.get_column_name(table_id, col_idx) {
+            Some(Some(name)) => Some(name.to_string()),
+            Some(None) => Some(format!("{col_idx}")),
+            None => None,
         }
     }
 }
 
-struct WriteTokenStream<'a, T: fmt::Write> {
+pub struct WriteTokenStream<'a, T: Write> {
     write: &'a mut T,
     spaced: bool,
 }
 
-impl<T: fmt::Write> TokenStream for WriteTokenStream<'_, T> {
-    type Error = fmt::Error;
+impl<'a, T: Write> WriteTokenStream<'a, T> {
+    /// Create a new token stream writing to the specified writer
+    pub fn new(write: &'a mut T) -> Self {
+        Self {
+            write,
+            spaced: true,
+        }
+    }
+}
 
-    fn append(&mut self, ty: TokenType, value: Option<&str>) -> fmt::Result {
+impl<T: Write> TokenStream for WriteTokenStream<'_, T> {
+    type Error = Error;
+
+    fn append(&mut self, ty: TokenType, value: Option<&str>) -> Result<()> {
         if !self.spaced {
             match ty {
                 TK_COMMA | TK_SEMI | TK_RP | TK_DOT => {}
@@ -77,45 +66,50 @@ impl<T: fmt::Write> TokenStream for WriteTokenStream<'_, T> {
                 }
             };
         }
-        if ty == TK_BLOB {
-            self.write.write_char('X')?;
-            self.write.write_char('\'')?;
-            if let Some(str) = value {
-                self.write.write_str(str)?;
+
+        match (ty, ty.as_str(), value) {
+            (TK_BLOB, None, value) => {
+                self.write.write_char('X')?;
+                self.write.write_char('\'')?;
+                if let Some(str) = value {
+                    self.write.write_str(str)?;
+                }
+                self.write.write_char('\'')?;
+                Ok(())
             }
-            return self.write.write_char('\'');
-        } else if let Some(str) = ty.as_str() {
-            self.write.write_str(str)?;
-            self.spaced = ty == TK_LP || ty == TK_DOT; // str should not be whitespace
-        }
-        if let Some(str) = value {
-            // trick for pretty-print
-            self.spaced = str.bytes().all(|b| b.is_ascii_whitespace());
-            self.write.write_str(str)
-        } else {
-            Ok(())
+            (_, None, None) => Err(Error::Custom(
+                "can not format both none ty and none value".to_string(),
+            )),
+            (_, ty_str, value) => {
+                if let Some(str) = ty_str {
+                    self.write.write_str(str)?;
+                    self.spaced = ty == TK_LP || ty == TK_DOT; // str should not be whitespace
+                }
+
+                if let Some(str) = value {
+                    // trick for pretty-print
+                    self.spaced = str.bytes().all(|b| b.is_ascii_whitespace());
+                    self.write.write_str(str)?;
+                }
+
+                Ok(())
+            }
         }
     }
 }
 
-struct BlankContext;
+pub struct BlankContext;
 
-impl ToSqlContext for BlankContext {
-    fn get_column_name(&self, _table_id: crate::ast::TableInternalId, _col_idx: usize) -> String {
-        "".to_string()
-    }
-
-    fn get_table_name(&self, _id: crate::ast::TableInternalId) -> &str {
-        ""
-    }
-}
+impl ToSqlContext for BlankContext {}
 
 /// Stream of token
 pub trait TokenStream {
     /// Potential error raised
     type Error;
+
     /// Push token to this stream
     fn append(&mut self, ty: TokenType, value: Option<&str>) -> Result<(), Self::Error>;
+
     /// Interspace iterator with commas
     fn comma<I, C: ToSqlContext>(&mut self, items: I, context: &C) -> Result<(), Self::Error>
     where
@@ -127,72 +121,89 @@ pub trait TokenStream {
             if i != 0 {
                 self.append(TK_COMMA, None)?;
             }
-            item.to_tokens_with_context(self, context)?;
+            item.to_tokens(self, context)?;
         }
         Ok(())
+    }
+}
+
+pub struct SqlDisplayer<'a, 'b, C: ToSqlContext, T: ToTokens> {
+    ctx: &'a C,
+    start_node: &'b T,
+}
+
+impl<'a, 'b, C: ToSqlContext, T: ToTokens> SqlDisplayer<'a, 'b, C, T> {
+    /// Create a new displayer with the specified context and AST node
+    pub fn new(ctx: &'a C, start_node: &'b T) -> Self {
+        Self { ctx, start_node }
+    }
+
+    // Return string representation with context
+    pub fn to_string(&self) -> Result<String> {
+        let mut s = String::new();
+        let mut stream = WriteTokenStream::new(&mut s);
+        self.start_node.to_tokens(&mut stream, self.ctx)?;
+        Ok(s)
+    }
+}
+
+impl<'a, 'b, C: ToSqlContext, T: ToTokens> Display for SqlDisplayer<'a, 'b, C, T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let mut stream = WriteTokenStream::new(f);
+        self.start_node
+            .to_tokens(&mut stream, self.ctx)
+            .map_err(|_| fmt::Error)
     }
 }
 
 /// Generate token(s) from AST node
 pub trait ToTokens {
     /// Send token(s) to the specified stream with context
-    fn to_tokens_with_context<S: TokenStream + ?Sized, C: ToSqlContext>(
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
         &self,
         s: &mut S,
         context: &C,
     ) -> Result<(), S::Error>;
 
-    /// Send token(s) to the specified stream
-    fn to_tokens<S: TokenStream + ?Sized>(&self, s: &mut S) -> Result<(), S::Error> {
-        self.to_tokens_with_context(s, &BlankContext)
+    // Return displayer representation with context
+    fn displayer<'a, 'b, C: ToSqlContext>(&'b self, ctx: &'a C) -> SqlDisplayer<'a, 'b, C, Self>
+    where
+        Self: Sized,
+    {
+        SqlDisplayer::new(ctx, self)
     }
 
-    /// Format AST node
-    fn to_fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        self.to_fmt_with_context(f, &BlankContext)
-    }
-
-    /// Format AST node with context
-    fn to_fmt_with_context<C: ToSqlContext>(
-        &self,
-        f: &mut Formatter<'_>,
-        context: &C,
-    ) -> fmt::Result {
-        let mut s = FmtTokenStream { f, spaced: true };
-        self.to_tokens_with_context(&mut s, context)
-    }
-
-    /// Format AST node to string
-    fn format(&self) -> Result<String, fmt::Error> {
-        self.format_with_context(&BlankContext)
-    }
-
-    /// Format AST node to string with context
-    fn format_with_context<C: ToSqlContext>(&self, context: &C) -> Result<String, fmt::Error> {
-        let mut s = String::new();
-        let mut w = WriteTokenStream {
-            write: &mut s,
-            spaced: true,
-        };
-
-        self.to_tokens_with_context(&mut w, context)?;
-
-        Ok(s)
+    // Return string representation with blank context
+    fn format(&self) -> Result<String>
+    where
+        Self: Sized,
+    {
+        self.displayer(&BlankContext).to_string()
     }
 }
 
 impl<T: ?Sized + ToTokens> ToTokens for &T {
-    fn to_tokens_with_context<S: TokenStream + ?Sized, C: ToSqlContext>(
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
         &self,
         s: &mut S,
         context: &C,
     ) -> Result<(), S::Error> {
-        ToTokens::to_tokens_with_context(&**self, s, context)
+        ToTokens::to_tokens(&**self, s, context)
+    }
+}
+
+impl<T: ?Sized + ToTokens> ToTokens for Box<T> {
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
+        &self,
+        s: &mut S,
+        context: &C,
+    ) -> Result<(), S::Error> {
+        ToTokens::to_tokens(self.as_ref(), s, context)
     }
 }
 
 impl ToTokens for String {
-    fn to_tokens_with_context<S: TokenStream + ?Sized, C: ToSqlContext>(
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
         &self,
         s: &mut S,
         _: &C,
@@ -202,7 +213,7 @@ impl ToTokens for String {
 }
 
 impl ToTokens for Cmd {
-    fn to_tokens_with_context<S: TokenStream + ?Sized, C: ToSqlContext>(
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
         &self,
         s: &mut S,
         context: &C,
@@ -210,16 +221,16 @@ impl ToTokens for Cmd {
         match self {
             Self::Explain(stmt) => {
                 s.append(TK_EXPLAIN, None)?;
-                stmt.to_tokens_with_context(s, context)?;
+                stmt.to_tokens(s, context)?;
             }
             Self::ExplainQueryPlan(stmt) => {
                 s.append(TK_EXPLAIN, None)?;
                 s.append(TK_QUERY, None)?;
                 s.append(TK_PLAN, None)?;
-                stmt.to_tokens_with_context(s, context)?;
+                stmt.to_tokens(s, context)?;
             }
             Self::Stmt(stmt) => {
-                stmt.to_tokens_with_context(s, context)?;
+                stmt.to_tokens(s, context)?;
             }
         }
         s.append(TK_SEMI, None)
@@ -228,12 +239,12 @@ impl ToTokens for Cmd {
 
 impl Display for Cmd {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        self.to_fmt(f)
+        self.displayer(&BlankContext).fmt(f)
     }
 }
 
 impl ToTokens for Stmt {
-    fn to_tokens_with_context<S: TokenStream + ?Sized, C: ToSqlContext>(
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
         &self,
         s: &mut S,
         context: &C,
@@ -242,35 +253,35 @@ impl ToTokens for Stmt {
             Self::AlterTable(AlterTable { name, body }) => {
                 s.append(TK_ALTER, None)?;
                 s.append(TK_TABLE, None)?;
-                name.to_tokens_with_context(s, context)?;
-                body.to_tokens_with_context(s, context)
+                name.to_tokens(s, context)?;
+                body.to_tokens(s, context)
             }
             Self::Analyze { name } => {
                 s.append(TK_ANALYZE, None)?;
                 if let Some(name) = name {
-                    name.to_tokens_with_context(s, context)?;
+                    name.to_tokens(s, context)?;
                 }
                 Ok(())
             }
             Self::Attach { expr, db_name, key } => {
                 s.append(TK_ATTACH, None)?;
-                expr.to_tokens_with_context(s, context)?;
+                expr.to_tokens(s, context)?;
                 s.append(TK_AS, None)?;
-                db_name.to_tokens_with_context(s, context)?;
+                db_name.to_tokens(s, context)?;
                 if let Some(key) = key {
                     s.append(TK_KEY, None)?;
-                    key.to_tokens_with_context(s, context)?;
+                    key.to_tokens(s, context)?;
                 }
                 Ok(())
             }
             Self::Begin { typ, name } => {
                 s.append(TK_BEGIN, None)?;
                 if let Some(typ) = typ {
-                    typ.to_tokens_with_context(s, context)?;
+                    typ.to_tokens(s, context)?;
                 }
                 if let Some(name) = name {
                     s.append(TK_TRANSACTION, None)?;
-                    name.to_tokens_with_context(s, context)?;
+                    name.to_tokens(s, context)?;
                 }
                 Ok(())
             }
@@ -278,7 +289,7 @@ impl ToTokens for Stmt {
                 s.append(TK_COMMIT, None)?;
                 if let Some(name) = name {
                     s.append(TK_TRANSACTION, None)?;
-                    name.to_tokens_with_context(s, context)?;
+                    name.to_tokens(s, context)?;
                 }
                 Ok(())
             }
@@ -300,15 +311,15 @@ impl ToTokens for Stmt {
                     s.append(TK_NOT, None)?;
                     s.append(TK_EXISTS, None)?;
                 }
-                idx_name.to_tokens_with_context(s, context)?;
+                idx_name.to_tokens(s, context)?;
                 s.append(TK_ON, None)?;
-                tbl_name.to_tokens_with_context(s, context)?;
+                tbl_name.to_tokens(s, context)?;
                 s.append(TK_LP, None)?;
                 comma(columns, s, context)?;
                 s.append(TK_RP, None)?;
                 if let Some(where_clause) = where_clause {
                     s.append(TK_WHERE, None)?;
-                    where_clause.to_tokens_with_context(s, context)?;
+                    where_clause.to_tokens(s, context)?;
                 }
                 Ok(())
             }
@@ -328,8 +339,8 @@ impl ToTokens for Stmt {
                     s.append(TK_NOT, None)?;
                     s.append(TK_EXISTS, None)?;
                 }
-                tbl_name.to_tokens_with_context(s, context)?;
-                body.to_tokens_with_context(s, context)
+                tbl_name.to_tokens(s, context)?;
+                body.to_tokens(s, context)
             }
             Self::CreateTrigger {
                 temporary,
@@ -352,13 +363,13 @@ impl ToTokens for Stmt {
                     s.append(TK_NOT, None)?;
                     s.append(TK_EXISTS, None)?;
                 }
-                trigger_name.to_tokens_with_context(s, context)?;
+                trigger_name.to_tokens(s, context)?;
                 if let Some(time) = time {
-                    time.to_tokens_with_context(s, context)?;
+                    time.to_tokens(s, context)?;
                 }
-                event.to_tokens_with_context(s, context)?;
+                event.to_tokens(s, context)?;
                 s.append(TK_ON, None)?;
-                tbl_name.to_tokens_with_context(s, context)?;
+                tbl_name.to_tokens(s, context)?;
                 if *for_each_row {
                     s.append(TK_FOR, None)?;
                     s.append(TK_EACH, None)?;
@@ -366,11 +377,11 @@ impl ToTokens for Stmt {
                 }
                 if let Some(when_clause) = when_clause {
                     s.append(TK_WHEN, None)?;
-                    when_clause.to_tokens_with_context(s, context)?;
+                    when_clause.to_tokens(s, context)?;
                 }
                 s.append(TK_BEGIN, Some("\n"))?;
                 for command in commands {
-                    command.to_tokens_with_context(s, context)?;
+                    command.to_tokens(s, context)?;
                     s.append(TK_SEMI, Some("\n"))?;
                 }
                 s.append(TK_END, None)
@@ -392,14 +403,14 @@ impl ToTokens for Stmt {
                     s.append(TK_NOT, None)?;
                     s.append(TK_EXISTS, None)?;
                 }
-                view_name.to_tokens_with_context(s, context)?;
+                view_name.to_tokens(s, context)?;
                 if !columns.is_empty() {
                     s.append(TK_LP, None)?;
                     comma(columns, s, context)?;
                     s.append(TK_RP, None)?;
                 }
                 s.append(TK_AS, None)?;
-                select.to_tokens_with_context(s, context)
+                select.to_tokens(s, context)
             }
             Self::CreateMaterializedView {
                 if_not_exists,
@@ -415,14 +426,14 @@ impl ToTokens for Stmt {
                     s.append(TK_NOT, None)?;
                     s.append(TK_EXISTS, None)?;
                 }
-                view_name.to_tokens_with_context(s, context)?;
+                view_name.to_tokens(s, context)?;
                 if !columns.is_empty() {
                     s.append(TK_LP, None)?;
                     comma(columns, s, context)?;
                     s.append(TK_RP, None)?;
                 }
                 s.append(TK_AS, None)?;
-                select.to_tokens_with_context(s, context)
+                select.to_tokens(s, context)
             }
             Self::CreateVirtualTable(CreateVirtualTable {
                 if_not_exists,
@@ -438,9 +449,9 @@ impl ToTokens for Stmt {
                     s.append(TK_NOT, None)?;
                     s.append(TK_EXISTS, None)?;
                 }
-                tbl_name.to_tokens_with_context(s, context)?;
+                tbl_name.to_tokens(s, context)?;
                 s.append(TK_USING, None)?;
-                module_name.to_tokens_with_context(s, context)?;
+                module_name.to_tokens(s, context)?;
                 s.append(TK_LP, None)?;
                 if !args.is_empty() {
                     comma(args, s, context)?;
@@ -457,17 +468,17 @@ impl ToTokens for Stmt {
                 limit,
             } => {
                 if let Some(with) = with {
-                    with.to_tokens_with_context(s, context)?;
+                    with.to_tokens(s, context)?;
                 }
                 s.append(TK_DELETE, None)?;
                 s.append(TK_FROM, None)?;
-                tbl_name.to_tokens_with_context(s, context)?;
+                tbl_name.to_tokens(s, context)?;
                 if let Some(indexed) = indexed {
-                    indexed.to_tokens_with_context(s, context)?;
+                    indexed.to_tokens(s, context)?;
                 }
                 if let Some(where_clause) = where_clause {
                     s.append(TK_WHERE, None)?;
-                    where_clause.to_tokens_with_context(s, context)?;
+                    where_clause.to_tokens(s, context)?;
                 }
                 if !returning.is_empty() {
                     s.append(TK_RETURNING, None)?;
@@ -479,13 +490,13 @@ impl ToTokens for Stmt {
                     comma(order_by, s, context)?;
                 }
                 if let Some(limit) = limit {
-                    limit.to_tokens_with_context(s, context)?;
+                    limit.to_tokens(s, context)?;
                 }
                 Ok(())
             }
             Self::Detach { name } => {
                 s.append(TK_DETACH, None)?;
-                name.to_tokens_with_context(s, context)
+                name.to_tokens(s, context)
             }
             Self::DropIndex {
                 if_exists,
@@ -497,7 +508,7 @@ impl ToTokens for Stmt {
                     s.append(TK_IF, None)?;
                     s.append(TK_EXISTS, None)?;
                 }
-                idx_name.to_tokens_with_context(s, context)
+                idx_name.to_tokens(s, context)
             }
             Self::DropTable {
                 if_exists,
@@ -509,7 +520,7 @@ impl ToTokens for Stmt {
                     s.append(TK_IF, None)?;
                     s.append(TK_EXISTS, None)?;
                 }
-                tbl_name.to_tokens_with_context(s, context)
+                tbl_name.to_tokens(s, context)
             }
             Self::DropTrigger {
                 if_exists,
@@ -521,7 +532,7 @@ impl ToTokens for Stmt {
                     s.append(TK_IF, None)?;
                     s.append(TK_EXISTS, None)?;
                 }
-                trigger_name.to_tokens_with_context(s, context)
+                trigger_name.to_tokens(s, context)
             }
             Self::DropView {
                 if_exists,
@@ -533,7 +544,7 @@ impl ToTokens for Stmt {
                     s.append(TK_IF, None)?;
                     s.append(TK_EXISTS, None)?;
                 }
-                view_name.to_tokens_with_context(s, context)
+                view_name.to_tokens(s, context)
             }
             Self::Insert {
                 with,
@@ -544,7 +555,7 @@ impl ToTokens for Stmt {
                 returning,
             } => {
                 if let Some(with) = with {
-                    with.to_tokens_with_context(s, context)?;
+                    with.to_tokens(s, context)?;
                 }
                 if let Some(ResolveType::Replace) = or_conflict {
                     s.append(TK_REPLACE, None)?;
@@ -552,17 +563,17 @@ impl ToTokens for Stmt {
                     s.append(TK_INSERT, None)?;
                     if let Some(or_conflict) = or_conflict {
                         s.append(TK_OR, None)?;
-                        or_conflict.to_tokens_with_context(s, context)?;
+                        or_conflict.to_tokens(s, context)?;
                     }
                 }
                 s.append(TK_INTO, None)?;
-                tbl_name.to_tokens_with_context(s, context)?;
+                tbl_name.to_tokens(s, context)?;
                 if !columns.is_empty() {
                     s.append(TK_LP, None)?;
                     comma(columns, s, context)?;
                     s.append(TK_RP, None)?;
                 }
-                body.to_tokens_with_context(s, context)?;
+                body.to_tokens(s, context)?;
                 if !returning.is_empty() {
                     s.append(TK_RETURNING, None)?;
                     comma(returning, s, context)?;
@@ -571,22 +582,22 @@ impl ToTokens for Stmt {
             }
             Self::Pragma { name, body } => {
                 s.append(TK_PRAGMA, None)?;
-                name.to_tokens_with_context(s, context)?;
+                name.to_tokens(s, context)?;
                 if let Some(body) = body {
-                    body.to_tokens_with_context(s, context)?;
+                    body.to_tokens(s, context)?;
                 }
                 Ok(())
             }
             Self::Reindex { name } => {
                 s.append(TK_REINDEX, None)?;
                 if let Some(name) = name {
-                    name.to_tokens_with_context(s, context)?;
+                    name.to_tokens(s, context)?;
                 }
                 Ok(())
             }
             Self::Release { name } => {
                 s.append(TK_RELEASE, None)?;
-                name.to_tokens_with_context(s, context)
+                name.to_tokens(s, context)
             }
             Self::Rollback {
                 tx_name,
@@ -595,19 +606,19 @@ impl ToTokens for Stmt {
                 s.append(TK_ROLLBACK, None)?;
                 if let Some(tx_name) = tx_name {
                     s.append(TK_TRANSACTION, None)?;
-                    tx_name.to_tokens_with_context(s, context)?;
+                    tx_name.to_tokens(s, context)?;
                 }
                 if let Some(savepoint_name) = savepoint_name {
                     s.append(TK_TO, None)?;
-                    savepoint_name.to_tokens_with_context(s, context)?;
+                    savepoint_name.to_tokens(s, context)?;
                 }
                 Ok(())
             }
             Self::Savepoint { name } => {
                 s.append(TK_SAVEPOINT, None)?;
-                name.to_tokens_with_context(s, context)
+                name.to_tokens(s, context)
             }
-            Self::Select(select) => select.to_tokens_with_context(s, context),
+            Self::Select(select) => select.to_tokens(s, context),
             Self::Update(Update {
                 with,
                 or_conflict,
@@ -621,26 +632,26 @@ impl ToTokens for Stmt {
                 limit,
             }) => {
                 if let Some(with) = with {
-                    with.to_tokens_with_context(s, context)?;
+                    with.to_tokens(s, context)?;
                 }
                 s.append(TK_UPDATE, None)?;
                 if let Some(or_conflict) = or_conflict {
                     s.append(TK_OR, None)?;
-                    or_conflict.to_tokens_with_context(s, context)?;
+                    or_conflict.to_tokens(s, context)?;
                 }
-                tbl_name.to_tokens_with_context(s, context)?;
+                tbl_name.to_tokens(s, context)?;
                 if let Some(indexed) = indexed {
-                    indexed.to_tokens_with_context(s, context)?;
+                    indexed.to_tokens(s, context)?;
                 }
                 s.append(TK_SET, None)?;
                 comma(sets, s, context)?;
                 if let Some(from) = from {
                     s.append(TK_FROM, None)?;
-                    from.to_tokens_with_context(s, context)?;
+                    from.to_tokens(s, context)?;
                 }
                 if let Some(where_clause) = where_clause {
                     s.append(TK_WHERE, None)?;
-                    where_clause.to_tokens_with_context(s, context)?;
+                    where_clause.to_tokens(s, context)?;
                 }
                 if !returning.is_empty() {
                     s.append(TK_RETURNING, None)?;
@@ -652,18 +663,18 @@ impl ToTokens for Stmt {
                     comma(order_by, s, context)?;
                 }
                 if let Some(limit) = limit {
-                    limit.to_tokens_with_context(s, context)?;
+                    limit.to_tokens(s, context)?;
                 }
                 Ok(())
             }
             Self::Vacuum { name, into } => {
                 s.append(TK_VACUUM, None)?;
                 if let Some(ref name) = name {
-                    name.to_tokens_with_context(s, context)?;
+                    name.to_tokens(s, context)?;
                 }
                 if let Some(ref into) = into {
                     s.append(TK_INTO, None)?;
-                    into.to_tokens_with_context(s, context)?;
+                    into.to_tokens(s, context)?;
                 }
                 Ok(())
             }
@@ -671,18 +682,8 @@ impl ToTokens for Stmt {
     }
 }
 
-impl ToTokens for Box<Expr> {
-    fn to_tokens_with_context<S: TokenStream + ?Sized, C: ToSqlContext>(
-        &self,
-        s: &mut S,
-        context: &C,
-    ) -> Result<(), S::Error> {
-        self.as_ref().to_tokens_with_context(s, context)
-    }
-}
-
 impl ToTokens for Expr {
-    fn to_tokens_with_context<S: TokenStream + ?Sized, C: ToSqlContext>(
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
         &self,
         s: &mut S,
         context: &C,
@@ -694,19 +695,19 @@ impl ToTokens for Expr {
                 start,
                 end,
             } => {
-                lhs.to_tokens_with_context(s, context)?;
+                lhs.to_tokens(s, context)?;
                 if *not {
                     s.append(TK_NOT, None)?;
                 }
                 s.append(TK_BETWEEN, None)?;
-                start.to_tokens_with_context(s, context)?;
+                start.to_tokens(s, context)?;
                 s.append(TK_AND, None)?;
-                end.to_tokens_with_context(s, context)
+                end.to_tokens(s, context)
             }
             Self::Binary(lhs, op, rhs) => {
-                lhs.to_tokens_with_context(s, context)?;
-                op.to_tokens_with_context(s, context)?;
-                rhs.to_tokens_with_context(s, context)
+                lhs.to_tokens(s, context)?;
+                op.to_tokens(s, context)?;
+                rhs.to_tokens(s, context)
             }
             Self::Register(reg) => {
                 // This is for internal use only, not part of SQL syntax
@@ -720,46 +721,46 @@ impl ToTokens for Expr {
             } => {
                 s.append(TK_CASE, None)?;
                 if let Some(ref base) = base {
-                    base.to_tokens_with_context(s, context)?;
+                    base.to_tokens(s, context)?;
                 }
                 for (when, then) in when_then_pairs {
                     s.append(TK_WHEN, None)?;
-                    when.to_tokens_with_context(s, context)?;
+                    when.to_tokens(s, context)?;
                     s.append(TK_THEN, None)?;
-                    then.to_tokens_with_context(s, context)?;
+                    then.to_tokens(s, context)?;
                 }
                 if let Some(ref else_expr) = else_expr {
                     s.append(TK_ELSE, None)?;
-                    else_expr.to_tokens_with_context(s, context)?;
+                    else_expr.to_tokens(s, context)?;
                 }
                 s.append(TK_END, None)
             }
             Self::Cast { expr, type_name } => {
                 s.append(TK_CAST, None)?;
                 s.append(TK_LP, None)?;
-                expr.to_tokens_with_context(s, context)?;
+                expr.to_tokens(s, context)?;
                 s.append(TK_AS, None)?;
                 if let Some(ref type_name) = type_name {
-                    type_name.to_tokens_with_context(s, context)?;
+                    type_name.to_tokens(s, context)?;
                 }
                 s.append(TK_RP, None)
             }
             Self::Collate(expr, collation) => {
-                expr.to_tokens_with_context(s, context)?;
+                expr.to_tokens(s, context)?;
                 s.append(TK_COLLATE, None)?;
                 double_quote(collation.as_str(), s)
             }
             Self::DoublyQualified(db_name, tbl_name, col_name) => {
-                db_name.to_tokens_with_context(s, context)?;
+                db_name.to_tokens(s, context)?;
                 s.append(TK_DOT, None)?;
-                tbl_name.to_tokens_with_context(s, context)?;
+                tbl_name.to_tokens(s, context)?;
                 s.append(TK_DOT, None)?;
-                col_name.to_tokens_with_context(s, context)
+                col_name.to_tokens(s, context)
             }
             Self::Exists(subquery) => {
                 s.append(TK_EXISTS, None)?;
                 s.append(TK_LP, None)?;
-                subquery.to_tokens_with_context(s, context)?;
+                subquery.to_tokens(s, context)?;
                 s.append(TK_RP, None)
             }
             Self::FunctionCall {
@@ -769,10 +770,10 @@ impl ToTokens for Expr {
                 order_by,
                 filter_over,
             } => {
-                name.to_tokens_with_context(s, context)?;
+                name.to_tokens(s, context)?;
                 s.append(TK_LP, None)?;
                 if let Some(distinctness) = distinctness {
-                    distinctness.to_tokens_with_context(s, context)?;
+                    distinctness.to_tokens(s, context)?;
                 }
                 if !args.is_empty() {
                     comma(args, s, context)?;
@@ -783,25 +784,31 @@ impl ToTokens for Expr {
                     comma(order_by, s, context)?;
                 }
                 s.append(TK_RP, None)?;
-                filter_over.to_tokens_with_context(s, context)?;
+                filter_over.to_tokens(s, context)?;
                 Ok(())
             }
             Self::FunctionCallStar { name, filter_over } => {
-                name.to_tokens_with_context(s, context)?;
+                name.to_tokens(s, context)?;
                 s.append(TK_LP, None)?;
                 s.append(TK_STAR, None)?;
                 s.append(TK_RP, None)?;
-                filter_over.to_tokens_with_context(s, context)?;
+                filter_over.to_tokens(s, context)?;
                 Ok(())
             }
-            Self::Id(id) => id.to_tokens_with_context(s, context),
+            Self::Id(id) => id.to_tokens(s, context),
             Self::Column { table, column, .. } => {
-                s.append(TK_ID, Some(context.get_table_name(*table)))?;
+                s.append(TK_ID, context.get_table_name(*table))?;
                 s.append(TK_DOT, None)?;
-                s.append(TK_ID, Some(&context.get_column_name(*table, *column)))
+                s.append(
+                    TK_ID,
+                    context
+                        .get_flat_column_name(*table, *column)
+                        .as_ref()
+                        .map(|s| s.as_ref()),
+                )
             }
             Self::InList { lhs, not, rhs } => {
-                lhs.to_tokens_with_context(s, context)?;
+                lhs.to_tokens(s, context)?;
                 if *not {
                     s.append(TK_NOT, None)?;
                 }
@@ -813,13 +820,13 @@ impl ToTokens for Expr {
                 s.append(TK_RP, None)
             }
             Self::InSelect { lhs, not, rhs } => {
-                lhs.to_tokens_with_context(s, context)?;
+                lhs.to_tokens(s, context)?;
                 if *not {
                     s.append(TK_NOT, None)?;
                 }
                 s.append(TK_IN, None)?;
                 s.append(TK_LP, None)?;
-                rhs.to_tokens_with_context(s, context)?;
+                rhs.to_tokens(s, context)?;
                 s.append(TK_RP, None)
             }
             Self::InTable {
@@ -828,12 +835,12 @@ impl ToTokens for Expr {
                 rhs,
                 args,
             } => {
-                lhs.to_tokens_with_context(s, context)?;
+                lhs.to_tokens(s, context)?;
                 if *not {
                     s.append(TK_NOT, None)?;
                 }
                 s.append(TK_IN, None)?;
-                rhs.to_tokens_with_context(s, context)?;
+                rhs.to_tokens(s, context)?;
                 if !args.is_empty() {
                     s.append(TK_LP, None)?;
                     comma(args, s, context)?;
@@ -842,7 +849,7 @@ impl ToTokens for Expr {
                 Ok(())
             }
             Self::IsNull(sub_expr) => {
-                sub_expr.to_tokens_with_context(s, context)?;
+                sub_expr.to_tokens(s, context)?;
                 s.append(TK_ISNULL, None)
             }
             Self::Like {
@@ -852,22 +859,22 @@ impl ToTokens for Expr {
                 rhs,
                 escape,
             } => {
-                lhs.to_tokens_with_context(s, context)?;
+                lhs.to_tokens(s, context)?;
                 if *not {
                     s.append(TK_NOT, None)?;
                 }
-                op.to_tokens_with_context(s, context)?;
-                rhs.to_tokens_with_context(s, context)?;
+                op.to_tokens(s, context)?;
+                rhs.to_tokens(s, context)?;
                 if let Some(escape) = escape {
                     s.append(TK_ESCAPE, None)?;
-                    escape.to_tokens_with_context(s, context)?;
+                    escape.to_tokens(s, context)?;
                 }
                 Ok(())
             }
-            Self::Literal(lit) => lit.to_tokens_with_context(s, context),
-            Self::Name(name) => name.to_tokens_with_context(s, context),
+            Self::Literal(lit) => lit.to_tokens(s, context),
+            Self::Name(name) => name.to_tokens(s, context),
             Self::NotNull(sub_expr) => {
-                sub_expr.to_tokens_with_context(s, context)?;
+                sub_expr.to_tokens(s, context)?;
                 s.append(TK_NOTNULL, None)
             }
             Self::Parenthesized(exprs) => {
@@ -876,29 +883,29 @@ impl ToTokens for Expr {
                 s.append(TK_RP, None)
             }
             Self::Qualified(qualifier, qualified) => {
-                qualifier.to_tokens_with_context(s, context)?;
+                qualifier.to_tokens(s, context)?;
                 s.append(TK_DOT, None)?;
-                qualified.to_tokens_with_context(s, context)
+                qualified.to_tokens(s, context)
             }
             Self::Raise(rt, err) => {
                 s.append(TK_RAISE, None)?;
                 s.append(TK_LP, None)?;
-                rt.to_tokens_with_context(s, context)?;
+                rt.to_tokens(s, context)?;
                 if let Some(err) = err {
                     s.append(TK_COMMA, None)?;
-                    err.to_tokens_with_context(s, context)?;
+                    err.to_tokens(s, context)?;
                 }
                 s.append(TK_RP, None)
             }
             Self::RowId { .. } => Ok(()),
             Self::Subquery(query) => {
                 s.append(TK_LP, None)?;
-                query.to_tokens_with_context(s, context)?;
+                query.to_tokens(s, context)?;
                 s.append(TK_RP, None)
             }
             Self::Unary(op, sub_expr) => {
-                op.to_tokens_with_context(s, context)?;
-                sub_expr.to_tokens_with_context(s, context)
+                op.to_tokens(s, context)?;
+                sub_expr.to_tokens(s, context)
             }
             Self::Variable(var) => match var.chars().next() {
                 Some(c) if c == '$' || c == '@' || c == '#' || c == ':' => {
@@ -913,12 +920,12 @@ impl ToTokens for Expr {
 
 impl Display for Expr {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        self.to_fmt(f)
+        self.displayer(&BlankContext).fmt(f)
     }
 }
 
 impl ToTokens for Literal {
-    fn to_tokens_with_context<S: TokenStream + ?Sized, C: ToSqlContext>(
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
         &self,
         s: &mut S,
         _: &C,
@@ -937,7 +944,7 @@ impl ToTokens for Literal {
 }
 
 impl ToTokens for LikeOperator {
-    fn to_tokens_with_context<S: TokenStream + ?Sized, C: ToSqlContext>(
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
         &self,
         s: &mut S,
         _: &C,
@@ -955,7 +962,7 @@ impl ToTokens for LikeOperator {
 }
 
 impl ToTokens for Operator {
-    fn to_tokens_with_context<S: TokenStream + ?Sized, C: ToSqlContext>(
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
         &self,
         s: &mut S,
         _: &C,
@@ -992,7 +999,7 @@ impl ToTokens for Operator {
 }
 
 impl ToTokens for UnaryOperator {
-    fn to_tokens_with_context<S: TokenStream + ?Sized, C: ToSqlContext>(
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
         &self,
         s: &mut S,
         _: &C,
@@ -1010,54 +1017,54 @@ impl ToTokens for UnaryOperator {
 }
 
 impl ToTokens for Select {
-    fn to_tokens_with_context<S: TokenStream + ?Sized, C: ToSqlContext>(
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
         &self,
         s: &mut S,
         context: &C,
     ) -> Result<(), S::Error> {
         if let Some(ref with) = self.with {
-            with.to_tokens_with_context(s, context)?;
+            with.to_tokens(s, context)?;
         }
-        self.body.to_tokens_with_context(s, context)?;
+        self.body.to_tokens(s, context)?;
         if !self.order_by.is_empty() {
             s.append(TK_ORDER, None)?;
             s.append(TK_BY, None)?;
             comma(&self.order_by, s, context)?;
         }
         if let Some(ref limit) = self.limit {
-            limit.to_tokens_with_context(s, context)?;
+            limit.to_tokens(s, context)?;
         }
         Ok(())
     }
 }
 
 impl ToTokens for SelectBody {
-    fn to_tokens_with_context<S: TokenStream + ?Sized, C: ToSqlContext>(
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
         &self,
         s: &mut S,
         context: &C,
     ) -> Result<(), S::Error> {
-        self.select.to_tokens_with_context(s, context)?;
+        self.select.to_tokens(s, context)?;
         for compound in &self.compounds {
-            compound.to_tokens_with_context(s, context)?;
+            compound.to_tokens(s, context)?;
         }
         Ok(())
     }
 }
 
 impl ToTokens for CompoundSelect {
-    fn to_tokens_with_context<S: TokenStream + ?Sized, C: ToSqlContext>(
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
         &self,
         s: &mut S,
         context: &C,
     ) -> Result<(), S::Error> {
-        self.operator.to_tokens_with_context(s, context)?;
-        self.select.to_tokens_with_context(s, context)
+        self.operator.to_tokens(s, context)?;
+        self.select.to_tokens(s, context)
     }
 }
 
 impl ToTokens for CompoundOperator {
-    fn to_tokens_with_context<S: TokenStream + ?Sized, C: ToSqlContext>(
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
         &self,
         s: &mut S,
         _: &C,
@@ -1076,12 +1083,12 @@ impl ToTokens for CompoundOperator {
 
 impl Display for CompoundOperator {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        self.to_fmt(f)
+        self.displayer(&BlankContext).fmt(f)
     }
 }
 
 impl ToTokens for OneSelect {
-    fn to_tokens_with_context<S: TokenStream + ?Sized, C: ToSqlContext>(
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
         &self,
         s: &mut S,
         context: &C,
@@ -1097,19 +1104,19 @@ impl ToTokens for OneSelect {
             } => {
                 s.append(TK_SELECT, None)?;
                 if let Some(ref distinctness) = distinctness {
-                    distinctness.to_tokens_with_context(s, context)?;
+                    distinctness.to_tokens(s, context)?;
                 }
                 comma(columns, s, context)?;
                 if let Some(ref from) = from {
                     s.append(TK_FROM, None)?;
-                    from.to_tokens_with_context(s, context)?;
+                    from.to_tokens(s, context)?;
                 }
                 if let Some(ref where_clause) = where_clause {
                     s.append(TK_WHERE, None)?;
-                    where_clause.to_tokens_with_context(s, context)?;
+                    where_clause.to_tokens(s, context)?;
                 }
                 if let Some(ref group_by) = group_by {
-                    group_by.to_tokens_with_context(s, context)?;
+                    group_by.to_tokens(s, context)?;
                 }
                 if !window_clause.is_empty() {
                     s.append(TK_WINDOW, None)?;
@@ -1135,14 +1142,14 @@ impl ToTokens for OneSelect {
 }
 
 impl ToTokens for FromClause {
-    fn to_tokens_with_context<S: TokenStream + ?Sized, C: ToSqlContext>(
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
         &self,
         s: &mut S,
         context: &C,
     ) -> Result<(), S::Error> {
-        self.select.as_ref().to_tokens_with_context(s, context)?;
+        self.select.as_ref().to_tokens(s, context)?;
         for join in &self.joins {
-            join.to_tokens_with_context(s, context)?;
+            join.to_tokens(s, context)?;
         }
 
         Ok(())
@@ -1150,7 +1157,7 @@ impl ToTokens for FromClause {
 }
 
 impl ToTokens for Distinctness {
-    fn to_tokens_with_context<S: TokenStream + ?Sized, C: ToSqlContext>(
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
         &self,
         s: &mut S,
         _: &C,
@@ -1166,22 +1173,22 @@ impl ToTokens for Distinctness {
 }
 
 impl ToTokens for ResultColumn {
-    fn to_tokens_with_context<S: TokenStream + ?Sized, C: ToSqlContext>(
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
         &self,
         s: &mut S,
         context: &C,
     ) -> Result<(), S::Error> {
         match self {
             Self::Expr(expr, alias) => {
-                expr.to_tokens_with_context(s, context)?;
+                expr.to_tokens(s, context)?;
                 if let Some(alias) = alias {
-                    alias.to_tokens_with_context(s, context)?;
+                    alias.to_tokens(s, context)?;
                 }
                 Ok(())
             }
             Self::Star => s.append(TK_STAR, None),
             Self::TableStar(tbl_name) => {
-                tbl_name.to_tokens_with_context(s, context)?;
+                tbl_name.to_tokens(s, context)?;
                 s.append(TK_DOT, None)?;
                 s.append(TK_STAR, None)
             }
@@ -1190,7 +1197,7 @@ impl ToTokens for ResultColumn {
 }
 
 impl ToTokens for As {
-    fn to_tokens_with_context<S: TokenStream + ?Sized, C: ToSqlContext>(
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
         &self,
         s: &mut S,
         context: &C,
@@ -1198,70 +1205,70 @@ impl ToTokens for As {
         match self {
             Self::As(ref name) => {
                 s.append(TK_AS, None)?;
-                name.to_tokens_with_context(s, context)
+                name.to_tokens(s, context)
             }
-            Self::Elided(ref name) => name.to_tokens_with_context(s, context),
+            Self::Elided(ref name) => name.to_tokens(s, context),
         }
     }
 }
 
 impl ToTokens for JoinedSelectTable {
-    fn to_tokens_with_context<S: TokenStream + ?Sized, C: ToSqlContext>(
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
         &self,
         s: &mut S,
         context: &C,
     ) -> Result<(), S::Error> {
-        self.operator.to_tokens_with_context(s, context)?;
-        self.table.to_tokens_with_context(s, context)?;
+        self.operator.to_tokens(s, context)?;
+        self.table.to_tokens(s, context)?;
         if let Some(ref constraint) = self.constraint {
-            constraint.to_tokens_with_context(s, context)?;
+            constraint.to_tokens(s, context)?;
         }
         Ok(())
     }
 }
 
 impl ToTokens for SelectTable {
-    fn to_tokens_with_context<S: TokenStream + ?Sized, C: ToSqlContext>(
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
         &self,
         s: &mut S,
         context: &C,
     ) -> Result<(), S::Error> {
         match self {
             Self::Table(name, alias, indexed) => {
-                name.to_tokens_with_context(s, context)?;
+                name.to_tokens(s, context)?;
                 if let Some(alias) = alias {
-                    alias.to_tokens_with_context(s, context)?;
+                    alias.to_tokens(s, context)?;
                 }
                 if let Some(indexed) = indexed {
-                    indexed.to_tokens_with_context(s, context)?;
+                    indexed.to_tokens(s, context)?;
                 }
                 Ok(())
             }
             Self::TableCall(name, exprs, alias) => {
-                name.to_tokens_with_context(s, context)?;
+                name.to_tokens(s, context)?;
                 s.append(TK_LP, None)?;
                 comma(exprs, s, context)?;
                 s.append(TK_RP, None)?;
                 if let Some(alias) = alias {
-                    alias.to_tokens_with_context(s, context)?;
+                    alias.to_tokens(s, context)?;
                 }
                 Ok(())
             }
             Self::Select(select, alias) => {
                 s.append(TK_LP, None)?;
-                select.to_tokens_with_context(s, context)?;
+                select.to_tokens(s, context)?;
                 s.append(TK_RP, None)?;
                 if let Some(alias) = alias {
-                    alias.to_tokens_with_context(s, context)?;
+                    alias.to_tokens(s, context)?;
                 }
                 Ok(())
             }
             Self::Sub(from, alias) => {
                 s.append(TK_LP, None)?;
-                from.to_tokens_with_context(s, context)?;
+                from.to_tokens(s, context)?;
                 s.append(TK_RP, None)?;
                 if let Some(alias) = alias {
-                    alias.to_tokens_with_context(s, context)?;
+                    alias.to_tokens(s, context)?;
                 }
                 Ok(())
             }
@@ -1270,7 +1277,7 @@ impl ToTokens for SelectTable {
 }
 
 impl ToTokens for JoinOperator {
-    fn to_tokens_with_context<S: TokenStream + ?Sized, C: ToSqlContext>(
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
         &self,
         s: &mut S,
         context: &C,
@@ -1279,7 +1286,7 @@ impl ToTokens for JoinOperator {
             Self::Comma => s.append(TK_COMMA, None),
             Self::TypedJoin(join_type) => {
                 if let Some(ref join_type) = join_type {
-                    join_type.to_tokens_with_context(s, context)?;
+                    join_type.to_tokens(s, context)?;
                 }
                 s.append(TK_JOIN, None)
             }
@@ -1288,7 +1295,7 @@ impl ToTokens for JoinOperator {
 }
 
 impl ToTokens for JoinType {
-    fn to_tokens_with_context<S: TokenStream + ?Sized, C: ToSqlContext>(
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
         &self,
         s: &mut S,
         _: &C,
@@ -1320,7 +1327,7 @@ impl ToTokens for JoinType {
 }
 
 impl ToTokens for JoinConstraint {
-    fn to_tokens_with_context<S: TokenStream + ?Sized, C: ToSqlContext>(
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
         &self,
         s: &mut S,
         context: &C,
@@ -1328,7 +1335,7 @@ impl ToTokens for JoinConstraint {
         match self {
             Self::On(expr) => {
                 s.append(TK_ON, None)?;
-                expr.to_tokens_with_context(s, context)
+                expr.to_tokens(s, context)
             }
             Self::Using(col_names) => {
                 s.append(TK_USING, None)?;
@@ -1341,7 +1348,7 @@ impl ToTokens for JoinConstraint {
 }
 
 impl ToTokens for GroupBy {
-    fn to_tokens_with_context<S: TokenStream + ?Sized, C: ToSqlContext>(
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
         &self,
         s: &mut S,
         context: &C,
@@ -1351,14 +1358,14 @@ impl ToTokens for GroupBy {
         comma(&self.exprs, s, context)?;
         if let Some(ref having) = self.having {
             s.append(TK_HAVING, None)?;
-            having.to_tokens_with_context(s, context)?;
+            having.to_tokens(s, context)?;
         }
         Ok(())
     }
 }
 
 impl ToTokens for Name {
-    fn to_tokens_with_context<S: TokenStream + ?Sized, C: ToSqlContext>(
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
         &self,
         s: &mut S,
         _: &C,
@@ -1369,31 +1376,37 @@ impl ToTokens for Name {
 
 impl Display for Name {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        self.to_fmt(f)
+        self.displayer(&BlankContext).fmt(f)
     }
 }
 
 impl ToTokens for QualifiedName {
-    fn to_tokens_with_context<S: TokenStream + ?Sized, C: ToSqlContext>(
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
         &self,
         s: &mut S,
         context: &C,
     ) -> Result<(), S::Error> {
         if let Some(ref db_name) = self.db_name {
-            db_name.to_tokens_with_context(s, context)?;
+            db_name.to_tokens(s, context)?;
             s.append(TK_DOT, None)?;
         }
-        self.name.to_tokens_with_context(s, context)?;
+        self.name.to_tokens(s, context)?;
         if let Some(ref alias) = self.alias {
             s.append(TK_AS, None)?;
-            alias.to_tokens_with_context(s, context)?;
+            alias.to_tokens(s, context)?;
         }
         Ok(())
     }
 }
 
+impl Display for QualifiedName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.displayer(&BlankContext).fmt(f)
+    }
+}
+
 impl ToTokens for AlterTableBody {
-    fn to_tokens_with_context<S: TokenStream + ?Sized, C: ToSqlContext>(
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
         &self,
         s: &mut S,
         context: &C,
@@ -1402,31 +1415,31 @@ impl ToTokens for AlterTableBody {
             Self::RenameTo(name) => {
                 s.append(TK_RENAME, None)?;
                 s.append(TK_TO, None)?;
-                name.to_tokens_with_context(s, context)
+                name.to_tokens(s, context)
             }
             Self::AddColumn(def) => {
                 s.append(TK_ADD, None)?;
                 s.append(TK_COLUMNKW, None)?;
-                def.to_tokens_with_context(s, context)
+                def.to_tokens(s, context)
             }
             Self::RenameColumn { old, new } => {
                 s.append(TK_RENAME, None)?;
                 s.append(TK_COLUMNKW, None)?;
-                old.to_tokens_with_context(s, context)?;
+                old.to_tokens(s, context)?;
                 s.append(TK_TO, None)?;
-                new.to_tokens_with_context(s, context)
+                new.to_tokens(s, context)
             }
             Self::DropColumn(name) => {
                 s.append(TK_DROP, None)?;
                 s.append(TK_COLUMNKW, None)?;
-                name.to_tokens_with_context(s, context)
+                name.to_tokens(s, context)
             }
         }
     }
 }
 
 impl ToTokens for CreateTableBody {
-    fn to_tokens_with_context<S: TokenStream + ?Sized, C: ToSqlContext>(
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
         &self,
         s: &mut S,
         context: &C,
@@ -1455,45 +1468,45 @@ impl ToTokens for CreateTableBody {
             }
             Self::AsSelect(select) => {
                 s.append(TK_AS, None)?;
-                select.to_tokens_with_context(s, context)
+                select.to_tokens(s, context)
             }
         }
     }
 }
 
 impl ToTokens for ColumnDefinition {
-    fn to_tokens_with_context<S: TokenStream + ?Sized, C: ToSqlContext>(
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
         &self,
         s: &mut S,
         context: &C,
     ) -> Result<(), S::Error> {
-        self.col_name.to_tokens_with_context(s, context)?;
+        self.col_name.to_tokens(s, context)?;
         if let Some(ref col_type) = self.col_type {
-            col_type.to_tokens_with_context(s, context)?;
+            col_type.to_tokens(s, context)?;
         }
         for constraint in &self.constraints {
-            constraint.to_tokens_with_context(s, context)?;
+            constraint.to_tokens(s, context)?;
         }
         Ok(())
     }
 }
 
 impl ToTokens for NamedColumnConstraint {
-    fn to_tokens_with_context<S: TokenStream + ?Sized, C: ToSqlContext>(
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
         &self,
         s: &mut S,
         context: &C,
     ) -> Result<(), S::Error> {
         if let Some(ref name) = self.name {
             s.append(TK_CONSTRAINT, None)?;
-            name.to_tokens_with_context(s, context)?;
+            name.to_tokens(s, context)?;
         }
-        self.constraint.to_tokens_with_context(s, context)
+        self.constraint.to_tokens(s, context)
     }
 }
 
 impl ToTokens for ColumnConstraint {
-    fn to_tokens_with_context<S: TokenStream + ?Sized, C: ToSqlContext>(
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
         &self,
         s: &mut S,
         context: &C,
@@ -1507,12 +1520,12 @@ impl ToTokens for ColumnConstraint {
                 s.append(TK_PRIMARY, None)?;
                 s.append(TK_KEY, None)?;
                 if let Some(order) = order {
-                    order.to_tokens_with_context(s, context)?;
+                    order.to_tokens(s, context)?;
                 }
                 if let Some(conflict_clause) = conflict_clause {
                     s.append(TK_ON, None)?;
                     s.append(TK_CONFLICT, None)?;
-                    conflict_clause.to_tokens_with_context(s, context)?;
+                    conflict_clause.to_tokens(s, context)?;
                 }
                 if *auto_increment {
                     s.append(TK_AUTOINCR, None)?;
@@ -1530,7 +1543,7 @@ impl ToTokens for ColumnConstraint {
                 if let Some(conflict_clause) = conflict_clause {
                     s.append(TK_ON, None)?;
                     s.append(TK_CONFLICT, None)?;
-                    conflict_clause.to_tokens_with_context(s, context)?;
+                    conflict_clause.to_tokens(s, context)?;
                 }
                 Ok(())
             }
@@ -1539,42 +1552,42 @@ impl ToTokens for ColumnConstraint {
                 if let Some(conflict_clause) = conflict_clause {
                     s.append(TK_ON, None)?;
                     s.append(TK_CONFLICT, None)?;
-                    conflict_clause.to_tokens_with_context(s, context)?;
+                    conflict_clause.to_tokens(s, context)?;
                 }
                 Ok(())
             }
             Self::Check(expr) => {
                 s.append(TK_CHECK, None)?;
                 s.append(TK_LP, None)?;
-                expr.to_tokens_with_context(s, context)?;
+                expr.to_tokens(s, context)?;
                 s.append(TK_RP, None)
             }
             Self::Default(expr) => {
                 s.append(TK_DEFAULT, None)?;
-                expr.to_tokens_with_context(s, context)
+                expr.to_tokens(s, context)
             }
             Self::Collate { collation_name } => {
                 s.append(TK_COLLATE, None)?;
-                collation_name.to_tokens_with_context(s, context)
+                collation_name.to_tokens(s, context)
             }
             Self::ForeignKey {
                 clause,
                 deref_clause,
             } => {
                 s.append(TK_REFERENCES, None)?;
-                clause.to_tokens_with_context(s, context)?;
+                clause.to_tokens(s, context)?;
                 if let Some(deref_clause) = deref_clause {
-                    deref_clause.to_tokens_with_context(s, context)?;
+                    deref_clause.to_tokens(s, context)?;
                 }
                 Ok(())
             }
             Self::Generated { expr, typ } => {
                 s.append(TK_AS, None)?;
                 s.append(TK_LP, None)?;
-                expr.to_tokens_with_context(s, context)?;
+                expr.to_tokens(s, context)?;
                 s.append(TK_RP, None)?;
                 if let Some(typ) = typ {
-                    typ.to_tokens_with_context(s, context)?;
+                    typ.to_tokens(s, context)?;
                 }
                 Ok(())
             }
@@ -1583,21 +1596,21 @@ impl ToTokens for ColumnConstraint {
 }
 
 impl ToTokens for NamedTableConstraint {
-    fn to_tokens_with_context<S: TokenStream + ?Sized, C: ToSqlContext>(
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
         &self,
         s: &mut S,
         context: &C,
     ) -> Result<(), S::Error> {
         if let Some(ref name) = self.name {
             s.append(TK_CONSTRAINT, None)?;
-            name.to_tokens_with_context(s, context)?;
+            name.to_tokens(s, context)?;
         }
-        self.constraint.to_tokens_with_context(s, context)
+        self.constraint.to_tokens(s, context)
     }
 }
 
 impl ToTokens for TableConstraint {
-    fn to_tokens_with_context<S: TokenStream + ?Sized, C: ToSqlContext>(
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
         &self,
         s: &mut S,
         context: &C,
@@ -1619,7 +1632,7 @@ impl ToTokens for TableConstraint {
                 if let Some(conflict_clause) = conflict_clause {
                     s.append(TK_ON, None)?;
                     s.append(TK_CONFLICT, None)?;
-                    conflict_clause.to_tokens_with_context(s, context)?;
+                    conflict_clause.to_tokens(s, context)?;
                 }
                 Ok(())
             }
@@ -1634,14 +1647,14 @@ impl ToTokens for TableConstraint {
                 if let Some(conflict_clause) = conflict_clause {
                     s.append(TK_ON, None)?;
                     s.append(TK_CONFLICT, None)?;
-                    conflict_clause.to_tokens_with_context(s, context)?;
+                    conflict_clause.to_tokens(s, context)?;
                 }
                 Ok(())
             }
             Self::Check(expr) => {
                 s.append(TK_CHECK, None)?;
                 s.append(TK_LP, None)?;
-                expr.to_tokens_with_context(s, context)?;
+                expr.to_tokens(s, context)?;
                 s.append(TK_RP, None)
             }
             Self::ForeignKey {
@@ -1655,9 +1668,9 @@ impl ToTokens for TableConstraint {
                 comma(columns, s, context)?;
                 s.append(TK_RP, None)?;
                 s.append(TK_REFERENCES, None)?;
-                clause.to_tokens_with_context(s, context)?;
+                clause.to_tokens(s, context)?;
                 if let Some(deref_clause) = deref_clause {
-                    deref_clause.to_tokens_with_context(s, context)?;
+                    deref_clause.to_tokens(s, context)?;
                 }
                 Ok(())
             }
@@ -1666,7 +1679,7 @@ impl ToTokens for TableConstraint {
 }
 
 impl ToTokens for SortOrder {
-    fn to_tokens_with_context<S: TokenStream + ?Sized, C: ToSqlContext>(
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
         &self,
         s: &mut S,
         _: &C,
@@ -1682,7 +1695,7 @@ impl ToTokens for SortOrder {
 }
 
 impl ToTokens for NullsOrder {
-    fn to_tokens_with_context<S: TokenStream + ?Sized, C: ToSqlContext>(
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
         &self,
         s: &mut S,
         _: &C,
@@ -1699,26 +1712,26 @@ impl ToTokens for NullsOrder {
 }
 
 impl ToTokens for ForeignKeyClause {
-    fn to_tokens_with_context<S: TokenStream + ?Sized, C: ToSqlContext>(
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
         &self,
         s: &mut S,
         context: &C,
     ) -> Result<(), S::Error> {
-        self.tbl_name.to_tokens_with_context(s, context)?;
+        self.tbl_name.to_tokens(s, context)?;
         if !self.columns.is_empty() {
             s.append(TK_LP, None)?;
             comma(&self.columns, s, context)?;
             s.append(TK_RP, None)?;
         }
         for arg in &self.args {
-            arg.to_tokens_with_context(s, context)?;
+            arg.to_tokens(s, context)?;
         }
         Ok(())
     }
 }
 
 impl ToTokens for RefArg {
-    fn to_tokens_with_context<S: TokenStream + ?Sized, C: ToSqlContext>(
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
         &self,
         s: &mut S,
         context: &C,
@@ -1727,28 +1740,28 @@ impl ToTokens for RefArg {
             Self::OnDelete(ref action) => {
                 s.append(TK_ON, None)?;
                 s.append(TK_DELETE, None)?;
-                action.to_tokens_with_context(s, context)
+                action.to_tokens(s, context)
             }
             Self::OnInsert(ref action) => {
                 s.append(TK_ON, None)?;
                 s.append(TK_INSERT, None)?;
-                action.to_tokens_with_context(s, context)
+                action.to_tokens(s, context)
             }
             Self::OnUpdate(ref action) => {
                 s.append(TK_ON, None)?;
                 s.append(TK_UPDATE, None)?;
-                action.to_tokens_with_context(s, context)
+                action.to_tokens(s, context)
             }
             Self::Match(ref name) => {
                 s.append(TK_MATCH, None)?;
-                name.to_tokens_with_context(s, context)
+                name.to_tokens(s, context)
             }
         }
     }
 }
 
 impl ToTokens for RefAct {
-    fn to_tokens_with_context<S: TokenStream + ?Sized, C: ToSqlContext>(
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
         &self,
         s: &mut S,
         _: &C,
@@ -1773,7 +1786,7 @@ impl ToTokens for RefAct {
 }
 
 impl ToTokens for DeferSubclause {
-    fn to_tokens_with_context<S: TokenStream + ?Sized, C: ToSqlContext>(
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
         &self,
         s: &mut S,
         context: &C,
@@ -1783,14 +1796,14 @@ impl ToTokens for DeferSubclause {
         }
         s.append(TK_DEFERRABLE, None)?;
         if let Some(init_deferred) = self.init_deferred {
-            init_deferred.to_tokens_with_context(s, context)?;
+            init_deferred.to_tokens(s, context)?;
         }
         Ok(())
     }
 }
 
 impl ToTokens for InitDeferredPred {
-    fn to_tokens_with_context<S: TokenStream + ?Sized, C: ToSqlContext>(
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
         &self,
         s: &mut S,
         _: &C,
@@ -1807,25 +1820,25 @@ impl ToTokens for InitDeferredPred {
 }
 
 impl ToTokens for IndexedColumn {
-    fn to_tokens_with_context<S: TokenStream + ?Sized, C: ToSqlContext>(
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
         &self,
         s: &mut S,
         context: &C,
     ) -> Result<(), S::Error> {
-        self.col_name.to_tokens_with_context(s, context)?;
+        self.col_name.to_tokens(s, context)?;
         if let Some(ref collation_name) = self.collation_name {
             s.append(TK_COLLATE, None)?;
-            collation_name.to_tokens_with_context(s, context)?;
+            collation_name.to_tokens(s, context)?;
         }
         if let Some(order) = self.order {
-            order.to_tokens_with_context(s, context)?;
+            order.to_tokens(s, context)?;
         }
         Ok(())
     }
 }
 
 impl ToTokens for Indexed {
-    fn to_tokens_with_context<S: TokenStream + ?Sized, C: ToSqlContext>(
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
         &self,
         s: &mut S,
         context: &C,
@@ -1834,7 +1847,7 @@ impl ToTokens for Indexed {
             Self::IndexedBy(ref name) => {
                 s.append(TK_INDEXED, None)?;
                 s.append(TK_BY, None)?;
-                name.to_tokens_with_context(s, context)
+                name.to_tokens(s, context)
             }
             Self::NotIndexed => {
                 s.append(TK_NOT, None)?;
@@ -1845,49 +1858,49 @@ impl ToTokens for Indexed {
 }
 
 impl ToTokens for SortedColumn {
-    fn to_tokens_with_context<S: TokenStream + ?Sized, C: ToSqlContext>(
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
         &self,
         s: &mut S,
         context: &C,
     ) -> Result<(), S::Error> {
-        self.expr.to_tokens_with_context(s, context)?;
+        self.expr.to_tokens(s, context)?;
         if let Some(ref order) = self.order {
-            order.to_tokens_with_context(s, context)?;
+            order.to_tokens(s, context)?;
         }
         if let Some(ref nulls) = self.nulls {
-            nulls.to_tokens_with_context(s, context)?;
+            nulls.to_tokens(s, context)?;
         }
         Ok(())
     }
 }
 
 impl ToTokens for Limit {
-    fn to_tokens_with_context<S: TokenStream + ?Sized, C: ToSqlContext>(
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
         &self,
         s: &mut S,
         context: &C,
     ) -> Result<(), S::Error> {
         s.append(TK_LIMIT, None)?;
-        self.expr.to_tokens_with_context(s, context)?;
+        self.expr.to_tokens(s, context)?;
         if let Some(ref offset) = self.offset {
             s.append(TK_OFFSET, None)?;
-            offset.to_tokens_with_context(s, context)?;
+            offset.to_tokens(s, context)?;
         }
         Ok(())
     }
 }
 
 impl ToTokens for InsertBody {
-    fn to_tokens_with_context<S: TokenStream + ?Sized, C: ToSqlContext>(
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
         &self,
         s: &mut S,
         context: &C,
     ) -> Result<(), S::Error> {
         match self {
             Self::Select(select, upsert) => {
-                select.to_tokens_with_context(s, context)?;
+                select.to_tokens(s, context)?;
                 if let Some(upsert) = upsert {
-                    upsert.to_tokens_with_context(s, context)?;
+                    upsert.to_tokens(s, context)?;
                 }
                 Ok(())
             }
@@ -1900,7 +1913,7 @@ impl ToTokens for InsertBody {
 }
 
 impl ToTokens for Set {
-    fn to_tokens_with_context<S: TokenStream + ?Sized, C: ToSqlContext>(
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
         &self,
         s: &mut S,
         context: &C,
@@ -1913,12 +1926,12 @@ impl ToTokens for Set {
             s.append(TK_RP, None)?;
         }
         s.append(TK_EQ, None)?;
-        self.expr.to_tokens_with_context(s, context)
+        self.expr.to_tokens(s, context)
     }
 }
 
 impl ToTokens for PragmaBody {
-    fn to_tokens_with_context<S: TokenStream + ?Sized, C: ToSqlContext>(
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
         &self,
         s: &mut S,
         context: &C,
@@ -1926,11 +1939,11 @@ impl ToTokens for PragmaBody {
         match self {
             Self::Equals(value) => {
                 s.append(TK_EQ, None)?;
-                value.to_tokens_with_context(s, context)
+                value.to_tokens(s, context)
             }
             Self::Call(value) => {
                 s.append(TK_LP, None)?;
-                value.to_tokens_with_context(s, context)?;
+                value.to_tokens(s, context)?;
                 s.append(TK_RP, None)
             }
         }
@@ -1938,7 +1951,7 @@ impl ToTokens for PragmaBody {
 }
 
 impl ToTokens for TriggerTime {
-    fn to_tokens_with_context<S: TokenStream + ?Sized, C: ToSqlContext>(
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
         &self,
         s: &mut S,
         _: &C,
@@ -1955,7 +1968,7 @@ impl ToTokens for TriggerTime {
 }
 
 impl ToTokens for TriggerEvent {
-    fn to_tokens_with_context<S: TokenStream + ?Sized, C: ToSqlContext>(
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
         &self,
         s: &mut S,
         context: &C,
@@ -1974,7 +1987,7 @@ impl ToTokens for TriggerEvent {
 }
 
 impl ToTokens for TriggerCmd {
-    fn to_tokens_with_context<S: TokenStream + ?Sized, C: ToSqlContext>(
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
         &self,
         s: &mut S,
         context: &C,
@@ -1990,18 +2003,18 @@ impl ToTokens for TriggerCmd {
                 s.append(TK_UPDATE, None)?;
                 if let Some(or_conflict) = or_conflict {
                     s.append(TK_OR, None)?;
-                    or_conflict.to_tokens_with_context(s, context)?;
+                    or_conflict.to_tokens(s, context)?;
                 }
-                tbl_name.to_tokens_with_context(s, context)?;
+                tbl_name.to_tokens(s, context)?;
                 s.append(TK_SET, None)?;
                 comma(sets, s, context)?;
                 if let Some(from) = from {
                     s.append(TK_FROM, None)?;
-                    from.to_tokens_with_context(s, context)?;
+                    from.to_tokens(s, context)?;
                 }
                 if let Some(where_clause) = where_clause {
                     s.append(TK_WHERE, None)?;
-                    where_clause.to_tokens_with_context(s, context)?;
+                    where_clause.to_tokens(s, context)?;
                 }
                 Ok(())
             }
@@ -2019,19 +2032,19 @@ impl ToTokens for TriggerCmd {
                     s.append(TK_INSERT, None)?;
                     if let Some(or_conflict) = or_conflict {
                         s.append(TK_OR, None)?;
-                        or_conflict.to_tokens_with_context(s, context)?;
+                        or_conflict.to_tokens(s, context)?;
                     }
                 }
                 s.append(TK_INTO, None)?;
-                tbl_name.to_tokens_with_context(s, context)?;
+                tbl_name.to_tokens(s, context)?;
                 if !col_names.is_empty() {
                     s.append(TK_LP, None)?;
                     comma(col_names, s, context)?;
                     s.append(TK_RP, None)?;
                 }
-                select.to_tokens_with_context(s, context)?;
+                select.to_tokens(s, context)?;
                 if let Some(upsert) = upsert {
-                    upsert.to_tokens_with_context(s, context)?;
+                    upsert.to_tokens(s, context)?;
                 }
                 if !returning.is_empty() {
                     s.append(TK_RETURNING, None)?;
@@ -2045,20 +2058,20 @@ impl ToTokens for TriggerCmd {
             } => {
                 s.append(TK_DELETE, None)?;
                 s.append(TK_FROM, None)?;
-                tbl_name.to_tokens_with_context(s, context)?;
+                tbl_name.to_tokens(s, context)?;
                 if let Some(where_clause) = where_clause {
                     s.append(TK_WHERE, None)?;
-                    where_clause.to_tokens_with_context(s, context)?;
+                    where_clause.to_tokens(s, context)?;
                 }
                 Ok(())
             }
-            Self::Select(select) => select.to_tokens_with_context(s, context),
+            Self::Select(select) => select.to_tokens(s, context),
         }
     }
 }
 
 impl ToTokens for ResolveType {
-    fn to_tokens_with_context<S: TokenStream + ?Sized, C: ToSqlContext>(
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
         &self,
         s: &mut S,
         _: &C,
@@ -2077,7 +2090,7 @@ impl ToTokens for ResolveType {
 }
 
 impl ToTokens for With {
-    fn to_tokens_with_context<S: TokenStream + ?Sized, C: ToSqlContext>(
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
         &self,
         s: &mut S,
         context: &C,
@@ -2091,12 +2104,12 @@ impl ToTokens for With {
 }
 
 impl ToTokens for CommonTableExpr {
-    fn to_tokens_with_context<S: TokenStream + ?Sized, C: ToSqlContext>(
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
         &self,
         s: &mut S,
         context: &C,
     ) -> Result<(), S::Error> {
-        self.tbl_name.to_tokens_with_context(s, context)?;
+        self.tbl_name.to_tokens(s, context)?;
         if !self.columns.is_empty() {
             s.append(TK_LP, None)?;
             comma(&self.columns, s, context)?;
@@ -2114,13 +2127,13 @@ impl ToTokens for CommonTableExpr {
             }
         };
         s.append(TK_LP, None)?;
-        self.select.to_tokens_with_context(s, context)?;
+        self.select.to_tokens(s, context)?;
         s.append(TK_RP, None)
     }
 }
 
 impl ToTokens for Type {
-    fn to_tokens_with_context<S: TokenStream + ?Sized, C: ToSqlContext>(
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
         &self,
         s: &mut S,
         context: &C,
@@ -2130,7 +2143,7 @@ impl ToTokens for Type {
             Some(ref size) => {
                 s.append(TK_ID, Some(&self.name))?; // TODO check there is no forbidden chars
                 s.append(TK_LP, None)?;
-                size.to_tokens_with_context(s, context)?;
+                size.to_tokens(s, context)?;
                 s.append(TK_RP, None)
             }
         }
@@ -2138,24 +2151,24 @@ impl ToTokens for Type {
 }
 
 impl ToTokens for TypeSize {
-    fn to_tokens_with_context<S: TokenStream + ?Sized, C: ToSqlContext>(
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
         &self,
         s: &mut S,
         context: &C,
     ) -> Result<(), S::Error> {
         match self {
-            Self::MaxSize(size) => size.to_tokens_with_context(s, context),
+            Self::MaxSize(size) => size.to_tokens(s, context),
             Self::TypeSize(size1, size2) => {
-                size1.to_tokens_with_context(s, context)?;
+                size1.to_tokens(s, context)?;
                 s.append(TK_COMMA, None)?;
-                size2.to_tokens_with_context(s, context)
+                size2.to_tokens(s, context)
             }
         }
     }
 }
 
 impl ToTokens for TransactionType {
-    fn to_tokens_with_context<S: TokenStream + ?Sized, C: ToSqlContext>(
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
         &self,
         s: &mut S,
         _: &C,
@@ -2172,7 +2185,7 @@ impl ToTokens for TransactionType {
 }
 
 impl ToTokens for Upsert {
-    fn to_tokens_with_context<S: TokenStream + ?Sized, C: ToSqlContext>(
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
         &self,
         s: &mut S,
         context: &C,
@@ -2180,18 +2193,18 @@ impl ToTokens for Upsert {
         s.append(TK_ON, None)?;
         s.append(TK_CONFLICT, None)?;
         if let Some(ref index) = self.index {
-            index.to_tokens_with_context(s, context)?;
+            index.to_tokens(s, context)?;
         }
-        self.do_clause.to_tokens_with_context(s, context)?;
+        self.do_clause.to_tokens(s, context)?;
         if let Some(ref next) = self.next {
-            next.to_tokens_with_context(s, context)?;
+            next.to_tokens(s, context)?;
         }
         Ok(())
     }
 }
 
 impl ToTokens for UpsertIndex {
-    fn to_tokens_with_context<S: TokenStream + ?Sized, C: ToSqlContext>(
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
         &self,
         s: &mut S,
         context: &C,
@@ -2201,14 +2214,14 @@ impl ToTokens for UpsertIndex {
         s.append(TK_RP, None)?;
         if let Some(ref where_clause) = self.where_clause {
             s.append(TK_WHERE, None)?;
-            where_clause.to_tokens_with_context(s, context)?;
+            where_clause.to_tokens(s, context)?;
         }
         Ok(())
     }
 }
 
 impl ToTokens for UpsertDo {
-    fn to_tokens_with_context<S: TokenStream + ?Sized, C: ToSqlContext>(
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
         &self,
         s: &mut S,
         context: &C,
@@ -2221,7 +2234,7 @@ impl ToTokens for UpsertDo {
                 comma(sets, s, context)?;
                 if let Some(where_clause) = where_clause {
                     s.append(TK_WHERE, None)?;
-                    where_clause.to_tokens_with_context(s, context)?;
+                    where_clause.to_tokens(s, context)?;
                 }
                 Ok(())
             }
@@ -2234,7 +2247,7 @@ impl ToTokens for UpsertDo {
 }
 
 impl ToTokens for FunctionTail {
-    fn to_tokens_with_context<S: TokenStream + ?Sized, C: ToSqlContext>(
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
         &self,
         s: &mut S,
         context: &C,
@@ -2243,51 +2256,51 @@ impl ToTokens for FunctionTail {
             s.append(TK_FILTER, None)?;
             s.append(TK_LP, None)?;
             s.append(TK_WHERE, None)?;
-            filter_clause.to_tokens_with_context(s, context)?;
+            filter_clause.to_tokens(s, context)?;
             s.append(TK_RP, None)?;
         }
         if let Some(ref over_clause) = self.over_clause {
             s.append(TK_OVER, None)?;
-            over_clause.to_tokens_with_context(s, context)?;
+            over_clause.to_tokens(s, context)?;
         }
         Ok(())
     }
 }
 
 impl ToTokens for Over {
-    fn to_tokens_with_context<S: TokenStream + ?Sized, C: ToSqlContext>(
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
         &self,
         s: &mut S,
         context: &C,
     ) -> Result<(), S::Error> {
         match self {
-            Self::Window(ref window) => window.to_tokens_with_context(s, context),
-            Self::Name(ref name) => name.to_tokens_with_context(s, context),
+            Self::Window(ref window) => window.to_tokens(s, context),
+            Self::Name(ref name) => name.to_tokens(s, context),
         }
     }
 }
 
 impl ToTokens for WindowDef {
-    fn to_tokens_with_context<S: TokenStream + ?Sized, C: ToSqlContext>(
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
         &self,
         s: &mut S,
         context: &C,
     ) -> Result<(), S::Error> {
-        self.name.to_tokens_with_context(s, context)?;
+        self.name.to_tokens(s, context)?;
         s.append(TK_AS, None)?;
-        self.window.to_tokens_with_context(s, context)
+        self.window.to_tokens(s, context)
     }
 }
 
 impl ToTokens for Window {
-    fn to_tokens_with_context<S: TokenStream + ?Sized, C: ToSqlContext>(
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
         &self,
         s: &mut S,
         context: &C,
     ) -> Result<(), S::Error> {
         s.append(TK_LP, None)?;
         if let Some(ref base) = self.base {
-            base.to_tokens_with_context(s, context)?;
+            base.to_tokens(s, context)?;
         }
         if !self.partition_by.is_empty() {
             s.append(TK_PARTITION, None)?;
@@ -2300,37 +2313,37 @@ impl ToTokens for Window {
             comma(&self.order_by, s, context)?;
         }
         if let Some(ref frame_clause) = self.frame_clause {
-            frame_clause.to_tokens_with_context(s, context)?;
+            frame_clause.to_tokens(s, context)?;
         }
         s.append(TK_RP, None)
     }
 }
 
 impl ToTokens for FrameClause {
-    fn to_tokens_with_context<S: TokenStream + ?Sized, C: ToSqlContext>(
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
         &self,
         s: &mut S,
         context: &C,
     ) -> Result<(), S::Error> {
-        self.mode.to_tokens_with_context(s, context)?;
+        self.mode.to_tokens(s, context)?;
         if let Some(ref end) = self.end {
             s.append(TK_BETWEEN, None)?;
-            self.start.to_tokens_with_context(s, context)?;
+            self.start.to_tokens(s, context)?;
             s.append(TK_AND, None)?;
-            end.to_tokens_with_context(s, context)?;
+            end.to_tokens(s, context)?;
         } else {
-            self.start.to_tokens_with_context(s, context)?;
+            self.start.to_tokens(s, context)?;
         }
         if let Some(ref exclude) = self.exclude {
             s.append(TK_EXCLUDE, None)?;
-            exclude.to_tokens_with_context(s, context)?;
+            exclude.to_tokens(s, context)?;
         }
         Ok(())
     }
 }
 
 impl ToTokens for FrameMode {
-    fn to_tokens_with_context<S: TokenStream + ?Sized, C: ToSqlContext>(
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
         &self,
         s: &mut S,
         _: &C,
@@ -2347,7 +2360,7 @@ impl ToTokens for FrameMode {
 }
 
 impl ToTokens for FrameBound {
-    fn to_tokens_with_context<S: TokenStream + ?Sized, C: ToSqlContext>(
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
         &self,
         s: &mut S,
         context: &C,
@@ -2358,11 +2371,11 @@ impl ToTokens for FrameBound {
                 s.append(TK_ROW, None)
             }
             Self::Following(value) => {
-                value.to_tokens_with_context(s, context)?;
+                value.to_tokens(s, context)?;
                 s.append(TK_FOLLOWING, None)
             }
             Self::Preceding(value) => {
-                value.to_tokens_with_context(s, context)?;
+                value.to_tokens(s, context)?;
                 s.append(TK_PRECEDING, None)
             }
             Self::UnboundedFollowing => {
@@ -2378,7 +2391,7 @@ impl ToTokens for FrameBound {
 }
 
 impl ToTokens for FrameExclude {
-    fn to_tokens_with_context<S: TokenStream + ?Sized, C: ToSqlContext>(
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
         &self,
         s: &mut S,
         _: &C,

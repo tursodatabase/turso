@@ -52,4 +52,7 @@ pub enum Error {
     // Custom error message
     #[error("{0}")]
     Custom(String),
+    // formatting error
+    #[error("{0}")]
+    FormatError(#[from] std::fmt::Error),
 }
