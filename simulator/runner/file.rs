@@ -150,7 +150,7 @@ impl File for SimulatorFile {
         self.inner.unlock_file()
     }
 
-    fn pread(&self, pos: usize, c: turso_core::Completion) -> Result<turso_core::Completion> {
+    fn pread(&self, pos: u64, c: turso_core::Completion) -> Result<turso_core::Completion> {
         self.nr_pread_calls.set(self.nr_pread_calls.get() + 1);
         if self.fault.get() {
             tracing::debug!("pread fault");
@@ -173,7 +173,7 @@ impl File for SimulatorFile {
 
     fn pwrite(
         &self,
-        pos: usize,
+        pos: u64,
         buffer: Arc<turso_core::Buffer>,
         c: turso_core::Completion,
     ) -> Result<turso_core::Completion> {
@@ -225,7 +225,7 @@ impl File for SimulatorFile {
 
     fn pwritev(
         &self,
-        pos: usize,
+        pos: u64,
         buffers: Vec<Arc<turso_core::Buffer>>,
         c: turso_core::Completion,
     ) -> Result<turso_core::Completion> {
@@ -255,7 +255,7 @@ impl File for SimulatorFile {
         self.inner.size()
     }
 
-    fn truncate(&self, len: usize, c: turso_core::Completion) -> Result<turso_core::Completion> {
+    fn truncate(&self, len: u64, c: turso_core::Completion) -> Result<turso_core::Completion> {
         if self.fault.get() {
             return Err(turso_core::LimboError::InternalError(
                 FAULT_ERROR_MSG.into(),

@@ -69,17 +69,12 @@ impl IO for MemoryIO {
         files.remove(path);
         Ok(())
     }
-
-    fn run_once(&self) -> Result<()> {
-        // nop
-        Ok(())
-    }
 }
 
 pub struct MemoryFile {
     path: String,
     pages: UnsafeCell<BTreeMap<usize, MemPage>>,
-    size: Cell<usize>,
+    size: Cell<u64>,
 }
 unsafe impl Send for MemoryFile {}
 unsafe impl Sync for MemoryFile {}
@@ -92,10 +87,10 @@ impl File for MemoryFile {
         Ok(())
     }
 
-    fn pread(&self, pos: usize, c: Completion) -> Result<Completion> {
+    fn pread(&self, pos: u64, c: Completion) -> Result<Completion> {
         tracing::debug!("pread(path={}): pos={}", self.path, pos);
         let r = c.as_read();
-        let buf_len = r.buf().len();
+        let buf_len = r.buf().len() as u64;
         if buf_len == 0 {
             c.complete(0);
             return Ok(c);
@@ -110,8 +105,8 @@ impl File for MemoryFile {
         let read_len = buf_len.min(file_size - pos);
         {
             let read_buf = r.buf();
-            let mut offset = pos;
-            let mut remaining = read_len;
+            let mut offset = pos as usize;
+            let mut remaining = read_len as usize;
             let mut buf_offset = 0;
 
             while remaining > 0 {
@@ -134,7 +129,7 @@ impl File for MemoryFile {
         Ok(c)
     }
 
-    fn pwrite(&self, pos: usize, buffer: Arc<Buffer>, c: Completion) -> Result<Completion> {
+    fn pwrite(&self, pos: u64, buffer: Arc<Buffer>, c: Completion) -> Result<Completion> {
         tracing::debug!(
             "pwrite(path={}): pos={}, size={}",
             self.path,
@@ -147,7 +142,7 @@ impl File for MemoryFile {
             return Ok(c);
         }
 
-        let mut offset = pos;
+        let mut offset = pos as usize;
         let mut remaining = buf_len;
         let mut buf_offset = 0;
         let data = &buffer.as_slice();
@@ -158,7 +153,7 @@ impl File for MemoryFile {
             let bytes_to_write = remaining.min(PAGE_SIZE - page_offset);
 
             {
-                let page = self.get_or_allocate_page(page_no);
+                let page = self.get_or_allocate_page(page_no as u64);
                 page[page_offset..page_offset + bytes_to_write]
                     .copy_from_slice(&data[buf_offset..buf_offset + bytes_to_write]);
             }
@@ -169,7 +164,7 @@ impl File for MemoryFile {
         }
 
         self.size
-            .set(core::cmp::max(pos + buf_len, self.size.get()));
+            .set(core::cmp::max(pos + buf_len as u64, self.size.get()));
 
         c.complete(buf_len as i32);
         Ok(c)
@@ -182,13 +177,13 @@ impl File for MemoryFile {
         Ok(c)
     }
 
-    fn truncate(&self, len: usize, c: Completion) -> Result<Completion> {
+    fn truncate(&self, len: u64, c: Completion) -> Result<Completion> {
         tracing::debug!("truncate(path={}): len={}", self.path, len);
         if len < self.size.get() {
             // Truncate pages
             unsafe {
                 let pages = &mut *self.pages.get();
-                pages.retain(|&k, _| k * PAGE_SIZE < len);
+                pages.retain(|&k, _| k * PAGE_SIZE < len as usize);
             }
         }
         self.size.set(len);
@@ -196,14 +191,14 @@ impl File for MemoryFile {
         Ok(c)
     }
 
-    fn pwritev(&self, pos: usize, buffers: Vec<Arc<Buffer>>, c: Completion) -> Result<Completion> {
+    fn pwritev(&self, pos: u64, buffers: Vec<Arc<Buffer>>, c: Completion) -> Result<Completion> {
         tracing::debug!(
             "pwritev(path={}): pos={}, buffers={:?}",
             self.path,
             pos,
             buffers.iter().map(|x| x.len()).collect::<Vec<_>>()
         );
-        let mut offset = pos;
+        let mut offset = pos as usize;
         let mut total_written = 0;
 
         for buffer in buffers {
@@ -222,7 +217,7 @@ impl File for MemoryFile {
                 let bytes_to_write = remaining.min(PAGE_SIZE - page_offset);
 
                 {
-                    let page = self.get_or_allocate_page(page_no);
+                    let page = self.get_or_allocate_page(page_no as u64);
                     page[page_offset..page_offset + bytes_to_write]
                         .copy_from_slice(&data[buf_offset..buf_offset + bytes_to_write]);
                 }
@@ -235,23 +230,23 @@ impl File for MemoryFile {
         }
         c.complete(total_written as i32);
         self.size
-            .set(core::cmp::max(pos + total_written, self.size.get()));
+            .set(core::cmp::max(pos + total_written as u64, self.size.get()));
         Ok(c)
     }
 
     fn size(&self) -> Result<u64> {
         tracing::debug!("size(path={}): {}", self.path, self.size.get());
-        Ok(self.size.get() as u64)
+        Ok(self.size.get())
     }
 }
 
 impl MemoryFile {
     #[allow(clippy::mut_from_ref)]
-    fn get_or_allocate_page(&self, page_no: usize) -> &mut MemPage {
+    fn get_or_allocate_page(&self, page_no: u64) -> &mut MemPage {
         unsafe {
             let pages = &mut *self.pages.get();
             pages
-                .entry(page_no)
+                .entry(page_no as usize)
                 .or_insert_with(|| Box::new([0; PAGE_SIZE]))
         }
     }

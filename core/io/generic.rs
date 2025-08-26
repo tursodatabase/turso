@@ -34,7 +34,7 @@ impl IO for GenericIO {
             memory_io: Arc::new(MemoryIO::new()),
         }))
     }
-    
+
     fn remove_file(&self, path: &str) -> Result<()> {
         trace!("remove_file(path = {})", path);
         std::fs::remove_file(path)?;
@@ -75,9 +75,9 @@ impl File for GenericFile {
         Ok(())
     }
 
-    fn pread(&self, pos: usize, c: Completion) -> Result<Completion> {
+    fn pread(&self, pos: u64, c: Completion) -> Result<Completion> {
         let mut file = self.file.borrow_mut();
-        file.seek(std::io::SeekFrom::Start(pos as u64))?;
+        file.seek(std::io::SeekFrom::Start(pos))?;
         {
             let r = c.as_read();
             let mut buf = r.buf();
@@ -88,9 +88,9 @@ impl File for GenericFile {
         Ok(c)
     }
 
-    fn pwrite(&self, pos: usize, buffer: Arc<crate::Buffer>, c: Completion) -> Result<Completion> {
+    fn pwrite(&self, pos: u64, buffer: Arc<crate::Buffer>, c: Completion) -> Result<Completion> {
         let mut file = self.file.borrow_mut();
-        file.seek(std::io::SeekFrom::Start(pos as u64))?;
+        file.seek(std::io::SeekFrom::Start(pos))?;
         let buf = buffer.as_slice();
         file.write_all(buf)?;
         c.complete(buf.len() as i32);
@@ -104,9 +104,9 @@ impl File for GenericFile {
         Ok(c)
     }
 
-    fn truncate(&self, len: usize, c: Completion) -> Result<Completion> {
+    fn truncate(&self, len: u64, c: Completion) -> Result<Completion> {
         let mut file = self.file.borrow_mut();
-        file.set_len(len as u64)?;
+        file.set_len(len)?;
         c.complete(0);
         Ok(c)
     }

@@ -68,7 +68,7 @@ impl DatabaseStorage for DatabaseFile {
         if !(512..=65536).contains(&size) || size & (size - 1) != 0 {
             return Err(LimboError::NotADB);
         }
-        let pos = (page_idx - 1) * size;
+        let pos = (page_idx as u64 - 1) * size as u64;
 
         if let Some(ctx) = encryption_ctx {
             let encryption_ctx = ctx.clone();
@@ -119,7 +119,7 @@ impl DatabaseStorage for DatabaseFile {
         assert!(buffer_size >= 512);
         assert!(buffer_size <= 65536);
         assert_eq!(buffer_size & (buffer_size - 1), 0);
-        let pos = (page_idx - 1) * buffer_size;
+        let pos = (page_idx as u64 - 1) * buffer_size as u64;
         let buffer = {
             if let Some(ctx) = encryption_ctx {
                 encrypt_buffer(page_idx, buffer, ctx)
@@ -143,7 +143,7 @@ impl DatabaseStorage for DatabaseFile {
         assert!(page_size <= 65536);
         assert_eq!(page_size & (page_size - 1), 0);
 
-        let pos = (first_page_idx - 1) * page_size;
+        let pos = (first_page_idx as u64 - 1) * (page_size as u64);
         let buffers = {
             if let Some(ctx) = encryption_key {
                 buffers
@@ -172,7 +172,7 @@ impl DatabaseStorage for DatabaseFile {
 
     #[instrument(skip_all, level = Level::INFO)]
     fn truncate(&self, len: usize, c: Completion) -> Result<Completion> {
-        let c = self.file.truncate(len, c)?;
+        let c = self.file.truncate(len as u64, c)?;
         Ok(c)
     }
 }

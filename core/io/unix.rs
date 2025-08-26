@@ -15,8 +15,6 @@ use std::{io::ErrorKind, sync::Arc};
 use tracing::debug;
 use tracing::{instrument, trace, Level};
 
-/// UnixIO lives longer than any of the files it creates, so it is
-/// safe to store references to it's internals in the UnixFiles
 pub struct UnixIO {}
 
 unsafe impl Send for UnixIO {}
@@ -127,24 +125,6 @@ impl IO for UnixIO {
     }
 }
 
-// enum CompletionCallback {
-//     Read(Arc<Mutex<std::fs::File>>, Completion, usize),
-//     Write(
-//         Arc<Mutex<std::fs::File>>,
-//         Completion,
-//         Arc<crate::Buffer>,
-//         usize,
-//     ),
-//     Writev(
-//         Arc<Mutex<std::fs::File>>,
-//         Completion,
-//         Vec<Arc<crate::Buffer>>,
-//         usize, // absolute file offset
-//         usize, // buf index
-//         usize, // intra-buf offset
-//     ),
-// }
-
 pub struct UnixFile {
     file: Arc<Mutex<std::fs::File>>,
 }
@@ -192,7 +172,7 @@ impl File for UnixFile {
     }
 
     #[instrument(err, skip_all, level = Level::TRACE)]
-    fn pread(&self, pos: usize, c: Completion) -> Result<Completion> {
+    fn pread(&self, pos: u64, c: Completion) -> Result<Completion> {
         let file = self.file.lock();
         let result = unsafe {
             let r = c.as_read();
@@ -217,9 +197,9 @@ impl File for UnixFile {
     }
 
     #[instrument(err, skip_all, level = Level::TRACE)]
-    fn pwrite(&self, pos: usize, buffer: Arc<crate::Buffer>, c: Completion) -> Result<Completion> {
+    fn pwrite(&self, pos: u64, buffer: Arc<crate::Buffer>, c: Completion) -> Result<Completion> {
         let file = self.file.lock();
-        let result = { rustix::io::pwrite(file.as_fd(), buffer.as_slice(), pos as u64) };
+        let result = { rustix::io::pwrite(file.as_fd(), buffer.as_slice(), pos) };
         match result {
             Ok(n) => {
                 trace!("pwrite n: {}", n);
@@ -234,7 +214,7 @@ impl File for UnixFile {
     #[instrument(err, skip_all, level = Level::TRACE)]
     fn pwritev(
         &self,
-        pos: usize,
+        pos: u64,
         buffers: Vec<Arc<crate::Buffer>>,
         c: Completion,
     ) -> Result<Completion> {
@@ -244,7 +224,7 @@ impl File for UnixFile {
         }
         let file = self.file.lock();
 
-        match try_pwritev_raw(file.as_raw_fd(), pos as u64, &buffers, 0, 0) {
+        match try_pwritev_raw(file.as_raw_fd(), pos, &buffers, 0, 0) {
             Ok(written) => {
                 trace!("pwritev wrote {written}");
                 c.complete(written as i32);
@@ -261,24 +241,21 @@ impl File for UnixFile {
         let file = self.file.lock();
 
         let result = unsafe {
-            
             #[cfg(not(any(target_os = "macos", target_os = "ios")))]
             {
                 libc::fsync(file.as_raw_fd())
             }
-            
+
             #[cfg(any(target_os = "macos", target_os = "ios"))]
             {
                 libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC)
             }
-            
         };
-        
+
         if result == -1 {
             let e = std::io::Error::last_os_error();
             Err(e.into())
         } else {
-
             #[cfg(not(any(target_os = "macos", target_os = "ios")))]
             trace!("fsync");
 
@@ -297,9 +274,9 @@ impl File for UnixFile {
     }
 
     #[instrument(err, skip_all, level = Level::INFO)]
-    fn truncate(&self, len: usize, c: Completion) -> Result<Completion> {
+    fn truncate(&self, len: u64, c: Completion) -> Result<Completion> {
         let file = self.file.lock();
-        let result = file.set_len(len as u64);
+        let result = file.set_len(len);
         match result {
             Ok(()) => {
                 trace!("file truncated to len=({})", len);

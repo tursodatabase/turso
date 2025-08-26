@@ -370,7 +370,7 @@ struct SortedChunk {
     /// The chunk file.
     file: Arc<dyn File>,
     /// Offset of the start of chunk in file
-    start_offset: usize,
+    start_offset: u64,
     /// The size of this chunk file in bytes.
     chunk_size: usize,
     /// The read buffer.
@@ -391,7 +391,7 @@ impl SortedChunk {
     fn new(file: Arc<dyn File>, start_offset: usize, buffer_size: usize) -> Self {
         Self {
             file,
-            start_offset,
+            start_offset: start_offset as u64,
             chunk_size: 0,
             buffer: Rc::new(RefCell::new(vec![0; buffer_size])),
             buffer_len: Rc::new(Cell::new(0)),
@@ -522,7 +522,7 @@ impl SortedChunk {
         let c = Completion::new_read(read_buffer_ref, read_complete);
         let c = self
             .file
-            .pread(self.start_offset + self.total_bytes_read.get(), c)?;
+            .pread(self.start_offset + self.total_bytes_read.get() as u64, c)?;
         Ok(c)
     }
 
