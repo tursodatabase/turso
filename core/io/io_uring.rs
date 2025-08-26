@@ -182,7 +182,7 @@ struct WritevState {
     /// File descriptor/id of the file we are writing to
     file_id: Fd,
     /// absolute file offset for next submit
-    file_pos: usize,
+    file_pos: u64,
     /// current buffer index in `bufs`
     current_buffer_idx: usize,
     /// intra-buffer offset
@@ -198,7 +198,7 @@ struct WritevState {
 }
 
 impl WritevState {
-    fn new(file: &UringFile, pos: usize, bufs: Vec<Arc<crate::Buffer>>) -> Self {
+    fn new(file: &UringFile, pos: u64, bufs: Vec<Arc<crate::Buffer>>) -> Self {
         let file_id = file
             .id()
             .map(Fd::Fixed)
@@ -223,23 +223,23 @@ impl WritevState {
 
     /// Advance (idx, off, pos) after written bytes
     #[inline(always)]
-    fn advance(&mut self, written: usize) {
+    fn advance(&mut self, written: u64) {
         let mut remaining = written;
         while remaining > 0 {
             let current_buf_len = self.bufs[self.current_buffer_idx].len();
             let left = current_buf_len - self.current_buffer_offset;
-            if remaining < left {
-                self.current_buffer_offset += remaining;
+            if remaining < left as u64 {
+                self.current_buffer_offset += remaining as usize;
                 self.file_pos += remaining;
                 remaining = 0;
             } else {
-                remaining -= left;
-                self.file_pos += left;
+                remaining -= left as u64;
+                self.file_pos += left as u64;
                 self.current_buffer_idx += 1;
                 self.current_buffer_offset = 0;
             }
         }
-        self.total_written += written;
+        self.total_written += written as usize;
     }
 
     #[inline(always)]
@@ -443,8 +443,8 @@ impl WrappedIOUring {
             return;
         }
 
-        let written = result as usize;
-        state.advance(written);
+        let written = result;
+        state.advance(written as u64);
         match state.remaining() {
             0 => {
                 tracing::info!(
@@ -643,7 +643,7 @@ impl File for UringFile {
         Ok(())
     }
 
-    fn pread(&self, pos: usize, c: Completion) -> Result<Completion> {
+    fn pread(&self, pos: u64, c: Completion) -> Result<Completion> {
         let r = c.as_read();
         let mut io = self.io.borrow_mut();
         let read_e = {
@@ -663,14 +663,14 @@ impl File for UringFile {
                         io.debug_check_fixed(idx, ptr, len);
                     }
                     io_uring::opcode::ReadFixed::new(fd, ptr, len as u32, idx as u16)
-                        .offset(pos as u64)
+                        .offset(pos)
                         .build()
                         .user_data(get_key(c.clone()))
                 } else {
                     trace!("pread(pos = {}, length = {})", pos, len);
                     // Use Read opcode if fixed buffer is not available
                     io_uring::opcode::Read::new(fd, buf.as_mut_ptr(), len as u32)
-                        .offset(pos as u64)
+                        .offset(pos)
                         .build()
                         .user_data(get_key(c.clone()))
                 }
@@ -680,7 +680,7 @@ impl File for UringFile {
         Ok(c)
     }
 
-    fn pwrite(&self, pos: usize, buffer: Arc<crate::Buffer>, c: Completion) -> Result<Completion> {
+    fn pwrite(&self, pos: u64, buffer: Arc<crate::Buffer>, c: Completion) -> Result<Completion> {
         let mut io = self.io.borrow_mut();
         let write = {
             let ptr = buffer.as_ptr();
@@ -698,13 +698,13 @@ impl File for UringFile {
                         io.debug_check_fixed(idx, ptr, len);
                     }
                     io_uring::opcode::WriteFixed::new(fd, ptr, len as u32, idx as u16)
-                        .offset(pos as u64)
+                        .offset(pos)
                         .build()
                         .user_data(get_key(c.clone()))
                 } else {
                     trace!("pwrite(pos = {}, length = {})", pos, buffer.len());
                     io_uring::opcode::Write::new(fd, ptr, len as u32)
-                        .offset(pos as u64)
+                        .offset(pos)
                         .build()
                         .user_data(get_key(c.clone()))
                 }
@@ -728,7 +728,7 @@ impl File for UringFile {
 
     fn pwritev(
         &self,
-        pos: usize,
+        pos: u64,
         bufs: Vec<Arc<crate::Buffer>>,
         c: Completion,
     ) -> Result<Completion> {
@@ -748,10 +748,10 @@ impl File for UringFile {
         Ok(self.file.metadata()?.len())
     }
 
-    fn truncate(&self, len: usize, c: Completion) -> Result<Completion> {
+    fn truncate(&self, len: u64, c: Completion) -> Result<Completion> {
         let mut io = self.io.borrow_mut();
         let truncate = with_fd!(self, |fd| {
-            io_uring::opcode::Ftruncate::new(fd, len as u64)
+            io_uring::opcode::Ftruncate::new(fd, len)
                 .build()
                 .user_data(get_key(c.clone()))
         });
