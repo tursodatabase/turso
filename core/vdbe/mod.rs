@@ -453,7 +453,14 @@ impl Program {
                 if !io.finished() {
                     return Ok(StepResult::IO);
                 }
-                state.io_completions = None;
+            }
+            let completions = state.io_completions.take();
+            if let Some(IOCompletions::Many {
+                done_cb: Some(callback),
+                ..
+            }) = completions
+            {
+                callback()?;
             }
             // invalidate row
             let _ = state.result_row.take();
