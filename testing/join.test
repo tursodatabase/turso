@@ -302,3 +302,12 @@ do_execsql_test left-join-backwards-iteration {
 } {12|Alan|
 11|Travis|accessories
 10|Daniel|coat}
+
+# regression test for issue 2794: not nulling out rowid properly when left join does not match
+do_execsql_test_on_specific_db {:memory:} min-null-regression-test {
+    create table t (x integer primary key, y);
+    create table u (x integer primary key, y);
+    insert into t values (1,1),(2,2);
+    insert into u values (1,1),(3,3);
+    select count(u.x) from t left join u using(y);
+} {1}

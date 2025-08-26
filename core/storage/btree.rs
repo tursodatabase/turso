@@ -4321,6 +4321,9 @@ impl BTreeCursor {
                 return Ok(IOResult::Done(None));
             }
         }
+        if self.get_null_flag() {
+            return Ok(IOResult::Done(None));
+        }
         if self.has_record.get() {
             let page = self.stack.top();
             let page = page.get();
