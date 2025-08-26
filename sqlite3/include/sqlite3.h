@@ -168,6 +168,7 @@ int sqlite3_bind_double(sqlite3_stmt *_stmt, int _idx, double _val);
 int sqlite3_bind_text(sqlite3_stmt *_stmt, int _idx, const char *_text, int _len, void *_destroy);
 
 int sqlite3_bind_blob(sqlite3_stmt *_stmt, int _idx, const void *_blob, int _len, void *_destroy);
+int sqlite3_bind_zeroblob(sqlite3_stmt *_smt, int _idx, int _n);
 
 int sqlite3_column_type(sqlite3_stmt *_stmt, int _idx);
 

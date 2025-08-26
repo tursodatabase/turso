@@ -94,6 +94,7 @@ pub struct sqlite3_stmt {
         *mut ffi::c_void,
     )>,
     pub(crate) next: *mut sqlite3_stmt,
+    pub deferred_zeroblob: Option<(usize, usize)>,
 }
 
 impl sqlite3_stmt {
@@ -103,6 +104,7 @@ impl sqlite3_stmt {
             stmt,
             destructors: Vec::new(),
             next: std::ptr::null_mut(),
+            deferred_zeroblob: None,
         }
     }
 }
@@ -331,6 +333,12 @@ pub unsafe extern "C" fn sqlite3_finalize(stmt: *mut sqlite3_stmt) -> ffi::c_int
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_step(stmt: *mut sqlite3_stmt) -> ffi::c_int {
     let stmt = &mut *stmt;
+    if let Some((col, size)) = stmt.deferred_zeroblob.take() {
+        if let Some(nz_idx) = std::num::NonZeroUsize::new(col) {
+            let blob = vec![0u8; size];
+            stmt.stmt.bind_at(nz_idx, turso_core::Value::Blob(blob));
+        }
+    }
     let db = &mut *stmt.db;
     loop {
         let _db = db.inner.lock().unwrap();
@@ -818,6 +826,40 @@ pub unsafe extern "C" fn sqlite3_bind_blob(
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn sqlite3_bind_zeroblob(
+    stmt: *mut sqlite3_stmt,
+    idx: ffi::c_int,
+    n: i64,
+) -> ffi::c_int {
+    sqlite3_bind_zeroblob64(stmt, idx, n)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn sqlite3_bind_zeroblob64(
+    stmt: *mut sqlite3_stmt,
+    idx: ffi::c_int,
+    n: i64,
+) -> ffi::c_int {
+    if stmt.is_null() {
+        return SQLITE_MISUSE;
+    }
+    if idx <= 0 {
+        return SQLITE_RANGE;
+    }
+    if n < 0 {
+        return SQLITE_ERROR;
+    }
+
+    let stmt_ref = &mut *stmt;
+    stmt_ref.stmt.bind_at(
+        NonZeroUsize::new(idx as usize).unwrap(),
+        Value::Blob(Vec::new()),
+    );
+    stmt_ref.deferred_zeroblob = Some((idx as usize, n as usize));
+    SQLITE_OK
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn sqlite3_clear_bindings(stmt: *mut sqlite3_stmt) -> ffi::c_int {
     if stmt.is_null() {
         return SQLITE_MISUSE;
@@ -940,6 +982,12 @@ pub unsafe extern "C" fn sqlite3_column_bytes(
     idx: ffi::c_int,
 ) -> ffi::c_int {
     let stmt = &mut *stmt;
+
+    if let Some((col, size)) = stmt.deferred_zeroblob {
+        if col == idx as usize {
+            return size as ffi::c_int;
+        }
+    }
     let row = stmt.stmt.row();
     let row = match row.as_ref() {
         Some(row) => row,
