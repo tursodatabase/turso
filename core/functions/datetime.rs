@@ -62,24 +62,35 @@ fn exec_datetime(values: &[Register], output_type: DateTimeOutput) -> Value {
 }
 
 fn modify_dt(dt: &mut NaiveDateTime, mods: &[Register], output_type: DateTimeOutput) -> Value {
+    let mut n_floor: i64 = 0;
     let mut subsec_requested = false;
-
     for modifier in mods {
         if let Value::Text(ref text_rc) = modifier.get_value() {
             // TODO: to prevent double conversion and properly support 'utc'/'localtime', we also
             // need to keep track of the current timezone and apply it to the modifier.
-            match apply_modifier(dt, text_rc.as_str()) {
+            let parsed = parse_modifier(text_rc.as_str());
+            if !matches!(parsed, Ok(Modifier::Floor) | Ok(Modifier::Ceiling)) {
+                n_floor = 0;
+            }
+
+            match apply_modifier(dt, text_rc.as_str(), &mut n_floor) {
                 Ok(true) => subsec_requested = true,
                 Ok(false) => {}
                 Err(_) => return Value::build_text(""),
+            }
+
+            if matches!(parsed, Ok(Modifier::Floor) | Ok(Modifier::Ceiling)) {
+                n_floor = 0;
             }
         } else {
             return Value::build_text("");
         }
     }
+
     if is_leap_second(dt) || *dt > get_max_datetime_exclusive() {
         return Value::build_text("");
     }
+
     format_dt(*dt, output_type, subsec_requested)
 }
 
@@ -95,7 +106,7 @@ fn format_dt(dt: NaiveDateTime, output_type: DateTimeOutput, subsec: bool) -> Va
             Value::from_text(t.as_str())
         }
         DateTimeOutput::DateTime => {
-            let t = if subsec {
+            let t = if subsec && dt.nanosecond() != 0 {
                 dt.format("%Y-%m-%d %H:%M:%S%.3f").to_string()
             } else {
                 dt.format("%Y-%m-%d %H:%M:%S").to_string()
@@ -134,9 +145,7 @@ fn strftime_format(dt: &NaiveDateTime, format_str: &str) -> String {
     }
 }
 
-// to prevent stripping the modifier string and comparing multiple times, this returns
-// whether the modifier was a subsec modifier because it impacts the format string
-fn apply_modifier(dt: &mut NaiveDateTime, modifier: &str) -> Result<bool> {
+fn apply_modifier(dt: &mut NaiveDateTime, modifier: &str, n_floor: &mut i64) -> Result<bool> {
     let parsed_modifier = parse_modifier(modifier)?;
 
     match parsed_modifier {
@@ -148,10 +157,10 @@ fn apply_modifier(dt: &mut NaiveDateTime, modifier: &str) -> Result<bool> {
             // Convert months to years + leftover months
             let years = m / 12;
             let leftover = m % 12;
-            add_years_and_months(dt, years, leftover)?;
+            add_years_and_months(dt, years, leftover, n_floor)?;
         }
         Modifier::Years(y) => {
-            add_years_and_months(dt, y, 0)?;
+            add_years_and_months(dt, y, 0, n_floor)?;
         }
         Modifier::TimeOffset(offset) => *dt += offset,
         Modifier::DateOffset {
@@ -159,9 +168,7 @@ fn apply_modifier(dt: &mut NaiveDateTime, modifier: &str) -> Result<bool> {
             months,
             days,
         } => {
-            *dt = dt
-                .checked_add_months(chrono::Months::new((years * 12 + months) as u32))
-                .ok_or_else(|| InvalidModifier("Invalid date offset".to_string()))?;
+            add_years_and_months(dt, years, months, n_floor)?;
             *dt += TimeDelta::days(days as i64);
         }
         Modifier::DateTimeOffset {
@@ -170,12 +177,20 @@ fn apply_modifier(dt: &mut NaiveDateTime, modifier: &str) -> Result<bool> {
             days,
             seconds,
         } => {
-            add_years_and_months(dt, years, months)?;
+            add_years_and_months(dt, years, months, n_floor)?;
             *dt += chrono::Duration::days(days as i64);
             *dt += chrono::Duration::seconds(seconds.into());
         }
-        Modifier::Ceiling => todo!(),
-        Modifier::Floor => todo!(),
+        Modifier::Floor => {
+            if *n_floor <= 0 {
+                return Ok(false);
+            }
+
+            *dt -= TimeDelta::days(*n_floor);
+        }
+        Modifier::Ceiling => {
+            *n_floor = 0;
+        }
         Modifier::StartOfMonth => {
             *dt = NaiveDate::from_ymd_opt(dt.year(), dt.month(), 1)
                 .unwrap()
@@ -222,16 +237,22 @@ fn is_julian_day_value(value: f64) -> bool {
     (0.0..5373484.5).contains(&value)
 }
 
-fn add_years_and_months(dt: &mut NaiveDateTime, years: i32, months: i32) -> Result<()> {
-    add_whole_years(dt, years)?;
-    add_months_in_increments(dt, months)?;
+fn add_years_and_months(
+    dt: &mut NaiveDateTime,
+    years: i32,
+    months: i32,
+    n_floor: &mut i64,
+) -> Result<()> {
+    add_whole_years(dt, years, n_floor)?;
+    add_months_in_increments(dt, months, n_floor)?;
     Ok(())
 }
 
-fn add_whole_years(dt: &mut NaiveDateTime, years: i32) -> Result<()> {
+fn add_whole_years(dt: &mut NaiveDateTime, years: i32, n_floor: &mut i64) -> Result<()> {
     if years == 0 {
         return Ok(());
     }
+
     let target_year = dt.year() + years;
     let (m, d, hh, mm, ss) = (dt.month(), dt.day(), dt.hour(), dt.minute(), dt.second());
 
@@ -255,16 +276,17 @@ fn add_whole_years(dt: &mut NaiveDateTime, years: i32) -> Result<()> {
             .ok_or_else(|| InvalidModifier("Invalid time format".to_string()))?;
 
         *dt = base_date + chrono::Duration::days(leftover as i64);
+        *n_floor += leftover as i64;
     } else {
         // do we fall back here?
     }
     Ok(())
 }
 
-fn add_months_in_increments(dt: &mut NaiveDateTime, months: i32) -> Result<()> {
+fn add_months_in_increments(dt: &mut NaiveDateTime, months: i32, n_floor: &mut i64) -> Result<()> {
     let step = if months >= 0 { 1 } else { -1 };
     for _ in 0..months.abs() {
-        add_one_month(dt, step)?;
+        add_one_month(dt, step, n_floor)?;
     }
     Ok(())
 }
@@ -275,7 +297,7 @@ fn add_months_in_increments(dt: &mut NaiveDateTime, months: i32) -> Result<()> {
 //
 // the modifiers 'ceiling' and 'floor' will determine behavior, so we'll need to eagerly
 // evaluate modifiers in the future to support those, and 'julianday'/'unixepoch'
-fn add_one_month(dt: &mut NaiveDateTime, step: i32) -> Result<()> {
+fn add_one_month(dt: &mut NaiveDateTime, step: i32, n_floor: &mut i64) -> Result<()> {
     let (y0, m0, d0) = (dt.year(), dt.month(), dt.day());
     let (hh, mm, ss) = (dt.hour(), dt.minute(), dt.second());
 
@@ -304,6 +326,7 @@ fn add_one_month(dt: &mut NaiveDateTime, step: i32) -> Result<()> {
             .ok_or_else(|| InvalidModifier("Invalid Auto format".to_string()))?;
 
         *dt = base_date + chrono::Duration::days(leftover as i64);
+        *n_floor += leftover as i64;
     }
     Ok(())
 }
@@ -1144,6 +1167,12 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_ceiling_modifier() {
+        assert_eq!(parse_modifier("ceiling").unwrap(), Modifier::Ceiling);
+        assert_eq!(parse_modifier("CEILING").unwrap(), Modifier::Ceiling);
+    }
+
+    #[test]
     fn test_parse_other_modifiers() {
         assert_eq!(parse_modifier("unixepoch").unwrap(), Modifier::UnixEpoch);
         assert_eq!(parse_modifier("UNIXEPOCH").unwrap(), Modifier::UnixEpoch);
@@ -1191,89 +1220,106 @@ mod tests {
     #[test]
     fn test_apply_modifier_days() {
         let mut dt = setup_datetime();
-        apply_modifier(&mut dt, "5 days").unwrap();
+        let mut n_floor = 0;
+        apply_modifier(&mut dt, "5 days", &mut n_floor).unwrap();
         assert_eq!(dt, create_datetime(2023, 6, 20, 12, 30, 45));
 
         dt = setup_datetime();
-        apply_modifier(&mut dt, "-3 days").unwrap();
+        let mut n_floor = 0;
+        apply_modifier(&mut dt, "-3 days", &mut n_floor).unwrap();
         assert_eq!(dt, create_datetime(2023, 6, 12, 12, 30, 45));
     }
 
     #[test]
     fn test_apply_modifier_hours() {
         let mut dt = setup_datetime();
-        apply_modifier(&mut dt, "6 hours").unwrap();
+        let mut n_floor = 0;
+        apply_modifier(&mut dt, "6 hours", &mut n_floor).unwrap();
         assert_eq!(dt, create_datetime(2023, 6, 15, 18, 30, 45));
 
         dt = setup_datetime();
-        apply_modifier(&mut dt, "-2 hours").unwrap();
+        let mut n_floor = 0;
+        apply_modifier(&mut dt, "-2 hours", &mut n_floor).unwrap();
         assert_eq!(dt, create_datetime(2023, 6, 15, 10, 30, 45));
     }
 
     #[test]
     fn test_apply_modifier_minutes() {
         let mut dt = setup_datetime();
-        apply_modifier(&mut dt, "45 minutes").unwrap();
+        let mut n_floor = 0;
+        apply_modifier(&mut dt, "45 minutes", &mut n_floor).unwrap();
         assert_eq!(dt, create_datetime(2023, 6, 15, 13, 15, 45));
 
         dt = setup_datetime();
-        apply_modifier(&mut dt, "-15 minutes").unwrap();
+        let mut n_floor = 0;
+        apply_modifier(&mut dt, "-15 minutes", &mut n_floor).unwrap();
         assert_eq!(dt, create_datetime(2023, 6, 15, 12, 15, 45));
     }
 
     #[test]
     fn test_apply_modifier_seconds() {
         let mut dt = setup_datetime();
-        apply_modifier(&mut dt, "30 seconds").unwrap();
+
+        let mut n_floor = 0;
+        apply_modifier(&mut dt, "30 seconds", &mut n_floor).unwrap();
         assert_eq!(dt, create_datetime(2023, 6, 15, 12, 31, 15));
 
         dt = setup_datetime();
-        apply_modifier(&mut dt, "-20 seconds").unwrap();
+        let mut n_floor = 0;
+        apply_modifier(&mut dt, "-20 seconds", &mut n_floor).unwrap();
         assert_eq!(dt, create_datetime(2023, 6, 15, 12, 30, 25));
     }
 
     #[test]
     fn test_apply_modifier_time_offset() {
         let mut dt = setup_datetime();
-        apply_modifier(&mut dt, "+01:30").unwrap();
+        let mut n_floor = 0;
+        apply_modifier(&mut dt, "+01:30", &mut n_floor).unwrap();
         assert_eq!(dt, create_datetime(2023, 6, 15, 14, 0, 45));
 
         dt = setup_datetime();
-        apply_modifier(&mut dt, "-00:45").unwrap();
+        let mut n_floor = 0;
+        apply_modifier(&mut dt, "-00:45", &mut n_floor).unwrap();
         assert_eq!(dt, create_datetime(2023, 6, 15, 11, 45, 45));
     }
 
     #[test]
     fn test_apply_modifier_date_time_offset() {
         let mut dt = setup_datetime();
-        apply_modifier(&mut dt, "+0001-01-01 01:01").unwrap();
+        let mut n_floor = 0;
+        apply_modifier(&mut dt, "+0001-01-01 01:01", &mut n_floor).unwrap();
         assert_eq!(dt, create_datetime(2024, 7, 16, 13, 31, 45));
 
         dt = setup_datetime();
-        apply_modifier(&mut dt, "-0001-01-01 01:01").unwrap();
+        let mut n_floor = 0;
+        apply_modifier(&mut dt, "-0001-01-01 01:01", &mut n_floor).unwrap();
         assert_eq!(dt, create_datetime(2022, 5, 14, 11, 29, 45));
 
         // Test with larger offsets
         dt = setup_datetime();
-        apply_modifier(&mut dt, "+0002-03-04 05:06").unwrap();
+        let mut n_floor = 0;
+        apply_modifier(&mut dt, "+0002-03-04 05:06", &mut n_floor).unwrap();
         assert_eq!(dt, create_datetime(2025, 9, 19, 17, 36, 45));
 
         dt = setup_datetime();
-        apply_modifier(&mut dt, "-0002-03-04 05:06").unwrap();
+        let mut n_floor = 0;
+        apply_modifier(&mut dt, "-0002-03-04 05:06", &mut n_floor).unwrap();
         assert_eq!(dt, create_datetime(2021, 3, 11, 7, 24, 45));
     }
 
     #[test]
     fn test_apply_modifier_start_of_year() {
         let mut dt = setup_datetime();
-        apply_modifier(&mut dt, "start of year").unwrap();
+        let mut n_floor = 0;
+        apply_modifier(&mut dt, "start of year", &mut n_floor).unwrap();
         assert_eq!(dt, create_datetime(2023, 1, 1, 0, 0, 0));
     }
 
     #[test]
     fn test_apply_modifier_start_of_day() {
         let mut dt = setup_datetime();
-        apply_modifier(&mut dt, "start of day").unwrap();
+        let mut n_floor = 0;
+        apply_modifier(&mut dt, "start of day", &mut n_floor).unwrap();
         assert_eq!(dt, create_datetime(2023, 6, 15, 0, 0, 0));
     }
 
@@ -1452,7 +1498,8 @@ mod tests {
     fn test_already_on_weekday_no_change() {
         // 2023-01-01 is a Sunday => weekday 0
         let mut dt = create_datetime(2023, 1, 1, 12, 0, 0);
-        apply_modifier(&mut dt, "weekday 0").unwrap();
+        let mut n_floor = 0;
+        apply_modifier(&mut dt, "weekday 0", &mut n_floor).unwrap();
         assert_eq!(dt, create_datetime(2023, 1, 1, 12, 0, 0));
         assert_eq!(weekday_sunday_based(&dt), 0);
     }
@@ -1462,14 +1509,16 @@ mod tests {
         // 2023-01-01 is a Sunday => weekday 0
         // "weekday 1" => next Monday => 2023-01-02
         let mut dt = create_datetime(2023, 1, 1, 12, 0, 0);
-        apply_modifier(&mut dt, "weekday 1").unwrap();
+        let mut n_floor = 0;
+        apply_modifier(&mut dt, "weekday 1", &mut n_floor).unwrap();
         assert_eq!(dt, create_datetime(2023, 1, 2, 12, 0, 0));
         assert_eq!(weekday_sunday_based(&dt), 1);
 
         // 2023-01-03 is a Tuesday => weekday 2
         // "weekday 5" => next Friday => 2023-01-06
         let mut dt = create_datetime(2023, 1, 3, 12, 0, 0);
-        apply_modifier(&mut dt, "weekday 5").unwrap();
+        let mut n_floor = 0;
+        apply_modifier(&mut dt, "weekday 5", &mut n_floor).unwrap();
         assert_eq!(dt, create_datetime(2023, 1, 6, 12, 0, 0));
         assert_eq!(weekday_sunday_based(&dt), 5);
     }
@@ -1479,12 +1528,13 @@ mod tests {
         // 2023-01-06 is a Friday => weekday 5
         // "weekday 0" => next Sunday => 2023-01-08
         let mut dt = create_datetime(2023, 1, 6, 12, 0, 0);
-        apply_modifier(&mut dt, "weekday 0").unwrap();
+        let mut n_floor = 0;
+        apply_modifier(&mut dt, "weekday 0", &mut n_floor).unwrap();
         assert_eq!(dt, create_datetime(2023, 1, 8, 12, 0, 0));
         assert_eq!(weekday_sunday_based(&dt), 0);
 
         // Now confirm that being on Sunday (weekday 0) and asking for "weekday 0" stays put
-        apply_modifier(&mut dt, "weekday 0").unwrap();
+        apply_modifier(&mut dt, "weekday 0", &mut n_floor).unwrap();
         assert_eq!(dt, create_datetime(2023, 1, 8, 12, 0, 0));
         assert_eq!(weekday_sunday_based(&dt), 0);
     }
@@ -1494,7 +1544,8 @@ mod tests {
         // 2023-01-05 is a Thursday => weekday 4
         // Asking for weekday 4 => no change
         let mut dt = create_datetime(2023, 1, 5, 12, 0, 0);
-        apply_modifier(&mut dt, "weekday 4").unwrap();
+        let mut n_floor = 0;
+        apply_modifier(&mut dt, "weekday 4", &mut n_floor).unwrap();
         assert_eq!(dt, create_datetime(2023, 1, 5, 12, 0, 0));
         assert_eq!(weekday_sunday_based(&dt), 4);
     }
@@ -1504,7 +1555,8 @@ mod tests {
         // 2023-01-06 is a Friday => weekday 5
         // Asking for weekday 5 => no change if already on Friday
         let mut dt = create_datetime(2023, 1, 6, 12, 0, 0);
-        apply_modifier(&mut dt, "weekday 5").unwrap();
+        let mut n_floor = 0;
+        apply_modifier(&mut dt, "weekday 5", &mut n_floor).unwrap();
         assert_eq!(dt, create_datetime(2023, 1, 6, 12, 0, 0));
         assert_eq!(weekday_sunday_based(&dt), 5);
     }
@@ -1526,7 +1578,8 @@ mod tests {
     #[test]
     fn test_apply_modifier_start_of_month() {
         let mut dt = create_datetime(2023, 6, 15, 12, 30, 45);
-        apply_modifier(&mut dt, "start of month").unwrap();
+        let mut n_floor = 0;
+        apply_modifier(&mut dt, "start of month", &mut n_floor).unwrap();
         assert_eq!(dt, create_datetime(2023, 6, 1, 0, 0, 0));
     }
 
@@ -1535,15 +1588,48 @@ mod tests {
         let mut dt = create_datetime(2023, 6, 15, 12, 30, 45);
         let dt_with_nanos = dt.with_nanosecond(123_456_789).unwrap();
         dt = dt_with_nanos;
-        apply_modifier(&mut dt, "subsec").unwrap();
+        let mut n_floor = 0;
+        apply_modifier(&mut dt, "subsec", &mut n_floor).unwrap();
         assert_eq!(dt, dt_with_nanos);
+    }
+
+    #[test]
+    fn test_apply_modifier_floor_modifier_n_floor_gt_0() {
+        let mut dt = create_datetime(2023, 6, 15, 12, 30, 45);
+        let mut n_floor = 3;
+
+        apply_modifier(&mut dt, "floor", &mut n_floor).unwrap();
+        assert_eq!(dt, create_datetime(2023, 6, 12, 12, 30, 45));
+    }
+
+    #[test]
+    fn test_apply_modifier_floor_modifier_n_floor_le_0() {
+        let mut dt = create_datetime(2023, 6, 15, 12, 30, 45);
+        let mut n_floor = 0;
+
+        apply_modifier(&mut dt, "floor", &mut n_floor).unwrap();
+        assert_eq!(dt, create_datetime(2023, 6, 15, 12, 30, 45));
+
+        n_floor = 2;
+        apply_modifier(&mut dt, "floor", &mut n_floor).unwrap();
+        assert_eq!(dt, create_datetime(2023, 6, 13, 12, 30, 45));
+    }
+
+    #[test]
+    fn test_apply_modifier_ceiling_modifier_sets_n_floor_to_zero() {
+        let mut dt = create_datetime(2023, 6, 15, 12, 30, 45);
+        let mut n_floor = 5;
+
+        apply_modifier(&mut dt, "ceiling", &mut n_floor).unwrap();
+        assert_eq!(n_floor, 0);
     }
 
     #[test]
     fn test_apply_modifier_start_of_month_basic() {
         // Basic check: from mid-month to the 1st at 00:00:00.
         let mut dt = create_datetime(2023, 6, 15, 12, 30, 45);
-        apply_modifier(&mut dt, "start of month").unwrap();
+        let mut n_floor = 0;
+        apply_modifier(&mut dt, "start of month", &mut n_floor).unwrap();
         assert_eq!(dt, create_datetime(2023, 6, 1, 0, 0, 0));
     }
 
@@ -1551,7 +1637,8 @@ mod tests {
     fn test_apply_modifier_start_of_month_already_at_first() {
         // If we're already at the start of the month, no change.
         let mut dt = create_datetime(2023, 6, 1, 0, 0, 0);
-        apply_modifier(&mut dt, "start of month").unwrap();
+        let mut n_floor = 0;
+        apply_modifier(&mut dt, "start of month", &mut n_floor).unwrap();
         assert_eq!(dt, create_datetime(2023, 6, 1, 0, 0, 0));
     }
 
@@ -1559,7 +1646,8 @@ mod tests {
     fn test_apply_modifier_start_of_month_edge_case() {
         // edge case: month boundary. 2023-07-31 -> start of July.
         let mut dt = create_datetime(2023, 7, 31, 23, 59, 59);
-        apply_modifier(&mut dt, "start of month").unwrap();
+        let mut n_floor = 0;
+        apply_modifier(&mut dt, "start of month", &mut n_floor).unwrap();
         assert_eq!(dt, create_datetime(2023, 7, 1, 0, 0, 0));
     }
 
@@ -1568,7 +1656,8 @@ mod tests {
         let mut dt = create_datetime(2023, 6, 15, 12, 30, 45);
         let dt_with_nanos = dt.with_nanosecond(123_456_789).unwrap();
         dt = dt_with_nanos;
-        apply_modifier(&mut dt, "subsec").unwrap();
+        let mut n_floor = 0;
+        apply_modifier(&mut dt, "subsec", &mut n_floor).unwrap();
         assert_eq!(dt, dt_with_nanos);
     }
 
@@ -1577,7 +1666,8 @@ mod tests {
         let mut dt = create_datetime(2025, 1, 2, 4, 12, 21)
             .with_nanosecond(891_000_000) // 891 milliseconds
             .unwrap();
-        apply_modifier(&mut dt, "subsec").unwrap();
+        let mut n_floor = 0;
+        apply_modifier(&mut dt, "subsec", &mut n_floor).unwrap();
 
         let formatted = dt.format("%Y-%m-%d %H:%M:%S%.3f").to_string();
         assert_eq!(formatted, "2025-01-02 04:12:21.891");
@@ -1586,7 +1676,8 @@ mod tests {
     #[test]
     fn test_apply_modifier_subsec_no_fractional_seconds() {
         let mut dt = create_datetime(2025, 1, 2, 4, 12, 21);
-        apply_modifier(&mut dt, "subsec").unwrap();
+        let mut n_floor = 0;
+        apply_modifier(&mut dt, "subsec", &mut n_floor).unwrap();
 
         let formatted = dt.format("%Y-%m-%d %H:%M:%S%.3f").to_string();
         assert_eq!(formatted, "2025-01-02 04:12:21.000");
@@ -1597,7 +1688,8 @@ mod tests {
         let mut dt = create_datetime(2025, 1, 2, 4, 12, 21)
             .with_nanosecond(891_123_456)
             .unwrap();
-        apply_modifier(&mut dt, "subsec").unwrap();
+        let mut n_floor = 0;
+        apply_modifier(&mut dt, "subsec", &mut n_floor).unwrap();
 
         let formatted = dt.format("%Y-%m-%d %H:%M:%S%.3f").to_string();
         assert_eq!(formatted, "2025-01-02 04:12:21.891");
