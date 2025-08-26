@@ -37,7 +37,7 @@ int main(void)
     test_sqlite3_bind_blob();
     test_sqlite3_column_type();
     test_sqlite3_column_decltype();
-    //test_sqlite3_next_stmt();
+    test_sqlite3_next_stmt();
     test_sqlite3_bind_zeroblob();
     return 0;
 }
