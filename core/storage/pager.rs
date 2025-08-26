@@ -1136,12 +1136,8 @@ impl Pager {
         let mut page_cache = self.page_cache.write();
         let page_key = PageCacheKey::new(page_idx);
         if let Some(page) = page_cache.get(&page_key)? {
-            if page.is_loaded() {
-                tracing::trace!("read_page(page_idx = {}) = cached", page_idx);
-                return Ok((page.clone(), None));
-            } else if !page.is_locked() {
-                page_cache.delete(page_key)?;
-            }
+            tracing::trace!("read_page(page_idx = {}) = cached", page_idx);
+            return Ok((page.clone(), None));
         }
         let (page, c) = self.read_page_no_cache(page_idx, None, false)?;
         self.cache_insert(page_idx, page.clone(), &mut page_cache)?;
@@ -2412,7 +2408,7 @@ mod tests {
                 let mut cache = cache.write();
                 let page_key = PageCacheKey::new(1);
                 let page = Page::new(1);
-                // Set loaded so that we avoid eviction due to the pagi
+                // Set loaded so that we avoid eviction, as we evict the page from cache if it is not locked and not loaded
                 page.set_loaded();
                 cache.insert(page_key, Arc::new(page)).unwrap();
             })

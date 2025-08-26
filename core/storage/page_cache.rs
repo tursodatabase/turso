@@ -165,6 +165,10 @@ impl DumbLruPageCache {
 
     pub fn get(&mut self, key: &PageCacheKey) -> Result<Option<PageRef>, CacheError> {
         if let Some(page) = self.peek(key, true) {
+            // Because we can abort a read_page completion, this means a page can be in the cache but be unloaded and unlocked.
+            // However, if we do not evict that page from the page cache, we will return an unloaded page later which will trigger
+            // assertions later on. This is worsened by the fact that page cache is not per `Statement`, so you can abort a completion
+            // in one Statement, and trigger some error in the next one if we don't evict the page here.
             if !page.is_loaded() && !page.is_locked() {
                 self.delete(*key)?;
                 Ok(None)
