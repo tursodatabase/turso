@@ -191,7 +191,7 @@ pub(crate) fn execute_interaction(
                 SimConnection::Disconnected => unreachable!(),
             };
             tracing::debug!(?interaction);
-            let results = interaction.execute_query(conn, &env.io);
+            let results = interaction.execute_query(conn);
             if results.is_err() {
                 tracing::error!(?results);
             }
