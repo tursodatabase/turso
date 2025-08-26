@@ -151,8 +151,7 @@ pub fn prepare_select_plan(
             }
             let (limit, offset) = select
                 .limit
-                .as_ref()
-                .map_or(Ok((None, None)), parse_limit)?;
+                .map_or(Ok((None, None)), |mut l| parse_limit(&mut l, connection))?;
 
             // FIXME: handle ORDER BY for compound selects
             if !select.order_by.is_empty() {
@@ -618,8 +617,8 @@ fn prepare_one_select_plan(
             plan.order_by = key;
 
             // Parse the LIMIT/OFFSET clause
-            (plan.limit, plan.offset) = limit.as_ref().map_or(Ok((None, None)), parse_limit)?;
-
+            (plan.limit, plan.offset) =
+                limit.map_or(Ok((None, None)), |mut l| parse_limit(&mut l, connection))?;
             // Return the unoptimized query plan
             Ok(plan)
         }

@@ -1,3 +1,5 @@
+use turso_parser::ast::{Expr, Literal, Name, Operator, UnaryOperator};
+
 use crate::{
     vdbe::{
         builder::ProgramBuilder,
@@ -30,7 +32,7 @@ pub fn emit_select_result(
     limit_ctx: Option<LimitCtx>,
 ) -> Result<()> {
     if let (Some(jump_to), Some(_)) = (offset_jump_to, label_on_limit_reached) {
-        emit_offset(program, plan, jump_to, reg_offset);
+        emit_offset(program, plan, jump_to, reg_offset, resolver);
     }
 
     let start_reg = reg_result_cols_start;
@@ -163,16 +165,68 @@ pub fn emit_offset(
     plan: &SelectPlan,
     jump_to: BranchOffset,
     reg_offset: Option<usize>,
+    resolver: &Resolver,
 ) {
-    match plan.offset {
-        Some(offset) if offset > 0 => {
-            program.add_comment(program.offset(), "OFFSET");
+    let Some(offset_expr) = &plan.offset else {
+        return;
+    };
+
+    if let Some(val) = try_fold_expr_to_i64(offset_expr) {
+        if val > 0 {
+            program.add_comment(program.offset(), "OFFSET const");
             program.emit_insn(Insn::IfPos {
                 reg: reg_offset.expect("reg_offset must be Some"),
                 target_pc: jump_to,
                 decrement_by: 1,
             });
         }
-        _ => {}
+        return;
+    }
+
+    let r = reg_offset.expect("reg_offset must be Some");
+
+    program.add_comment(program.offset(), "OFFSET expr");
+
+    _ = translate_expr(program, None, offset_expr, r, resolver);
+
+    program.emit_insn(Insn::MustBeInt { reg: r });
+
+    program.emit_insn(Insn::IfPos {
+        reg: r,
+        target_pc: jump_to,
+        decrement_by: 1,
+    });
+}
+
+#[allow(clippy::borrowed_box)]
+pub fn try_fold_expr_to_i64(expr: &Box<Expr>) -> Option<i64> {
+    match expr.as_ref() {
+        Expr::Literal(Literal::Numeric(n)) => n.parse::<i64>().ok(),
+        Expr::Literal(Literal::Null) => Some(0),
+        Expr::Id(Name::Ident(s)) => {
+            let lowered = s.to_ascii_lowercase();
+            if lowered == "true" {
+                Some(1)
+            } else if lowered == "false" {
+                Some(0)
+            } else {
+                None
+            }
+        }
+        Expr::Unary(UnaryOperator::Negative, inner) => try_fold_expr_to_i64(inner).map(|v| -v),
+        Expr::Unary(UnaryOperator::Positive, inner) => try_fold_expr_to_i64(inner),
+        Expr::Binary(left, op, right) => {
+            let l = try_fold_expr_to_i64(left)?;
+            let r = try_fold_expr_to_i64(right)?;
+            match op {
+                Operator::Add => Some(l.saturating_add(r)),
+                Operator::Subtract => Some(l.saturating_sub(r)),
+                Operator::Multiply => Some(l.saturating_mul(r)),
+                Operator::Divide if r != 0 => Some(l.saturating_div(r)),
+                _ => None,
+            }
+        }
+
+        _ => None,
     }
 }
