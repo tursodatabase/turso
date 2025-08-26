@@ -1616,27 +1616,23 @@ impl<'a> Parser<'a> {
                 }
                 TK_OR => {
                     eat_assert!(self, TK_OR);
-                    Expr::Binary(copy_result(dest), Operator::Or, self.parse_expr(pre + 1)?)
+                    let expr = self.parse_expr(pre + 1)?;
+                    Expr::Binary(copy_result(dest), Operator::Or, expr)
                 }
                 TK_AND => {
                     eat_assert!(self, TK_AND);
-                    Expr::Binary(copy_result(dest), Operator::And, self.parse_expr(pre + 1)?)
+                    let expr = self.parse_expr(pre + 1)?;
+                    Expr::Binary(copy_result(dest), Operator::And, expr)
                 }
                 TK_EQ => {
                     eat_assert!(self, TK_EQ);
-                    Expr::Binary(
-                        copy_result(dest),
-                        Operator::Equals,
-                        self.parse_expr(pre + 1)?,
-                    )
+                    let expr = self.parse_expr(pre + 1)?;
+                    Expr::Binary(copy_result(dest), Operator::Equals, expr)
                 }
                 TK_NE => {
                     eat_assert!(self, TK_NE);
-                    Expr::Binary(
-                        copy_result(dest),
-                        Operator::NotEquals,
-                        self.parse_expr(pre + 1)?,
-                    )
+                    let expr = self.parse_expr(pre + 1)?;
+                    Expr::Binary(copy_result(dest), Operator::NotEquals, expr)
                 }
                 TK_IS => {
                     eat_assert!(self, TK_IS);
@@ -1668,7 +1664,8 @@ impl<'a> Parser<'a> {
                         }
                     };
 
-                    Expr::Binary(copy_result(dest), op, self.parse_expr(pre + 1)?)
+                    let expr = self.parse_expr(pre + 1)?;
+                    Expr::Binary(copy_result(dest), op, expr)
                 }
                 TK_BETWEEN => {
                     eat_assert!(self, TK_BETWEEN);
@@ -1778,108 +1775,74 @@ impl<'a> Parser<'a> {
                 }
                 TK_LT => {
                     eat_assert!(self, TK_LT);
-                    Expr::Binary(copy_result(dest), Operator::Less, self.parse_expr(pre + 1)?)
+                    let expr = self.parse_expr(pre + 1)?;
+                    Expr::Binary(copy_result(dest), Operator::Less, expr)
                 }
                 TK_GT => {
                     eat_assert!(self, TK_GT);
-                    Expr::Binary(
-                        copy_result(dest),
-                        Operator::Greater,
-                        self.parse_expr(pre + 1)?,
-                    )
+                    let expr = self.parse_expr(pre + 1)?;
+                    Expr::Binary(copy_result(dest), Operator::Greater, expr)
                 }
                 TK_LE => {
                     eat_assert!(self, TK_LE);
-                    Expr::Binary(
-                        copy_result(dest),
-                        Operator::LessEquals,
-                        self.parse_expr(pre + 1)?,
-                    )
+                    let expr = self.parse_expr(pre + 1)?;
+                    Expr::Binary(copy_result(dest), Operator::LessEquals, expr)
                 }
                 TK_GE => {
                     eat_assert!(self, TK_GE);
-                    Expr::Binary(
-                        copy_result(dest),
-                        Operator::GreaterEquals,
-                        self.parse_expr(pre + 1)?,
-                    )
+                    let expr = self.parse_expr(pre + 1)?;
+                    Expr::Binary(copy_result(dest), Operator::GreaterEquals, expr)
                 }
                 TK_ESCAPE => unreachable!(),
                 TK_BITAND => {
                     eat_assert!(self, TK_BITAND);
-                    Expr::Binary(
-                        copy_result(dest),
-                        Operator::BitwiseAnd,
-                        self.parse_expr(pre + 1)?,
-                    )
+                    let expr = self.parse_expr(pre + 1)?;
+                    Expr::Binary(copy_result(dest), Operator::BitwiseAnd, expr)
                 }
                 TK_BITOR => {
                     eat_assert!(self, TK_BITOR);
-                    Expr::Binary(
-                        copy_result(dest),
-                        Operator::BitwiseOr,
-                        self.parse_expr(pre + 1)?,
-                    )
+                    let expr = self.parse_expr(pre + 1)?;
+                    Expr::Binary(copy_result(dest), Operator::BitwiseOr, expr)
                 }
                 TK_LSHIFT => {
                     eat_assert!(self, TK_LSHIFT);
-                    Expr::Binary(
-                        copy_result(dest),
-                        Operator::LeftShift,
-                        self.parse_expr(pre + 1)?,
-                    )
+                    let expr = self.parse_expr(pre + 1)?;
+                    Expr::Binary(copy_result(dest), Operator::LeftShift, expr)
                 }
                 TK_RSHIFT => {
                     eat_assert!(self, TK_RSHIFT);
-                    Expr::Binary(
-                        copy_result(dest),
-                        Operator::RightShift,
-                        self.parse_expr(pre + 1)?,
-                    )
+                    let expr = self.parse_expr(pre + 1)?;
+                    Expr::Binary(copy_result(dest), Operator::RightShift, expr)
                 }
                 TK_PLUS => {
                     eat_assert!(self, TK_PLUS);
-                    Expr::Binary(copy_result(dest), Operator::Add, self.parse_expr(pre + 1)?)
+                    let expr = self.parse_expr(pre + 1)?;
+                    Expr::Binary(copy_result(dest), Operator::Add, expr)
                 }
                 TK_MINUS => {
                     eat_assert!(self, TK_MINUS);
-                    Expr::Binary(
-                        copy_result(dest),
-                        Operator::Subtract,
-                        self.parse_expr(pre + 1)?,
-                    )
+                    let expr = self.parse_expr(pre + 1)?;
+                    Expr::Binary(copy_result(dest), Operator::Subtract, expr)
                 }
                 TK_STAR => {
                     eat_assert!(self, TK_STAR);
-                    Expr::Binary(
-                        copy_result(dest),
-                        Operator::Multiply,
-                        self.parse_expr(pre + 1)?,
-                    )
+                    let expr = self.parse_expr(pre + 1)?;
+                    Expr::Binary(copy_result(dest), Operator::Multiply, expr)
                 }
                 TK_SLASH => {
                     eat_assert!(self, TK_SLASH);
-                    Expr::Binary(
-                        copy_result(dest),
-                        Operator::Divide,
-                        self.parse_expr(pre + 1)?,
-                    )
+                    let expr = self.parse_expr(pre + 1)?;
+                    Expr::Binary(copy_result(dest), Operator::Divide, expr)
                 }
                 TK_REM => {
                     eat_assert!(self, TK_REM);
-                    Expr::Binary(
-                        copy_result(dest),
-                        Operator::Modulus,
-                        self.parse_expr(pre + 1)?,
-                    )
+                    let expr = self.parse_expr(pre + 1)?;
+                    Expr::Binary(copy_result(dest), Operator::Modulus, expr)
                 }
                 TK_CONCAT => {
                     eat_assert!(self, TK_CONCAT);
-                    Expr::Binary(
-                        copy_result(dest),
-                        Operator::Concat,
-                        self.parse_expr(pre + 1)?,
-                    )
+                    let expr = self.parse_expr(pre + 1)?;
+                    Expr::Binary(copy_result(dest), Operator::Concat, expr)
                 }
                 TK_PTR => {
                     let tok = eat_assert!(self, TK_PTR);
@@ -1889,9 +1852,13 @@ impl<'a> Parser<'a> {
                         Operator::ArrowRightShift
                     };
 
-                    Expr::Binary(copy_result(dest), op, self.parse_expr(pre + 1)?)
+                    let expr = self.parse_expr(pre + 1)?;
+                    Expr::Binary(copy_result(dest), op, expr)
                 }
-                TK_COLLATE => Expr::Collate(copy_result(dest), self.parse_collate()?.unwrap()),
+                TK_COLLATE => {
+                    let expr = self.parse_collate()?.unwrap();
+                    Expr::Collate(copy_result(dest), expr)
+                }
                 _ => unreachable!(),
             });
         }
