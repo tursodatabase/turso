@@ -1,3 +1,5 @@
+use std::mem::MaybeUninit;
+
 use crate::ast::{
     check::ColumnCount, AlterTable, AlterTableBody, As, Cmd, ColumnConstraint, ColumnDefinition,
     CommonTableExpr, CompoundOperator, CompoundSelect, CreateTableBody, CreateVirtualTable,
@@ -77,6 +79,264 @@ macro_rules! eat_expect {
             eat_assert!($parser, $( $x ),*)
         }
     };
+}
+
+macro_rules! parse_expr_operand {
+    ( $parser:expr, $f:expr ) => {{
+        let tok = peek_expect!(
+            $parser,
+            TK_LP,
+            TK_CAST,
+            TK_CTIME_KW,
+            TK_RAISE,
+            TK_ID,
+            TK_STRING,
+            TK_INDEXED,
+            TK_JOIN_KW,
+            TK_NULL,
+            TK_BLOB,
+            TK_FLOAT,
+            TK_INTEGER,
+            TK_VARIABLE,
+            TK_NOT,
+            TK_BITNOT,
+            TK_PLUS,
+            TK_MINUS,
+            TK_EXISTS,
+            TK_CASE,
+        );
+
+        match tok.token_type.unwrap() {
+            TK_LP => {
+                eat_assert!($parser, TK_LP);
+                match $parser.peek_no_eof()?.token_type.unwrap() {
+                    TK_WITH | TK_SELECT | TK_VALUES => {
+                        let select = $parser.parse_select()?;
+                        eat_expect!($parser, TK_RP);
+                        Ok($f(Expr::Subquery(select)))
+                    }
+                    _ => {
+                        let exprs = $parser.parse_nexpr_list()?;
+                        eat_expect!($parser, TK_RP);
+                        Ok($f(Expr::Parenthesized(exprs)))
+                    }
+                }
+            }
+            TK_NULL => {
+                eat_assert!($parser, TK_NULL);
+                Ok($f(Expr::Literal(Literal::Null)))
+            }
+            TK_BLOB => {
+                let tok = eat_assert!($parser, TK_BLOB);
+                Ok($f(Expr::Literal(Literal::Blob(from_bytes(tok.value)))))
+            }
+            TK_FLOAT => {
+                let tok = eat_assert!($parser, TK_FLOAT);
+                Ok($f(Expr::Literal(Literal::Numeric(from_bytes(tok.value)))))
+            }
+            TK_INTEGER => {
+                let tok = eat_assert!($parser, TK_INTEGER);
+                Ok($f(Expr::Literal(Literal::Numeric(from_bytes(tok.value)))))
+            }
+            TK_VARIABLE => {
+                let tok = eat_assert!($parser, TK_VARIABLE);
+                Ok($f(Expr::Variable(from_bytes(tok.value))))
+            }
+            TK_CAST => {
+                eat_assert!($parser, TK_CAST);
+                eat_expect!($parser, TK_LP);
+                let expr = $parser.parse_expr(0)?;
+                eat_expect!($parser, TK_AS);
+                let typ = $parser.parse_type()?;
+                eat_expect!($parser, TK_RP);
+                Ok($f(Expr::Cast {
+                    expr,
+                    type_name: typ,
+                }))
+            }
+            TK_CTIME_KW => {
+                let tok = eat_assert!($parser, TK_CTIME_KW);
+                if b"CURRENT_DATE".eq_ignore_ascii_case(tok.value) {
+                    Ok($f(Expr::Literal(Literal::CurrentDate)))
+                } else if b"CURRENT_TIME".eq_ignore_ascii_case(tok.value) {
+                    Ok($f(Expr::Literal(Literal::CurrentTime)))
+                } else if b"CURRENT_TIMESTAMP".eq_ignore_ascii_case(tok.value) {
+                    Ok($f(Expr::Literal(Literal::CurrentTimestamp)))
+                } else {
+                    unreachable!()
+                }
+            }
+            TK_NOT => {
+                eat_assert!($parser, TK_NOT);
+                let expr = $parser.parse_expr(2)?; // NOT precedence is 2
+                Ok($f(Expr::Unary(UnaryOperator::Not, expr)))
+            }
+            TK_BITNOT => {
+                eat_assert!($parser, TK_BITNOT);
+                let expr = $parser.parse_expr(11)?; // BITNOT precedence is 11
+                Ok($f(Expr::Unary(UnaryOperator::BitwiseNot, expr)))
+            }
+            TK_PLUS => {
+                eat_assert!($parser, TK_PLUS);
+                let expr = $parser.parse_expr(11)?; // PLUS precedence is 11
+                Ok($f(Expr::Unary(UnaryOperator::Positive, expr)))
+            }
+            TK_MINUS => {
+                eat_assert!($parser, TK_MINUS);
+                let expr = $parser.parse_expr(11)?; // MINUS precedence is 11
+                Ok($f(Expr::Unary(UnaryOperator::Negative, expr)))
+            }
+            TK_EXISTS => {
+                eat_assert!($parser, TK_EXISTS);
+                eat_expect!($parser, TK_LP);
+                let select = $parser.parse_select()?;
+                eat_expect!($parser, TK_RP);
+                Ok($f(Expr::Exists(select)))
+            }
+            TK_CASE => {
+                eat_assert!($parser, TK_CASE);
+                let base = if $parser.peek_no_eof()?.token_type.unwrap() != TK_WHEN {
+                    Some($parser.parse_expr(0)?)
+                } else {
+                    None
+                };
+
+                eat_expect!($parser, TK_WHEN);
+                let first_when = $parser.parse_expr_unbox(0)?;
+                eat_expect!($parser, TK_THEN);
+                let mut when_then_pairs = vec![(first_when, $parser.parse_expr_unbox(0)?)];
+
+                while let Some(tok) = $parser.peek()? {
+                    if tok.token_type.unwrap() != TK_WHEN {
+                        break;
+                    }
+
+                    eat_assert!($parser, TK_WHEN);
+                    let when = $parser.parse_expr_unbox(0)?;
+                    eat_expect!($parser, TK_THEN);
+                    let then = $parser.parse_expr_unbox(0)?;
+                    when_then_pairs.push((when, then));
+                }
+
+                let else_expr = if let Some(ok) = $parser.peek()? {
+                    if ok.token_type == Some(TK_ELSE) {
+                        eat_assert!($parser, TK_ELSE);
+                        Some($parser.parse_expr(0)?)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                eat_expect!($parser, TK_END);
+                Ok($f(Expr::Case {
+                    base,
+                    when_then_pairs,
+                    else_expr,
+                }))
+            }
+            TK_RAISE => {
+                eat_assert!($parser, TK_RAISE);
+                eat_expect!($parser, TK_LP);
+
+                let resolve = match $parser.peek_no_eof()?.token_type.unwrap() {
+                    TK_IGNORE => {
+                        eat_assert!($parser, TK_IGNORE);
+                        ResolveType::Ignore
+                    }
+                    _ => $parser.parse_raise_type()?,
+                };
+
+                let expr = if resolve != ResolveType::Ignore {
+                    eat_expect!($parser, TK_COMMA);
+                    Some($parser.parse_expr(0)?)
+                } else {
+                    None
+                };
+
+                eat_expect!($parser, TK_RP);
+                Ok($f(Expr::Raise(resolve, expr)))
+            }
+            _ => {
+                let can_be_lit_str = tok.token_type == Some(TK_STRING);
+                let name = $parser.parse_nm()?;
+
+                let second_name = if let Some(tok) = $parser.peek()? {
+                    if tok.token_type == Some(TK_DOT) {
+                        eat_assert!($parser, TK_DOT);
+                        Some($parser.parse_nm()?)
+                    } else if tok.token_type == Some(TK_LP) {
+                        if can_be_lit_str {
+                            return Err(Error::ParseUnexpectedToken {
+                                parsed_offset: ($parser.offset(), 1).into(),
+                                got: TK_STRING,
+                                expected: &[TK_ID, TK_INDEXED, TK_JOIN_KW],
+                            });
+                        } // can not be literal string in function name
+
+                        eat_assert!($parser, TK_LP);
+                        let tok = $parser.peek_no_eof()?;
+                        match tok.token_type.unwrap() {
+                            TK_STAR => {
+                                eat_assert!($parser, TK_STAR);
+                                eat_expect!($parser, TK_RP);
+                                return Ok($f(Expr::FunctionCallStar {
+                                    name,
+                                    filter_over: $parser.parse_filter_over()?,
+                                }));
+                            }
+                            _ => {
+                                let distinct = $parser.parse_distinct()?;
+                                let exprs = $parser.parse_expr_list()?;
+                                let order_by = $parser.parse_order_by()?;
+                                eat_expect!($parser, TK_RP);
+                                let filter_over = $parser.parse_filter_over()?;
+                                return Ok($f(Expr::FunctionCall {
+                                    name,
+                                    distinctness: distinct,
+                                    args: exprs,
+                                    order_by,
+                                    filter_over,
+                                }));
+                            }
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                let third_name = if let Some(tok) = $parser.peek()? {
+                    if tok.token_type == Some(TK_DOT) {
+                        debug_assert!(second_name.is_some());
+                        eat_assert!($parser, TK_DOT);
+                        Some($parser.parse_nm()?)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                if let Some(second_name) = second_name {
+                    if let Some(third_name) = third_name {
+                        Ok($f(Expr::DoublyQualified(name, second_name, third_name)))
+                    } else {
+                        Ok($f(Expr::Qualified(name, second_name)))
+                    }
+                } else if can_be_lit_str {
+                    Ok($f(Expr::Literal(match name {
+                        Name::Quoted(s) => Literal::String(s),
+                        Name::Ident(s) => Literal::String(s),
+                    })))
+                } else {
+                    Ok($f(Expr::Id(name)))
+                }
+            }
+        }
+    }};
 }
 
 #[inline(always)]
@@ -953,11 +1213,11 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_signed(&mut self) -> Result<Expr> {
+    fn parse_signed(&mut self) -> Result<Box<Expr>> {
         peek_expect!(self, TK_FLOAT, TK_INTEGER, TK_PLUS, TK_MINUS);
 
         let expr = self.parse_expr_operand()?;
-        match &expr {
+        match expr.as_ref() {
             Expr::Unary(_, inner) => match inner.as_ref() {
                 Expr::Literal(Literal::Numeric(_)) => Ok(expr),
                 _ => Err(Error::Custom(
@@ -998,14 +1258,11 @@ impl<'a> Parser<'a> {
                 let first_size = self.parse_signed()?;
                 let tok = eat_expect!(self, TK_RP, TK_COMMA);
                 match tok.token_type.unwrap() {
-                    TK_RP => Some(TypeSize::MaxSize(Box::new(first_size))),
+                    TK_RP => Some(TypeSize::MaxSize(first_size)),
                     TK_COMMA => {
                         let second_size = self.parse_signed()?;
                         eat_expect!(self, TK_RP);
-                        Some(TypeSize::TypeSize(
-                            Box::new(first_size),
-                            Box::new(second_size),
-                        ))
+                        Some(TypeSize::TypeSize(first_size, second_size))
                     }
                     _ => unreachable!(),
                 }
@@ -1101,7 +1358,7 @@ impl<'a> Parser<'a> {
         eat_expect!(self, TK_WHERE);
         let expr = self.parse_expr(0)?;
         eat_expect!(self, TK_RP);
-        Ok(Some(Box::new(expr)))
+        Ok(Some(expr))
     }
 
     fn parse_frame_opt(&mut self) -> Result<Option<FrameClause>> {
@@ -1144,7 +1401,7 @@ impl<'a> Parser<'a> {
                 FrameBound::CurrentRow
             }
             _ => {
-                let expr = Box::new(self.parse_expr(0)?);
+                let expr = self.parse_expr(0)?;
                 let tok = eat_expect!(self, TK_PRECEDING, TK_FOLLOWING);
                 match tok.token_type.unwrap() {
                     TK_PRECEDING => FrameBound::Preceding(expr),
@@ -1169,7 +1426,7 @@ impl<'a> Parser<'a> {
                     FrameBound::CurrentRow
                 }
                 _ => {
-                    let expr = Box::new(self.parse_expr(0)?);
+                    let expr = self.parse_expr(0)?;
                     let tok = eat_expect!(self, TK_PRECEDING, TK_FOLLOWING);
                     match tok.token_type.unwrap() {
                         TK_PRECEDING => FrameBound::Preceding(expr),
@@ -1288,256 +1545,14 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_expr_operand(&mut self) -> Result<Expr> {
-        let tok = peek_expect!(
-            self,
-            TK_LP,
-            TK_CAST,
-            TK_CTIME_KW,
-            TK_RAISE,
-            TK_ID,
-            TK_STRING,
-            TK_INDEXED,
-            TK_JOIN_KW,
-            TK_NULL,
-            TK_BLOB,
-            TK_FLOAT,
-            TK_INTEGER,
-            TK_VARIABLE,
-            TK_NOT,
-            TK_BITNOT,
-            TK_PLUS,
-            TK_MINUS,
-            TK_EXISTS,
-            TK_CASE,
-        );
-
-        match tok.token_type.unwrap() {
-            TK_LP => {
-                eat_assert!(self, TK_LP);
-                match self.peek_no_eof()?.token_type.unwrap() {
-                    TK_WITH | TK_SELECT | TK_VALUES => {
-                        let select = self.parse_select()?;
-                        eat_expect!(self, TK_RP);
-                        Ok(Expr::Subquery(select))
-                    }
-                    _ => {
-                        let exprs = self.parse_nexpr_list()?;
-                        eat_expect!(self, TK_RP);
-                        Ok(Expr::Parenthesized(exprs))
-                    }
-                }
-            }
-            TK_NULL => {
-                eat_assert!(self, TK_NULL);
-                Ok(Expr::Literal(Literal::Null))
-            }
-            TK_BLOB => {
-                let tok = eat_assert!(self, TK_BLOB);
-                Ok(Expr::Literal(Literal::Blob(from_bytes(tok.value))))
-            }
-            TK_FLOAT => {
-                let tok = eat_assert!(self, TK_FLOAT);
-                Ok(Expr::Literal(Literal::Numeric(from_bytes(tok.value))))
-            }
-            TK_INTEGER => {
-                let tok = eat_assert!(self, TK_INTEGER);
-                Ok(Expr::Literal(Literal::Numeric(from_bytes(tok.value))))
-            }
-            TK_VARIABLE => {
-                let tok = eat_assert!(self, TK_VARIABLE);
-                Ok(Expr::Variable(from_bytes(tok.value)))
-            }
-            TK_CAST => {
-                eat_assert!(self, TK_CAST);
-                eat_expect!(self, TK_LP);
-                let expr = self.parse_expr(0)?;
-                eat_expect!(self, TK_AS);
-                let typ = self.parse_type()?;
-                eat_expect!(self, TK_RP);
-                Ok(Expr::cast(expr, typ))
-            }
-            TK_CTIME_KW => {
-                let tok = eat_assert!(self, TK_CTIME_KW);
-                if b"CURRENT_DATE".eq_ignore_ascii_case(tok.value) {
-                    Ok(Expr::Literal(Literal::CurrentDate))
-                } else if b"CURRENT_TIME".eq_ignore_ascii_case(tok.value) {
-                    Ok(Expr::Literal(Literal::CurrentTime))
-                } else if b"CURRENT_TIMESTAMP".eq_ignore_ascii_case(tok.value) {
-                    Ok(Expr::Literal(Literal::CurrentTimestamp))
-                } else {
-                    unreachable!()
-                }
-            }
-            TK_NOT => {
-                eat_assert!(self, TK_NOT);
-                let expr = self.parse_expr(2)?; // NOT precedence is 2
-                Ok(Expr::unary(UnaryOperator::Not, expr))
-            }
-            TK_BITNOT => {
-                eat_assert!(self, TK_BITNOT);
-                let expr = self.parse_expr(11)?; // BITNOT precedence is 11
-                Ok(Expr::unary(UnaryOperator::BitwiseNot, expr))
-            }
-            TK_PLUS => {
-                eat_assert!(self, TK_PLUS);
-                let expr = self.parse_expr(11)?; // PLUS precedence is 11
-                Ok(Expr::unary(UnaryOperator::Positive, expr))
-            }
-            TK_MINUS => {
-                eat_assert!(self, TK_MINUS);
-                let expr = self.parse_expr(11)?; // MINUS precedence is 11
-                Ok(Expr::unary(UnaryOperator::Negative, expr))
-            }
-            TK_EXISTS => {
-                eat_assert!(self, TK_EXISTS);
-                eat_expect!(self, TK_LP);
-                let select = self.parse_select()?;
-                eat_expect!(self, TK_RP);
-                Ok(Expr::Exists(select))
-            }
-            TK_CASE => {
-                eat_assert!(self, TK_CASE);
-                let base = if self.peek_no_eof()?.token_type.unwrap() != TK_WHEN {
-                    Some(self.parse_expr(0)?)
-                } else {
-                    None
-                };
-
-                eat_expect!(self, TK_WHEN);
-                let first_when = self.parse_expr(0)?;
-                eat_expect!(self, TK_THEN);
-                let mut when_then_pairs = vec![(first_when, self.parse_expr(0)?)];
-
-                while let Some(tok) = self.peek()? {
-                    if tok.token_type.unwrap() != TK_WHEN {
-                        break;
-                    }
-
-                    eat_assert!(self, TK_WHEN);
-                    let when = self.parse_expr(0)?;
-                    eat_expect!(self, TK_THEN);
-                    let then = self.parse_expr(0)?;
-                    when_then_pairs.push((when, then));
-                }
-
-                let else_expr = if let Some(ok) = self.peek()? {
-                    if ok.token_type == Some(TK_ELSE) {
-                        eat_assert!(self, TK_ELSE);
-                        Some(self.parse_expr(0)?)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-
-                eat_expect!(self, TK_END);
-                Ok(Expr::case(base, when_then_pairs, else_expr))
-            }
-            TK_RAISE => {
-                eat_assert!(self, TK_RAISE);
-                eat_expect!(self, TK_LP);
-
-                let resolve = match self.peek_no_eof()?.token_type.unwrap() {
-                    TK_IGNORE => {
-                        eat_assert!(self, TK_IGNORE);
-                        ResolveType::Ignore
-                    }
-                    _ => self.parse_raise_type()?,
-                };
-
-                let expr = if resolve != ResolveType::Ignore {
-                    eat_expect!(self, TK_COMMA);
-                    Some(self.parse_expr(0)?)
-                } else {
-                    None
-                };
-
-                eat_expect!(self, TK_RP);
-                Ok(Expr::raise(resolve, expr))
-            }
-            _ => {
-                let can_be_lit_str = tok.token_type == Some(TK_STRING);
-                let name = self.parse_nm()?;
-
-                let second_name = if let Some(tok) = self.peek()? {
-                    if tok.token_type == Some(TK_DOT) {
-                        eat_assert!(self, TK_DOT);
-                        Some(self.parse_nm()?)
-                    } else if tok.token_type == Some(TK_LP) {
-                        if can_be_lit_str {
-                            return Err(Error::ParseUnexpectedToken {
-                                parsed_offset: (self.offset(), 1).into(),
-                                got: TK_STRING,
-                                expected: &[TK_ID, TK_INDEXED, TK_JOIN_KW],
-                            });
-                        } // can not be literal string in function name
-
-                        eat_assert!(self, TK_LP);
-                        let tok = self.peek_no_eof()?;
-                        match tok.token_type.unwrap() {
-                            TK_STAR => {
-                                eat_assert!(self, TK_STAR);
-                                eat_expect!(self, TK_RP);
-                                return Ok(Expr::FunctionCallStar {
-                                    name,
-                                    filter_over: self.parse_filter_over()?,
-                                });
-                            }
-                            _ => {
-                                let distinct = self.parse_distinct()?;
-                                let exprs = self.parse_expr_list()?;
-                                let order_by = self.parse_order_by()?;
-                                eat_expect!(self, TK_RP);
-                                let filter_over = self.parse_filter_over()?;
-                                return Ok(Expr::FunctionCall {
-                                    name,
-                                    distinctness: distinct,
-                                    args: exprs,
-                                    order_by,
-                                    filter_over,
-                                });
-                            }
-                        }
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-
-                let third_name = if let Some(tok) = self.peek()? {
-                    if tok.token_type == Some(TK_DOT) {
-                        debug_assert!(second_name.is_some());
-                        eat_assert!(self, TK_DOT);
-                        Some(self.parse_nm()?)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-
-                if let Some(second_name) = second_name {
-                    if let Some(third_name) = third_name {
-                        Ok(Expr::DoublyQualified(name, second_name, third_name))
-                    } else {
-                        Ok(Expr::Qualified(name, second_name))
-                    }
-                } else if can_be_lit_str {
-                    Ok(Expr::Literal(match name {
-                        Name::Quoted(s) => Literal::String(s),
-                        Name::Ident(s) => Literal::String(s),
-                    }))
-                } else {
-                    Ok(Expr::Id(name))
-                }
-            }
-        }
+    fn parse_expr_operand_unbox(&mut self) -> Result<Expr> {
+        parse_expr_operand!(self, |e: Expr| e)
     }
 
-    #[allow(clippy::vec_box)]
+    fn parse_expr_operand(&mut self) -> Result<Box<Expr>> {
+        parse_expr_operand!(self, Box::new)
+    }
+
     fn parse_expr_list(&mut self) -> Result<Vec<Expr>> {
         let mut exprs = vec![];
         while let Some(tok) = self.peek()? {
@@ -1548,7 +1563,10 @@ impl<'a> Parser<'a> {
                 _ => break,
             }
 
-            exprs.push(self.parse_expr(0)?);
+            exprs.push(Expr::Literal(Literal::Null));
+            // safe because we will drop the vector if error occurs
+            unsafe { self.write_expr(0, exprs.last_mut().unwrap() as *mut Expr)? };
+
             match self.peek_no_eof()?.token_type.unwrap() {
                 TK_COMMA => {
                     eat_assert!(self, TK_COMMA);
@@ -1560,8 +1578,17 @@ impl<'a> Parser<'a> {
         Ok(exprs)
     }
 
-    fn parse_expr(&mut self, precedence: u8) -> Result<Expr> {
-        let mut result = self.parse_expr_operand()?;
+    // this function is unsafe, make sure you know what you are doing
+    unsafe fn write_expr(&mut self, precedence: u8, dest: *mut Expr) -> Result<()> {
+        dest.write(self.parse_expr_operand_unbox()?);
+
+        // this function will be called before `write`
+        // so it safe to copy out and drop the previous value
+        unsafe fn copy_result(result: *const Expr) -> Box<Expr> {
+            let mut boxed = Box::new_uninit();
+            std::ptr::copy_nonoverlapping(result, boxed.as_mut_ptr(), 1);
+            boxed.assume_init()
+        }
 
         loop {
             let pre = match self.current_token_precedence()? {
@@ -1580,28 +1607,36 @@ impl<'a> Parser<'a> {
                 not = true;
             }
 
-            let expr = match tok.token_type.unwrap() {
+            dest.write(match tok.token_type.unwrap() {
                 TK_NULL => {
                     // special case `NOT NULL`
                     debug_assert!(not); // FIXME: not always true because of current_token_precedence
                     eat_assert!(self, TK_NULL);
-                    Expr::not_null(result)
+                    Expr::NotNull(copy_result(dest))
                 }
                 TK_OR => {
                     eat_assert!(self, TK_OR);
-                    Expr::binary(result, Operator::Or, self.parse_expr(pre + 1)?)
+                    Expr::Binary(copy_result(dest), Operator::Or, self.parse_expr(pre + 1)?)
                 }
                 TK_AND => {
                     eat_assert!(self, TK_AND);
-                    Expr::binary(result, Operator::And, self.parse_expr(pre + 1)?)
+                    Expr::Binary(copy_result(dest), Operator::And, self.parse_expr(pre + 1)?)
                 }
                 TK_EQ => {
                     eat_assert!(self, TK_EQ);
-                    Expr::binary(result, Operator::Equals, self.parse_expr(pre + 1)?)
+                    Expr::Binary(
+                        copy_result(dest),
+                        Operator::Equals,
+                        self.parse_expr(pre + 1)?,
+                    )
                 }
                 TK_NE => {
                     eat_assert!(self, TK_NE);
-                    Expr::binary(result, Operator::NotEquals, self.parse_expr(pre + 1)?)
+                    Expr::Binary(
+                        copy_result(dest),
+                        Operator::NotEquals,
+                        self.parse_expr(pre + 1)?,
+                    )
                 }
                 TK_IS => {
                     eat_assert!(self, TK_IS);
@@ -1633,14 +1668,19 @@ impl<'a> Parser<'a> {
                         }
                     };
 
-                    Expr::binary(result, op, self.parse_expr(pre + 1)?)
+                    Expr::Binary(copy_result(dest), op, self.parse_expr(pre + 1)?)
                 }
                 TK_BETWEEN => {
                     eat_assert!(self, TK_BETWEEN);
                     let start = self.parse_expr(pre)?;
                     eat_expect!(self, TK_AND);
                     let end = self.parse_expr(pre)?;
-                    Expr::between(result, not, start, end)
+                    Expr::Between {
+                        lhs: copy_result(dest),
+                        not,
+                        start,
+                        end,
+                    }
                 }
                 TK_IN => {
                     eat_assert!(self, TK_IN);
@@ -1653,12 +1693,20 @@ impl<'a> Parser<'a> {
                                 TK_SELECT | TK_WITH | TK_VALUES => {
                                     let select = self.parse_select()?;
                                     eat_expect!(self, TK_RP);
-                                    Expr::in_select(result, not, select)
+                                    Expr::InSelect {
+                                        lhs: copy_result(dest),
+                                        not,
+                                        rhs: select,
+                                    }
                                 }
                                 _ => {
                                     let exprs = self.parse_expr_list()?;
                                     eat_expect!(self, TK_RP);
-                                    Expr::in_list(result, not, exprs)
+                                    Expr::InList {
+                                        lhs: copy_result(dest),
+                                        not,
+                                        rhs: exprs,
+                                    }
                                 }
                             }
                         }
@@ -1672,7 +1720,13 @@ impl<'a> Parser<'a> {
                                     eat_expect!(self, TK_RP);
                                 }
                             }
-                            Expr::in_table(result, not, name, exprs)
+
+                            Expr::InTable {
+                                lhs: copy_result(dest),
+                                not,
+                                rhs: name,
+                                args: exprs,
+                            }
                         }
                     }
                 }
@@ -1706,72 +1760,126 @@ impl<'a> Parser<'a> {
                         None
                     };
 
-                    Expr::like(result, not, op, expr, escape)
+                    Expr::Like {
+                        lhs: copy_result(dest),
+                        not,
+                        op,
+                        rhs: expr,
+                        escape,
+                    }
                 }
                 TK_ISNULL => {
                     eat_assert!(self, TK_ISNULL);
-                    Expr::is_null(result)
+                    Expr::IsNull(copy_result(dest))
                 }
                 TK_NOTNULL => {
                     eat_assert!(self, TK_NOTNULL);
-                    Expr::not_null(result)
+                    Expr::NotNull(copy_result(dest))
                 }
                 TK_LT => {
                     eat_assert!(self, TK_LT);
-                    Expr::binary(result, Operator::Less, self.parse_expr(pre + 1)?)
+                    Expr::Binary(copy_result(dest), Operator::Less, self.parse_expr(pre + 1)?)
                 }
                 TK_GT => {
                     eat_assert!(self, TK_GT);
-                    Expr::binary(result, Operator::Greater, self.parse_expr(pre + 1)?)
+                    Expr::Binary(
+                        copy_result(dest),
+                        Operator::Greater,
+                        self.parse_expr(pre + 1)?,
+                    )
                 }
                 TK_LE => {
                     eat_assert!(self, TK_LE);
-                    Expr::binary(result, Operator::LessEquals, self.parse_expr(pre + 1)?)
+                    Expr::Binary(
+                        copy_result(dest),
+                        Operator::LessEquals,
+                        self.parse_expr(pre + 1)?,
+                    )
                 }
                 TK_GE => {
                     eat_assert!(self, TK_GE);
-                    Expr::binary(result, Operator::GreaterEquals, self.parse_expr(pre + 1)?)
+                    Expr::Binary(
+                        copy_result(dest),
+                        Operator::GreaterEquals,
+                        self.parse_expr(pre + 1)?,
+                    )
                 }
                 TK_ESCAPE => unreachable!(),
                 TK_BITAND => {
                     eat_assert!(self, TK_BITAND);
-                    Expr::binary(result, Operator::BitwiseAnd, self.parse_expr(pre + 1)?)
+                    Expr::Binary(
+                        copy_result(dest),
+                        Operator::BitwiseAnd,
+                        self.parse_expr(pre + 1)?,
+                    )
                 }
                 TK_BITOR => {
                     eat_assert!(self, TK_BITOR);
-                    Expr::binary(result, Operator::BitwiseOr, self.parse_expr(pre + 1)?)
+                    Expr::Binary(
+                        copy_result(dest),
+                        Operator::BitwiseOr,
+                        self.parse_expr(pre + 1)?,
+                    )
                 }
                 TK_LSHIFT => {
                     eat_assert!(self, TK_LSHIFT);
-                    Expr::binary(result, Operator::LeftShift, self.parse_expr(pre + 1)?)
+                    Expr::Binary(
+                        copy_result(dest),
+                        Operator::LeftShift,
+                        self.parse_expr(pre + 1)?,
+                    )
                 }
                 TK_RSHIFT => {
                     eat_assert!(self, TK_RSHIFT);
-                    Expr::binary(result, Operator::RightShift, self.parse_expr(pre + 1)?)
+                    Expr::Binary(
+                        copy_result(dest),
+                        Operator::RightShift,
+                        self.parse_expr(pre + 1)?,
+                    )
                 }
                 TK_PLUS => {
                     eat_assert!(self, TK_PLUS);
-                    Expr::binary(result, Operator::Add, self.parse_expr(pre + 1)?)
+                    Expr::Binary(copy_result(dest), Operator::Add, self.parse_expr(pre + 1)?)
                 }
                 TK_MINUS => {
                     eat_assert!(self, TK_MINUS);
-                    Expr::binary(result, Operator::Subtract, self.parse_expr(pre + 1)?)
+                    Expr::Binary(
+                        copy_result(dest),
+                        Operator::Subtract,
+                        self.parse_expr(pre + 1)?,
+                    )
                 }
                 TK_STAR => {
                     eat_assert!(self, TK_STAR);
-                    Expr::binary(result, Operator::Multiply, self.parse_expr(pre + 1)?)
+                    Expr::Binary(
+                        copy_result(dest),
+                        Operator::Multiply,
+                        self.parse_expr(pre + 1)?,
+                    )
                 }
                 TK_SLASH => {
                     eat_assert!(self, TK_SLASH);
-                    Expr::binary(result, Operator::Divide, self.parse_expr(pre + 1)?)
+                    Expr::Binary(
+                        copy_result(dest),
+                        Operator::Divide,
+                        self.parse_expr(pre + 1)?,
+                    )
                 }
                 TK_REM => {
                     eat_assert!(self, TK_REM);
-                    Expr::binary(result, Operator::Modulus, self.parse_expr(pre + 1)?)
+                    Expr::Binary(
+                        copy_result(dest),
+                        Operator::Modulus,
+                        self.parse_expr(pre + 1)?,
+                    )
                 }
                 TK_CONCAT => {
                     eat_assert!(self, TK_CONCAT);
-                    Expr::binary(result, Operator::Concat, self.parse_expr(pre + 1)?)
+                    Expr::Binary(
+                        copy_result(dest),
+                        Operator::Concat,
+                        self.parse_expr(pre + 1)?,
+                    )
                 }
                 TK_PTR => {
                     let tok = eat_assert!(self, TK_PTR);
@@ -1781,16 +1889,41 @@ impl<'a> Parser<'a> {
                         Operator::ArrowRightShift
                     };
 
-                    Expr::binary(result, op, self.parse_expr(pre + 1)?)
+                    Expr::Binary(copy_result(dest), op, self.parse_expr(pre + 1)?)
                 }
-                TK_COLLATE => Expr::collate(result, self.parse_collate()?.unwrap()),
+                TK_COLLATE => Expr::Collate(copy_result(dest), self.parse_collate()?.unwrap()),
                 _ => unreachable!(),
-            };
-
-            result = expr;
+            });
         }
 
-        Ok(result)
+        Ok(())
+    }
+
+    fn parse_expr_unbox(&mut self, precedence: u8) -> Result<Expr> {
+        let mut result = MaybeUninit::new(Expr::Literal(Literal::Null));
+        match unsafe { self.write_expr(precedence, result.as_mut_ptr()) } {
+            Ok(()) => Ok(unsafe { result.assume_init() }),
+            Err(e) => {
+                unsafe {
+                    result.assume_init_drop();
+                } // safe because we always write something first
+                Err(e)
+            }
+        }
+    }
+
+    fn parse_expr(&mut self, precedence: u8) -> Result<Box<Expr>> {
+        let mut result = Box::new_uninit();
+        result.write(Expr::Literal(Literal::Null));
+        match unsafe { self.write_expr(precedence, result.as_mut_ptr()) } {
+            Ok(()) => Ok(unsafe { result.assume_init() }),
+            Err(e) => {
+                unsafe {
+                    result.assume_init_drop();
+                } // safe because we always write something first
+                Err(e)
+            }
+        }
     }
 
     fn parse_collate(&mut self) -> Result<Option<Name>> {
@@ -2005,10 +2138,7 @@ impl<'a> Parser<'a> {
             _ => None,
         };
 
-        Ok(Some(GroupBy {
-            exprs,
-            having: having.map(Box::new),
-        }))
+        Ok(Some(GroupBy { exprs, having }))
     }
 
     fn parse_where(&mut self) -> Result<Option<Box<Expr>>> {
@@ -2018,7 +2148,7 @@ impl<'a> Parser<'a> {
                 TK_WHERE => {
                     eat_assert!(self, TK_WHERE);
                     let expr = self.parse_expr(0)?;
-                    Ok(Some(expr.into_boxed()))
+                    Ok(Some(expr))
                 }
                 _ => Ok(None),
             },
@@ -2080,7 +2210,7 @@ impl<'a> Parser<'a> {
                 TK_ON => {
                     eat_assert!(self, TK_ON);
                     let expr = self.parse_expr(0)?;
-                    Ok(Some(JoinConstraint::On(expr.into_boxed())))
+                    Ok(Some(JoinConstraint::On(expr)))
                 }
                 TK_USING => {
                     eat_assert!(self, TK_USING);
@@ -2308,7 +2438,7 @@ impl<'a> Parser<'a> {
 
                 let expr = self.parse_expr(0)?;
                 let alias = self.parse_as()?;
-                Ok(ResultColumn::Expr(expr.into_boxed(), alias))
+                Ok(ResultColumn::Expr(expr, alias))
             }
         }
     }
@@ -2329,9 +2459,11 @@ impl<'a> Parser<'a> {
         Ok(result)
     }
 
-    #[allow(clippy::vec_box)]
     fn parse_nexpr_list(&mut self) -> Result<Vec<Expr>> {
-        let mut result = vec![self.parse_expr(0)?];
+        let mut result = vec![Expr::Literal(Literal::Null)];
+        // safe because we will drop the vector if error occurs
+        unsafe { self.write_expr(0, result.last_mut().unwrap() as *mut Expr)? };
+
         while let Some(tok) = self.peek()? {
             if tok.token_type == Some(TK_COMMA) {
                 eat_assert!(self, TK_COMMA);
@@ -2339,7 +2471,9 @@ impl<'a> Parser<'a> {
                 break;
             }
 
-            result.push(self.parse_expr(0)?);
+            result.push(Expr::Literal(Literal::Null));
+            // safe because we will drop the vector if error occurs
+            unsafe { self.write_expr(0, result.last_mut().unwrap() as *mut Expr)? };
         }
 
         Ok(result)
@@ -2428,7 +2562,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_sorted_column(&mut self) -> Result<SortedColumn> {
-        let expr = self.parse_expr(0)?.into_boxed();
+        let expr = self.parse_expr(0)?;
         let sort_order = self.parse_sort_order()?;
 
         let nulls = match self.peek()? {
@@ -2492,7 +2626,7 @@ impl<'a> Parser<'a> {
             return Ok(None);
         }
 
-        let limit = self.parse_expr(0)?.into_boxed();
+        let limit = self.parse_expr(0)?;
         let offset = match self.peek()? {
             Some(tok) => match tok.token_type.unwrap() {
                 TK_OFFSET | TK_COMMA => {
@@ -2502,8 +2636,7 @@ impl<'a> Parser<'a> {
                 _ => None,
             },
             _ => None,
-        }
-        .map(Box::new);
+        };
 
         Ok(Some(Limit {
             expr: limit,
@@ -2560,7 +2693,7 @@ impl<'a> Parser<'a> {
         eat_expect!(self, TK_LP);
         let expr = self.parse_expr(0)?;
         eat_expect!(self, TK_RP);
-        Ok(TableConstraint::Check(expr.into_boxed()))
+        Ok(TableConstraint::Check(expr))
     }
 
     fn parse_foreign_key_table_constraint(&mut self) -> Result<TableConstraint> {
@@ -2847,7 +2980,7 @@ impl<'a> Parser<'a> {
             _ => None,
         };
 
-        Ok(Stmt::attach(expr, db_name, key))
+        Ok(Stmt::Attach { expr, db_name, key })
     }
 
     fn parse_detach(&mut self) -> Result<Stmt> {
@@ -2857,20 +2990,23 @@ impl<'a> Parser<'a> {
         }
 
         Ok(Stmt::Detach {
-            name: self.parse_expr(0)?.into_boxed(),
+            name: self.parse_expr(0)?,
         })
     }
 
     fn parse_pragma_value(&mut self) -> Result<PragmaValue> {
-        let expr = match self.peek_no_eof()?.token_type.unwrap().fallback_id_if_ok() {
+        match self.peek_no_eof()?.token_type.unwrap().fallback_id_if_ok() {
             TK_ON | TK_DELETE | TK_DEFAULT => {
                 let tok = eat_assert!(self, TK_ON, TK_DELETE, TK_DEFAULT);
-                Expr::Literal(Literal::Keyword(from_bytes(tok.value)))
+                Ok(Box::new(Expr::Literal(Literal::Keyword(from_bytes(
+                    tok.value,
+                )))))
             }
-            TK_ID | TK_STRING | TK_INDEXED | TK_JOIN_KW => Expr::Name(self.parse_nm()?),
-            _ => self.parse_signed()?,
-        };
-        Ok(Box::new(expr))
+            TK_ID | TK_STRING | TK_INDEXED | TK_JOIN_KW => {
+                Ok(Box::new(Expr::Name(self.parse_nm()?)))
+            }
+            _ => self.parse_signed(),
+        }
     }
 
     fn parse_pragma(&mut self) -> Result<Stmt> {
@@ -2919,7 +3055,7 @@ impl<'a> Parser<'a> {
             _ => None,
         };
 
-        Ok(Stmt::vacuum(name, into))
+        Ok(Stmt::Vacuum { name, into })
     }
 
     fn parse_term(&mut self) -> Result<Box<Expr>> {
@@ -2933,7 +3069,7 @@ impl<'a> Parser<'a> {
             TK_CTIME_KW,
         );
 
-        self.parse_expr_operand().map(Box::new)
+        self.parse_expr_operand()
     }
 
     fn parse_default_column_constraint(&mut self) -> Result<ColumnConstraint> {
@@ -2941,7 +3077,7 @@ impl<'a> Parser<'a> {
         match self.peek_no_eof()?.token_type.unwrap().fallback_id_if_ok() {
             TK_LP => {
                 eat_assert!(self, TK_LP);
-                let expr = self.parse_expr(0)?;
+                let expr = self.parse_expr_unbox(0)?;
                 eat_expect!(self, TK_RP);
                 Ok(ColumnConstraint::Default(Box::new(Expr::Parenthesized(
                     vec![expr],
@@ -3064,7 +3200,7 @@ impl<'a> Parser<'a> {
         eat_expect!(self, TK_LP);
         let expr = self.parse_expr(0)?;
         eat_expect!(self, TK_RP);
-        Ok(ColumnConstraint::Check(expr.into_boxed()))
+        Ok(ColumnConstraint::Check(expr))
     }
 
     fn parse_ref_act(&mut self) -> Result<RefAct> {
@@ -3185,7 +3321,7 @@ impl<'a> Parser<'a> {
         }
 
         eat_expect!(self, TK_LP);
-        let expr = self.parse_expr(0)?.into_boxed();
+        let expr = self.parse_expr(0)?;
         eat_expect!(self, TK_RP);
 
         let typ = match self.peek()? {
@@ -3421,7 +3557,7 @@ impl<'a> Parser<'a> {
                 eat_expect!(self, TK_EQ);
                 Ok(Set {
                     col_names: names,
-                    expr: self.parse_expr(0)?.into_boxed(),
+                    expr: self.parse_expr(0)?,
                 })
             }
             _ => {
@@ -3429,7 +3565,7 @@ impl<'a> Parser<'a> {
                 eat_expect!(self, TK_EQ);
                 Ok(Set {
                     col_names: vec![name],
-                    expr: self.parse_expr(0)?.into_boxed(),
+                    expr: self.parse_expr(0)?,
                 })
             }
         }
@@ -3658,8 +3794,7 @@ impl<'a> Parser<'a> {
                 Some(self.parse_expr(0)?)
             }
             _ => None,
-        }
-        .map(Box::new);
+        };
 
         eat_expect!(self, TK_BEGIN);
 
@@ -4146,9 +4281,9 @@ mod tests {
                         select: OneSelect::Select {
                             distinctness: None,
                             columns: vec![ResultColumn::Expr(
-                                Expr::Parenthesized(vec![Expr::Literal(
+                                Box::new(Expr::Parenthesized(vec![Expr::Literal(
                                     Literal::Numeric("1".to_owned()),
-                                )]).into_boxed(),
+                                )])),
                                 None,
                             )],
                             from: None,
