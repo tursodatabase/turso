@@ -1064,7 +1064,7 @@ impl Wal for WalFile {
         let offset = self.frame_offset(frame_id);
         page.set_locked();
         let frame = page.clone();
-        let page_idx = page.get().id as usize;
+        let page_idx = page.get().id;
         let encryption_ctx = self.encryption_ctx.borrow().clone();
         let seq = self.header.checkpoint_seq;
         let complete = Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
@@ -1561,8 +1561,7 @@ impl WalFile {
     fn frame_offset(&self, frame_id: u64) -> u64 {
         assert!(frame_id > 0, "Frame ID must be 1-based");
         let page_offset = (frame_id - 1) * (self.page_size() + WAL_FRAME_HEADER_SIZE as u32) as u64;
-        let offset = WAL_HEADER_SIZE as u64 + page_offset;
-        offset
+        WAL_HEADER_SIZE as u64 + page_offset
     }
 
     #[allow(clippy::mut_from_ref)]
@@ -2294,7 +2293,7 @@ pub mod test {
         let done = Rc::new(Cell::new(false));
         let _done = done.clone();
         let _ = file.file.truncate(
-            WAL_HEADER_SIZE,
+            WAL_HEADER_SIZE as u64,
             Completion::new_trunc(move |_| {
                 let done = _done.clone();
                 done.set(true);

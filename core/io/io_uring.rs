@@ -400,7 +400,7 @@ impl WrappedIOUring {
                         iov_allocation[0].iov_len as u32,
                         id as u16,
                     )
-                    .offset(st.file_pos as u64)
+                    .offset(st.file_pos)
                     .build()
                     .user_data(key)
                 } else {
@@ -409,7 +409,7 @@ impl WrappedIOUring {
                         iov_allocation[0].iov_base as *const u8,
                         iov_allocation[0].iov_len as u32,
                     )
-                    .offset(st.file_pos as u64)
+                    .offset(st.file_pos)
                     .build()
                     .user_data(key)
                 }
@@ -425,7 +425,7 @@ impl WrappedIOUring {
 
         let entry = with_fd!(st.file_id, |fd| {
             io_uring::opcode::Writev::new(fd, ptr, iov_count as u32)
-                .offset(st.file_pos as u64)
+                .offset(st.file_pos)
                 .build()
                 .user_data(key)
         });
