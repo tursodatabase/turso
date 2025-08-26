@@ -10,6 +10,7 @@ use std::sync::{Arc, OnceLock};
 use std::{fmt::Debug, pin::Pin};
 
 pub trait File: Send + Sync {
+    fn path(&self) -> &std::path::Path;
     fn lock_file(&self, exclusive: bool) -> Result<()>;
     fn unlock_file(&self) -> Result<()>;
     fn pread(&self, pos: usize, c: Completion) -> Result<Completion>;

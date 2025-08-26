@@ -108,6 +108,7 @@ impl IO for UnixIO {
 
         #[allow(clippy::arc_with_non_send_sync)]
         let unix_file = Arc::new(UnixFile {
+            path: std::path::PathBuf::from(path),
             file: Arc::new(Mutex::new(file)),
         });
         if std::env::var(common::ENV_DISABLE_FILE_LOCK).is_err() {
@@ -146,12 +147,16 @@ impl IO for UnixIO {
 // }
 
 pub struct UnixFile {
+    path: std::path::PathBuf,
     file: Arc<Mutex<std::fs::File>>,
 }
 unsafe impl Send for UnixFile {}
 unsafe impl Sync for UnixFile {}
 
 impl File for UnixFile {
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
     fn lock_file(&self, exclusive: bool) -> Result<()> {
         let fd = self.file.lock();
         let fd = fd.as_fd();

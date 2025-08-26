@@ -18,6 +18,11 @@ impl Clock for VfsMod {
     }
 }
 
+struct VfsFile {
+    inner: VfsFileImpl,
+    path: std::path::PathBuf,
+}
+
 impl IO for VfsMod {
     fn open_file(&self, path: &str, flags: OpenFlags, direct: bool) -> Result<Arc<dyn File>> {
         let c_path = CString::new(path).map_err(|_| {
@@ -29,7 +34,10 @@ impl IO for VfsMod {
         if file.is_null() {
             return Err(LimboError::ExtensionError("File not found".to_string()));
         }
-        Ok(Arc::new(turso_ext::VfsFileImpl::new(file, self.ctx)?))
+        Ok(Arc::new(VfsFile {
+            inner: turso_ext::VfsFileImpl::new(file, self.ctx)?,
+            path: std::path::PathBuf::from(path),
+        }))
     }
 
     fn remove_file(&self, path: &str) -> Result<()> {
@@ -99,10 +107,13 @@ fn to_callback(c: Completion) -> IOCallback {
     })
 }
 
-impl File for VfsFileImpl {
+impl File for VfsFile {
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
     fn lock_file(&self, exclusive: bool) -> Result<()> {
-        let vfs = unsafe { &*self.vfs };
-        let result = unsafe { (vfs.lock)(self.file, exclusive) };
+        let vfs = unsafe { &*self.inner.vfs };
+        let result = unsafe { (vfs.lock)(self.inner.file, exclusive) };
         if result.is_ok() {
             return Err(LimboError::ExtensionError(result.to_string()));
         }
@@ -110,11 +121,11 @@ impl File for VfsFileImpl {
     }
 
     fn unlock_file(&self) -> Result<()> {
-        if self.vfs.is_null() {
+        if self.inner.vfs.is_null() {
             return Err(LimboError::ExtensionError("VFS is null".to_string()));
         }
-        let vfs = unsafe { &*self.vfs };
-        let result = unsafe { (vfs.unlock)(self.file) };
+        let vfs = unsafe { &*self.inner.vfs };
+        let result = unsafe { (vfs.unlock)(self.inner.file) };
         if result.is_ok() {
             return Err(LimboError::ExtensionError(result.to_string()));
         }
@@ -122,7 +133,7 @@ impl File for VfsFileImpl {
     }
 
     fn pread(&self, pos: usize, c: Completion) -> Result<Completion> {
-        if self.vfs.is_null() {
+        if self.inner.vfs.is_null() {
             c.complete(-1);
             return Err(LimboError::ExtensionError("VFS is null".to_string()));
         }
@@ -130,10 +141,10 @@ impl File for VfsFileImpl {
         let buf = r.buf();
         let len = buf.len();
         let cb = to_callback(c.clone());
-        let vfs = unsafe { &*self.vfs };
+        let vfs = unsafe { &*self.inner.vfs };
         let res = unsafe {
             (vfs.read)(
-                self.file,
+                self.inner.file,
                 BufferRef::new(buf.as_mut_ptr(), len),
                 pos as i64,
                 cb,
@@ -146,17 +157,17 @@ impl File for VfsFileImpl {
     }
 
     fn pwrite(&self, pos: usize, buffer: Arc<Buffer>, c: Completion) -> Result<Completion> {
-        if self.vfs.is_null() {
+        if self.inner.vfs.is_null() {
             c.complete(-1);
             return Err(LimboError::ExtensionError("VFS is null".to_string()));
         }
-        let vfs = unsafe { &*self.vfs };
+        let vfs = unsafe { &*self.inner.vfs };
         let res = unsafe {
             let buf = buffer.clone();
             let len = buf.len();
             let cb = to_callback(c.clone());
             (vfs.write)(
-                self.file,
+                self.inner.file,
                 BufferRef::new(buf.as_ptr() as *mut u8, len),
                 pos as i64,
                 cb,
@@ -169,13 +180,13 @@ impl File for VfsFileImpl {
     }
 
     fn sync(&self, c: Completion) -> Result<Completion> {
-        if self.vfs.is_null() {
+        if self.inner.vfs.is_null() {
             c.complete(-1);
             return Err(LimboError::ExtensionError("VFS is null".to_string()));
         }
-        let vfs = unsafe { &*self.vfs };
+        let vfs = unsafe { &*self.inner.vfs };
         let cb = to_callback(c.clone());
-        let res = unsafe { (vfs.sync)(self.file, cb) };
+        let res = unsafe { (vfs.sync)(self.inner.file, cb) };
         if res.is_error() {
             return Err(LimboError::ExtensionError("sync failed".to_string()));
         }
@@ -183,8 +194,8 @@ impl File for VfsFileImpl {
     }
 
     fn size(&self) -> Result<u64> {
-        let vfs = unsafe { &*self.vfs };
-        let result = unsafe { (vfs.size)(self.file) };
+        let vfs = unsafe { &*self.inner.vfs };
+        let result = unsafe { (vfs.size)(self.inner.file) };
         if result < 0 {
             Err(LimboError::ExtensionError("size failed".to_string()))
         } else {
@@ -193,13 +204,13 @@ impl File for VfsFileImpl {
     }
 
     fn truncate(&self, len: usize, c: Completion) -> Result<Completion> {
-        if self.vfs.is_null() {
+        if self.inner.vfs.is_null() {
             c.complete(-1);
             return Err(LimboError::ExtensionError("VFS is null".to_string()));
         }
-        let vfs = unsafe { &*self.vfs };
+        let vfs = unsafe { &*self.inner.vfs };
         let cb = to_callback(c.clone());
-        let res = unsafe { (vfs.truncate)(self.file, len as i64, cb) };
+        let res = unsafe { (vfs.truncate)(self.inner.file, len as i64, cb) };
         if res.is_error() {
             return Err(LimboError::ExtensionError("truncate failed".to_string()));
         }
