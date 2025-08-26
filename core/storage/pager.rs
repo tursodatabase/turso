@@ -124,6 +124,14 @@ pub struct PageInner {
     pub flags: AtomicUsize,
     pub contents: Option<PageContent>,
     pub id: usize,
+    /// If >0, the page is pinned and not eligible for eviction from the page cache.
+    /// The reason this is a counter is that multiple nested code paths may signal that
+    /// a page must not be evicted from the page cache, so even if an inner code path
+    /// requests unpinning via [Page::unpin], the pin count will still be >0 if the outer
+    /// code path has not yet requested to unpin the page as well.
+    ///
+    /// Note that [DumbLruPageCache::clear] evicts the pages even if pinned, so as long as
+    /// we clear the page cache on errors, pins will not 'leak'.
     pub pin_count: AtomicUsize,
     /// The WAL frame number this page was loaded from (0 if loaded from main DB file)
     /// This tracks which version of the page we have in memory
@@ -238,12 +246,13 @@ impl Page {
         }
     }
 
-    /// Pin the page to prevent it from being evicted from the page cache.
+    /// Increment the pin count by 1. A pin count >0 means the page is pinned and not eligible for eviction from the page cache.
     pub fn pin(&self) {
         self.get().pin_count.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Unpin the page to allow it to be evicted from the page cache.
+    /// Decrement the pin count by 1. If the count reaches 0, the page is no longer
+    /// pinned and is eligible for eviction from the page cache.
     pub fn unpin(&self) {
         let was_pinned = self.try_unpin();
 
@@ -254,8 +263,8 @@ impl Page {
         );
     }
 
-    /// Try to unpin the page if it's pinned, otherwise do nothing.
-    /// Returns true if the page was originally pinned.
+    /// Try to decrement the pin count by 1, but do nothing if it was already 0.
+    /// Returns true if the pin count was decremented.
     pub fn try_unpin(&self) -> bool {
         self.get()
             .pin_count
@@ -269,6 +278,7 @@ impl Page {
             .is_ok()
     }
 
+    /// Returns true if the page is pinned and thus not eligible for eviction from the page cache.
     pub fn is_pinned(&self) -> bool {
         self.get().pin_count.load(Ordering::Acquire) > 0
     }
