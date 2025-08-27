@@ -17,7 +17,6 @@ use super::sqlite3_ondisk::{self, checksum_wal, WalHeader, WAL_MAGIC_BE, WAL_MAG
 use crate::fast_lock::SpinLock;
 use crate::io::{clock, File, IO};
 use crate::result::LimboResult;
-use crate::storage::encryption::EncryptionContext;
 use crate::storage::sqlite3_ondisk::{
     begin_read_wal_frame, begin_read_wal_frame_raw, finish_read_page, prepare_wal_frame,
     write_pages_vectored, PageSize, WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE,
@@ -25,7 +24,7 @@ use crate::storage::sqlite3_ondisk::{
 use crate::types::{IOCompletions, IOResult};
 use crate::{
     bail_corrupt_error, io_yield_many, turso_assert, Buffer, Completion, CompletionError,
-    LimboError, Result,
+    IOContext, LimboError, Result,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -304,7 +303,7 @@ pub trait Wal: Debug {
     /// Return unique set of pages changed **after** frame_watermark position and until current WAL session max_frame_no
     fn changed_pages_after(&self, frame_watermark: u64) -> Result<Vec<u32>>;
 
-    fn set_encryption_context(&mut self, ctx: EncryptionContext);
+    fn set_io_context(&mut self, ctx: IOContext);
 
     #[cfg(debug_assertions)]
     fn as_any(&self) -> &dyn std::any::Any;
@@ -576,7 +575,7 @@ pub struct WalFile {
     /// Manages locks needed for checkpointing
     checkpoint_guard: Option<CheckpointLocks>,
 
-    encryption_ctx: RefCell<Option<EncryptionContext>>,
+    io_ctx: RefCell<IOContext>,
 }
 
 impl fmt::Debug for WalFile {
@@ -1065,7 +1064,10 @@ impl Wal for WalFile {
         page.set_locked();
         let frame = page.clone();
         let page_idx = page.get().id;
-        let encryption_ctx = self.encryption_ctx.borrow().clone();
+        let encryption_ctx = {
+            let io_ctx = self.io_ctx.borrow();
+            io_ctx.encryption_context().cloned()
+        };
         let seq = self.header.checkpoint_seq;
         let complete = Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
             let Ok((buf, bytes_read)) = res else {
@@ -1244,7 +1246,8 @@ impl Wal for WalFile {
             let page_content = page.get_contents();
             let page_buf = page_content.as_ptr();
 
-            let encryption_ctx = self.encryption_ctx.borrow();
+            let io_ctx = self.io_ctx.borrow();
+            let encryption_ctx = io_ctx.encryption_context();
             let encrypted_data = {
                 if let Some(key) = encryption_ctx.as_ref() {
                     Some(key.encrypt_page(page_buf, page_id)?)
@@ -1442,7 +1445,8 @@ impl Wal for WalFile {
             let plain = page.get_contents().as_ptr();
 
             let data_to_write: std::borrow::Cow<[u8]> = {
-                let ectx = self.encryption_ctx.borrow();
+                let io_ctx = self.io_ctx.borrow();
+                let ectx = io_ctx.encryption_context();
                 if let Some(ctx) = ectx.as_ref() {
                     Cow::Owned(ctx.encrypt_page(plain, page_id as usize)?)
                 } else {
@@ -1511,8 +1515,8 @@ impl Wal for WalFile {
         self
     }
 
-    fn set_encryption_context(&mut self, ctx: EncryptionContext) {
-        self.encryption_ctx.replace(Some(ctx));
+    fn set_io_context(&mut self, ctx: IOContext) {
+        self.io_ctx.replace(ctx);
     }
 }
 
@@ -1550,7 +1554,7 @@ impl WalFile {
             prev_checkpoint: CheckpointResult::default(),
             checkpoint_guard: None,
             header: *header,
-            encryption_ctx: RefCell::new(None),
+            io_ctx: RefCell::new(IOContext::default()),
         }
     }
 
@@ -1798,12 +1802,7 @@ impl WalFile {
                         let batch_map = self.ongoing_checkpoint.pending_writes.take();
                         if !batch_map.is_empty() {
                             let done_flag = self.ongoing_checkpoint.add_write();
-                            completions.extend(write_pages_vectored(
-                                pager,
-                                batch_map,
-                                done_flag,
-                                self.encryption_ctx.borrow().as_ref(),
-                            )?);
+                            completions.extend(write_pages_vectored(pager, batch_map, done_flag)?);
                         }
                     }
 

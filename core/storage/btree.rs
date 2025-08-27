@@ -23,7 +23,7 @@ use crate::{
         RecordCursor, SeekResult,
     },
     util::IOExt,
-    Completion, MvCursor,
+    Completion, MvCursor, Page,
 };
 
 use crate::{
@@ -38,7 +38,7 @@ use super::{
         write_varint_to_vec, IndexInteriorCell, IndexLeafCell, OverflowCell, MINIMUM_CELL_SIZE,
     },
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::{
     cell::{Cell, Ref, RefCell},
     cmp::{Ordering, Reverse},
@@ -125,16 +125,6 @@ macro_rules! debug_validate_cells {
     };
 }
 
-/// Wrapper around a page reference used in order to update the reference in case page was unloaded
-/// and we need to update the reference.
-#[derive(Debug)]
-pub struct BTreePageInner {
-    pub page: RefCell<PageRef>,
-}
-
-pub type BTreePage = Arc<BTreePageInner>;
-unsafe impl Send for BTreePageInner {}
-unsafe impl Sync for BTreePageInner {}
 /// State machine of destroy operations
 /// Keep track of traversal so that it can be resumed when IO is encountered
 #[derive(Debug, Clone)]
@@ -244,7 +234,7 @@ enum WriteState {
     /// we may also need to clear the old cell's overflow pages
     /// and add them to the freelist.
     Overwrite {
-        page: Arc<BTreePageInner>,
+        page: Arc<Page>,
         cell_idx: usize,
         // This is an Option although it's not optional; we `take` it as owned for [BTreeCursor::overwrite_cell]
         // to work around the borrow checker, and then insert it back if overwriting returns IO.
@@ -252,7 +242,7 @@ enum WriteState {
     },
     /// Insert a new cell. This path is taken when inserting a new row.
     Insert {
-        page: Arc<BTreePageInner>,
+        page: Arc<Page>,
         cell_idx: usize,
         new_payload: Vec<u8>,
         fill_cell_payload_state: FillCellPayloadState,
@@ -265,12 +255,12 @@ struct ReadPayloadOverflow {
     payload: Vec<u8>,
     next_page: u32,
     remaining_to_read: usize,
-    page: BTreePage,
+    page: PageRef,
 }
 
 enum PayloadOverflowWithOffset {
     SkipOverflowPages {
-        next_page: BTreePage,
+        next_page: PageRef,
         pages_left_to_skip: u32,
         page_offset: u32,
         amount: u32,
@@ -279,7 +269,7 @@ enum PayloadOverflowWithOffset {
     },
     ProcessPage {
         remaining_to_read: u32,
-        page: BTreePage,
+        page: PageRef,
         current_offset: usize,
         buffer_offset: usize,
         is_write: bool,
@@ -332,7 +322,7 @@ impl BTreeKey<'_> {
 #[derive(Debug, Clone)]
 struct BalanceInfo {
     /// Old pages being balanced. We can have maximum 3 pages being balanced at the same time.
-    pages_to_balance: [Option<BTreePage>; MAX_SIBLING_PAGES_TO_BALANCE],
+    pages_to_balance: [Option<PageRef>; MAX_SIBLING_PAGES_TO_BALANCE],
     /// Bookkeeping of the rightmost pointer so the offset::BTREE_RIGHTMOST_PTR can be updated.
     rightmost_pointer: *mut u8,
     /// Divider cells of old pages. We can have maximum 2 divider cells because of 3 pages.
@@ -696,7 +686,7 @@ impl BTreeCursor {
                 }
                 EmptyTableState::ReadPage { page } => {
                     turso_assert!(page.is_loaded(), "page should be loaded");
-                    let cell_count = page.get().contents.as_ref().unwrap().cell_count();
+                    let cell_count = page.get_contents().cell_count();
                     break Ok(IOResult::Done(cell_count == 0));
                 }
             }
@@ -709,9 +699,7 @@ impl BTreeCursor {
     fn get_prev_record(&mut self) -> Result<IOResult<bool>> {
         loop {
             let page = self.stack.top();
-
-            let page = page.get();
-            let contents = page.get().contents.as_ref().unwrap();
+            let contents = page.get_contents();
             let page_type = contents.page_type();
             let is_index = page.is_index();
 
@@ -828,10 +816,9 @@ impl BTreeCursor {
                 payload,
                 next_page,
                 remaining_to_read,
-                page: page_btree,
+                page,
             } = read_overflow_state.as_mut().unwrap();
 
-            let page = page_btree.get();
             turso_assert!(page.is_loaded(), "page should be loaded");
             tracing::debug!(next_page, remaining_to_read, "reading overflow page");
             let contents = page.get_contents();
@@ -844,15 +831,8 @@ impl BTreeCursor {
             *remaining_to_read -= to_read;
 
             if *remaining_to_read != 0 && next != 0 {
-                let (new_page, c) = self.pager.read_page(next as usize).map(|(page, c)| {
-                    (
-                        Arc::new(BTreePageInner {
-                            page: RefCell::new(page),
-                        }),
-                        c,
-                    )
-                })?;
-                *page_btree = new_page;
+                let (new_page, c) = self.pager.read_page(next as usize)?;
+                *page = new_page;
                 *next_page = next;
                 if let Some(c) = c {
                     io_yield_one!(c);
@@ -951,10 +931,8 @@ impl BTreeCursor {
                 return self.continue_payload_overflow_with_offset(buffer, self.usable_space());
             }
 
-            let page_btree = self.stack.top();
-
-            let page = page_btree.get();
-            let contents = page.get().contents.as_ref().unwrap();
+            let page = self.stack.top();
+            let contents = page.get_contents();
             let cell_idx = self.stack.current_cell_index() as usize - 1;
 
             if cell_idx >= contents.cell_count() {
@@ -994,13 +972,7 @@ impl BTreeCursor {
                     local_amount = local_size as u32 - offset;
                 }
                 if is_write {
-                    self.write_payload_to_page(
-                        offset,
-                        local_amount,
-                        payload,
-                        buffer,
-                        page_btree.clone(),
-                    );
+                    self.write_payload_to_page(offset, local_amount, payload, buffer, page.clone());
                 } else {
                     self.read_payload_from_page(offset, local_amount, payload, buffer);
                 }
@@ -1060,8 +1032,7 @@ impl BTreeCursor {
                     buffer_offset,
                     is_write,
                 }) => {
-                    let page = next_page.get();
-                    turso_assert!(page.is_loaded(), "page should be loaded");
+                    turso_assert!(next_page.is_loaded(), "page should be loaded");
 
                     if pages_left_to_skip == 0 {
                         self.state =
@@ -1075,7 +1046,7 @@ impl BTreeCursor {
                         continue;
                     }
 
-                    let contents = page.get_contents();
+                    let contents = next_page.get_contents();
                     let next = contents.read_u32_no_offset(0);
 
                     if next == 0 {
@@ -1085,11 +1056,11 @@ impl BTreeCursor {
                     }
                     pages_left_to_skip -= 1;
 
-                    let (page, c) = self.read_page(next as usize)?;
+                    let (next_page, c) = self.read_page(next as usize)?;
 
                     self.state = CursorState::ReadWritePayload(
                         PayloadOverflowWithOffset::SkipOverflowPages {
-                            next_page: page,
+                            next_page,
                             pages_left_to_skip,
                             page_offset,
                             amount,
@@ -1104,12 +1075,11 @@ impl BTreeCursor {
                 }
                 CursorState::ReadWritePayload(PayloadOverflowWithOffset::ProcessPage {
                     mut remaining_to_read,
-                    page: mut page_btree,
+                    mut page,
                     mut current_offset,
                     mut buffer_offset,
                     is_write,
                 }) => {
-                    let page = page_btree.get();
                     turso_assert!(page.is_loaded(), "page should be loaded");
 
                     let contents = page.get_contents();
@@ -1127,7 +1097,7 @@ impl BTreeCursor {
                             bytes_to_process,
                             page_payload,
                             buffer,
-                            page_btree.clone(),
+                            page.clone(),
                         );
                     } else {
                         self.read_payload_from_page(
@@ -1153,13 +1123,13 @@ impl BTreeCursor {
 
                     // Load next page
                     current_offset = 0; // Reset offset for new page
-                    let (page, c) = self.read_page(next as usize)?;
-                    page_btree = page;
+                    let (next_page, c) = self.read_page(next as usize)?;
+                    page = next_page;
 
                     self.state =
                         CursorState::ReadWritePayload(PayloadOverflowWithOffset::ProcessPage {
                             remaining_to_read,
-                            page: page_btree,
+                            page,
                             current_offset,
                             buffer_offset,
                             is_write,
@@ -1199,9 +1169,9 @@ impl BTreeCursor {
         num_bytes: u32,
         payload: &[u8],
         buffer: &mut [u8],
-        page: BTreePage,
+        page: PageRef,
     ) {
-        self.pager.add_dirty(&page.get());
+        self.pager.add_dirty(&page);
         // SAFETY: This is safe as long as the page is not evicted from the cache.
         let payload_mut =
             unsafe { std::slice::from_raw_parts_mut(payload.as_ptr() as *mut u8, payload.len()) };
@@ -1234,19 +1204,17 @@ impl BTreeCursor {
             }
         }
         loop {
-            let mem_page_rc = self.stack.top();
-            let mem_page = mem_page_rc.get();
-
-            let contents = mem_page.get().contents.as_ref().unwrap();
+            let mem_page = self.stack.top();
+            let contents = mem_page.get_contents();
             let cell_count = contents.cell_count();
             tracing::debug!(
-                id = mem_page_rc.get().get().id,
+                id = mem_page.get().id,
                 cell = self.stack.current_cell_index(),
                 cell_count,
                 "current_before_advance",
             );
 
-            let is_index = mem_page_rc.get().is_index();
+            let is_index = mem_page.is_index();
             let should_skip_advance = is_index
                 && self.going_upwards // we are going upwards, this means we still need to visit divider cell in an index
                 && self.stack.current_cell_index() >= 0 && self.stack.current_cell_index() < cell_count as i32; // if we weren't on a
@@ -1255,7 +1223,7 @@ impl BTreeCursor {
             if should_skip_advance {
                 tracing::debug!(
                     going_upwards = self.going_upwards,
-                    page = mem_page_rc.get().get().id,
+                    page = mem_page.get().id,
                     cell_idx = self.stack.current_cell_index(),
                     "skipping advance",
                 );
@@ -1266,7 +1234,7 @@ impl BTreeCursor {
             // Important to advance only after loading the page in order to not advance > 1 times
             self.stack.advance();
             let cell_idx = self.stack.current_cell_index() as usize;
-            tracing::debug!(id = mem_page_rc.get().get().id, cell = cell_idx, "current");
+            tracing::debug!(id = mem_page.get().id, cell = cell_idx, "current");
 
             if cell_idx >= cell_count {
                 let rightmost_already_traversed = cell_idx > cell_count;
@@ -1301,7 +1269,7 @@ impl BTreeCursor {
                 cell_idx,
                 contents.cell_count(),
                 contents.page_type(),
-                mem_page_rc.get().get().id
+                mem_page.get().id
             );
 
             if contents.is_leaf() {
@@ -1362,7 +1330,6 @@ impl BTreeCursor {
                     if let Some(rightmost_page_id) = rightmost_page_id {
                         // If we know the rightmost page and are already on it, we can skip a seek.
                         let current_page = self.stack.top();
-                        let current_page = current_page.get();
                         if current_page.get().id == *rightmost_page_id {
                             let contents = current_page.get_contents();
                             let cell_count = contents.cell_count();
@@ -1379,9 +1346,8 @@ impl BTreeCursor {
                 }
                 MoveToRightState::ProcessPage => {
                     let mem_page = self.stack.top();
-                    let page = mem_page.get();
-                    let page_idx = page.get().id;
-                    let contents = page.get().contents.as_ref().unwrap();
+                    let page_idx = mem_page.get().id;
+                    let contents = mem_page.get_contents();
                     if contents.is_leaf() {
                         self.move_to_right_state = (MoveToRightState::Start, Some(page_idx));
                         if contents.cell_count() > 0 {
@@ -1415,8 +1381,7 @@ impl BTreeCursor {
     fn tablebtree_move_to(&mut self, rowid: i64, seek_op: SeekOp) -> Result<IOResult<()>> {
         loop {
             let page = self.stack.top();
-            let page = page.get();
-            let contents = page.get().contents.as_ref().unwrap();
+            let contents = page.get_contents();
             if contents.is_leaf() {
                 self.seek_state = CursorSeekState::FoundLeaf {
                     eq_seen: Cell::new(false),
@@ -1553,8 +1518,7 @@ impl BTreeCursor {
 
         loop {
             let page = self.stack.top();
-            let page = page.get();
-            let contents = page.get().contents.as_ref().unwrap();
+            let contents = page.get_contents();
             if contents.is_leaf() {
                 let eq_seen = match &self.seek_state {
                     CursorSeekState::MovingBetweenPages { eq_seen } => eq_seen.get(),
@@ -1774,8 +1738,7 @@ impl BTreeCursor {
             // No need for another move_to_root. Move_to already moves to root
             return_if_io!(self.move_to(SeekKey::TableRowId(rowid), seek_op));
             let page = self.stack.top();
-            let page = page.get();
-            let contents = page.get().contents.as_ref().unwrap();
+            let contents = page.get_contents();
             turso_assert!(
                 contents.is_leaf(),
                 "tablebtree_seek() called on non-leaf page"
@@ -1817,8 +1780,7 @@ impl BTreeCursor {
         };
 
         let page = self.stack.top();
-        let page = page.get();
-        let contents = page.get().contents.as_ref().unwrap();
+        let contents = page.get_contents();
 
         loop {
             let min = min_cell_idx.get();
@@ -1940,8 +1902,7 @@ impl BTreeCursor {
             let eq_seen = eq_seen.get();
             let page = self.stack.top();
 
-            let page = page.get();
-            let contents = page.get().contents.as_ref().unwrap();
+            let contents = page.get_contents();
             let cell_count = contents.cell_count();
             if cell_count == 0 {
                 return Ok(IOResult::Done(SeekResult::NotFound));
@@ -1981,8 +1942,7 @@ impl BTreeCursor {
         };
 
         let page = self.stack.top();
-        let page = page.get();
-        let contents = page.get().contents.as_ref().unwrap();
+        let contents = page.get_contents();
 
         let iter_dir = seek_op.iteration_direction();
 
@@ -2193,10 +2153,7 @@ impl BTreeCursor {
 
                     // get page and find cell
                     let cell_idx = {
-                        let page = page.get();
-
                         self.pager.add_dirty(&page);
-
                         self.stack.current_cell_index()
                     };
                     if cell_idx == -1 {
@@ -2208,8 +2165,8 @@ impl BTreeCursor {
 
                     // if the cell index is less than the total cells, check: if its an existing
                     // rowid, we are going to update / overwrite the cell
-                    if cell_idx < page.get().get_contents().cell_count() {
-                        let cell = page.get().get_contents().cell_get(cell_idx, usable_space)?;
+                    if cell_idx < page.get_contents().cell_count() {
+                        let cell = page.get_contents().cell_get(cell_idx, usable_space)?;
                         match cell {
                             BTreeCell::TableLeafCell(tbl_leaf) => {
                                 if tbl_leaf.rowid == bkey.to_rowid() {
@@ -2274,7 +2231,7 @@ impl BTreeCursor {
                     ref mut fill_cell_payload_state,
                 } => {
                     return_if_io!(fill_cell_payload(
-                        page.get(),
+                        page.clone(),
                         bkey.maybe_rowid(),
                         new_payload,
                         *cell_idx,
@@ -2285,8 +2242,7 @@ impl BTreeCursor {
                     ));
 
                     {
-                        let page = page.get();
-                        let contents = page.get().contents.as_mut().unwrap();
+                        let contents = page.get_contents();
                         tracing::debug!(name: "overflow", cell_count = contents.cell_count());
 
                         insert_into_cell(
@@ -2297,7 +2253,7 @@ impl BTreeCursor {
                         )?;
                     };
                     self.stack.set_cell_index(*cell_idx as i32);
-                    let overflows = !page.get().get_contents().overflow_cells.is_empty();
+                    let overflows = !page.get_contents().overflow_cells.is_empty();
                     if overflows {
                         *write_state = WriteState::Balancing;
                         assert!(self.balance_state.sub_state == BalanceSubState::Start, "There should be no balancing operation in progress when insert state is {:?}, got: {:?}", self.state, self.balance_state.sub_state);
@@ -2313,11 +2269,7 @@ impl BTreeCursor {
                     cell_idx,
                     ref mut state,
                 } => {
-                    turso_assert!(
-                        page.get().is_loaded(),
-                        "page {}is not loaded",
-                        page.get().get().id
-                    );
+                    turso_assert!(page.is_loaded(), "page {}is not loaded", page.get().id);
                     let page = page.clone();
 
                     // Currently it's necessary to .take() here to prevent double-borrow of `self` in `overwrite_cell`.
@@ -2337,10 +2289,9 @@ impl BTreeCursor {
                         };
                         return Ok(IOResult::IO(io));
                     }
-                    let overflows = !page.get().get_contents().overflow_cells.is_empty();
+                    let overflows = !page.get_contents().overflow_cells.is_empty();
                     let underflows = !overflows && {
-                        let free_space =
-                            compute_free_space(page.get().get_contents(), usable_space);
+                        let free_space = compute_free_space(page.get_contents(), usable_space);
                         free_space * 3 > usable_space * 2
                     };
                     let CursorState::Write(write_state) = &mut self.state else {
@@ -2415,8 +2366,7 @@ impl BTreeCursor {
                         // is less than 2/3rds of the total usable space on the page
                         //
                         // https://github.com/sqlite/sqlite/blob/0aa95099f5003dc99f599ab77ac0004950b281ef/src/btree.c#L9064-L9071
-                        let current_page = current_page.get();
-                        let page = current_page.get().contents.as_mut().unwrap();
+                        let page = current_page.get_contents();
                         let free_space = compute_free_space(page, usable_space);
                         let this_level_is_already_balanced = page.overflow_cells.is_empty()
                             && (!self.stack.has_parent() || free_space * 3 <= usable_space * 2);
@@ -2471,7 +2421,6 @@ impl BTreeCursor {
                     // Since we are going to change the btree structure, let's forget our cached knowledge of the rightmost page.
                     let _ = self.move_to_right_state.1.take();
                     let parent_page = self.stack.top();
-                    let parent_page = parent_page.get();
                     let parent_contents = parent_page.get_contents();
                     let page_type = parent_contents.page_type();
                     turso_assert!(
@@ -2506,7 +2455,7 @@ impl BTreeCursor {
                         );
                     }
                     self.pager.add_dirty(&parent_page);
-                    let parent_contents = parent_page.get().contents.as_ref().unwrap();
+                    let parent_contents = parent_page.get_contents();
                     let page_to_balance_idx = self.stack.current_cell_index() as usize;
 
                     tracing::debug!(
@@ -2515,7 +2464,7 @@ impl BTreeCursor {
                         page_to_balance_idx
                     );
                     // Part 1: Find the sibling pages to balance
-                    let mut pages_to_balance: [Option<BTreePage>; MAX_SIBLING_PAGES_TO_BALANCE] =
+                    let mut pages_to_balance: [Option<Arc<Page>>; MAX_SIBLING_PAGES_TO_BALANCE] =
                         [const { None }; MAX_SIBLING_PAGES_TO_BALANCE];
                     turso_assert!(
                         page_to_balance_idx <= parent_contents.cell_count(),
@@ -2606,8 +2555,7 @@ impl BTreeCursor {
                             })?;
                         {
                             // mark as dirty
-                            let sibling_page = page.get();
-                            self.pager.add_dirty(&sibling_page);
+                            self.pager.add_dirty(&page);
                         }
                         if let Some(c) = c {
                             completions.push(c);
@@ -2690,14 +2638,12 @@ impl BTreeCursor {
                         .take(balance_info.sibling_count)
                     {
                         let page = page.as_ref().unwrap();
-                        let page = page.get();
                         turso_assert!(page.is_loaded(), "page should be loaded");
 
                         #[cfg(debug_assertions)]
                         let page_type_of_siblings = balance_info.pages_to_balance[0]
                             .as_ref()
                             .unwrap()
-                            .get()
                             .get_contents()
                             .page_type();
 
@@ -2709,9 +2655,7 @@ impl BTreeCursor {
                         }
                     }
                     // Start balancing.
-                    let parent_page_btree = self.stack.top();
-                    let parent_page = parent_page_btree.get();
-
+                    let parent_page = self.stack.top();
                     let parent_contents = parent_page.get_contents();
                     let parent_is_root = !self.stack.has_parent();
 
@@ -2719,12 +2663,11 @@ impl BTreeCursor {
                     // The count includes: all cells and overflow cells from the sibling pages, and divider cells from the parent page,
                     // excluding the rightmost divider, which will not be dropped from the parent; instead it will be updated at the end.
                     let mut total_cells_to_redistribute = 0;
-                    let mut pages_to_balance_new: [Option<BTreePage>;
+                    let mut pages_to_balance_new: [Option<Arc<Page>>;
                         MAX_NEW_SIBLING_PAGES_AFTER_BALANCE] =
                         [const { None }; MAX_NEW_SIBLING_PAGES_AFTER_BALANCE];
                     for i in (0..balance_info.sibling_count).rev() {
                         let sibling_page = balance_info.pages_to_balance[i].as_ref().unwrap();
-                        let sibling_page = sibling_page.get();
                         turso_assert!(sibling_page.is_loaded(), "sibling page is not loaded");
                         let sibling_contents = sibling_page.get_contents();
                         total_cells_to_redistribute += sibling_contents.cell_count();
@@ -2814,7 +2757,6 @@ impl BTreeCursor {
                     let page_type = balance_info.pages_to_balance[0]
                         .as_ref()
                         .unwrap()
-                        .get()
                         .get_contents()
                         .page_type();
                     tracing::debug!("balance_non_root(page_type={:?})", page_type);
@@ -2826,7 +2768,7 @@ impl BTreeCursor {
                         .take(balance_info.sibling_count)
                         .enumerate()
                     {
-                        let old_page = old_page.as_ref().unwrap().get();
+                        let old_page = old_page.as_ref().unwrap();
                         let old_page_contents = old_page.get_contents();
                         let page_type = old_page_contents.page_type();
                         let max_local = payload_overflow_threshold_max(page_type, usable_space);
@@ -2929,7 +2871,6 @@ impl BTreeCursor {
                         cell_array.cell_count_per_page_cumulative[i] =
                             old_cell_count_per_page_cumulative[i];
                         let page = &balance_info.pages_to_balance[i].as_ref().unwrap();
-                        let page = page.get();
                         let page_contents = page.get_contents();
                         let free_space = compute_free_space(page_contents, usable_space);
 
@@ -3178,7 +3119,7 @@ impl BTreeCursor {
                         if i < balance_info.sibling_count {
                             let page = balance_info.pages_to_balance[i].as_ref().unwrap();
                             turso_assert!(
-                                page.get().is_dirty(),
+                                page.is_dirty(),
                                 "sibling page must be already marked dirty"
                             );
                             pages_to_balance_new[i].replace(page.clone());
@@ -3205,7 +3146,7 @@ impl BTreeCursor {
                             .take(sibling_count_new)
                             .enumerate()
                         {
-                            page_numbers[i] = page.as_ref().unwrap().get().get().id;
+                            page_numbers[i] = page.as_ref().unwrap().get().id;
                         }
                         page_numbers.sort();
                         for (page, new_id) in pages_to_balance_new
@@ -3215,10 +3156,10 @@ impl BTreeCursor {
                             .zip(page_numbers.iter().rev().take(sibling_count_new))
                         {
                             let page = page.as_ref().unwrap();
-                            if *new_id != page.get().get().id {
-                                page.get().get().id = *new_id;
+                            if *new_id != page.get().id {
+                                page.get().id = *new_id;
                                 self.pager
-                                    .update_dirty_loaded_page_in_cache(*new_id, page.get())?;
+                                    .update_dirty_loaded_page_in_cache(*new_id, page.clone())?;
                             }
                         }
 
@@ -3231,7 +3172,7 @@ impl BTreeCursor {
                             for page in pages_to_balance_new.iter().take(sibling_count_new) {
                                 tracing::debug!(
                                     "balance_non_root(new_sibling page_id={})",
-                                    page.as_ref().unwrap().get().get().id
+                                    page.as_ref().unwrap().get().id
                                 );
                             }
                         }
@@ -3248,7 +3189,6 @@ impl BTreeCursor {
                     let right_page_id = pages_to_balance_new[sibling_count_new - 1]
                         .as_ref()
                         .unwrap()
-                        .get()
                         .get()
                         .id as u32;
                     let rightmost_pointer = balance_info.rightmost_pointer;
@@ -3273,13 +3213,11 @@ impl BTreeCursor {
                         let last_page = balance_info.pages_to_balance[last_sibling_idx]
                             .as_ref()
                             .unwrap();
-                        let right_pointer =
-                            last_page.get().get_contents().rightmost_pointer().unwrap();
+                        let right_pointer = last_page.get_contents().rightmost_pointer().unwrap();
                         let new_last_page = pages_to_balance_new[sibling_count_new - 1]
                             .as_ref()
                             .unwrap();
                         new_last_page
-                            .get()
                             .get_contents()
                             .write_rightmost_ptr(right_pointer);
                     }
@@ -3306,12 +3244,11 @@ impl BTreeCursor {
                             // Interior
                             // Make this page's rightmost pointer point to pointer of divider cell before modification
                             let previous_pointer_divider = read_u32(divider_cell, 0);
-                            page.get()
-                                .get_contents()
+                            page.get_contents()
                                 .write_rightmost_ptr(previous_pointer_divider);
                             // divider cell now points to this page
                             new_divider_cell
-                                .extend_from_slice(&(page.get().get().id as u32).to_be_bytes());
+                                .extend_from_slice(&(page.get().id as u32).to_be_bytes());
                             // now copy the rest of the divider cell:
                             // Table Interior page:
                             //   * varint rowid
@@ -3331,12 +3268,12 @@ impl BTreeCursor {
                             let (_, n_bytes_payload) = read_varint(divider_cell)?;
                             let (rowid, _) = read_varint(&divider_cell[n_bytes_payload..])?;
                             new_divider_cell
-                                .extend_from_slice(&(page.get().get().id as u32).to_be_bytes());
+                                .extend_from_slice(&(page.get().id as u32).to_be_bytes());
                             write_varint_to_vec(rowid, &mut new_divider_cell);
                         } else {
                             // Leaf index
                             new_divider_cell
-                                .extend_from_slice(&(page.get().get().id as u32).to_be_bytes());
+                                .extend_from_slice(&(page.get().id as u32).to_be_bytes());
                             new_divider_cell.extend_from_slice(divider_cell);
                         }
 
@@ -3355,7 +3292,7 @@ impl BTreeCursor {
                             left_pointer
                         );
                         turso_assert!(
-                            left_pointer == page.get().get().id as u32,
+                            left_pointer == page.get().id as u32,
                             "left pointer is not the same as page id"
                         );
                         // FIXME: remove this lock
@@ -3388,7 +3325,7 @@ impl BTreeCursor {
                             parent_contents,
                             divider_cell_insert_idx_in_parent,
                             divider_cell_is_overflow_cell,
-                            &page.get(),
+                            page,
                             usable_space,
                         );
                     }
@@ -3403,9 +3340,9 @@ impl BTreeCursor {
                         for page in pages_to_balance_new.iter().take(sibling_count_new) {
                             let page = page.as_ref().unwrap();
                             assert!(
-                                pages_pointed_to.contains(&(page.get().get().id as u32)),
+                                pages_pointed_to.contains(&(page.get().id as u32)),
                                 "page {} not pointed to by divider cell or rightmost pointer",
-                                page.get().get().id
+                                page.get().id
                             );
                         }
                     }
@@ -3480,7 +3417,6 @@ impl BTreeCursor {
                                 )
                             };
                             let page = pages_to_balance_new[page_idx].as_ref().unwrap();
-                            let page = page.get();
                             tracing::debug!("pre_edit_page(page={})", page.get().id);
                             let page_contents = page.get_contents();
                             edit_page(
@@ -3505,7 +3441,6 @@ impl BTreeCursor {
 
                     // TODO: vacuum support
                     let first_child_page = pages_to_balance_new[0].as_ref().unwrap();
-                    let first_child_page = first_child_page.get();
                     let first_child_contents = first_child_page.get_contents();
                     if parent_is_root
                         && parent_contents.cell_count() == 0
@@ -3560,7 +3495,7 @@ impl BTreeCursor {
 
                     #[cfg(debug_assertions)]
                     BTreeCursor::post_balance_non_root_validation(
-                        &parent_page_btree,
+                        &parent_page,
                         balance_info,
                         parent_contents,
                         pages_to_balance_new,
@@ -3596,9 +3531,7 @@ impl BTreeCursor {
                         let balance_info = balance_info.borrow();
                         let balance_info = balance_info.as_ref().expect("must be balancing");
                         let page = balance_info.pages_to_balance[*curr_page].as_ref().unwrap();
-                        return_if_io!(self
-                            .pager
-                            .free_page(Some(page.get().clone()), page.get().get().id));
+                        return_if_io!(self.pager.free_page(Some(page.clone()), page.get().id));
                         *sub_state = BalanceSubState::FreePages {
                             curr_page: *curr_page + 1,
                             sibling_count_new: *sibling_count_new,
@@ -3662,10 +3595,10 @@ impl BTreeCursor {
     #[cfg(debug_assertions)]
     #[allow(clippy::too_many_arguments)]
     fn post_balance_non_root_validation(
-        parent_page: &BTreePage,
+        parent_page: &PageRef,
         balance_info: &BalanceInfo,
         parent_contents: &mut PageContent,
-        pages_to_balance_new: [Option<BTreePage>; MAX_NEW_SIBLING_PAGES_AFTER_BALANCE],
+        pages_to_balance_new: [Option<PageRef>; MAX_NEW_SIBLING_PAGES_AFTER_BALANCE],
         page_type: PageType,
         is_table_leaf: bool,
         mut cells_debug: Vec<Vec<u8>>,
@@ -3680,9 +3613,9 @@ impl BTreeCursor {
             match cell {
                 BTreeCell::TableInteriorCell(table_interior_cell) => {
                     let left_child_page = table_interior_cell.left_child_page;
-                    if left_child_page == parent_page.get().get().id as u32 {
+                    if left_child_page == parent_page.get().id as u32 {
                         tracing::error!("balance_non_root(parent_divider_points_to_same_page, page_id={}, cell_left_child_page={})",
-                                parent_page.get().get().id,
+                                parent_page.get().id,
                                 left_child_page,
                             );
                         valid = false;
@@ -3690,9 +3623,9 @@ impl BTreeCursor {
                 }
                 BTreeCell::IndexInteriorCell(index_interior_cell) => {
                     let left_child_page = index_interior_cell.left_child_page;
-                    if left_child_page == parent_page.get().get().id as u32 {
+                    if left_child_page == parent_page.get().id as u32 {
                         tracing::error!("balance_non_root(parent_divider_points_to_same_page, page_id={}, cell_left_child_page={})",
-                                parent_page.get().get().id,
+                                parent_page.get().id,
                                 left_child_page,
                             );
                         valid = false;
@@ -3708,7 +3641,6 @@ impl BTreeCursor {
             .enumerate()
         {
             let page = page.as_ref().unwrap();
-            let page = page.get();
             let contents = page.get_contents();
             debug_validate_cells!(contents, usable_space);
             // Cells are distributed in order
@@ -3743,7 +3675,7 @@ impl BTreeCursor {
                             );
                             valid = false;
                         }
-                        if left_child_page == parent_page.get().get().id as u32 {
+                        if left_child_page == parent_page.get().id as u32 {
                             tracing::error!("balance_non_root(child_page_points_parent_of_child, page_id={}, cell_left_child_page={}, page_idx={})",
                                 page.get().id,
                                 left_child_page,
@@ -3762,7 +3694,7 @@ impl BTreeCursor {
                             );
                             valid = false;
                         }
-                        if left_child_page == parent_page.get().get().id as u32 {
+                        if left_child_page == parent_page.get().id as u32 {
                             tracing::error!("balance_non_root(child_page_points_parent_of_child, page_id={}, cell_left_child_page={}, page_idx={})",
                                 page.get().id,
                                 left_child_page,
@@ -3820,11 +3752,11 @@ impl BTreeCursor {
                 }
 
                 if right_page_id == page.get().id as u32
-                    || right_page_id == parent_page.get().get().id as u32
+                    || right_page_id == parent_page.get().id as u32
                 {
                     tracing::error!("balance_non_root(balance_shallower_rightmost_pointer, page_id={}, parent_page_id={}, rightmost={})",
                         page.get().id,
-                        parent_page.get().get().id,
+                        parent_page.get().id,
                         right_page_id,
                     );
                     valid = false;
@@ -4064,17 +3996,16 @@ impl BTreeCursor {
 
         let is_page_1 = {
             let current_root = self.stack.top();
-            current_root.get().get().id == 1
+            current_root.get().id == 1
         };
 
         let offset = if is_page_1 { DatabaseHeader::SIZE } else { 0 };
 
-        let root_btree = self.stack.top();
-        let root = root_btree.get();
+        let root = self.stack.top();
         let root_contents = root.get_contents();
         // FIXME: handle page cache is full
         // FIXME: remove sync IO hack
-        let child_btree = self.pager.io.block(|| {
+        let child = self.pager.io.block(|| {
             self.pager
                 .do_allocate_page(root_contents.page_type(), 0, BtreePageAllocMode::Any)
         })?;
@@ -4082,18 +4013,17 @@ impl BTreeCursor {
         tracing::debug!(
             "balance_root(root={}, rightmost={}, page_type={:?})",
             root.get().id,
-            child_btree.get().get().id,
-            root.get_contents().page_type()
+            child.get().id,
+            root_contents.page_type()
         );
 
         turso_assert!(root.is_dirty(), "root must be marked dirty");
         turso_assert!(
-            child_btree.get().is_dirty(),
+            child.is_dirty(),
             "child must be marked dirty as freshly allocated page"
         );
 
         let root_buf = root_contents.as_ptr();
-        let child = child_btree.get();
         let child_contents = child.get_contents();
         let child_buf = child_contents.as_ptr();
         let (root_pointer_start, root_pointer_len) =
@@ -4135,9 +4065,9 @@ impl BTreeCursor {
         root_contents.overflow_cells.clear();
         self.root_page = root.get().id;
         self.stack.clear();
-        self.stack.push(root_btree.clone());
+        self.stack.push(root.clone());
         self.stack.set_cell_index(0); // leave parent pointing at the rightmost pointer (in this case 0, as there are no cells), since we will be balancing the rightmost child page.
-        self.stack.push(child_btree.clone());
+        self.stack.push(child.clone());
         Ok(IOResult::Done(()))
     }
 
@@ -4161,8 +4091,7 @@ impl BTreeCursor {
                 }
                 SeekEndState::ProcessPage => {
                     let mem_page = self.stack.top();
-                    let page = mem_page.get();
-                    let contents = page.get().contents.as_ref().unwrap();
+                    let contents = mem_page.get_contents();
                     if contents.is_leaf() {
                         // set cursor just past the last cell to append
                         self.stack.set_cell_index(contents.cell_count() as i32);
@@ -4326,7 +4255,6 @@ impl BTreeCursor {
         }
         if self.has_record.get() {
             let page = self.stack.top();
-            let page = page.get();
             let contents = page.get_contents();
             let page_type = contents.page_type();
             if page_type.is_table() {
@@ -4400,7 +4328,6 @@ impl BTreeCursor {
         }
 
         let page = self.stack.top();
-        let page = page.get();
         let contents = page.get_contents();
         let cell_idx = self.stack.current_cell_index();
         let cell = contents.cell_get(cell_idx as usize, self.usable_space())?;
@@ -4506,9 +4433,9 @@ impl BTreeCursor {
             match delete_state {
                 DeleteState::Start => {
                     let page = self.stack.top();
-                    self.pager.add_dirty(&page.get());
+                    self.pager.add_dirty(&page);
                     if matches!(
-                        page.get().get_contents().page_type(),
+                        page.get_contents().page_type(),
                         PageType::TableLeaf | PageType::TableInterior
                     ) {
                         if return_if_io!(self.rowid()).is_none() {
@@ -4528,7 +4455,7 @@ impl BTreeCursor {
                     // Right now we calculate the key every time for simplicity/debugging
                     // since it won't affect correctness which is more important
                     let page = self.stack.top();
-                    let target_key = if page.get().is_index() {
+                    let target_key = if page.is_index() {
                         let record = match return_if_io!(self.record()) {
                             Some(record) => record.clone(),
                             None => unreachable!("there should've been a record"),
@@ -4555,8 +4482,6 @@ impl BTreeCursor {
                 DeleteState::LoadPage {
                     post_balancing_seek_key,
                 } => {
-                    let _page: Arc<BTreePageInner> = self.stack.top();
-
                     self.state = CursorState::Delete(DeleteState::FindCell {
                         post_balancing_seek_key: post_balancing_seek_key.take(),
                     });
@@ -4567,9 +4492,7 @@ impl BTreeCursor {
                 } => {
                     let page = self.stack.top();
                     let cell_idx = self.stack.current_cell_index() as usize;
-
-                    let page = page.get();
-                    let contents = page.get().contents.as_ref().unwrap();
+                    let contents = page.get_contents();
                     if cell_idx >= contents.cell_count() {
                         return_corrupt!(format!(
                             "Corrupted page: cell index {} is out of bounds for page with {} cells",
@@ -4615,7 +4538,6 @@ impl BTreeCursor {
                     };
 
                     let page = self.stack.top();
-                    let page = page.get();
                     let contents = page.get_contents();
 
                     if !contents.is_leaf() {
@@ -4669,9 +4591,8 @@ impl BTreeCursor {
                         .expect("parent page should be on the stack")
                         .cell_idx = cell_idx as i32;
                     let (cell_payload, leaf_cell_idx) = {
-                        let leaf_page_ref = self.stack.top();
-                        let leaf_page = leaf_page_ref.get();
-                        let leaf_contents = leaf_page.get().contents.as_ref().unwrap();
+                        let leaf_page = self.stack.top();
+                        let leaf_contents = leaf_page.get_contents();
                         assert!(leaf_contents.is_leaf());
                         assert!(leaf_contents.cell_count() > 0);
                         let leaf_cell_idx = leaf_contents.cell_count() - 1;
@@ -4710,7 +4631,7 @@ impl BTreeCursor {
                     let leaf_page = self.stack.top();
 
                     self.pager.add_dirty(page);
-                    self.pager.add_dirty(&leaf_page.get());
+                    self.pager.add_dirty(&leaf_page);
 
                     // Step 2: Replace the cell in the parent (interior) page.
                     {
@@ -4734,8 +4655,7 @@ impl BTreeCursor {
 
                     // Step 3: Delete the predecessor cell from the leaf page.
                     {
-                        let leaf_page_ref = leaf_page.get();
-                        let leaf_contents = leaf_page_ref.get_contents();
+                        let leaf_contents = leaf_page.get_contents();
                         drop_cell(leaf_contents, leaf_cell_idx, usable_space)?;
                     }
 
@@ -4751,8 +4671,7 @@ impl BTreeCursor {
                     // If the latter is true, we must always balance that level regardless of whether the leaf page (or any ancestor pages in between) need balancing.
 
                     let leaf_underflows = {
-                        let leaf_page = page.get();
-                        let leaf_contents = leaf_page.get_contents();
+                        let leaf_contents = page.get_contents();
                         let free_space = compute_free_space(leaf_contents, usable_space);
                         free_space * 3 > usable_space * 2
                     };
@@ -4765,7 +4684,6 @@ impl BTreeCursor {
                             .stack
                             .get_page_at_level(*btree_depth)
                             .expect("ancestor page should be on the stack");
-                        let interior_page = interior_page.get();
                         let interior_contents = interior_page.get_contents();
                         let overflows = !interior_contents.overflow_cells.is_empty();
                         if overflows {
@@ -4892,9 +4810,7 @@ impl BTreeCursor {
                             return Err(LimboError::Corrupt("Invalid overflow page number".into()));
                         }
                         let (page, c) = self.read_page(next_page as usize)?;
-                        self.overflow_state = OverflowState::ProcessPage {
-                            next_page: page.get(),
-                        };
+                        self.overflow_state = OverflowState::ProcessPage { next_page: page };
                         if let Some(c) = c {
                             io_yield_one!(c);
                         }
@@ -4926,9 +4842,7 @@ impl BTreeCursor {
                             return Err(LimboError::Corrupt("Invalid overflow page number".into()));
                         }
                         let (page, c) = self.read_page(next as usize)?;
-                        self.overflow_state = OverflowState::ProcessPage {
-                            next_page: page.get(),
-                        };
+                        self.overflow_state = OverflowState::ProcessPage { next_page: page };
                         if let Some(c) = c {
                             io_yield_one!(c);
                         }
@@ -4999,10 +4913,9 @@ impl BTreeCursor {
                 }
                 DestroyState::ProcessPage => {
                     let page = self.stack.top();
-                    assert!(page.get().is_loaded()); //  page should be loaded at this time
+                    assert!(page.is_loaded()); //  page should be loaded at this time
                     self.stack.advance();
-                    let page = page.get();
-                    let contents = page.get().contents.as_ref().unwrap();
+                    let contents = page.get_contents();
                     let cell_idx = self.stack.current_cell_index();
 
                     //  If we've processed all cells in this page, figure out what to do with this page
@@ -5122,9 +5035,9 @@ impl BTreeCursor {
                 }
                 DestroyState::FreePage => {
                     let page = self.stack.top();
-                    let page_id = page.get().get().id;
+                    let page_id = page.get().id;
 
-                    return_if_io!(self.pager.free_page(Some(page.get()), page_id));
+                    return_if_io!(self.pager.free_page(Some(page), page_id));
 
                     if self.stack.has_parent() {
                         self.stack.pop();
@@ -5150,17 +5063,13 @@ impl BTreeCursor {
 
     pub fn overwrite_cell(
         &mut self,
-        page_ref: BTreePage,
+        page: PageRef,
         cell_idx: usize,
         record: &ImmutableRecord,
         state: &mut OverwriteCellState,
     ) -> Result<IOResult<()>> {
         loop {
-            turso_assert!(
-                page_ref.get().is_loaded(),
-                "page {} is not loaded",
-                page_ref.get().get().id
-            );
+            turso_assert!(page.is_loaded(), "page {} is not loaded", page.get().id);
             match state {
                 OverwriteCellState::AllocatePayload => {
                     let serial_types_len = self.record_cursor.borrow_mut().len(record);
@@ -5178,10 +5087,9 @@ impl BTreeCursor {
                     rowid,
                     fill_cell_payload_state,
                 } => {
-                    let page = page_ref.get();
                     {
                         return_if_io!(fill_cell_payload(
-                            page,
+                            page.clone(),
                             *rowid,
                             new_payload,
                             cell_idx,
@@ -5193,9 +5101,8 @@ impl BTreeCursor {
                     }
                     // figure out old cell offset & size
                     let (old_offset, old_local_size) = {
-                        let page_ref = page_ref.get();
-                        let page = page_ref.get().contents.as_ref().unwrap();
-                        page.cell_get_raw_region(cell_idx, self.usable_space())
+                        let contents = page.get_contents();
+                        contents.cell_get_raw_region(cell_idx, self.usable_space())
                     };
 
                     *state = OverwriteCellState::ClearOverflowPagesAndOverwrite {
@@ -5210,28 +5117,19 @@ impl BTreeCursor {
                     old_offset,
                     old_local_size,
                 } => {
-                    let page = page_ref.get();
-                    let page_contents = page.get().contents.as_ref().unwrap();
-                    let cell = page_contents.cell_get(cell_idx, self.usable_space())?;
+                    let contents = page.get_contents();
+                    let cell = contents.cell_get(cell_idx, self.usable_space())?;
                     return_if_io!(self.clear_overflow_pages(&cell));
 
                     // if it all fits in local space and old_local_size is enough, do an in-place overwrite
                     if new_payload.len() == *old_local_size {
-                        let _res = BTreeCursor::overwrite_content(
-                            page_ref.clone(),
-                            *old_offset,
-                            new_payload,
-                        )?;
+                        let _res =
+                            BTreeCursor::overwrite_content(page.clone(), *old_offset, new_payload)?;
                         return Ok(IOResult::Done(()));
                     }
 
-                    drop_cell(page_ref.get().get_contents(), cell_idx, self.usable_space())?;
-                    insert_into_cell(
-                        page_ref.get().get_contents(),
-                        new_payload,
-                        cell_idx,
-                        self.usable_space(),
-                    )?;
+                    drop_cell(contents, cell_idx, self.usable_space())?;
+                    insert_into_cell(contents, new_payload, cell_idx, self.usable_space())?;
                     return Ok(IOResult::Done(()));
                 }
             }
@@ -5239,13 +5137,12 @@ impl BTreeCursor {
     }
 
     pub fn overwrite_content(
-        page_ref: BTreePage,
+        page: PageRef,
         dest_offset: usize,
         new_payload: &[u8],
     ) -> Result<IOResult<()>> {
-        let page_ref = page_ref.get();
-        turso_assert!(page_ref.is_loaded(), "page should be loaded");
-        let buf = page_ref.get().contents.as_mut().unwrap().as_ptr();
+        turso_assert!(page.is_loaded(), "page should be loaded");
+        let buf = page.get_contents().as_ptr();
         buf[dest_offset..dest_offset + new_payload.len()].copy_from_slice(new_payload);
 
         Ok(IOResult::Done(()))
@@ -5282,7 +5179,6 @@ impl BTreeCursor {
             todo!("Implement count for mvcc");
         }
 
-        let mut mem_page_rc;
         let mut mem_page;
         let mut contents;
 
@@ -5297,10 +5193,9 @@ impl BTreeCursor {
                     }
                 }
                 CountState::Loop => {
-                    mem_page_rc = self.stack.top();
-                    mem_page = mem_page_rc.get();
+                    mem_page = self.stack.top();
                     turso_assert!(mem_page.is_loaded(), "page should be loaded");
-                    contents = mem_page.get().contents.as_ref().unwrap();
+                    contents = mem_page.get_contents();
 
                     /* If this is a leaf page or the tree is not an int-key tree, then
                      ** this page contains countable entries. Increment the entry counter
@@ -5329,10 +5224,9 @@ impl BTreeCursor {
                             // Move to parent
                             self.stack.pop();
 
-                            mem_page_rc = self.stack.top();
-                            mem_page = mem_page_rc.get();
+                            mem_page = self.stack.top();
                             turso_assert!(mem_page.is_loaded(), "page should be loaded");
-                            contents = mem_page.get().contents.as_ref().unwrap();
+                            contents = mem_page.get_contents();
 
                             let cell_idx = self.stack.current_cell_index() as usize;
 
@@ -5436,11 +5330,11 @@ impl BTreeCursor {
         }
     }
 
-    pub fn read_page(&self, page_idx: usize) -> Result<(BTreePage, Option<Completion>)> {
+    pub fn read_page(&self, page_idx: usize) -> Result<(PageRef, Option<Completion>)> {
         btree_read_page(&self.pager, page_idx)
     }
 
-    pub fn allocate_page(&self, page_type: PageType, offset: usize) -> Result<IOResult<BTreePage>> {
+    pub fn allocate_page(&self, page_type: PageType, offset: usize) -> Result<IOResult<PageRef>> {
         self.pager
             .do_allocate_page(page_type, offset, BtreePageAllocMode::Any)
     }
@@ -5504,11 +5398,20 @@ pub enum IntegrityCheckError {
         got: usize,
         expected: usize,
     },
-    #[error("Page {page_id} referenced multiple times")]
+    #[error("Page {page_id} referenced multiple times (references={references:?}, page_category={page_category:?})")]
     PageReferencedMultipleTimes {
-        page_id: usize,
-        is_overflow_page: bool,
+        page_id: u64,
+        references: Vec<u64>,
+        page_category: PageCategory,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum PageCategory {
+    Normal,
+    Overflow,
+    FreeListTrunk,
+    FreePage,
 }
 
 #[derive(Clone)]
@@ -5516,34 +5419,74 @@ struct IntegrityCheckPageEntry {
     page_idx: usize,
     level: usize,
     max_intkey: i64,
+    page_category: PageCategory,
 }
 pub struct IntegrityCheckState {
-    pub current_page: usize,
     page_stack: Vec<IntegrityCheckPageEntry>,
     first_leaf_level: Option<usize>,
-    pages_referenced: HashSet<usize>,
+    page_reference: HashMap<u64, u64>,
     page: Option<PageRef>,
 }
 
 impl IntegrityCheckState {
-    pub fn new(page_idx: usize) -> Self {
+    pub fn new() -> Self {
         Self {
-            current_page: page_idx,
-            page_stack: vec![IntegrityCheckPageEntry {
-                page_idx,
-                level: 0,
-                max_intkey: i64::MAX,
-            }],
-            pages_referenced: HashSet::new(),
+            page_stack: Vec::new(),
+            page_reference: HashMap::new(),
             first_leaf_level: None,
             page: None,
         }
+    }
+
+    pub fn start(
+        &mut self,
+        page_idx: usize,
+        page_category: PageCategory,
+        errors: &mut Vec<IntegrityCheckError>,
+    ) {
+        assert!(
+            self.page_stack.is_empty(),
+            "stack should be empty before integrity check for new root"
+        );
+        self.first_leaf_level = None;
+        let _ = self.page.take();
+        // root can't be referenced from anywhere - so we insert "zero entry" for it
+        self.push_page(
+            IntegrityCheckPageEntry {
+                page_idx,
+                level: 0,
+                max_intkey: i64::MAX,
+                page_category,
+            },
+            0,
+            errors,
+        );
+    }
+
+    fn push_page(
+        &mut self,
+        entry: IntegrityCheckPageEntry,
+        referenced_by: u64,
+        errors: &mut Vec<IntegrityCheckError>,
+    ) {
+        let page_id = entry.page_idx as u64;
+        let Some(previous) = self.page_reference.insert(page_id, referenced_by) else {
+            // do not traverse free pages as they have no meaingful structured content
+            if entry.page_category != PageCategory::FreePage {
+                self.page_stack.push(entry);
+            }
+            return;
+        };
+        errors.push(IntegrityCheckError::PageReferencedMultipleTimes {
+            page_id,
+            page_category: entry.page_category,
+            references: vec![previous, referenced_by],
+        });
     }
 }
 impl std::fmt::Debug for IntegrityCheckState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("IntegrityCheckState")
-            .field("current_page", &self.current_page)
             .field("first_leaf_level", &self.first_leaf_level)
             .finish()
     }
@@ -5567,6 +5510,7 @@ pub fn integrity_check(
     loop {
         let Some(IntegrityCheckPageEntry {
             page_idx,
+            page_category,
             level,
             max_intkey,
         }) = state.page_stack.last().cloned()
@@ -5577,7 +5521,7 @@ pub fn integrity_check(
             Some(page) => page,
             None => {
                 let (page, c) = btree_read_page(pager, page_idx)?;
-                state.page = Some(page.get());
+                state.page = Some(page);
                 if let Some(c) = c {
                     io_yield_one!(c);
                 }
@@ -5588,28 +5532,55 @@ pub fn integrity_check(
         state.page_stack.pop();
 
         let contents = page.get_contents();
-        let is_overflow_page = contents.maybe_page_type().is_none();
-        if !state.pages_referenced.insert(page.get().id) {
-            errors.push(IntegrityCheckError::PageReferencedMultipleTimes {
-                page_id: page.get().id,
-                is_overflow_page,
-            });
-            continue;
-        }
-        let usable_space = pager.usable_space();
-        let mut coverage_checker = CoverageChecker::new(page.get().id);
-
-        if is_overflow_page {
-            let next_overflow_page = contents.read_u32_no_offset(0);
-            if next_overflow_page != 0 {
-                state.page_stack.push(IntegrityCheckPageEntry {
-                    page_idx: next_overflow_page as usize,
-                    level,
-                    max_intkey,
-                });
+        if page_category == PageCategory::FreeListTrunk {
+            let next_freelist_trunk_page = contents.read_u32_no_offset(0);
+            if next_freelist_trunk_page != 0 {
+                state.push_page(
+                    IntegrityCheckPageEntry {
+                        page_idx: next_freelist_trunk_page as usize,
+                        level,
+                        max_intkey,
+                        page_category: PageCategory::FreeListTrunk,
+                    },
+                    page.get().id as u64,
+                    errors,
+                );
+            }
+            let page_pointers = contents.read_u32_no_offset(4);
+            for i in 0..page_pointers {
+                let page_pointer = contents.read_u32_no_offset((8 + 4 * i) as usize);
+                state.push_page(
+                    IntegrityCheckPageEntry {
+                        page_idx: page_pointer as usize,
+                        level,
+                        max_intkey,
+                        page_category: PageCategory::FreePage,
+                    },
+                    page.get().id as u64,
+                    errors,
+                );
             }
             continue;
         }
+        if page_category == PageCategory::Overflow {
+            let next_overflow_page = contents.read_u32_no_offset(0);
+            if next_overflow_page != 0 {
+                state.push_page(
+                    IntegrityCheckPageEntry {
+                        page_idx: next_overflow_page as usize,
+                        level,
+                        max_intkey,
+                        page_category: PageCategory::Overflow,
+                    },
+                    page.get().id as u64,
+                    errors,
+                );
+            }
+            continue;
+        }
+
+        let usable_space = pager.usable_space();
+        let mut coverage_checker = CoverageChecker::new(page.get().id);
 
         // Now we check every cell for few things:
         // 1. Check cell is in correct range. Not exceeds page and not starts before we have marked
@@ -5648,11 +5619,16 @@ pub fn integrity_check(
             let cell = contents.cell_get(cell_idx, usable_space)?;
             match cell {
                 BTreeCell::TableInteriorCell(table_interior_cell) => {
-                    state.page_stack.push(IntegrityCheckPageEntry {
-                        page_idx: table_interior_cell.left_child_page as usize,
-                        level: level + 1,
-                        max_intkey: table_interior_cell.rowid,
-                    });
+                    state.push_page(
+                        IntegrityCheckPageEntry {
+                            page_idx: table_interior_cell.left_child_page as usize,
+                            level: level + 1,
+                            max_intkey: table_interior_cell.rowid,
+                            page_category: PageCategory::Normal,
+                        },
+                        page.get().id as u64,
+                        errors,
+                    );
                     let rowid = table_interior_cell.rowid;
                     if rowid > max_intkey || rowid > next_rowid {
                         errors.push(IntegrityCheckError::CellRowidOutOfRange {
@@ -5690,25 +5666,40 @@ pub fn integrity_check(
                     }
                     next_rowid = rowid;
                     if let Some(first_overflow_page) = table_leaf_cell.first_overflow_page {
-                        state.page_stack.push(IntegrityCheckPageEntry {
-                            page_idx: first_overflow_page as usize,
-                            level,
-                            max_intkey,
-                        });
+                        state.push_page(
+                            IntegrityCheckPageEntry {
+                                page_idx: first_overflow_page as usize,
+                                level,
+                                max_intkey,
+                                page_category: PageCategory::Overflow,
+                            },
+                            page.get().id as u64,
+                            errors,
+                        );
                     }
                 }
                 BTreeCell::IndexInteriorCell(index_interior_cell) => {
-                    state.page_stack.push(IntegrityCheckPageEntry {
-                        page_idx: index_interior_cell.left_child_page as usize,
-                        level: level + 1,
-                        max_intkey, // we don't care about intkey in non-table pages
-                    });
+                    state.push_page(
+                        IntegrityCheckPageEntry {
+                            page_idx: index_interior_cell.left_child_page as usize,
+                            level: level + 1,
+                            max_intkey, // we don't care about intkey in non-table pages
+                            page_category: PageCategory::Normal,
+                        },
+                        page.get().id as u64,
+                        errors,
+                    );
                     if let Some(first_overflow_page) = index_interior_cell.first_overflow_page {
-                        state.page_stack.push(IntegrityCheckPageEntry {
-                            page_idx: first_overflow_page as usize,
-                            level,
-                            max_intkey,
-                        });
+                        state.push_page(
+                            IntegrityCheckPageEntry {
+                                page_idx: first_overflow_page as usize,
+                                level,
+                                max_intkey,
+                                page_category: PageCategory::Overflow,
+                            },
+                            page.get().id as u64,
+                            errors,
+                        );
                     }
                 }
                 BTreeCell::IndexLeafCell(index_leaf_cell) => {
@@ -5725,22 +5716,32 @@ pub fn integrity_check(
                         state.first_leaf_level = Some(level);
                     }
                     if let Some(first_overflow_page) = index_leaf_cell.first_overflow_page {
-                        state.page_stack.push(IntegrityCheckPageEntry {
-                            page_idx: first_overflow_page as usize,
-                            level,
-                            max_intkey,
-                        });
+                        state.push_page(
+                            IntegrityCheckPageEntry {
+                                page_idx: first_overflow_page as usize,
+                                level,
+                                max_intkey,
+                                page_category: PageCategory::Overflow,
+                            },
+                            page.get().id as u64,
+                            errors,
+                        );
                     }
                 }
             }
         }
 
         if let Some(rightmost) = contents.rightmost_pointer() {
-            state.page_stack.push(IntegrityCheckPageEntry {
-                page_idx: rightmost as usize,
-                level: level + 1,
-                max_intkey,
-            });
+            state.push_page(
+                IntegrityCheckPageEntry {
+                    page_idx: rightmost as usize,
+                    level: level + 1,
+                    max_intkey,
+                    page_category: PageCategory::Normal,
+                },
+                page.get().id as u64,
+                errors,
+            );
         }
 
         // Now we add free blocks to the coverage checker
@@ -5777,15 +5778,8 @@ pub fn integrity_check(
 pub fn btree_read_page(
     pager: &Rc<Pager>,
     page_idx: usize,
-) -> Result<(BTreePage, Option<Completion>)> {
-    pager.read_page(page_idx).map(|(page, c)| {
-        (
-            Arc::new(BTreePageInner {
-                page: RefCell::new(page),
-            }),
-            c,
-        )
-    })
+) -> Result<(Arc<Page>, Option<Completion>)> {
+    pager.read_page(page_idx)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5892,7 +5886,7 @@ struct PageStack {
     /// Pointer to the current page being consumed
     current_page: Cell<i32>,
     /// List of pages in the stack. Root page will be in index 0
-    pub stack: RefCell<[Option<BTreePage>; BTCURSOR_MAX_DEPTH + 1]>,
+    pub stack: RefCell<[Option<PageRef>; BTCURSOR_MAX_DEPTH + 1]>,
     /// List of cell indices in the stack.
     /// node_states[current_page] is the current cell index being consumed. Similarly
     /// node_states[current_page-1] is the cell index of the parent of the current page
@@ -5914,10 +5908,10 @@ impl PageStack {
     /// Push a new page onto the stack.
     /// This effectively means traversing to a child page.
     #[instrument(skip_all, level = Level::DEBUG, name = "pagestack::push")]
-    fn _push(&self, page: BTreePage, starting_cell_idx: i32) {
+    fn _push(&self, page: PageRef, starting_cell_idx: i32) {
         tracing::trace!(
             current = self.current_page.get(),
-            new_page_id = page.get().get().id,
+            new_page_id = page.get().id,
         );
         'validate: {
             let current = self.current_page.get();
@@ -5928,9 +5922,9 @@ impl PageStack {
             let current_top = stack[current as usize].as_ref();
             if let Some(current_top) = current_top {
                 turso_assert!(
-                    current_top.get().get().id != page.get().get().id,
+                    current_top.get().id != page.get().id,
                     "about to push page {} twice",
-                    page.get().get().id
+                    page.get().id
                 );
             }
         }
@@ -5944,7 +5938,7 @@ impl PageStack {
         assert!(current >= 0);
 
         // Pin the page to prevent it from being evicted while on the stack
-        page.get().pin();
+        page.pin();
 
         self.stack.borrow_mut()[current as usize] = Some(page);
         self.node_states.borrow_mut()[current as usize] = BTreeNodeState {
@@ -5967,7 +5961,6 @@ impl PageStack {
         let current = self.current();
         let stack = self.stack.borrow();
         let page = stack[current].as_ref().unwrap();
-        let page = page.get();
         turso_assert!(
             page.is_pinned(),
             "parent page {} is not pinned",
@@ -5983,11 +5976,11 @@ impl PageStack {
         self.node_states.borrow_mut()[current].cell_count = Some(cell_count);
     }
 
-    fn push(&self, page: BTreePage) {
+    fn push(&self, page: PageRef) {
         self._push(page, -1);
     }
 
-    fn push_backwards(&self, page: BTreePage) {
+    fn push_backwards(&self, page: PageRef) {
         self._push(page, i32::MAX);
     }
 
@@ -6001,7 +5994,7 @@ impl PageStack {
 
         // Unpin the page before removing it from the stack
         if let Some(page) = &self.stack.borrow()[current as usize] {
-            page.get().unpin();
+            page.unpin();
         }
 
         self.node_states.borrow_mut()[current as usize] = BTreeNodeState::default();
@@ -6012,12 +6005,12 @@ impl PageStack {
     /// Get the top page on the stack.
     /// This is the page that is currently being traversed.
     #[instrument(skip(self), level = Level::DEBUG, name = "pagestack::top", )]
-    fn top(&self) -> BTreePage {
+    fn top(&self) -> Arc<Page> {
         let page = self.stack.borrow()[self.current()]
             .as_ref()
             .unwrap()
             .clone();
-        tracing::trace!(current = self.current(), page_id = page.get().get().id);
+        tracing::trace!(current = self.current(), page_id = page.get().id);
         turso_assert!(page.is_loaded(), "page should be loaded");
         page
     }
@@ -6074,7 +6067,7 @@ impl PageStack {
     }
 
     /// Get a page at a specific level in the stack (0 = root, 1 = first child, etc.)
-    fn get_page_at_level(&self, level: usize) -> Option<BTreePage> {
+    fn get_page_at_level(&self, level: usize) -> Option<PageRef> {
         let stack = self.stack.borrow();
         if level < stack.len() {
             stack[level].clone()
@@ -6089,7 +6082,7 @@ impl PageStack {
             .iter_mut()
             .flatten()
             .for_each(|page| {
-                let _ = page.get().try_unpin();
+                let _ = page.try_unpin();
             });
     }
 
@@ -6126,16 +6119,6 @@ impl CellArray {
     /// Returns the number of cells up to and including the given page.
     pub fn cell_count_up_to_page(&self, page_idx: usize) -> usize {
         self.cell_count_per_page_cumulative[page_idx] as usize
-    }
-}
-
-impl BTreePageInner {
-    pub fn get(&self) -> PageRef {
-        self.page.borrow().clone()
-    }
-
-    pub fn is_loaded(&self) -> bool {
-        self.page.borrow().is_loaded()
     }
 }
 
@@ -6239,15 +6222,10 @@ fn find_free_slot(
     Ok(None)
 }
 
-pub fn btree_init_page(page: &BTreePage, page_type: PageType, offset: usize, usable_space: usize) {
+pub fn btree_init_page(page: &PageRef, page_type: PageType, offset: usize, usable_space: usize) {
     // setup btree page
-    let contents = page.get();
-    tracing::debug!(
-        "btree_init_page(id={}, offset={})",
-        contents.get().id,
-        offset
-    );
-    let contents = contents.get().contents.as_mut().unwrap();
+    let contents = page.get_contents();
+    tracing::debug!("btree_init_page(id={}, offset={})", page.get().id, offset);
     contents.offset = offset;
     let id = page_type as u8;
     contents.write_page_type(id);
@@ -7179,7 +7157,7 @@ fn fill_cell_payload(
         match fill_cell_payload_state {
             FillCellPayloadState::Start => {
                 page.pin(); // We need to pin this page because we will be accessing its contents after fill_cell_payload is done.
-                let page_contents = page.get().contents.as_ref().unwrap();
+                let page_contents = page.get_contents();
 
                 let page_type = page_contents.page_type();
                 // fill in header
@@ -7404,7 +7382,7 @@ mod tests {
         },
         types::Text,
         vdbe::Register,
-        BufferPool, Completion, Connection, StepResult, WalFile, WalFileShared,
+        BufferPool, Completion, Connection, IOContext, StepResult, WalFile, WalFileShared,
     };
     use std::{
         cell::RefCell,
@@ -7429,14 +7407,11 @@ mod tests {
     use super::{btree_init_page, defragment_page, drop_cell, insert_into_cell};
 
     #[allow(clippy::arc_with_non_send_sync)]
-    fn get_page(id: usize) -> BTreePage {
+    fn get_page(id: usize) -> Arc<Page> {
         let page = Arc::new(Page::new(id));
 
         let inner = PageContent::new(0, Arc::new(Buffer::new_temporary(4096)));
         page.get().contents.replace(inner);
-        let page = Arc::new(BTreePageInner {
-            page: RefCell::new(page),
-        });
 
         btree_init_page(&page, PageType::TableLeaf, 0, 4096);
         page
@@ -7500,7 +7475,7 @@ mod tests {
         let db = get_database();
         let conn = db.connect().unwrap();
         let page = get_page(2);
-        let page = page.get();
+
         let header_size = 8;
         let regs = &[Register::Value(Value::Integer(1))];
         let record = ImmutableRecord::from_registers(regs, regs.len());
@@ -7525,7 +7500,7 @@ mod tests {
         let conn = db.connect().unwrap();
 
         let page = get_page(2);
-        let page = page.get();
+
         let page_contents = page.get_contents();
         let header_size = 8;
 
@@ -7558,13 +7533,13 @@ mod tests {
         let num_columns = 5;
         let cursor = BTreeCursor::new_table(None, pager.clone(), page_idx, num_columns);
         let (page, _c) = cursor.read_page(page_idx).unwrap();
-        while page.get().is_locked() {
+        while page.is_locked() {
             pager.io.run_once().unwrap();
         }
-        let page = page.get();
+
         // Pin page in order to not drop it in between
         page.set_dirty();
-        let contents = page.get().contents.as_ref().unwrap();
+        let contents = page.get_contents();
         let mut previous_key = None;
         let mut valid = true;
         let mut depth = None;
@@ -7578,7 +7553,7 @@ mod tests {
                     left_child_page, ..
                 }) => {
                     let (child_page, _c) = cursor.read_page(left_child_page as usize).unwrap();
-                    while child_page.get().is_locked() {
+                    while child_page.is_locked() {
                         pager.io.run_once().unwrap();
                     }
                     child_pages.push(child_page);
@@ -7632,26 +7607,26 @@ mod tests {
                 valid = false;
             }
         }
-        let first_page_type = child_pages.first().map(|p| {
-            if !p.get().is_loaded() {
-                let (new_page, _c) = pager.read_page(p.get().get().id).unwrap();
-                p.page.replace(new_page);
+        let first_page_type = child_pages.first_mut().map(|p| {
+            if !p.is_loaded() {
+                let (new_page, _c) = pager.read_page(p.get().id).unwrap();
+                *p = new_page;
             }
-            while p.get().is_locked() {
+            while p.is_locked() {
                 pager.io.run_once().unwrap();
             }
-            p.get().get_contents().page_type()
+            p.get_contents().page_type()
         });
         if let Some(child_type) = first_page_type {
-            for page in child_pages.iter().skip(1) {
-                if !page.get().is_loaded() {
-                    let (new_page, _c) = pager.read_page(page.get().get().id).unwrap();
-                    page.page.replace(new_page);
+            for page in child_pages.iter_mut().skip(1) {
+                if !page.is_loaded() {
+                    let (new_page, _c) = pager.read_page(page.get().id).unwrap();
+                    *page = new_page;
                 }
-                while page.get().is_locked() {
+                while page.is_locked() {
                     pager.io.run_once().unwrap();
                 }
-                if page.get().get_contents().page_type() != child_type {
+                if page.get_contents().page_type() != child_type {
                     tracing::error!("child pages have different types");
                     valid = false;
                 }
@@ -7669,13 +7644,13 @@ mod tests {
 
         let cursor = BTreeCursor::new_table(None, pager.clone(), page_idx, num_columns);
         let (page, _c) = cursor.read_page(page_idx).unwrap();
-        while page.get().is_locked() {
+        while page.is_locked() {
             pager.io.run_once().unwrap();
         }
-        let page = page.get();
+
         // Pin page in order to not drop it in between loading of different pages. If not contents will be a dangling reference.
         page.set_dirty();
-        let contents = page.get().contents.as_ref().unwrap();
+        let contents = page.get_contents();
         let mut current = Vec::new();
         let mut child = Vec::new();
         for cell_idx in 0..contents.cell_count() {
@@ -7732,11 +7707,8 @@ mod tests {
         // FIXME: handle page cache is full
         let _ = run_until_done(|| pager.allocate_page1(), &pager);
         let page2 = run_until_done(|| pager.allocate_page(), &pager).unwrap();
-        let page2 = Arc::new(BTreePageInner {
-            page: RefCell::new(page2),
-        });
         btree_init_page(&page2, PageType::TableLeaf, 0, 4096);
-        (pager, page2.get().get().id, db, conn)
+        (pager, page2.get().id, db, conn)
     }
 
     #[test]
@@ -8495,7 +8467,7 @@ mod tests {
         let conn = db.connect().unwrap();
 
         let page = get_page(2);
-        let page = page.get();
+
         let page_contents = page.get_contents();
         let header_size = 8;
 
@@ -8713,18 +8685,20 @@ mod tests {
             let c = Completion::new_write(move |_| {
                 let _ = _buf.clone();
             });
-            let _c = pager
-                .db_file
-                .write_page(current_page as usize, buf.clone(), None, c)?;
+            let _c = pager.db_file.write_page(
+                current_page as usize,
+                buf.clone(),
+                &IOContext::default(),
+                c,
+            )?;
             pager.io.run_once()?;
 
             let (page, _c) = cursor.read_page(current_page as usize)?;
-            while page.get().is_locked() {
+            while page.is_locked() {
                 cursor.pager.io.run_once()?;
             }
 
             {
-                let page = page.get();
                 let contents = page.get_contents();
 
                 let next_page = if current_page < 4 {
@@ -8780,18 +8754,17 @@ mod tests {
         if trunk_page_id > 0 {
             // Verify trunk page structure
             let (trunk_page, _c) = cursor.read_page(trunk_page_id as usize)?;
-            if let Some(contents) = trunk_page.get().get().contents.as_ref() {
-                // Read number of leaf pages in trunk
-                let n_leaf = contents.read_u32_no_offset(4);
-                assert!(n_leaf > 0, "Trunk page should have leaf entries");
+            let contents = trunk_page.get_contents();
+            // Read number of leaf pages in trunk
+            let n_leaf = contents.read_u32_no_offset(4);
+            assert!(n_leaf > 0, "Trunk page should have leaf entries");
 
-                for i in 0..n_leaf {
-                    let leaf_page_id = contents.read_u32_no_offset(8 + (i as usize * 4));
-                    assert!(
-                        (2..=4).contains(&leaf_page_id),
-                        "Leaf page ID {leaf_page_id} should be in range 2-4"
-                    );
-                }
+            for i in 0..n_leaf {
+                let leaf_page_id = contents.read_u32_no_offset(8 + (i as usize * 4));
+                assert!(
+                    (2..=4).contains(&leaf_page_id),
+                    "Leaf page ID {leaf_page_id} should be in range 2-4"
+                );
             }
         }
 
@@ -8872,19 +8845,18 @@ mod tests {
 
         // Configure the root page to point to the two leaf pages
         {
-            let root_page = root_page.get();
-            let contents = root_page.get().contents.as_mut().unwrap();
+            let contents = root_page.get_contents();
 
             // Set rightmost pointer to page4
-            contents.write_rightmost_ptr(page4.get().get().id as u32);
+            contents.write_rightmost_ptr(page4.get().id as u32);
 
             // Create a cell with pointer to page3
             let cell_content = vec![
                 // First 4 bytes: left child pointer (page3)
-                (page3.get().get().id >> 24) as u8,
-                (page3.get().get().id >> 16) as u8,
-                (page3.get().get().id >> 8) as u8,
-                page3.get().get().id as u8,
+                (page3.get().id >> 24) as u8,
+                (page3.get().id >> 16) as u8,
+                (page3.get().id >> 8) as u8,
+                page3.get().id as u8,
                 // Next byte: rowid as varint (simple value 100)
                 100,
             ];
@@ -8895,8 +8867,7 @@ mod tests {
 
         // Add a simple record to each leaf page
         for page in [&page3, &page4] {
-            let page = page.get();
-            let contents = page.get().contents.as_mut().unwrap();
+            let contents = page.get_contents();
 
             // Simple record with just a rowid and payload
             let record_bytes = vec![
@@ -8947,7 +8918,7 @@ mod tests {
         let conn = db.connect().unwrap();
 
         let page = get_page(2);
-        let page = page.get();
+
         let page_contents = page.get_contents();
         let header_size = 8;
 
@@ -8988,7 +8959,7 @@ mod tests {
         let conn = db.connect().unwrap();
 
         let page = get_page(2);
-        let page = page.get();
+
         let page_contents = page.get_contents();
         let header_size = 8;
 
@@ -9035,7 +9006,7 @@ mod tests {
         let conn = db.connect().unwrap();
 
         let page = get_page(2);
-        let page = page.get();
+
         let page_contents = page.get_contents();
         let header_size = 8;
 
@@ -9117,7 +9088,7 @@ mod tests {
         let conn = db.connect().unwrap();
 
         let page = get_page(2);
-        let page = page.get();
+
         let page_contents = page.get_contents();
         let header_size = 8;
 
@@ -9293,7 +9264,7 @@ mod tests {
         let db = get_database();
         let conn = db.connect().unwrap();
         let page = get_page(2);
-        let page = page.get();
+
         let page_contents = page.get_contents();
         let header_size = 8;
         let usable_space = 4096;
@@ -9311,7 +9282,7 @@ mod tests {
         let conn = db.connect().unwrap();
 
         let page = get_page(2);
-        let page = page.get();
+
         let page_contents = page.get_contents();
         let usable_space = 4096;
 
@@ -9333,7 +9304,7 @@ mod tests {
         let conn = db.connect().unwrap();
 
         let page = get_page(2);
-        let page = page.get();
+
         let page_contents = page.get_contents();
         let usable_space = 4096;
 
@@ -9364,7 +9335,7 @@ mod tests {
         let conn = db.connect().unwrap();
 
         let page = get_page(2);
-        let page = page.get();
+
         let page_contents = page.get_contents();
         let usable_space = 4096;
 
@@ -9397,7 +9368,7 @@ mod tests {
         let conn = db.connect().unwrap();
 
         let page = get_page(2);
-        let page = page.get();
+
         let page_contents = page.get_contents();
         let usable_space = 4096;
 
@@ -9423,7 +9394,7 @@ mod tests {
         let conn = db.connect().unwrap();
 
         let page = get_page(2);
-        let page = page.get();
+
         let page_contents = page.get_contents();
         let usable_space = 4096;
 
@@ -9467,7 +9438,7 @@ mod tests {
         let defragment = |page| {
             defragment_page(page, usable_space, 4).unwrap();
         };
-        let page = page.get();
+
         defragment(page.get_contents());
         defragment(page.get_contents());
         insert(0, page.clone());
@@ -9515,7 +9486,7 @@ mod tests {
         run_until_done(
             || {
                 fill_cell_payload(
-                    page.get(),
+                    page.clone(),
                     Some(0),
                     &mut payload,
                     0,
@@ -9528,7 +9499,7 @@ mod tests {
             &conn.pager.borrow().clone(),
         )
         .unwrap();
-        let page = page.get();
+
         insert(0, page.clone());
         defragment(page.get_contents());
         insert(0, page.clone());
@@ -9601,7 +9572,7 @@ mod tests {
         run_until_done(
             || {
                 fill_cell_payload(
-                    page.get(),
+                    page.clone(),
                     Some(0),
                     &mut payload,
                     0,
@@ -9614,12 +9585,12 @@ mod tests {
             &conn.pager.borrow().clone(),
         )
         .unwrap();
-        insert_into_cell(page.get().get_contents(), &payload, 0, 4096).unwrap();
-        let free = compute_free_space(page.get().get_contents(), usable_space);
+        insert_into_cell(page.get_contents(), &payload, 0, 4096).unwrap();
+        let free = compute_free_space(page.get_contents(), usable_space);
         let total_size = payload.len() + 2;
         assert_eq!(
             free,
-            usable_space - page.get().get_contents().header_size() - total_size
+            usable_space - page.get_contents().header_size() - total_size
         );
         dbg!(free);
     }
@@ -9942,11 +9913,8 @@ mod tests {
             let (pager, _, _, _) = empty_btree();
             let page_type = PageType::TableLeaf;
             let page = run_until_done(|| pager.allocate_page(), &pager).unwrap();
-            let page = Arc::new(BTreePageInner {
-                page: RefCell::new(page),
-            });
             btree_init_page(&page, page_type, 0, pager.usable_space());
-            let page = page.get();
+
             let mut size = (rng.next_u64() % 100) as u16;
             let mut i = 0;
             // add a bunch of cells

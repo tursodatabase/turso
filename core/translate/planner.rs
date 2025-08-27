@@ -373,9 +373,10 @@ fn parse_from_clause_table(
             let cur_table_index = table_references.joined_tables().len();
             let identifier = maybe_alias
                 .map(|a| match a {
-                    ast::As::As(id) => id.as_str().to_string(),
-                    ast::As::Elided(id) => id.as_str().to_string(),
+                    ast::As::As(id) => id,
+                    ast::As::Elided(id) => id,
                 })
+                .map(|id| normalize_ident(id.as_str()))
                 .unwrap_or(format!("subquery_{cur_table_index}"));
             table_references.add_joined_table(JoinedTable::new_subquery(
                 identifier,
@@ -438,7 +439,7 @@ fn parse_table(
                 ast::As::As(id) => id,
                 ast::As::Elided(id) => id,
             })
-            .map(|a| a.as_str().to_string());
+            .map(|a| normalize_ident(a.as_str()));
         let internal_id = table_ref_counter.next();
         let tbl_ref = if let Table::Virtual(tbl) = table.as_ref() {
             transform_args_into_where_terms(args, internal_id, vtab_predicates, table.as_ref())?;
@@ -494,14 +495,17 @@ fn parse_table(
     if let Some(view) = view {
         // Create a virtual table wrapper for the view
         // We'll use the view's columns from the schema
-        let vtab = crate::vtab_view::create_view_virtual_table(table_name.as_str(), view.clone())?;
+        let vtab = crate::vtab_view::create_view_virtual_table(
+            normalize_ident(table_name.as_str()).as_str(),
+            view.clone(),
+        )?;
 
         let alias = maybe_alias
             .map(|a| match a {
                 ast::As::As(id) => id,
                 ast::As::Elided(id) => id,
             })
-            .map(|a| a.as_str().to_string());
+            .map(|a| normalize_ident(a.as_str()));
 
         table_references.add_joined_table(JoinedTable {
             op: Operation::Scan(Scan::VirtualTable {

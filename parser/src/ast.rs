@@ -1360,6 +1360,8 @@ pub enum PragmaName {
     QueryOnly,
     /// Returns schema version of the database file.
     SchemaVersion,
+    /// Control database synchronization mode (OFF | FULL | NORMAL | EXTRA)
+    Synchronous,
     /// returns information about the columns of a table
     TableInfo,
     /// enable capture-changes logic for the connection

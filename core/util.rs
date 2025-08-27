@@ -1111,7 +1111,11 @@ pub fn cast_real_to_integer(float: f64) -> std::result::Result<i64, ()> {
 // we don't need to verify the numeric literal here, as it is already verified by the parser
 pub fn parse_numeric_literal(text: &str) -> Result<Value> {
     // a single extra underscore ("_") character can exist between any two digits
-    let text = text.replace("_", "");
+    let text = if text.contains('_') {
+        std::borrow::Cow::Owned(text.replace('_', ""))
+    } else {
+        std::borrow::Cow::Borrowed(text)
+    };
 
     if text.starts_with("0x") || text.starts_with("0X") {
         let value = u64::from_str_radix(&text[2..], 16)? as i64;

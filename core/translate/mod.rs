@@ -83,7 +83,7 @@ pub fn translate(
         // These options will be extended whithin each translate program
         ProgramBuilderOpts {
             num_cursors: 1,
-            approx_num_insns: 2,
+            approx_num_insns: 32,
             approx_num_labels: 2,
         },
     );

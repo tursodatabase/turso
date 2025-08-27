@@ -4,6 +4,39 @@ use crate::{io::Completion, Buffer, CompletionError, Result};
 use std::sync::Arc;
 use tracing::{instrument, Level};
 
+#[derive(Clone)]
+pub enum EncryptionOrChecksum {
+    Encryption(EncryptionContext),
+    Checksum,
+    None,
+}
+
+#[derive(Clone)]
+pub struct IOContext {
+    encryption_or_checksum: EncryptionOrChecksum,
+}
+
+impl IOContext {
+    pub fn encryption_context(&self) -> Option<&EncryptionContext> {
+        match &self.encryption_or_checksum {
+            EncryptionOrChecksum::Encryption(ctx) => Some(ctx),
+            _ => None,
+        }
+    }
+
+    pub fn set_encryption(&mut self, encryption_ctx: EncryptionContext) {
+        self.encryption_or_checksum = EncryptionOrChecksum::Encryption(encryption_ctx);
+    }
+}
+
+impl Default for IOContext {
+    fn default() -> Self {
+        Self {
+            encryption_or_checksum: EncryptionOrChecksum::None,
+        }
+    }
+}
+
 /// DatabaseStorage is an interface a database file that consists of pages.
 ///
 /// The purpose of this trait is to abstract the upper layers of Limbo from
@@ -12,17 +45,12 @@ use tracing::{instrument, Level};
 pub trait DatabaseStorage: Send + Sync {
     fn read_header(&self, c: Completion) -> Result<Completion>;
 
-    fn read_page(
-        &self,
-        page_idx: usize,
-        encryption_ctx: Option<&EncryptionContext>,
-        c: Completion,
-    ) -> Result<Completion>;
+    fn read_page(&self, page_idx: usize, io_ctx: &IOContext, c: Completion) -> Result<Completion>;
     fn write_page(
         &self,
         page_idx: usize,
         buffer: Arc<Buffer>,
-        encryption_ctx: Option<&EncryptionContext>,
+        io_ctx: &IOContext,
         c: Completion,
     ) -> Result<Completion>;
     fn write_pages(
@@ -30,7 +58,7 @@ pub trait DatabaseStorage: Send + Sync {
         first_page_idx: usize,
         page_size: usize,
         buffers: Vec<Arc<Buffer>>,
-        encryption_ctx: Option<&EncryptionContext>,
+        io_ctx: &IOContext,
         c: Completion,
     ) -> Result<Completion>;
     fn sync(&self, c: Completion) -> Result<Completion>;
@@ -56,12 +84,7 @@ impl DatabaseStorage for DatabaseFile {
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
-    fn read_page(
-        &self,
-        page_idx: usize,
-        encryption_ctx: Option<&EncryptionContext>,
-        c: Completion,
-    ) -> Result<Completion> {
+    fn read_page(&self, page_idx: usize, io_ctx: &IOContext, c: Completion) -> Result<Completion> {
         let r = c.as_read();
         let size = r.buf().len();
         assert!(page_idx > 0);
@@ -70,7 +93,7 @@ impl DatabaseStorage for DatabaseFile {
         }
         let pos = (page_idx - 1) * size;
 
-        if let Some(ctx) = encryption_ctx {
+        if let Some(ctx) = io_ctx.encryption_context() {
             let encryption_ctx = ctx.clone();
             let read_buffer = r.buf_arc();
             let original_c = c.clone();
@@ -111,7 +134,7 @@ impl DatabaseStorage for DatabaseFile {
         &self,
         page_idx: usize,
         buffer: Arc<Buffer>,
-        encryption_ctx: Option<&EncryptionContext>,
+        io_ctx: &IOContext,
         c: Completion,
     ) -> Result<Completion> {
         let buffer_size = buffer.len();
@@ -121,7 +144,7 @@ impl DatabaseStorage for DatabaseFile {
         assert_eq!(buffer_size & (buffer_size - 1), 0);
         let pos = (page_idx - 1) * buffer_size;
         let buffer = {
-            if let Some(ctx) = encryption_ctx {
+            if let Some(ctx) = io_ctx.encryption_context() {
                 encrypt_buffer(page_idx, buffer, ctx)
             } else {
                 buffer
@@ -135,7 +158,7 @@ impl DatabaseStorage for DatabaseFile {
         first_page_idx: usize,
         page_size: usize,
         buffers: Vec<Arc<Buffer>>,
-        encryption_key: Option<&EncryptionContext>,
+        io_ctx: &IOContext,
         c: Completion,
     ) -> Result<Completion> {
         assert!(first_page_idx > 0);
@@ -145,7 +168,7 @@ impl DatabaseStorage for DatabaseFile {
 
         let pos = (first_page_idx - 1) * page_size;
         let buffers = {
-            if let Some(ctx) = encryption_key {
+            if let Some(ctx) = io_ctx.encryption_context() {
                 buffers
                     .into_iter()
                     .enumerate()

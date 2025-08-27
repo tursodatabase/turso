@@ -114,7 +114,7 @@ pub fn translate_insert(
                         Expr::Id(name) => {
                             if name.is_double_quoted() {
                                 *expr =
-                                    Expr::Literal(ast::Literal::String(format!("{name}"))).into();
+                                    Expr::Literal(ast::Literal::String(name.to_string())).into();
                             } else {
                                 // an INSERT INTO ... VALUES (...) cannot reference columns
                                 crate::bail_parse_error!("no such column: {name}");
@@ -375,9 +375,14 @@ pub fn translate_insert(
             target_pc: make_record_label,
         });
         let rowid_column_name = insertion.key.column_name();
+        let mut description =
+            String::with_capacity(table_name.as_str().len() + rowid_column_name.len() + 2);
+        description.push_str(table_name.as_str());
+        description.push('.');
+        description.push_str(rowid_column_name);
         program.emit_insn(Insn::Halt {
             err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
-            description: format!("{}.{}", table_name.as_str(), rowid_column_name),
+            description,
         });
         program.preassign_label_to_next_insn(make_record_label);
     }
@@ -486,15 +491,28 @@ pub fn translate_insert(
         program.emit_insn(Insn::HaltIfNull {
             target_reg: column_mapping.register,
             err_code: SQLITE_CONSTRAINT_NOTNULL,
-            description: format!(
-                "{}.{}",
-                table_name,
-                column_mapping
-                    .column
-                    .name
-                    .as_ref()
-                    .expect("Column name must be present")
-            ),
+            description: {
+                let mut description = String::with_capacity(
+                    table_name.as_str().len()
+                        + column_mapping
+                            .column
+                            .name
+                            .as_ref()
+                            .expect("Column name must be present")
+                            .len()
+                        + 2,
+                );
+                description.push_str(table_name.as_str());
+                description.push('.');
+                description.push_str(
+                    column_mapping
+                        .column
+                        .name
+                        .as_ref()
+                        .expect("Column name must be present"),
+                );
+                description
+            },
         });
     }
     // Create and insert the record

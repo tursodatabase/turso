@@ -39,7 +39,7 @@ Turso Database is an in-process SQL database written in Rust, compatible with SQ
 * **SQLite compatibility** for SQL dialect, file formats, and the C API [see [document](COMPAT.md) for details]
 * **Change data capture (CDC)** for real-time tracking of database changes.
 * **Language support** for
-  * [Go](bindings/go)
+  * [Go](https://github.com/tursodatabase/turso-go)
   * [JavaScript](bindings/javascript)
   * [Java](bindings/java)
   * [Python](bindings/python)
@@ -171,24 +171,16 @@ print(res.fetchone())
 <summary>🦫 Go</summary>
 <br>
 
-1. Clone the repository
-2. Build the library and set your LD_LIBRARY_PATH to include turso's target directory
 ```console
-cargo build --package turso-go
-export LD_LIBRARY_PATH=/path/to/turso/target/debug:$LD_LIBRARY_PATH
-```
-3. Use the driver
-
-```console
-go get github.com/tursodatabase/turso
-go install github.com/tursodatabase/turso
+go get github.com/tursodatabase/turso-go
+go install github.com/tursodatabase/turso-go
 ```
 
 Example usage:
 ```go
 import (
     "database/sql"
-    _ "github.com/tursodatabase/turso"
+    _ "github.com/tursodatabase/turso-go"
 )
 
 conn, _ = sql.Open("turso", "sqlite.db")

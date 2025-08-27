@@ -160,7 +160,7 @@ Turso aims to be fully compatible with SQLite, with opt-in features not supporte
 | PRAGMA shrink_memory             | No         |                                              |
 | PRAGMA soft_heap_limit           | No         |                                              |
 | PRAGMA stats                     | No         | Used for testing in SQLite                   |
-| PRAGMA synchronous               | No         |                                              |
+| PRAGMA synchronous               | Partial    | `OFF` and `FULL` supported                   |
 | PRAGMA table_info                | Yes        |                                              |
 | PRAGMA table_list                | No         |                                              |
 | PRAGMA table_xinfo               | No         |                                              |
