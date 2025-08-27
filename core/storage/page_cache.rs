@@ -8,9 +8,7 @@ use crate::turso_assert;
 
 use super::pager::PageRef;
 
-/// FIXME: https://github.com/tursodatabase/turso/issues/1661
-const DEFAULT_PAGE_CACHE_SIZE_IN_PAGES_MAKE_ME_SMALLER_ONCE_WAL_SPILL_IS_IMPLEMENTED: usize =
-    100000;
+const DEFAULT_PAGE_CACHE_SIZE_IN_PAGES: usize = 2000;
 
 #[derive(Debug, Eq, Hash, PartialEq, Clone)]
 pub struct PageCacheKey {
@@ -27,6 +25,7 @@ struct PageCacheEntry {
 
 pub struct DumbLruPageCache {
     capacity: usize,
+    spill_threshold: usize,
     map: RefCell<PageHashMap>,
     head: RefCell<Option<NonNull<PageCacheEntry>>>,
     tail: RefCell<Option<NonNull<PageCacheEntry>>>,
@@ -50,11 +49,24 @@ struct HashMapNode {
 #[derive(Debug, PartialEq)]
 pub enum CacheError {
     InternalError(String),
-    Locked { pgno: usize },
-    Dirty { pgno: usize },
-    Pinned { pgno: usize },
+    Locked {
+        pgno: usize,
+    },
+    Dirty {
+        pgno: usize,
+    },
+    Pinned {
+        pgno: usize,
+    },
     ActiveRefs,
-    Full,
+    /// The page cache is full.
+    /// The `should_spill` field is true if we should attempt to spill pages to disk
+    /// (either to WAL or to an ephemeral database file)
+    Full {
+        cache_capacity: usize,
+        cache_len: usize,
+        should_spill: bool,
+    },
     KeyExists,
 }
 
@@ -69,11 +81,22 @@ impl PageCacheKey {
         Self { pgno }
     }
 }
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum CacheInsertOnConflict {
+    Error,
+    Overwrite,
+}
+
 impl DumbLruPageCache {
     pub fn new(capacity: usize) -> Self {
         assert!(capacity > 0, "capacity of cache should be at least 1");
         Self {
             capacity,
+            // Note: if PRAGMA cache_size is a positive integer in sqlite (meaning the page cache size is in pages, rather than bytes),
+            // then the output of PRAGMA cache_spill is equal to the capacity. If OTOH PRAGMA cache_size is negative, meaning the page cache size is in kB,
+            // then the output of PRAGMA cache_spill is some kind of calculation. But to make things simple, let's use the capacity as the spill threshold.
+            spill_threshold: capacity,
             map: RefCell::new(PageHashMap::new(capacity)),
             head: RefCell::new(None),
             tail: RefCell::new(None),
@@ -84,27 +107,24 @@ impl DumbLruPageCache {
         self.map.borrow().contains_key(key)
     }
 
-    pub fn insert(&mut self, key: PageCacheKey, value: PageRef) -> Result<(), CacheError> {
-        self._insert(key, value, false)
-    }
-
-    pub fn insert_ignore_existing(
+    pub fn insert(
         &mut self,
         key: PageCacheKey,
         value: PageRef,
+        on_conflict: CacheInsertOnConflict,
     ) -> Result<(), CacheError> {
-        self._insert(key, value, true)
+        self._insert(key, value, on_conflict)
     }
 
     pub fn _insert(
         &mut self,
         key: PageCacheKey,
         value: PageRef,
-        ignore_exists: bool,
+        on_conflict: CacheInsertOnConflict,
     ) -> Result<(), CacheError> {
         trace!("insert(key={:?})", key);
         // Check first if page already exists in cache
-        if !ignore_exists {
+        if on_conflict == CacheInsertOnConflict::Error {
             if let Some(existing_page_ref) = self.get(&key) {
                 assert!(
                     Arc::ptr_eq(&value, &existing_page_ref),
@@ -282,7 +302,11 @@ impl DumbLruPageCache {
 
     pub fn make_room_for(&mut self, n: usize) -> Result<(), CacheError> {
         if n > self.capacity {
-            return Err(CacheError::Full);
+            return Err(CacheError::Full {
+                cache_capacity: self.capacity,
+                cache_len: self.len(),
+                should_spill: false, // User is requesting more room than we can possibly hold, so spilling will not help
+            });
         }
 
         let len = self.len();
@@ -316,7 +340,11 @@ impl DumbLruPageCache {
         }
 
         match need_to_evict > 0 {
-            true => Err(CacheError::Full),
+            true => Err(CacheError::Full {
+                cache_capacity: self.capacity,
+                cache_len: self.len(),
+                should_spill: self.len() >= self.spill_threshold,
+            }),
             false => Ok(()),
         }
     }
@@ -546,9 +574,7 @@ impl DumbLruPageCache {
 
 impl Default for DumbLruPageCache {
     fn default() -> Self {
-        DumbLruPageCache::new(
-            DEFAULT_PAGE_CACHE_SIZE_IN_PAGES_MAKE_ME_SMALLER_ONCE_WAL_SPILL_IS_IMPLEMENTED,
-        )
+        DumbLruPageCache::new(DEFAULT_PAGE_CACHE_SIZE_IN_PAGES)
     }
 }
 
@@ -698,7 +724,9 @@ mod tests {
     fn insert_page(cache: &mut DumbLruPageCache, id: usize) -> PageCacheKey {
         let key = create_key(id);
         let page = page_with_content(id);
-        assert!(cache.insert(key.clone(), page).is_ok());
+        assert!(cache
+            .insert(key.clone(), page, CacheInsertOnConflict::Error)
+            .is_ok());
         key
     }
 
@@ -712,7 +740,9 @@ mod tests {
     ) -> (PageCacheKey, NonNull<PageCacheEntry>) {
         let key = create_key(id);
         let page = page_with_content(id);
-        assert!(cache.insert(key.clone(), page).is_ok());
+        assert!(cache
+            .insert(key.clone(), page, CacheInsertOnConflict::Error)
+            .is_ok());
         let entry = cache.get_ptr(&key).expect("Entry should exist");
         (key, entry)
     }
@@ -895,7 +925,9 @@ mod tests {
         let mut cache = DumbLruPageCache::default();
         let key1 = create_key(1);
         let page1 = page_with_content(1);
-        assert!(cache.insert(key1.clone(), page1.clone()).is_ok());
+        assert!(cache
+            .insert(key1.clone(), page1.clone(), CacheInsertOnConflict::Error)
+            .is_ok());
         assert!(page_has_content(&page1));
         cache.verify_list_integrity();
 
@@ -918,10 +950,13 @@ mod tests {
         let key1 = create_key(1);
         let page1_v1 = page_with_content(1);
         let page1_v2 = page_with_content(1);
-        assert!(cache.insert(key1.clone(), page1_v1.clone()).is_ok());
+        assert!(cache
+            .insert(key1.clone(), page1_v1.clone(), CacheInsertOnConflict::Error)
+            .is_ok());
         assert_eq!(cache.len(), 1);
         cache.verify_list_integrity();
-        let _ = cache.insert(key1.clone(), page1_v2.clone()); // Panic
+        let _ = cache.insert(key1.clone(), page1_v2.clone(), CacheInsertOnConflict::Error);
+        // Panic
     }
 
     #[test]
@@ -1085,8 +1120,8 @@ mod tests {
                         continue; // skip duplicate page ids
                     }
                     tracing::debug!("inserting page {:?}", key);
-                    match cache.insert(key.clone(), page.clone()) {
-                        Err(CacheError::Full | CacheError::ActiveRefs) => {} // Ignore
+                    match cache.insert(key.clone(), page.clone(), CacheInsertOnConflict::Error) {
+                        Err(CacheError::Full { .. } | CacheError::ActiveRefs) => {} // Ignore
                         Err(err) => {
                             // Any other error should fail the test
                             panic!("Cache insertion failed: {err:?}");
@@ -1202,7 +1237,13 @@ mod tests {
         assert_eq!(result, CacheResizeResult::Done);
         assert_eq!(cache.len(), 3);
         assert_eq!(cache.capacity, 3);
-        assert!(cache.insert(create_key(6), page_with_content(6)).is_ok());
+        assert!(cache
+            .insert(
+                create_key(6),
+                page_with_content(6),
+                CacheInsertOnConflict::Error
+            )
+            .is_ok());
     }
 
     #[test]
@@ -1223,7 +1264,13 @@ mod tests {
         }
         assert_eq!(cache.len(), 5);
         // FIXME: For now this will assert because we cannot insert a page with same id but different contents of page.
-        assert!(cache.insert(create_key(4), page_with_content(4)).is_err());
+        assert!(cache
+            .insert(
+                create_key(4),
+                page_with_content(4),
+                CacheInsertOnConflict::Error
+            )
+            .is_err());
         cache.verify_list_integrity();
     }
 
@@ -1234,9 +1281,15 @@ mod tests {
         let page1 = page_with_content(1);
         let page2 = page_with_content(2);
         let page3 = page_with_content(3);
-        assert!(cache.insert(create_key(1), page1.clone()).is_ok());
-        assert!(cache.insert(create_key(2), page2.clone()).is_ok());
-        assert!(cache.insert(create_key(3), page3.clone()).is_ok());
+        assert!(cache
+            .insert(create_key(1), page1.clone(), CacheInsertOnConflict::Error)
+            .is_ok());
+        assert!(cache
+            .insert(create_key(2), page2.clone(), CacheInsertOnConflict::Error)
+            .is_ok());
+        assert!(cache
+            .insert(create_key(3), page3.clone(), CacheInsertOnConflict::Error)
+            .is_ok());
         assert_eq!(cache.len(), 3);
         cache.verify_list_integrity();
         assert_eq!(cache.resize(2), CacheResizeResult::PendingEvictions);
@@ -1246,7 +1299,13 @@ mod tests {
         drop(page3);
         assert_eq!(cache.resize(1), CacheResizeResult::Done); // Evicted 2 and 3
         assert_eq!(cache.len(), 1);
-        assert!(cache.insert(create_key(4), page_with_content(4)).is_err());
+        assert!(cache
+            .insert(
+                create_key(4),
+                page_with_content(4),
+                CacheInsertOnConflict::Error
+            )
+            .is_err());
         cache.verify_list_integrity();
     }
 
@@ -1261,7 +1320,13 @@ mod tests {
         assert_eq!(cache.len(), 3);
         assert_eq!(cache.capacity, 3);
         cache.verify_list_integrity();
-        assert!(cache.insert(create_key(4), page_with_content(4)).is_ok());
+        assert!(cache
+            .insert(
+                create_key(4),
+                page_with_content(4),
+                CacheInsertOnConflict::Error
+            )
+            .is_ok());
     }
 
     #[test]
@@ -1279,7 +1344,13 @@ mod tests {
         assert_eq!(cache.len(), 2);
         assert_eq!(cache.capacity, 10);
         cache.verify_list_integrity();
-        assert!(cache.insert(create_key(8), page_with_content(8)).is_ok());
+        assert!(cache
+            .insert(
+                create_key(8),
+                page_with_content(8),
+                CacheInsertOnConflict::Error
+            )
+            .is_ok());
     }
 
     #[test]
@@ -1293,7 +1364,13 @@ mod tests {
         assert_eq!(cache.len(), 0);
         assert_eq!(cache.capacity, 10);
         cache.verify_list_integrity();
-        assert!(cache.insert(create_key(8), page_with_content(8)).is_ok());
+        assert!(cache
+            .insert(
+                create_key(8),
+                page_with_content(8),
+                CacheInsertOnConflict::Error
+            )
+            .is_ok());
     }
 
     #[test]
@@ -1307,7 +1384,9 @@ mod tests {
             for i in 0..1000 {
                 let key = create_key(i);
                 let page = page_with_content(i);
-                cache.insert(key, page).unwrap();
+                cache
+                    .insert(key, page, CacheInsertOnConflict::Error)
+                    .unwrap();
             }
 
             cache.clear().unwrap();
