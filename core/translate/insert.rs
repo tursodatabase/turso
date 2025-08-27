@@ -71,7 +71,7 @@ pub fn translate_insert(
             "INSERT to table with indexes is disabled. Omit the `--experimental-indexes=false` flag to enable this feature."
         );
     }
-    let table_name = &tbl_name.name;
+    let table_name = normalize_ident(&tbl_name.name.to_string());
     let table = match schema.get_table(table_name.as_str()) {
         Some(table) => table,
         None => crate::bail_parse_error!("no such table: {}", table_name),
@@ -114,7 +114,7 @@ pub fn translate_insert(
                         Expr::Id(name) => {
                             if name.is_double_quoted() {
                                 *expr =
-                                    Expr::Literal(ast::Literal::String(format!("{name}"))).into();
+                                    Expr::Literal(ast::Literal::String(name.to_string())).into();
                             } else {
                                 // an INSERT INTO ... VALUES (...) cannot reference columns
                                 crate::bail_parse_error!("no such column: {name}");
@@ -509,7 +509,7 @@ pub fn translate_insert(
         key_reg: insertion.key_register(),
         record_reg: insertion.record_register(),
         flag: InsertFlags::new(),
-        table_name: table_name.to_string(),
+        table_name: table_name.clone(),
     });
 
     // Emit update in the CDC table if necessary (after the INSERT updated the table)
