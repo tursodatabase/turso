@@ -33,7 +33,7 @@ use crate::{
     },
 };
 use std::env::temp_dir;
-use std::ops::DerefMut;
+use std::ops::{ControlFlow, DerefMut};
 use std::{
     borrow::BorrowMut,
     rc::Rc,
@@ -5136,7 +5136,7 @@ pub fn op_yield(
 }
 
 pub struct OpInsertState {
-    pub sub_state: OpInsertSubState,
+    pub step_fn: Option<InsertStepFn>,
     pub old_record: Option<(i64, Vec<Value>)>,
 }
 
@@ -5159,6 +5159,14 @@ pub enum OpInsertSubState {
     ApplyViewChange,
 }
 
+type InsertStepFn = fn(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Rc<Pager>,
+    mv_store: Option<&Arc<MvStore>>,
+) -> Result<IOResult<()>>;
+
 pub fn op_insert(
     program: &Program,
     state: &mut ProgramState,
@@ -5166,6 +5174,28 @@ pub fn op_insert(
     pager: &Rc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
+    if state.op_insert_state.step_fn.is_none() {
+        state.op_insert_state.step_fn = Some(insert_maybe_capture_record);
+    }
+
+    while let Some(step_fn) = state.op_insert_state.step_fn.take() {
+        match step_fn(program, state, insn, pager, mv_store)? {
+            IOResult::Done(()) => {}
+            IOResult::IO(io) => return Ok(InsnFunctionStepResult::IO(io)),
+        }
+    }
+    state.op_insert_state.step_fn = None;
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+fn insert_apply_view_change(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Rc<Pager>,
+    mv_store: Option<&Arc<MvStore>>,
+) -> Result<IOResult<()>> {
     load_insn!(
         Insert {
             cursor: cursor_id,
@@ -5176,223 +5206,291 @@ pub fn op_insert(
         },
         insn
     );
+    let schema = program.connection.schema.borrow();
+    let dependent_views = schema
+        .get_dependent_materialized_views_unnormalized(table_name)
+        .unwrap();
+    assert!(!dependent_views.is_empty());
 
-    loop {
-        match &state.op_insert_state.sub_state {
-            OpInsertSubState::MaybeCaptureRecord => {
-                let schema = program.connection.schema.borrow();
-                let dependent_views =
-                    schema.get_dependent_materialized_views_unnormalized(table_name);
-                // If there are no dependent views, we don't need to capture the old record.
-                // We also don't need to do it if the rowid of the UPDATEd row was changed, because that means
-                // we deleted it earlier and `op_delete` already captured the change.
-                if dependent_views.is_none() || flag.has(InsertFlags::UPDATE_ROWID_CHANGE) {
-                    if flag.has(InsertFlags::REQUIRE_SEEK) {
-                        state.op_insert_state.sub_state = OpInsertSubState::Seek;
-                    } else {
-                        state.op_insert_state.sub_state = OpInsertSubState::Insert;
-                    }
-                    continue;
-                }
+    let (key, values) = {
+        let mut cursor = state.get_cursor(*cursor_id);
+        let cursor = cursor.as_btree_mut();
 
-                turso_assert!(!flag.has(InsertFlags::REQUIRE_SEEK), "to capture old record accurately, we must be located at the correct position in the table");
+        let key = match &state.registers[*key_reg].get_value() {
+            Value::Integer(i) => *i,
+            _ => unreachable!("expected integer key"),
+        };
 
-                let old_record = {
-                    let mut cursor = state.get_cursor(*cursor_id);
-                    let cursor = cursor.as_btree_mut();
-                    // Get the current key - for INSERT operations, there may not be a current row
-                    let maybe_key = return_if_io!(cursor.rowid());
-                    if let Some(key) = maybe_key {
-                        // Get the current record before deletion and extract values
-                        let maybe_record = return_if_io!(cursor.record());
-                        if let Some(record) = maybe_record {
-                            let mut values = record
-                                .get_values()
-                                .into_iter()
-                                .map(|v| v.to_owned())
-                                .collect::<Vec<_>>();
-
-                            // Fix rowid alias columns: replace Null with actual rowid value
-                            if let Some(table) = schema.get_table(table_name) {
-                                for (i, col) in table.columns().iter().enumerate() {
-                                    if col.is_rowid_alias && i < values.len() {
-                                        values[i] = Value::Integer(key);
-                                    }
-                                }
-                            }
-                            Some((key, values))
-                        } else {
-                            None
-                        }
-                    } else {
-                        // No current row - this is a fresh INSERT, not an UPDATE
-                        None
-                    }
-                };
-
-                state.op_insert_state.old_record = old_record;
-                if flag.has(InsertFlags::REQUIRE_SEEK) {
-                    state.op_insert_state.sub_state = OpInsertSubState::Seek;
-                } else {
-                    state.op_insert_state.sub_state = OpInsertSubState::Insert;
-                }
-                continue;
+        let record = match &state.registers[*record_reg] {
+            Register::Record(r) => std::borrow::Cow::Borrowed(r),
+            Register::Value(value) => {
+                let x = 1;
+                let regs = &state.registers[*record_reg..*record_reg + 1];
+                let new_regs = [&state.registers[*record_reg]];
+                let record = ImmutableRecord::from_registers(new_regs, new_regs.len());
+                std::borrow::Cow::Owned(record)
             }
-            OpInsertSubState::Seek => {
-                if let SeekInternalResult::IO(io) = seek_internal(
-                    program,
-                    state,
-                    pager,
-                    mv_store,
-                    RecordSource::Unpacked {
-                        start_reg: *key_reg,
-                        num_regs: 1,
-                    },
-                    *cursor_id,
-                    false,
-                    SeekOp::GE { eq_only: true },
-                )? {
-                    return Ok(InsnFunctionStepResult::IO(io));
-                }
-                state.op_insert_state.sub_state = OpInsertSubState::Insert;
+            Register::Aggregate(..) => {
+                unreachable!("Cannot insert an aggregate value.")
             }
-            OpInsertSubState::Insert => {
-                let key = match &state.registers[*key_reg].get_value() {
-                    Value::Integer(i) => *i,
-                    _ => unreachable!("expected integer key"),
-                };
-                let record = match &state.registers[*record_reg] {
-                    Register::Record(r) => std::borrow::Cow::Borrowed(r),
-                    Register::Value(value) => {
-                        let x = 1;
-                        let regs = &state.registers[*record_reg..*record_reg + 1];
-                        let new_regs = [&state.registers[*record_reg]];
-                        let record = ImmutableRecord::from_registers(new_regs, new_regs.len());
-                        std::borrow::Cow::Owned(record)
-                    }
-                    Register::Aggregate(..) => unreachable!("Cannot insert an aggregate value."),
-                };
+        };
 
-                {
-                    let mut cursor = state.get_cursor(*cursor_id);
-                    let cursor = cursor.as_btree_mut();
+        // Add insertion of new row to view deltas
+        let mut new_values = record
+            .get_values()
+            .into_iter()
+            .map(|v| v.to_owned())
+            .collect::<Vec<_>>();
 
-                    return_if_io!(cursor.insert(&BTreeKey::new_table_rowid(key, Some(&record))));
+        // Fix rowid alias columns: replace Null with actual rowid value
+        let schema = program.connection.schema.borrow();
+        if let Some(table) = schema.get_table(table_name) {
+            for (i, col) in table.columns().iter().enumerate() {
+                if col.is_rowid_alias && i < new_values.len() {
+                    new_values[i] = Value::Integer(key);
                 }
-                // Increment metrics for row write
-                state.metrics.rows_written = state.metrics.rows_written.saturating_add(1);
-
-                // Only update last_insert_rowid for regular table inserts, not schema modifications
-                let root_page = {
-                    let mut cursor = state.get_cursor(*cursor_id);
-                    let cursor = cursor.as_btree_mut();
-                    cursor.root_page()
-                };
-                if root_page != 1 {
-                    state.op_insert_state.sub_state = OpInsertSubState::UpdateLastRowid;
-                } else {
-                    let schema = program.connection.schema.borrow();
-                    let dependent_views =
-                        schema.get_dependent_materialized_views_unnormalized(table_name);
-                    if dependent_views.is_some() {
-                        state.op_insert_state.sub_state = OpInsertSubState::ApplyViewChange;
-                    } else {
-                        break;
-                    }
-                }
-            }
-            OpInsertSubState::UpdateLastRowid => {
-                let maybe_rowid = {
-                    let mut cursor = state.get_cursor(*cursor_id);
-                    let cursor = cursor.as_btree_mut();
-                    return_if_io!(cursor.rowid())
-                };
-                if let Some(rowid) = maybe_rowid {
-                    program.connection.update_last_rowid(rowid);
-
-                    let prev_changes = program.n_change.get();
-                    program.n_change.set(prev_changes + 1);
-                }
-                let schema = program.connection.schema.borrow();
-                let dependent_views =
-                    schema.get_dependent_materialized_views_unnormalized(table_name);
-                if dependent_views.is_some() {
-                    state.op_insert_state.sub_state = OpInsertSubState::ApplyViewChange;
-                    continue;
-                }
-                break;
-            }
-            OpInsertSubState::ApplyViewChange => {
-                let schema = program.connection.schema.borrow();
-                let dependent_views =
-                    schema.get_dependent_materialized_views_unnormalized(table_name);
-                assert!(dependent_views.is_some());
-                let dependent_views = dependent_views.unwrap();
-
-                let (key, values) = {
-                    let mut cursor = state.get_cursor(*cursor_id);
-                    let cursor = cursor.as_btree_mut();
-
-                    let key = match &state.registers[*key_reg].get_value() {
-                        Value::Integer(i) => *i,
-                        _ => unreachable!("expected integer key"),
-                    };
-
-                    let record = match &state.registers[*record_reg] {
-                        Register::Record(r) => std::borrow::Cow::Borrowed(r),
-                        Register::Value(value) => {
-                            let x = 1;
-                            let regs = &state.registers[*record_reg..*record_reg + 1];
-                            let new_regs = [&state.registers[*record_reg]];
-                            let record = ImmutableRecord::from_registers(new_regs, new_regs.len());
-                            std::borrow::Cow::Owned(record)
-                        }
-                        Register::Aggregate(..) => {
-                            unreachable!("Cannot insert an aggregate value.")
-                        }
-                    };
-
-                    // Add insertion of new row to view deltas
-                    let mut new_values = record
-                        .get_values()
-                        .into_iter()
-                        .map(|v| v.to_owned())
-                        .collect::<Vec<_>>();
-
-                    // Fix rowid alias columns: replace Null with actual rowid value
-                    let schema = program.connection.schema.borrow();
-                    if let Some(table) = schema.get_table(table_name) {
-                        for (i, col) in table.columns().iter().enumerate() {
-                            if col.is_rowid_alias && i < new_values.len() {
-                                new_values[i] = Value::Integer(key);
-                            }
-                        }
-                    }
-
-                    (key, new_values)
-                };
-
-                let mut tx_states = program.connection.view_transaction_states.borrow_mut();
-                if let Some((key, values)) = state.op_insert_state.old_record.take() {
-                    for view_name in dependent_views.iter() {
-                        let tx_state = tx_states.entry(view_name.clone()).or_default();
-                        tx_state.delta.delete(key, values.clone());
-                    }
-                }
-                for view_name in dependent_views.iter() {
-                    let tx_state = tx_states.entry(view_name.clone()).or_default();
-
-                    tx_state.delta.insert(key, values.clone());
-                }
-
-                break;
             }
         }
-    }
 
-    state.op_insert_state.sub_state = OpInsertSubState::MaybeCaptureRecord;
-    state.pc += 1;
-    Ok(InsnFunctionStepResult::Step)
+        (key, new_values)
+    };
+
+    let mut tx_states = program.connection.view_transaction_states.borrow_mut();
+    if let Some((key, values)) = state.op_insert_state.old_record.take() {
+        for view_name in dependent_views.iter() {
+            let tx_state = tx_states.entry(view_name.clone()).or_default();
+            tx_state.delta.delete(key, values.clone());
+        }
+    }
+    for view_name in dependent_views.iter() {
+        let tx_state = tx_states.entry(view_name.clone()).or_default();
+
+        tx_state.delta.insert(key, values.clone());
+    }
+    Ok(IOResult::Done(()))
+}
+
+fn insert_update_last_rowid(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Rc<Pager>,
+    mv_store: Option<&Arc<MvStore>>,
+) -> Result<IOResult<()>> {
+    load_insn!(
+        Insert {
+            cursor: cursor_id,
+            key_reg,
+            record_reg,
+            flag,
+            table_name,
+        },
+        insn
+    );
+    let maybe_rowid = {
+        let mut cursor = state.get_cursor(*cursor_id);
+        let cursor = cursor.as_btree_mut();
+        match cursor.rowid()? {
+            IOResult::Done(rowid) => rowid,
+            IOResult::IO(io) => return Ok(IOResult::IO(io)),
+        }
+    };
+    if let Some(rowid) = maybe_rowid {
+        program.connection.update_last_rowid(rowid);
+
+        let prev_changes = program.n_change.get();
+        program.n_change.set(prev_changes + 1);
+    }
+    let schema = program.connection.schema.borrow();
+    let dependent_views = schema.get_dependent_materialized_views_unnormalized(table_name);
+    if !dependent_views.is_none() && !dependent_views.unwrap().is_empty() {
+        state.op_insert_state.step_fn = Some(insert_apply_view_change);
+    }
+    Ok(IOResult::Done(()))
+}
+
+fn insert_insert(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Rc<Pager>,
+    mv_store: Option<&Arc<MvStore>>,
+) -> Result<IOResult<()>> {
+    load_insn!(
+        Insert {
+            cursor: cursor_id,
+            key_reg,
+            record_reg,
+            flag,
+            table_name,
+        },
+        insn
+    );
+    let key = match &state.registers[*key_reg].get_value() {
+        Value::Integer(i) => *i,
+        _ => unreachable!("expected integer key"),
+    };
+    let record = match &state.registers[*record_reg] {
+        Register::Record(r) => std::borrow::Cow::Borrowed(r),
+        Register::Value(value) => {
+            let x = 1;
+            let regs = &state.registers[*record_reg..*record_reg + 1];
+            let new_regs = [&state.registers[*record_reg]];
+            let record = ImmutableRecord::from_registers(new_regs, new_regs.len());
+            std::borrow::Cow::Owned(record)
+        }
+        Register::Aggregate(..) => unreachable!("Cannot insert an aggregate value."),
+    };
+    {
+        let mut cursor = state.get_cursor(*cursor_id);
+        let cursor = cursor.as_btree_mut();
+
+        match cursor.insert(&BTreeKey::new_table_rowid(key, Some(&record)))? {
+            IOResult::Done(_) => {}
+            IOResult::IO(io) => return Ok(IOResult::IO(io)),
+        }
+    }
+    state.metrics.rows_written = state.metrics.rows_written.saturating_add(1);
+    let root_page = {
+        let mut cursor = state.get_cursor(*cursor_id);
+        let cursor = cursor.as_btree_mut();
+        cursor.root_page()
+    };
+
+    // Increment metrics for row write
+
+    // Only update last_insert_rowid for regular table inserts, not schema modifications
+    if root_page != 1 {
+        state.op_insert_state.step_fn = Some(insert_update_last_rowid);
+    } else {
+        let schema = program.connection.schema.borrow();
+        let dependent_views = schema.get_dependent_materialized_views_unnormalized(table_name);
+        if !dependent_views.is_none() && !dependent_views.unwrap().is_empty() {
+            state.op_insert_state.step_fn = Some(insert_apply_view_change);
+        }
+    }
+    Ok(IOResult::Done(()))
+}
+
+fn insert_seek(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Rc<Pager>,
+    mv_store: Option<&Arc<MvStore>>,
+) -> Result<IOResult<()>> {
+    load_insn!(
+        Insert {
+            cursor: cursor_id,
+            key_reg,
+            record_reg,
+            flag,
+            table_name,
+        },
+        insn
+    );
+    if let SeekInternalResult::IO(io) = seek_internal(
+        program,
+        state,
+        pager,
+        mv_store,
+        RecordSource::Unpacked {
+            start_reg: *key_reg,
+            num_regs: 1,
+        },
+        *cursor_id,
+        false,
+        SeekOp::GE { eq_only: true },
+    )? {
+        return Ok(IOResult::IO(io));
+    }
+    state.op_insert_state.step_fn = Some(insert_insert);
+    return Ok(IOResult::Done(()));
+}
+
+fn insert_maybe_capture_record(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Rc<Pager>,
+    mv_store: Option<&Arc<MvStore>>,
+) -> Result<IOResult<()>> {
+    load_insn!(
+        Insert {
+            cursor: cursor_id,
+            key_reg,
+            record_reg,
+            flag,
+            table_name,
+        },
+        insn
+    );
+    let schema = program.connection.schema.borrow();
+    let dependent_views = schema.get_dependent_materialized_views_unnormalized(table_name);
+    if dependent_views.is_none()
+        || dependent_views.unwrap().is_empty()
+        || flag.has(InsertFlags::UPDATE_ROWID_CHANGE)
+    {
+        if flag.has(InsertFlags::REQUIRE_SEEK) {
+            state.op_insert_state.step_fn = Some(insert_seek);
+        } else {
+            state.op_insert_state.step_fn = Some(insert_insert);
+        }
+        return Ok(IOResult::Done(()));
+    }
+    turso_assert!(
+        !flag.has(InsertFlags::REQUIRE_SEEK),
+        "to capture old record accurately, we must be located at the correct position in the table"
+    );
+    let old_record = {
+        let mut cursor = state.get_cursor(*cursor_id);
+        let cursor = cursor.as_btree_mut();
+        // Get the current key - for INSERT operations, there may not be a current row
+        let maybe_key = match cursor.rowid()? {
+            IOResult::Done(key) => key,
+            IOResult::IO(io) => return Ok(IOResult::IO(io)),
+        };
+        if let Some(key) = maybe_key {
+            // Get the current record before deletion and extract values
+            let maybe_record = match cursor.record()? {
+                IOResult::Done(record) => record,
+                IOResult::IO(io) => return Ok(IOResult::IO(io)),
+            };
+            if let Some(record) = maybe_record {
+                let mut values = record
+                    .get_values()
+                    .into_iter()
+                    .map(|v| v.to_owned())
+                    .collect::<Vec<_>>();
+
+                // Fix rowid alias columns: replace Null with actual rowid value
+                if let Some(table) = schema.get_table(table_name) {
+                    for (i, col) in table.columns().iter().enumerate() {
+                        if col.is_rowid_alias && i < values.len() {
+                            values[i] = Value::Integer(key);
+                        }
+                    }
+                }
+                Some((key, values))
+            } else {
+                None
+            }
+        } else {
+            // No current row - this is a fresh INSERT, not an UPDATE
+            None
+        }
+    };
+    state.op_insert_state.old_record = old_record;
+    // If there are no dependent views, we don't need to capture the old record.
+    // We also don't need to do it if the rowid of the UPDATEd row was changed, because that means
+    // we deleted it earlier and `op_delete` already captured the change.
+
+    if flag.has(InsertFlags::REQUIRE_SEEK) {
+        state.op_insert_state.step_fn = Some(insert_seek);
+    } else {
+        state.op_insert_state.step_fn = Some(insert_insert);
+    }
+    Ok(IOResult::Done(()))
 }
 
 pub fn op_int_64(
@@ -5449,8 +5547,9 @@ pub fn op_delete(
         match &state.op_delete_state.sub_state {
             OpDeleteSubState::MaybeCaptureRecord => {
                 let schema = program.connection.schema.borrow();
-                let dependent_views = schema.get_dependent_materialized_views(table_name);
-                if dependent_views.is_empty() {
+                let dependent_views =
+                    schema.get_dependent_materialized_views_unnormalized(table_name);
+                if dependent_views.is_none() || dependent_views.unwrap().is_empty() {
                     state.op_delete_state.sub_state = OpDeleteSubState::Delete;
                     continue;
                 }

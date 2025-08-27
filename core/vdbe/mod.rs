@@ -311,7 +311,7 @@ impl ProgramState {
             op_new_rowid_state: OpNewRowidState::Start,
             op_idx_insert_state: OpIdxInsertState::MaybeSeek,
             op_insert_state: OpInsertState {
-                sub_state: OpInsertSubState::MaybeCaptureRecord,
+                step_fn: None,
                 old_record: None,
             },
             op_no_conflict_state: OpNoConflictState::Start,
