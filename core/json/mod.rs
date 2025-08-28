@@ -148,7 +148,7 @@ pub fn convert_ref_dbtype_to_jsonb(val: &RefValue, strict: Conv) -> crate::Resul
                 // Check if the blob is a valid JSON string binary
                 [b'{', .., b'}'] | [b'[', .., b']'] => {
                     let str = std::str::from_utf8(slice)
-                        .map_err(|_| LimboError::ParseError("invalid utf-8".to_string()))?;
+                        .map_err(|_| LimboError::ParseError("malformed JSON".to_string()))?;
 
                     if matches!(strict, Conv::ToString) {
                         let mut str = str.replace('"', "\\\"");
