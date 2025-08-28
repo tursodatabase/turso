@@ -285,7 +285,7 @@ fn prepare_one_select_plan(
             };
 
             let mut aggregate_expressions = Vec::new();
-            for column in columns.iter_mut() {
+            for column in columns.drain(..) {
                 match column {
                     ResultColumn::Star => {
                         select_star(
@@ -321,21 +321,21 @@ fn prepare_one_select_plan(
                                 continue;
                             }
                             plan.result_columns.push(ResultSetColumn {
-                                expr: ast::Expr::Column {
+                                expr: Box::new(ast::Expr::Column {
                                     database: None, // TODO: support different databases
                                     table: table.internal_id,
                                     column: idx,
                                     is_rowid_alias: column.is_rowid_alias,
-                                },
+                                }),
                                 alias: None,
                                 contains_aggregates: false,
                             });
                             table.mark_column_used(idx);
                         }
                     }
-                    ResultColumn::Expr(ref mut expr, maybe_alias) => {
+                    ResultColumn::Expr(mut expr, maybe_alias) => {
                         bind_column_references(
-                            expr,
+                            expr.as_mut(),
                             &mut plan.table_references,
                             Some(&plan.result_columns),
                             connection,
@@ -374,10 +374,9 @@ fn prepare_one_select_plan(
                                         let agg_args = match (args.is_empty(), &f) {
                                             (true, crate::function::AggFunc::Count0) => {
                                                 // COUNT() case
-                                                vec![ast::Expr::Literal(ast::Literal::Numeric(
-                                                    "1".to_string(),
-                                                ))
-                                                .into()]
+                                                vec![Box::new(ast::Expr::Literal(
+                                                    ast::Literal::Numeric("1".to_string()),
+                                                ))]
                                             }
                                             (true, _) => crate::bail_parse_error!(
                                                 "Aggregate function {} requires arguments",
@@ -386,13 +385,12 @@ fn prepare_one_select_plan(
                                             (false, _) => args.clone(),
                                         };
 
-                                        let agg = Aggregate {
+                                        aggregate_expressions.push(Aggregate {
                                             func: f,
-                                            args: agg_args.iter().map(|arg| *arg.clone()).collect(),
-                                            original_expr: *expr.clone(),
+                                            args: agg_args,
+                                            original_expr: expr.clone(),
                                             distinctness,
-                                        };
-                                        aggregate_expressions.push(agg.clone());
+                                        });
                                         plan.result_columns.push(ResultSetColumn {
                                             alias: maybe_alias.as_ref().map(|alias| match alias {
                                                 ast::As::Elided(alias) => {
@@ -400,14 +398,14 @@ fn prepare_one_select_plan(
                                                 }
                                                 ast::As::As(alias) => alias.as_str().to_string(),
                                             }),
-                                            expr: *expr.clone(),
+                                            expr: expr,
                                             contains_aggregates: true,
                                         });
                                     }
                                     Ok(_) => {
                                         let contains_aggregates = resolve_aggregates(
                                             schema,
-                                            expr,
+                                            expr.as_ref(),
                                             &mut aggregate_expressions,
                                         )?;
                                         plan.result_columns.push(ResultSetColumn {
@@ -417,7 +415,7 @@ fn prepare_one_select_plan(
                                                 }
                                                 ast::As::As(alias) => alias.as_str().to_string(),
                                             }),
-                                            expr: *expr.clone(),
+                                            expr: expr,
                                             contains_aggregates,
                                         });
                                     }
@@ -428,7 +426,7 @@ fn prepare_one_select_plan(
                                             if let ExtFunc::Scalar(_) = f.as_ref().func {
                                                 let contains_aggregates = resolve_aggregates(
                                                     schema,
-                                                    expr,
+                                                    expr.as_ref(),
                                                     &mut aggregate_expressions,
                                                 )?;
                                                 plan.result_columns.push(ResultSetColumn {
@@ -442,17 +440,14 @@ fn prepare_one_select_plan(
                                                             }
                                                         }
                                                     }),
-                                                    expr: *expr.clone(),
+                                                    expr: expr,
                                                     contains_aggregates,
                                                 });
                                             } else {
                                                 let agg = Aggregate {
                                                     func: AggFunc::External(f.func.clone().into()),
-                                                    args: args
-                                                        .iter()
-                                                        .map(|arg| *arg.clone())
-                                                        .collect(),
-                                                    original_expr: *expr.clone(),
+                                                    args: args.clone(),
+                                                    original_expr: expr.clone(),
                                                     distinctness,
                                                 };
                                                 aggregate_expressions.push(agg.clone());
@@ -467,7 +462,7 @@ fn prepare_one_select_plan(
                                                             }
                                                         }
                                                     }),
-                                                    expr: *expr.clone(),
+                                                    expr: expr,
                                                     contains_aggregates: true,
                                                 });
                                             }
@@ -490,10 +485,10 @@ fn prepare_one_select_plan(
                                     Ok(Func::Agg(f)) => {
                                         let agg = Aggregate {
                                             func: f,
-                                            args: vec![ast::Expr::Literal(ast::Literal::Numeric(
-                                                "1".to_string(),
+                                            args: vec![Box::new(ast::Expr::Literal(
+                                                ast::Literal::Numeric("1".to_string()),
                                             ))],
-                                            original_expr: *expr.clone(),
+                                            original_expr: expr.clone(),
                                             distinctness: Distinctness::NonDistinct,
                                         };
                                         aggregate_expressions.push(agg.clone());
@@ -504,7 +499,7 @@ fn prepare_one_select_plan(
                                                 }
                                                 ast::As::As(alias) => alias.as_str().to_string(),
                                             }),
-                                            expr: *expr.clone(),
+                                            expr: expr,
                                             contains_aggregates: true,
                                         });
                                     }
@@ -527,15 +522,18 @@ fn prepare_one_select_plan(
                                     },
                                 }
                             }
-                            expr => {
-                                let contains_aggregates =
-                                    resolve_aggregates(schema, expr, &mut aggregate_expressions)?;
+                            _ => {
+                                let contains_aggregates = resolve_aggregates(
+                                    schema,
+                                    expr.as_ref(),
+                                    &mut aggregate_expressions,
+                                )?;
                                 plan.result_columns.push(ResultSetColumn {
                                     alias: maybe_alias.as_ref().map(|alias| match alias {
                                         ast::As::Elided(alias) => alias.as_str().to_string(),
                                         ast::As::As(alias) => alias.as_str().to_string(),
                                     }),
-                                    expr: expr.clone(),
+                                    expr: expr,
                                     contains_aggregates,
                                 });
                             }
@@ -551,7 +549,7 @@ fn prepare_one_select_plan(
 
             // Parse the actual WHERE clause and add its conditions to the plan WHERE clause that already contains the join conditions.
             parse_where(
-                where_clause.as_deref(),
+                &where_clause,
                 &mut plan.table_references,
                 Some(&plan.result_columns),
                 &mut plan.where_clause,
@@ -571,10 +569,10 @@ fn prepare_one_select_plan(
 
                 plan.group_by = Some(GroupBy {
                     sort_order: Some((0..group_by.exprs.len()).map(|_| SortOrder::Asc).collect()),
-                    exprs: group_by.exprs.iter().map(|expr| *expr.clone()).collect(),
+                    exprs: group_by.exprs,
                     having: if let Some(having) = group_by.having {
                         let mut predicates = vec![];
-                        break_predicate_at_and_boundaries(&having, &mut predicates);
+                        break_predicate_at_and_boundaries(having, &mut predicates);
                         for expr in predicates.iter_mut() {
                             bind_column_references(
                                 expr,
@@ -633,7 +631,7 @@ fn prepare_one_select_plan(
             for i in 0..len {
                 result_columns.push(ResultSetColumn {
                     // these result_columns work as placeholders for the values, so the expr doesn't matter
-                    expr: ast::Expr::Literal(ast::Literal::Numeric(i.to_string())),
+                    expr: Box::new(ast::Expr::Literal(ast::Literal::Numeric(i.to_string()))),
                     alias: None,
                     contains_aggregates: false,
                 });
@@ -651,10 +649,7 @@ fn prepare_one_select_plan(
                 contains_constant_false_condition: false,
                 query_destination,
                 distinctness: Distinctness::NonDistinct,
-                values: values
-                    .iter()
-                    .map(|values| values.iter().map(|value| *value.clone()).collect())
-                    .collect(),
+                values: values,
             };
 
             Ok(plan)
@@ -663,7 +658,7 @@ fn prepare_one_select_plan(
 }
 
 fn add_vtab_predicates_to_where_clause(
-    vtab_predicates: &mut Vec<Expr>,
+    vtab_predicates: &mut Vec<Box<Expr>>,
     plan: &mut SelectPlan,
     connection: &Arc<Connection>,
 ) -> Result<()> {
@@ -700,7 +695,7 @@ fn replace_column_number_with_copy_of_column_expr(
         let maybe_result_column = columns.get(column_number - 1);
         match maybe_result_column {
             Some(ResultSetColumn { expr, .. }) => {
-                *order_by_or_group_by_expr = expr.clone();
+                *order_by_or_group_by_expr = expr.as_ref().clone();
             }
             None => {
                 crate::bail_parse_error!("invalid column index: {}", column_number)

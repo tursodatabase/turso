@@ -99,7 +99,7 @@ pub fn prepare_delete_plan(
 
     // Parse the WHERE clause
     parse_where(
-        where_clause.as_deref(),
+        &where_clause,
         &mut table_references,
         None,
         &mut where_predicates,

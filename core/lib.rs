@@ -2188,7 +2188,7 @@ impl Statement {
 
     pub fn get_column_type(&self, idx: usize) -> Option<String> {
         let column = &self.program.result_columns.get(idx).expect("No column");
-        match &column.expr {
+        match column.expr.as_ref() {
             turso_parser::ast::Expr::Column {
                 table,
                 column: column_idx,

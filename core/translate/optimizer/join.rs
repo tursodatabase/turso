@@ -1333,7 +1333,7 @@ mod tests {
 
         // Create where clause that only references second column
         let where_clause = vec![WhereTerm {
-            expr: Expr::Binary(
+            expr: Box::new(Expr::Binary(
                 Box::new(Expr::Column {
                     database: None,
                     table: joined_tables[0].internal_id,
@@ -1342,7 +1342,7 @@ mod tests {
                 }),
                 ast::Operator::Equals,
                 Box::new(Expr::Literal(ast::Literal::Numeric(5.to_string()))),
-            ),
+            )),
             from_outer_join: None,
             consumed: false,
         }];
@@ -1425,7 +1425,7 @@ mod tests {
         // Create where clause that references first and third columns
         let where_clause = vec![
             WhereTerm {
-                expr: Expr::Binary(
+                expr: Box::new(Expr::Binary(
                     Box::new(Expr::Column {
                         database: None,
                         table: joined_tables[0].internal_id,
@@ -1434,12 +1434,12 @@ mod tests {
                     }),
                     ast::Operator::Equals,
                     Box::new(Expr::Literal(ast::Literal::Numeric(5.to_string()))),
-                ),
+                )),
                 from_outer_join: None,
                 consumed: false,
             },
             WhereTerm {
-                expr: Expr::Binary(
+                expr: Box::new(Expr::Binary(
                     Box::new(Expr::Column {
                         database: None,
                         table: joined_tables[0].internal_id,
@@ -1448,7 +1448,7 @@ mod tests {
                     }),
                     ast::Operator::Equals,
                     Box::new(Expr::Literal(ast::Literal::Numeric(7.to_string()))),
-                ),
+                )),
                 from_outer_join: None,
                 consumed: false,
             },
@@ -1536,7 +1536,7 @@ mod tests {
         // Create where clause: c1 = 5 AND c2 > 10 AND c3 = 7
         let where_clause = vec![
             WhereTerm {
-                expr: Expr::Binary(
+                expr: Box::new(Expr::Binary(
                     Box::new(Expr::Column {
                         database: None,
                         table: joined_tables[0].internal_id,
@@ -1545,12 +1545,12 @@ mod tests {
                     }),
                     ast::Operator::Equals,
                     Box::new(Expr::Literal(ast::Literal::Numeric(5.to_string()))),
-                ),
+                )),
                 from_outer_join: None,
                 consumed: false,
             },
             WhereTerm {
-                expr: Expr::Binary(
+                expr: Box::new(Expr::Binary(
                     Box::new(Expr::Column {
                         database: None,
                         table: joined_tables[0].internal_id,
@@ -1559,12 +1559,12 @@ mod tests {
                     }),
                     ast::Operator::Greater,
                     Box::new(Expr::Literal(ast::Literal::Numeric(10.to_string()))),
-                ),
+                )),
                 from_outer_join: None,
                 consumed: false,
             },
             WhereTerm {
-                expr: Expr::Binary(
+                expr: Box::new(Expr::Binary(
                     Box::new(Expr::Column {
                         database: None,
                         table: joined_tables[0].internal_id,
@@ -1573,7 +1573,7 @@ mod tests {
                     }),
                     ast::Operator::Equals,
                     Box::new(Expr::Literal(ast::Literal::Numeric(7.to_string()))),
-                ),
+                )),
                 from_outer_join: None,
                 consumed: false,
             },
@@ -1690,7 +1690,7 @@ mod tests {
     /// Creates a binary expression for a WHERE clause
     fn _create_binary_expr(lhs: Expr, op: Operator, rhs: Expr) -> WhereTerm {
         WhereTerm {
-            expr: Expr::Binary(Box::new(lhs), op, Box::new(rhs)),
+            expr: Box::new(Expr::Binary(Box::new(lhs), op, Box::new(rhs))),
             from_outer_join: None,
             consumed: false,
         }

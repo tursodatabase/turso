@@ -75,8 +75,8 @@ pub fn resolve_aggregates(
                         }
                         aggs.push(Aggregate {
                             func: f,
-                            args: args.iter().map(|arg| *arg.clone()).collect(),
-                            original_expr: expr.clone(),
+                            args: args.clone(),
+                            original_expr: expr.clone().into(),
                             distinctness,
                         });
                         contains_aggregates = true;
@@ -98,7 +98,7 @@ pub fn resolve_aggregates(
                     aggs.push(Aggregate {
                         func: f,
                         args: vec![],
-                        original_expr: expr.clone(),
+                        original_expr: expr.clone().into(),
                         distinctness: Distinctness::NonDistinct,
                     });
                     contains_aggregates = true;
@@ -207,7 +207,7 @@ pub fn bind_column_references(
                             .name(referenced_tables)
                             .is_some_and(|name| name.eq_ignore_ascii_case(&normalized_id))
                         {
-                            *expr = result_column.expr.clone();
+                            *expr = result_column.expr.as_ref().clone();
                             return Ok(());
                         }
                     }
@@ -335,7 +335,7 @@ fn parse_from_clause_table(
     schema: &Schema,
     table: ast::SelectTable,
     table_references: &mut TableReferences,
-    vtab_predicates: &mut Vec<Expr>,
+    vtab_predicates: &mut Vec<Box<Expr>>,
     ctes: &mut Vec<JoinedTable>,
     syms: &SymbolTable,
     table_ref_counter: &mut TableRefIdCounter,
@@ -408,7 +408,7 @@ fn parse_table(
     table_references: &mut TableReferences,
     ctes: &mut Vec<JoinedTable>,
     table_ref_counter: &mut TableRefIdCounter,
-    vtab_predicates: &mut Vec<Expr>,
+    vtab_predicates: &mut Vec<Box<Expr>>,
     qualified_name: &QualifiedName,
     maybe_alias: Option<&As>,
     args: &[Box<Expr>],
@@ -549,7 +549,7 @@ fn parse_table(
 fn transform_args_into_where_terms(
     args: &[Box<Expr>],
     internal_id: TableInternalId,
-    predicates: &mut Vec<Expr>,
+    predicates: &mut Vec<Box<Expr>>,
     table: &Table,
 ) -> Result<()> {
     let mut args_iter = args.iter();
@@ -561,19 +561,19 @@ fn transform_args_into_where_terms(
         hidden_count += 1;
 
         if let Some(arg_expr) = args_iter.next() {
-            let column_expr = Expr::Column {
+            let column_expr = Box::new(Expr::Column {
                 database: None,
                 table: internal_id,
                 column: i,
                 is_rowid_alias: col.is_rowid_alias,
-            };
+            });
             let expr = match arg_expr.as_ref() {
-                Expr::Literal(Null) => Expr::IsNull(Box::new(column_expr)),
-                other => Expr::Binary(
+                Expr::Literal(Null) => Box::new(Expr::IsNull(column_expr)),
+                other => Box::new(Expr::Binary(
                     column_expr.into(),
                     ast::Operator::Equals,
                     other.clone().into(),
-                ),
+                )),
             };
             predicates.push(expr);
         }
@@ -598,7 +598,7 @@ pub fn parse_from(
     syms: &SymbolTable,
     with: Option<With>,
     out_where_clause: &mut Vec<WhereTerm>,
-    vtab_predicates: &mut Vec<Expr>,
+    vtab_predicates: &mut Vec<Box<Expr>>,
     table_references: &mut TableReferences,
     table_ref_counter: &mut TableRefIdCounter,
     connection: &Arc<crate::Connection>,
@@ -710,15 +710,15 @@ pub fn parse_from(
 }
 
 pub fn parse_where(
-    where_clause: Option<&Expr>,
+    where_clause: &Option<Box<Expr>>,
     table_references: &mut TableReferences,
     result_columns: Option<&[ResultSetColumn]>,
     out_where_clause: &mut Vec<WhereTerm>,
     connection: &Arc<crate::Connection>,
 ) -> Result<()> {
-    if let Some(where_expr) = where_clause {
+    if let Some(ref where_expr) = where_clause {
         let mut predicates = vec![];
-        break_predicate_at_and_boundaries(where_expr, &mut predicates);
+        break_predicate_at_and_boundaries(where_expr.clone(), &mut predicates);
         for expr in predicates.iter_mut() {
             bind_column_references(expr, table_references, result_columns, connection)?;
         }
@@ -916,7 +916,7 @@ fn parse_join(
     syms: &SymbolTable,
     ctes: &mut Vec<JoinedTable>,
     out_where_clause: &mut Vec<WhereTerm>,
-    vtab_predicates: &mut Vec<Expr>,
+    vtab_predicates: &mut Vec<Box<Expr>>,
     table_references: &mut TableReferences,
     table_ref_counter: &mut TableRefIdCounter,
     connection: &Arc<crate::Connection>,
@@ -992,7 +992,7 @@ fn parse_join(
 
     if let Some(constraint) = constraint {
         match constraint {
-            ast::JoinConstraint::On(ref expr) => {
+            ast::JoinConstraint::On(expr) => {
                 let mut preds = vec![];
                 break_predicate_at_and_boundaries(expr, &mut preds);
                 for predicate in preds.iter_mut() {
@@ -1054,7 +1054,7 @@ fn parse_join(
                     }
                     let (left_table_idx, left_table_id, left_col_idx, left_col) = left_col.unwrap();
                     let (right_col_idx, right_col) = right_col.unwrap();
-                    let expr = Expr::Binary(
+                    let expr = Box::new(Expr::Binary(
                         Box::new(Expr::Column {
                             database: None,
                             table: left_table_id,
@@ -1068,7 +1068,7 @@ fn parse_join(
                             column: right_col_idx,
                             is_rowid_alias: right_col.is_rowid_alias,
                         }),
-                    );
+                    ));
 
                     let left_table: &mut JoinedTable = table_references
                         .joined_tables_mut()
@@ -1145,14 +1145,17 @@ pub fn parse_limit(limit: &Limit) -> Result<(Option<isize>, Option<isize>)> {
     }
 }
 
-pub fn break_predicate_at_and_boundaries(predicate: &Expr, out_predicates: &mut Vec<Expr>) {
-    match predicate {
+pub fn break_predicate_at_and_boundaries(
+    predicate: Box<Expr>,
+    out_predicates: &mut Vec<Box<Expr>>,
+) {
+    match *predicate {
         Expr::Binary(left, ast::Operator::And, right) => {
             break_predicate_at_and_boundaries(left, out_predicates);
             break_predicate_at_and_boundaries(right, out_predicates);
         }
         _ => {
-            out_predicates.push(predicate.clone());
+            out_predicates.push(predicate);
         }
     }
 }

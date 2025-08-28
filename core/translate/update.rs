@@ -247,7 +247,7 @@ pub fn prepare_update_plan(
 
         // Parse the WHERE clause
         parse_where(
-            body.where_clause.as_deref(),
+            &body.where_clause,
             &mut table_references,
             Some(&result_columns),
             &mut where_clause,
@@ -280,10 +280,10 @@ pub fn prepare_update_plan(
         let mut ephemeral_plan = SelectPlan {
             table_references,
             result_columns: vec![ResultSetColumn {
-                expr: Expr::RowId {
+                expr: Box::new(Expr::RowId {
                     database: None,
                     table: internal_id,
-                },
+                }),
                 alias: None,
                 contains_aggregates: false,
             }],
@@ -322,7 +322,7 @@ pub fn prepare_update_plan(
     if ephemeral_plan.is_none() {
         // Parse the WHERE clause
         parse_where(
-            body.where_clause.as_deref(),
+            &body.where_clause,
             &mut table_references,
             Some(&result_columns),
             &mut where_clause,

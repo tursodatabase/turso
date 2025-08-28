@@ -185,20 +185,19 @@ pub fn translate_aggregation_step(
             let delimiter_reg = program.alloc_register();
 
             let expr = &agg.args[0];
-            let delimiter_expr: ast::Expr;
+            let default_delimiter = ast::Expr::Literal(ast::Literal::String(String::from("\",\"")));
+            let mut delimiter_expr = &default_delimiter;
 
             if agg.args.len() == 2 {
-                match &agg.args[1] {
+                match agg.args[1].as_ref() {
                     arg @ ast::Expr::Column { .. } => {
-                        delimiter_expr = arg.clone();
+                        delimiter_expr = arg;
                     }
-                    ast::Expr::Literal(ast::Literal::String(s)) => {
-                        delimiter_expr = ast::Expr::Literal(ast::Literal::String(s.to_string()));
+                    arg @ ast::Expr::Literal(ast::Literal::String(_)) => {
+                        delimiter_expr = arg;
                     }
                     _ => crate::bail_parse_error!("Incorrect delimiter parameter"),
                 };
-            } else {
-                delimiter_expr = ast::Expr::Literal(ast::Literal::String(String::from("\",\"")));
             }
 
             translate_expr(program, Some(referenced_tables), expr, expr_reg, resolver)?;
@@ -206,7 +205,7 @@ pub fn translate_aggregation_step(
             translate_expr(
                 program,
                 Some(referenced_tables),
-                &delimiter_expr,
+                delimiter_expr,
                 delimiter_reg,
                 resolver,
             )?;
@@ -308,11 +307,9 @@ pub fn translate_aggregation_step(
             let delimiter_reg = program.alloc_register();
 
             let expr = &agg.args[0];
-            let delimiter_expr = match &agg.args[1] {
-                arg @ ast::Expr::Column { .. } => arg.clone(),
-                ast::Expr::Literal(ast::Literal::String(s)) => {
-                    ast::Expr::Literal(ast::Literal::String(s.to_string()))
-                }
+            let delimiter_expr = match agg.args[1].as_ref() {
+                arg @ ast::Expr::Column { .. } => arg,
+                arg @ ast::Expr::Literal(ast::Literal::String(_)) => arg,
                 _ => crate::bail_parse_error!("Incorrect delimiter parameter"),
             };
 
@@ -320,7 +317,7 @@ pub fn translate_aggregation_step(
             translate_expr(
                 program,
                 Some(referenced_tables),
-                &delimiter_expr,
+                delimiter_expr,
                 delimiter_reg,
                 resolver,
             )?;

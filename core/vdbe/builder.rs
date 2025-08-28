@@ -298,7 +298,7 @@ impl ProgramBuilder {
     pub fn add_pragma_result_column(&mut self, col_name: String) {
         // TODO figure out a better type definition for ResultSetColumn
         // or invent another way to set pragma result columns
-        let expr = ast::Expr::Id(ast::Name::Ident("".to_string()));
+        let expr = Box::new(ast::Expr::Id(ast::Name::Ident("".to_string())));
         self.result_columns.push(ResultSetColumn {
             expr,
             alias: Some(col_name),

@@ -2665,13 +2665,13 @@ fn unwrap_parens(expr: &ast::Expr) -> Result<&ast::Expr> {
 
 /// Recursively unwrap parentheses from an owned Expr.
 /// Returns how many pairs of parentheses were removed.
-pub fn unwrap_parens_owned(expr: ast::Expr) -> Result<(ast::Expr, usize)> {
+pub fn unwrap_parens_owned(expr: Box<ast::Expr>) -> Result<(Box<ast::Expr>, usize)> {
     let mut paren_count = 0;
-    match expr {
+    match *expr {
         ast::Expr::Parenthesized(mut exprs) => match exprs.len() {
             1 => {
                 paren_count += 1;
-                let (expr, count) = unwrap_parens_owned(*exprs.pop().unwrap().clone())?;
+                let (expr, count) = unwrap_parens_owned(exprs.pop().unwrap())?;
                 paren_count += count;
                 Ok((expr, paren_count))
             }
@@ -3358,7 +3358,7 @@ pub fn process_returning_clause(
                 bind_column_references(expr, &mut table_references, None, connection)?;
 
                 result_columns.push(ResultSetColumn {
-                    expr: *expr.clone(),
+                    expr: expr.clone(),
                     alias: column_alias,
                     contains_aggregates: false,
                 });
@@ -3367,12 +3367,12 @@ pub fn process_returning_clause(
                 // Handle RETURNING * by expanding to all table columns
                 // Use the shared internal_id for all columns
                 for (column_index, column) in table.columns().iter().enumerate() {
-                    let column_expr = Expr::Column {
+                    let column_expr = Box::new(Expr::Column {
                         database: None,
                         table: internal_id,
                         column: column_index,
                         is_rowid_alias: false,
-                    };
+                    });
 
                     result_columns.push(ResultSetColumn {
                         expr: column_expr,
@@ -3385,12 +3385,12 @@ pub fn process_returning_clause(
                 // Handle RETURNING table.* by expanding to all table columns
                 // For single table RETURNING, this is equivalent to *
                 for (column_index, column) in table.columns().iter().enumerate() {
-                    let column_expr = Expr::Column {
+                    let column_expr = Box::new(Expr::Column {
                         database: None,
                         table: internal_id,
                         column: column_index,
                         is_rowid_alias: false,
-                    };
+                    });
 
                     result_columns.push(ResultSetColumn {
                         expr: column_expr,

@@ -19,7 +19,7 @@ use super::{emitter::OperationMode, planner::determine_where_to_eval_term};
 
 #[derive(Debug, Clone)]
 pub struct ResultSetColumn {
-    pub expr: ast::Expr,
+    pub expr: Box<ast::Expr>,
     pub alias: Option<String>,
     // TODO: encode which aggregates (e.g. index bitmask of plan.aggregates) are present in this column
     pub contains_aggregates: bool,
@@ -30,7 +30,7 @@ impl ResultSetColumn {
         if let Some(alias) = &self.alias {
             return Some(alias);
         }
-        match &self.expr {
+        match self.expr.as_ref() {
             ast::Expr::Column { table, column, .. } => {
                 let table_ref = tables.find_table_by_internal_id(*table).unwrap();
                 table_ref.get_column_at(*column).unwrap().name.as_deref()
@@ -56,11 +56,11 @@ impl ResultSetColumn {
 
 #[derive(Debug, Clone)]
 pub struct GroupBy {
-    pub exprs: Vec<ast::Expr>,
+    pub exprs: Vec<Box<ast::Expr>>,
     /// sort order, if a sorter is required (= the columns aren't already in the correct order)
     pub sort_order: Option<Vec<SortOrder>>,
     /// having clause split into a vec at 'AND' boundaries.
-    pub having: Option<Vec<ast::Expr>>,
+    pub having: Option<Vec<Box<ast::Expr>>>,
 }
 
 /// In a query plan, WHERE clause conditions and JOIN conditions are all folded into a vector of WhereTerm.
@@ -72,7 +72,7 @@ pub struct GroupBy {
 #[derive(Debug, Clone)]
 pub struct WhereTerm {
     /// The original condition expression.
-    pub expr: ast::Expr,
+    pub expr: Box<ast::Expr>,
     /// Is this condition originally from an OUTER JOIN, and if so, what is the internal ID of the [TableReference] that it came from?
     /// The ID is always the right-hand-side table of the OUTER JOIN.
     /// If `from_outer_join` is Some, we need to evaluate this term at the loop of the the corresponding table,
@@ -302,7 +302,7 @@ pub struct SelectPlan {
     /// whether the query is DISTINCT
     pub distinctness: Distinctness,
     /// values: https://sqlite.org/syntax/select-core.html
-    pub values: Vec<Vec<Expr>>,
+    pub values: Vec<Vec<Box<Expr>>>,
 }
 
 impl SelectPlan {
@@ -360,7 +360,7 @@ impl SelectPlan {
             },
         };
         let result_col_expr = &self.result_columns.first().unwrap().expr;
-        if *result_col_expr != count && *result_col_expr != count_star {
+        if *result_col_expr.as_ref() != count && *result_col_expr.as_ref() != count_star {
             return false;
         }
         true
@@ -437,12 +437,12 @@ pub fn select_star(tables: &[JoinedTable], out_columns: &mut Vec<ResultSetColumn
                 })
                 .map(|(i, col)| ResultSetColumn {
                     alias: None,
-                    expr: ast::Expr::Column {
+                    expr: Box::new(ast::Expr::Column {
                         database: None,
                         table: table.internal_id,
                         column: i,
                         is_rowid_alias: col.is_rowid_alias,
-                    },
+                    }),
                     contains_aggregates: false,
                 }),
         );
@@ -1042,8 +1042,8 @@ pub enum Search {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Aggregate {
     pub func: AggFunc,
-    pub args: Vec<ast::Expr>,
-    pub original_expr: ast::Expr,
+    pub args: Vec<Box<ast::Expr>>,
+    pub original_expr: Box<ast::Expr>,
     pub distinctness: Distinctness,
 }
 
