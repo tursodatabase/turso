@@ -56,6 +56,12 @@ impl InteractionPlan {
         // Remove all properties that do not use the failing tables
         plan.plan.retain_mut(|interactions| {
             let retain = if idx == failing_execution.interaction_index {
+                if let Interactions::Property(
+                    Property::FsyncNoWait { tables, .. } | Property::FaultyQuery { tables, .. },
+                ) = interactions
+                {
+                    tables.retain(|table| depending_tables.contains(table));
+                }
                 true
             } else {
                 let mut has_table = interactions
@@ -73,9 +79,13 @@ impl InteractionPlan {
                             | Property::DropSelect { queries, .. } => {
                                 queries.clear();
                             }
-                            Property::FsyncNoWait { tables, .. }
-                            | Property::FaultyQuery { tables, .. } => {
-                                tables.retain(|table| depending_tables.contains(table));
+                            Property::FsyncNoWait { tables, query }
+                            | Property::FaultyQuery { tables, query } => {
+                                if !query.uses().iter().any(|t| depending_tables.contains(t)) {
+                                    tables.clear();
+                                } else {
+                                    tables.retain(|table| depending_tables.contains(table));
+                                }
                             }
                             Property::SelectLimit { .. }
                             | Property::SelectSelectOptimizer { .. }
