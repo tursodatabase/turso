@@ -321,16 +321,15 @@ pub struct OrderByRemapping {
 /// In case any of the ORDER BY sort keys are exactly equal to a result column, we can skip emitting that result column.
 /// If we skip a result column, we need to keep track what index in the ORDER BY sorter the result columns have,
 /// because the result columns should be emitted in the SELECT clause order, not the ORDER BY clause order.
-///
-/// If any result columns can be skipped, this returns list of 2-tuples of (SkippedResultColumnIndex: usize, ResultColumnIndexInOrderBySorter: usize)
 pub fn order_by_deduplicate_result_columns(
     order_by: &[(Box<ast::Expr>, SortOrder)],
     result_columns: &[ResultSetColumn],
 ) -> Vec<OrderByRemapping> {
     let mut result_column_remapping: Vec<OrderByRemapping> = Vec::new();
-    let mut independent_order_by_cols_on_the_left = order_by.len();
+    let order_by_len = order_by.len();
 
-    for (i, rc) in result_columns.iter().enumerate() {
+    let mut i = 0;
+    for rc in result_columns.iter() {
         let found = order_by
             .iter()
             .enumerate()
@@ -340,13 +339,15 @@ pub fn order_by_deduplicate_result_columns(
                 orderby_sorter_idx: j,
                 deduplicated: true,
             });
-            independent_order_by_cols_on_the_left =
-                independent_order_by_cols_on_the_left.saturating_sub(1);
         } else {
+            // This result column is not a duplicate of any ORDER BY key, so its sorter
+            // index comes after all ORDER BY entries (hence the +order_by_len). The
+            // counter `i` tracks how many such non-duplicate result columns we've seen.
             result_column_remapping.push(OrderByRemapping {
-                orderby_sorter_idx: i + independent_order_by_cols_on_the_left,
+                orderby_sorter_idx: i + order_by_len,
                 deduplicated: false,
             });
+            i += 1;
         }
     }
 
