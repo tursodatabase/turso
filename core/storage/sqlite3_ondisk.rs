@@ -1092,9 +1092,9 @@ pub fn write_pages_vectored(
                     if runs_left.fetch_sub(1, Ordering::AcqRel) == 1 {
                         done.store(true, Ordering::Release);
                     }
-                    for c in completions {
-                        c.abort();
-                    }
+                    pager.io.cancel(&completions)?;
+                    // cancel any submitted completions and drain the IO before returning an error
+                    pager.io.drain()?;
                     return Err(e);
                 }
             }
