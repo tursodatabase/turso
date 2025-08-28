@@ -143,7 +143,24 @@ pub fn convert_ref_dbtype_to_jsonb(val: &RefValue, strict: Conv) -> crate::Resul
             res.map_err(|_| LimboError::ParseError("malformed JSON".to_string()))
         }
         RefValue::Blob(blob) => {
-            let json = Jsonb::from_raw_data(blob.to_slice());
+            let slice = blob.to_slice();
+            let json = match slice {
+                // Check if the blob is a valid JSON string binary
+                [b'{', .., b'}'] | [b'[', .., b']'] => {
+                    let str = std::str::from_utf8(slice)
+                        .map_err(|_| LimboError::ParseError("invalid utf-8".to_string()))?;
+
+                    if matches!(strict, Conv::ToString) {
+                        let mut str = str.replace('"', "\\\"");
+                        str.insert(0, '"');
+                        str.push('"');
+                        Jsonb::from_str(&str)?
+                    } else {
+                        Jsonb::from_str(str)?
+                    }
+                }
+                _ => Jsonb::from_raw_data(blob.to_slice()),
+            };
             json.element_type()?;
             Ok(json)
         }
