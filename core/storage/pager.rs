@@ -1804,6 +1804,8 @@ impl Pager {
                 let io_ctx = self.io_ctx.borrow();
                 if let Some(ctx) = io_ctx.encryption_context() {
                     default_header.reserved_space = ctx.required_reserved_bytes()
+                } else {
+                    default_header.reserved_space = 16;
                 }
 
                 if let Some(size) = self.page_size.get() {

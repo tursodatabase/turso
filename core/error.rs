@@ -122,6 +122,12 @@ pub enum CompletionError {
     Aborted,
     #[error("Decryption failed for page={page_idx}")]
     DecryptionError { page_idx: usize },
+    #[error("Checksum mismatch on page {page_id}: expected {expected}, got {actual}")]
+    ChecksumMismatch {
+        page_id: usize,
+        expected: u64,
+        actual: u64,
+    },
 }
 
 #[macro_export]
