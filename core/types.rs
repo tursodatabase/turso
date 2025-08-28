@@ -102,8 +102,17 @@ pub trait Extendable<T> {
 impl<T: AnyText> Extendable<T> for Text {
     #[inline(always)]
     fn do_extend(&mut self, other: &T) {
-        self.value.clear();
-        self.value.extend_from_slice(other.as_ref().as_bytes());
+        // SAFETY:
+        // 'other' comes from an ImmutableRecord pointing at page data, while 'self' is an owned value in
+        // a VDBE register. These do not overlap.
+        unsafe {
+            let bytes = other.as_ref().as_bytes();
+            let ptr = bytes.as_ptr();
+            let len = bytes.len();
+            self.value.reserve(len.saturating_sub(self.value.len()));
+            std::ptr::copy_nonoverlapping(ptr, self.value.as_mut_ptr(), len);
+            self.value.set_len(len);
+        }
         self.subtype = other.subtype();
     }
 }
@@ -111,8 +120,17 @@ impl<T: AnyText> Extendable<T> for Text {
 impl<T: AnyBlob> Extendable<T> for Vec<u8> {
     #[inline(always)]
     fn do_extend(&mut self, other: &T) {
-        self.clear();
-        self.extend_from_slice(other.as_slice());
+        // SAFETY:
+        // 'other' comes from an ImmutableRecord pointing at page data, while 'self' is an owned value in
+        // a VDBE register. These do not overlap.
+        unsafe {
+            let bytes = other.as_slice();
+            let ptr = bytes.as_ptr();
+            let len = bytes.len();
+            self.reserve(len.saturating_sub(self.len()));
+            std::ptr::copy_nonoverlapping(ptr, self.as_mut_ptr(), len);
+            self.set_len(len);
+        }
     }
 }
 
