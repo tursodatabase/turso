@@ -159,7 +159,7 @@ pub fn convert_ref_dbtype_to_jsonb(val: &RefValue, strict: Conv) -> crate::Resul
                         Jsonb::from_str(str)?
                     }
                 }
-                _ => Jsonb::from_raw_data(blob.to_slice()),
+                _ => Jsonb::from_raw_data(slice),
             };
             json.element_type()?;
             Ok(json)
