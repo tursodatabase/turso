@@ -1727,7 +1727,6 @@ impl BTreeCursor {
             self.mv_cursor.is_none(),
             "attempting to seek with MV cursor"
         );
-        let iter_dir = seek_op.iteration_direction();
 
         if matches!(
             self.seek_state,
@@ -1735,133 +1734,114 @@ impl BTreeCursor {
                 | CursorSeekState::MovingBetweenPages { .. }
                 | CursorSeekState::InteriorPageBinarySearch { .. }
         ) {
-            // No need for another move_to_root. Move_to already moves to root
             return_if_io!(self.move_to(SeekKey::TableRowId(rowid), seek_op));
-            let page = self.stack.top();
-            let contents = page.get_contents();
-            turso_assert!(
-                contents.is_leaf(),
-                "tablebtree_seek() called on non-leaf page"
-            );
-
-            let cell_count = contents.cell_count();
-            if cell_count == 0 {
-                self.stack.set_cell_index(0);
-                return Ok(IOResult::Done(SeekResult::NotFound));
-            }
-            let min_cell_idx = Cell::new(0);
-            let max_cell_idx = Cell::new(cell_count as isize - 1);
-
-            // If iter dir is forwards, we want the first cell that matches;
-            // If iter dir is backwards, we want the last cell that matches.
-            let nearest_matching_cell = Cell::new(None);
-
-            self.seek_state = CursorSeekState::LeafPageBinarySearch {
-                min_cell_idx,
-                max_cell_idx,
-                nearest_matching_cell,
-                eq_seen: Cell::new(false), // not relevant for table btrees
-                target_cell_when_not_found: Cell::new(match seek_op.iteration_direction() {
-                    IterationDirection::Forwards => cell_count as i32,
-                    IterationDirection::Backwards => -1,
-                }),
-            };
         }
-
-        let CursorSeekState::LeafPageBinarySearch {
-            min_cell_idx,
-            max_cell_idx,
-            nearest_matching_cell,
-            target_cell_when_not_found,
-            ..
-        } = &self.seek_state
-        else {
-            unreachable!("we must be in a leaf binary search state");
-        };
 
         let page = self.stack.top();
         let contents = page.get_contents();
+        turso_assert!(
+            contents.is_leaf(),
+            "tablebtree_seek() called on non-leaf page"
+        );
 
-        loop {
-            let min = min_cell_idx.get();
-            let max = max_cell_idx.get();
-            if min > max {
-                if let Some(nearest_matching_cell) = nearest_matching_cell.get() {
-                    self.stack.set_cell_index(nearest_matching_cell as i32);
-                    self.has_record.set(true);
-                    return Ok(IOResult::Done(SeekResult::Found));
-                } else {
-                    // if !eq_only - matching entry can exist in neighbour leaf page
-                    // this can happen if key in the interiour page was deleted - but divider kept untouched
-                    // in such case BTree can navigate to the leaf which no longer has matching key for seek_op
-                    // in this case, caller must advance cursor if necessary
-                    return Ok(IOResult::Done(if seek_op.eq_only() {
-                        let has_record = target_cell_when_not_found.get() >= 0
-                            && target_cell_when_not_found.get() < contents.cell_count() as i32;
-                        self.has_record.set(has_record);
-                        self.stack.set_cell_index(target_cell_when_not_found.get());
-                        SeekResult::NotFound
-                    } else {
-                        // set cursor to the position where which would hold the op-boundary if it were present
-                        self.stack.set_cell_index(target_cell_when_not_found.get());
-                        SeekResult::TryAdvance
-                    }));
-                };
-            }
+        let cell_count = contents.cell_count();
+        if cell_count == 0 {
+            self.stack.set_cell_index(0);
+            return Ok(IOResult::Done(SeekResult::NotFound));
+        }
 
+        let mut min = 0;
+        let mut max = cell_count as i32 - 1;
+        let mut result = None;
+
+        // Search for an exact match first
+        while min <= max {
             let cur_cell_idx = (min + max) >> 1; // rustc generates extra insns for (min+max)/2 due to them being isize. we know min&max are >=0 here.
             let cell_rowid = contents.cell_table_leaf_read_rowid(cur_cell_idx as usize)?;
-
             let cmp = cell_rowid.cmp(&rowid);
-
-            let found = match seek_op {
-                SeekOp::GT => cmp.is_gt(),
-                SeekOp::GE { eq_only: true } => cmp.is_eq(),
-                SeekOp::GE { eq_only: false } => cmp.is_ge(),
-                SeekOp::LE { eq_only: true } => cmp.is_eq(),
-                SeekOp::LE { eq_only: false } => cmp.is_le(),
-                SeekOp::LT => cmp.is_lt(),
-            };
-
-            // rowids are unique, so we can return the rowid immediately
-            if found && seek_op.eq_only() {
-                self.stack.set_cell_index(cur_cell_idx as i32);
-                self.has_record.set(true);
-                return Ok(IOResult::Done(SeekResult::Found));
-            }
-
-            if found {
-                nearest_matching_cell.set(Some(cur_cell_idx as usize));
-                match iter_dir {
-                    IterationDirection::Forwards => {
-                        max_cell_idx.set(cur_cell_idx - 1);
-                    }
-                    IterationDirection::Backwards => {
-                        min_cell_idx.set(cur_cell_idx + 1);
-                    }
+            if cmp == Ordering::Equal {
+                let accepts_eq = matches!(seek_op, SeekOp::GE { .. } | SeekOp::LE { .. });
+                if accepts_eq {
+                    // If our seek op accepts an exact match, we can just return here.
+                    self.stack.set_cell_index(cur_cell_idx);
+                    self.has_record.set(true);
+                    return Ok(IOResult::Done(SeekResult::Found));
                 }
-            } else if cmp.is_gt() {
-                if matches!(seek_op, SeekOp::GE { eq_only: true }) {
-                    target_cell_when_not_found
-                        .set(target_cell_when_not_found.get().min(cur_cell_idx as i32));
-                }
-                max_cell_idx.set(cur_cell_idx - 1);
-            } else if cmp.is_lt() {
-                if matches!(seek_op, SeekOp::LE { eq_only: true }) {
-                    target_cell_when_not_found
-                        .set(target_cell_when_not_found.get().max(cur_cell_idx as i32));
-                }
-                min_cell_idx.set(cur_cell_idx + 1);
+                result = Some(cur_cell_idx as i32);
+                break;
+            } else if cmp == Ordering::Greater {
+                max = cur_cell_idx - 1;
             } else {
-                match iter_dir {
-                    IterationDirection::Forwards => {
-                        min_cell_idx.set(cur_cell_idx + 1);
-                    }
-                    IterationDirection::Backwards => {
-                        max_cell_idx.set(cur_cell_idx - 1);
+                min = cur_cell_idx + 1;
+            }
+        }
+
+        match result {
+            Some(idx) => match seek_op {
+                SeekOp::GE { .. } | SeekOp::LE { .. } => unreachable!(),
+                // Otherwise nudge either right or left to get the first GT/LT key.
+                SeekOp::GT => {
+                    let first_gt_forwards = idx + 1;
+                    self.stack.set_cell_index(first_gt_forwards);
+                    if first_gt_forwards < cell_count as i32 {
+                        self.has_record.set(true);
+                        return Ok(IOResult::Done(SeekResult::Found));
+                    } else {
+                        self.has_record.set(false);
+                        // Match key can be on the next sibling page.
+                        return Ok(IOResult::Done(SeekResult::TryAdvance));
                     }
                 }
-            }
+                SeekOp::LT => {
+                    let first_lt_backwards = idx - 1;
+                    self.stack.set_cell_index(first_lt_backwards);
+                    if first_lt_backwards >= 0 {
+                        self.has_record.set(true);
+                        return Ok(IOResult::Done(SeekResult::Found));
+                    } else {
+                        self.has_record.set(false);
+                        // Match key can be on the previous sibling page.
+                        return Ok(IOResult::Done(SeekResult::TryAdvance));
+                    }
+                }
+            },
+            None => match seek_op {
+                SeekOp::GE { eq_only: true } | SeekOp::LE { eq_only: true } => {
+                    let is_forward = matches!(seek_op, SeekOp::GE { .. } | SeekOp::GT);
+                    // Set to min if forwards, max if backwards.
+                    // This is because in forwards iteration we approach from the left, and vice versa for backwards iteration.
+                    let stack_index = if is_forward { min } else { max };
+                    self.stack.set_cell_index(stack_index);
+                    let in_bounds = stack_index >= 0 && stack_index < cell_count as i32;
+                    self.has_record.set(in_bounds);
+                    // We expected an EQ match and didnt find one.
+                    return Ok(IOResult::Done(SeekResult::NotFound));
+                }
+                SeekOp::GE { eq_only: false } | SeekOp::GT => {
+                    // Set to min because in forwards iteration we approach from the left.
+                    self.stack.set_cell_index(min);
+                    if min >= 0 && min < cell_count as i32 {
+                        self.has_record.set(true);
+                        return Ok(IOResult::Done(SeekResult::Found));
+                    } else {
+                        self.has_record.set(false);
+                        // Match key can be on the next sibling page.
+                        return Ok(IOResult::Done(SeekResult::TryAdvance));
+                    }
+                }
+                SeekOp::LE { eq_only: false } | SeekOp::LT => {
+                    // Set to max because in backwards iteration we approach from the right.
+                    self.stack.set_cell_index(max);
+                    if max >= 0 && max < cell_count as i32 {
+                        self.has_record.set(true);
+                        return Ok(IOResult::Done(SeekResult::Found));
+                    } else {
+                        self.has_record.set(false);
+                        // Match key can be on the previous sibling page.
+                        return Ok(IOResult::Done(SeekResult::TryAdvance));
+                    }
+                }
+            },
         }
     }
 
