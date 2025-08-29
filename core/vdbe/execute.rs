@@ -11,8 +11,8 @@ use crate::storage::pager::{AtomicDbState, CreateBTreeFlags, DbState};
 use crate::storage::sqlite3_ondisk::read_varint;
 use crate::translate::collate::CollationSeq;
 use crate::types::{
-    compare_immutable, compare_records_generic, CaseInsensitiveString, Extendable, IOCompletions,
-    ImmutableRecord, SeekResult, Text,
+    compare_immutable, compare_records_generic, Extendable, IOCompletions, ImmutableRecord,
+    SeekResult, Text,
 };
 use crate::util::{normalize_ident, IOExt as _};
 use crate::vdbe::insn::InsertFlags;

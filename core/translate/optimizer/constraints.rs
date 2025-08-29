@@ -1,4 +1,4 @@
-use std::{cmp::Ordering, collections::HashMap, sync::Arc};
+use std::{cmp::Ordering, sync::Arc};
 
 use crate::{
     schema::{Column, Index},
@@ -7,7 +7,7 @@ use crate::{
         plan::{JoinOrderMember, TableReferences, WhereTerm},
         planner::{table_mask_from_expr, TableMask},
     },
-    types::{CaseInsensitiveMap, CaseInsensitiveString},
+    types::CaseInsensitiveMap,
     Result,
 };
 use turso_ext::{ConstraintInfo, ConstraintOp};

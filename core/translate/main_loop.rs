@@ -9,7 +9,7 @@ use crate::{
         plan::{DistinctCtx, Distinctness, Scan},
         result_row::emit_select_result,
     },
-    types::{CaseInsensitiveString, SeekOp},
+    types::SeekOp,
     vdbe::{
         builder::{CursorKey, CursorType, ProgramBuilder},
         insn::{CmpInsFlags, IdxInsertFlags, Insn},

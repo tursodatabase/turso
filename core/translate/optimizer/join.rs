@@ -515,7 +515,7 @@ mod tests {
                 ColumnUsedMask, IterationDirection, JoinInfo, Operation, TableReferences, WhereTerm,
             },
             planner::TableMask,
-        }, types::{CaseInsensitiveHashBuilder, CaseInsensitiveMap, CaseInsensitiveString}, vdbe::builder::TableRefIdCounter
+        }, types::{CaseInsensitiveMap}, vdbe::builder::TableRefIdCounter
     };
 
     #[test]

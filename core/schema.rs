@@ -1,8 +1,5 @@
 use crate::incremental::view::IncrementalView;
-use crate::types::{
-    CaseInsensitiveHashBuilder, CaseInsensitiveMap, CaseInsensitiveSet, CaseInsensitiveString,
-    IOResult,
-};
+use crate::types::{CaseInsensitiveMap, CaseInsensitiveSet, IOResult};
 
 /// Type alias for the materialized views collection
 pub type MaterializedViewsMap = HashMap<String, Arc<Mutex<IncrementalView>>>;
@@ -32,7 +29,7 @@ use crate::{util::normalize_ident, Result};
 use core::fmt;
 use std::cell::RefCell;
 use std::collections::hash_map::Entry;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 use std::ops::Deref;
 use std::rc::Rc;
 use std::sync::Arc;

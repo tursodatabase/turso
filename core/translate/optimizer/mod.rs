@@ -1,4 +1,4 @@
-use std::{cell::RefCell, cmp::Ordering, collections::HashMap, sync::Arc};
+use std::{cell::RefCell, sync::Arc};
 
 use constraints::{
     constraints_from_where_clause, usable_constraints_for_join_order, Constraint, ConstraintRef,
@@ -18,7 +18,7 @@ use crate::{
         optimizer::{access_method::AccessMethodParams, constraints::TableConstraints},
         plan::{Scan, TerminationKey},
     },
-    types::{CaseInsensitiveMap, CaseInsensitiveString, SeekOp},
+    types::{CaseInsensitiveMap, SeekOp},
     LimboError, Result,
 };
 

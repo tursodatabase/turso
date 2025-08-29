@@ -27,7 +27,6 @@ use crate::translate::compound_select::emit_program_for_compound_select;
 use crate::translate::expr::{emit_returning_results, ReturningValueRegisters};
 use crate::translate::plan::{DeletePlan, Plan, QueryDestination, Search};
 use crate::translate::values::emit_values;
-use crate::types::CaseInsensitiveString;
 use crate::util::exprs_are_equivalent;
 use crate::vdbe::builder::{CursorKey, CursorType, ProgramBuilder};
 use crate::vdbe::insn::{CmpInsFlags, IdxInsertFlags, InsertFlags, RegisterOrLiteral};

@@ -3,7 +3,6 @@ use std::sync::Arc;
 use crate::translate::emitter::{
     emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary, OperationMode, Resolver,
 };
-use crate::types::CaseInsensitiveString;
 use crate::vdbe::insn::{CmpInsFlags, Cookie};
 use crate::SymbolTable;
 use crate::{

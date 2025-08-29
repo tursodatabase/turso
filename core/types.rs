@@ -16,9 +16,8 @@ use crate::vdbe::Register;
 use crate::vtab::VirtualTableCursor;
 use crate::{turso_assert, Completion, Result, IO};
 use std::collections::hash_map::Entry;
-use std::collections::HashMap;
 use std::fmt::{Debug, Display};
-use std::hash::{BuildHasher, Hash, Hasher};
+use std::hash::{Hash, Hasher};
 
 const MAX_REAL_SIZE: u8 = 15;
 
@@ -2769,56 +2768,14 @@ impl Hash for CaseInsensitiveString {
     }
 }
 
-pub struct CaseInsensitiveHasher {
-    inner: std::hash::DefaultHasher,
-}
-
-pub struct CaseInsensitiveHashBuilder;
-
-impl BuildHasher for CaseInsensitiveHashBuilder {
-    type Hasher = CaseInsensitiveHasher;
-
-    fn build_hasher(&self) -> Self::Hasher {
-        CaseInsensitiveHasher {
-            inner: std::collections::hash_map::DefaultHasher::new(),
-        }
-    }
-}
-
-impl Hasher for CaseInsensitiveHasher {
-    fn finish(&self) -> u64 {
-        self.inner.finish()
-    }
-
-    fn write(&mut self, bytes: &[u8]) {
-        for byte in bytes {
-            self.inner.write_u8(byte.to_ascii_lowercase());
-        }
-    }
-}
-
 impl Display for CaseInsensitiveString {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.as_str())
     }
 }
 
-impl Default for CaseInsensitiveHashBuilder {
-    fn default() -> Self {
-        Self
-    }
-}
-
-impl Clone for CaseInsensitiveHashBuilder {
-    fn clone(&self) -> Self {
-        Self
-    }
-}
-
-pub type CaseInsensitiveMapInner<V> =
-    std::collections::HashMap<CaseInsensitiveString, V, CaseInsensitiveHashBuilder>;
-pub type CaseInsensitiveSetInner =
-    std::collections::HashSet<CaseInsensitiveString, CaseInsensitiveHashBuilder>;
+pub type CaseInsensitiveMapInner<V> = std::collections::HashMap<CaseInsensitiveString, V>;
+pub type CaseInsensitiveSetInner = std::collections::HashSet<CaseInsensitiveString>;
 #[derive(Debug, Clone)]
 pub struct CaseInsensitiveMap<V> {
     inner: CaseInsensitiveMapInner<V>,
@@ -2827,7 +2784,7 @@ pub struct CaseInsensitiveMap<V> {
 impl<V> CaseInsensitiveMap<V> {
     pub fn new() -> Self {
         Self {
-            inner: CaseInsensitiveMapInner::with_hasher(CaseInsensitiveHashBuilder),
+            inner: CaseInsensitiveMapInner::new(),
         }
     }
     pub fn get(&self, key: &str) -> Option<&V> {
@@ -2901,7 +2858,7 @@ pub struct CaseInsensitiveSet {
 impl CaseInsensitiveSet {
     pub fn new() -> Self {
         Self {
-            inner: CaseInsensitiveSetInner::with_hasher(CaseInsensitiveHashBuilder),
+            inner: CaseInsensitiveSetInner::new(),
         }
     }
     pub fn insert(&mut self, key: &str) {
@@ -3849,8 +3806,7 @@ mod tests {
 
     #[test]
     fn test_case_insensitive_string_hash_map_with_str() {
-        let mut map = HashMap::with_hasher(CaseInsensitiveHashBuilder);
-        println!("before insert");
+        let mut map = HashMap::new();
         map.insert(CaseInsensitiveString::new_owned("test"), "test");
 
         // Test case-insensitive lookup without allocation
