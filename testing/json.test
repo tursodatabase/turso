@@ -280,7 +280,7 @@ do_execsql_test json_arrow_object {
 } {{[1,2,3]}}
 
 do_execsql_test json_arrow_blob {
-    SELECT cast('{"age":30,"name":"John"}' as blob) ->> '$.age'
+    SELECT cast('{"age":30,"name":"John"}' as blob) -> '$.age'
 } {{30}}
 
 do_execsql_test json_arrow_shift_object {
