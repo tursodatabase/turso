@@ -15,7 +15,10 @@ use crate::vdbe::sorter::Sorter;
 use crate::vdbe::Register;
 use crate::vtab::VirtualTableCursor;
 use crate::{turso_assert, Completion, Result, IO};
+use std::borrow::Borrow;
+use std::collections::HashMap;
 use std::fmt::{Debug, Display};
+use std::hash::{BuildHasher, Hash, Hasher};
 
 const MAX_REAL_SIZE: u8 = 15;
 
@@ -2667,6 +2670,150 @@ impl WalFrameInfo {
     }
 }
 
+#[derive(Debug, Clone)]
+pub enum CaseInsensitiveString {
+    Borrowed(*const str),
+    Owned(String),
+}
+
+impl CaseInsensitiveString {
+    pub fn new_owned(s: &str) -> Self {
+        Self::Owned(s.to_string())
+    }
+    pub fn new_borrowed(s: &str) -> Self {
+        Self::Borrowed(s as *const str)
+    }
+
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Borrowed(s) => unsafe { std::mem::transmute::<*const str, &str>(*s) },
+            Self::Owned(s) => s,
+        }
+    }
+
+    pub fn to_string(&self) -> String {
+        match self {
+            Self::Borrowed(s) => unsafe {
+                let str = std::mem::transmute::<*const str, &str>(*s);
+                str.to_string()
+            },
+            Self::Owned(s) => s.clone(),
+        }
+    }
+}
+
+impl From<String> for CaseInsensitiveString {
+    fn from(value: String) -> Self {
+        Self::Owned(value)
+    }
+}
+impl From<&String> for CaseInsensitiveString {
+    fn from(value: &String) -> Self {
+        Self::new_owned(value)
+    }
+}
+
+impl From<&str> for CaseInsensitiveString {
+    fn from(value: &str) -> Self {
+        Self::new_owned(value)
+    }
+}
+
+impl AsRef<str> for CaseInsensitiveString {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl PartialEq<CaseInsensitiveString> for &str {
+    fn eq(&self, other: &CaseInsensitiveString) -> bool {
+        self.eq_ignore_ascii_case(other.as_str())
+    }
+}
+
+impl PartialEq<str> for CaseInsensitiveString {
+    fn eq(&self, other: &str) -> bool {
+        self.as_str().eq_ignore_ascii_case(other)
+    }
+}
+
+impl PartialEq<CaseInsensitiveString> for CaseInsensitiveString {
+    fn eq(&self, other: &CaseInsensitiveString) -> bool {
+        self.as_str().eq_ignore_ascii_case(other.as_str())
+    }
+}
+
+impl Eq for CaseInsensitiveString {}
+
+impl PartialOrd<CaseInsensitiveString> for CaseInsensitiveString {
+    fn partial_cmp(&self, other: &CaseInsensitiveString) -> Option<std::cmp::Ordering> {
+        self.as_str().partial_cmp(other.as_str())
+    }
+}
+
+impl Ord for CaseInsensitiveString {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.as_str().cmp(other.as_str())
+    }
+}
+
+impl Hash for CaseInsensitiveString {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write(self.as_str().as_bytes());
+    }
+}
+
+pub struct CaseInsensitiveHasher {
+    inner: std::hash::DefaultHasher,
+}
+
+pub struct CaseInsensitiveHashBuilder;
+
+impl BuildHasher for CaseInsensitiveHashBuilder {
+    type Hasher = CaseInsensitiveHasher;
+
+    fn build_hasher(&self) -> Self::Hasher {
+        CaseInsensitiveHasher {
+            inner: std::collections::hash_map::DefaultHasher::new(),
+        }
+    }
+}
+
+impl Hasher for CaseInsensitiveHasher {
+    fn finish(&self) -> u64 {
+        self.inner.finish()
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.inner.write_u8(byte.to_ascii_lowercase());
+        }
+    }
+}
+
+impl Display for CaseInsensitiveString {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+impl Default for CaseInsensitiveHashBuilder {
+    fn default() -> Self {
+        Self
+    }
+}
+
+impl Clone for CaseInsensitiveHashBuilder {
+    fn clone(&self) -> Self {
+        Self
+    }
+}
+
+pub type CaseInsensitiveMap<V> =
+    std::collections::HashMap<CaseInsensitiveString, V, CaseInsensitiveHashBuilder>;
+pub type CaseInsensitiveSet =
+    std::collections::HashSet<CaseInsensitiveString, CaseInsensitiveHashBuilder>;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3561,5 +3708,75 @@ mod tests {
             buf.len(),
             header_length + size_of::<i8>() + size_of::<f64>() + text.len()
         );
+    }
+
+    #[test]
+    fn test_case_insensitive_string() {
+        let s1 = CaseInsensitiveString::new_owned("test");
+        let s2 = CaseInsensitiveString::new_owned("Test");
+        assert_eq!(s1, s2);
+    }
+
+    #[test]
+    fn test_case_insensitive_string_hash_map() {
+        let mut map = HashMap::new();
+        map.insert(CaseInsensitiveString::new_owned("test"), "test");
+        assert_eq!(
+            map.get(&CaseInsensitiveString::new_owned("Test")),
+            Some(&"test")
+        );
+    }
+
+    #[test]
+    fn test_case_insensitive_string_hash_map_with_str() {
+        let mut map = HashMap::with_hasher(CaseInsensitiveHashBuilder);
+        println!("before insert");
+        map.insert(CaseInsensitiveString::new_owned("test"), "test");
+
+        // Test case-insensitive lookup without allocation
+        // let first_get = map.get("test");
+        // assert_eq!(first_get, Some(&"test"));
+        println!("after insert");
+        assert_eq!(
+            map.get(&CaseInsensitiveString::new_borrowed("TEST")),
+            Some(&"test")
+        );
+        println!("after get");
+        assert_eq!(
+            map.get(&CaseInsensitiveString::new_borrowed("Test")),
+            Some(&"test")
+        );
+    }
+
+    #[test]
+    fn test_case_insensitive_hashmap_wrapper() {
+        // Test the clean public API
+        let mut map = HashMap::with_hasher(CaseInsensitiveHashBuilder);
+        map.insert(CaseInsensitiveString::new_owned("test"), "value");
+
+        // Zero-allocation lookups with clean API
+        assert_eq!(
+            map.get(&CaseInsensitiveString::new_borrowed("test")),
+            Some(&"value")
+        );
+        assert_eq!(
+            map.get(&CaseInsensitiveString::new_borrowed("TEST")),
+            Some(&"value")
+        );
+        assert_eq!(
+            map.get(&CaseInsensitiveString::new_borrowed("Test")),
+            Some(&"value")
+        );
+        assert_eq!(
+            map.get(&CaseInsensitiveString::new_borrowed("missing")),
+            None
+        );
+
+        assert!(map.contains_key(&CaseInsensitiveString::new_borrowed("TEST")));
+        assert!(!map.contains_key(&CaseInsensitiveString::new_borrowed("missing")));
+        assert_eq!(map.len(), 1);
+        assert!(!map.is_empty());
+
+        println!("CaseInsensitiveHashMap wrapper works perfectly!");
     }
 }

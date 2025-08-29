@@ -73,6 +73,18 @@ pub fn normalize_ident(identifier: &str) -> String {
     .to_lowercase()
 }
 
+pub fn normalize_ident_no_allocation(identifier: &str) -> &str {
+    let quote_pair = QUOTE_PAIRS
+        .iter()
+        .find(|&(start, end)| identifier.starts_with(*start) && identifier.ends_with(*end));
+
+    if let Some(&(_, _)) = quote_pair {
+        &identifier[1..identifier.len() - 1]
+    } else {
+        identifier
+    }
+}
+
 pub const PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX: &str = "sqlite_autoindex_";
 
 /// Unparsed index that comes from a sql query, i.e not an automatic index

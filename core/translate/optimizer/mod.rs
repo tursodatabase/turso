@@ -14,10 +14,11 @@ use crate::{
     parameters::PARAM_PREFIX,
     schema::{Index, IndexColumn, Schema, Table},
     translate::{
-        expr::walk_expr_mut, optimizer::access_method::AccessMethodParams,
-        optimizer::constraints::TableConstraints, plan::Scan, plan::TerminationKey,
+        expr::walk_expr_mut,
+        optimizer::{access_method::AccessMethodParams, constraints::TableConstraints},
+        plan::{Scan, TerminationKey},
     },
-    types::SeekOp,
+    types::{CaseInsensitiveMap, CaseInsensitiveString, SeekOp},
     LimboError, Result,
 };
 
@@ -184,7 +185,7 @@ fn optimize_subqueries(plan: &mut SelectPlan, schema: &Schema) -> Result<()> {
 fn optimize_table_access(
     schema: &Schema,
     table_references: &mut TableReferences,
-    available_indexes: &HashMap<String, Vec<Arc<Index>>>,
+    available_indexes: &CaseInsensitiveMap<Vec<Arc<Index>>>,
     where_clause: &mut [WhereTerm],
     order_by: &mut Vec<(Box<ast::Expr>, SortOrder)>,
     group_by: &mut Option<GroupBy>,

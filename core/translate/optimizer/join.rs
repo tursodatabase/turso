@@ -507,18 +507,15 @@ mod tests {
 
     use super::*;
     use crate::{
-        schema::{BTreeTable, Column, Index, IndexColumn, Table, Type},
-        translate::{
-            optimizer::access_method::AccessMethodParams,
-            optimizer::constraints::{
+        schema::{BTreeTable, Column, Index, IndexColumn, Table, Type}, translate::{
+            optimizer::{access_method::AccessMethodParams, constraints::{
                 constraints_from_where_clause, BinaryExprSide, ConstraintRef,
-            },
+            }},
             plan::{
                 ColumnUsedMask, IterationDirection, JoinInfo, Operation, TableReferences, WhereTerm,
             },
             planner::TableMask,
-        },
-        vdbe::builder::TableRefIdCounter,
+        }, types::{CaseInsensitiveHashBuilder, CaseInsensitiveMap, CaseInsensitiveString}, vdbe::builder::TableRefIdCounter
     };
 
     #[test]
@@ -536,7 +533,9 @@ mod tests {
     /// Test that [compute_best_join_order] returns None when there are no table references.
     fn test_compute_best_join_order_empty() {
         let table_references = TableReferences::new(vec![], vec![]);
-        let available_indexes = HashMap::new();
+        let available_indexes = CaseInsensitiveMap::<Vec<Arc<Index>>>::with_hasher(
+            CaseInsensitiveHashBuilder,
+        );
         let where_clause = vec![];
 
         let access_methods_arena = RefCell::new(Vec::new());
@@ -565,7 +564,9 @@ mod tests {
             table_id_counter.next(),
         )];
         let table_references = TableReferences::new(joined_tables, vec![]);
-        let available_indexes = HashMap::new();
+        let available_indexes = CaseInsensitiveMap::<Vec<Arc<Index>>>::with_hasher(
+            CaseInsensitiveHashBuilder,
+        );
         let where_clause = vec![];
 
         let access_methods_arena = RefCell::new(Vec::new());
@@ -609,7 +610,9 @@ mod tests {
 
         let table_references = TableReferences::new(joined_tables, vec![]);
         let access_methods_arena = RefCell::new(Vec::new());
-        let available_indexes = HashMap::new();
+        let available_indexes = CaseInsensitiveMap::<Vec<Arc<Index>>>::with_hasher(
+            CaseInsensitiveHashBuilder,
+        );
         let table_constraints =
             constraints_from_where_clause(&where_clause, &table_references, &available_indexes)
                 .unwrap();
@@ -660,7 +663,9 @@ mod tests {
 
         let table_references = TableReferences::new(joined_tables, vec![]);
         let access_methods_arena = RefCell::new(Vec::new());
-        let mut available_indexes = HashMap::new();
+        let mut available_indexes = CaseInsensitiveMap::<Vec<Arc<Index>>>::with_hasher(
+            CaseInsensitiveHashBuilder,
+        );
         let index = Arc::new(Index {
             name: "sqlite_autoindex_test_table_1".to_string(),
             table_name: "test_table".to_string(),
@@ -676,7 +681,7 @@ mod tests {
             root_page: 1,
             has_rowid: true,
         });
-        available_indexes.insert("test_table".to_string(), vec![index]);
+        available_indexes.insert("test_table".into(), vec![index]);
 
         let table_constraints =
             constraints_from_where_clause(&where_clause, &table_references, &available_indexes)
@@ -728,7 +733,9 @@ mod tests {
         const TABLE1: usize = 0;
         const TABLE2: usize = 1;
 
-        let mut available_indexes = HashMap::new();
+        let mut available_indexes = CaseInsensitiveMap::<Vec<Arc<Index>>>::with_hasher(
+            CaseInsensitiveHashBuilder,
+        );
         // Index on the outer table (table1)
         let index1 = Arc::new(Index {
             name: "index1".to_string(),
@@ -745,7 +752,7 @@ mod tests {
             root_page: 1,
             has_rowid: true,
         });
-        available_indexes.insert("table1".to_string(), vec![index1]);
+        available_indexes.insert("table1".into(), vec![index1]);
 
         // SELECT * FROM table1 JOIN table2 WHERE table1.id = table2.id
         // expecting table2 to be chosen first due to the index on table1.id
@@ -841,7 +848,9 @@ mod tests {
         const TABLE_NO_CUSTOMERS: usize = 1;
         const TABLE_NO_ORDER_ITEMS: usize = 2;
 
-        let mut available_indexes = HashMap::new();
+        let mut available_indexes = CaseInsensitiveMap::<Vec<Arc<Index>>>::with_hasher(
+            CaseInsensitiveHashBuilder,
+        );
         ["orders", "customers", "order_items"]
             .iter()
             .for_each(|table_name| {
@@ -862,7 +871,8 @@ mod tests {
                     root_page: 1,
                     has_rowid: true,
                 });
-                available_indexes.insert(table_name.to_string(), vec![index]);
+                let table_name = CaseInsensitiveString::new_owned(table_name);
+                available_indexes.insert(table_name, vec![index]);
             });
         let customer_id_idx = Arc::new(Index {
             name: "orders_customer_id_idx".to_string(),
@@ -896,10 +906,10 @@ mod tests {
         });
 
         available_indexes
-            .entry("orders".to_string())
+            .entry("orders".into())
             .and_modify(|v| v.push(customer_id_idx));
         available_indexes
-            .entry("order_items".to_string())
+            .entry("order_items".into())
             .and_modify(|v| v.push(order_id_idx));
 
         // SELECT * FROM orders JOIN customers JOIN order_items
@@ -1037,7 +1047,9 @@ mod tests {
         ];
 
         let table_references = TableReferences::new(joined_tables, vec![]);
-        let available_indexes = HashMap::new();
+        let available_indexes = CaseInsensitiveMap::<Vec<Arc<Index>>>::with_hasher(
+            CaseInsensitiveHashBuilder,
+        );
         let access_methods_arena = RefCell::new(Vec::new());
         let table_constraints =
             constraints_from_where_clause(&where_clause, &table_references, &available_indexes)
@@ -1144,7 +1156,9 @@ mod tests {
 
         let table_references = TableReferences::new(joined_tables, vec![]);
         let access_methods_arena = RefCell::new(Vec::new());
-        let available_indexes = HashMap::new();
+        let available_indexes = CaseInsensitiveMap::<Vec<Arc<Index>>>::with_hasher(
+            CaseInsensitiveHashBuilder,
+        );
         let table_constraints =
             constraints_from_where_clause(&where_clause, &table_references, &available_indexes)
                 .unwrap();
@@ -1206,7 +1220,9 @@ mod tests {
             tables.push(_create_btree_table(&format!("t{}", i + 1), columns));
         }
 
-        let available_indexes = HashMap::new();
+        let available_indexes = CaseInsensitiveMap::<Vec<Arc<Index>>>::with_hasher(
+            CaseInsensitiveHashBuilder,
+        );
 
         let mut table_id_counter = TableRefIdCounter::new();
         // Create table references
@@ -1317,8 +1333,10 @@ mod tests {
             has_rowid: true,
         });
 
-        let mut available_indexes = HashMap::new();
-        available_indexes.insert("t1".to_string(), vec![index]);
+        let mut available_indexes = CaseInsensitiveMap::<Vec<Arc<Index>>>::with_hasher(
+            CaseInsensitiveHashBuilder,
+        );
+        available_indexes.insert("t1".into(), vec![index]);
 
         let table = Table::BTree(table);
         joined_tables.push(JoinedTable {
@@ -1374,7 +1392,9 @@ mod tests {
     fn test_index_skips_middle_column() {
         let mut table_id_counter = TableRefIdCounter::new();
         let mut joined_tables = Vec::new();
-        let mut available_indexes = HashMap::new();
+        let mut available_indexes = CaseInsensitiveMap::<Vec<Arc<Index>>>::with_hasher(
+            CaseInsensitiveHashBuilder,
+        );
 
         let columns = _create_column_list(&["c1", "c2", "c3"], Type::Integer);
         let table = _create_btree_table("t1", columns);
@@ -1409,7 +1429,7 @@ mod tests {
             ephemeral: false,
             has_rowid: true,
         });
-        available_indexes.insert("t1".to_string(), vec![index]);
+        available_indexes.insert("t1".into(), vec![index]);
 
         let table = Table::BTree(table);
         joined_tables.push(JoinedTable {
@@ -1485,7 +1505,9 @@ mod tests {
     fn test_index_stops_at_range_operator() {
         let mut table_id_counter = TableRefIdCounter::new();
         let mut joined_tables = Vec::new();
-        let mut available_indexes = HashMap::new();
+        let mut available_indexes = CaseInsensitiveMap::<Vec<Arc<Index>>>::with_hasher(
+            CaseInsensitiveHashBuilder,
+        );
 
         let columns = _create_column_list(&["c1", "c2", "c3"], Type::Integer);
         let table = _create_btree_table("t1", columns);
@@ -1520,7 +1542,7 @@ mod tests {
             has_rowid: true,
             unique: false,
         });
-        available_indexes.insert("t1".to_string(), vec![index]);
+        available_indexes.insert("t1".into(), vec![index]);
 
         let table = Table::BTree(table);
         joined_tables.push(JoinedTable {

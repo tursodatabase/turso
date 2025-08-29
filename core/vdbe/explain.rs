@@ -532,18 +532,18 @@ pub fn insn_to_str(
                 default,
             } => {
                 let cursor_type = &program.cursor_ref[*cursor_id].1;
-                let column_name: Option<&String> = match cursor_type {
+                let column_name: Option<String> = match cursor_type {
                     CursorType::BTreeTable(table) => {
                         let name = table.columns.get(*column).and_then(|v| v.name.as_ref());
-                        name
+                        name.map(|s| s.to_string())
                     }
                     CursorType::BTreeIndex(index) => {
                         let name = &index.columns.get(*column).unwrap().name;
-                        Some(name)
+                        Some(name.to_string())
                     }
                     CursorType::Pseudo(_) => None,
                     CursorType::Sorter => None,
-                    CursorType::VirtualTable(v) => v.columns.get(*column).unwrap().name.as_ref(),
+                    CursorType::VirtualTable(v) => v.columns.get(*column).unwrap().name.as_ref().map(|s| s.to_string()),
                 };
                 (
                     "Column",
@@ -556,7 +556,7 @@ pub fn insn_to_str(
                         "r[{}]={}.{}",
                         dest,
                         get_table_or_index_name(*cursor_id),
-                        column_name.unwrap_or(&format!("column {}", *column))
+                        column_name.as_deref().unwrap_or(&format!("column {}", *column))
                     ),
                 )
             }

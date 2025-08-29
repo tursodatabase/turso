@@ -8,6 +8,7 @@ use crate::{
     schema::{Affinity, BTreeTable, Column, Index},
     storage::{pager::CreateBTreeFlags, wal::CheckpointMode},
     translate::collate::CollationSeq,
+    types::CaseInsensitiveString,
     Value,
 };
 use turso_macros::Description;

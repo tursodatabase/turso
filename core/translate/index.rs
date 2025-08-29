@@ -3,6 +3,7 @@ use std::sync::Arc;
 use crate::translate::emitter::{
     emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary, OperationMode, Resolver,
 };
+use crate::types::CaseInsensitiveString;
 use crate::vdbe::insn::{CmpInsFlags, Cookie};
 use crate::SymbolTable;
 use crate::{
@@ -50,7 +51,7 @@ pub fn translate_create_index(
         }
         crate::bail_parse_error!("Error: index with name '{idx_name}' already exists.");
     }
-    let Some(tbl) = schema.tables.get(&tbl_name) else {
+    let Some(tbl) = schema.tables.get(&CaseInsensitiveString::new_borrowed(tbl_name.as_str())) else {
         crate::bail_parse_error!("Error: table '{tbl_name}' does not exist.");
     };
     let Some(tbl) = tbl.btree() else {

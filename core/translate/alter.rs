@@ -317,9 +317,9 @@ pub fn translate_alter_table(
                 p5: 0,
             });
             program.emit_insn(Insn::RenameColumn {
-                table: table_name.to_owned(),
+                table: table_name.into(),
                 column_index,
-                name: rename_to.to_owned(),
+                name: rename_to.into(),
             });
 
             program
@@ -405,8 +405,8 @@ pub fn translate_alter_table(
             });
 
             program.emit_insn(Insn::RenameTable {
-                from: table_name.to_owned(),
-                to: new_name.to_owned(),
+                from: table_name.into(),
+                to: new_name.into(),
             });
 
             program

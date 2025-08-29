@@ -7,6 +7,7 @@ use crate::{
         plan::{JoinOrderMember, TableReferences, WhereTerm},
         planner::{table_mask_from_expr, TableMask},
     },
+    types::{CaseInsensitiveMap, CaseInsensitiveString},
     Result,
 };
 use turso_ext::{ConstraintInfo, ConstraintOp};
@@ -174,7 +175,7 @@ fn estimate_selectivity(column: &Column, op: ast::Operator) -> f64 {
 pub fn constraints_from_where_clause(
     where_clause: &[WhereTerm],
     table_references: &TableReferences,
-    available_indexes: &HashMap<String, Vec<Arc<Index>>>,
+    available_indexes: &CaseInsensitiveMap<Vec<Arc<Index>>>,
 ) -> Result<Vec<TableConstraints>> {
     let mut constraints = Vec::new();
 
@@ -189,7 +190,9 @@ pub fn constraints_from_where_clause(
             table_id: table_reference.internal_id,
             constraints: Vec::new(),
             candidates: available_indexes
-                .get(table_reference.table.get_name())
+                .get(&CaseInsensitiveString::new_borrowed(
+                    table_reference.table.get_name(),
+                ))
                 .map_or(Vec::new(), |indexes| {
                     indexes
                         .iter()
@@ -313,7 +316,9 @@ pub fn constraints_from_where_clause(
                 });
             }
             for index in available_indexes
-                .get(table_reference.table.get_name())
+                .get(&CaseInsensitiveString::new_borrowed(
+                    table_reference.table.get_name(),
+                ))
                 .unwrap_or(&Vec::new())
             {
                 if let Some(position_in_index) =
