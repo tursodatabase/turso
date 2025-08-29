@@ -1107,6 +1107,12 @@ impl Wal for WalFile {
         tracing::debug!("read_frame({})", frame_id);
         let offset = self.frame_offset(frame_id);
         let (frame_ptr, frame_len) = (frame.as_mut_ptr(), frame.len());
+
+        let encryption_ctx = {
+            let io_ctx = self.io_ctx.borrow();
+            io_ctx.encryption_context().cloned()
+        };
+        let (header, _) = sqlite3_ondisk::parse_wal_frame_header(&frame);
         let complete = Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
             let Ok((buf, bytes_read)) = res else {
                 return;
@@ -1117,6 +1123,17 @@ impl Wal for WalFile {
                 "read({bytes_read}) != expected({buf_len})"
             );
             let buf_ptr = buf.as_mut_ptr();
+            if let Some(ctx) = encryption_ctx.clone() {
+                match ctx.decrypt_page(buf.as_slice(), header.page_number as usize) {
+                    Ok(decrypted_data) => {
+                        buf.as_mut_slice().copy_from_slice(&decrypted_data);
+                    }
+                    Err(_) => {
+                        tracing::error!("Failed to decrypt page data for frame_id={frame_id}");
+                        return;
+                    }
+                }
+            }
             unsafe {
                 std::ptr::copy_nonoverlapping(buf_ptr, frame_ptr, frame_len);
             }
