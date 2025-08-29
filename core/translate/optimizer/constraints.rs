@@ -190,9 +190,7 @@ pub fn constraints_from_where_clause(
             table_id: table_reference.internal_id,
             constraints: Vec::new(),
             candidates: available_indexes
-                .get(&CaseInsensitiveString::new_borrowed(
-                    table_reference.table.get_name(),
-                ))
+                .get(table_reference.table.get_name())
                 .map_or(Vec::new(), |indexes| {
                     indexes
                         .iter()
@@ -316,9 +314,7 @@ pub fn constraints_from_where_clause(
                 });
             }
             for index in available_indexes
-                .get(&CaseInsensitiveString::new_borrowed(
-                    table_reference.table.get_name(),
-                ))
+                .get(table_reference.table.get_name())
                 .unwrap_or(&Vec::new())
             {
                 if let Some(position_in_index) =

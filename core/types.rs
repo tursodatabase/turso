@@ -15,7 +15,7 @@ use crate::vdbe::sorter::Sorter;
 use crate::vdbe::Register;
 use crate::vtab::VirtualTableCursor;
 use crate::{turso_assert, Completion, Result, IO};
-use std::borrow::Borrow;
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::fmt::{Debug, Display};
 use std::hash::{BuildHasher, Hash, Hasher};
@@ -2759,7 +2759,13 @@ impl Ord for CaseInsensitiveString {
 
 impl Hash for CaseInsensitiveString {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        state.write(self.as_str().as_bytes());
+        for ch in self.as_str().chars() {
+            for folded_ch in ch.to_lowercase() {
+                let mut buf = [0u8; 4];
+                let bytes = folded_ch.encode_utf8(&mut buf);
+                state.write(bytes.as_bytes());
+            }
+        }
     }
 }
 
@@ -2809,10 +2815,124 @@ impl Clone for CaseInsensitiveHashBuilder {
     }
 }
 
-pub type CaseInsensitiveMap<V> =
+pub type CaseInsensitiveMapInner<V> =
     std::collections::HashMap<CaseInsensitiveString, V, CaseInsensitiveHashBuilder>;
-pub type CaseInsensitiveSet =
+pub type CaseInsensitiveSetInner =
     std::collections::HashSet<CaseInsensitiveString, CaseInsensitiveHashBuilder>;
+#[derive(Debug, Clone)]
+pub struct CaseInsensitiveMap<V> {
+    inner: CaseInsensitiveMapInner<V>,
+}
+
+impl<V> CaseInsensitiveMap<V> {
+    pub fn new() -> Self {
+        Self {
+            inner: CaseInsensitiveMapInner::with_hasher(CaseInsensitiveHashBuilder),
+        }
+    }
+    pub fn get(&self, key: &str) -> Option<&V> {
+        self.inner.get(&CaseInsensitiveString::new_borrowed(key))
+    }
+    pub fn insert(&mut self, key: &str, value: V) {
+        self.inner
+            .insert(CaseInsensitiveString::new_owned(key), value);
+    }
+    pub fn remove(&mut self, key: &str) -> Option<V> {
+        self.inner.remove(&CaseInsensitiveString::new_borrowed(key))
+    }
+    pub fn get_mut(&mut self, key: &str) -> Option<&mut V> {
+        self.inner
+            .get_mut(&CaseInsensitiveString::new_borrowed(key))
+    }
+    pub fn contains_key(&self, key: &str) -> bool {
+        self.inner
+            .contains_key(&CaseInsensitiveString::new_borrowed(key))
+    }
+    pub fn iter(&self) -> impl Iterator<Item = (&CaseInsensitiveString, &V)> {
+        self.inner.iter()
+    }
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = (&CaseInsensitiveString, &mut V)> {
+        self.inner.iter_mut()
+    }
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+    pub fn clear(&mut self) {
+        self.inner.clear();
+    }
+
+    pub fn keys(&self) -> impl Iterator<Item = &str> {
+        self.inner.keys().map(|k| k.as_str())
+    }
+
+    pub fn entry(&mut self, key: &str) -> Entry<CaseInsensitiveString, V> {
+        self.inner.entry(CaseInsensitiveString::new_borrowed(key))
+    }
+
+    pub fn values(&self) -> impl Iterator<Item = &V> {
+        self.inner.values()
+    }
+}
+
+impl<V> Default for CaseInsensitiveMap<V> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<V> FromIterator<(CaseInsensitiveString, V)> for CaseInsensitiveMap<V> {
+    fn from_iter<T: IntoIterator<Item = (CaseInsensitiveString, V)>>(iter: T) -> Self {
+        let mut map = Self::new();
+        for (key, value) in iter {
+            map.inner.insert(key, value);
+        }
+        map
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CaseInsensitiveSet {
+    inner: CaseInsensitiveSetInner,
+}
+
+impl CaseInsensitiveSet {
+    pub fn new() -> Self {
+        Self {
+            inner: CaseInsensitiveSetInner::with_hasher(CaseInsensitiveHashBuilder),
+        }
+    }
+    pub fn insert(&mut self, key: &str) {
+        self.inner.insert(CaseInsensitiveString::new_owned(key));
+    }
+    pub fn remove(&mut self, key: &str) {
+        self.inner.remove(&CaseInsensitiveString::new_borrowed(key));
+    }
+    pub fn contains(&self, key: &str) -> bool {
+        self.inner
+            .contains(&CaseInsensitiveString::new_borrowed(key))
+    }
+    pub fn iter(&self) -> impl Iterator<Item = &CaseInsensitiveString> {
+        self.inner.iter()
+    }
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+    pub fn clear(&mut self) {
+        self.inner.clear();
+    }
+}
+
+impl Default for CaseInsensitiveSet {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -3750,33 +3870,25 @@ mod tests {
 
     #[test]
     fn test_case_insensitive_hashmap_wrapper() {
-        // Test the clean public API
-        let mut map = HashMap::with_hasher(CaseInsensitiveHashBuilder);
-        map.insert(CaseInsensitiveString::new_owned("test"), "value");
+        let mut map = CaseInsensitiveMap::new();
+        map.insert("sqlite_schema", "value");
 
         // Zero-allocation lookups with clean API
-        assert_eq!(
-            map.get(&CaseInsensitiveString::new_borrowed("test")),
-            Some(&"value")
-        );
-        assert_eq!(
-            map.get(&CaseInsensitiveString::new_borrowed("TEST")),
-            Some(&"value")
-        );
-        assert_eq!(
-            map.get(&CaseInsensitiveString::new_borrowed("Test")),
-            Some(&"value")
-        );
-        assert_eq!(
-            map.get(&CaseInsensitiveString::new_borrowed("missing")),
-            None
-        );
+        assert_eq!(map.get("sqlite_schema"), Some(&"value"));
+        assert_eq!(map.get("SQLITE_SCHEMA"), Some(&"value"));
+        assert_eq!(map.get("SQLite_Schema"), Some(&"value"));
+        assert_eq!(map.get("missing"), None);
 
-        assert!(map.contains_key(&CaseInsensitiveString::new_borrowed("TEST")));
-        assert!(!map.contains_key(&CaseInsensitiveString::new_borrowed("missing")));
+        assert!(map.contains_key("sqlite_schema"));
+        assert!(!map.contains_key("missing"));
         assert_eq!(map.len(), 1);
         assert!(!map.is_empty());
-
-        println!("CaseInsensitiveHashMap wrapper works perfectly!");
+        let map2 = map.clone();
+        assert_eq!(map2.get("sqlite_schema"), Some(&"value"));
+        assert_eq!(map2.get("SQLITE_SCHEMA"), Some(&"value"));
+        assert_eq!(map2.get("SQLite_Schema"), Some(&"value"));
+        assert_eq!(map2.get("missing"), None);
+        assert!(map2.contains_key("sqlite_schema"));
+        assert!(!map2.contains_key("missing"));
     }
 }

@@ -222,12 +222,7 @@ pub fn init_loop(
                         });
                     }
                     // For delete, we need to open all the other indexes too for writing
-                    if let Some(indexes) = t_ctx
-                        .resolver
-                        .schema
-                        .indexes
-                        .get(&CaseInsensitiveString::new_borrowed(btree.name.as_str()))
-                    {
+                    if let Some(indexes) = t_ctx.resolver.schema.indexes.get(btree.name.as_str()) {
                         for index in indexes {
                             if table
                                 .op
@@ -307,9 +302,7 @@ pub fn init_loop(
                         // UPDATE opens these in emit_program_for_update() separately
                         if mode == OperationMode::DELETE {
                             if let Some(indexes) =
-                                t_ctx.resolver.schema.indexes.get(
-                                    &CaseInsensitiveString::new_borrowed(table.table.get_name()),
-                                )
+                                t_ctx.resolver.schema.indexes.get(table.table.get_name())
                             {
                                 for index in indexes {
                                     if table

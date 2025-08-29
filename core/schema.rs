@@ -65,11 +65,9 @@ pub struct Schema {
 
 impl Schema {
     pub fn new(indexes_enabled: bool) -> Self {
-        let mut tables: CaseInsensitiveMap<Arc<Table>> =
-            HashMap::with_hasher(CaseInsensitiveHashBuilder);
-        let has_indexes: CaseInsensitiveSet = HashSet::with_hasher(CaseInsensitiveHashBuilder);
-        let indexes: CaseInsensitiveMap<Vec<Arc<Index>>> =
-            HashMap::with_hasher(CaseInsensitiveHashBuilder);
+        let mut tables: CaseInsensitiveMap<Arc<Table>> = CaseInsensitiveMap::new();
+        let has_indexes: CaseInsensitiveSet = CaseInsensitiveSet::new();
+        let indexes: CaseInsensitiveMap<Vec<Arc<Index>>> = CaseInsensitiveMap::new();
         #[allow(clippy::arc_with_non_send_sync)]
         tables.insert(
             SCHEMA_TABLE_NAME.into(),
@@ -77,7 +75,7 @@ impl Schema {
         );
         for function in VirtualTable::builtin_functions() {
             tables.insert(
-                function.name.to_owned().into(),
+                function.name.as_str(),
                 Arc::new(Table::Virtual(Arc::new((*function).clone()))),
             );
         }
@@ -202,14 +200,15 @@ impl Schema {
     }
 
     pub fn add_btree_table(&mut self, table: Arc<BTreeTable>) {
+        let table_clone = table.clone();
         let name = normalize_ident_no_allocation(&table.name);
-        self.tables.insert(name.into(), Table::BTree(table).into());
+        self.tables.insert(name, Table::BTree(table_clone).into());
     }
 
     pub fn add_virtual_table(&mut self, table: Arc<VirtualTable>) {
+        let table_clone = table.clone();
         let name = normalize_ident_no_allocation(&table.name);
-        self.tables
-            .insert(name.into(), Table::Virtual(table).into());
+        self.tables.insert(name, Table::Virtual(table_clone).into());
     }
 
     pub fn get_table(&self, name: &str) -> Option<Arc<Table>> {
@@ -219,21 +218,17 @@ impl Schema {
         } else {
             name
         };
-        self.tables
-            .get(&CaseInsensitiveString::new_borrowed(name))
-            .cloned()
+        self.tables.get(name).cloned()
     }
 
     pub fn remove_table(&mut self, table_name: &str) {
         let name = normalize_ident_no_allocation(table_name);
-        self.tables
-            .remove(&CaseInsensitiveString::new_borrowed(name));
+        self.tables.remove(name);
     }
 
     pub fn get_btree_table(&self, name: &str) -> Option<Arc<BTreeTable>> {
         let name = normalize_ident_no_allocation(name);
-        dbg!(name, &self.tables);
-        if let Some(table) = self.tables.get(&CaseInsensitiveString::new_borrowed(name)) {
+        if let Some(table) = self.tables.get(name) {
             table.btree()
         } else {
             None
@@ -251,42 +246,39 @@ impl Schema {
     pub fn get_indices(&self, table_name: &str) -> &[Arc<Index>] {
         let name = normalize_ident_no_allocation(table_name);
         self.indexes
-            .get(&CaseInsensitiveString::new_borrowed(name))
+            .get(&name)
             .map_or_else(|| &[] as &[Arc<Index>], |v| v.as_slice())
     }
 
     pub fn get_index(&self, table_name: &str, index_name: &str) -> Option<&Arc<Index>> {
         let name = normalize_ident_no_allocation(table_name);
         self.indexes
-            .get(&CaseInsensitiveString::new_borrowed(name))?
+            .get(&name)?
             .iter()
             .find(|index| index.name == index_name)
     }
 
     pub fn remove_indices_for_table(&mut self, table_name: &str) {
         let name = normalize_ident_no_allocation(table_name);
-        self.indexes
-            .remove(&CaseInsensitiveString::new_borrowed(name));
+        self.indexes.remove(&name);
     }
 
     pub fn remove_index(&mut self, idx: &Index) {
         let name = normalize_ident_no_allocation(&idx.table_name);
         self.indexes
-            .get_mut(&CaseInsensitiveString::new_borrowed(name))
+            .get_mut(&name)
             .expect("Must have the index")
             .retain_mut(|other_idx| other_idx.name != idx.name);
     }
 
     pub fn table_has_indexes(&self, table_name: &str) -> bool {
         let name = normalize_ident_no_allocation(table_name);
-        self.has_indexes
-            .contains(&CaseInsensitiveString::new_borrowed(name))
+        self.has_indexes.contains(&name)
     }
 
     pub fn table_set_has_index(&mut self, table_name: &str) {
         let name = normalize_ident_no_allocation(table_name);
-        self.has_indexes
-            .insert(CaseInsensitiveString::new_owned(name));
+        self.has_indexes.insert(name);
     }
 
     pub fn indexes_enabled(&self) -> bool {

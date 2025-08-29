@@ -527,9 +527,7 @@ fn emit_delete_insns(
             .resolver
             .schema
             .indexes
-            .get(&CaseInsensitiveString::new_borrowed(
-                table_reference.table.get_name(),
-            ));
+            .get(table_reference.table.get_name());
         let index_refs_opt = indexes.map(|indexes| {
             indexes
                 .iter()

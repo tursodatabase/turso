@@ -51,7 +51,7 @@ pub fn translate_create_index(
         }
         crate::bail_parse_error!("Error: index with name '{idx_name}' already exists.");
     }
-    let Some(tbl) = schema.tables.get(&CaseInsensitiveString::new_borrowed(tbl_name.as_str())) else {
+    let Some(tbl) = schema.tables.get(tbl_name.as_str()) else {
         crate::bail_parse_error!("Error: table '{tbl_name}' does not exist.");
     };
     let Some(tbl) = tbl.btree() else {

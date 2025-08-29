@@ -7200,21 +7200,18 @@ pub fn op_rename_table(
     let conn = program.connection.clone();
 
     conn.with_schema_mut(|schema| {
-        if let Some(mut indexes) = schema
-            .indexes
-            .remove(&CaseInsensitiveString::new_borrowed(from.as_str()))
-        {
+        if let Some(mut indexes) = schema.indexes.remove(from.as_str()) {
             indexes.iter_mut().for_each(|index| {
                 let index = Arc::make_mut(index);
                 index.table_name = to.to_string();
             });
 
-            schema.indexes.insert(to.into(), indexes);
+            schema.indexes.insert(to, indexes);
         };
 
         let mut table = schema
             .tables
-            .remove(&CaseInsensitiveString::new_borrowed(from.as_str()))
+            .remove(from.as_str())
             .expect("table being renamed should be in schema");
 
         {
@@ -7228,7 +7225,7 @@ pub fn op_rename_table(
             btree.name = to.to_string();
         }
 
-        schema.tables.insert(to.into(), table);
+        schema.tables.insert(to, table);
     });
 
     state.pc += 1;
@@ -7255,7 +7252,7 @@ pub fn op_drop_column(
     conn.with_schema_mut(|schema| {
         let table = schema
             .tables
-            .get_mut(&CaseInsensitiveString::new_borrowed(table.as_str()))
+            .get_mut(table.as_str())
             .expect("table being renamed should be in schema");
 
         let table = Arc::make_mut(table);
@@ -7286,7 +7283,7 @@ pub fn op_add_column(
     conn.with_schema_mut(|schema| {
         let table = schema
             .tables
-            .get_mut(&CaseInsensitiveString::new_borrowed(table.as_str()))
+            .get_mut(table.as_str())
             .expect("table being renamed should be in schema");
 
         let table = Arc::make_mut(table);
@@ -7324,7 +7321,7 @@ pub fn op_rename_column(
     conn.with_schema_mut(|schema| {
         let table = schema
             .tables
-            .get_mut(&CaseInsensitiveString::new_borrowed(table_name.as_str()))
+            .get_mut(table_name.as_str())
             .expect("table being renamed should be in schema");
 
         let table = Arc::make_mut(table);
@@ -7340,10 +7337,7 @@ pub fn op_rename_column(
             .get_mut(*column_index)
             .expect("renamed column should be in schema");
 
-        if let Some(indexes) = schema
-            .indexes
-            .get_mut(&CaseInsensitiveString::new_borrowed(table_name.as_str()))
-        {
+        if let Some(indexes) = schema.indexes.get_mut(table_name.as_str()) {
             for index in indexes {
                 let index = Arc::make_mut(index);
                 for index_column in &mut index.columns {

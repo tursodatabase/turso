@@ -65,7 +65,7 @@ pub(crate) unsafe extern "C" fn register_vtab_module(
                     return ResultCode::Error;
                 };
                 let schema_ptr = Arc::as_ptr(&*guard) as *mut Schema;
-                (*schema_ptr).tables.insert(name_str.into(), table);
+                (*schema_ptr).tables.insert(name_str.as_str(), table);
             } else {
                 return ResultCode::Error;
             }
