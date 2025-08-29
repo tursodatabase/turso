@@ -2893,6 +2893,8 @@ impl Default for CaseInsensitiveSet {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
     use crate::translate::collate::CollationSeq;
 
