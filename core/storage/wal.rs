@@ -1112,7 +1112,7 @@ impl Wal for WalFile {
             let io_ctx = self.io_ctx.borrow();
             io_ctx.encryption_context().cloned()
         };
-        let (header, _) = sqlite3_ondisk::parse_wal_frame_header(&frame);
+        let (header, _) = sqlite3_ondisk::parse_wal_frame_header(frame);
         let complete = Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
             let Ok((buf, bytes_read)) = res else {
                 return;
