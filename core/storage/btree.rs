@@ -5898,9 +5898,6 @@ struct PageStack {
 }
 
 impl PageStack {
-    fn increment_current(&self) {
-        self.current_page.set(self.current_page.get() + 1);
-    }
     fn decrement_current(&self) {
         assert!(self.current_page.get() > 0);
         self.current_page.set(self.current_page.get() - 1);
@@ -5913,24 +5910,19 @@ impl PageStack {
             current = self.current_page.get(),
             new_page_id = page.get().id,
         );
-        'validate: {
-            let current = self.current_page.get();
-            if current == -1 {
-                break 'validate;
-            }
-            let stack = self.stack.borrow();
-            let current_top = stack[current as usize].as_ref();
-            if let Some(current_top) = current_top {
-                turso_assert!(
-                    current_top.get().id != page.get().id,
-                    "about to push page {} twice",
-                    page.get().id
-                );
-            }
-        }
-        self.populate_parent_cell_count();
-        self.increment_current();
         let current = self.current_page.get();
+        let mut stack = self.stack.borrow_mut();
+        let current_top = stack.get(current as usize).and_then(|p| p.as_ref());
+        if let Some(current_top) = current_top {
+            turso_assert!(
+                current_top.get().id != page.get().id,
+                "about to push page {} twice",
+                page.get().id
+            );
+        }
+        self.populate_parent_cell_count(&stack);
+        let current = current + 1;
+        self.current_page.set(current);
         assert!(
             current < BTCURSOR_MAX_DEPTH as i32,
             "corrupted database, stack is bigger than expected"
@@ -5940,7 +5932,7 @@ impl PageStack {
         // Pin the page to prevent it from being evicted while on the stack
         page.pin();
 
-        self.stack.borrow_mut()[current as usize] = Some(page);
+        stack[current as usize] = Some(page);
         self.node_states.borrow_mut()[current as usize] = BTreeNodeState {
             cell_idx: starting_cell_idx,
             cell_count: None, // we don't know the cell count yet, so we set it to None. any code pushing a child page onto the stack MUST set the parent page's cell_count.
@@ -5953,13 +5945,12 @@ impl PageStack {
     ///
     /// This rests on the assumption that the parent page is already in memory whenever a child is pushed onto the stack.
     /// We currently ensure this by pinning all the pages on [PageStack] to the page cache so that they cannot be evicted.
-    fn populate_parent_cell_count(&self) {
+    fn populate_parent_cell_count(&self, stack: &[Option<PageRef>; BTCURSOR_MAX_DEPTH + 1]) {
         let stack_empty = self.current_page.get() == -1;
         if stack_empty {
             return;
         }
         let current = self.current();
-        let stack = self.stack.borrow();
         let page = stack[current].as_ref().unwrap();
         turso_assert!(
             page.is_pinned(),
