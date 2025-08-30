@@ -279,9 +279,17 @@ do_execsql_test json_arrow_object {
     SELECT '{"a": [1,2,3]}' -> '$.a'
 } {{[1,2,3]}}
 
+do_execsql_test json_arrow_blob {
+    SELECT cast('{"age":30,"name":"John"}' as blob) -> '$.age'
+} {{30}}
+
 do_execsql_test json_arrow_shift_object {
     SELECT '{"a": [1,2,3]}' ->> '$.a'
 } {{[1,2,3]}}
+
+do_execsql_test json_arrow_shift_blob {
+    SELECT cast('{"age":30,"name":"John"}' as blob) ->> '$.age'
+} {{30}}
 
 do_execsql_test json_extract_object_2 {
     SELECT json_extract('{"a": [1,2,3]}', '$.a', '$.a[0]', '$.a[1]', '$.a[3]')
@@ -510,10 +518,9 @@ do_execsql_test json_extract_overflow_int64 {
 #  SELECT json_extract('[1, 2, 3]', '$[170141183460469231731687303715884105729]');
 #} {{2}}
 
-# TODO: fix me - this passes on SQLite and needs to be fixed in Limbo.
-#do_execsql_test json_extract_blob {
-#  select json_extract(CAST('[1,2,3]' as BLOB), '$[1]')
-#} {{2}}
+do_execsql_test json_extract_blob {
+  select json_extract(CAST('[1,2,3]' as BLOB), '$[1]')
+} {{2}}
 
 do_execsql_test json_array_length {
    SELECT json_array_length('[1,2,3,4]');
@@ -680,12 +687,11 @@ do_execsql_test json_valid_1 {
 do_execsql_test json_valid_2 {
    SELECT json_valid('["a",55,"b",72]');
 } {1}
-#
-# Unimplemented
-#do_execsql_test json_valid_3 {
-#   SELECT json_valid( CAST('{"a":"1}' AS BLOB) );
-#} {0}
-#
+
+do_execsql_test json_valid_3 {
+   SELECT json_valid( CAST('{"a":"1}' AS BLOB) );
+} {0}
+
 do_execsql_test json_valid_4 {
   SELECT json_valid(123);
 } {1}
@@ -830,6 +836,14 @@ do_execsql_test json-remove-7 {
     SELECT json_remove('{"a": 1, "b": [1,2], "c": {"d": 3}}', '$.a', '$.b[0]', '$.c.d');
 } {{{"b":[2],"c":{}}}}
 
+do_execsql_test json-remove-8 {
+    SELECT json_remove(cast('{"age":30,"name":"John"}' as blob), '$.age');
+} {{{"name":"John"}}}
+
+do_execsql_test json-remove-9 {
+    SELECT json_remove(cast('{"user":{"id":123,"profile":{"name":"Alice","age":25}}}' as blob), '$.user.id');
+} {{{"user":{"profile":{"name":"Alice","age":25}}}}}
+
 do_execsql_test json_set_field_empty_object {
    SELECT json_set('{}', '$.field', 'value');
 } {{{"field":"value"}}}
@@ -837,6 +851,10 @@ do_execsql_test json_set_field_empty_object {
 do_execsql_test json_set_replace_field {
    SELECT json_set('{"field":"old_value"}', '$.field', 'new_value');
 } {{{"field":"new_value"}}}
+
+do_execsql_test json_set_replace_field_2 {
+    SELECT json_set(cast('{"age":30,"name":"John"}' as blob), '$.age', 40);
+} {{{"age":40,"name":"John"}}}
 
 do_execsql_test json_set_set_deeply_nested_key {
    SELECT json_set('{}', '$.object.doesnt.exist', 'value');
