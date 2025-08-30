@@ -1910,10 +1910,11 @@ pub fn begin_read_wal_frame(
                         original_c(res);
                         return;
                     };
-                    assert!(
-                        bytes_read > 0,
-                        "Expected to read some data on success for page_idx={page_idx}"
-                    );
+                    if bytes_read <= 0 {
+                        tracing::trace!("Read page {page_idx} with {} bytes", bytes_read);
+                        original_c(Ok((buf, bytes_read)));
+                        return;
+                    }
 
                     match checksum_ctx.verify_and_strip_checksum(buf.as_mut_slice(), page_idx) {
                         Ok(_) => {
