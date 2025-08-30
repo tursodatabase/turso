@@ -1075,6 +1075,10 @@ pub enum Insn {
         dest: usize,              // P2: output register for result
         new_mode: Option<String>, // P3: new journal mode (if setting)
     },
+    IfNeg {
+        reg: usize,
+        target_pc: BranchOffset,
+    },
 }
 
 impl Insn {
@@ -1212,6 +1216,7 @@ impl Insn {
             Insn::RenameColumn { .. } => execute::op_rename_column,
             Insn::MaxPgcnt { .. } => execute::op_max_pgcnt,
             Insn::JournalMode { .. } => execute::op_journal_mode,
+            Insn::IfNeg { .. } => execute::op_if_neg,
         }
     }
 }

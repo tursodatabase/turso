@@ -4,6 +4,7 @@ use std::sync::Arc;
 use crate::schema::{BTreeTable, Column, Type};
 use crate::translate::optimizer::optimize_select_plan;
 use crate::translate::plan::{Operation, QueryDestination, Scan, Search, SelectPlan};
+use crate::translate::planner::parse_limit;
 use crate::vdbe::builder::CursorType;
 use crate::{
     bail_parse_error,
@@ -21,8 +22,7 @@ use super::plan::{
     ColumnUsedMask, IterationDirection, JoinedTable, Plan, ResultSetColumn, TableReferences,
     UpdatePlan,
 };
-use super::planner::bind_column_references;
-use super::planner::{parse_limit, parse_where};
+use super::planner::{bind_column_references, parse_where};
 /*
 * Update is simple. By default we scan the table, and for each row, we check the WHERE
 * clause. If it evaluates to true, we build the new record with the updated value and insert.
@@ -331,7 +331,10 @@ pub fn prepare_update_plan(
     };
 
     // Parse the LIMIT/OFFSET clause
-    let (limit, offset) = body.limit.as_ref().map_or(Ok((None, None)), parse_limit)?;
+    let (limit, offset) = body
+        .limit
+        .as_mut()
+        .map_or(Ok((None, None)), |l| parse_limit(l, connection))?;
 
     // Check what indexes will need to be updated by checking set_clauses and see
     // if a column is contained in an index.
