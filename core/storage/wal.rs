@@ -1095,6 +1095,11 @@ impl Wal for WalFile {
         tracing::debug!("read_frame({})", frame_id);
         let offset = self.frame_offset(frame_id);
         let (frame_ptr, frame_len) = (frame.as_mut_ptr(), frame.len());
+
+        let encryption_ctx = {
+            let io_ctx = self.io_ctx.borrow();
+            io_ctx.encryption_context().cloned()
+        };
         let complete = Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
             let Ok((buf, bytes_read)) = res else {
                 return;
@@ -1104,9 +1109,33 @@ impl Wal for WalFile {
                 bytes_read == buf_len as i32,
                 "read({bytes_read}) != expected({buf_len})"
             );
-            let buf_ptr = buf.as_mut_ptr();
+            let buf_ptr = buf.as_ptr();
+            let frame_ref: &mut [u8] =
+                unsafe { std::slice::from_raw_parts_mut(frame_ptr, frame_len) };
+
+            // Copy the just-read WAL frame into the destination buffer
             unsafe {
                 std::ptr::copy_nonoverlapping(buf_ptr, frame_ptr, frame_len);
+            }
+
+            // Now parse the header from the freshly-copied data
+            let (header, raw_page) = sqlite3_ondisk::parse_wal_frame_header(frame_ref);
+
+            if let Some(ctx) = encryption_ctx.clone() {
+                match ctx.decrypt_page(raw_page, header.page_number as usize) {
+                    Ok(decrypted_data) => {
+                        turso_assert!(
+                            (frame_len - WAL_FRAME_HEADER_SIZE) == decrypted_data.len(),
+                            "frame_len - header_size({}) != expected({})",
+                            frame_len - WAL_FRAME_HEADER_SIZE,
+                            decrypted_data.len()
+                        );
+                        frame_ref[WAL_FRAME_HEADER_SIZE..].copy_from_slice(&decrypted_data);
+                    }
+                    Err(_) => {
+                        tracing::error!("Failed to decrypt page data for frame_id={frame_id}");
+                    }
+                }
             }
         });
         let c =
