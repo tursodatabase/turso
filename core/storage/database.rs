@@ -39,6 +39,10 @@ impl IOContext {
     pub fn encryption_or_checksum(&self) -> &EncryptionOrChecksum {
         &self.encryption_or_checksum
     }
+
+    pub fn reset_encryption_or_checksum(&mut self) {
+        self.encryption_or_checksum = EncryptionOrChecksum::None;
+    }
 }
 
 impl Default for IOContext {

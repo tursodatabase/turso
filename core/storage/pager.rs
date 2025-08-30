@@ -43,7 +43,7 @@ impl HeaderRef {
     pub fn from_pager(pager: &Pager) -> Result<IOResult<Self>> {
         loop {
             let state = pager.header_ref_state.borrow().clone();
-            tracing::trace!(?state);
+            tracing::trace!("HeaderRef::from_pager - {:?}", state);
             match state {
                 HeaderRefState::Start => {
                     if !pager.db_state.is_initialized() {
@@ -976,6 +976,14 @@ impl Pager {
         (page_size.get() as usize) - (reserved_space as usize)
     }
 
+    pub fn reserved_space(&self) -> u8 {
+        *self.reserved_space.get_or_init(|| {
+            self.io
+                .block(|| self.with_header(|header| header.reserved_space))
+                .unwrap_or_default()
+        })
+    }
+
     /// Set the initial page size for the database. Should only be called before the database is initialized
     pub fn set_initial_page_size(&self, size: PageSize) {
         assert_eq!(self.db_state.get(), DbState::Uninitialized);
@@ -1801,6 +1809,9 @@ impl Pager {
                 if let Some(ctx) = io_ctx.encryption_context() {
                     default_header.reserved_space = ctx.required_reserved_bytes()
                 } else {
+                    tracing::info!(
+                        "no encryption context, using default reserved space of 16 bytes"
+                    );
                     default_header.reserved_space = 16;
                 }
 
@@ -2184,6 +2195,16 @@ impl Pager {
         wal.borrow_mut()
             .set_io_context(self.io_ctx.borrow().clone());
         Ok(())
+    }
+
+    pub fn reset_checksum_context(&self) {
+        {
+            let mut io_ctx = self.io_ctx.borrow_mut();
+            io_ctx.reset_encryption_or_checksum();
+        }
+        let Some(wal) = self.wal.as_ref() else { return };
+        wal.borrow_mut()
+            .set_io_context(self.io_ctx.borrow().clone())
     }
 }
 
