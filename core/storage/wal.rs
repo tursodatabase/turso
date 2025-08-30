@@ -1142,7 +1142,6 @@ impl Wal for WalFile {
                     }
                     Err(_) => {
                         tracing::error!("Failed to decrypt page data for frame_id={frame_id}");
-                        return;
                     }
                 }
             }
