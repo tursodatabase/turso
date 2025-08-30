@@ -12,6 +12,7 @@
 //! for the database, also either local or remote.
 pub(crate) mod btree;
 pub(crate) mod buffer_pool;
+pub(crate) mod checksum;
 pub mod database;
 pub(crate) mod encryption;
 pub(crate) mod page_cache;
