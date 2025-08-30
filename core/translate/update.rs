@@ -121,6 +121,12 @@ pub fn prepare_update_plan(
         bail_parse_error!("INDEXED BY clause is not supported in UPDATE");
     }
     let table_name = &body.tbl_name.name;
+
+    // Check if this is a system table that should be protected from direct writes
+    if crate::schema::is_system_table(table_name.as_str()) {
+        bail_parse_error!("table {} may not be modified", table_name);
+    }
+
     if schema.table_has_indexes(&table_name.to_string()) && !schema.indexes_enabled() {
         // Let's disable altering a table with indices altogether instead of checking column by
         // column to be extra safe.

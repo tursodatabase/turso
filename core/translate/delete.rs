@@ -23,6 +23,12 @@ pub fn translate_delete(
     connection: &Arc<crate::Connection>,
 ) -> Result<ProgramBuilder> {
     let tbl_name = normalize_ident(tbl_name.name.as_str());
+
+    // Check if this is a system table that should be protected from direct writes
+    if crate::schema::is_system_table(&tbl_name) {
+        crate::bail_parse_error!("table {} may not be modified", tbl_name);
+    }
+
     if schema.table_has_indexes(&tbl_name) && !schema.indexes_enabled() {
         // Let's disable altering a table with indices altogether instead of checking column by
         // column to be extra safe.
