@@ -1,21 +1,23 @@
 use serde::{Deserialize, Serialize};
 use sql_generation::{
-    generation::{frequency, pick, pick_index, ArbitraryFrom},
+    generation::{Arbitrary, ArbitraryFrom, GenerationContext, frequency, pick, pick_index},
     model::{
         query::{
+            Create, Delete, Drop, Insert, Select,
             predicate::Predicate,
             select::{CompoundOperator, CompoundSelect, ResultColumn, SelectBody, SelectInner},
             transaction::{Begin, Commit, Rollback},
             update::Update,
-            Create, Delete, Drop, Insert, Select,
         },
         table::SimValue,
     },
 };
-use turso_core::{types, LimboError};
+use turso_core::{LimboError, types};
 use turso_parser::ast::{self, Distinctness};
 
-use crate::{generation::Shadow as _, model::Query, runner::env::SimulatorEnv};
+use crate::{
+    generation::Shadow as _, model::Query, profiles::query::QueryProfile, runner::env::SimulatorEnv,
+};
 
 use super::plan::{Assertion, Interaction, InteractionStats, ResultSet};
 
@@ -301,7 +303,10 @@ impl Property {
                                 for row in rows {
                                     for (i, (col, val)) in update.set_values.iter().enumerate() {
                                         if &row[i] != val {
-                                            return Ok(Err(format!("updated row {} has incorrect value for column {col}: expected {val}, got {}", i, row[i])));
+                                            return Ok(Err(format!(
+                                                "updated row {} has incorrect value for column {col}: expected {val}, got {}",
+                                                i, row[i]
+                                            )));
                                         }
                                     }
                                 }
@@ -380,7 +385,10 @@ impl Property {
                                 if found {
                                     Ok(Ok(()))
                                 } else {
-                                    Ok(Err(format!("row [{:?}] not found in table", row.iter().map(|v| v.to_string()).collect::<Vec<String>>())))
+                                    Ok(Err(format!(
+                                        "row [{:?}] not found in table",
+                                        row.iter().map(|v| v.to_string()).collect::<Vec<String>>()
+                                    )))
                                 }
                             }
                             Err(err) => Err(LimboError::InternalError(err.to_string())),
@@ -854,15 +862,22 @@ impl Property {
                         match (select_result_set, select_tlp_result_set) {
                             (Ok(select_rows), Ok(select_tlp_rows)) => {
                                 if select_rows.len() != select_tlp_rows.len() {
-                                    return Ok(Err(format!("row count mismatch: select returned {} rows, select_tlp returned {} rows", select_rows.len(), select_tlp_rows.len())));
+                                    return Ok(Err(format!(
+                                        "row count mismatch: select returned {} rows, select_tlp returned {} rows",
+                                        select_rows.len(),
+                                        select_tlp_rows.len()
+                                    )));
                                 }
                                 // Check if any row in select_rows is not in select_tlp_rows
                                 for row in select_rows.iter() {
                                     if !select_tlp_rows.iter().any(|r| r == row) {
                                         tracing::debug!(
-                                                    "select and select_tlp returned different rows, ({}) is in select but not in select_tlp",
-                                                    row.iter().map(|v| v.to_string()).collect::<Vec<String>>().join(", ")
-                                                );
+                                            "select and select_tlp returned different rows, ({}) is in select but not in select_tlp",
+                                            row.iter()
+                                                .map(|v| v.to_string())
+                                                .collect::<Vec<String>>()
+                                                .join(", ")
+                                        );
                                         return Ok(Err(format!(
                                             "row mismatch: row [{}] exists in select results but not in select_tlp results",
                                             print_row(row)
@@ -873,9 +888,12 @@ impl Property {
                                 for row in select_tlp_rows.iter() {
                                     if !select_rows.iter().any(|r| r == row) {
                                         tracing::debug!(
-                                                    "select and select_tlp returned different rows, ({}) is in select_tlp but not in select",
-                                                    row.iter().map(|v| v.to_string()).collect::<Vec<String>>().join(", ")
-                                                );
+                                            "select and select_tlp returned different rows, ({}) is in select_tlp but not in select",
+                                            row.iter()
+                                                .map(|v| v.to_string())
+                                                .collect::<Vec<String>>()
+                                                .join(", ")
+                                        );
 
                                         return Ok(Err(format!(
                                             "row mismatch: row [{}] exists in select_tlp but not in select",
@@ -935,7 +953,9 @@ impl Property {
                                     if union_count == count1 + count2 {
                                         Ok(Ok(()))
                                     } else {
-                                        Ok(Err(format!("UNION ALL should preserve cardinality but it didn't: {count1} + {count2} != {union_count}")))
+                                        Ok(Err(format!(
+                                            "UNION ALL should preserve cardinality but it didn't: {count1} + {count2} != {union_count}"
+                                        )))
                                     }
                                 }
                                 (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
@@ -952,7 +972,7 @@ impl Property {
 }
 
 fn assert_all_table_values(tables: &[String]) -> impl Iterator<Item = Interaction> + use<'_> {
-    let checks = tables.iter().flat_map(|table| {
+    tables.iter().flat_map(|table| {
         let select = Interaction::Query(Query::Select(Select::simple(
             table.clone(),
             Predicate::true_(),
@@ -1006,50 +1026,64 @@ fn assert_all_table_values(tables: &[String]) -> impl Iterator<Item = Interactio
             }),
         });
         [select, assertion].into_iter()
-    });
-    checks
+    })
 }
 
 #[derive(Debug)]
 pub(crate) struct Remaining {
-    pub(crate) read: f64,
-    pub(crate) write: f64,
-    pub(crate) create: f64,
-    pub(crate) create_index: f64,
-    pub(crate) delete: f64,
-    pub(crate) update: f64,
-    pub(crate) drop: f64,
+    pub(crate) select: u32,
+    pub(crate) insert: u32,
+    pub(crate) create: u32,
+    pub(crate) create_index: u32,
+    pub(crate) delete: u32,
+    pub(crate) update: u32,
+    pub(crate) drop: u32,
 }
 
-pub(crate) fn remaining(env: &SimulatorEnv, stats: &InteractionStats) -> Remaining {
-    let remaining_read = ((env.opts.max_interactions as f64 * env.opts.read_percent / 100.0)
-        - (stats.read_count as f64))
-        .max(0.0);
-    let remaining_write = ((env.opts.max_interactions as f64 * env.opts.write_percent / 100.0)
-        - (stats.write_count as f64))
-        .max(0.0);
-    let remaining_create = ((env.opts.max_interactions as f64 * env.opts.create_percent / 100.0)
-        - (stats.create_count as f64))
-        .max(0.0);
+pub(crate) fn remaining(
+    max_interactions: u32,
+    opts: &QueryProfile,
+    stats: &InteractionStats,
+) -> Remaining {
+    let total_weight = opts.select_weight
+        + opts.create_table_weight
+        + opts.create_index_weight
+        + opts.insert_weight
+        + opts.update_weight
+        + opts.delete_weight
+        + opts.drop_table_weight;
 
-    let remaining_create_index =
-        ((env.opts.max_interactions as f64 * env.opts.create_index_percent / 100.0)
-            - (stats.create_index_count as f64))
-            .max(0.0);
+    let total_select = (max_interactions * opts.select_weight) / total_weight;
+    let total_insert = (max_interactions * opts.insert_weight) / total_weight;
+    let total_create = (max_interactions * opts.create_table_weight) / total_weight;
+    let total_create_index = (max_interactions * opts.create_index_weight) / total_weight;
+    let total_delete = (max_interactions * opts.delete_weight) / total_weight;
+    let total_update = (max_interactions * opts.update_weight) / total_weight;
+    let total_drop = (max_interactions * opts.drop_table_weight) / total_weight;
 
-    let remaining_delete = ((env.opts.max_interactions as f64 * env.opts.delete_percent / 100.0)
-        - (stats.delete_count as f64))
-        .max(0.0);
-    let remaining_update = ((env.opts.max_interactions as f64 * env.opts.update_percent / 100.0)
-        - (stats.update_count as f64))
-        .max(0.0);
-    let remaining_drop = ((env.opts.max_interactions as f64 * env.opts.drop_percent / 100.0)
-        - (stats.drop_count as f64))
-        .max(0.0);
+    let remaining_select = total_select
+        .checked_sub(stats.select_count)
+        .unwrap_or_default();
+    let remaining_insert = total_insert
+        .checked_sub(stats.insert_count)
+        .unwrap_or_default();
+    let remaining_create = total_create
+        .checked_sub(stats.create_count)
+        .unwrap_or_default();
+    let remaining_create_index = total_create_index
+        .checked_sub(stats.create_index_count)
+        .unwrap_or_default();
+    let remaining_delete = total_delete
+        .checked_sub(stats.delete_count)
+        .unwrap_or_default();
+    let remaining_update = total_update
+        .checked_sub(stats.update_count)
+        .unwrap_or_default();
+    let remaining_drop = total_drop.checked_sub(stats.drop_count).unwrap_or_default();
 
     Remaining {
-        read: remaining_read,
-        write: remaining_write,
+        select: remaining_select,
+        insert: remaining_insert,
         create: remaining_create,
         create_index: remaining_create_index,
         delete: remaining_delete,
@@ -1067,7 +1101,7 @@ fn property_insert_values_select<R: rand::Rng>(
     let table = pick(&env.tables, rng);
     // Generate rows to insert
     let rows = (0..rng.random_range(1..=5))
-        .map(|_| Vec::<SimValue>::arbitrary_from(rng, table))
+        .map(|_| Vec::<SimValue>::arbitrary_from(rng, env, table))
         .collect::<Vec<_>>();
 
     // Pick a random row to select
@@ -1101,7 +1135,7 @@ fn property_insert_values_select<R: rand::Rng>(
         }));
     }
     for _ in 0..rng.random_range(0..3) {
-        let query = Query::arbitrary_from(rng, (env, remaining));
+        let query = Query::arbitrary_from(rng, env, remaining);
         match &query {
             Query::Delete(Delete {
                 table: t,
@@ -1144,7 +1178,7 @@ fn property_insert_values_select<R: rand::Rng>(
     // Select the row
     let select_query = Select::simple(
         table.name.clone(),
-        Predicate::arbitrary_from(rng, (table, &row)),
+        Predicate::arbitrary_from(rng, env, (table, &row)),
     );
 
     Property::InsertValuesSelect {
@@ -1158,7 +1192,7 @@ fn property_insert_values_select<R: rand::Rng>(
 
 fn property_read_your_updates_back<R: rand::Rng>(rng: &mut R, env: &SimulatorEnv) -> Property {
     // e.g. UPDATE t SET a=1, b=2 WHERE c=1;
-    let update = Update::arbitrary_from(rng, env);
+    let update = Update::arbitrary(rng, env);
     // e.g. SELECT a, b FROM t WHERE c=1;
     let select = Select::single(
         update.table().to_string(),
@@ -1190,7 +1224,7 @@ fn property_select_limit<R: rand::Rng>(rng: &mut R, env: &SimulatorEnv) -> Prope
     let select = Select::single(
         table.name.clone(),
         vec![ResultColumn::Star],
-        Predicate::arbitrary_from(rng, table),
+        Predicate::arbitrary_from(rng, env, table),
         Some(rng.random_range(1..=5)),
         Distinctness::All,
     );
@@ -1215,7 +1249,7 @@ fn property_double_create_failure<R: rand::Rng>(
     // - [x] There will be no errors in the middle interactions.(best effort)
     // - [ ] Table `t` will not be renamed or dropped.(todo: add this constraint once ALTER or DROP is implemented)
     for _ in 0..rng.random_range(0..3) {
-        let query = Query::arbitrary_from(rng, (env, remaining));
+        let query = Query::arbitrary_from(rng, env, remaining);
         if let Query::Create(Create { table: t }) = &query {
             // There will be no errors in the middle interactions.
             // - Creating the same table is an error
@@ -1240,7 +1274,7 @@ fn property_delete_select<R: rand::Rng>(
     // Get a random table
     let table = pick(&env.tables, rng);
     // Generate a random predicate
-    let predicate = Predicate::arbitrary_from(rng, table);
+    let predicate = Predicate::arbitrary_from(rng, env, table);
 
     // Create random queries respecting the constraints
     let mut queries = Vec::new();
@@ -1248,7 +1282,7 @@ fn property_delete_select<R: rand::Rng>(
     // - [x] A row that holds for the predicate will not be inserted.
     // - [ ] The table `t` will not be renamed, dropped, or altered. (todo: add this constraint once ALTER or DROP is implemented)
     for _ in 0..rng.random_range(0..3) {
-        let query = Query::arbitrary_from(rng, (env, remaining));
+        let query = Query::arbitrary_from(rng, env, remaining);
         match &query {
             Query::Insert(Insert::Values { table: t, values }) => {
                 // A row that holds for the predicate will not be inserted.
@@ -1303,7 +1337,7 @@ fn property_drop_select<R: rand::Rng>(
     // - [x] There will be no errors in the middle interactions. (this constraint is impossible to check, so this is just best effort)
     // - [-] The table `t` will not be created, no table will be renamed to `t`. (todo: update this constraint once ALTER is implemented)
     for _ in 0..rng.random_range(0..3) {
-        let query = Query::arbitrary_from(rng, (env, remaining));
+        let query = Query::arbitrary_from(rng, env, remaining);
         if let Query::Create(Create { table: t }) = &query {
             // - The table `t` will not be created
             if t.name == table.name {
@@ -1313,7 +1347,10 @@ fn property_drop_select<R: rand::Rng>(
         queries.push(query);
     }
 
-    let select = Select::simple(table.name.clone(), Predicate::arbitrary_from(rng, table));
+    let select = Select::simple(
+        table.name.clone(),
+        Predicate::arbitrary_from(rng, env, table),
+    );
 
     Property::DropSelect {
         table: table.name.clone(),
@@ -1326,7 +1363,7 @@ fn property_select_select_optimizer<R: rand::Rng>(rng: &mut R, env: &SimulatorEn
     // Get a random table
     let table = pick(&env.tables, rng);
     // Generate a random predicate
-    let predicate = Predicate::arbitrary_from(rng, table);
+    let predicate = Predicate::arbitrary_from(rng, env, table);
     // Transform into a Binary predicate to force values to be casted to a bool
     let expr = ast::Expr::Binary(
         Box::new(predicate.0),
@@ -1344,8 +1381,8 @@ fn property_where_true_false_null<R: rand::Rng>(rng: &mut R, env: &SimulatorEnv)
     // Get a random table
     let table = pick(&env.tables, rng);
     // Generate a random predicate
-    let p1 = Predicate::arbitrary_from(rng, table);
-    let p2 = Predicate::arbitrary_from(rng, table);
+    let p1 = Predicate::arbitrary_from(rng, env, table);
+    let p2 = Predicate::arbitrary_from(rng, env, table);
 
     // Create the select query
     let select = Select::simple(table.name.clone(), p1);
@@ -1363,8 +1400,8 @@ fn property_union_all_preserves_cardinality<R: rand::Rng>(
     // Get a random table
     let table = pick(&env.tables, rng);
     // Generate a random predicate
-    let p1 = Predicate::arbitrary_from(rng, table);
-    let p2 = Predicate::arbitrary_from(rng, table);
+    let p1 = Predicate::arbitrary_from(rng, env, table);
+    let p2 = Predicate::arbitrary_from(rng, env, table);
 
     // Create the select query
     let select = Select::single(
@@ -1387,7 +1424,7 @@ fn property_fsync_no_wait<R: rand::Rng>(
     remaining: &Remaining,
 ) -> Property {
     Property::FsyncNoWait {
-        query: Query::arbitrary_from(rng, (env, remaining)),
+        query: Query::arbitrary_from(rng, env, remaining),
         tables: env.tables.iter().map(|t| t.name.clone()).collect(),
     }
 }
@@ -1398,108 +1435,111 @@ fn property_faulty_query<R: rand::Rng>(
     remaining: &Remaining,
 ) -> Property {
     Property::FaultyQuery {
-        query: Query::arbitrary_from(rng, (env, remaining)),
+        query: Query::arbitrary_from(rng, env, remaining),
         tables: env.tables.iter().map(|t| t.name.clone()).collect(),
     }
 }
 
 impl ArbitraryFrom<(&SimulatorEnv, &InteractionStats)> for Property {
-    fn arbitrary_from<R: rand::Rng>(
+    fn arbitrary_from<R: rand::Rng, C: GenerationContext>(
         rng: &mut R,
+        context: &C,
         (env, stats): (&SimulatorEnv, &InteractionStats),
     ) -> Self {
-        let remaining_ = remaining(env, stats);
+        let opts = context.opts();
+        let remaining_ = remaining(env.opts.max_interactions, &env.profile.query, stats);
 
         frequency(
             vec![
                 (
                     if !env.opts.disable_insert_values_select {
-                        f64::min(remaining_.read, remaining_.write)
+                        u32::min(remaining_.select, remaining_.insert)
                     } else {
-                        0.0
+                        0
                     },
                     Box::new(|rng: &mut R| property_insert_values_select(rng, env, &remaining_)),
                 ),
                 (
-                    remaining_.read,
+                    remaining_.select,
                     Box::new(|rng: &mut R| property_table_has_expected_content(rng, env)),
                 ),
                 (
-                    f64::min(remaining_.read, remaining_.write),
+                    u32::min(remaining_.select, remaining_.insert),
                     Box::new(|rng: &mut R| property_read_your_updates_back(rng, env)),
                 ),
                 (
                     if !env.opts.disable_double_create_failure {
-                        remaining_.create / 2.0
+                        remaining_.create / 2
                     } else {
-                        0.0
+                        0
                     },
                     Box::new(|rng: &mut R| property_double_create_failure(rng, env, &remaining_)),
                 ),
                 (
                     if !env.opts.disable_select_limit {
-                        remaining_.read
+                        remaining_.select
                     } else {
-                        0.0
+                        0
                     },
                     Box::new(|rng: &mut R| property_select_limit(rng, env)),
                 ),
                 (
                     if !env.opts.disable_delete_select {
-                        f64::min(remaining_.read, remaining_.write).min(remaining_.delete)
+                        u32::min(remaining_.select, remaining_.insert).min(remaining_.delete)
                     } else {
-                        0.0
+                        0
                     },
                     Box::new(|rng: &mut R| property_delete_select(rng, env, &remaining_)),
                 ),
                 (
                     if !env.opts.disable_drop_select {
                         // remaining_.drop
-                        0.0
+                        0
                     } else {
-                        0.0
+                        0
                     },
                     Box::new(|rng: &mut R| property_drop_select(rng, env, &remaining_)),
                 ),
                 (
                     if !env.opts.disable_select_optimizer {
-                        remaining_.read / 2.0
+                        remaining_.select / 2
                     } else {
-                        0.0
+                        0
                     },
                     Box::new(|rng: &mut R| property_select_select_optimizer(rng, env)),
                 ),
                 (
-                    if env.opts.experimental_indexes && !env.opts.disable_where_true_false_null {
-                        remaining_.read / 2.0
+                    if opts.indexes && !env.opts.disable_where_true_false_null {
+                        remaining_.select / 2
                     } else {
-                        0.0
+                        0
                     },
                     Box::new(|rng: &mut R| property_where_true_false_null(rng, env)),
                 ),
                 (
-                    if env.opts.experimental_indexes
-                        && !env.opts.disable_union_all_preserves_cardinality
-                    {
-                        remaining_.read / 3.0
+                    if opts.indexes && !env.opts.disable_union_all_preserves_cardinality {
+                        remaining_.select / 3
                     } else {
-                        0.0
+                        0
                     },
                     Box::new(|rng: &mut R| property_union_all_preserves_cardinality(rng, env)),
                 ),
                 (
-                    if !env.opts.disable_fsync_no_wait {
-                        50.0 // Freestyle number
+                    if env.profile.io.enable && !env.opts.disable_fsync_no_wait {
+                        50 // Freestyle number
                     } else {
-                        0.0
+                        0
                     },
                     Box::new(|rng: &mut R| property_fsync_no_wait(rng, env, &remaining_)),
                 ),
                 (
-                    if !env.opts.disable_faulty_query {
-                        20.0
+                    if env.profile.io.enable
+                        && env.profile.io.fault.enable
+                        && !env.opts.disable_faulty_query
+                    {
+                        20
                     } else {
-                        0.0
+                        0
                     },
                     Box::new(|rng: &mut R| property_faulty_query(rng, env, &remaining_)),
                 ),

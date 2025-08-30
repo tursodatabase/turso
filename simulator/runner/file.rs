@@ -6,10 +6,10 @@ use std::{
 
 use rand::Rng as _;
 use rand_chacha::ChaCha8Rng;
-use tracing::{instrument, Level};
+use tracing::{Level, instrument};
 use turso_core::{File, Result};
 
-use crate::runner::{clock::SimulatorClock, FAULT_ERROR_MSG};
+use crate::runner::{FAULT_ERROR_MSG, clock::SimulatorClock};
 pub(crate) struct SimulatorFile {
     pub path: String,
     pub(crate) inner: Arc<dyn File>,
@@ -201,7 +201,9 @@ impl File for SimulatorFile {
         self.nr_sync_calls.set(self.nr_sync_calls.get() + 1);
         if self.fault.get() {
             // TODO: Enable this when https://github.com/tursodatabase/turso/issues/2091 is fixed.
-            tracing::debug!("ignoring sync fault because it causes false positives with current simulator design");
+            tracing::debug!(
+                "ignoring sync fault because it causes false positives with current simulator design"
+            );
             self.fault.set(false);
         }
         let c = if let Some(latency) = self.generate_latency_duration() {

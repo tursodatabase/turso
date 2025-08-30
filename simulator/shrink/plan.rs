@@ -1,4 +1,5 @@
 use crate::{
+    SandboxedResult, SimulatorEnv,
     generation::{
         plan::{Interaction, InteractionPlan, Interactions},
         property::Property,
@@ -6,7 +7,6 @@ use crate::{
     model::Query,
     run_simulation,
     runner::execution::Execution,
-    SandboxedResult, SimulatorEnv,
 };
 use std::sync::{Arc, Mutex};
 

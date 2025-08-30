@@ -201,3 +201,7 @@ endif
 	fi
 
 .PHONY: merge-pr
+
+sim-schema: 
+	cargo run -p limbo_sim -- print-schema > simulator/configs/custom/profile-schema.json
+

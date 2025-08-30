@@ -5,8 +5,8 @@ use tracing::instrument;
 use turso_core::{Connection, LimboError, Result, StepResult};
 
 use crate::generation::{
-    plan::{Interaction, InteractionPlan, InteractionPlanState, ResultSet},
     Shadow as _,
+    plan::{Interaction, InteractionPlan, InteractionPlanState, ResultSet},
 };
 
 use super::env::{SimConnection, SimulatorEnv};

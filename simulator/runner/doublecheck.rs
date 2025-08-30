@@ -6,13 +6,13 @@ use std::{
 use sql_generation::generation::pick_index;
 
 use crate::{
-    generation::plan::InteractionPlanState, runner::execution::ExecutionContinuation,
-    InteractionPlan,
+    InteractionPlan, generation::plan::InteractionPlanState,
+    runner::execution::ExecutionContinuation,
 };
 
 use super::{
     env::{SimConnection, SimulatorEnv},
-    execution::{execute_interaction, Execution, ExecutionHistory, ExecutionResult},
+    execution::{Execution, ExecutionHistory, ExecutionResult, execute_interaction},
 };
 
 pub(crate) fn run_simulation(
@@ -207,7 +207,9 @@ fn execute_plan(
                             match (limbo_values, doublecheck_values) {
                                 (Ok(limbo_values), Ok(doublecheck_values)) => {
                                     if limbo_values != doublecheck_values {
-                                        tracing::error!("returned values from limbo and doublecheck results do not match");
+                                        tracing::error!(
+                                            "returned values from limbo and doublecheck results do not match"
+                                        );
                                         tracing::debug!("limbo values {:?}", limbo_values);
                                         tracing::debug!(
                                             "doublecheck values {:?}",
@@ -231,7 +233,9 @@ fn execute_plan(
                                     }
                                 }
                                 (Ok(limbo_result), Err(doublecheck_err)) => {
-                                    tracing::error!("limbo and doublecheck results do not match, limbo returned values but doublecheck failed");
+                                    tracing::error!(
+                                        "limbo and doublecheck results do not match, limbo returned values but doublecheck failed"
+                                    );
                                     tracing::error!("limbo values {:?}", limbo_result);
                                     tracing::error!("doublecheck error {}", doublecheck_err);
                                     return Err(turso_core::LimboError::InternalError(
@@ -239,7 +243,9 @@ fn execute_plan(
                                     ));
                                 }
                                 (Err(limbo_err), Ok(_)) => {
-                                    tracing::error!("limbo and doublecheck results do not match, limbo failed but doublecheck returned values");
+                                    tracing::error!(
+                                        "limbo and doublecheck results do not match, limbo failed but doublecheck returned values"
+                                    );
                                     tracing::error!("limbo error {}", limbo_err);
                                     return Err(turso_core::LimboError::InternalError(
                                         "limbo and doublecheck results do not match".into(),

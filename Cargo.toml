@@ -67,6 +67,8 @@ rusqlite = { version = "0.37.0", features = ["bundled"] }
 itertools = "0.14.0"
 rand = "0.9.2"
 tracing = "0.1.41"
+schemars = "1.0.4"
+garde = "0.22"
 
 [profile.release]
 debug = "line-tables-only"

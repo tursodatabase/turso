@@ -10,7 +10,7 @@ use crate::{
 
 use super::{
     env::{SimConnection, SimulatorEnv},
-    execution::{execute_interaction, Execution, ExecutionHistory, ExecutionResult},
+    execution::{Execution, ExecutionHistory, ExecutionResult, execute_interaction},
 };
 
 pub(crate) fn run_simulation(

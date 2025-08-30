@@ -5,7 +5,7 @@ use std::{
 
 use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
-use turso_core::{Clock, Instant, OpenFlags, PlatformIO, Result, IO};
+use turso_core::{Clock, IO, Instant, OpenFlags, PlatformIO, Result};
 
 use crate::runner::{clock::SimulatorClock, file::SimulatorFile};
 

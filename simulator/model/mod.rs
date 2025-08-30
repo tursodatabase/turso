@@ -5,14 +5,14 @@ use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use sql_generation::model::{
     query::{
+        Create, CreateIndex, Delete, Drop, EmptyContext, Insert, Select,
         select::{CompoundOperator, FromClause, ResultColumn, SelectInner},
         transaction::{Begin, Commit, Rollback},
         update::Update,
-        Create, CreateIndex, Delete, Drop, EmptyContext, Insert, Select,
     },
     table::{JoinTable, JoinType, SimValue, Table, TableContext},
 };
-use turso_parser::ast::{fmt::ToTokens, Distinctness};
+use turso_parser::ast::{Distinctness, fmt::ToTokens};
 
 use crate::{generation::Shadow, runner::env::SimulatorTables};
 
@@ -282,10 +282,11 @@ impl Shadow for SelectInner {
 
             Ok(join_table)
         } else {
-            assert!(self
-                .columns
-                .iter()
-                .all(|col| matches!(col, ResultColumn::Expr(_))));
+            assert!(
+                self.columns
+                    .iter()
+                    .all(|col| matches!(col, ResultColumn::Expr(_)))
+            );
 
             // If `WHERE` is false, just return an empty table
             if !self.where_clause.test(&[], &Table::anonymous(vec![])) {

@@ -3,54 +3,52 @@ use std::collections::HashSet;
 use rand::Rng;
 use turso_core::Value;
 
-use crate::generation::{gen_random_text, pick, readable_name_custom, Arbitrary, ArbitraryFrom};
+use crate::generation::{
+    gen_random_text, pick, readable_name_custom, Arbitrary, ArbitraryFrom, GenerationContext,
+};
 use crate::model::table::{Column, ColumnType, Name, SimValue, Table};
 
 use super::ArbitraryFromMaybe;
 
 impl Arbitrary for Name {
-    fn arbitrary<R: Rng>(rng: &mut R) -> Self {
+    fn arbitrary<R: Rng, C: GenerationContext>(rng: &mut R, _c: &C) -> Self {
         let name = readable_name_custom("_", rng);
         Name(name.replace("-", "_"))
     }
 }
 
 impl Arbitrary for Table {
-    fn arbitrary<R: Rng>(rng: &mut R) -> Self {
-        let name = Name::arbitrary(rng).0;
-        let columns = loop {
-            let large_table = rng.random_bool(0.1);
-            let column_size = if large_table {
-                rng.random_range(64..125) // todo: make this higher (128+)
-            } else {
-                rng.random_range(1..=10)
-            };
-            let columns = (1..=column_size)
-                .map(|_| Column::arbitrary(rng))
-                .collect::<Vec<_>>();
-            // TODO: see if there is a better way to detect duplicates here
-            let mut set = HashSet::with_capacity(columns.len());
-            set.extend(columns.iter());
-            // Has repeated column name inside so generate again
-            if set.len() != columns.len() {
-                continue;
+    fn arbitrary<R: Rng, C: GenerationContext>(rng: &mut R, context: &C) -> Self {
+        let opts = context.opts().table.clone();
+        let name = Name::arbitrary(rng, context).0;
+        let large_table =
+            opts.large_table.enable && rng.random_bool(opts.large_table.large_table_prob);
+        let column_size = if large_table {
+            rng.random_range(opts.large_table.column_range)
+        } else {
+            rng.random_range(opts.column_range)
+        } as usize;
+        let mut column_set = HashSet::with_capacity(column_size);
+        for col in std::iter::repeat_with(|| Column::arbitrary(rng, context)) {
+            column_set.insert(col);
+            if column_set.len() == column_size {
+                break;
             }
-            break columns;
-        };
+        }
 
         Table {
             rows: Vec::new(),
             name,
-            columns,
+            columns: Vec::from_iter(column_set),
             indexes: vec![],
         }
     }
 }
 
 impl Arbitrary for Column {
-    fn arbitrary<R: Rng>(rng: &mut R) -> Self {
-        let name = Name::arbitrary(rng).0;
-        let column_type = ColumnType::arbitrary(rng);
+    fn arbitrary<R: Rng, C: GenerationContext>(rng: &mut R, context: &C) -> Self {
+        let name = Name::arbitrary(rng, context).0;
+        let column_type = ColumnType::arbitrary(rng, context);
         Self {
             name,
             column_type,
@@ -61,16 +59,20 @@ impl Arbitrary for Column {
 }
 
 impl Arbitrary for ColumnType {
-    fn arbitrary<R: Rng>(rng: &mut R) -> Self {
+    fn arbitrary<R: Rng, C: GenerationContext>(rng: &mut R, _context: &C) -> Self {
         pick(&[Self::Integer, Self::Float, Self::Text, Self::Blob], rng).to_owned()
     }
 }
 
 impl ArbitraryFrom<&Table> for Vec<SimValue> {
-    fn arbitrary_from<R: Rng>(rng: &mut R, table: &Table) -> Self {
+    fn arbitrary_from<R: Rng, C: GenerationContext>(
+        rng: &mut R,
+        context: &C,
+        table: &Table,
+    ) -> Self {
         let mut row = Vec::new();
         for column in table.columns.iter() {
-            let value = SimValue::arbitrary_from(rng, &column.column_type);
+            let value = SimValue::arbitrary_from(rng, context, &column.column_type);
             row.push(value);
         }
         row
@@ -78,7 +80,11 @@ impl ArbitraryFrom<&Table> for Vec<SimValue> {
 }
 
 impl ArbitraryFrom<&Vec<&SimValue>> for SimValue {
-    fn arbitrary_from<R: Rng>(rng: &mut R, values: &Vec<&Self>) -> Self {
+    fn arbitrary_from<R: Rng, C: GenerationContext>(
+        rng: &mut R,
+        _context: &C,
+        values: &Vec<&Self>,
+    ) -> Self {
         if values.is_empty() {
             return Self(Value::Null);
         }
@@ -88,7 +94,11 @@ impl ArbitraryFrom<&Vec<&SimValue>> for SimValue {
 }
 
 impl ArbitraryFrom<&ColumnType> for SimValue {
-    fn arbitrary_from<R: Rng>(rng: &mut R, column_type: &ColumnType) -> Self {
+    fn arbitrary_from<R: Rng, C: GenerationContext>(
+        rng: &mut R,
+        _context: &C,
+        column_type: &ColumnType,
+    ) -> Self {
         let value = match column_type {
             ColumnType::Integer => Value::Integer(rng.random_range(i64::MIN..i64::MAX)),
             ColumnType::Float => Value::Float(rng.random_range(-1e10..1e10)),
@@ -102,19 +112,27 @@ impl ArbitraryFrom<&ColumnType> for SimValue {
 pub struct LTValue(pub SimValue);
 
 impl ArbitraryFrom<&Vec<&SimValue>> for LTValue {
-    fn arbitrary_from<R: Rng>(rng: &mut R, values: &Vec<&SimValue>) -> Self {
+    fn arbitrary_from<R: Rng, C: GenerationContext>(
+        rng: &mut R,
+        context: &C,
+        values: &Vec<&SimValue>,
+    ) -> Self {
         if values.is_empty() {
             return Self(SimValue(Value::Null));
         }
 
         // Get value less than all values
         let value = Value::exec_min(values.iter().map(|value| &value.0));
-        Self::arbitrary_from(rng, &SimValue(value))
+        Self::arbitrary_from(rng, context, &SimValue(value))
     }
 }
 
 impl ArbitraryFrom<&SimValue> for LTValue {
-    fn arbitrary_from<R: Rng>(rng: &mut R, value: &SimValue) -> Self {
+    fn arbitrary_from<R: Rng, C: GenerationContext>(
+        rng: &mut R,
+        _context: &C,
+        value: &SimValue,
+    ) -> Self {
         let new_value = match &value.0 {
             Value::Integer(i) => Value::Integer(rng.random_range(i64::MIN..*i - 1)),
             Value::Float(f) => Value::Float(f - rng.random_range(0.0..1e10)),
@@ -164,19 +182,27 @@ impl ArbitraryFrom<&SimValue> for LTValue {
 pub struct GTValue(pub SimValue);
 
 impl ArbitraryFrom<&Vec<&SimValue>> for GTValue {
-    fn arbitrary_from<R: Rng>(rng: &mut R, values: &Vec<&SimValue>) -> Self {
+    fn arbitrary_from<R: Rng, C: GenerationContext>(
+        rng: &mut R,
+        context: &C,
+        values: &Vec<&SimValue>,
+    ) -> Self {
         if values.is_empty() {
             return Self(SimValue(Value::Null));
         }
         // Get value greater than all values
         let value = Value::exec_max(values.iter().map(|value| &value.0));
 
-        Self::arbitrary_from(rng, &SimValue(value))
+        Self::arbitrary_from(rng, context, &SimValue(value))
     }
 }
 
 impl ArbitraryFrom<&SimValue> for GTValue {
-    fn arbitrary_from<R: Rng>(rng: &mut R, value: &SimValue) -> Self {
+    fn arbitrary_from<R: Rng, C: GenerationContext>(
+        rng: &mut R,
+        _context: &C,
+        value: &SimValue,
+    ) -> Self {
         let new_value = match &value.0 {
             Value::Integer(i) => Value::Integer(rng.random_range(*i..i64::MAX)),
             Value::Float(f) => Value::Float(rng.random_range(*f..1e10)),
@@ -226,7 +252,11 @@ impl ArbitraryFrom<&SimValue> for GTValue {
 pub struct LikeValue(pub SimValue);
 
 impl ArbitraryFromMaybe<&SimValue> for LikeValue {
-    fn arbitrary_from_maybe<R: Rng>(rng: &mut R, value: &SimValue) -> Option<Self> {
+    fn arbitrary_from_maybe<R: Rng, C: GenerationContext>(
+        rng: &mut R,
+        _context: &C,
+        value: &SimValue,
+    ) -> Option<Self> {
         match &value.0 {
             value @ Value::Text(..) => {
                 let t = value.to_string();

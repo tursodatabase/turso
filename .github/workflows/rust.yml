@@ -64,8 +64,12 @@ jobs:
       - uses: useblacksmith/rust-cache@v3
         with:
           prefix-key: "v1-rust" # can be updated if we need to reset caches due to non-trivial change in the dependencies (for example, custom env var were set for single workspace project)
-      - name: Install the project
+      - name: Simulator default
         run: ./scripts/run-sim --maximum-tests 1000 --min-tick 10 --max-tick 50 loop -n 10 -s
+      - name: Simulator InsertHeavy
+        run: ./scripts/run-sim --maximum-tests 1000 --min-tick 10 --max-tick 50 --profile write_heavy loop -n 10 -s
+      - name: Simulator Faultless
+        run: ./scripts/run-sim --maximum-tests 1000 --min-tick 10 --max-tick 50 --profile faultless loop -n 10 -s
 
   test-limbo:
     runs-on: blacksmith-4vcpu-ubuntu-2404

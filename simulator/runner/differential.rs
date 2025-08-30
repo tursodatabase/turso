@@ -4,18 +4,18 @@ use sql_generation::{generation::pick_index, model::table::SimValue};
 use turso_core::Value;
 
 use crate::{
+    InteractionPlan,
     generation::{
-        plan::{Interaction, InteractionPlanState, ResultSet},
         Shadow as _,
+        plan::{Interaction, InteractionPlanState, ResultSet},
     },
     model::Query,
     runner::execution::ExecutionContinuation,
-    InteractionPlan,
 };
 
 use super::{
     env::{SimConnection, SimulatorEnv},
-    execution::{execute_interaction, Execution, ExecutionHistory, ExecutionResult},
+    execution::{Execution, ExecutionHistory, ExecutionResult, execute_interaction},
 };
 
 pub(crate) fn run_simulation(
@@ -249,7 +249,9 @@ fn execute_plan(
                             match (limbo_values, rusqlite_values) {
                                 (Ok(limbo_values), Ok(rusqlite_values)) => {
                                     if limbo_values != rusqlite_values {
-                                        tracing::error!("returned values from limbo and rusqlite results do not match");
+                                        tracing::error!(
+                                            "returned values from limbo and rusqlite results do not match"
+                                        );
                                         let diff = limbo_values
                                             .iter()
                                             .zip(rusqlite_values.iter())
@@ -303,7 +305,9 @@ fn execute_plan(
                                     tracing::warn!("rusqlite error {}", rusqlite_err);
                                 }
                                 (Ok(limbo_result), Err(rusqlite_err)) => {
-                                    tracing::error!("limbo and rusqlite results do not match, limbo returned values but rusqlite failed");
+                                    tracing::error!(
+                                        "limbo and rusqlite results do not match, limbo returned values but rusqlite failed"
+                                    );
                                     tracing::error!("limbo values {:?}", limbo_result);
                                     tracing::error!("rusqlite error {}", rusqlite_err);
                                     return Err(turso_core::LimboError::InternalError(
@@ -311,7 +315,9 @@ fn execute_plan(
                                     ));
                                 }
                                 (Err(limbo_err), Ok(_)) => {
-                                    tracing::error!("limbo and rusqlite results do not match, limbo failed but rusqlite returned values");
+                                    tracing::error!(
+                                        "limbo and rusqlite results do not match, limbo failed but rusqlite returned values"
+                                    );
                                     tracing::error!("limbo error {}", limbo_err);
                                     return Err(turso_core::LimboError::InternalError(
                                         "limbo and rusqlite results do not match".into(),

@@ -4,7 +4,7 @@
 name = "limbo_sim"
 version.workspace = true
 authors.workspace = true
-edition.workspace = true
+edition = "2024"
 license.workspace = true
 repository.workspace = true
 description = "The Limbo deterministic simulator"
@@ -38,3 +38,7 @@ hex = "0.4.3"
 itertools = "0.14.0"
 sql_generation = { workspace = true }
 turso_parser = { workspace = true }
+schemars = { workspace = true }
+garde = { workspace = true, features = ["derive", "serde"] }
+json5 = { version = "0.4.1" }
+strum = { workspace = true }
