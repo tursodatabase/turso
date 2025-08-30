@@ -155,10 +155,11 @@ impl DatabaseStorage for DatabaseFile {
                         let Ok((buf, bytes_read)) = res else {
                             return;
                         };
-                        assert!(
-                            bytes_read > 0,
-                            "Expected to read some data on success for page_id={page_idx}"
-                        );
+                        if bytes_read <= 0 {
+                            tracing::trace!("Read page {page_idx} with {} bytes", bytes_read);
+                            original_c.complete(bytes_read);
+                            return;
+                        }
                         match checksum_ctx.verify_and_strip_checksum(buf.as_mut_slice(), page_idx) {
                             Ok(_) => {
                                 original_c.complete(bytes_read);
