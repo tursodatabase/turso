@@ -450,7 +450,7 @@ fn prepare_one_select_plan(
                                                     original_expr: expr.clone(),
                                                     distinctness,
                                                 };
-                                                aggregate_expressions.push(agg.clone());
+                                                aggregate_expressions.push(agg);
                                                 plan.result_columns.push(ResultSetColumn {
                                                     alias: maybe_alias.as_ref().map(|alias| {
                                                         match alias {
@@ -491,7 +491,7 @@ fn prepare_one_select_plan(
                                             original_expr: expr.clone(),
                                             distinctness: Distinctness::NonDistinct,
                                         };
-                                        aggregate_expressions.push(agg.clone());
+                                        aggregate_expressions.push(agg);
                                         plan.result_columns.push(ResultSetColumn {
                                             alias: maybe_alias.as_ref().map(|alias| match alias {
                                                 ast::As::Elided(alias) => {
