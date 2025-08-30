@@ -74,20 +74,9 @@ impl Drop for EncryptionKey {
     }
 }
 
-pub trait AeadCipher<const TAG_SIZE: usize>: Clone {
-    fn new(key: &EncryptionKey) -> Self;
-
+pub trait AeadCipher {
     fn encrypt(&self, plaintext: &[u8], ad: &[u8]) -> Result<(Vec<u8>, Vec<u8>)>;
     fn decrypt(&self, ciphertext: &[u8], nonce: &[u8], ad: &[u8]) -> Result<Vec<u8>>;
-
-    fn tag_size(&self) -> usize {
-        TAG_SIZE
-    }
-    fn nonce_size(&self) -> usize;
-
-    fn key_size(&self) -> usize;
-
-    fn metadata_size(&self) -> usize;
 }
 
 // wrapper struct for AEGIS-256 cipher, because the crate we use is a bit low-level and we add
@@ -96,19 +85,21 @@ pub trait AeadCipher<const TAG_SIZE: usize>: Clone {
 // vanilla version, which is still order of magnitudes faster than AES-GCM in software. Hardware
 // based compilation is left for future work.
 #[derive(Clone)]
-pub struct Aegis256Cipher<const TAG_SIZE: usize> {
+pub struct Aegis256Cipher {
     key: EncryptionKey,
 }
 
-impl<const TAG_SIZE: usize> AeadCipher<TAG_SIZE> for Aegis256Cipher<TAG_SIZE> {
+impl Aegis256Cipher {
     fn new(key: &EncryptionKey) -> Self {
         Self { key: key.clone() }
     }
+}
 
+impl AeadCipher for Aegis256Cipher {
     fn encrypt(&self, plaintext: &[u8], ad: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
         let nonce = generate_secure_nonce();
         let (ciphertext, tag) =
-            Aegis256::<TAG_SIZE>::new(self.key.as_bytes(), &nonce).encrypt(plaintext, ad);
+            Aegis256::<AEGIS_TAG_SIZE>::new(self.key.as_bytes(), &nonce).encrypt(plaintext, ad);
 
         let mut result = ciphertext;
         result.extend_from_slice(&tag);
@@ -116,46 +107,36 @@ impl<const TAG_SIZE: usize> AeadCipher<TAG_SIZE> for Aegis256Cipher<TAG_SIZE> {
     }
 
     fn decrypt(&self, ciphertext: &[u8], nonce: &[u8], ad: &[u8]) -> Result<Vec<u8>> {
-        if ciphertext.len() < TAG_SIZE {
+        if ciphertext.len() < AEGIS_TAG_SIZE {
             return Err(LimboError::InternalError("Ciphertext too short".into()));
         }
-        let (ct, tag) = ciphertext.split_at(ciphertext.len() - TAG_SIZE);
-        let tag_array: [u8; TAG_SIZE] = tag.try_into().map_err(|_| {
-            LimboError::InternalError(format!("Invalid tag size for AEGIS-256 {TAG_SIZE}"))
+        let (ct, tag) = ciphertext.split_at(ciphertext.len() - AEGIS_TAG_SIZE);
+        let tag_array: [u8; AEGIS_TAG_SIZE] = tag.try_into().map_err(|_| {
+            LimboError::InternalError(format!("Invalid tag size for AEGIS-256 {AEGIS_TAG_SIZE}"))
         })?;
 
         let nonce_array: [u8; 32] = nonce
             .try_into()
             .map_err(|_| LimboError::InternalError("Invalid nonce size for AEGIS-256".into()))?;
 
-        Aegis256::<TAG_SIZE>::new(self.key.as_bytes(), &nonce_array)
+        Aegis256::<AEGIS_TAG_SIZE>::new(self.key.as_bytes(), &nonce_array)
             .decrypt(ct, &tag_array, ad)
             .map_err(|_| LimboError::InternalError("AEGIS-256 decryption failed".into()))
-    }
-
-    fn nonce_size(&self) -> usize {
-        32
-    }
-
-    fn key_size(&self) -> usize {
-        16
-    }
-
-    fn metadata_size(&self) -> usize {
-        self.nonce_size() + self.tag_size()
     }
 }
 
 #[derive(Clone)]
-pub struct Aes256GcmCipher<const TAG_SIZE: usize> {
+pub struct Aes256GcmCipher {
     key: EncryptionKey,
 }
 
-impl<const TAG_SIZE: usize> AeadCipher<TAG_SIZE> for Aes256GcmCipher<TAG_SIZE> {
+impl Aes256GcmCipher {
     fn new(key: &EncryptionKey) -> Self {
         Self { key: key.clone() }
     }
+}
 
+impl AeadCipher for Aes256GcmCipher {
     fn encrypt(&self, plaintext: &[u8], _ad: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
         use aes_gcm::aead::{AeadInPlace, KeyInit};
         use aes_gcm::Aes256Gcm;
@@ -169,7 +150,7 @@ impl<const TAG_SIZE: usize> AeadCipher<TAG_SIZE> for Aes256GcmCipher<TAG_SIZE> {
             .encrypt_in_place_detached(&nonce, b"", &mut buffer)
             .map_err(|_| LimboError::InternalError("AES-GCM encrypt failed".into()))?;
 
-        buffer.extend_from_slice(&tag[..TAG_SIZE]);
+        buffer.extend_from_slice(&tag[..AES256GCM_TAG_SIZE]);
         Ok((buffer, nonce.to_vec()))
     }
 
@@ -177,10 +158,10 @@ impl<const TAG_SIZE: usize> AeadCipher<TAG_SIZE> for Aes256GcmCipher<TAG_SIZE> {
         use aes_gcm::aead::{AeadInPlace, KeyInit};
         use aes_gcm::{Aes256Gcm, Nonce};
 
-        if ciphertext.len() < TAG_SIZE {
+        if ciphertext.len() < AES256GCM_TAG_SIZE {
             return Err(LimboError::InternalError("Ciphertext too short".into()));
         }
-        let (ct, tag) = ciphertext.split_at(ciphertext.len() - TAG_SIZE);
+        let (ct, tag) = ciphertext.split_at(ciphertext.len() - AES256GCM_TAG_SIZE);
 
         let cipher = Aes256Gcm::new_from_slice(self.key.as_bytes())
             .map_err(|_| LimboError::InternalError("Bad AES key".into()))?;
@@ -193,21 +174,9 @@ impl<const TAG_SIZE: usize> AeadCipher<TAG_SIZE> for Aes256GcmCipher<TAG_SIZE> {
 
         Ok(buffer)
     }
-
-    fn nonce_size(&self) -> usize {
-        12
-    }
-
-    fn key_size(&self) -> usize {
-        32
-    }
-
-    fn metadata_size(&self) -> usize {
-        self.nonce_size() + self.tag_size()
-    }
 }
 
-impl std::fmt::Debug for Aegis256Cipher<AEGIS_TAG_SIZE> {
+impl std::fmt::Debug for Aegis256Cipher {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Aegis256Cipher")
             .field("key", &"<redacted>")
@@ -265,8 +234,8 @@ impl CipherMode {
     /// Returns the authentication tag size for this cipher mode.
     pub fn tag_size(&self) -> usize {
         match self {
-            CipherMode::Aes256Gcm => 16,
-            CipherMode::Aegis256 => 16,
+            CipherMode::Aes256Gcm => AES256GCM_TAG_SIZE,
+            CipherMode::Aegis256 => AEGIS_TAG_SIZE,
         }
     }
 
@@ -278,22 +247,15 @@ impl CipherMode {
 
 #[derive(Clone)]
 pub enum Cipher {
-    Aes256Gcm(Box<Aes256GcmCipher<AES256GCM_TAG_SIZE>>),
-    Aegis256(Box<Aegis256Cipher<AEGIS_TAG_SIZE>>),
+    Aes256Gcm(Aes256GcmCipher),
+    Aegis256(Aegis256Cipher),
 }
 
 impl Cipher {
-    pub fn encrypt(&self, plaintext: &[u8], ad: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
+    fn as_aead(&self) -> &dyn AeadCipher {
         match self {
-            Cipher::Aes256Gcm(cipher) => cipher.encrypt(plaintext, ad),
-            Cipher::Aegis256(cipher) => cipher.encrypt(plaintext, ad),
-        }
-    }
-
-    pub fn decrypt(&self, ciphertext: &[u8], nonce: &[u8], ad: &[u8]) -> Result<Vec<u8>> {
-        match self {
-            Cipher::Aes256Gcm(cipher) => cipher.decrypt(ciphertext, nonce, ad),
-            Cipher::Aegis256(cipher) => cipher.decrypt(ciphertext, nonce, ad),
+            Cipher::Aes256Gcm(c) => c,
+            Cipher::Aegis256(c) => c,
         }
     }
 }
@@ -326,12 +288,8 @@ impl EncryptionContext {
         }
 
         let cipher = match cipher_mode {
-            CipherMode::Aes256Gcm => {
-                Cipher::Aes256Gcm(Box::new(Aes256GcmCipher::<AES256GCM_TAG_SIZE>::new(key)))
-            }
-            CipherMode::Aegis256 => {
-                Cipher::Aegis256(Box::new(Aegis256Cipher::<AEGIS_TAG_SIZE>::new(key)))
-            }
+            CipherMode::Aes256Gcm => Cipher::Aes256Gcm(Aes256GcmCipher::new(key)),
+            CipherMode::Aegis256 => Cipher::Aegis256(Aegis256Cipher::new(key)),
         };
         Ok(Self {
             cipher_mode,
@@ -432,11 +390,11 @@ impl EncryptionContext {
 
     /// encrypts raw data using the configured cipher, returns ciphertext and nonce
     fn encrypt_raw(&self, plaintext: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
-        self.cipher.encrypt(plaintext, b"")
+        self.cipher.as_aead().encrypt(plaintext, b"")
     }
 
     fn decrypt_raw(&self, ciphertext: &[u8], nonce: &[u8]) -> Result<Vec<u8>> {
-        self.cipher.decrypt(ciphertext, nonce, b"")
+        self.cipher.as_aead().decrypt(ciphertext, nonce, b"")
     }
 
     #[cfg(not(feature = "encryption"))]
@@ -507,7 +465,7 @@ mod tests {
     #[test]
     fn test_aegis256_cipher_wrapper() {
         let key = EncryptionKey::from_hex_string(&generate_random_hex_key()).unwrap();
-        let cipher = Aegis256Cipher::<AEGIS_TAG_SIZE>::new(&key);
+        let cipher = Aegis256Cipher::new(&key);
 
         let plaintext = b"Hello, AEGIS-256!";
         let ad = b"additional data";
