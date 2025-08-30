@@ -146,7 +146,68 @@ impl<const TAG_SIZE: usize> AeadCipher<TAG_SIZE> for Aegis256Cipher<TAG_SIZE> {
     }
 }
 
-impl std::fmt::Debug for Aegis256Cipher {
+#[derive(Clone)]
+pub struct Aes256GcmCipher<const TAG_SIZE: usize> {
+    key: EncryptionKey,
+}
+
+impl<const TAG_SIZE: usize> AeadCipher<TAG_SIZE> for Aes256GcmCipher<TAG_SIZE> {
+    fn new(key: &EncryptionKey) -> Self {
+        Self { key: key.clone() }
+    }
+
+    fn encrypt(&self, plaintext: &[u8], _ad: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
+        use aes_gcm::aead::{AeadInPlace, KeyInit};
+        use aes_gcm::Aes256Gcm;
+
+        let cipher = Aes256Gcm::new_from_slice(self.key.as_bytes())
+            .map_err(|_| LimboError::InternalError("Bad AES key".into()))?;
+        let nonce = Aes256Gcm::generate_nonce(&mut rand::thread_rng());
+        let mut buffer = plaintext.to_vec();
+
+        let tag = cipher
+            .encrypt_in_place_detached(&nonce, b"", &mut buffer)
+            .map_err(|_| LimboError::InternalError("AES-GCM encrypt failed".into()))?;
+
+        buffer.extend_from_slice(&tag[..TAG_SIZE]);
+        Ok((buffer, nonce.to_vec()))
+    }
+
+    fn decrypt(&self, ciphertext: &[u8], nonce: &[u8], ad: &[u8]) -> Result<Vec<u8>> {
+        use aes_gcm::aead::{AeadInPlace, KeyInit};
+        use aes_gcm::{Aes256Gcm, Nonce};
+
+        if ciphertext.len() < TAG_SIZE {
+            return Err(LimboError::InternalError("Ciphertext too short".into()));
+        }
+        let (ct, tag) = ciphertext.split_at(ciphertext.len() - TAG_SIZE);
+
+        let cipher = Aes256Gcm::new_from_slice(self.key.as_bytes())
+            .map_err(|_| LimboError::InternalError("Bad AES key".into()))?;
+        let nonce = Nonce::from_slice(nonce);
+
+        let mut buffer = ct.to_vec();
+        cipher
+            .decrypt_in_place_detached(nonce, ad, &mut buffer, tag.into())
+            .map_err(|_| LimboError::InternalError("AES-GCM decrypt failed".into()))?;
+
+        Ok(buffer)
+    }
+
+    fn nonce_size(&self) -> usize {
+        12
+    }
+
+    fn key_size(&self) -> usize {
+        32
+    }
+
+    fn metadata_size(&self) -> usize {
+        self.nonce_size() + self.tag_size()
+    }
+}
+
+impl std::fmt::Debug for Aegis256Cipher<AEGIS_TAG_SIZE> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Aegis256Cipher")
             .field("key", &"<redacted>")
