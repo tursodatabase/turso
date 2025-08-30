@@ -93,47 +93,56 @@ pub trait AeadCipher<const TAG_SIZE: usize>: Clone {
 // wrapper struct for AEGIS-256 cipher, because the crate we use is a bit low-level and we add
 // some nice abstractions here
 // note, the AEGIS has many variants and support for hardware acceleration. Here we just use the
-// vanilla version, which is still order of maginitudes faster than AES-GCM in software. Hardware
+// vanilla version, which is still order of magnitudes faster than AES-GCM in software. Hardware
 // based compilation is left for future work.
 #[derive(Clone)]
-pub struct Aegis256Cipher {
+pub struct Aegis256Cipher<const TAG_SIZE: usize> {
     key: EncryptionKey,
 }
 
-impl Aegis256Cipher {
-    // AEGIS-256 supports both 16 and 32 byte tags, we use the 16 byte variant, it is faster
-    // and provides sufficient security for our use case.
-    const TAG_SIZE: usize = 16;
+impl<const TAG_SIZE: usize> AeadCipher<TAG_SIZE> for Aegis256Cipher<TAG_SIZE> {
     fn new(key: &EncryptionKey) -> Self {
         Self { key: key.clone() }
     }
 
-    fn encrypt(&self, plaintext: &[u8], ad: &[u8]) -> Result<(Vec<u8>, [u8; 32])> {
+    fn encrypt(&self, plaintext: &[u8], ad: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
         let nonce = generate_secure_nonce();
         let (ciphertext, tag) =
-            Aegis256::<16>::new(self.key.as_bytes(), &nonce).encrypt(plaintext, ad);
+            Aegis256::<TAG_SIZE>::new(self.key.as_bytes(), &nonce).encrypt(plaintext, ad);
+
         let mut result = ciphertext;
         result.extend_from_slice(&tag);
-        Ok((result, nonce))
+        Ok((result, nonce.to_vec()))
     }
 
-    fn decrypt(&self, ciphertext: &[u8], nonce: &[u8; 32], ad: &[u8]) -> Result<Vec<u8>> {
-        if ciphertext.len() < Self::TAG_SIZE {
-            return Err(LimboError::InternalError(
-                "Ciphertext too short for AEGIS-256".into(),
-            ));
+    fn decrypt(&self, ciphertext: &[u8], nonce: &[u8], ad: &[u8]) -> Result<Vec<u8>> {
+        if ciphertext.len() < TAG_SIZE {
+            return Err(LimboError::InternalError("Ciphertext too short".into()));
         }
-        let (ct, tag) = ciphertext.split_at(ciphertext.len() - Self::TAG_SIZE);
-        let tag_array: [u8; 16] = tag
-            .try_into()
-            .map_err(|_| LimboError::InternalError("Invalid tag size for AEGIS-256".into()))?;
+        let (ct, tag) = ciphertext.split_at(ciphertext.len() - TAG_SIZE);
+        let tag_array: [u8; TAG_SIZE] = tag.try_into().map_err(|_| {
+            LimboError::InternalError(format!("Invalid tag size for AEGIS-256 {TAG_SIZE}"))
+        })?;
 
-        let plaintext = Aegis256::<16>::new(self.key.as_bytes(), nonce)
+        let nonce_array: [u8; 32] = nonce
+            .try_into()
+            .map_err(|_| LimboError::InternalError("Invalid nonce size for AEGIS-256".into()))?;
+
+        Aegis256::<TAG_SIZE>::new(self.key.as_bytes(), &nonce_array)
             .decrypt(ct, &tag_array, ad)
-            .map_err(|_| {
-                LimboError::InternalError("AEGIS-256 decryption failed: invalid tag".into())
-            })?;
-        Ok(plaintext)
+            .map_err(|_| LimboError::InternalError("AEGIS-256 decryption failed".into()))
+    }
+
+    fn nonce_size(&self) -> usize {
+        32
+    }
+
+    fn key_size(&self) -> usize {
+        16
+    }
+
+    fn metadata_size(&self) -> usize {
+        self.nonce_size() + self.tag_size()
     }
 }
 
