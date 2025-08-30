@@ -1280,7 +1280,7 @@ impl ImmutableRecord {
     pub fn column_count(&self) -> usize {
         let mut cursor = RecordCursor::new();
         cursor.parse_full_header(self).unwrap();
-        cursor.offsets.len()
+        cursor.serial_types.len()
     }
 }
 
@@ -3561,5 +3561,22 @@ mod tests {
             buf.len(),
             header_length + size_of::<i8>() + size_of::<f64>() + text.len()
         );
+    }
+
+    #[test]
+    fn test_column_count_matches_values_written() {
+        // Test with different numbers of values
+        for num_values in 1..=10 {
+            let values: Vec<Value> = (0..num_values).map(|i| Value::Integer(i as i64)).collect();
+
+            let record = ImmutableRecord::from_values(&values, values.len());
+            assert_eq!(
+                record.column_count(),
+                num_values,
+                "column_count should be {} for {} values",
+                num_values,
+                num_values
+            );
+        }
     }
 }
