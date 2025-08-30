@@ -222,7 +222,7 @@ pub fn init_loop(
                         });
                     }
                     // For delete, we need to open all the other indexes too for writing
-                    if let Some(indexes) = t_ctx.resolver.schema.indexes.get(&btree.name) {
+                    if let Some(indexes) = t_ctx.resolver.schema.indexes.get(btree.name.as_str()) {
                         for index in indexes {
                             if table
                                 .op
