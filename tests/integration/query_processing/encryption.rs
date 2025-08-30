@@ -124,5 +124,21 @@ fn test_per_page_encryption() -> anyhow::Result<()> {
         })?;
     }
 
+    {
+        // let's test connecting to the encrypted db using URI
+        let uri = format!(
+            "file:{}?cipher=aegis256&hexkey=b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327",
+            db_path.to_str().unwrap()
+        );
+        let (_io, conn) = turso_core::Connection::from_uri(&uri, true, false, false)?;
+        let mut row_count = 0;
+        run_query_on_row(&tmp_db, &conn, "SELECT * FROM test", |row: &Row| {
+            assert_eq!(row.get::<i64>(0).unwrap(), 1);
+            assert_eq!(row.get::<String>(1).unwrap(), "Hello, World!");
+            row_count += 1;
+        })?;
+        assert_eq!(row_count, 1);
+    }
+
     Ok(())
 }

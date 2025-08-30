@@ -1277,6 +1277,12 @@ impl Connection {
             std::fs::set_permissions(&opts.path, perms.permissions())?;
         }
         let conn = db.connect()?;
+        if let Some(cipher) = opts.cipher {
+            let _ = conn.pragma_update("cipher", format!("'{cipher}'"));
+        }
+        if let Some(hexkey) = opts.hexkey {
+            let _ = conn.pragma_update("hexkey", format!("'{hexkey}'"));
+        }
         Ok((io, conn))
     }
 
