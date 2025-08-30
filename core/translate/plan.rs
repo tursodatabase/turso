@@ -156,7 +156,7 @@ pub enum Plan {
         right_most: SelectPlan,
         limit: Option<isize>,
         offset: Option<isize>,
-        order_by: Option<Vec<(ast::Expr, SortOrder)>>,
+        order_by: Option<Vec<(Box<ast::Expr>, SortOrder)>>,
     },
     Delete(DeletePlan),
     Update(UpdatePlan),
