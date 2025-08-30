@@ -651,10 +651,7 @@ fn prepare_one_select_plan(
                 contains_constant_false_condition: false,
                 query_destination,
                 distinctness: Distinctness::NonDistinct,
-                values: values
-                    .iter()
-                    .map(|values| values.iter().map(|value| *value.clone()).collect())
-                    .collect(),
+                values,
             };
 
             Ok(plan)
