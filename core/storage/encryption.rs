@@ -1,13 +1,14 @@
 #![allow(unused_variables, dead_code)]
 use crate::{LimboError, Result};
 use aegis::aegis256::Aegis256;
-use aes_gcm::{
-    aead::{Aead, AeadCore, KeyInit, OsRng},
-    Aes256Gcm, Key, Nonce,
-};
+use aes_gcm::aead::{AeadCore, OsRng};
 use std::ops::Deref;
 
 pub const ENCRYPTED_PAGE_SIZE: usize = 4096;
+// AEGIS-256 supports both 16 and 32 byte tags, we use the 16 byte variant, it is faster
+// and provides sufficient security for our use case.
+const AEGIS_TAG_SIZE: usize = 16;
+const AES256GCM_TAG_SIZE: usize = 16;
 
 #[repr(transparent)]
 #[derive(Clone)]
