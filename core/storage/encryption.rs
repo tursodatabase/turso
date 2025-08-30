@@ -327,10 +327,11 @@ impl EncryptionContext {
 
         let cipher = match cipher_mode {
             CipherMode::Aes256Gcm => {
-                let cipher_key: &Key<Aes256Gcm> = key.as_ref().into();
-                Cipher::Aes256Gcm(Box::new(Aes256Gcm::new(cipher_key)))
+                Cipher::Aes256Gcm(Box::new(Aes256GcmCipher::<AES256GCM_TAG_SIZE>::new(key)))
             }
-            CipherMode::Aegis256 => Cipher::Aegis256(Box::new(Aegis256Cipher::new(key))),
+            CipherMode::Aegis256 => {
+                Cipher::Aegis256(Box::new(Aegis256Cipher::<AEGIS_TAG_SIZE>::new(key)))
+            }
         };
         Ok(Self {
             cipher_mode,
