@@ -1838,7 +1838,7 @@ pub fn read_entire_wal_dumb(file: &Arc<dyn File>) -> Result<Arc<UnsafeCell<WalFi
 pub fn begin_read_wal_frame_raw(
     buffer_pool: &Arc<BufferPool>,
     io: &Arc<dyn File>,
-    offset: usize,
+    offset: u64,
     complete: Box<ReadComplete>,
 ) -> Result<Completion> {
     tracing::trace!("begin_read_wal_frame_raw(offset={})", offset);
@@ -1851,7 +1851,7 @@ pub fn begin_read_wal_frame_raw(
 
 pub fn begin_read_wal_frame(
     io: &Arc<dyn File>,
-    offset: usize,
+    offset: u64,
     buffer_pool: Arc<BufferPool>,
     complete: Box<ReadComplete>,
     page_idx: usize,

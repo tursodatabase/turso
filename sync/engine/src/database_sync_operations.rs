@@ -81,7 +81,7 @@ pub async fn db_bootstrap<C: ProtocolIO, Ctx>(
             while !c.is_completed() {
                 coro.yield_(ProtocolCommand::IO).await?;
             }
-            pos += content_len;
+            pos += content_len as u64;
         }
         if content.is_done()? {
             break;
@@ -123,7 +123,7 @@ pub async fn wal_apply_from_file<Ctx>(
             // todo(sivukhin): we need to error out in case of partial read
             assert!(size as usize == WAL_FRAME_SIZE);
         });
-        let c = frames_file.pread(offset as usize, c)?;
+        let c = frames_file.pread(offset, c)?;
         while !c.is_completed() {
             coro.yield_(ProtocolCommand::IO).await?;
         }
@@ -243,7 +243,7 @@ pub async fn wal_pull_to_file_v1<C: ProtocolIO, Ctx>(
         while !c.is_completed() {
             coro.yield_(ProtocolCommand::IO).await?;
         }
-        offset += WAL_FRAME_SIZE;
+        offset += WAL_FRAME_SIZE as u64;
     }
 
     let c = Completion::new_sync(move |_| {
@@ -323,7 +323,7 @@ pub async fn wal_pull_to_file_legacy<C: ProtocolIO, Ctx>(
                         coro.yield_(ProtocolCommand::IO).await?;
                     }
 
-                    last_offset += WAL_FRAME_SIZE;
+                    last_offset += WAL_FRAME_SIZE as u64;
                     buffer_len = 0;
                     start_frame += 1;
 
@@ -974,7 +974,7 @@ pub async fn bootstrap_db_file_v1<C: ProtocolIO, Ctx>(
         };
         assert!(rc as usize == 0);
     });
-    let c = file.truncate(header.db_size as usize * PAGE_SIZE, c)?;
+    let c = file.truncate(header.db_size * PAGE_SIZE as u64, c)?;
     while !c.is_completed() {
         coro.yield_(ProtocolCommand::IO).await?;
     }
@@ -984,7 +984,7 @@ pub async fn bootstrap_db_file_v1<C: ProtocolIO, Ctx>(
     while let Some(page_data) =
         wait_proto_message::<Ctx, PageData>(coro, &completion, &mut bytes).await?
     {
-        let offset = page_data.page_id as usize * PAGE_SIZE;
+        let offset = page_data.page_id * PAGE_SIZE as u64;
         let page = decode_page(&header, page_data)?;
         if page.len() != PAGE_SIZE {
             return Err(Error::DatabaseSyncEngineError(format!(
@@ -1074,7 +1074,7 @@ pub async fn reset_wal_file<Ctx>(
         // let's truncate WAL file completely in order for this operation to safely execute on empty WAL in case of initial bootstrap phase
         0
     } else {
-        WAL_HEADER + WAL_FRAME_SIZE * (frames_count as usize)
+        WAL_HEADER as u64 + WAL_FRAME_SIZE as u64 * frames_count
     };
     tracing::debug!("reset db wal to the size of {} frames", frames_count);
     let c = Completion::new_trunc(move |result| {

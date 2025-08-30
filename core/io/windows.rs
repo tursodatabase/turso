@@ -3,16 +3,16 @@ use parking_lot::RwLock;
 use std::io::{Read, Seek, Write};
 use std::sync::Arc;
 use tracing::{debug, instrument, trace, Level};
-pub struct GenericIO {}
+pub struct WindowsIO {}
 
-impl GenericIO {
+impl WindowsIO {
     pub fn new() -> Result<Self> {
         debug!("Using IO backend 'syscall'");
         Ok(Self {})
     }
 }
 
-impl IO for GenericIO {
+impl IO for WindowsIO {
     #[instrument(err, skip_all, level = Level::TRACE)]
     fn open_file(&self, path: &str, flags: OpenFlags, direct: bool) -> Result<Arc<dyn File>> {
         trace!("open_file(path = {})", path);
@@ -25,7 +25,7 @@ impl IO for GenericIO {
         }
 
         let file = file.open(path)?;
-        Ok(Arc::new(GenericFile {
+        Ok(Arc::new(WindowsFile {
             file: RwLock::new(file),
         }))
     }
@@ -42,7 +42,7 @@ impl IO for GenericIO {
     }
 }
 
-impl Clock for GenericIO {
+impl Clock for WindowsIO {
     fn now(&self) -> Instant {
         let now = chrono::Local::now();
         Instant {
@@ -52,11 +52,11 @@ impl Clock for GenericIO {
     }
 }
 
-pub struct GenericFile {
+pub struct WindowsFile {
     file: RwLock<std::fs::File>,
 }
 
-impl File for GenericFile {
+impl File for WindowsFile {
     #[instrument(err, skip_all, level = Level::TRACE)]
     fn lock_file(&self, exclusive: bool) -> Result<()> {
         unimplemented!()

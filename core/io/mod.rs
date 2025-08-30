@@ -12,10 +12,10 @@ use std::{fmt::Debug, pin::Pin};
 pub trait File: Send + Sync {
     fn lock_file(&self, exclusive: bool) -> Result<()>;
     fn unlock_file(&self) -> Result<()>;
-    fn pread(&self, pos: usize, c: Completion) -> Result<Completion>;
-    fn pwrite(&self, pos: usize, buffer: Arc<Buffer>, c: Completion) -> Result<Completion>;
+    fn pread(&self, pos: u64, c: Completion) -> Result<Completion>;
+    fn pwrite(&self, pos: u64, buffer: Arc<Buffer>, c: Completion) -> Result<Completion>;
     fn sync(&self, c: Completion) -> Result<Completion>;
-    fn pwritev(&self, pos: usize, buffers: Vec<Arc<Buffer>>, c: Completion) -> Result<Completion> {
+    fn pwritev(&self, pos: u64, buffers: Vec<Arc<Buffer>>, c: Completion) -> Result<Completion> {
         use std::sync::atomic::{AtomicUsize, Ordering};
         if buffers.is_empty() {
             c.complete(0);
@@ -56,12 +56,12 @@ pub trait File: Send + Sync {
                 c.abort();
                 return Err(e);
             }
-            pos += len;
+            pos += len as u64;
         }
         Ok(c)
     }
     fn size(&self) -> Result<u64>;
-    fn truncate(&self, len: usize, c: Completion) -> Result<Completion>;
+    fn truncate(&self, len: u64, c: Completion) -> Result<Completion>;
 }
 
 #[derive(Debug, Copy, Clone, PartialEq)]
@@ -87,7 +87,9 @@ pub trait IO: Clock + Send + Sync {
     // remove_file is used in the sync-engine
     fn remove_file(&self, path: &str) -> Result<()>;
 
-    fn run_once(&self) -> Result<()>;
+    fn run_once(&self) -> Result<()> {
+        Ok(())
+    }
 
     fn wait_for_completion(&self, c: Completion) -> Result<()> {
         while !c.finished() {
