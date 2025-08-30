@@ -11402,14 +11402,23 @@ mod tests {
         ];
 
         for (input, expected) in test_cases {
-            println!("Testing input: {:?}", from_bytes(input));
+            let input_str = from_bytes(input);
             let parser = Parser::new(input);
             let mut results = Vec::new();
             for cmd in parser {
                 results.push(cmd.unwrap());
             }
 
-            assert_eq!(results, expected, "Input: {input:?}");
+            assert_eq!(results, expected, "Input: {input_str:?}");
+
+            // to_string tests
+            for (i, r) in results.iter().enumerate() {
+                let rstring = r.to_string();
+                // put new string into parser again
+                let result = Parser::new(rstring.as_bytes()).next().unwrap().unwrap();
+                let expected = &expected[i];
+                assert_eq!(result, expected.clone(), "Input: {rstring:?}");
+            }
         }
     }
 }

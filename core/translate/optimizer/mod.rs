@@ -8,7 +8,7 @@ use join::{compute_best_join_order, BestJoinOrderResult};
 use lift_common_subexpressions::lift_common_subexpressions_from_binary_or_terms;
 use order::{compute_order_target, plan_satisfies_order_target, EliminatesSortBy};
 use turso_ext::{ConstraintInfo, ConstraintUsage};
-use turso_parser::ast::{self, fmt::ToTokens as _, Expr, SortOrder};
+use turso_parser::ast::{self, Expr, SortOrder};
 
 use crate::{
     parameters::PARAM_PREFIX,
@@ -52,11 +52,7 @@ pub fn optimize_plan(plan: &mut Plan, schema: &Schema) -> Result<()> {
         }
     }
     // When debug tracing is enabled, print the optimized plan as a SQL string for debugging
-    tracing::debug!(
-        plan_sql = plan
-            .format_with_context(&crate::translate::display::PlanContext(&[]))
-            .unwrap()
-    );
+    tracing::debug!(plan_sql = plan.to_string());
     Ok(())
 }
 

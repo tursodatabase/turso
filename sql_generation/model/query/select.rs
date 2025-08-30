@@ -3,12 +3,13 @@ use std::{collections::HashSet, fmt::Display};
 pub use ast::Distinctness;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
-use turso_parser::ast::{self, fmt::ToTokens, SortOrder};
-
-use crate::model::{
-    query::EmptyContext,
-    table::{JoinTable, JoinType, JoinedTable, Table},
+use turso_parser::ast::{
+    self,
+    fmt::{BlankContext, ToTokens},
+    SortOrder,
 };
+
+use crate::model::table::{JoinTable, JoinType, JoinedTable, Table};
 
 use super::predicate::Predicate;
 
@@ -366,7 +367,7 @@ impl Select {
 
 impl Display for Select {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.to_sql_ast().to_fmt_with_context(f, &EmptyContext {})
+        self.to_sql_ast().displayer(&BlankContext).fmt(f)
     }
 }
 

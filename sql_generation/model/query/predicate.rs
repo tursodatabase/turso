@@ -1,7 +1,10 @@
 use std::fmt::Display;
 
 use serde::{Deserialize, Serialize};
-use turso_parser::ast::{self, fmt::ToTokens};
+use turso_parser::ast::{
+    self,
+    fmt::{BlankContext, ToTokens},
+};
 
 use crate::model::table::{SimValue, Table, TableContext};
 
@@ -142,6 +145,6 @@ pub fn expr_to_value<T: TableContext>(
 
 impl Display for Predicate {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.to_fmt(f)
+        self.0.displayer(&BlankContext).fmt(f)
     }
 }

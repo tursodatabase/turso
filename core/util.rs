@@ -1237,7 +1237,7 @@ pub fn extract_view_columns(select_stmt: &ast::Select, schema: &Schema) -> Vec<C
                         .or_else(|| extract_column_name_from_expr(expr))
                         .unwrap_or_else(|| {
                             // If we can't extract a simple column name, use the expression itself
-                            expr.format().unwrap_or_else(|_| format!("column_{i}"))
+                            expr.to_string()
                         });
                     columns.push(Column {
                         name: Some(name),

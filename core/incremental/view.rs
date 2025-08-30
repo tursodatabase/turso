@@ -140,14 +140,7 @@ impl IncrementalView {
             Parser::new(sql.as_bytes()).next_cmd()
         {
             // Compare the SELECT statements as SQL strings
-            use turso_parser::ast::fmt::ToTokens;
-
-            // Format both SELECT statements and compare
-            if let (Ok(current_sql), Ok(provided_sql)) =
-                (self.select_stmt.format(), select.format())
-            {
-                return current_sql == provided_sql;
-            }
+            return self.select_stmt == select;
         }
         false
     }

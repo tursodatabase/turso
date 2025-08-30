@@ -1,4 +1,4 @@
-use turso_parser::ast::SortOrder;
+use turso_parser::ast::{fmt::ToTokens, SortOrder};
 
 use std::sync::Arc;
 
@@ -20,6 +20,7 @@ use crate::{
 
 use super::{
     aggregation::translate_aggregation_step,
+    display::PlanContext,
     emitter::{OperationMode, TranslateCtx},
     expr::{
         translate_condition_expr, translate_expr, translate_expr_no_constant_opt,
@@ -77,12 +78,17 @@ pub fn init_distinct(program: &mut ProgramBuilder, plan: &SelectPlan) -> Distinc
             .result_columns
             .iter()
             .enumerate()
-            .map(|(i, col)| IndexColumn {
-                name: col.expr.to_string(),
-                order: SortOrder::Asc,
-                pos_in_table: i,
-                collation: None, // FIXME: this should be determined based on the result column expression!
-                default: None, // FIXME: this should be determined based on the result column expression!
+            .map(|(i, col)| {
+                IndexColumn {
+                    name: col
+                        .expr
+                        .displayer(&PlanContext(&[&plan.table_references]))
+                        .to_string(),
+                    order: SortOrder::Asc,
+                    pos_in_table: i,
+                    collation: None, // FIXME: this should be determined based on the result column expression!
+                    default: None, // FIXME: this should be determined based on the result column expression!
+                }
             })
             .collect(),
         unique: false,
@@ -141,14 +147,18 @@ pub fn init_loop(
             agg.args.len() == 1,
             "DISTINCT aggregate functions must have exactly one argument"
         );
-        let index_name = format!("distinct_agg_{}_{}", i, agg.args[0]);
+        let index_name = format!(
+            "distinct_agg_{}_{}",
+            i,
+            agg.args[0].displayer(&PlanContext(&[tables]))
+        );
         let index = Arc::new(Index {
             name: index_name.clone(),
             table_name: String::new(),
             ephemeral: true,
             root_page: 0,
             columns: vec![IndexColumn {
-                name: agg.args[0].to_string(),
+                name: agg.args[0].displayer(&PlanContext(&[tables])).to_string(),
                 order: SortOrder::Asc,
                 pos_in_table: 0,
                 collation: None, // FIXME: this should be inferred from the expression
