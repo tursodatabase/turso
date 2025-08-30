@@ -3,6 +3,7 @@ mod error;
 pub(crate) mod jsonb;
 mod ops;
 pub(crate) mod path;
+pub(crate) mod vtab;
 
 use crate::json::error::Error as JsonError;
 pub use crate::json::ops::{

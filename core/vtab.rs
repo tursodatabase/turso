@@ -1,8 +1,9 @@
+use crate::json::vtab::JsonEachVirtualTable;
 use crate::pragma::{PragmaVirtualTable, PragmaVirtualTableCursor};
 use crate::schema::Column;
 use crate::util::columns_from_create_table_body;
 use crate::{Connection, LimboError, SymbolTable, Value};
-
+use std::cell::RefCell;
 use std::ffi::c_void;
 use std::ptr::NonNull;
 use std::rc::Rc;
@@ -14,6 +15,7 @@ use turso_parser::{ast, parser::Parser};
 pub(crate) enum VirtualTableType {
     Pragma(PragmaVirtualTable),
     External(ExtVirtualTable),
+    Internal(Arc<RefCell<dyn InternalVirtualTable>>),
     View(crate::vtab_view::ViewVirtualTable),
 }
 
@@ -31,23 +33,44 @@ impl VirtualTable {
             VirtualTableType::Pragma(_) => true,
             VirtualTableType::External(table) => table.readonly(),
             VirtualTableType::View(_) => true,
+            VirtualTableType::Internal(_) => true,
         }
     }
 
     pub(crate) fn builtin_functions() -> Vec<Arc<VirtualTable>> {
-        PragmaVirtualTable::functions()
+        let mut vtables: Vec<Arc<VirtualTable>> = PragmaVirtualTable::functions()
             .into_iter()
             .map(|(tab, schema)| {
                 let vtab = VirtualTable {
                     name: format!("pragma_{}", tab.pragma_name),
                     columns: Self::resolve_columns(schema)
-                        .expect("built-in function schema resolution should not fail"),
+                        .expect("pragma table-valued function schema resolution should not fail"),
                     kind: VTabKind::TableValuedFunction,
                     vtab_type: VirtualTableType::Pragma(tab),
                 };
                 Arc::new(vtab)
             })
-            .collect()
+            .collect();
+
+        #[cfg(feature = "json")]
+        vtables.extend(Self::json_virtual_tables());
+
+        vtables
+    }
+
+    #[cfg(feature = "json")]
+    fn json_virtual_tables() -> Vec<Arc<VirtualTable>> {
+        let json_each = JsonEachVirtualTable {};
+
+        let json_each_virtual_table = VirtualTable {
+            name: json_each.name(),
+            columns: Self::resolve_columns(json_each.sql())
+                .expect("internal table-valued function schema resolution should not fail"),
+            kind: VTabKind::TableValuedFunction,
+            vtab_type: VirtualTableType::Internal(Arc::new(RefCell::new(json_each))),
+        };
+
+        vec![Arc::new(json_each_virtual_table)]
     }
 
     pub(crate) fn function(name: &str, syms: &SymbolTable) -> crate::Result<Arc<VirtualTable>> {
@@ -127,6 +150,9 @@ impl VirtualTable {
             VirtualTableType::View(table) => {
                 Ok(VirtualTableCursor::View(Box::new(table.open(conn)?)))
             }
+            VirtualTableType::Internal(table) => {
+                Ok(VirtualTableCursor::Internal(table.borrow().open(conn)?))
+            }
         }
     }
 
@@ -135,6 +161,7 @@ impl VirtualTable {
             VirtualTableType::Pragma(_) => Err(LimboError::ReadOnly),
             VirtualTableType::External(table) => table.update(args),
             VirtualTableType::View(_) => Err(LimboError::ReadOnly),
+            VirtualTableType::Internal(_) => Err(LimboError::ReadOnly),
         }
     }
 
@@ -143,6 +170,7 @@ impl VirtualTable {
             VirtualTableType::Pragma(_) => Ok(()),
             VirtualTableType::External(table) => table.destroy(),
             VirtualTableType::View(_) => Ok(()),
+            VirtualTableType::Internal(_) => Ok(()),
         }
     }
 
@@ -155,6 +183,7 @@ impl VirtualTable {
             VirtualTableType::Pragma(table) => table.best_index(constraints),
             VirtualTableType::External(table) => table.best_index(constraints, order_by),
             VirtualTableType::View(view) => view.best_index(),
+            VirtualTableType::Internal(table) => table.borrow().best_index(constraints, order_by),
         }
     }
 }
@@ -163,6 +192,7 @@ pub enum VirtualTableCursor {
     Pragma(Box<PragmaVirtualTableCursor>),
     External(ExtVirtualTableCursor),
     View(Box<crate::vtab_view::ViewVirtualTableCursor>),
+    Internal(Arc<RefCell<dyn InternalVirtualTableCursor>>),
 }
 
 impl VirtualTableCursor {
@@ -171,6 +201,7 @@ impl VirtualTableCursor {
             VirtualTableCursor::Pragma(cursor) => cursor.next(),
             VirtualTableCursor::External(cursor) => cursor.next(),
             VirtualTableCursor::View(cursor) => cursor.next(),
+            VirtualTableCursor::Internal(cursor) => cursor.borrow_mut().next(),
         }
     }
 
@@ -179,6 +210,7 @@ impl VirtualTableCursor {
             VirtualTableCursor::Pragma(cursor) => cursor.rowid(),
             VirtualTableCursor::External(cursor) => cursor.rowid(),
             VirtualTableCursor::View(cursor) => cursor.rowid(),
+            VirtualTableCursor::Internal(cursor) => cursor.borrow().rowid(),
         }
     }
 
@@ -187,6 +219,7 @@ impl VirtualTableCursor {
             VirtualTableCursor::Pragma(cursor) => cursor.column(column),
             VirtualTableCursor::External(cursor) => cursor.column(column),
             VirtualTableCursor::View(cursor) => cursor.column(column),
+            VirtualTableCursor::Internal(cursor) => cursor.borrow().column(column),
         }
     }
 
@@ -203,6 +236,9 @@ impl VirtualTableCursor {
                 cursor.filter(idx_num, idx_str, arg_count, args)
             }
             VirtualTableCursor::View(cursor) => cursor.filter(args),
+            VirtualTableCursor::Internal(cursor) => {
+                cursor.borrow_mut().filter(&args, idx_str, idx_num)
+            }
         }
     }
 }
@@ -403,4 +439,31 @@ impl Drop for ExtVirtualTableCursor {
             tracing::error!("Failed to close virtual table cursor");
         }
     }
+}
+
+pub trait InternalVirtualTable: std::fmt::Debug {
+    fn name(&self) -> String;
+    fn open(
+        &self,
+        conn: Arc<Connection>,
+    ) -> crate::Result<Arc<RefCell<dyn InternalVirtualTableCursor>>>;
+    fn best_index(
+        &self,
+        constraints: &[turso_ext::ConstraintInfo],
+        order_by: &[turso_ext::OrderByInfo],
+    ) -> Result<turso_ext::IndexInfo, ResultCode>;
+    fn sql(&self) -> String;
+}
+
+pub trait InternalVirtualTableCursor {
+    /// next returns `Ok(true)` if there are more rows, and `Ok(false)` otherwise.
+    fn next(&mut self) -> Result<bool, LimboError>;
+    fn rowid(&self) -> i64;
+    fn column(&self, column: usize) -> Result<Value, LimboError>;
+    fn filter(
+        &mut self,
+        args: &[Value],
+        idx_str: Option<String>,
+        idx_num: i32,
+    ) -> Result<bool, LimboError>;
 }
