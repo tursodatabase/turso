@@ -7,8 +7,6 @@ use aes_gcm::{
 };
 use std::ops::Deref;
 
-pub const ENCRYPTED_PAGE_SIZE: usize = 4096;
-
 #[repr(transparent)]
 #[derive(Clone)]
 pub struct EncryptionKey([u8; 32]);
@@ -208,10 +206,11 @@ impl std::fmt::Debug for Cipher {
 pub struct EncryptionContext {
     cipher_mode: CipherMode,
     cipher: Cipher,
+    page_size: usize,
 }
 
 impl EncryptionContext {
-    pub fn new(cipher_mode: CipherMode, key: &EncryptionKey) -> Result<Self> {
+    pub fn new(cipher_mode: CipherMode, key: &EncryptionKey, page_size: usize) -> Result<Self> {
         let required_size = cipher_mode.required_key_size();
         if key.as_slice().len() != required_size {
             return Err(crate::LimboError::InvalidArgument(format!(
@@ -232,6 +231,7 @@ impl EncryptionContext {
         Ok(Self {
             cipher_mode,
             cipher,
+            page_size,
         })
     }
 
@@ -253,36 +253,38 @@ impl EncryptionContext {
         tracing::debug!("encrypting page {}", page_id);
         assert_eq!(
             page.len(),
-            ENCRYPTED_PAGE_SIZE,
-            "Page data must be exactly {ENCRYPTED_PAGE_SIZE} bytes"
+            self.page_size,
+            "Page data must be exactly {} bytes",
+            self.page_size
         );
 
         let metadata_size = self.cipher_mode.metadata_size();
-        let reserved_bytes = &page[ENCRYPTED_PAGE_SIZE - metadata_size..];
+        let reserved_bytes = &page[self.page_size - metadata_size..];
         let reserved_bytes_zeroed = reserved_bytes.iter().all(|&b| b == 0);
         assert!(
             reserved_bytes_zeroed,
             "last reserved bytes must be empty/zero, but found non-zero bytes"
         );
 
-        let payload = &page[..ENCRYPTED_PAGE_SIZE - metadata_size];
+        let payload = &page[..self.page_size - metadata_size];
         let (encrypted, nonce) = self.encrypt_raw(payload)?;
 
         let nonce_size = self.cipher_mode.nonce_size();
         assert_eq!(
             encrypted.len(),
-            ENCRYPTED_PAGE_SIZE - nonce_size,
+            self.page_size - nonce_size,
             "Encrypted page must be exactly {} bytes",
-            ENCRYPTED_PAGE_SIZE - nonce_size
+            self.page_size - nonce_size
         );
 
-        let mut result = Vec::with_capacity(ENCRYPTED_PAGE_SIZE);
+        let mut result = Vec::with_capacity(self.page_size);
         result.extend_from_slice(&encrypted);
         result.extend_from_slice(&nonce);
         assert_eq!(
             result.len(),
-            ENCRYPTED_PAGE_SIZE,
-            "Encrypted page must be exactly {ENCRYPTED_PAGE_SIZE} bytes"
+            self.page_size,
+            "Encrypted page must be exactly {} bytes",
+            self.page_size
         );
         Ok(result)
     }
@@ -296,8 +298,9 @@ impl EncryptionContext {
         tracing::debug!("decrypting page {}", page_id);
         assert_eq!(
             encrypted_page.len(),
-            ENCRYPTED_PAGE_SIZE,
-            "Encrypted page data must be exactly {ENCRYPTED_PAGE_SIZE} bytes"
+            self.page_size,
+            "Encrypted page data must be exactly {} bytes",
+            self.page_size
         );
 
         let nonce_size = self.cipher_mode.nonce_size();
@@ -310,18 +313,19 @@ impl EncryptionContext {
         let metadata_size = self.cipher_mode.metadata_size();
         assert_eq!(
             decrypted_data.len(),
-            ENCRYPTED_PAGE_SIZE - metadata_size,
+            self.page_size - metadata_size,
             "Decrypted page data must be exactly {} bytes",
-            ENCRYPTED_PAGE_SIZE - metadata_size
+            self.page_size - metadata_size
         );
 
-        let mut result = Vec::with_capacity(ENCRYPTED_PAGE_SIZE);
+        let mut result = Vec::with_capacity(self.page_size);
         result.extend_from_slice(&decrypted_data);
-        result.resize(ENCRYPTED_PAGE_SIZE, 0);
+        result.resize(self.page_size, 0);
         assert_eq!(
             result.len(),
-            ENCRYPTED_PAGE_SIZE,
-            "Decrypted page data must be exactly {ENCRYPTED_PAGE_SIZE} bytes"
+            self.page_size,
+            "Decrypted page data must be exactly {} bytes",
+            self.page_size
         );
         Ok(result)
     }
@@ -393,6 +397,7 @@ fn generate_secure_nonce() -> [u8; 32] {
 mod tests {
     use super::*;
     use rand::Rng;
+    const DEFAULT_ENCRYPTED_PAGE_SIZE: usize = 4096;
 
     fn generate_random_hex_key() -> String {
         let mut rng = rand::thread_rng();
@@ -407,10 +412,10 @@ mod tests {
         let mut rng = rand::thread_rng();
         let cipher_mode = CipherMode::Aes256Gcm;
         let metadata_size = cipher_mode.metadata_size();
-        let data_size = ENCRYPTED_PAGE_SIZE - metadata_size;
+        let data_size = DEFAULT_ENCRYPTED_PAGE_SIZE - metadata_size;
 
         let page_data = {
-            let mut page = vec![0u8; ENCRYPTED_PAGE_SIZE];
+            let mut page = vec![0u8; DEFAULT_ENCRYPTED_PAGE_SIZE];
             page.iter_mut()
                 .take(data_size)
                 .for_each(|byte| *byte = rng.gen());
@@ -418,16 +423,17 @@ mod tests {
         };
 
         let key = EncryptionKey::from_hex_string(&generate_random_hex_key()).unwrap();
-        let ctx = EncryptionContext::new(CipherMode::Aes256Gcm, &key).unwrap();
+        let ctx = EncryptionContext::new(CipherMode::Aes256Gcm, &key, DEFAULT_ENCRYPTED_PAGE_SIZE)
+            .unwrap();
 
         let page_id = 42;
         let encrypted = ctx.encrypt_page(&page_data, page_id).unwrap();
-        assert_eq!(encrypted.len(), ENCRYPTED_PAGE_SIZE);
+        assert_eq!(encrypted.len(), DEFAULT_ENCRYPTED_PAGE_SIZE);
         assert_ne!(&encrypted[..data_size], &page_data[..data_size]);
         assert_ne!(&encrypted[..], &page_data[..]);
 
         let decrypted = ctx.decrypt_page(&encrypted, page_id).unwrap();
-        assert_eq!(decrypted.len(), ENCRYPTED_PAGE_SIZE);
+        assert_eq!(decrypted.len(), DEFAULT_ENCRYPTED_PAGE_SIZE);
         assert_eq!(decrypted, page_data);
     }
 
@@ -452,7 +458,8 @@ mod tests {
     #[cfg(feature = "encryption")]
     fn test_aegis256_raw_encryption() {
         let key = EncryptionKey::from_hex_string(&generate_random_hex_key()).unwrap();
-        let ctx = EncryptionContext::new(CipherMode::Aegis256, &key).unwrap();
+        let ctx = EncryptionContext::new(CipherMode::Aegis256, &key, DEFAULT_ENCRYPTED_PAGE_SIZE)
+            .unwrap();
 
         let plaintext = b"Hello, AEGIS-256!";
         let (ciphertext, nonce) = ctx.encrypt_raw(plaintext).unwrap();
@@ -470,10 +477,10 @@ mod tests {
         let mut rng = rand::thread_rng();
         let cipher_mode = CipherMode::Aegis256;
         let metadata_size = cipher_mode.metadata_size();
-        let data_size = ENCRYPTED_PAGE_SIZE - metadata_size;
+        let data_size = DEFAULT_ENCRYPTED_PAGE_SIZE - metadata_size;
 
         let page_data = {
-            let mut page = vec![0u8; ENCRYPTED_PAGE_SIZE];
+            let mut page = vec![0u8; DEFAULT_ENCRYPTED_PAGE_SIZE];
             page.iter_mut()
                 .take(data_size)
                 .for_each(|byte| *byte = rng.gen());
@@ -481,15 +488,16 @@ mod tests {
         };
 
         let key = EncryptionKey::from_hex_string(&generate_random_hex_key()).unwrap();
-        let ctx = EncryptionContext::new(CipherMode::Aegis256, &key).unwrap();
+        let ctx = EncryptionContext::new(CipherMode::Aegis256, &key, DEFAULT_ENCRYPTED_PAGE_SIZE)
+            .unwrap();
 
         let page_id = 42;
         let encrypted = ctx.encrypt_page(&page_data, page_id).unwrap();
-        assert_eq!(encrypted.len(), ENCRYPTED_PAGE_SIZE);
+        assert_eq!(encrypted.len(), DEFAULT_ENCRYPTED_PAGE_SIZE);
         assert_ne!(&encrypted[..data_size], &page_data[..data_size]);
 
         let decrypted = ctx.decrypt_page(&encrypted, page_id).unwrap();
-        assert_eq!(decrypted.len(), ENCRYPTED_PAGE_SIZE);
+        assert_eq!(decrypted.len(), DEFAULT_ENCRYPTED_PAGE_SIZE);
         assert_eq!(decrypted, page_data);
     }
 }

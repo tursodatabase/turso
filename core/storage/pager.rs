@@ -2186,7 +2186,8 @@ impl Pager {
     }
 
     pub fn set_encryption_context(&self, cipher_mode: CipherMode, key: &EncryptionKey) {
-        let encryption_ctx = EncryptionContext::new(cipher_mode, key).unwrap();
+        let page_size = self.page_size.get().unwrap().get() as usize;
+        let encryption_ctx = EncryptionContext::new(cipher_mode, key, page_size).unwrap();
         {
             let mut io_ctx = self.io_ctx.borrow_mut();
             io_ctx.set_encryption(encryption_ctx);
