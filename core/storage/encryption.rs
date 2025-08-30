@@ -432,42 +432,11 @@ impl EncryptionContext {
 
     /// encrypts raw data using the configured cipher, returns ciphertext and nonce
     fn encrypt_raw(&self, plaintext: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
-        match &self.cipher {
-            Cipher::Aes256Gcm(cipher) => {
-                let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
-                let ciphertext = cipher
-                    .encrypt(&nonce, plaintext)
-                    .map_err(|e| LimboError::InternalError(format!("Encryption failed: {e:?}")))?;
-                Ok((ciphertext, nonce.to_vec()))
-            }
-            Cipher::Aegis256(cipher) => {
-                let ad = b"";
-                let (ciphertext, nonce) = cipher.encrypt(plaintext, ad)?;
-                Ok((ciphertext, nonce.to_vec()))
-            }
-        }
+        self.cipher.encrypt(plaintext, b"")
     }
 
     fn decrypt_raw(&self, ciphertext: &[u8], nonce: &[u8]) -> Result<Vec<u8>> {
-        match &self.cipher {
-            Cipher::Aes256Gcm(cipher) => {
-                let nonce = Nonce::from_slice(nonce);
-                let plaintext = cipher.decrypt(nonce, ciphertext).map_err(|e| {
-                    crate::LimboError::InternalError(format!("Decryption failed: {e:?}"))
-                })?;
-                Ok(plaintext)
-            }
-            Cipher::Aegis256(cipher) => {
-                let nonce_array: [u8; 32] = nonce.try_into().map_err(|_| {
-                    LimboError::InternalError(format!(
-                        "Invalid nonce size for AEGIS-256: expected 32, got {}",
-                        nonce.len()
-                    ))
-                })?;
-                let ad = b"";
-                cipher.decrypt(ciphertext, &nonce_array, ad)
-            }
-        }
+        self.cipher.decrypt(ciphertext, nonce, b"")
     }
 
     #[cfg(not(feature = "encryption"))]
