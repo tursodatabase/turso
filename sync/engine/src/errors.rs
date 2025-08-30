@@ -10,6 +10,8 @@ pub enum Error {
     DatabaseSyncEngineError(String),
     #[error("database sync engine conflict: {0}")]
     DatabaseSyncEngineConflict(String),
+    #[error("database sync engine IO error: {0}")]
+    IoError(#[from] std::io::Error),
 }
 
 #[cfg(test)]

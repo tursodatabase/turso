@@ -116,3 +116,5 @@ module.exports.JsDataPollResult = __napiModule.exports.JsDataPollResult
 module.exports.JsProtocolIo = __napiModule.exports.JsProtocolIo
 module.exports.JsProtocolRequestData = __napiModule.exports.JsProtocolRequestData
 module.exports.SyncEngine = __napiModule.exports.SyncEngine
+module.exports.DatabaseChangeTypeJs = __napiModule.exports.DatabaseChangeTypeJs
+module.exports.SyncEngineProtocolVersion = __napiModule.exports.SyncEngineProtocolVersion

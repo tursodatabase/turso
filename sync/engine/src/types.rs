@@ -1,8 +1,39 @@
+use std::{cell::RefCell, collections::HashMap, sync::Arc};
+
 use serde::{Deserialize, Serialize};
 
 use crate::{errors::Error, Result};
 
-pub type Coro = genawaiter::sync::Co<ProtocolCommand, Result<()>>;
+pub type Transform<Ctx> =
+    Arc<dyn Fn(&Ctx, DatabaseRowMutation) -> Result<Option<DatabaseRowStatement>> + 'static>;
+
+pub struct Coro<Ctx> {
+    pub ctx: RefCell<Ctx>,
+    gen: genawaiter::sync::Co<ProtocolCommand, Result<Ctx>>,
+}
+
+impl<Ctx> Coro<Ctx> {
+    pub fn new(ctx: Ctx, gen: genawaiter::sync::Co<ProtocolCommand, Result<Ctx>>) -> Self {
+        Self {
+            ctx: RefCell::new(ctx),
+            gen,
+        }
+    }
+    pub async fn yield_(&self, value: ProtocolCommand) -> Result<()> {
+        let ctx = self.gen.yield_(value).await?;
+        self.ctx.replace(ctx);
+        Ok(())
+    }
+}
+
+impl From<genawaiter::sync::Co<ProtocolCommand, Result<()>>> for Coro<()> {
+    fn from(value: genawaiter::sync::Co<ProtocolCommand, Result<()>>) -> Self {
+        Self {
+            gen: value,
+            ctx: RefCell::new(()),
+        }
+    }
+}
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct DbSyncInfo {
@@ -17,6 +48,17 @@ pub struct DbSyncStatus {
     pub max_frame_no: u64,
 }
 
+#[derive(Debug)]
+pub struct DbChangesStatus {
+    pub revision: DatabasePullRevision,
+    pub file_path: String,
+}
+
+pub struct SyncEngineStats {
+    pub cdc_operations: i64,
+    pub wal_size: i64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum DatabaseChangeType {
     Delete,
@@ -29,12 +71,30 @@ pub struct DatabaseMetadata {
     /// Unique identifier of the client - generated on sync startup
     pub client_unique_id: String,
     /// Latest generation from remote which was pulled locally to the Synced DB
-    pub synced_generation: u64,
-    /// Latest frame number from remote which was pulled locally to the Synced DB
-    pub synced_frame_no: Option<u64>,
+    pub synced_revision: Option<DatabasePullRevision>,
     /// pair of frame_no for Draft and Synced DB such that content of the database file up to these frames is identical
-    pub draft_wal_match_watermark: u64,
-    pub synced_wal_match_watermark: u64,
+    pub revert_since_wal_salt: Option<Vec<u32>>,
+    pub revert_since_wal_watermark: u64,
+    pub last_pushed_pull_gen_hint: i64,
+    pub last_pushed_change_id_hint: i64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum DatabasePullRevision {
+    Legacy {
+        generation: u64,
+        synced_frame_no: Option<u64>,
+    },
+    V1 {
+        revision: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+pub enum DatabaseSyncEngineProtocolVersion {
+    Legacy,
+    V1,
 }
 
 impl DatabaseMetadata {
@@ -197,6 +257,21 @@ impl TryFrom<&turso_core::Row> for DatabaseChange {
             updates,
         })
     }
+}
+
+pub struct DatabaseRowMutation {
+    pub change_time: u64,
+    pub table_name: String,
+    pub id: i64,
+    pub change_type: DatabaseChangeType,
+    pub before: Option<HashMap<String, turso_core::Value>>,
+    pub after: Option<HashMap<String, turso_core::Value>>,
+    pub updates: Option<HashMap<String, turso_core::Value>>,
+}
+
+pub struct DatabaseRowStatement {
+    pub sql: String,
+    pub values: Vec<turso_core::Value>,
 }
 
 pub enum DatabaseTapeRowChangeType {

@@ -120,6 +120,8 @@ pub enum CompletionError {
     UringIOError(&'static str),
     #[error("Completion was aborted")]
     Aborted,
+    #[error("Decryption failed for page={page_idx}")]
+    DecryptionError { page_idx: usize },
 }
 
 #[macro_export]

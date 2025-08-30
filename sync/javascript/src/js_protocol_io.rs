@@ -15,6 +15,7 @@ pub enum JsProtocolRequest {
         method: String,
         path: String,
         body: Option<Vec<u8>>,
+        headers: Vec<(String, String)>,
     },
     FullRead {
         path: String,
@@ -130,11 +131,16 @@ impl ProtocolIO for JsProtocolIo {
         method: &str,
         path: &str,
         body: Option<Vec<u8>>,
+        headers: &[(&str, &str)],
     ) -> turso_sync_engine::Result<JsDataCompletion> {
         Ok(self.add_request(JsProtocolRequest::Http {
             method: method.to_string(),
             path: path.to_string(),
             body,
+            headers: headers
+                .iter()
+                .map(|x| (x.0.to_string(), x.1.to_string()))
+                .collect(),
         }))
     }
 

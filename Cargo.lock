@@ -2839,6 +2839,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "prost"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7231bd9b3d3d33c86b58adbac74b5ec0ad9f496b19d22801d773636feaa95f3d"
+dependencies = [
+ "bytes",
+ "prost-derive",
+]
+
+[[package]]
+name = "prost-derive"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9120690fafc389a67ba3803df527d0ec9cbbc9cc45e4cc20b332996dfb672425"
+dependencies = [
+ "anyhow",
+ "itertools 0.14.0",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.100",
+]
+
+[[package]]
 name = "py-turso"
 version = "0.1.4"
 dependencies = [
@@ -3157,6 +3180,16 @@ dependencies = [
  "libc",
  "untrusted",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "roaring"
+version = "0.11.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f08d6a905edb32d74a5d5737a0c9d7e950c312f3c46cb0ca0a2ca09ea11878a0"
+dependencies = [
+ "bytemuck",
+ "byteorder",
 ]
 
 [[package]]
@@ -3978,13 +4011,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "turso-go"
-version = "0.1.4"
-dependencies = [
- "turso_core",
-]
-
-[[package]]
 name = "turso-java"
 version = "0.1.4"
 dependencies = [
@@ -4206,8 +4232,10 @@ dependencies = [
  "futures",
  "genawaiter",
  "http",
+ "prost",
  "rand 0.9.2",
  "rand_chacha 0.9.0",
+ "roaring",
  "serde",
  "serde_json",
  "tempfile",

@@ -726,7 +726,12 @@ impl Limbo {
                                     stats.io_time_elapsed_samples.push(start.elapsed());
                                 }
                             }
-                            Ok(StepResult::Interrupt) => break,
+                            Ok(StepResult::Interrupt) => {
+                                if let Some(ref mut stats) = statistics {
+                                    stats.execute_time_elapsed_samples.push(start.elapsed());
+                                }
+                                break;
+                            }
                             Ok(StepResult::Done) => {
                                 if let Some(ref mut stats) = statistics {
                                     stats.execute_time_elapsed_samples.push(start.elapsed());
@@ -850,6 +855,90 @@ impl Limbo {
                         let _ = self.write_fmt(format_args!("{table}"));
                     }
                 }
+                OutputMode::Line => {
+                    let mut first_row_printed = false;
+                    loop {
+                        if self.interrupt_count.load(Ordering::Acquire) > 0 {
+                            println!("Query interrupted.");
+                            return Ok(());
+                        }
+
+                        let start = Instant::now();
+
+                        let max_width = (0..rows.num_columns())
+                            .map(|i| rows.get_column_name(i).len())
+                            .max()
+                            .unwrap_or(0);
+
+                        let formatted_columns: Vec<String> = (0..rows.num_columns())
+                            .map(|i| {
+                                format!("{:>width$}", rows.get_column_name(i), width = max_width)
+                            })
+                            .collect();
+
+                        match rows.step() {
+                            Ok(StepResult::Row) => {
+                                if let Some(ref mut stats) = statistics {
+                                    stats.execute_time_elapsed_samples.push(start.elapsed());
+                                }
+                                let record = rows.row().unwrap();
+
+                                if !first_row_printed {
+                                    first_row_printed = true;
+                                } else {
+                                    self.writeln("")?;
+                                }
+
+                                for (i, value) in record.get_values().enumerate() {
+                                    self.write(&formatted_columns[i])?;
+                                    self.write(b" = ")?;
+                                    if matches!(value, Value::Null) {
+                                        let bytes = self.opts.null_value.clone();
+                                        self.write(bytes.as_bytes())?;
+                                    } else {
+                                        self.write(format!("{value}").as_bytes())?;
+                                    }
+                                    self.writeln("")?;
+                                }
+                            }
+                            Ok(StepResult::IO) => {
+                                let start = Instant::now();
+                                rows.run_once()?;
+                                if let Some(ref mut stats) = statistics {
+                                    stats.io_time_elapsed_samples.push(start.elapsed());
+                                }
+                            }
+                            Ok(StepResult::Interrupt) => {
+                                if let Some(ref mut stats) = statistics {
+                                    stats.execute_time_elapsed_samples.push(start.elapsed());
+                                }
+                                break;
+                            }
+                            Ok(StepResult::Done) => {
+                                if let Some(ref mut stats) = statistics {
+                                    stats.execute_time_elapsed_samples.push(start.elapsed());
+                                }
+                                break;
+                            }
+                            Ok(StepResult::Busy) => {
+                                if let Some(ref mut stats) = statistics {
+                                    stats.execute_time_elapsed_samples.push(start.elapsed());
+                                }
+                                let _ = self.writeln("database is busy");
+                                break;
+                            }
+                            Err(err) => {
+                                if let Some(ref mut stats) = statistics {
+                                    stats.execute_time_elapsed_samples.push(start.elapsed());
+                                }
+                                let report =
+                                    miette::Error::from(err).with_source_code(sql.to_owned());
+                                let _ = self.write_fmt(format_args!("{report:?}"));
+                                break;
+                            }
+                        }
+                    }
+                }
             },
             Ok(None) => {}
             Err(err) => {
@@ -949,44 +1038,25 @@ impl Limbo {
         // Get column information using PRAGMA table_info
         let pragma_sql = format!("PRAGMA table_info({view_name})");
 
-        match self.conn.query(&pragma_sql) {
-            Ok(Some(ref mut rows)) => {
-                let mut columns = Vec::new();
-                loop {
-                    match rows.step()? {
-                        StepResult::Row => {
-                            let row = rows.row().unwrap();
-                            // Column name is in the second column (index 1) of PRAGMA table_info
-                            if let Ok(Value::Text(col_name)) = row.get::<&Value>(1) {
-                                columns.push(col_name.as_str().to_string());
-                            }
-                        }
-                        StepResult::IO => {
-                            rows.run_once()?;
-                        }
-                        StepResult::Done => break,
-                        StepResult::Interrupt => break,
-                        StepResult::Busy => break,
-                    }
-                }
-
-                if columns.is_empty() {
-                    anyhow::bail!("PRAGMA table_info returned no columns for view '{}'. The view may be corrupted or the database schema is invalid.", view_name);
-                }
-
-                Ok(columns.join(","))
+        let mut columns = Vec::new();
+        let handler = |row: &turso_core::Row| -> anyhow::Result<()> {
+            // Column name is in the second column (index 1) of PRAGMA table_info
+            if let Ok(Value::Text(col_name)) = row.get::<&Value>(1) {
+                columns.push(col_name.as_str().to_string());
             }
-            Ok(None) => {
-                anyhow::bail!("PRAGMA table_info('{}') returned no results. The view may not exist or the database schema is invalid.", view_name);
-            }
-            Err(e) => {
-                anyhow::bail!(
-                    "Failed to execute PRAGMA table_info for view '{}': {}",
-                    view_name,
-                    e
-                );
-            }
+            Ok(())
+        };
+        if let Err(err) = self.handle_row(&pragma_sql, handler) {
+            return Err(anyhow::anyhow!(
+                "Error retrieving columns for view '{}': {}",
+                view_name,
+                err
+            ));
         }
+        if columns.is_empty() {
+            anyhow::bail!("PRAGMA table_info returned no columns for view '{}'. The view may be corrupted or the database schema is invalid.", view_name);
+        }
+        Ok(columns.join(","))
     }
 
     fn query_one_table_schema(
@@ -1123,43 +1193,24 @@ impl Limbo {
             None => String::from("SELECT name FROM sqlite_schema WHERE type='index' ORDER BY 1"),
         };
 
-        match self.conn.query(&sql) {
-            Ok(Some(ref mut rows)) => {
-                let mut indexes = String::new();
-                loop {
-                    match rows.step()? {
-                        StepResult::Row => {
-                            let row = rows.row().unwrap();
-                            if let Ok(Value::Text(idx)) = row.get::<&Value>(0) {
-                                indexes.push_str(idx.as_str());
-                                indexes.push(' ');
-                            }
-                        }
-                        StepResult::IO => {
-                            rows.run_once()?;
-                        }
-                        StepResult::Interrupt => break,
-                        StepResult::Done => break,
-                        StepResult::Busy => {
-                            let _ = self.writeln("database is busy");
-                            break;
-                        }
-                    }
-                }
-                if !indexes.is_empty() {
-                    let _ = self.writeln(indexes.trim_end());
-                }
+        let mut indexes = String::new();
+        let handler = |row: &turso_core::Row| -> anyhow::Result<()> {
+            if let Ok(Value::Text(idx)) = row.get::<&Value>(0) {
+                indexes.push_str(idx.as_str());
+                indexes.push(' ');
             }
-            Err(err) => {
-                if err.to_string().contains("no such table: sqlite_schema") {
-                    return Err(anyhow::anyhow!("Unable to access database schema. The database may be using an older SQLite version or may not be properly initialized."));
-                } else {
-                    return Err(anyhow::anyhow!("Error querying schema: {}", err));
-                }
+            Ok(())
+        };
+        if let Err(err) = self.handle_row(&sql, handler) {
+            if err.to_string().contains("no such table: sqlite_schema") {
+                return Err(anyhow::anyhow!("Unable to access database schema. The database may be using an older SQLite version or may not be properly initialized."));
+            } else {
+                return Err(anyhow::anyhow!("Error querying schema: {}", err));
             }
-            Ok(None) => {}
         }
-
+        if !indexes.is_empty() {
+            let _ = self.writeln(indexes.trim_end().as_bytes());
+        }
         Ok(())
     }
 
@@ -1173,52 +1224,62 @@ impl Limbo {
             ),
         };
 
-        match self.conn.query(&sql) {
-            Ok(Some(ref mut rows)) => {
-                let mut tables = String::new();
-                loop {
-                    match rows.step()? {
-                        StepResult::Row => {
-                            let row = rows.row().unwrap();
-                            if let Ok(Value::Text(table)) = row.get::<&Value>(0) {
-                                tables.push_str(table.as_str());
-                                tables.push(' ');
-                            }
-                        }
-                        StepResult::IO => {
-                            rows.run_once()?;
-                        }
-                        StepResult::Interrupt => break,
-                        StepResult::Done => break,
-                        StepResult::Busy => {
-                            let _ = self.writeln("database is busy");
-                            break;
-                        }
+        let mut tables = String::new();
+        let handler = |row: &turso_core::Row| -> anyhow::Result<()> {
+            if let Ok(Value::Text(table)) = row.get::<&Value>(0) {
+                tables.push_str(table.as_str());
+                tables.push(' ');
+            }
+            Ok(())
+        };
+        if let Err(e) = self.handle_row(&sql, handler) {
+            if e.to_string().contains("no such table: sqlite_schema") {
+                return Err(anyhow::anyhow!("Unable to access database schema. The database may be using an older SQLite version or may not be properly initialized."));
+            } else {
+                return Err(anyhow::anyhow!("Error querying schema: {}", e));
+            }
+        }
+        if !tables.is_empty() {
+            let _ = self.writeln(tables.trim_end().as_bytes());
+        } else if let Some(pattern) = pattern {
+            let _ = self.write_fmt(format_args!(
+                "Error: Tables with pattern '{pattern}' not found."
+            ));
+        } else {
+            let _ = self.writeln(b"No tables found in the database.");
+        }
+        Ok(())
+    }
+
+    fn handle_row<F>(&mut self, sql: &str, mut handler: F) -> anyhow::Result<()>
+    where
+        F: FnMut(&turso_core::Row) -> anyhow::Result<()>,
+    {
+        match self.conn.query(sql) {
+            Ok(Some(ref mut rows)) => loop {
+                match rows.step()? {
+                    StepResult::Row => {
+                        let row = rows.row().unwrap();
+                        handler(row)?;
+                    }
+                    StepResult::IO => {
+                        rows.run_once()?;
+                    }
+                    StepResult::Interrupt => break,
+                    StepResult::Done => break,
+                    StepResult::Busy => {
+                        let _ = self.writeln("database is busy");
+                        break;
                     }
                 }
-
-                if !tables.is_empty() {
-                    let _ = self.writeln(tables.trim_end());
-                } else if let Some(pattern) = pattern {
-                    let _ = self.write_fmt(format_args!(
-                        "Error: Tables with pattern '{pattern}' not found."
-                    ));
-                } else {
-                    let _ = self.writeln("No tables found in the database.");
-                }
-            }
+            },
             Ok(None) => {
                 let _ = self.writeln("No results returned from the query.");
             }
             Err(err) => {
-                if err.to_string().contains("no such table: sqlite_schema") {
-                    return Err(anyhow::anyhow!("Unable to access database schema. The database may be using an older SQLite version or may not be properly initialized."));
-                } else {
-                    return Err(anyhow::anyhow!("Error querying schema: {}", err));
-                }
+                return Err(anyhow::anyhow!("Error querying database: {}", err));
             }
         }
-
         Ok(())
     }
 

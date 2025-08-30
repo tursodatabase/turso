@@ -67,6 +67,14 @@ export declare class Database {
    * `Ok(())` if the database is closed successfully.
    */
   close(): void
+  /**
+   * Sets the default safe integers mode for all statements from this database.
+   *
+   * # Arguments
+   *
+   * * `toggle` - Whether to use safe integers by default.
+   */
+  defaultSafeIntegers(toggle?: boolean | undefined | null): void
   /** Runs the I/O loop synchronously. */
   ioLoopSync(): void
   /** Runs the I/O loop asynchronously, returning a Promise. */
@@ -107,11 +115,22 @@ export declare class Statement {
   raw(raw?: boolean | undefined | null): void
   /** Sets the presentation mode to pluck. */
   pluck(pluck?: boolean | undefined | null): void
+  /**
+   * Sets safe integers mode for this statement.
+   *
+   * # Arguments
+   *
+   * * `toggle` - Whether to use safe integers.
+   */
+  safeIntegers(toggle?: boolean | undefined | null): void
+  /** Get column information for the statement */
+  columns(): unknown[]
   /** Finalizes the statement. */
   finalize(): void
 }
 export declare class GeneratorHolder {
   resume(error?: string | undefined | null): number
+  take(): GeneratorResponse | null
 }
 
 export declare class JsDataCompletion {
@@ -143,16 +162,42 @@ export declare class SyncEngine {
   protocolIo(): JsProtocolRequestData | null
   sync(): GeneratorHolder
   push(): GeneratorHolder
+  stats(): GeneratorHolder
   pull(): GeneratorHolder
+  checkpoint(): GeneratorHolder
   open(): Database
+}
+
+export declare const enum DatabaseChangeTypeJs {
+  Insert = 0,
+  Update = 1,
+  Delete = 2
 }
 
 export interface DatabaseOpts {
   path: string
 }
 
+export interface DatabaseRowMutationJs {
+  changeTime: number
+  tableName: string
+  id: number
+  changeType: DatabaseChangeTypeJs
+  before?: Record<string, any>
+  after?: Record<string, any>
+  updates?: Record<string, any>
+}
+
+export interface DatabaseRowStatementJs {
+  sql: string
+  values: Array<any>
+}
+
+export type GeneratorResponse =
+  | { type: 'SyncEngineStats', operations: number, wal: number }
+
 export type JsProtocolRequest =
-  | { type: 'Http', method: string, path: string, body?: Buffer }
+  | { type: 'Http', method: string, path: string, body?: Array<number>, headers: Array<[string, string]> }
   | { type: 'FullRead', path: string }
   | { type: 'FullWrite', path: string, content: Array<number> }
 
@@ -160,5 +205,13 @@ export interface SyncEngineOpts {
   path: string
   clientName?: string
   walPullBatchSize?: number
-  enableTracing?: boolean
+  enableTracing?: string
+  tablesIgnore?: Array<string>
+  transform?: (arg: DatabaseRowMutationJs) => DatabaseRowStatementJs | null
+  protocolVersion?: SyncEngineProtocolVersion
+}
+
+export declare const enum SyncEngineProtocolVersion {
+  Legacy = 0,
+  V1 = 1
 }

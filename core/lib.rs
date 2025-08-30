@@ -76,6 +76,7 @@ use std::{
 };
 #[cfg(feature = "fs")]
 use storage::database::DatabaseFile;
+pub use storage::database::IOContext;
 pub use storage::encryption::{EncryptionContext, EncryptionKey};
 use storage::page_cache::DumbLruPageCache;
 use storage::pager::{AtomicDbState, DbState};
@@ -106,6 +107,12 @@ enum TransactionState {
     Read,
     PendingUpgrade,
     None,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SyncMode {
+    Off = 0,
+    Full = 2,
 }
 
 pub(crate) type MvStore = mvcc::MvStore<mvcc::LocalClock>;
@@ -465,6 +472,7 @@ impl Database {
             is_nested_stmt: Cell::new(false),
             encryption_key: RefCell::new(None),
             encryption_cipher_mode: Cell::new(None),
+            sync_mode: Cell::new(SyncMode::Full),
         });
         self.n_connections
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -899,6 +907,7 @@ pub struct Connection {
     is_nested_stmt: Cell<bool>,
     encryption_key: RefCell<Option<EncryptionKey>>,
     encryption_cipher_mode: Cell<Option<CipherMode>>,
+    sync_mode: Cell<SyncMode>,
 }
 
 impl Drop for Connection {
@@ -1458,7 +1467,10 @@ impl Connection {
             };
 
             let commit_err = if force_commit {
-                pager.io.block(|| pager.commit_dirty_pages(true)).err()
+                pager
+                    .io
+                    .block(|| pager.commit_dirty_pages(true, self.get_sync_mode()))
+                    .err()
             } else {
                 None
             };
@@ -1979,6 +1991,14 @@ impl Connection {
 
     pub fn set_query_only(&self, value: bool) {
         self.query_only.set(value);
+    }
+
+    pub fn get_sync_mode(&self) -> SyncMode {
+        self.sync_mode.get()
+    }
+
+    pub fn set_sync_mode(&self, mode: SyncMode) {
+        self.sync_mode.set(mode);
     }
 
     /// Creates a HashSet of modules that have been loaded

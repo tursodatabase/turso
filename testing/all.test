@@ -41,3 +41,4 @@ source $testdir/integrity_check.test
 source $testdir/rollback.test
 source $testdir/views.test
 source $testdir/vtab.test
+source $testdir/upsert.test

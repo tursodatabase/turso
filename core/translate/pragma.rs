@@ -324,6 +324,27 @@ fn update_pragma(
             connection.set_encryption_cipher(cipher);
             Ok((program, TransactionMode::None))
         }
+        PragmaName::Synchronous => {
+            use crate::SyncMode;
+
+            let mode = match value {
+                Expr::Name(name) => {
+                    let name_upper = name.as_str().to_uppercase();
+                    match name_upper.as_str() {
+                        "OFF" | "FALSE" | "NO" | "0" => SyncMode::Off,
+                        _ => SyncMode::Full,
+                    }
+                }
+                Expr::Literal(Literal::Numeric(n)) => match n.as_str() {
+                    "0" => SyncMode::Off,
+                    _ => SyncMode::Full,
+                },
+                _ => SyncMode::Full,
+            };
+
+            connection.set_sync_mode(mode);
+            Ok((program, TransactionMode::None))
+        }
     }
 }
 
@@ -602,6 +623,14 @@ fn query_pragma(
                 program.emit_result_row(register, 1);
                 program.add_pragma_result_column(pragma.to_string());
             }
+            Ok((program, TransactionMode::None))
+        }
+        PragmaName::Synchronous => {
+            let mode = connection.get_sync_mode();
+            let register = program.alloc_register();
+            program.emit_int(mode as i64, register);
+            program.emit_result_row(register, 1);
+            program.add_pragma_result_column(pragma.to_string());
             Ok((program, TransactionMode::None))
         }
     }

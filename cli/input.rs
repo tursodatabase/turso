@@ -63,6 +63,7 @@ impl Default for Io {
 pub enum OutputMode {
     List,
     Pretty,
+    Line,
 }
 
 impl std::fmt::Display for OutputMode {

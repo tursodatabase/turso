@@ -21,6 +21,7 @@ pub(crate) mod group_by;
 pub(crate) mod index;
 pub(crate) mod insert;
 pub(crate) mod integrity_check;
+pub(crate) mod logical;
 pub(crate) mod main_loop;
 pub(crate) mod optimizer;
 pub(crate) mod order_by;
@@ -34,6 +35,7 @@ pub(crate) mod select;
 pub(crate) mod subquery;
 pub(crate) mod transaction;
 pub(crate) mod update;
+pub(crate) mod upsert;
 mod values;
 pub(crate) mod view;
 
@@ -83,7 +85,7 @@ pub fn translate(
         // These options will be extended whithin each translate program
         ProgramBuilderOpts {
             num_cursors: 1,
-            approx_num_insns: 2,
+            approx_num_insns: 32,
             approx_num_labels: 2,
         },
     );

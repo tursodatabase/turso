@@ -4,7 +4,6 @@
 resolver = "2"
 members = [
     "bindings/dart/rust",
-    "bindings/go",
     "bindings/java",
     "bindings/javascript",
     "bindings/python",

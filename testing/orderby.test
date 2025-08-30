@@ -218,3 +218,17 @@ do_execsql_test_on_specific_db {:memory:} distinct_orderby_regression {
   SELECT DISTINCT c,b FROM t ORDER BY d,b;
 } {3|2
 4|3}
+
+do_execsql_test order_by_column_deduplication {
+    select name, name, price from products order by name;
+} {accessories|accessories|81.0
+boots|boots|1.0
+cap|cap|82.0
+coat|coat|33.0
+hat|hat|79.0
+jeans|jeans|78.0
+shirt|shirt|18.0
+shorts|shorts|70.0
+sneakers|sneakers|82.0
+sweater|sweater|25.0
+sweatshirt|sweatshirt|74.0}

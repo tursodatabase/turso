@@ -64,3 +64,5 @@ export const JsDataPollResult = __napiModule.exports.JsDataPollResult
 export const JsProtocolIo = __napiModule.exports.JsProtocolIo
 export const JsProtocolRequestData = __napiModule.exports.JsProtocolRequestData
 export const SyncEngine = __napiModule.exports.SyncEngine
+export const DatabaseChangeTypeJs = __napiModule.exports.DatabaseChangeTypeJs
+export const SyncEngineProtocolVersion = __napiModule.exports.SyncEngineProtocolVersion

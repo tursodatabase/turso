@@ -2,7 +2,9 @@
 use crate::function::AlterTableFunc;
 use crate::numeric::{NullableInteger, Numeric};
 use crate::schema::Table;
-use crate::storage::btree::{integrity_check, IntegrityCheckError, IntegrityCheckState};
+use crate::storage::btree::{
+    integrity_check, IntegrityCheckError, IntegrityCheckState, PageCategory,
+};
 use crate::storage::database::DatabaseFile;
 use crate::storage::page_cache::DumbLruPageCache;
 use crate::storage::pager::{AtomicDbState, CreateBTreeFlags, DbState};
@@ -1760,19 +1762,21 @@ pub fn op_type_check(
                 return Ok(());
             }
             let col_affinity = col.affinity();
-            let ty_str = col.ty_str.as_str();
+            let ty_str = &col.ty_str;
             let applied = apply_affinity_char(reg, col_affinity);
             let value_type = reg.get_value().value_type();
-            match (ty_str, value_type) {
-                ("INTEGER" | "INT", ValueType::Integer) => {}
-                ("REAL", ValueType::Float) => {}
-                ("BLOB", ValueType::Blob) => {}
-                ("TEXT", ValueType::Text) => {}
-                ("ANY", _) => {}
-                (t, v) => bail_constraint_error!(
+            match value_type {
+                ValueType::Integer
+                    if ty_str.eq_ignore_ascii_case("INTEGER")
+                        || ty_str.eq_ignore_ascii_case("INT") => {}
+                ValueType::Float if ty_str.eq_ignore_ascii_case("REAL") => {}
+                ValueType::Blob if ty_str.eq_ignore_ascii_case("BLOB") => {}
+                ValueType::Text if ty_str.eq_ignore_ascii_case("TEXT") => {}
+                _ if ty_str.eq_ignore_ascii_case("ANY") => {}
+                v => bail_constraint_error!(
                     "cannot store {} value in {} column {}.{} ({})",
                     v,
-                    t,
+                    ty_str,
                     &table_reference.name,
                     col.name.as_deref().unwrap_or(""),
                     SQLITE_CONSTRAINT
@@ -5177,11 +5181,12 @@ pub fn op_insert(
         match &state.op_insert_state.sub_state {
             OpInsertSubState::MaybeCaptureRecord => {
                 let schema = program.connection.schema.borrow();
-                let dependent_views = schema.get_dependent_materialized_views(table_name);
+                let dependent_views =
+                    schema.get_dependent_materialized_views_unnormalized(table_name);
                 // If there are no dependent views, we don't need to capture the old record.
                 // We also don't need to do it if the rowid of the UPDATEd row was changed, because that means
                 // we deleted it earlier and `op_delete` already captured the change.
-                if dependent_views.is_empty() || flag.has(InsertFlags::UPDATE_ROWID_CHANGE) {
+                if dependent_views.is_none() || flag.has(InsertFlags::UPDATE_ROWID_CHANGE) {
                     if flag.has(InsertFlags::REQUIRE_SEEK) {
                         state.op_insert_state.sub_state = OpInsertSubState::Seek;
                     } else {
@@ -5287,8 +5292,9 @@ pub fn op_insert(
                     state.op_insert_state.sub_state = OpInsertSubState::UpdateLastRowid;
                 } else {
                     let schema = program.connection.schema.borrow();
-                    let dependent_views = schema.get_dependent_materialized_views(table_name);
-                    if !dependent_views.is_empty() {
+                    let dependent_views =
+                        schema.get_dependent_materialized_views_unnormalized(table_name);
+                    if dependent_views.is_some() {
                         state.op_insert_state.sub_state = OpInsertSubState::ApplyViewChange;
                     } else {
                         break;
@@ -5308,8 +5314,9 @@ pub fn op_insert(
                     program.n_change.set(prev_changes + 1);
                 }
                 let schema = program.connection.schema.borrow();
-                let dependent_views = schema.get_dependent_materialized_views(table_name);
-                if !dependent_views.is_empty() {
+                let dependent_views =
+                    schema.get_dependent_materialized_views_unnormalized(table_name);
+                if dependent_views.is_some() {
                     state.op_insert_state.sub_state = OpInsertSubState::ApplyViewChange;
                     continue;
                 }
@@ -5317,8 +5324,10 @@ pub fn op_insert(
             }
             OpInsertSubState::ApplyViewChange => {
                 let schema = program.connection.schema.borrow();
-                let dependent_views = schema.get_dependent_materialized_views(table_name);
-                assert!(!dependent_views.is_empty());
+                let dependent_views =
+                    schema.get_dependent_materialized_views_unnormalized(table_name);
+                assert!(dependent_views.is_some());
+                let dependent_views = dependent_views.unwrap();
 
                 let (key, values) = {
                     let mut cursor = state.get_cursor(*cursor_id);
@@ -6660,9 +6669,7 @@ pub fn op_zero_or_null(
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(ZeroOrNull { rg1, rg2, dest }, insn);
-    if *state.registers[*rg1].get_value() == Value::Null
-        || *state.registers[*rg2].get_value() == Value::Null
-    {
+    if state.registers[*rg1].is_null() || state.registers[*rg2].is_null() {
         state.registers[*dest] = Register::Value(Value::Null)
     } else {
         state.registers[*dest] = Register::Value(Value::Integer(0));
@@ -7108,10 +7115,26 @@ pub fn op_integrity_check(
     );
     match &mut state.op_integrity_check_state {
         OpIntegrityCheckState::Start => {
+            let freelist_trunk_page =
+                return_if_io!(pager.with_header(|header| header.freelist_trunk_page.get()));
+            let mut errors = Vec::new();
+            let mut integrity_check_state = IntegrityCheckState::new();
+            let mut current_root_idx = 0;
+            // check freelist pages first, if there are any for database
+            if freelist_trunk_page > 0 {
+                integrity_check_state.start(
+                    freelist_trunk_page as usize,
+                    PageCategory::FreeListTrunk,
+                    &mut errors,
+                );
+            } else {
+                integrity_check_state.start(roots[0], PageCategory::Normal, &mut errors);
+                current_root_idx += 1;
+            }
             state.op_integrity_check_state = OpIntegrityCheckState::Checking {
-                errors: Vec::new(),
-                current_root_idx: 0,
-                state: IntegrityCheckState::new(roots[0]),
+                errors,
+                state: integrity_check_state,
+                current_root_idx,
             };
         }
         OpIntegrityCheckState::Checking {
@@ -7120,9 +7143,9 @@ pub fn op_integrity_check(
             state: integrity_check_state,
         } => {
             return_if_io!(integrity_check(integrity_check_state, errors, pager));
-            *current_root_idx += 1;
             if *current_root_idx < roots.len() {
-                *integrity_check_state = IntegrityCheckState::new(roots[*current_root_idx]);
+                integrity_check_state.start(roots[*current_root_idx], PageCategory::Normal, errors);
+                *current_root_idx += 1;
                 return Ok(InsnFunctionStepResult::Step);
             } else {
                 let message = if errors.is_empty() {

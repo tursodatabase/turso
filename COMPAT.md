@@ -56,7 +56,7 @@ Turso aims to be fully compatible with SQLite, with opt-in features not supporte
 | ATTACH DATABASE           | Partial | Only for reads. All modifications will currently fail to find the table           |
 | BEGIN TRANSACTION         | Partial | Transaction names are not supported.                                              |
 | COMMIT TRANSACTION        | Partial | Transaction names are not supported.                                              |
-| CREATE INDEX              | Partial | Disabled by default.                                                              |
+| CREATE INDEX              | Partial | Only for columns (not arbitrary expressions)                                      |
 | CREATE TABLE              | Partial |                                                                                   |
 | CREATE TABLE ... STRICT   | Yes     |                                                                                   |
 | CREATE TRIGGER            | No      |                                                                                   |
@@ -71,8 +71,8 @@ Turso aims to be fully compatible with SQLite, with opt-in features not supporte
 | END TRANSACTION           | Partial | Alias for `COMMIT TRANSACTION`                                                    |
 | EXPLAIN                   | Yes     |                                                                                   |
 | INDEXED BY                | No      |                                                                                   |
-| INSERT                    | Partial |                                                                                   |
-| ON CONFLICT clause        | No      |                                                                                   |
+| INSERT                    | Yes     |                                                                                   |
+| ON CONFLICT clause        | Yes     |                                                                                   |
 | REINDEX                   | No      |                                                                                   |
 | RELEASE SAVEPOINT         | No      |                                                                                   |
 | REPLACE                   | No      |                                                                                   |
@@ -160,7 +160,7 @@ Turso aims to be fully compatible with SQLite, with opt-in features not supporte
 | PRAGMA shrink_memory             | No         |                                              |
 | PRAGMA soft_heap_limit           | No         |                                              |
 | PRAGMA stats                     | No         | Used for testing in SQLite                   |
-| PRAGMA synchronous               | No         |                                              |
+| PRAGMA synchronous               | Partial    | `OFF` and `FULL` supported                   |
 | PRAGMA table_info                | Yes        |                                              |
 | PRAGMA table_list                | No         |                                              |
 | PRAGMA table_xinfo               | No         |                                              |

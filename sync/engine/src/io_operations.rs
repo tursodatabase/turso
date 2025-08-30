@@ -12,9 +12,9 @@ pub trait IoOperations {
     fn open_tape(&self, path: &str, capture: bool) -> Result<DatabaseTape>;
     fn try_open(&self, path: &str) -> Result<Option<Arc<dyn turso_core::File>>>;
     fn create(&self, path: &str) -> Result<Arc<dyn turso_core::File>>;
-    fn truncate(
+    fn truncate<Ctx>(
         &self,
-        coro: &Coro,
+        coro: &Coro<Ctx>,
         file: Arc<dyn turso_core::File>,
         len: usize,
     ) -> impl std::future::Future<Output = Result<()>>;
@@ -47,9 +47,9 @@ impl IoOperations for Arc<dyn turso_core::IO> {
         }
     }
 
-    async fn truncate(
+    async fn truncate<Ctx>(
         &self,
-        coro: &Coro,
+        coro: &Coro<Ctx>,
         file: Arc<dyn turso_core::File>,
         len: usize,
     ) -> Result<()> {

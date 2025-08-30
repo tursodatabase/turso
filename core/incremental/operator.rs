@@ -359,13 +359,12 @@ pub enum JoinType {
     Right,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum AggregateFunction {
     Count,
     Sum(String),
     Avg(String),
-    Min(String),
-    Max(String),
+    // MIN and MAX are not supported - see comment in compiler.rs for explanation
 }
 
 impl Display for AggregateFunction {
@@ -374,8 +373,6 @@ impl Display for AggregateFunction {
             AggregateFunction::Count => write!(f, "COUNT(*)"),
             AggregateFunction::Sum(col) => write!(f, "SUM({col})"),
             AggregateFunction::Avg(col) => write!(f, "AVG({col})"),
-            AggregateFunction::Min(col) => write!(f, "MIN({col})"),
-            AggregateFunction::Max(col) => write!(f, "MAX({col})"),
         }
     }
 }
@@ -401,8 +398,8 @@ impl AggregateFunction {
                     AggFunc::Count | AggFunc::Count0 => Some(AggregateFunction::Count),
                     AggFunc::Sum => input_column.map(AggregateFunction::Sum),
                     AggFunc::Avg => input_column.map(AggregateFunction::Avg),
-                    AggFunc::Min => input_column.map(AggregateFunction::Min),
-                    AggFunc::Max => input_column.map(AggregateFunction::Max),
+                    // MIN and MAX are not supported in incremental views - see compiler.rs
+                    AggFunc::Min | AggFunc::Max => None,
                     _ => None, // Other aggregate functions not yet supported in DBSP
                 }
             }
@@ -417,8 +414,18 @@ pub trait IncrementalOperator: Debug {
     /// Initialize with base data
     fn initialize(&mut self, data: Delta);
 
-    /// Process a delta (incremental update)
-    fn process_delta(&mut self, delta: Delta) -> Delta;
+    /// Evaluate the operator with a delta, without modifying internal state
+    /// This is used during query execution to compute results including uncommitted changes
+    ///
+    /// # Arguments
+    /// * `delta` - The committed delta to process
+    /// * `uncommitted` - Optional uncommitted changes from the current transaction
+    fn eval(&self, delta: Delta, uncommitted: Option<Delta>) -> Delta;
+
+    /// Commit a delta to the operator's internal state and return the output
+    /// This is called when a transaction commits, making changes permanent
+    /// Returns the output delta (what downstream operators should see)
+    fn commit(&mut self, delta: Delta) -> Delta;
 
     /// Get current accumulated state
     fn get_current_state(&self) -> Delta;
@@ -554,20 +561,51 @@ impl IncrementalOperator for FilterOperator {
         }
     }
 
-    fn process_delta(&mut self, delta: Delta) -> Delta {
+    fn eval(&self, delta: Delta, uncommitted: Option<Delta>) -> Delta {
         let mut output_delta = Delta::new();
 
-        // Process only the delta, not the entire state
+        // Merge delta with uncommitted if present
+        let combined_delta = if let Some(uncommitted) = uncommitted {
+            let mut combined = delta;
+            combined.merge(&uncommitted);
+            combined
+        } else {
+            delta
+        };
+
+        // Process the combined delta through the filter
+        for (row, weight) in combined_delta.changes {
+            if let Some(tracker) = &self.tracker {
+                tracker.lock().unwrap().record_filter();
+            }
+
+            // Only pass through rows that satisfy the filter predicate
+            // For deletes (weight < 0), we only pass them if the row values
+            // would have passed the filter (meaning it was in the view)
+            if self.evaluate_predicate(&row.values) {
+                output_delta.changes.push((row, weight));
+            }
+        }
+
+        output_delta
+    }
+
+    fn commit(&mut self, delta: Delta) -> Delta {
+        let mut output_delta = Delta::new();
+
+        // Commit the delta to our internal state
+        // Only pass through and track rows that satisfy the filter predicate
         for (row, weight) in delta.changes {
             if let Some(tracker) = &self.tracker {
                 tracker.lock().unwrap().record_filter();
             }
 
+            // Only track and output rows that pass the filter
+            // For deletes, this means the row was in the view (its values pass the filter)
+            // For inserts, this means the row should be in the view
             if self.evaluate_predicate(&row.values) {
-                output_delta.changes.push((row.clone(), weight));
-
-                // Update our state
-                self.current_state.changes.push((row, weight));
+                self.current_state.changes.push((row.clone(), weight));
+                output_delta.changes.push((row, weight));
             }
         }
 
@@ -575,7 +613,10 @@ impl IncrementalOperator for FilterOperator {
     }
 
     fn get_current_state(&self) -> Delta {
-        self.current_state.clone()
+        // Return a consolidated view of the current state
+        let mut consolidated = self.current_state.clone();
+        consolidated.consolidate();
+        consolidated
     }
 
     fn set_tracker(&mut self, tracker: Arc<Mutex<ComputationTracker>>) {
@@ -720,6 +761,46 @@ impl ProjectOperator {
                     }
                     _ => c.expr.to_string(),
                 })
+            })
+            .collect();
+
+        Ok(Self {
+            columns,
+            input_column_names,
+            output_column_names,
+            current_state: Delta::new(),
+            tracker: None,
+            internal_conn,
+        })
+    }
+
+    /// Create a ProjectOperator from pre-compiled expressions
+    pub fn from_compiled(
+        compiled_exprs: Vec<CompiledExpression>,
+        aliases: Vec<Option<String>>,
+        input_column_names: Vec<String>,
+        output_column_names: Vec<String>,
+    ) -> crate::Result<Self> {
+        // Set up internal connection for expression evaluation
+        let io = Arc::new(crate::MemoryIO::new());
+        let db = Database::open_file(
+            io, ":memory:", false, // no MVCC needed for expression evaluation
+            false, // no indexes needed
+        )?;
+        let internal_conn = db.connect()?;
+        // Set to read-only mode and disable auto-commit since we're only evaluating expressions
+        internal_conn.query_only.set(true);
+        internal_conn.auto_commit.set(false);
+
+        // Create ProjectColumn structs from compiled expressions
+        let columns: Vec<ProjectColumn> = compiled_exprs
+            .into_iter()
+            .zip(aliases)
+            .map(|(compiled, alias)| ProjectColumn {
+                // Create a placeholder AST expression since we already have the compiled version
+                expr: turso_parser::ast::Expr::Literal(turso_parser::ast::Literal::Null),
+                alias,
+                compiled,
             })
             .collect();
 
@@ -899,349 +980,59 @@ impl IncrementalOperator for ProjectOperator {
         }
     }
 
-    fn process_delta(&mut self, delta: Delta) -> Delta {
+    fn eval(&self, delta: Delta, uncommitted: Option<Delta>) -> Delta {
         let mut output_delta = Delta::new();
 
-        for (row, weight) in &delta.changes {
+        // Merge delta with uncommitted if present
+        let combined_delta = if let Some(uncommitted) = uncommitted {
+            let mut combined = delta;
+            combined.merge(&uncommitted);
+            combined
+        } else {
+            delta
+        };
+
+        for (row, weight) in &combined_delta.changes {
             if let Some(tracker) = &self.tracker {
                 tracker.lock().unwrap().record_project();
             }
 
             let projected = self.project_values(&row.values);
             let projected_row = HashableRow::new(row.rowid, projected);
+            output_delta.changes.push((projected_row, *weight));
+        }
 
-            output_delta.changes.push((projected_row.clone(), *weight));
-            self.current_state.changes.push((projected_row, *weight));
+        output_delta
+    }
+
+    fn commit(&mut self, delta: Delta) -> Delta {
+        let mut output_delta = Delta::new();
+
+        // Commit the delta to our internal state and build output
+        for (row, weight) in &delta.changes {
+            if let Some(tracker) = &self.tracker {
+                tracker.lock().unwrap().record_project();
+            }
+            let projected = self.project_values(&row.values);
+            let projected_row = HashableRow::new(row.rowid, projected);
+            self.current_state
+                .changes
+                .push((projected_row.clone(), *weight));
+            output_delta.changes.push((projected_row, *weight));
         }
 
         output_delta
     }
 
     fn get_current_state(&self) -> Delta {
-        self.current_state.clone()
+        // Return a consolidated view of the current state
+        let mut consolidated = self.current_state.clone();
+        consolidated.consolidate();
+        consolidated
     }
 
     fn set_tracker(&mut self, tracker: Arc<Mutex<ComputationTracker>>) {
         self.tracker = Some(tracker);
-    }
-}
-
-/// Join operator - performs incremental joins using DBSP formula
-/// ∂(A ⋈ B) = A ⋈ ∂B + ∂A ⋈ B + ∂A ⋈ ∂B
-#[derive(Debug)]
-pub struct JoinOperator {
-    join_type: JoinType,
-    pub left_on_column: String,
-    pub right_on_column: String,
-    left_column_names: Vec<String>,
-    right_column_names: Vec<String>,
-    // Current accumulated state for both sides
-    left_state: Delta,
-    right_state: Delta,
-    // Index for efficient lookups: column_value_as_string -> vec of row_keys
-    // We use String representation of values since Value doesn't implement Hash
-    left_index: HashMap<String, Vec<i64>>,
-    right_index: HashMap<String, Vec<i64>>,
-    // Result state
-    current_state: Delta,
-    tracker: Option<Arc<Mutex<ComputationTracker>>>,
-    // For generating unique keys for join results
-    next_result_key: i64,
-}
-
-impl JoinOperator {
-    pub fn new(
-        join_type: JoinType,
-        left_on_column: String,
-        right_on_column: String,
-        left_column_names: Vec<String>,
-        right_column_names: Vec<String>,
-    ) -> Self {
-        Self {
-            join_type,
-            left_on_column,
-            right_on_column,
-            left_column_names,
-            right_column_names,
-            left_state: Delta::new(),
-            right_state: Delta::new(),
-            left_index: HashMap::new(),
-            right_index: HashMap::new(),
-            current_state: Delta::new(),
-            tracker: None,
-            next_result_key: 0,
-        }
-    }
-
-    pub fn set_tracker(&mut self, tracker: Arc<Mutex<ComputationTracker>>) {
-        self.tracker = Some(tracker);
-    }
-
-    /// Build index for a side of the join
-    fn build_index(
-        state: &Delta,
-        column_names: &[String],
-        on_column: &str,
-    ) -> HashMap<String, Vec<i64>> {
-        let mut index = HashMap::new();
-
-        // Find the column index
-        let col_idx = column_names.iter().position(|c| c == on_column);
-        if col_idx.is_none() {
-            return index;
-        }
-        let col_idx = col_idx.unwrap();
-
-        // Build the index
-        for (row, weight) in &state.changes {
-            // Include rows with positive weight in the index
-            if *weight > 0 {
-                if let Some(key_value) = row.values.get(col_idx) {
-                    // Convert value to string for indexing
-                    let key_str = format!("{key_value:?}");
-                    index
-                        .entry(key_str)
-                        .or_insert_with(Vec::new)
-                        .push(row.rowid);
-                }
-            }
-        }
-
-        index
-    }
-
-    /// Join two deltas
-    fn join_deltas(&self, left_delta: &Delta, right_delta: &Delta, next_key: &mut i64) -> Delta {
-        let mut result = Delta::new();
-
-        // Find column indices
-        let left_col_idx = self
-            .left_column_names
-            .iter()
-            .position(|c| c == &self.left_on_column)
-            .unwrap_or(0);
-        let right_col_idx = self
-            .right_column_names
-            .iter()
-            .position(|c| c == &self.right_on_column)
-            .unwrap_or(0);
-
-        // For each row in left_delta
-        for (left_row, left_weight) in &left_delta.changes {
-            // Process both inserts and deletes
-
-            let left_join_value = left_row.values.get(left_col_idx);
-            if left_join_value.is_none() {
-                continue;
-            }
-            let left_join_value = left_join_value.unwrap();
-
-            // Look up matching rows in right_delta
-            for (right_row, right_weight) in &right_delta.changes {
-                // Process both inserts and deletes
-
-                let right_join_value = right_row.values.get(right_col_idx);
-                if right_join_value.is_none() {
-                    continue;
-                }
-                let right_join_value = right_join_value.unwrap();
-
-                // Check if values match
-                if left_join_value == right_join_value {
-                    // Record the join lookup
-                    if let Some(tracker) = &self.tracker {
-                        tracker.lock().unwrap().record_join_lookup();
-                    }
-
-                    // Create joined row
-                    let mut joined_values = left_row.values.clone();
-                    joined_values.extend(right_row.values.clone());
-
-                    // Generate a unique key for the result
-                    let result_key = *next_key;
-                    *next_key += 1;
-
-                    let joined_row = HashableRow::new(result_key, joined_values);
-                    result
-                        .changes
-                        .push((joined_row, left_weight * right_weight));
-                }
-            }
-        }
-
-        result
-    }
-
-    /// Join a delta with the full state using the index
-    fn join_delta_with_state(
-        &self,
-        delta: &Delta,
-        state: &Delta,
-        delta_on_left: bool,
-        next_key: &mut i64,
-    ) -> Delta {
-        let mut result = Delta::new();
-
-        let (delta_col_idx, state_col_names) = if delta_on_left {
-            (
-                self.left_column_names
-                    .iter()
-                    .position(|c| c == &self.left_on_column)
-                    .unwrap_or(0),
-                &self.right_column_names,
-            )
-        } else {
-            (
-                self.right_column_names
-                    .iter()
-                    .position(|c| c == &self.right_on_column)
-                    .unwrap_or(0),
-                &self.left_column_names,
-            )
-        };
-
-        // Use index for efficient lookup
-        let state_index = Self::build_index(
-            state,
-            state_col_names,
-            if delta_on_left {
-                &self.right_on_column
-            } else {
-                &self.left_on_column
-            },
-        );
-
-        for (delta_row, delta_weight) in &delta.changes {
-            // Process both inserts and deletes
-
-            let delta_join_value = delta_row.values.get(delta_col_idx);
-            if delta_join_value.is_none() {
-                continue;
-            }
-            let delta_join_value = delta_join_value.unwrap();
-
-            // Use index to find matching rows
-            let delta_key_str = format!("{delta_join_value:?}");
-            if let Some(matching_keys) = state_index.get(&delta_key_str) {
-                for state_key in matching_keys {
-                    // Look up in the state - find the row with this rowid
-                    let state_row_opt = state
-                        .changes
-                        .iter()
-                        .find(|(row, weight)| row.rowid == *state_key && *weight > 0);
-
-                    if let Some((state_row, state_weight)) = state_row_opt {
-                        // Record the join lookup
-                        if let Some(tracker) = &self.tracker {
-                            tracker.lock().unwrap().record_join_lookup();
-                        }
-
-                        // Create joined row
-                        let joined_values = if delta_on_left {
-                            let mut v = delta_row.values.clone();
-                            v.extend(state_row.values.clone());
-                            v
-                        } else {
-                            let mut v = state_row.values.clone();
-                            v.extend(delta_row.values.clone());
-                            v
-                        };
-
-                        let result_key = *next_key;
-                        *next_key += 1;
-
-                        let joined_row = HashableRow::new(result_key, joined_values);
-                        result
-                            .changes
-                            .push((joined_row, delta_weight * state_weight));
-                    }
-                }
-            }
-        }
-
-        result
-    }
-
-    /// Initialize both sides of the join
-    pub fn initialize_both(&mut self, left_data: Delta, right_data: Delta) {
-        self.left_state = left_data.clone();
-        self.right_state = right_data.clone();
-
-        // Build indices
-        self.left_index = Self::build_index(
-            &self.left_state,
-            &self.left_column_names,
-            &self.left_on_column,
-        );
-        self.right_index = Self::build_index(
-            &self.right_state,
-            &self.right_column_names,
-            &self.right_on_column,
-        );
-
-        // Perform initial join
-        let mut next_key = self.next_result_key;
-        self.current_state = self.join_deltas(&self.left_state, &self.right_state, &mut next_key);
-        self.next_result_key = next_key;
-    }
-
-    /// Process deltas for both sides using DBSP formula
-    /// ∂(A ⋈ B) = A ⋈ ∂B + ∂A ⋈ B + ∂A ⋈ ∂B
-    pub fn process_both_deltas(&mut self, left_delta: Delta, right_delta: Delta) -> Delta {
-        let mut result = Delta::new();
-        let mut next_key = self.next_result_key;
-
-        // A ⋈ ∂B (existing left with new right)
-        let a_join_db =
-            self.join_delta_with_state(&right_delta, &self.left_state, false, &mut next_key);
-        result.merge(&a_join_db);
-
-        // ∂A ⋈ B (new left with existing right)
-        let da_join_b =
-            self.join_delta_with_state(&left_delta, &self.right_state, true, &mut next_key);
-        result.merge(&da_join_b);
-
-        // ∂A ⋈ ∂B (new left with new right)
-        let da_join_db = self.join_deltas(&left_delta, &right_delta, &mut next_key);
-        result.merge(&da_join_db);
-
-        // Update the next key counter
-        self.next_result_key = next_key;
-
-        // Update state
-        self.left_state.merge(&left_delta);
-        self.right_state.merge(&right_delta);
-        self.current_state.merge(&result);
-
-        // Rebuild indices if needed
-        self.left_index = Self::build_index(
-            &self.left_state,
-            &self.left_column_names,
-            &self.left_on_column,
-        );
-        self.right_index = Self::build_index(
-            &self.right_state,
-            &self.right_column_names,
-            &self.right_on_column,
-        );
-
-        result
-    }
-
-    pub fn get_current_state(&self) -> &Delta {
-        &self.current_state
-    }
-
-    /// Process a delta from the left table only
-    pub fn process_left_delta(&mut self, left_delta: Delta) -> Delta {
-        let empty_delta = Delta::new();
-        self.process_both_deltas(left_delta, empty_delta)
-    }
-
-    /// Process a delta from the right table only  
-    pub fn process_right_delta(&mut self, right_delta: Delta) -> Delta {
-        let empty_delta = Delta::new();
-        self.process_both_deltas(empty_delta, right_delta)
     }
 }
 
@@ -1275,10 +1066,8 @@ struct AggregateState {
     sums: HashMap<String, f64>,
     // For AVG: column_name -> (sum, count) for computing average
     avgs: HashMap<String, (f64, i64)>,
-    // For MIN: column_name -> min value
-    mins: HashMap<String, Value>,
-    // For MAX: column_name -> max value
-    maxs: HashMap<String, Value>,
+    // MIN/MAX are not supported - they require O(n) storage overhead for handling deletions
+    // correctly. See comment in apply_delta() for details.
 }
 
 impl AggregateState {
@@ -1287,8 +1076,6 @@ impl AggregateState {
             count: 0,
             sums: HashMap::new(),
             avgs: HashMap::new(),
-            mins: HashMap::new(),
-            maxs: HashMap::new(),
         }
     }
 
@@ -1337,43 +1124,6 @@ impl AggregateState {
                         }
                     }
                 }
-                AggregateFunction::Min(col_name) => {
-                    // MIN/MAX are more complex for incremental updates
-                    // For now, we'll need to recompute from the full state
-                    // This is a limitation we can improve later
-                    if weight > 0 {
-                        // Only update on insert
-                        if let Some(idx) = column_names.iter().position(|c| c == col_name) {
-                            if let Some(val) = values.get(idx) {
-                                self.mins
-                                    .entry(col_name.clone())
-                                    .and_modify(|existing| {
-                                        if val < existing {
-                                            *existing = val.clone();
-                                        }
-                                    })
-                                    .or_insert_with(|| val.clone());
-                            }
-                        }
-                    }
-                }
-                AggregateFunction::Max(col_name) => {
-                    if weight > 0 {
-                        // Only update on insert
-                        if let Some(idx) = column_names.iter().position(|c| c == col_name) {
-                            if let Some(val) = values.get(idx) {
-                                self.maxs
-                                    .entry(col_name.clone())
-                                    .and_modify(|existing| {
-                                        if val > existing {
-                                            *existing = val.clone();
-                                        }
-                                    })
-                                    .or_insert_with(|| val.clone());
-                            }
-                        }
-                    }
-                }
             }
         }
     }
@@ -1406,12 +1156,6 @@ impl AggregateState {
                     } else {
                         result.push(Value::Null);
                     }
-                }
-                AggregateFunction::Min(col_name) => {
-                    result.push(self.mins.get(col_name).cloned().unwrap_or(Value::Null));
-                }
-                AggregateFunction::Max(col_name) => {
-                    result.push(self.maxs.get(col_name).cloned().unwrap_or(Value::Null));
                 }
             }
         }
@@ -1472,8 +1216,9 @@ impl AggregateOperator {
     pub fn process_delta(&mut self, delta: Delta) -> Delta {
         let mut output_delta = Delta::new();
 
-        // Track which groups were modified
+        // Track which groups were modified and their old values
         let mut modified_groups = HashSet::new();
+        let mut old_values: HashMap<String, Vec<Value>> = HashMap::new();
 
         // Process each change in the delta
         for (row, weight) in &delta.changes {
@@ -1484,6 +1229,17 @@ impl AggregateOperator {
             // Extract group key
             let group_key = self.extract_group_key(&row.values);
             let group_key_str = Self::group_key_to_string(&group_key);
+
+            // Store old aggregate values BEFORE applying the delta
+            // (only for the first time we see this group in this batch)
+            if !modified_groups.contains(&group_key_str) {
+                if let Some(state) = self.group_states.get(&group_key_str) {
+                    let mut old_row = group_key.clone();
+                    old_row.extend(state.to_values(&self.aggregates));
+                    old_values.insert(group_key_str.clone(), old_row);
+                }
+            }
+
             modified_groups.insert(group_key_str.clone());
 
             // Store the actual group key values
@@ -1514,16 +1270,24 @@ impl AggregateOperator {
                 .cloned()
                 .unwrap_or_default();
 
+            // Generate a unique key for this group
+            // We use a hash of the group key to ensure consistency
+            let result_key = group_key_str
+                .bytes()
+                .fold(0i64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as i64));
+
+            // Emit retraction for old value if it existed
+            if let Some(old_row_values) = old_values.get(&group_key_str) {
+                let old_row = HashableRow::new(result_key, old_row_values.clone());
+                output_delta.changes.push((old_row.clone(), -1));
+                // Also remove from current state
+                self.current_state.changes.push((old_row, -1));
+            }
+
             if let Some(state) = self.group_states.get(&group_key_str) {
                 // Build output row: group_by columns + aggregate values
                 let mut output_values = group_key.clone();
                 output_values.extend(state.to_values(&self.aggregates));
-
-                // Generate a unique key for this group
-                // We use a hash of the group key to ensure consistency
-                let result_key = group_key_str
-                    .bytes()
-                    .fold(0i64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as i64));
 
                 // Check if group should be removed (count is 0)
                 if state.count > 0 {
@@ -1534,12 +1298,8 @@ impl AggregateOperator {
                     // Update current state
                     self.current_state.changes.push((output_row, 1));
                 } else {
-                    // Add to output delta with negative weight (deletion)
-                    let output_row = HashableRow::new(result_key, output_values);
-                    output_delta.changes.push((output_row.clone(), -1));
-
-                    // Mark for removal in current state
-                    self.current_state.changes.push((output_row, -1));
+                    // Group has count=0, remove from state
+                    // (we already emitted the retraction above if needed)
                     self.group_states.remove(&group_key_str);
                     self.group_key_values.remove(&group_key_str);
                 }
@@ -1559,16 +1319,108 @@ impl AggregateOperator {
 
 impl IncrementalOperator for AggregateOperator {
     fn initialize(&mut self, data: Delta) {
-        // Process all initial data
-        self.process_delta(data);
+        // Process all initial data - this modifies state during initialization
+        let _ = self.process_delta(data);
     }
 
-    fn process_delta(&mut self, delta: Delta) -> Delta {
+    fn eval(&self, delta: Delta, uncommitted: Option<Delta>) -> Delta {
+        // Clone the current state to work with temporarily
+        let mut temp_group_states = self.group_states.clone();
+        let mut temp_group_key_values = self.group_key_values.clone();
+
+        // Merge delta with uncommitted if present
+        let combined_delta = if let Some(uncommitted) = uncommitted {
+            let mut combined = delta;
+            combined.merge(&uncommitted);
+            combined
+        } else {
+            delta
+        };
+
+        let mut output_delta = Delta::new();
+        let mut modified_groups = HashSet::new();
+        let mut old_values: HashMap<String, Vec<Value>> = HashMap::new();
+
+        // Process each change in the combined delta using temporary state
+        for (row, weight) in &combined_delta.changes {
+            if let Some(tracker) = &self.tracker {
+                tracker.lock().unwrap().record_aggregation();
+            }
+
+            // Extract group key
+            let group_key = self.extract_group_key(&row.values);
+            let group_key_str = Self::group_key_to_string(&group_key);
+
+            // Store old aggregate values BEFORE applying the delta
+            if !modified_groups.contains(&group_key_str) {
+                if let Some(state) = temp_group_states.get(&group_key_str) {
+                    let mut old_row = group_key.clone();
+                    old_row.extend(state.to_values(&self.aggregates));
+                    old_values.insert(group_key_str.clone(), old_row);
+                }
+            }
+
+            modified_groups.insert(group_key_str.clone());
+            temp_group_key_values.insert(group_key_str.clone(), group_key.clone());
+
+            // Get or create aggregate state for this group in temporary state
+            let state = temp_group_states
+                .entry(group_key_str.clone())
+                .or_insert_with(AggregateState::new);
+
+            // Apply the delta to the temporary aggregate state
+            state.apply_delta(
+                &row.values,
+                *weight,
+                &self.aggregates,
+                &self.input_column_names,
+            );
+        }
+
+        // Generate output delta for modified groups using temporary state
+        for group_key_str in modified_groups {
+            let group_key = temp_group_key_values
+                .get(&group_key_str)
+                .cloned()
+                .unwrap_or_default();
+
+            // Generate a unique key for this group
+            let result_key = group_key_str
+                .bytes()
+                .fold(0i64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as i64));
+
+            // Emit retraction for old value if it existed
+            if let Some(old_row_values) = old_values.get(&group_key_str) {
+                let old_row = HashableRow::new(result_key, old_row_values.clone());
+                output_delta.changes.push((old_row, -1));
+            }
+
+            if let Some(state) = temp_group_states.get(&group_key_str) {
+                // Build output row: group_by columns + aggregate values
+                let mut output_values = group_key.clone();
+                output_values.extend(state.to_values(&self.aggregates));
+
+                // Check if group should be included (count > 0)
+                if state.count > 0 {
+                    let output_row = HashableRow::new(result_key, output_values);
+                    output_delta.changes.push((output_row, 1));
+                }
+            }
+        }
+
+        output_delta
+    }
+
+    fn commit(&mut self, delta: Delta) -> Delta {
+        // Actually update the internal state when committing and return the output
         self.process_delta(delta)
     }
 
     fn get_current_state(&self) -> Delta {
-        self.current_state.clone()
+        // Return a consolidated view of the current state
+        let mut consolidated = self.current_state.clone();
+        consolidated.consolidate();
+        consolidated
     }
 
     fn set_tracker(&mut self, tracker: Arc<Mutex<ComputationTracker>>) {
@@ -1603,176 +1455,245 @@ mod tests {
         );
     }
 
-    // Join tests
+    // Aggregate tests
     #[test]
-    fn test_join_uses_delta_formula() {
-        let tracker = Arc::new(Mutex::new(ComputationTracker::new()));
+    fn test_aggregate_incremental_update_emits_retraction() {
+        // This test verifies that when an aggregate value changes,
+        // the operator emits both a retraction (-1) of the old value
+        // and an insertion (+1) of the new value.
 
-        // Create join operator
-        let mut join = JoinOperator::new(
-            JoinType::Inner,
-            "user_id".to_string(),
-            "user_id".to_string(),
-            vec!["user_id".to_string(), "email".to_string()],
-            vec![
-                "login_id".to_string(),
-                "user_id".to_string(),
-                "timestamp".to_string(),
-            ],
+        // Create an aggregate operator for SUM(age) with no GROUP BY
+        let mut agg = AggregateOperator::new(
+            vec![], // No GROUP BY
+            vec![AggregateFunction::Sum("age".to_string())],
+            vec!["id".to_string(), "name".to_string(), "age".to_string()],
         );
-        join.set_tracker(tracker.clone());
 
-        // Initial data: emails table
-        let mut emails = Delta::new();
-        emails.insert(
+        // Initial data: 3 users
+        let mut initial_delta = Delta::new();
+        initial_delta.insert(
             1,
             vec![
                 Value::Integer(1),
-                Value::Text(Text::new("alice@example.com")),
+                Value::Text("Alice".to_string().into()),
+                Value::Integer(25),
             ],
         );
-        emails.insert(
+        initial_delta.insert(
             2,
-            vec![Value::Integer(2), Value::Text(Text::new("bob@example.com"))],
+            vec![
+                Value::Integer(2),
+                Value::Text("Bob".to_string().into()),
+                Value::Integer(30),
+            ],
         );
-
-        // Initial data: logins table
-        let mut logins = Delta::new();
-        logins.insert(
-            1,
-            vec![Value::Integer(1), Value::Integer(1), Value::Integer(1000)],
-        );
-        logins.insert(
-            2,
-            vec![Value::Integer(2), Value::Integer(1), Value::Integer(2000)],
-        );
-
-        // Initialize join
-        join.initialize_both(emails.clone(), logins.clone());
-
-        // Reset tracker for delta processing
-        tracker.lock().unwrap().join_lookups = 0;
-
-        // Add one login for bob (user_id=2)
-        let mut delta_logins = Delta::new();
-        delta_logins.insert(
+        initial_delta.insert(
             3,
-            vec![Value::Integer(3), Value::Integer(2), Value::Integer(3000)],
+            vec![
+                Value::Integer(3),
+                Value::Text("Charlie".to_string().into()),
+                Value::Integer(35),
+            ],
         );
 
-        // Process delta - should use incremental formula
-        let empty_delta = Delta::new();
-        let output = join.process_both_deltas(empty_delta, delta_logins);
+        // Initialize with initial data
+        agg.initialize(initial_delta);
 
-        // Should have one join result (bob's new login)
-        assert_eq!(output.len(), 1);
+        // Verify initial state: SUM(age) = 25 + 30 + 35 = 90
+        let state = agg.get_current_state();
+        assert_eq!(state.changes.len(), 1, "Should have one aggregate row");
+        let (row, weight) = &state.changes[0];
+        assert_eq!(*weight, 1, "Aggregate row should have weight 1");
+        assert_eq!(row.values[0], Value::Float(90.0), "SUM should be 90");
 
-        // Verify we used index lookups, not nested loops
-        // Should have done 1 lookup (finding bob's email for the new login)
-        let lookups = tracker.lock().unwrap().join_lookups;
-        assert_eq!(lookups, 1, "Should use index lookup, not scan all emails");
+        // Now add a new user (incremental update)
+        let mut update_delta = Delta::new();
+        update_delta.insert(
+            4,
+            vec![
+                Value::Integer(4),
+                Value::Text("David".to_string().into()),
+                Value::Integer(40),
+            ],
+        );
 
-        // Verify incremental behavior - we processed only the delta
-        let t = tracker.lock().unwrap();
-        assert_incremental(&t, 1, 3); // 1 operation for 3 total rows
+        // Process the incremental update
+        let output_delta = agg.eval(update_delta.clone(), None);
+        agg.commit(update_delta);
+
+        // CRITICAL: The output delta should contain TWO changes:
+        // 1. Retraction of old aggregate value (90) with weight -1
+        // 2. Insertion of new aggregate value (130) with weight +1
+        assert_eq!(
+            output_delta.changes.len(),
+            2,
+            "Expected 2 changes (retraction + insertion), got {}: {:?}",
+            output_delta.changes.len(),
+            output_delta.changes
+        );
+
+        // Verify the retraction comes first
+        let (retraction_row, retraction_weight) = &output_delta.changes[0];
+        assert_eq!(
+            *retraction_weight, -1,
+            "First change should be a retraction"
+        );
+        assert_eq!(
+            retraction_row.values[0],
+            Value::Float(90.0),
+            "Retracted value should be the old sum (90)"
+        );
+
+        // Verify the insertion comes second
+        let (insertion_row, insertion_weight) = &output_delta.changes[1];
+        assert_eq!(*insertion_weight, 1, "Second change should be an insertion");
+        assert_eq!(
+            insertion_row.values[0],
+            Value::Float(130.0),
+            "Inserted value should be the new sum (130)"
+        );
+
+        // Both changes should have the same row ID (since it's the same aggregate group)
+        assert_eq!(
+            retraction_row.rowid, insertion_row.rowid,
+            "Retraction and insertion should have the same row ID"
+        );
     }
 
     #[test]
-    fn test_join_maintains_index() {
-        // Create join operator
-        let mut join = JoinOperator::new(
-            JoinType::Inner,
-            "id".to_string(),
-            "ref_id".to_string(),
-            vec!["id".to_string(), "name".to_string()],
-            vec!["ref_id".to_string(), "value".to_string()],
+    fn test_aggregate_with_group_by_emits_retractions() {
+        // This test verifies that when aggregate values change for grouped data,
+        // the operator emits both retractions and insertions correctly for each group.
+
+        // Create an aggregate operator for SUM(score) GROUP BY team
+        let mut agg = AggregateOperator::new(
+            vec!["team".to_string()], // GROUP BY team
+            vec![AggregateFunction::Sum("score".to_string())],
+            vec![
+                "id".to_string(),
+                "team".to_string(),
+                "player".to_string(),
+                "score".to_string(),
+            ],
         );
 
-        // Initial data
-        let mut left = Delta::new();
-        left.insert(1, vec![Value::Integer(1), Value::Text(Text::new("A"))]);
-        left.insert(2, vec![Value::Integer(2), Value::Text(Text::new("B"))]);
-
-        let mut right = Delta::new();
-        right.insert(1, vec![Value::Integer(1), Value::Integer(100)]);
-
-        // Initialize - should build index
-        join.initialize_both(left.clone(), right.clone());
-
-        // Verify initial join worked
-        let state = join.get_current_state();
-        assert_eq!(state.changes.len(), 1); // One match: id=1
-
-        // Add new item to left
-        let mut delta_left = Delta::new();
-        delta_left.insert(3, vec![Value::Integer(3), Value::Text(Text::new("C"))]);
-
-        // Add matching item to right
-        let mut delta_right = Delta::new();
-        delta_right.insert(2, vec![Value::Integer(3), Value::Integer(300)]);
-
-        // Process deltas
-        let output = join.process_both_deltas(delta_left, delta_right);
-
-        // Should have new join result
-        assert_eq!(output.len(), 1);
-
-        // Verify the join result has the expected values
-        assert!(!output.changes.is_empty());
-        let (result, _weight) = &output.changes[0];
-        assert_eq!(result.values.len(), 4); // id, name, ref_id, value
-    }
-
-    #[test]
-    fn test_join_formula_correctness() {
-        // Test the DBSP formula: ∂(A ⋈ B) = A ⋈ ∂B + ∂A ⋈ B + ∂A ⋈ ∂B
-        let tracker = Arc::new(Mutex::new(ComputationTracker::new()));
-
-        let mut join = JoinOperator::new(
-            JoinType::Inner,
-            "x".to_string(),
-            "x".to_string(),
-            vec!["x".to_string(), "a".to_string()],
-            vec!["x".to_string(), "b".to_string()],
+        // Initial data: players on different teams
+        let mut initial_delta = Delta::new();
+        initial_delta.insert(
+            1,
+            vec![
+                Value::Integer(1),
+                Value::Text("red".to_string().into()),
+                Value::Text("Alice".to_string().into()),
+                Value::Integer(10),
+            ],
         );
-        join.set_tracker(tracker.clone());
+        initial_delta.insert(
+            2,
+            vec![
+                Value::Integer(2),
+                Value::Text("blue".to_string().into()),
+                Value::Text("Bob".to_string().into()),
+                Value::Integer(15),
+            ],
+        );
+        initial_delta.insert(
+            3,
+            vec![
+                Value::Integer(3),
+                Value::Text("red".to_string().into()),
+                Value::Text("Charlie".to_string().into()),
+                Value::Integer(20),
+            ],
+        );
 
-        // Initial state A
-        let mut a = Delta::new();
-        a.insert(1, vec![Value::Integer(1), Value::Text(Text::new("a1"))]);
-        a.insert(2, vec![Value::Integer(2), Value::Text(Text::new("a2"))]);
+        // Initialize with initial data
+        agg.initialize(initial_delta);
 
-        // Initial state B
-        let mut b = Delta::new();
-        b.insert(1, vec![Value::Integer(1), Value::Text(Text::new("b1"))]);
-        b.insert(2, vec![Value::Integer(2), Value::Text(Text::new("b2"))]);
+        // Verify initial state: red team = 30, blue team = 15
+        let state = agg.get_current_state();
+        assert_eq!(state.changes.len(), 2, "Should have two groups");
 
-        join.initialize_both(a.clone(), b.clone());
+        // Find the red and blue team aggregates
+        let mut red_sum = None;
+        let mut blue_sum = None;
+        for (row, weight) in &state.changes {
+            assert_eq!(*weight, 1);
+            if let Value::Text(team) = &row.values[0] {
+                if team.as_str() == "red" {
+                    red_sum = Some(&row.values[1]);
+                } else if team.as_str() == "blue" {
+                    blue_sum = Some(&row.values[1]);
+                }
+            }
+        }
+        assert_eq!(
+            red_sum,
+            Some(&Value::Float(30.0)),
+            "Red team sum should be 30"
+        );
+        assert_eq!(
+            blue_sum,
+            Some(&Value::Float(15.0)),
+            "Blue team sum should be 15"
+        );
 
-        // Reset tracker
-        tracker.lock().unwrap().join_lookups = 0;
+        // Now add a new player to the red team (incremental update)
+        let mut update_delta = Delta::new();
+        update_delta.insert(
+            4,
+            vec![
+                Value::Integer(4),
+                Value::Text("red".to_string().into()),
+                Value::Text("David".to_string().into()),
+                Value::Integer(25),
+            ],
+        );
 
-        // Delta for A (add x=3)
-        let mut delta_a = Delta::new();
-        delta_a.insert(3, vec![Value::Integer(3), Value::Text(Text::new("a3"))]);
+        // Process the incremental update
+        let output_delta = agg.eval(update_delta.clone(), None);
+        agg.commit(update_delta);
 
-        // Delta for B (add x=3 and x=1)
-        let mut delta_b = Delta::new();
-        delta_b.insert(3, vec![Value::Integer(3), Value::Text(Text::new("b3"))]);
-        delta_b.insert(4, vec![Value::Integer(1), Value::Text(Text::new("b1_new"))]);
+        // Should have 2 changes: retraction of old red team sum, insertion of new red team sum
+        // Blue team should NOT be affected
+        assert_eq!(
+            output_delta.changes.len(),
+            2,
+            "Expected 2 changes for red team only, got {}: {:?}",
+            output_delta.changes.len(),
+            output_delta.changes
+        );
 
-        let output = join.process_both_deltas(delta_a, delta_b);
+        // Both changes should be for the red team
+        let mut found_retraction = false;
+        let mut found_insertion = false;
 
-        // Expected results:
-        // A ⋈ ∂B: (1,a1) ⋈ (1,b1_new) = 1 result
-        // ∂A ⋈ B: (3,a3) ⋈ nothing = 0 results
-        // ∂A ⋈ ∂B: (3,a3) ⋈ (3,b3) = 1 result
-        // Total: 2 results
-        assert_eq!(output.len(), 2);
+        for (row, weight) in &output_delta.changes {
+            if let Value::Text(team) = &row.values[0] {
+                assert_eq!(team.as_str(), "red", "Only red team should have changes");
 
-        // Verify we're doing incremental work
-        let lookups = tracker.lock().unwrap().join_lookups;
-        assert!(lookups <= 4, "Should use efficient index lookups");
+                if *weight == -1 {
+                    // Retraction of old value
+                    assert_eq!(
+                        row.values[1],
+                        Value::Float(30.0),
+                        "Should retract old sum of 30"
+                    );
+                    found_retraction = true;
+                } else if *weight == 1 {
+                    // Insertion of new value
+                    assert_eq!(
+                        row.values[1],
+                        Value::Float(55.0),
+                        "Should insert new sum of 55"
+                    );
+                    found_insertion = true;
+                }
+            }
+        }
+
+        assert!(found_retraction, "Should have found retraction");
+        assert!(found_insertion, "Should have found insertion");
     }
 
     // Aggregation tests
@@ -1821,21 +1742,25 @@ mod tests {
             ],
         );
 
-        let output = agg.process_delta(delta);
+        let _output = agg.eval(delta.clone(), None);
+        agg.commit(delta);
 
-        // Should only update one group (cat_0), not recount all groups
-        assert_eq!(tracker.lock().unwrap().aggregation_updates, 1);
+        // Should update one group (cat_0) twice - once in eval, once in commit
+        // This is still incremental - we're not recounting all groups
+        assert_eq!(tracker.lock().unwrap().aggregation_updates, 2);
 
-        // Output should show cat_0 now has count 11
-        assert_eq!(output.len(), 1);
-        assert!(!output.changes.is_empty());
-        let (change_row, _weight) = &output.changes[0];
-        assert_eq!(change_row.values[0], Value::Text(Text::new("cat_0")));
-        assert_eq!(change_row.values[1], Value::Integer(11));
+        // Check the final state - cat_0 should now have count 11
+        let final_state = agg.get_current_state();
+        let cat_0 = final_state
+            .changes
+            .iter()
+            .find(|(row, _)| row.values[0] == Value::Text(Text::new("cat_0")))
+            .unwrap();
+        assert_eq!(cat_0.0.values[1], Value::Integer(11));
 
-        // Verify incremental behavior
+        // Verify incremental behavior - we process the delta twice (eval + commit)
         let t = tracker.lock().unwrap();
-        assert_incremental(&t, 1, 101);
+        assert_incremental(&t, 2, 101);
     }
 
     #[test]
@@ -1906,17 +1831,20 @@ mod tests {
             ],
         );
 
-        let output = agg.process_delta(delta);
+        let _output = agg.eval(delta.clone(), None);
+        agg.commit(delta);
 
-        // Should only update Widget group
-        assert_eq!(tracker.lock().unwrap().aggregation_updates, 1);
-        assert_eq!(output.len(), 1);
+        // Should update Widget group twice (once in eval, once in commit)
+        assert_eq!(tracker.lock().unwrap().aggregation_updates, 2);
 
-        // Widget should now be 300 (250 + 50)
-        assert!(!output.changes.is_empty());
-        let (change, _weight) = &output.changes[0];
-        assert_eq!(change.values[0], Value::Text(Text::new("Widget")));
-        assert_eq!(change.values[1], Value::Integer(300));
+        // Check final state - Widget should now be 300 (250 + 50)
+        let final_state = agg.get_current_state();
+        let widget = final_state
+            .changes
+            .iter()
+            .find(|(row, _)| row.values[0] == Value::Text(Text::new("Widget")))
+            .unwrap();
+        assert_eq!(widget.0.values[1], Value::Integer(300));
     }
 
     #[test]
@@ -1981,15 +1909,18 @@ mod tests {
             4,
             vec![Value::Integer(4), Value::Integer(1), Value::Integer(50)],
         );
-        let output = agg.process_delta(delta);
+        let _output = agg.eval(delta.clone(), None);
+        agg.commit(delta);
 
-        // Should only update user 1
-        assert_eq!(output.len(), 1);
-        assert!(!output.changes.is_empty());
-        let (change, _weight) = &output.changes[0];
-        assert_eq!(change.values[0], Value::Integer(1)); // user_id
-        assert_eq!(change.values[1], Value::Integer(3)); // count: 2 + 1
-        assert_eq!(change.values[2], Value::Integer(350)); // sum: 300 + 50
+        // Check final state - user 1 should have updated count and sum
+        let final_state = agg.get_current_state();
+        let user1 = final_state
+            .changes
+            .iter()
+            .find(|(row, _)| row.values[0] == Value::Integer(1))
+            .unwrap();
+        assert_eq!(user1.0.values[1], Value::Integer(3)); // count: 2 + 1
+        assert_eq!(user1.0.values[2], Value::Integer(350)); // sum: 300 + 50
     }
 
     #[test]
@@ -2063,13 +1994,17 @@ mod tests {
                 Value::Integer(30),
             ],
         );
-        let output = agg.process_delta(delta);
+        let _output = agg.eval(delta.clone(), None);
+        agg.commit(delta);
 
-        // Category A avg should now be (10 + 20 + 30) / 3 = 20
-        assert!(!output.changes.is_empty());
-        let (change, _weight) = &output.changes[0];
-        assert_eq!(change.values[0], Value::Text(Text::new("A")));
-        assert_eq!(change.values[1], Value::Float(20.0));
+        // Check final state - Category A avg should now be (10 + 20 + 30) / 3 = 20
+        let final_state = agg.get_current_state();
+        let cat_a = final_state
+            .changes
+            .iter()
+            .find(|(row, _)| row.values[0] == Value::Text(Text::new("A")))
+            .unwrap();
+        assert_eq!(cat_a.0.values[1], Value::Float(20.0));
     }
 
     #[test]
@@ -2126,13 +2061,662 @@ mod tests {
             ],
         );
 
-        let output = agg.process_delta(delta);
+        let _output = agg.eval(delta.clone(), None);
+        agg.commit(delta);
 
-        // Should update to count=1, sum=200
-        assert!(!output.changes.is_empty());
-        let (change_row, _weight) = &output.changes[0];
-        assert_eq!(change_row.values[0], Value::Text(Text::new("A")));
-        assert_eq!(change_row.values[1], Value::Integer(1)); // count: 2 - 1
-        assert_eq!(change_row.values[2], Value::Integer(200)); // sum: 300 - 100
+        // Check final state - should update to count=1, sum=200
+        let final_state = agg.get_current_state();
+        let cat_a = final_state
+            .changes
+            .iter()
+            .find(|(row, _)| row.values[0] == Value::Text(Text::new("A")))
+            .unwrap();
+        assert_eq!(cat_a.0.values[1], Value::Integer(1)); // count: 2 - 1
+        assert_eq!(cat_a.0.values[2], Value::Integer(200)); // sum: 300 - 100
+    }
+
+    #[test]
+    fn test_count_aggregation_with_deletions() {
+        let aggregates = vec![AggregateFunction::Count];
+        let group_by = vec!["category".to_string()];
+        let input_columns = vec!["category".to_string(), "value".to_string()];
+
+        let mut agg = AggregateOperator::new(group_by, aggregates.clone(), input_columns);
+
+        // Initialize with data
+        let mut init_data = Delta::new();
+        init_data.insert(1, vec![Value::Text("A".into()), Value::Integer(10)]);
+        init_data.insert(2, vec![Value::Text("A".into()), Value::Integer(20)]);
+        init_data.insert(3, vec![Value::Text("B".into()), Value::Integer(30)]);
+        agg.initialize(init_data);
+
+        // Check initial counts
+        let state = agg.get_current_state();
+        assert_eq!(state.changes.len(), 2);
+
+        // Find group A and B
+        let group_a = state
+            .changes
+            .iter()
+            .find(|(row, _)| row.values[0] == Value::Text("A".into()))
+            .unwrap();
+        let group_b = state
+            .changes
+            .iter()
+            .find(|(row, _)| row.values[0] == Value::Text("B".into()))
+            .unwrap();
+
+        assert_eq!(group_a.0.values[1], Value::Integer(2)); // COUNT = 2 for A
+        assert_eq!(group_b.0.values[1], Value::Integer(1)); // COUNT = 1 for B
+
+        // Delete one row from group A
+        let mut delete_delta = Delta::new();
+        delete_delta.delete(1, vec![Value::Text("A".into()), Value::Integer(10)]);
+
+        let output = agg.eval(delete_delta.clone(), None);
+        agg.commit(delete_delta);
+
+        // Should emit retraction for old count and insertion for new count
+        assert_eq!(output.changes.len(), 2);
+
+        // Check final state
+        let final_state = agg.get_current_state();
+        let group_a_final = final_state
+            .changes
+            .iter()
+            .find(|(row, _)| row.values[0] == Value::Text("A".into()))
+            .unwrap();
+        assert_eq!(group_a_final.0.values[1], Value::Integer(1)); // COUNT = 1 for A after deletion
+
+        // Delete all rows from group B
+        let mut delete_all_b = Delta::new();
+        delete_all_b.delete(3, vec![Value::Text("B".into()), Value::Integer(30)]);
+
+        let output_b = agg.eval(delete_all_b.clone(), None);
+        agg.commit(delete_all_b);
+        assert_eq!(output_b.changes.len(), 1); // Only retraction, no new row
+        assert_eq!(output_b.changes[0].1, -1); // Retraction
+
+        // Final state should not have group B
+        let final_state2 = agg.get_current_state();
+        assert_eq!(final_state2.changes.len(), 1); // Only group A remains
+        assert_eq!(final_state2.changes[0].0.values[0], Value::Text("A".into()));
+    }
+
+    #[test]
+    fn test_sum_aggregation_with_deletions() {
+        let aggregates = vec![AggregateFunction::Sum("value".to_string())];
+        let group_by = vec!["category".to_string()];
+        let input_columns = vec!["category".to_string(), "value".to_string()];
+
+        let mut agg = AggregateOperator::new(group_by, aggregates.clone(), input_columns);
+
+        // Initialize with data
+        let mut init_data = Delta::new();
+        init_data.insert(1, vec![Value::Text("A".into()), Value::Integer(10)]);
+        init_data.insert(2, vec![Value::Text("A".into()), Value::Integer(20)]);
+        init_data.insert(3, vec![Value::Text("B".into()), Value::Integer(30)]);
+        init_data.insert(4, vec![Value::Text("B".into()), Value::Integer(15)]);
+        agg.initialize(init_data);
+
+        // Check initial sums
+        let state = agg.get_current_state();
+        let group_a = state
+            .changes
+            .iter()
+            .find(|(row, _)| row.values[0] == Value::Text("A".into()))
+            .unwrap();
+        let group_b = state
+            .changes
+            .iter()
+            .find(|(row, _)| row.values[0] == Value::Text("B".into()))
+            .unwrap();
+
+        assert_eq!(group_a.0.values[1], Value::Integer(30)); // SUM = 30 for A (10+20)
+        assert_eq!(group_b.0.values[1], Value::Integer(45)); // SUM = 45 for B (30+15)
+
+        // Delete one row from group A
+        let mut delete_delta = Delta::new();
+        delete_delta.delete(2, vec![Value::Text("A".into()), Value::Integer(20)]);
+
+        let _ = agg.eval(delete_delta.clone(), None);
+        agg.commit(delete_delta);
+
+        // Check updated sum
+        let state = agg.get_current_state();
+        let group_a = state
+            .changes
+            .iter()
+            .find(|(row, _)| row.values[0] == Value::Text("A".into()))
+            .unwrap();
+        assert_eq!(group_a.0.values[1], Value::Integer(10)); // SUM = 10 for A after deletion
+
+        // Delete all from group B
+        let mut delete_all_b = Delta::new();
+        delete_all_b.delete(3, vec![Value::Text("B".into()), Value::Integer(30)]);
+        delete_all_b.delete(4, vec![Value::Text("B".into()), Value::Integer(15)]);
+
+        let _ = agg.eval(delete_all_b.clone(), None);
+        agg.commit(delete_all_b);
+
+        // Group B should be gone
+        let final_state = agg.get_current_state();
+        assert_eq!(final_state.changes.len(), 1); // Only group A remains
+        assert_eq!(final_state.changes[0].0.values[0], Value::Text("A".into()));
+    }
+
+    #[test]
+    fn test_avg_aggregation_with_deletions() {
+        let aggregates = vec![AggregateFunction::Avg("value".to_string())];
+        let group_by = vec!["category".to_string()];
+        let input_columns = vec!["category".to_string(), "value".to_string()];
+
+        let mut agg = AggregateOperator::new(group_by, aggregates.clone(), input_columns);
+
+        // Initialize with data
+        let mut init_data = Delta::new();
+        init_data.insert(1, vec![Value::Text("A".into()), Value::Integer(10)]);
+        init_data.insert(2, vec![Value::Text("A".into()), Value::Integer(20)]);
+        init_data.insert(3, vec![Value::Text("A".into()), Value::Integer(30)]);
+        agg.initialize(init_data);
+
+        // Check initial average
+        let state = agg.get_current_state();
+        assert_eq!(state.changes.len(), 1);
+        assert_eq!(state.changes[0].0.values[1], Value::Float(20.0)); // AVG = (10+20+30)/3 = 20
+
+        // Delete the middle value
+        let mut delete_delta = Delta::new();
+        delete_delta.delete(2, vec![Value::Text("A".into()), Value::Integer(20)]);
+
+        let _ = agg.eval(delete_delta.clone(), None);
+        agg.commit(delete_delta);
+
+        // Check updated average
+        let state = agg.get_current_state();
+        assert_eq!(state.changes[0].0.values[1], Value::Float(20.0)); // AVG = (10+30)/2 = 20 (same!)
+
+        // Delete another to change the average
+        let mut delete_another = Delta::new();
+        delete_another.delete(3, vec![Value::Text("A".into()), Value::Integer(30)]);
+
+        let _ = agg.eval(delete_another.clone(), None);
+        agg.commit(delete_another);
+
+        let state = agg.get_current_state();
+        assert_eq!(state.changes[0].0.values[1], Value::Float(10.0)); // AVG = 10/1 = 10
+    }
+
+    #[test]
+    fn test_multiple_aggregations_with_deletions() {
+        // Test COUNT, SUM, and AVG together
+        let aggregates = vec![
+            AggregateFunction::Count,
+            AggregateFunction::Sum("value".to_string()),
+            AggregateFunction::Avg("value".to_string()),
+        ];
+        let group_by = vec!["category".to_string()];
+        let input_columns = vec!["category".to_string(), "value".to_string()];
+
+        let mut agg = AggregateOperator::new(group_by, aggregates.clone(), input_columns);
+
+        // Initialize with data
+        let mut init_data = Delta::new();
+        init_data.insert(1, vec![Value::Text("A".into()), Value::Integer(100)]);
+        init_data.insert(2, vec![Value::Text("A".into()), Value::Integer(200)]);
+        init_data.insert(3, vec![Value::Text("B".into()), Value::Integer(50)]);
+        agg.initialize(init_data);
+
+        // Check initial state
+        let state = agg.get_current_state();
+        let group_a = state
+            .changes
+            .iter()
+            .find(|(row, _)| row.values[0] == Value::Text("A".into()))
+            .unwrap();
+
+        assert_eq!(group_a.0.values[1], Value::Integer(2)); // COUNT = 2
+        assert_eq!(group_a.0.values[2], Value::Integer(300)); // SUM = 300
+        assert_eq!(group_a.0.values[3], Value::Float(150.0)); // AVG = 150
+
+        // Delete one row from group A
+        let mut delete_delta = Delta::new();
+        delete_delta.delete(1, vec![Value::Text("A".into()), Value::Integer(100)]);
+
+        let _ = agg.eval(delete_delta.clone(), None);
+        agg.commit(delete_delta);
+
+        // Check all aggregates updated correctly
+        let state = agg.get_current_state();
+        let group_a = state
+            .changes
+            .iter()
+            .find(|(row, _)| row.values[0] == Value::Text("A".into()))
+            .unwrap();
+
+        assert_eq!(group_a.0.values[1], Value::Integer(1)); // COUNT = 1
+        assert_eq!(group_a.0.values[2], Value::Integer(200)); // SUM = 200
+        assert_eq!(group_a.0.values[3], Value::Float(200.0)); // AVG = 200
+
+        // Insert a new row with floating point value
+        let mut insert_delta = Delta::new();
+        insert_delta.insert(4, vec![Value::Text("A".into()), Value::Float(50.5)]);
+
+        let _ = agg.eval(insert_delta.clone(), None);
+        agg.commit(insert_delta);
+
+        let state = agg.get_current_state();
+        let group_a = state
+            .changes
+            .iter()
+            .find(|(row, _)| row.values[0] == Value::Text("A".into()))
+            .unwrap();
+
+        assert_eq!(group_a.0.values[1], Value::Integer(2)); // COUNT = 2
+        assert_eq!(group_a.0.values[2], Value::Float(250.5)); // SUM = 250.5
+        assert_eq!(group_a.0.values[3], Value::Float(125.25)); // AVG = 125.25
+    }
+
+    #[test]
+    fn test_filter_operator_rowid_update() {
+        // When a row's rowid changes (e.g., UPDATE t SET a=1 WHERE a=3 on INTEGER PRIMARY KEY),
+        // the operator should properly consolidate the state
+
+        let mut filter = FilterOperator::new(
+            FilterPredicate::GreaterThan {
+                column: "b".to_string(),
+                value: Value::Integer(2),
+            },
+            vec!["a".to_string(), "b".to_string()],
+        );
+
+        // Initialize with a row (rowid=3, values=[3, 3])
+        let mut init_data = Delta::new();
+        init_data.insert(3, vec![Value::Integer(3), Value::Integer(3)]);
+        filter.initialize(init_data);
+
+        // Check initial state
+        let state = filter.get_current_state();
+        assert_eq!(state.changes.len(), 1);
+        assert_eq!(state.changes[0].0.rowid, 3);
+        assert_eq!(
+            state.changes[0].0.values,
+            vec![Value::Integer(3), Value::Integer(3)]
+        );
+
+        // Simulate an UPDATE that changes rowid from 3 to 1
+        // This is sent as: delete(3) + insert(1)
+        let mut update_delta = Delta::new();
+        update_delta.delete(3, vec![Value::Integer(3), Value::Integer(3)]);
+        update_delta.insert(1, vec![Value::Integer(1), Value::Integer(3)]);
+
+        let output = filter.eval(update_delta.clone(), None);
+        filter.commit(update_delta);
+
+        // The output delta should have both changes (both pass the filter b > 2)
+        assert_eq!(output.changes.len(), 2);
+        assert_eq!(output.changes[0].1, -1); // delete weight
+        assert_eq!(output.changes[1].1, 1); // insert weight
+
+        // The current state should be consolidated to only have rows with positive weight
+        let final_state = filter.get_current_state();
+
+        // After consolidation, we should have only one row with rowid=1
+        assert_eq!(
+            final_state.changes.len(),
+            1,
+            "State should be consolidated to have only one row"
+        );
+        assert_eq!(final_state.changes[0].0.rowid, 1);
+        assert_eq!(
+            final_state.changes[0].0.values,
+            vec![Value::Integer(1), Value::Integer(3)]
+        );
+        assert_eq!(final_state.changes[0].1, 1); // positive weight
+    }
+
+    // ============================================================================
+    // EVAL/COMMIT PATTERN TESTS
+    // These tests verify that the eval/commit pattern works correctly:
+    // - eval() computes results without modifying state
+    // - eval() with uncommitted data returns correct results
+    // - commit() updates internal state
+    // - State remains unchanged when eval() is called with uncommitted data
+    // ============================================================================
+
+    #[test]
+    fn test_filter_eval_with_uncommitted() {
+        let mut filter = FilterOperator::new(
+            FilterPredicate::GreaterThan {
+                column: "age".to_string(),
+                value: Value::Integer(25),
+            },
+            vec!["id".to_string(), "name".to_string(), "age".to_string()],
+        );
+
+        // Initialize with some data
+        let mut init_data = Delta::new();
+        init_data.insert(
+            1,
+            vec![
+                Value::Integer(1),
+                Value::Text("Alice".into()),
+                Value::Integer(30),
+            ],
+        );
+        init_data.insert(
+            2,
+            vec![
+                Value::Integer(2),
+                Value::Text("Bob".into()),
+                Value::Integer(20),
+            ],
+        );
+        filter.initialize(init_data);
+
+        // Verify initial state (only Alice passes filter)
+        let state = filter.get_current_state();
+        assert_eq!(state.changes.len(), 1);
+        assert_eq!(state.changes[0].0.rowid, 1);
+
+        // Create uncommitted changes
+        let mut uncommitted = Delta::new();
+        uncommitted.insert(
+            3,
+            vec![
+                Value::Integer(3),
+                Value::Text("Charlie".into()),
+                Value::Integer(35),
+            ],
+        );
+        uncommitted.insert(
+            4,
+            vec![
+                Value::Integer(4),
+                Value::Text("David".into()),
+                Value::Integer(15),
+            ],
+        );
+
+        // Eval with uncommitted - should return filtered uncommitted rows
+        let result = filter.eval(Delta::new(), Some(uncommitted.clone()));
+        assert_eq!(
+            result.changes.len(),
+            1,
+            "Only Charlie (35) should pass filter"
+        );
+        assert_eq!(result.changes[0].0.rowid, 3);
+
+        // Verify state hasn't changed
+        let state_after_eval = filter.get_current_state();
+        assert_eq!(
+            state_after_eval.changes.len(),
+            1,
+            "State should still only have Alice"
+        );
+        assert_eq!(state_after_eval.changes[0].0.rowid, 1);
+
+        // Now commit the changes
+        filter.commit(uncommitted);
+
+        // State should now include Charlie (who passes filter)
+        let final_state = filter.get_current_state();
+        assert_eq!(
+            final_state.changes.len(),
+            2,
+            "State should now have Alice and Charlie"
+        );
+    }
+
+    #[test]
+    fn test_aggregate_eval_with_uncommitted_preserves_state() {
+        // This is the critical test - aggregations must not modify internal state during eval
+        let mut agg = AggregateOperator::new(
+            vec!["category".to_string()],
+            vec![
+                AggregateFunction::Count,
+                AggregateFunction::Sum("amount".to_string()),
+            ],
+            vec![
+                "id".to_string(),
+                "category".to_string(),
+                "amount".to_string(),
+            ],
+        );
+
+        // Initialize with data
+        let mut init_data = Delta::new();
+        init_data.insert(
+            1,
+            vec![
+                Value::Integer(1),
+                Value::Text("A".into()),
+                Value::Integer(100),
+            ],
+        );
+        init_data.insert(
+            2,
+            vec![
+                Value::Integer(2),
+                Value::Text("A".into()),
+                Value::Integer(200),
+            ],
+        );
+        init_data.insert(
+            3,
+            vec![
+                Value::Integer(3),
+                Value::Text("B".into()),
+                Value::Integer(150),
+            ],
+        );
+        agg.initialize(init_data);
+
+        // Check initial state: A -> (count=2, sum=300), B -> (count=1, sum=150)
+        let initial_state = agg.get_current_state();
+        assert_eq!(initial_state.changes.len(), 2);
+
+        // Store initial state for comparison
+        let initial_a = initial_state
+            .changes
+            .iter()
+            .find(|(row, _)| row.values[0] == Value::Text("A".into()))
+            .unwrap();
+        assert_eq!(initial_a.0.values[1], Value::Integer(2)); // count
+        assert_eq!(initial_a.0.values[2], Value::Float(300.0)); // sum
+
+        // Create uncommitted changes
+        let mut uncommitted = Delta::new();
+        uncommitted.insert(
+            4,
+            vec![
+                Value::Integer(4),
+                Value::Text("A".into()),
+                Value::Integer(50),
+            ],
+        );
+        uncommitted.insert(
+            5,
+            vec![
+                Value::Integer(5),
+                Value::Text("C".into()),
+                Value::Integer(75),
+            ],
+        );
+
+        // Eval with uncommitted should return the delta (changes to aggregates)
+        let result = agg.eval(Delta::new(), Some(uncommitted.clone()));
+
+        // Result should contain updates for A and new group C
+        // For A: retraction of old (2, 300) and insertion of new (3, 350)
+        // For C: insertion of (1, 75)
+        assert!(!result.changes.is_empty(), "Should have aggregate changes");
+
+        // CRITICAL: Verify internal state hasn't changed
+        let state_after_eval = agg.get_current_state();
+        assert_eq!(
+            state_after_eval.changes.len(),
+            2,
+            "State should still have only A and B"
+        );
+
+        let a_after_eval = state_after_eval
+            .changes
+            .iter()
+            .find(|(row, _)| row.values[0] == Value::Text("A".into()))
+            .unwrap();
+        assert_eq!(
+            a_after_eval.0.values[1],
+            Value::Integer(2),
+            "A count should still be 2"
+        );
+        assert_eq!(
+            a_after_eval.0.values[2],
+            Value::Float(300.0),
+            "A sum should still be 300"
+        );
+
+        // Now commit the changes
+        agg.commit(uncommitted);
+
+        // State should now be updated
+        let final_state = agg.get_current_state();
+        assert_eq!(final_state.changes.len(), 3, "Should now have A, B, and C");
+
+        let a_final = final_state
+            .changes
+            .iter()
+            .find(|(row, _)| row.values[0] == Value::Text("A".into()))
+            .unwrap();
+        assert_eq!(
+            a_final.0.values[1],
+            Value::Integer(3),
+            "A count should now be 3"
+        );
+        assert_eq!(
+            a_final.0.values[2],
+            Value::Float(350.0),
+            "A sum should now be 350"
+        );
+
+        let c_final = final_state
+            .changes
+            .iter()
+            .find(|(row, _)| row.values[0] == Value::Text("C".into()))
+            .unwrap();
+        assert_eq!(
+            c_final.0.values[1],
+            Value::Integer(1),
+            "C count should be 1"
+        );
+        assert_eq!(
+            c_final.0.values[2],
+            Value::Float(75.0),
+            "C sum should be 75"
+        );
+    }
+
+    #[test]
+    fn test_aggregate_eval_multiple_times_without_commit() {
+        // Test that calling eval multiple times with different uncommitted data
+        // doesn't pollute the internal state
+        let mut agg = AggregateOperator::new(
+            vec![], // No GROUP BY
+            vec![
+                AggregateFunction::Count,
+                AggregateFunction::Sum("value".to_string()),
+            ],
+            vec!["id".to_string(), "value".to_string()],
+        );
+
+        // Initialize
+        let mut init_data = Delta::new();
+        init_data.insert(1, vec![Value::Integer(1), Value::Integer(100)]);
+        init_data.insert(2, vec![Value::Integer(2), Value::Integer(200)]);
+        agg.initialize(init_data);
+
+        // Initial state: count=2, sum=300
+        let initial_state = agg.get_current_state();
+        assert_eq!(initial_state.changes.len(), 1);
+        assert_eq!(initial_state.changes[0].0.values[0], Value::Integer(2));
+        assert_eq!(initial_state.changes[0].0.values[1], Value::Float(300.0));
+
+        // First eval with uncommitted
+        let mut uncommitted1 = Delta::new();
+        uncommitted1.insert(3, vec![Value::Integer(3), Value::Integer(50)]);
+        let _ = agg.eval(Delta::new(), Some(uncommitted1));
+
+        // State should be unchanged
+        let state1 = agg.get_current_state();
+        assert_eq!(state1.changes[0].0.values[0], Value::Integer(2));
+        assert_eq!(state1.changes[0].0.values[1], Value::Float(300.0));
+
+        // Second eval with different uncommitted
+        let mut uncommitted2 = Delta::new();
+        uncommitted2.insert(4, vec![Value::Integer(4), Value::Integer(75)]);
+        uncommitted2.insert(5, vec![Value::Integer(5), Value::Integer(25)]);
+        let _ = agg.eval(Delta::new(), Some(uncommitted2));
+
+        // State should STILL be unchanged
+        let state2 = agg.get_current_state();
+        assert_eq!(state2.changes[0].0.values[0], Value::Integer(2));
+        assert_eq!(state2.changes[0].0.values[1], Value::Float(300.0));
+
+        // Third eval with deletion as uncommitted
+        let mut uncommitted3 = Delta::new();
+        uncommitted3.delete(1, vec![Value::Integer(1), Value::Integer(100)]);
+        let _ = agg.eval(Delta::new(), Some(uncommitted3));
+
+        // State should STILL be unchanged
+        let state3 = agg.get_current_state();
+        assert_eq!(state3.changes[0].0.values[0], Value::Integer(2));
+        assert_eq!(state3.changes[0].0.values[1], Value::Float(300.0));
+    }
+
+    #[test]
+    fn test_aggregate_eval_with_mixed_committed_and_uncommitted() {
+        // Test eval with both committed delta and uncommitted changes
+        let mut agg = AggregateOperator::new(
+            vec!["type".to_string()],
+            vec![AggregateFunction::Count],
+            vec!["id".to_string(), "type".to_string()],
+        );
+
+        // Initialize
+        let mut init_data = Delta::new();
+        init_data.insert(1, vec![Value::Integer(1), Value::Text("X".into())]);
+        init_data.insert(2, vec![Value::Integer(2), Value::Text("Y".into())]);
+        agg.initialize(init_data);
+
+        // Create a committed delta (to be processed)
+        let mut committed_delta = Delta::new();
+        committed_delta.insert(3, vec![Value::Integer(3), Value::Text("X".into())]);
+
+        // Create uncommitted changes
+        let mut uncommitted = Delta::new();
+        uncommitted.insert(4, vec![Value::Integer(4), Value::Text("Y".into())]);
+        uncommitted.insert(5, vec![Value::Integer(5), Value::Text("Z".into())]);
+
+        // Eval with both - should process both but not commit
+        let result = agg.eval(committed_delta.clone(), Some(uncommitted));
+
+        // Result should reflect changes from both
+        assert!(!result.changes.is_empty());
+
+        // But internal state should be unchanged
+        let state = agg.get_current_state();
+        assert_eq!(state.changes.len(), 2, "Should still have only X and Y");
+
+        // Now commit only the committed_delta
+        agg.commit(committed_delta);
+
+        // State should now have X count=2, Y count=1
+        let final_state = agg.get_current_state();
+        let x = final_state
+            .changes
+            .iter()
+            .find(|(row, _)| row.values[0] == Value::Text("X".into()))
+            .unwrap();
+        assert_eq!(x.0.values[1], Value::Integer(2));
     }
 }

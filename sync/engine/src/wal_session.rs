@@ -38,9 +38,9 @@ impl WalSession {
         let info = self.conn.wal_get_frame(frame_no, frame)?;
         Ok(info)
     }
-    pub fn end(&mut self) -> Result<()> {
+    pub fn end(&mut self, force_commit: bool) -> Result<()> {
         assert!(self.in_txn);
-        self.conn.wal_insert_end(false)?;
+        self.conn.wal_insert_end(force_commit)?;
         self.in_txn = false;
         Ok(())
     }
@@ -53,7 +53,7 @@ impl Drop for WalSession {
     fn drop(&mut self) {
         if self.in_txn {
             let _ = self
-                .end()
+                .end(false)
                 .inspect_err(|e| tracing::error!("failed to close WAL session: {}", e));
         }
     }

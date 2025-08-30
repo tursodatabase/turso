@@ -1,253 +1,92 @@
-use std::sync::Arc;
+use std::{
+    cell::RefCell,
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
+
+use turso_core::OpenFlags;
+use uuid::Uuid;
 
 use crate::{
+    database_replay_generator::DatabaseReplayGenerator,
     database_sync_operations::{
-        checkpoint_wal_file, connect, connect_untracked, db_bootstrap, push_logical_changes,
-        reset_wal_file, transfer_logical_changes, transfer_physical_changes, wait_full_body,
-        wal_pull, wal_push, WalPullResult,
+        bootstrap_db_file, connect_untracked, count_local_changes, fetch_last_change_id, has_table,
+        push_logical_changes, read_wal_salt, reset_wal_file, update_last_change_id, wait_full_body,
+        wal_apply_from_file, wal_pull_to_file, PAGE_SIZE, WAL_FRAME_HEADER, WAL_FRAME_SIZE,
     },
-    database_tape::DatabaseTape,
+    database_tape::{
+        DatabaseChangesIteratorMode, DatabaseChangesIteratorOpts, DatabaseReplaySession,
+        DatabaseReplaySessionOpts, DatabaseTape, DatabaseTapeOpts, DatabaseWalSession,
+        CDC_PRAGMA_NAME,
+    },
     errors::Error,
     io_operations::IoOperations,
     protocol_io::ProtocolIO,
-    types::{Coro, DatabaseMetadata},
+    types::{
+        Coro, DatabaseMetadata, DatabasePullRevision, DatabaseSyncEngineProtocolVersion,
+        DatabaseTapeOperation, DbChangesStatus, SyncEngineStats, Transform,
+    },
     wal_session::WalSession,
     Result,
 };
 
-#[derive(Debug, Clone)]
-pub struct DatabaseSyncEngineOpts {
+#[derive(Clone)]
+pub struct DatabaseSyncEngineOpts<Ctx> {
     pub client_name: String,
+    pub tables_ignore: Vec<String>,
+    pub transform: Option<Transform<Ctx>>,
     pub wal_pull_batch_size: u64,
+    pub protocol_version_hint: DatabaseSyncEngineProtocolVersion,
 }
 
-pub struct DatabaseSyncEngine<P: ProtocolIO> {
+impl<Ctx> std::fmt::Debug for DatabaseSyncEngineOpts<Ctx> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DatabaseSyncEngineOpts")
+            .field("client_name", &self.client_name)
+            .field("tables_ignore", &self.tables_ignore)
+            .field("transform.is_some()", &self.transform.is_some())
+            .field("wal_pull_batch_size", &self.wal_pull_batch_size)
+            .finish()
+    }
+}
+
+pub struct DatabaseSyncEngine<P: ProtocolIO, Ctx> {
     io: Arc<dyn turso_core::IO>,
     protocol: Arc<P>,
-    draft_tape: DatabaseTape,
-    draft_path: String,
-    synced_path: String,
+    db_file: Arc<dyn turso_core::DatabaseStorage>,
+    main_tape: DatabaseTape,
+    main_db_wal_path: String,
+    revert_db_wal_path: String,
+    main_db_path: String,
     meta_path: String,
-    opts: DatabaseSyncEngineOpts,
-    meta: Option<DatabaseMetadata>,
-    // we remember information if Synced DB is dirty - which will make Database to reset it in case of any sync attempt
-    // this bit is set to false when we properly reset Synced DB
-    // this bit is set to true when we transfer changes from Draft to Synced or on initialization
-    synced_is_dirty: bool,
+    opts: DatabaseSyncEngineOpts<Ctx>,
+    meta: RefCell<DatabaseMetadata>,
+    client_unique_id: String,
 }
 
-async fn update_meta<IO: ProtocolIO>(
-    coro: &Coro,
-    io: &IO,
-    meta_path: &str,
-    orig: &mut Option<DatabaseMetadata>,
-    update: impl FnOnce(&mut DatabaseMetadata),
-) -> Result<()> {
-    let mut meta = orig.as_ref().unwrap().clone();
-    update(&mut meta);
-    tracing::info!("update_meta: {meta:?}");
-    let completion = io.full_write(meta_path, meta.dump()?)?;
-    // todo: what happen if we will actually update the metadata on disk but fail and so in memory state will not be updated
-    wait_full_body(coro, &completion).await?;
-    *orig = Some(meta);
-    Ok(())
+fn db_size_from_page(page: &[u8]) -> u32 {
+    u32::from_be_bytes(page[28..28 + 4].try_into().unwrap())
 }
 
-async fn set_meta<IO: ProtocolIO>(
-    coro: &Coro,
-    io: &IO,
-    meta_path: &str,
-    orig: &mut Option<DatabaseMetadata>,
-    meta: DatabaseMetadata,
-) -> Result<()> {
-    tracing::info!("set_meta: {meta:?}");
-    let completion = io.full_write(meta_path, meta.dump()?)?;
-    // todo: what happen if we will actually update the metadata on disk but fail and so in memory state will not be updated
-    wait_full_body(coro, &completion).await?;
-    *orig = Some(meta);
-    Ok(())
-}
-
-impl<C: ProtocolIO> DatabaseSyncEngine<C> {
+impl<P: ProtocolIO, Ctx> DatabaseSyncEngine<P, Ctx> {
     /// Creates new instance of SyncEngine and initialize it immediately if no consistent local data exists
     pub async fn new(
-        coro: &Coro,
+        coro: &Coro<Ctx>,
         io: Arc<dyn turso_core::IO>,
-        protocol: Arc<C>,
-        path: &str,
-        opts: DatabaseSyncEngineOpts,
+        protocol: Arc<P>,
+        main_db_path: &str,
+        opts: DatabaseSyncEngineOpts<Ctx>,
     ) -> Result<Self> {
-        let draft_path = format!("{path}-draft");
-        let draft_tape = io.open_tape(&draft_path, true)?;
-        let mut db = Self {
-            io,
-            protocol,
-            draft_tape,
-            draft_path,
-            synced_path: format!("{path}-synced"),
-            meta_path: format!("{path}-info"),
-            opts,
-            meta: None,
-            synced_is_dirty: true,
-        };
-        db.init(coro).await?;
-        Ok(db)
-    }
+        let main_db_wal_path = format!("{main_db_path}-wal");
+        let revert_db_wal_path = format!("{main_db_path}-wal-revert");
+        let meta_path = format!("{main_db_path}-info");
 
-    /// Create database connection and appropriately configure it before use
-    pub async fn connect(&self, coro: &Coro) -> Result<Arc<turso_core::Connection>> {
-        connect(coro, &self.draft_tape).await
-    }
+        let db_file = io.open_file(main_db_path, turso_core::OpenFlags::Create, false)?;
+        let db_file = Arc::new(turso_core::storage::database::DatabaseFile::new(db_file));
 
-    /// Sync all new changes from remote DB and apply them locally
-    /// This method will **not** send local changed to the remote
-    /// This method will block writes for the period of pull
-    pub async fn pull(&mut self, coro: &Coro) -> Result<()> {
-        tracing::info!(
-            "pull: draft={}, synced={}",
-            self.draft_path,
-            self.synced_path
-        );
+        tracing::info!("init(path={}): opts={:?}", main_db_path, opts);
 
-        // reset Synced DB if it wasn't properly cleaned-up on previous "sync-method" attempt
-        self.reset_synced_if_dirty(coro).await?;
-
-        loop {
-            // update Synced DB with fresh changes from remote
-            let pull_result = self.pull_synced_from_remote(coro).await?;
-
-            {
-                // we will "replay" Synced WAL to the Draft WAL later without pushing it to the remote
-                // so, we pass 'capture: true' as we need to preserve all changes for future push of WAL
-                let synced = self.io.open_tape(&self.synced_path, true)?;
-
-                // we will start wal write session for Draft DB in order to hold write lock during transfer of changes
-                let mut draft_session = WalSession::new(connect(coro, &self.draft_tape).await?);
-                draft_session.begin()?;
-
-                // mark Synced as dirty as we will start transfer of logical changes there and if we will fail in the middle - we will need to cleanup Synced db
-                self.synced_is_dirty = true;
-
-                // transfer logical changes to the Synced DB in order to later execute physical "rebase" operation
-                let client_id = &self.meta().client_unique_id;
-                transfer_logical_changes(coro, &self.draft_tape, &synced, client_id, true).await?;
-
-                // now we are ready to do the rebase: let's transfer physical changes from Synced to Draft
-                let synced_wal_watermark = self.meta().synced_wal_match_watermark;
-                let synced_sync_watermark = self.meta().synced_frame_no.expect(
-                    "synced_frame_no must be set as we call pull_synced_from_remote before that",
-                );
-                let draft_wal_watermark = self.meta().draft_wal_match_watermark;
-                let draft_sync_watermark = transfer_physical_changes(
-                    coro,
-                    &synced,
-                    draft_session,
-                    synced_wal_watermark,
-                    synced_sync_watermark,
-                    draft_wal_watermark,
-                )
-                .await?;
-                update_meta(
-                    coro,
-                    self.protocol.as_ref(),
-                    &self.meta_path,
-                    &mut self.meta,
-                    |m| {
-                        m.draft_wal_match_watermark = draft_sync_watermark;
-                        m.synced_wal_match_watermark = synced_sync_watermark;
-                    },
-                )
-                .await?;
-            }
-
-            // Synced DB is 100% dirty now - let's reset it
-            assert!(self.synced_is_dirty);
-            self.reset_synced_if_dirty(coro).await?;
-
-            let WalPullResult::NeedCheckpoint = pull_result else {
-                break;
-            };
-            tracing::info!(
-                "ready to checkpoint synced db file at {:?}, generation={}",
-                self.synced_path,
-                self.meta().synced_generation
-            );
-            {
-                let synced = self.io.open_tape(&self.synced_path, false)?;
-                checkpoint_wal_file(coro, &connect_untracked(&synced)?).await?;
-                update_meta(
-                    coro,
-                    self.protocol.as_ref(),
-                    &self.meta_path,
-                    &mut self.meta,
-                    |m| {
-                        m.synced_generation += 1;
-                        m.synced_frame_no = Some(0);
-                        m.synced_wal_match_watermark = 0;
-                    },
-                )
-                .await?;
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Sync local changes to remote DB
-    /// This method will **not** pull remote changes to the local DB
-    /// This method will **not** block writes for the period of sync
-    pub async fn push(&mut self, coro: &Coro) -> Result<()> {
-        tracing::info!(
-            "push: draft={}, synced={}",
-            self.draft_path,
-            self.synced_path
-        );
-
-        // reset Synced DB if it wasn't properly cleaned-up on previous "sync-method" attempt
-        self.reset_synced_if_dirty(coro).await?;
-
-        // update Synced DB with fresh changes from remote in order to avoid WAL frame conflicts
-        self.pull_synced_from_remote(coro).await?;
-
-        // we will push Synced WAL to the remote
-        // so, we pass 'capture: false' as we don't need to preserve changes made to Synced WAL in turso_cdc
-        let synced = self.io.open_tape(&self.synced_path, false)?;
-
-        self.synced_is_dirty = true;
-        let client_id = &self.meta().client_unique_id;
-        push_logical_changes(
-            coro,
-            self.protocol.as_ref(),
-            &self.draft_tape,
-            &synced,
-            client_id,
-        )
-        .await?;
-
-        self.reset_synced_if_dirty(coro).await?;
-
-        Ok(())
-    }
-
-    /// Sync local changes to remote DB and bring new changes from remote to local
-    /// This method will block writes for the period of sync
-    pub async fn sync(&mut self, coro: &Coro) -> Result<()> {
-        // todo(sivukhin): this is bit suboptimal as both 'push' and 'pull' will call pull_synced_from_remote
-        // but for now - keep it simple
-        self.push(coro).await?;
-        self.pull(coro).await?;
-        Ok(())
-    }
-
-    async fn init(&mut self, coro: &Coro) -> Result<()> {
-        tracing::info!(
-            "initialize sync engine: draft={}, synced={}, opts={:?}",
-            self.draft_path,
-            self.synced_path,
-            self.opts,
-        );
-
-        let completion = self.protocol.full_read(&self.meta_path)?;
+        let completion = protocol.full_read(&meta_path)?;
         let data = wait_full_body(coro, &completion).await?;
         let meta = if data.is_empty() {
             None
@@ -255,200 +94,546 @@ impl<C: ProtocolIO> DatabaseSyncEngine<C> {
             Some(DatabaseMetadata::load(&data)?)
         };
 
-        match meta {
-            Some(meta) => {
-                self.meta = Some(meta);
-            }
+        let meta = match meta {
+            Some(meta) => meta,
             None => {
-                let meta = self.bootstrap_db_files(coro).await?;
-                tracing::info!("write meta after successful bootstrap: meta={meta:?}");
-                set_meta(
+                let client_unique_id = format!("{}-{}", opts.client_name, uuid::Uuid::new_v4());
+                let revision = bootstrap_db_file(
                     coro,
-                    self.protocol.as_ref(),
-                    &self.meta_path,
-                    &mut self.meta,
-                    meta,
+                    protocol.as_ref(),
+                    &io,
+                    main_db_path,
+                    opts.protocol_version_hint,
                 )
                 .await?;
+                let meta = DatabaseMetadata {
+                    client_unique_id,
+                    synced_revision: Some(revision),
+                    revert_since_wal_salt: None,
+                    revert_since_wal_watermark: 0,
+                    last_pushed_change_id_hint: 0,
+                    last_pushed_pull_gen_hint: 0,
+                };
+                tracing::info!("write meta after successful bootstrap: meta={meta:?}");
+                let completion = protocol.full_write(&meta_path, meta.dump()?)?;
+                // todo: what happen if we will actually update the metadata on disk but fail and so in memory state will not be updated
+                wait_full_body(coro, &completion).await?;
+                meta
             }
         };
 
-        let draft_exists = self.io.try_open(&self.draft_path)?.is_some();
-        let synced_exists = self.io.try_open(&self.synced_path)?.is_some();
-        if !draft_exists || !synced_exists {
-            let error = "Draft or Synced files doesn't exists, but metadata is".to_string();
+        let main_exists = io.try_open(main_db_path)?.is_some();
+        if !main_exists {
+            let error = "main DB file doesn't exists, but metadata is".to_string();
             return Err(Error::DatabaseSyncEngineError(error));
         }
 
-        if self.meta().synced_frame_no.is_none() {
-            // sync WAL from the remote in case of bootstrap - all subsequent initializations will be fast
-            self.pull(coro).await?;
-        }
-        Ok(())
-    }
-
-    async fn pull_synced_from_remote(&mut self, coro: &Coro) -> Result<WalPullResult> {
-        tracing::info!(
-            "pull_synced_from_remote: draft={:?}, synced={:?}",
-            self.draft_path,
-            self.synced_path,
-        );
-        let synced = self.io.open_tape(&self.synced_path, false)?;
-        let synced_conn = connect(coro, &synced).await?;
-        let mut wal = WalSession::new(synced_conn);
-
-        let generation = self.meta().synced_generation;
-        let mut start_frame = self.meta().synced_frame_no.unwrap_or(0) + 1;
-        loop {
-            let end_frame = start_frame + self.opts.wal_pull_batch_size;
-            let update = async |coro, frame_no| {
-                update_meta(
-                    coro,
-                    self.protocol.as_ref(),
-                    &self.meta_path,
-                    &mut self.meta,
-                    |m| m.synced_frame_no = Some(frame_no),
-                )
-                .await
-            };
-            match wal_pull(
-                coro,
-                self.protocol.as_ref(),
-                &mut wal,
-                generation,
-                start_frame,
-                end_frame,
-                update,
-            )
-            .await?
-            {
-                WalPullResult::Done => return Ok(WalPullResult::Done),
-                WalPullResult::NeedCheckpoint => return Ok(WalPullResult::NeedCheckpoint),
-                WalPullResult::PullMore => {
-                    start_frame = end_frame;
-                    continue;
-                }
-            }
-        }
-    }
-
-    #[allow(dead_code)]
-    async fn push_synced_to_remote(&mut self, coro: &Coro) -> Result<()> {
-        tracing::info!(
-            "push_synced_to_remote: draft={}, synced={}, id={}",
-            self.draft_path,
-            self.synced_path,
-            self.meta().client_unique_id
-        );
-        let synced = self.io.open_tape(&self.synced_path, false)?;
-        let synced_conn = connect(coro, &synced).await?;
-
-        let mut wal = WalSession::new(synced_conn);
-        wal.begin()?;
-
-        // todo(sivukhin): push frames in multiple batches
-        let generation = self.meta().synced_generation;
-        let start_frame = self.meta().synced_frame_no.unwrap_or(0) + 1;
-        let end_frame = wal.conn().wal_state()?.max_frame + 1;
-        match wal_push(
-            coro,
-            self.protocol.as_ref(),
-            &mut wal,
-            None,
-            generation,
-            start_frame,
-            end_frame,
+        let main_db = turso_core::Database::open_with_flags(
+            io.clone(),
+            main_db_path,
+            db_file.clone(),
+            OpenFlags::Create,
+            false,
+            true,
+            false,
         )
-        .await
+        .unwrap();
+        let tape_opts = DatabaseTapeOpts {
+            cdc_table: None,
+            cdc_mode: Some("full".to_string()),
+        };
+        let main_tape = DatabaseTape::new_with_opts(main_db, tape_opts);
+        tracing::info!("initialize database tape connection: path={}", main_db_path);
+        let mut db = Self {
+            io,
+            protocol,
+            db_file,
+            main_db_wal_path,
+            main_tape,
+            revert_db_wal_path,
+            main_db_path: main_db_path.to_string(),
+            meta_path: format!("{main_db_path}-info"),
+            opts,
+            meta: RefCell::new(meta.clone()),
+            client_unique_id: meta.client_unique_id.clone(),
+        };
+
+        let synced_revision = meta.synced_revision.as_ref().unwrap();
+        if let DatabasePullRevision::Legacy {
+            synced_frame_no: None,
+            ..
+        } = synced_revision
         {
-            Ok(_) => {
-                update_meta(
-                    coro,
-                    self.protocol.as_ref(),
-                    &self.meta_path,
-                    &mut self.meta,
-                    |m| m.synced_frame_no = Some(end_frame - 1),
-                )
-                .await?;
-                self.synced_is_dirty = false;
-                Ok(())
-            }
-            Err(err) => {
-                tracing::info!("push_synced_to_remote: failed: err={err}");
-                Err(err)
+            // sync WAL from the remote in case of bootstrap - all subsequent initializations will be fast
+            if let Some(changes) = db.wait_changes_from_remote(coro).await? {
+                db.apply_changes_from_remote(coro, changes).await?;
             }
         }
+        Ok(db)
     }
 
-    async fn bootstrap_db_files(&mut self, coro: &Coro) -> Result<DatabaseMetadata> {
-        assert!(
-            self.meta.is_none(),
-            "bootstrap_db_files must be called only when meta is not set"
-        );
+    fn open_revert_db_conn(&mut self) -> Result<Arc<turso_core::Connection>> {
+        let db = turso_core::Database::open_with_flags_bypass_registry(
+            self.io.clone(),
+            &self.main_db_path,
+            &self.revert_db_wal_path,
+            self.db_file.clone(),
+            OpenFlags::Create,
+            false,
+            true,
+            false,
+        )?;
+        let conn = db.connect()?;
+        conn.wal_auto_checkpoint_disable();
+        Ok(conn)
+    }
+
+    async fn checkpoint_passive(&mut self, coro: &Coro<Ctx>) -> Result<(Option<Vec<u32>>, u64)> {
+        let watermark = self.meta().revert_since_wal_watermark;
         tracing::info!(
-            "bootstrap_db_files: draft={}, synced={}",
-            self.draft_path,
-            self.synced_path,
+            "checkpoint(path={:?}): revert_since_wal_watermark={}",
+            self.main_db_path,
+            watermark
         );
+        let main_conn = connect_untracked(&self.main_tape)?;
+        let main_wal = self.io.try_open(&self.main_db_wal_path)?;
+        let main_wal_salt = if let Some(main_wal) = main_wal {
+            read_wal_salt(coro, &main_wal).await?
+        } else {
+            None
+        };
 
-        let start_time = std::time::Instant::now();
-        // cleanup all files left from previous attempt to bootstrap
-        // we shouldn't write any WAL files - but let's truncate them too for safety
-        if let Some(file) = self.io.try_open(&self.draft_path)? {
-            self.io.truncate(coro, file, 0).await?;
-        }
-        if let Some(file) = self.io.try_open(&self.synced_path)? {
-            self.io.truncate(coro, file, 0).await?;
-        }
-        if let Some(file) = self.io.try_open(&format!("{}-wal", self.draft_path))? {
-            self.io.truncate(coro, file, 0).await?;
-        }
-        if let Some(file) = self.io.try_open(&format!("{}-wal", self.synced_path))? {
-            self.io.truncate(coro, file, 0).await?;
-        }
-
-        let files = &[
-            self.io.create(&self.draft_path)?,
-            self.io.create(&self.synced_path)?,
-        ];
-        let db_info = db_bootstrap(coro, self.protocol.as_ref(), files).await?;
-
-        let elapsed = std::time::Instant::now().duration_since(start_time);
         tracing::info!(
-            "bootstrap_db_files: finished draft={:?}, synced={:?}: elapsed={:?}",
-            self.draft_path,
-            self.synced_path,
-            elapsed
+            "checkpoint(path={:?}): main_wal_salt={:?}",
+            self.main_db_path,
+            main_wal_salt
         );
 
-        Ok(DatabaseMetadata {
-            client_unique_id: format!("{}-{}", self.opts.client_name, uuid::Uuid::new_v4()),
-            synced_generation: db_info.current_generation,
-            synced_frame_no: None,
-            draft_wal_match_watermark: 0,
-            synced_wal_match_watermark: 0,
+        let revert_since_wal_salt = self.meta().revert_since_wal_salt.clone();
+        if revert_since_wal_salt.is_some() && main_wal_salt != revert_since_wal_salt {
+            self.update_meta(coro, |meta| {
+                meta.revert_since_wal_watermark = 0;
+                meta.revert_since_wal_salt = main_wal_salt.clone();
+            })
+            .await?;
+            return Ok((main_wal_salt, 0));
+        }
+        // we do this Passive checkpoint in order to transfer all synced frames to the DB file and make history of revert DB valid
+        // if we will not do that we will be in situation where WAL in the revert DB is not valid relative to the DB file
+        let result = main_conn.checkpoint(turso_core::CheckpointMode::Passive {
+            upper_bound_inclusive: Some(watermark),
+        })?;
+        tracing::info!(
+            "checkpoint(path={:?}): checkpointed portion of WAL: {:?}",
+            self.main_db_path,
+            result
+        );
+        if result.max_frame < watermark {
+            return Err(Error::DatabaseSyncEngineError(
+                format!("unable to checkpoint synced portion of WAL: result={result:?}, watermark={watermark}"),
+            ));
+        }
+        Ok((main_wal_salt, watermark))
+    }
+
+    pub async fn stats(&self, coro: &Coro<Ctx>) -> Result<SyncEngineStats> {
+        let main_conn = connect_untracked(&self.main_tape)?;
+        let change_id = self.meta().last_pushed_change_id_hint;
+        Ok(SyncEngineStats {
+            cdc_operations: count_local_changes(coro, &main_conn, change_id).await?,
+            wal_size: main_conn.wal_state()?.max_frame as i64,
         })
     }
 
-    /// Reset WAL of Synced database which potentially can have some local changes
-    async fn reset_synced_if_dirty(&mut self, coro: &Coro) -> Result<()> {
+    pub async fn checkpoint(&mut self, coro: &Coro<Ctx>) -> Result<()> {
+        let (main_wal_salt, watermark) = self.checkpoint_passive(coro).await?;
+
+        let main_conn = connect_untracked(&self.main_tape)?;
+        let revert_conn = self.open_revert_db_conn()?;
+
+        let mut page = [0u8; PAGE_SIZE];
+        let db_size = if revert_conn.try_wal_watermark_read_page(1, &mut page, None)? {
+            db_size_from_page(&page)
+        } else {
+            0
+        };
+
         tracing::info!(
-            "reset_synced: synced_path={:?}, synced_is_dirty={}",
-            self.synced_path,
-            self.synced_is_dirty
+            "checkpoint(path={:?}): revert DB initial size: {}",
+            self.main_db_path,
+            db_size
         );
-        // if we know that Synced DB is not dirty - let's skip this phase completely
-        if !self.synced_is_dirty {
-            return Ok(());
+
+        let main_wal_state;
+        {
+            let mut revert_session = WalSession::new(revert_conn.clone());
+            revert_session.begin()?;
+
+            let mut main_session = WalSession::new(main_conn.clone());
+            main_session.begin()?;
+
+            main_wal_state = main_conn.wal_state()?;
+            tracing::info!(
+                "checkpoint(path={:?}): main DB WAL state: {:?}",
+                self.main_db_path,
+                main_wal_state
+            );
+
+            let mut revert_session = DatabaseWalSession::new(coro, revert_session).await?;
+
+            let main_changed_pages = main_conn.wal_changed_pages_after(watermark)?;
+            tracing::info!(
+                "checkpoint(path={:?}): collected {} changed pages",
+                self.main_db_path,
+                main_changed_pages.len()
+            );
+            let revert_changed_pages: HashSet<u32> = revert_conn
+                .wal_changed_pages_after(0)?
+                .into_iter()
+                .collect();
+            for page_no in main_changed_pages {
+                if revert_changed_pages.contains(&page_no) {
+                    tracing::info!(
+                        "checkpoint(path={:?}): skip page {} as it present in revert WAL",
+                        self.main_db_path,
+                        page_no
+                    );
+                    continue;
+                }
+                if page_no > db_size {
+                    tracing::info!(
+                        "checkpoint(path={:?}): skip page {} as it ahead of revert-DB size",
+                        self.main_db_path,
+                        page_no
+                    );
+                    continue;
+                }
+                if !main_conn.try_wal_watermark_read_page(page_no, &mut page, Some(watermark))? {
+                    tracing::info!(
+                        "checkpoint(path={:?}): skip page {} as it was allocated in the wAL portion for revert",
+                        self.main_db_path,
+                        page_no
+                    );
+                    continue;
+                }
+                tracing::info!(
+                    "checkpoint(path={:?}): append page {} (current db_size={})",
+                    self.main_db_path,
+                    page_no,
+                    db_size
+                );
+                revert_session.append_page(page_no, &page)?;
+            }
+            revert_session.commit(db_size)?;
+            revert_session.wal_session.end(false)?;
         }
-        if let Some(synced_wal) = self.io.try_open(&format!("{}-wal", self.synced_path))? {
-            reset_wal_file(coro, synced_wal, self.meta().synced_frame_no.unwrap_or(0)).await?;
-        }
-        self.synced_is_dirty = false;
+        self.update_meta(coro, |meta| {
+            meta.revert_since_wal_salt = main_wal_salt;
+            meta.revert_since_wal_watermark = main_wal_state.max_frame;
+        })
+        .await?;
+
+        let result = main_conn.checkpoint(turso_core::CheckpointMode::Truncate {
+            upper_bound_inclusive: Some(main_wal_state.max_frame),
+        })?;
+        tracing::info!(
+            "checkpoint(path={:?}): main DB TRUNCATE checkpoint result: {:?}",
+            self.main_db_path,
+            result
+        );
+
         Ok(())
     }
 
-    fn meta(&self) -> &DatabaseMetadata {
-        self.meta.as_ref().expect("metadata must be set")
+    pub async fn wait_changes_from_remote(
+        &self,
+        coro: &Coro<Ctx>,
+    ) -> Result<Option<DbChangesStatus>> {
+        let file_path = format!("{}-frames-{}", self.main_db_path, Uuid::new_v4());
+        tracing::info!(
+            "wait_changes(path={}): file_path={}",
+            self.main_db_path,
+            file_path
+        );
+        let file = self.io.create(&file_path)?;
+
+        let revision = self.meta().synced_revision.clone().unwrap();
+        let next_revision = wal_pull_to_file(
+            coro,
+            self.protocol.as_ref(),
+            file.clone(),
+            &revision,
+            self.opts.wal_pull_batch_size,
+        )
+        .await?;
+
+        if file.size()? == 0 {
+            tracing::info!(
+                "wait_changes(path={}): no changes detected, removing changes file {}",
+                self.main_db_path,
+                file_path
+            );
+            self.io.remove_file(&file_path)?;
+            return Ok(None);
+        }
+
+        tracing::info!(
+            "wait_changes_from_remote(path={}): revision: {:?} -> {:?}",
+            self.main_db_path,
+            revision,
+            next_revision
+        );
+
+        Ok(Some(DbChangesStatus {
+            revision: next_revision,
+            file_path,
+        }))
+    }
+
+    /// Sync all new changes from remote DB and apply them locally
+    /// This method will **not** send local changed to the remote
+    /// This method will block writes for the period of pull
+    pub async fn apply_changes_from_remote(
+        &mut self,
+        coro: &Coro<Ctx>,
+        remote_changes: DbChangesStatus,
+    ) -> Result<()> {
+        let pull_result = self.apply_changes_internal(coro, &remote_changes).await;
+        let cleanup_result: Result<()> = self
+            .io
+            .remove_file(&remote_changes.file_path)
+            .inspect_err(|e| tracing::error!("failed to cleanup changes file: {e}"))
+            .map_err(|e| e.into());
+        let Ok(revert_since_wal_watermark) = pull_result else {
+            return Err(pull_result.err().unwrap());
+        };
+
+        let revert_wal_file = self.io.open_file(
+            &self.revert_db_wal_path,
+            turso_core::OpenFlags::Create,
+            false,
+        )?;
+        reset_wal_file(coro, revert_wal_file, 0).await?;
+
+        self.update_meta(coro, |meta| {
+            meta.revert_since_wal_watermark = revert_since_wal_watermark;
+            meta.synced_revision = Some(remote_changes.revision);
+            meta.last_pushed_change_id_hint = 0;
+        })
+        .await?;
+
+        cleanup_result
+    }
+    async fn apply_changes_internal(
+        &mut self,
+        coro: &Coro<Ctx>,
+        remote_changes: &DbChangesStatus,
+    ) -> Result<u64> {
+        tracing::info!(
+            "apply_changes(path={}, changes={:?})",
+            self.main_db_path,
+            remote_changes
+        );
+
+        let (_, watermark) = self.checkpoint_passive(coro).await?;
+
+        let changes_file = self.io.open_file(
+            &remote_changes.file_path,
+            turso_core::OpenFlags::empty(),
+            false,
+        )?;
+
+        let revert_conn = self.open_revert_db_conn()?;
+        let main_conn = connect_untracked(&self.main_tape)?;
+
+        let mut revert_session = WalSession::new(revert_conn.clone());
+        revert_session.begin()?;
+
+        let mut main_session = WalSession::new(main_conn.clone());
+        main_session.begin()?;
+
+        let had_cdc_table = has_table(coro, &main_conn, "turso_cdc").await?;
+
+        // read schema version after initiating WAL session (in order to read it with consistent max_frame_no)
+        let main_conn_schema_version = main_conn.read_schema_version()?;
+
+        let mut main_session = DatabaseWalSession::new(coro, main_session).await?;
+
+        // fetch last_change_id from remote
+        let (pull_gen, last_change_id) = fetch_last_change_id(
+            coro,
+            self.protocol.as_ref(),
+            &main_conn,
+            &self.client_unique_id,
+        )
+        .await?;
+
+        // collect local changes before doing anything with the main DB
+        // it's important to do this after opening WAL session - otherwise we can miss some updates
+        let iterate_opts = DatabaseChangesIteratorOpts {
+            first_change_id: last_change_id.map(|x| x + 1),
+            mode: DatabaseChangesIteratorMode::Apply,
+            ignore_schema_changes: false,
+            ..Default::default()
+        };
+        let mut local_changes = Vec::new();
+        let mut iterator = self.main_tape.iterate_changes(iterate_opts)?;
+        while let Some(operation) = iterator.next(coro).await? {
+            match operation {
+                DatabaseTapeOperation::RowChange(change) => local_changes.push(change),
+                DatabaseTapeOperation::Commit => continue,
+            }
+        }
+        tracing::info!(
+            "apply_changes(path={}): collected {} changes",
+            self.main_db_path,
+            local_changes.len()
+        );
+
+        // rollback local changes not checkpointed to the revert-db
+        tracing::info!(
+            "apply_changes(path={}): rolling back frames after {} watermark, max_frame={}",
+            self.main_db_path,
+            watermark,
+            main_conn.wal_state()?.max_frame
+        );
+        let local_rollback = main_session.rollback_changes_after(watermark)?;
+        let mut frame = [0u8; WAL_FRAME_SIZE];
+
+        let remote_rollback = revert_conn.wal_state()?.max_frame;
+        tracing::info!(
+            "apply_changes(path={}): rolling back {} frames from revert DB",
+            self.main_db_path,
+            remote_rollback
+        );
+        // rollback local changes by using frames from revert-db
+        // it's important to append pages from revert-db after local revert - because pages from revert-db must overwrite rollback from main DB
+        for frame_no in 1..=remote_rollback {
+            let info = revert_session.read_at(frame_no, &mut frame)?;
+            main_session.append_page(info.page_no, &frame[WAL_FRAME_HEADER..])?;
+        }
+
+        // after rollback - WAL state is aligned with remote - let's apply changes from it
+        let db_size = wal_apply_from_file(coro, changes_file, &mut main_session).await?;
+        tracing::info!(
+            "apply_changes(path={}): applied changes from remote: db_size={}",
+            self.main_db_path,
+            db_size,
+        );
+
+        let revert_since_wal_watermark;
+        if local_changes.is_empty() && local_rollback == 0 && remote_rollback == 0 && !had_cdc_table
+        {
+            main_session.commit(db_size)?;
+            revert_since_wal_watermark = main_session.frames_count()?;
+            main_session.wal_session.end(false)?;
+        } else {
+            main_session.commit(0)?;
+            let current_schema_version = main_conn.read_schema_version()?;
+            revert_since_wal_watermark = main_session.frames_count()?;
+            let final_schema_version = current_schema_version.max(main_conn_schema_version) + 1;
+            main_conn.write_schema_version(final_schema_version)?;
+            tracing::info!(
+                "apply_changes(path={}): updated schema version to {}",
+                self.main_db_path,
+                final_schema_version
+            );
+
+            update_last_change_id(coro, &main_conn, &self.client_unique_id, pull_gen + 1, 0)
+                .await
+                .inspect_err(|e| tracing::error!("update_last_change_id failed: {e}"))?;
+
+            if had_cdc_table {
+                tracing::info!(
+                    "apply_changes(path={}): initiate CDC pragma again in order to recreate CDC table",
+                    self.main_db_path,
+                );
+                let _ = main_conn.pragma_update(CDC_PRAGMA_NAME, "'full'")?;
+            }
+
+            let mut replay = DatabaseReplaySession {
+                conn: main_conn.clone(),
+                cached_delete_stmt: HashMap::new(),
+                cached_insert_stmt: HashMap::new(),
+                cached_update_stmt: HashMap::new(),
+                in_txn: true,
+                generator: DatabaseReplayGenerator::<Ctx> {
+                    conn: main_conn.clone(),
+                    opts: DatabaseReplaySessionOpts::<Ctx> {
+                        use_implicit_rowid: false,
+                        transform: self.opts.transform.clone(),
+                    },
+                },
+            };
+            for change in local_changes {
+                let operation = DatabaseTapeOperation::RowChange(change);
+                replay.replay(coro, operation).await?;
+            }
+
+            main_session.wal_session.end(true)?;
+        }
+
+        Ok(revert_since_wal_watermark)
+    }
+
+    /// Sync local changes to remote DB
+    /// This method will **not** pull remote changes to the local DB
+    /// This method will **not** block writes for the period of sync
+    pub async fn push_changes_to_remote(&self, coro: &Coro<Ctx>) -> Result<()> {
+        tracing::info!("push_changes(path={})", self.main_db_path);
+
+        let (_, change_id) = push_logical_changes(
+            coro,
+            self.protocol.as_ref(),
+            &self.main_tape,
+            &self.client_unique_id,
+            &self.opts,
+        )
+        .await?;
+
+        self.update_meta(coro, |m| {
+            m.last_pushed_change_id_hint = change_id;
+        })
+        .await?;
+
+        Ok(())
+    }
+
+    /// Create read/write database connection and appropriately configure it before use
+    pub async fn connect_rw(&self, coro: &Coro<Ctx>) -> Result<Arc<turso_core::Connection>> {
+        let conn = self.main_tape.connect(coro).await?;
+        conn.wal_auto_checkpoint_disable();
+        Ok(conn)
+    }
+
+    /// Sync local changes to remote DB and bring new changes from remote to local
+    /// This method will block writes for the period of sync
+    pub async fn sync(&mut self, coro: &Coro<Ctx>) -> Result<()> {
+        // todo(sivukhin): this is bit suboptimal as both 'push' and 'pull' will call pull_synced_from_remote
+        // but for now - keep it simple
+        self.push_changes_to_remote(coro).await?;
+        if let Some(changes) = self.wait_changes_from_remote(coro).await? {
+            self.apply_changes_from_remote(coro, changes).await?;
+        }
+        Ok(())
+    }
+
+    fn meta(&self) -> std::cell::Ref<'_, DatabaseMetadata> {
+        self.meta.borrow()
+    }
+
+    async fn update_meta(
+        &self,
+        coro: &Coro<Ctx>,
+        update: impl FnOnce(&mut DatabaseMetadata),
+    ) -> Result<()> {
+        let mut meta = self.meta().clone();
+        update(&mut meta);
+        tracing::info!("update_meta: {meta:?}");
+        let completion = self.protocol.full_write(&self.meta_path, meta.dump()?)?;
+        // todo: what happen if we will actually update the metadata on disk but fail and so in memory state will not be updated
+        wait_full_body(coro, &completion).await?;
+        self.meta.replace(meta);
+        Ok(())
     }
 }

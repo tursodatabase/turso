@@ -1,6 +1,6 @@
 "use strict";
 
-import { SyncEngine } from '#entry-point';
+import { SyncEngine, DatabaseRowMutationJs, DatabaseRowStatementJs } from '#entry-point';
 import { Database } from '@tursodatabase/database';
 
 const GENERATOR_RESUME_IO = 0;
@@ -63,9 +63,16 @@ async function process(opts, request) {
     const completion = request.completion();
     if (requestType.type == 'Http') {
         try {
+            let headers = opts.headers;
+            if (requestType.headers != null && requestType.headers.length > 0) {
+                headers = { ...opts.headers };
+                for (let header of requestType.headers) {
+                    headers[header[0]] = header[1];
+                }
+            }
             const response = await fetch(`${opts.url}${requestType.path}`, {
                 method: requestType.method,
-                headers: opts.headers,
+                headers: headers,
                 body: requestType.body != null ? new Uint8Array(requestType.body) : null,
             });
             completion.status(response.status);
@@ -101,7 +108,7 @@ async function process(opts, request) {
     }
 }
 
-async function run(opts, engine, generator) {
+async function run(opts, engine, generator): Promise<any> {
     let tasks = [];
     while (generator.resume(null) !== GENERATOR_RESUME_DONE) {
         for (let request = engine.protocolIo(); request != null; request = engine.protocolIo()) {
@@ -113,6 +120,7 @@ async function run(opts, engine, generator) {
 
         tasks = tasks.filter(t => !t.finished);
     }
+    return generator.take();
 }
 
 interface ConnectOpts {
@@ -121,16 +129,27 @@ interface ConnectOpts {
     url: string;
     authToken?: string;
     encryptionKey?: string;
+    tablesIgnore?: string[],
+    transform?: (arg: DatabaseRowMutationJs) => DatabaseRowStatementJs | null,
+    enableTracing?: string,
 }
 
 interface Sync {
     sync(): Promise<void>;
     push(): Promise<void>;
     pull(): Promise<void>;
+    checkpoint(): Promise<void>;
+    stats(): Promise<{ operations: number, wal: number }>;
 }
 
 export async function connect(opts: ConnectOpts): Database & Sync {
-    const engine = new SyncEngine({ path: opts.path, clientName: opts.clientName });
+    const engine = new SyncEngine({
+        path: opts.path,
+        clientName: opts.clientName,
+        tablesIgnore: opts.tablesIgnore,
+        transform: opts.transform,
+        enableTracing: opts.enableTracing
+    });
     const httpOpts = {
         url: opts.url,
         headers: {
@@ -147,5 +166,9 @@ export async function connect(opts: ConnectOpts): Database & Sync {
     db.sync = async function () { await run(httpOpts, engine, engine.sync()); }
     db.pull = async function () { await run(httpOpts, engine, engine.pull()); }
     db.push = async function () { await run(httpOpts, engine, engine.push()); }
+    db.checkpoint = async function () { await run(httpOpts, engine, engine.checkpoint()); }
+    db.stats = async function () { return (await run(httpOpts, engine, engine.stats())); }
     return db;
 }
+
+export { Database, Sync };

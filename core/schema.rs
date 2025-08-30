@@ -157,6 +157,15 @@ impl Schema {
             .unwrap_or_default()
     }
 
+    /// Get all materialized views that depend on a given table, skip normalizing ident.
+    /// We are basically assuming we already normalized the ident.
+    pub fn get_dependent_materialized_views_unnormalized(
+        &self,
+        table_name: &str,
+    ) -> Option<&Vec<String>> {
+        self.table_to_materialized_views.get(table_name)
+    }
+
     /// Populate all materialized views by scanning their source tables
     /// Returns IOResult to support async execution
     pub fn populate_materialized_views(

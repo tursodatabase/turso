@@ -1,3 +1,4 @@
+pub mod compiler;
 pub mod dbsp;
 pub mod expr_compiler;
 pub mod hashable_row;

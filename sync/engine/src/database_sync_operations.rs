@@ -1,19 +1,29 @@
 use std::sync::Arc;
 
-use turso_core::{types::Text, Buffer, Completion, LimboError, Value};
+use bytes::BytesMut;
+use prost::Message;
+use turso_core::{
+    types::{Text, WalFrameInfo},
+    Buffer, Completion, LimboError, OpenFlags, Value,
+};
 
 use crate::{
     database_replay_generator::DatabaseReplayGenerator,
+    database_sync_engine::DatabaseSyncEngineOpts,
     database_tape::{
-        exec_stmt, run_stmt_expect_one_row, DatabaseChangesIteratorMode,
+        run_stmt_expect_one_row, run_stmt_ignore_rows, DatabaseChangesIteratorMode,
         DatabaseChangesIteratorOpts, DatabaseReplaySessionOpts, DatabaseTape, DatabaseWalSession,
     },
     errors::Error,
+    io_operations::IoOperations,
     protocol_io::{DataCompletion, DataPollResult, ProtocolIO},
-    server_proto::{self, ExecuteStreamReq, Stmt, StreamRequest},
+    server_proto::{
+        self, ExecuteStreamReq, PageData, PageUpdatesEncodingReq, PullUpdatesReqProtoBody,
+        PullUpdatesRespProtoBody, Stmt, StmtResult, StreamRequest,
+    },
     types::{
-        Coro, DatabaseTapeOperation, DatabaseTapeRowChangeType, DbSyncInfo, DbSyncStatus,
-        ProtocolCommand,
+        Coro, DatabasePullRevision, DatabaseSyncEngineProtocolVersion, DatabaseTapeOperation,
+        DatabaseTapeRowChangeType, DbSyncInfo, DbSyncStatus, ProtocolCommand,
     },
     wal_session::WalSession,
     Result,
@@ -21,29 +31,17 @@ use crate::{
 
 pub const WAL_HEADER: usize = 32;
 pub const WAL_FRAME_HEADER: usize = 24;
-const PAGE_SIZE: usize = 4096;
-const WAL_FRAME_SIZE: usize = WAL_FRAME_HEADER + PAGE_SIZE;
+pub const PAGE_SIZE: usize = 4096;
+pub const WAL_FRAME_SIZE: usize = WAL_FRAME_HEADER + PAGE_SIZE;
 
 enum WalHttpPullResult<C: DataCompletion> {
     Frames(C),
     NeedCheckpoint(DbSyncStatus),
 }
 
-pub enum WalPullResult {
-    Done,
-    PullMore,
-    NeedCheckpoint,
-}
-
 pub enum WalPushResult {
     Ok { baton: Option<String> },
     NeedCheckpoint,
-}
-
-pub async fn connect(coro: &Coro, tape: &DatabaseTape) -> Result<Arc<turso_core::Connection>> {
-    let conn = tape.connect(coro).await?;
-    conn.wal_auto_checkpoint_disable();
-    Ok(conn)
 }
 
 pub fn connect_untracked(tape: &DatabaseTape) -> Result<Arc<turso_core::Connection>> {
@@ -53,10 +51,10 @@ pub fn connect_untracked(tape: &DatabaseTape) -> Result<Arc<turso_core::Connecti
 }
 
 /// Bootstrap multiple DB files from latest generation from remote
-pub async fn db_bootstrap<C: ProtocolIO>(
-    coro: &Coro,
+pub async fn db_bootstrap<C: ProtocolIO, Ctx>(
+    coro: &Coro<Ctx>,
     client: &C,
-    dbs: &[Arc<dyn turso_core::File>],
+    db: Arc<dyn turso_core::File>,
 ) -> Result<DbSyncInfo> {
     tracing::debug!("db_bootstrap");
     let start_time = std::time::Instant::now();
@@ -72,18 +70,15 @@ pub async fn db_bootstrap<C: ProtocolIO>(
             #[allow(clippy::arc_with_non_send_sync)]
             let buffer = Arc::new(Buffer::new_temporary(chunk.len()));
             buffer.as_mut_slice().copy_from_slice(chunk);
-            let mut completions = Vec::with_capacity(dbs.len());
-            for db in dbs {
-                let c = Completion::new_write(move |res| {
-                    let Ok(size) = res else {
-                        return;
-                    };
-                    // todo(sivukhin): we need to error out in case of partial read
-                    assert!(size as usize == content_len);
-                });
-                completions.push(db.pwrite(pos, buffer.clone(), c)?);
-            }
-            while !completions.iter().all(|x| x.is_completed()) {
+            let c = Completion::new_write(move |result| {
+                // todo(sivukhin): we need to error out in case of partial read
+                let Ok(size) = result else {
+                    return;
+                };
+                assert!(size as usize == content_len);
+            });
+            let c = db.pwrite(pos, buffer.clone(), c)?;
+            while !c.is_completed() {
                 coro.yield_(ProtocolCommand::IO).await?;
             }
             pos += content_len;
@@ -95,14 +90,11 @@ pub async fn db_bootstrap<C: ProtocolIO>(
     }
 
     // sync files in the end
-    let mut completions = Vec::with_capacity(dbs.len());
-    for db in dbs {
-        let c = Completion::new_sync(move |_| {
-            // todo(sivukhin): we need to error out in case of failed sync
-        });
-        completions.push(db.sync(c)?);
-    }
-    while !completions.iter().all(|x| x.is_completed()) {
+    let c = Completion::new_sync(move |_| {
+        // todo(sivukhin): we need to error out in case of failed sync
+    });
+    let c = db.sync(c)?;
+    while !c.is_completed() {
         coro.yield_(ProtocolCommand::IO).await?;
     }
 
@@ -112,92 +104,277 @@ pub async fn db_bootstrap<C: ProtocolIO>(
     Ok(db_info)
 }
 
-/// Pull updates from remote to the database file
-///
-/// Returns [WalPullResult::Done] if pull reached the end of database history
-/// Returns [WalPullResult::PullMore] if all frames from [start_frame..end_frame) range were pulled, but remote have more
-/// Returns [WalPullResult::NeedCheckpoint] if remote generation increased and local version must be checkpointed
-///
-/// Guarantees:
-/// 1. Frames are commited to the WAL (i.e. db_size is not zero 0) only at transaction boundaries from remote
-/// 2. wal_pull is idempotent for fixed generation and can be called multiple times with same frame range
-pub async fn wal_pull<'a, C: ProtocolIO, U: AsyncFnMut(&'a Coro, u64) -> Result<()>>(
-    coro: &'a Coro,
+pub async fn wal_apply_from_file<Ctx>(
+    coro: &Coro<Ctx>,
+    frames_file: Arc<dyn turso_core::File>,
+    session: &mut DatabaseWalSession,
+) -> Result<u32> {
+    let size = frames_file.size()?;
+    assert!(size % WAL_FRAME_SIZE as u64 == 0);
+    #[allow(clippy::arc_with_non_send_sync)]
+    let buffer = Arc::new(Buffer::new_temporary(WAL_FRAME_SIZE));
+    tracing::debug!("wal_apply_from_file: size={}", size);
+    let mut db_size = 0;
+    for offset in (0..size).step_by(WAL_FRAME_SIZE) {
+        let c = Completion::new_read(buffer.clone(), move |result| {
+            let Ok((_, size)) = result else {
+                return;
+            };
+            // todo(sivukhin): we need to error out in case of partial read
+            assert!(size as usize == WAL_FRAME_SIZE);
+        });
+        let c = frames_file.pread(offset as usize, c)?;
+        while !c.is_completed() {
+            coro.yield_(ProtocolCommand::IO).await?;
+        }
+        let info = WalFrameInfo::from_frame_header(buffer.as_slice());
+        tracing::debug!("got frame: {:?}", info);
+        db_size = info.db_size;
+        session.append_page(info.page_no, &buffer.as_slice()[WAL_FRAME_HEADER..])?;
+    }
+    assert!(db_size > 0);
+    Ok(db_size)
+}
+
+pub async fn wal_pull_to_file<C: ProtocolIO, Ctx>(
+    coro: &Coro<Ctx>,
     client: &C,
-    wal_session: &mut WalSession,
-    generation: u64,
+    frames_file: Arc<dyn turso_core::File>,
+    revision: &DatabasePullRevision,
+    wal_pull_batch_size: u64,
+) -> Result<DatabasePullRevision> {
+    match revision {
+        DatabasePullRevision::Legacy {
+            generation,
+            synced_frame_no,
+        } => {
+            let start_frame = synced_frame_no.unwrap_or(0) + 1;
+            wal_pull_to_file_legacy(
+                coro,
+                client,
+                frames_file,
+                *generation,
+                start_frame,
+                wal_pull_batch_size,
+            )
+            .await
+        }
+        DatabasePullRevision::V1 { revision } => {
+            wal_pull_to_file_v1(coro, client, frames_file, revision).await
+        }
+    }
+}
+
+/// Pull updates from remote to the separate file
+pub async fn wal_pull_to_file_v1<C: ProtocolIO, Ctx>(
+    coro: &Coro<Ctx>,
+    client: &C,
+    frames_file: Arc<dyn turso_core::File>,
+    revision: &str,
+) -> Result<DatabasePullRevision> {
+    tracing::info!("wal_pull: revision={revision}");
+    let mut bytes = BytesMut::new();
+
+    let request = PullUpdatesReqProtoBody {
+        encoding: PageUpdatesEncodingReq::Raw as i32,
+        server_revision: String::new(),
+        client_revision: revision.to_string(),
+        long_poll_timeout_ms: 0,
+        server_pages: BytesMut::new().into(),
+        client_pages: BytesMut::new().into(),
+    };
+    let request = request.encode_to_vec();
+    let completion = client.http(
+        "POST",
+        "/pull-updates",
+        Some(request),
+        &[
+            ("content-type", "application/protobuf"),
+            ("accept-encoding", "application/protobuf"),
+        ],
+    )?;
+    let Some(header) =
+        wait_proto_message::<Ctx, PullUpdatesRespProtoBody>(coro, &completion, &mut bytes).await?
+    else {
+        return Err(Error::DatabaseSyncEngineError(
+            "no header returned in the pull-updates protobuf call".to_string(),
+        ));
+    };
+    tracing::info!("wal_pull_to_file: got header={:?}", header);
+
+    let mut offset = 0;
+    #[allow(clippy::arc_with_non_send_sync)]
+    let buffer = Arc::new(Buffer::new_temporary(WAL_FRAME_SIZE));
+
+    let mut page_data_opt =
+        wait_proto_message::<Ctx, PageData>(coro, &completion, &mut bytes).await?;
+    while let Some(page_data) = page_data_opt.take() {
+        let page_id = page_data.page_id;
+        tracing::info!("received page {}", page_id);
+        let page = decode_page(&header, page_data)?;
+        if page.len() != PAGE_SIZE {
+            return Err(Error::DatabaseSyncEngineError(format!(
+                "page has unexpected size: {} != {}",
+                page.len(),
+                PAGE_SIZE
+            )));
+        }
+        buffer.as_mut_slice()[WAL_FRAME_HEADER..].copy_from_slice(&page);
+        page_data_opt = wait_proto_message(coro, &completion, &mut bytes).await?;
+        let mut frame_info = WalFrameInfo {
+            db_size: 0,
+            page_no: page_id as u32 + 1,
+        };
+        if page_data_opt.is_none() {
+            frame_info.db_size = header.db_size as u32;
+        }
+        tracing::info!("page_data_opt: {}", page_data_opt.is_some());
+        frame_info.put_to_frame_header(buffer.as_mut_slice());
+
+        let c = Completion::new_write(move |result| {
+            // todo(sivukhin): we need to error out in case of partial read
+            let Ok(size) = result else {
+                return;
+            };
+            assert!(size as usize == WAL_FRAME_SIZE);
+        });
+
+        let c = frames_file.pwrite(offset, buffer.clone(), c)?;
+        while !c.is_completed() {
+            coro.yield_(ProtocolCommand::IO).await?;
+        }
+        offset += WAL_FRAME_SIZE;
+    }
+
+    let c = Completion::new_sync(move |_| {
+        // todo(sivukhin): we need to error out in case of failed sync
+    });
+    let c = frames_file.sync(c)?;
+    while !c.is_completed() {
+        coro.yield_(ProtocolCommand::IO).await?;
+    }
+
+    Ok(DatabasePullRevision::V1 {
+        revision: header.server_revision,
+    })
+}
+
+/// Pull updates from remote to the separate file
+pub async fn wal_pull_to_file_legacy<C: ProtocolIO, Ctx>(
+    coro: &Coro<Ctx>,
+    client: &C,
+    frames_file: Arc<dyn turso_core::File>,
+    mut generation: u64,
     mut start_frame: u64,
-    end_frame: u64,
-    mut update: U,
-) -> Result<WalPullResult> {
+    wal_pull_batch_size: u64,
+) -> Result<DatabasePullRevision> {
     tracing::info!(
-        "wal_pull: generation={}, start_frame={}, end_frame={}",
-        generation,
-        start_frame,
-        end_frame
+        "wal_pull: generation={generation}, start_frame={start_frame}, wal_pull_batch_size={wal_pull_batch_size}"
     );
 
     // todo(sivukhin): optimize allocation by using buffer pool in the DatabaseSyncOperations
-    let mut buffer = Vec::with_capacity(WAL_FRAME_SIZE);
-
-    let result = wal_pull_http(coro, client, generation, start_frame, end_frame).await?;
-    let data = match result {
-        WalHttpPullResult::NeedCheckpoint(status) => {
-            assert!(status.status == "checkpoint_needed");
-            tracing::debug!("wal_pull: need checkpoint: status={status:?}");
-            if status.generation == generation && status.max_frame_no < start_frame {
-                tracing::debug!("wal_pull: end of history: status={:?}", status);
-                update(coro, status.max_frame_no).await?;
-                return Ok(WalPullResult::Done);
+    #[allow(clippy::arc_with_non_send_sync)]
+    let buffer = Arc::new(Buffer::new_temporary(WAL_FRAME_SIZE));
+    let mut buffer_len = 0;
+    let mut last_offset = 0;
+    let mut committed_len = 0;
+    let revision = loop {
+        let end_frame = start_frame + wal_pull_batch_size;
+        let result = wal_pull_http(coro, client, generation, start_frame, end_frame).await?;
+        let data = match result {
+            WalHttpPullResult::NeedCheckpoint(status) => {
+                assert!(status.status == "checkpoint_needed");
+                tracing::debug!("wal_pull: need checkpoint: status={status:?}");
+                if status.generation == generation && status.max_frame_no < start_frame {
+                    tracing::debug!("wal_pull: end of history: status={:?}", status);
+                    break DatabasePullRevision::Legacy {
+                        generation: status.generation,
+                        synced_frame_no: Some(status.max_frame_no),
+                    };
+                }
+                generation += 1;
+                start_frame = 1;
+                continue;
             }
-            return Ok(WalPullResult::NeedCheckpoint);
+            WalHttpPullResult::Frames(content) => content,
+        };
+        loop {
+            while let Some(chunk) = data.poll_data()? {
+                let mut chunk = chunk.data();
+                while !chunk.is_empty() {
+                    let to_fill = (WAL_FRAME_SIZE - buffer_len).min(chunk.len());
+                    buffer.as_mut_slice()[buffer_len..buffer_len + to_fill]
+                        .copy_from_slice(&chunk[0..to_fill]);
+                    buffer_len += to_fill;
+                    chunk = &chunk[to_fill..];
+
+                    if buffer_len < WAL_FRAME_SIZE {
+                        continue;
+                    }
+                    let c = Completion::new_write(move |result| {
+                        // todo(sivukhin): we need to error out in case of partial read
+                        let Ok(size) = result else {
+                            return;
+                        };
+                        assert!(size as usize == WAL_FRAME_SIZE);
+                    });
+                    let c = frames_file.pwrite(last_offset, buffer.clone(), c)?;
+                    while !c.is_completed() {
+                        coro.yield_(ProtocolCommand::IO).await?;
+                    }
+
+                    last_offset += WAL_FRAME_SIZE;
+                    buffer_len = 0;
+                    start_frame += 1;
+
+                    let info = WalFrameInfo::from_frame_header(buffer.as_slice());
+                    if info.is_commit_frame() {
+                        committed_len = last_offset;
+                    }
+                }
+            }
+            if data.is_done()? {
+                break;
+            }
+            coro.yield_(ProtocolCommand::IO).await?;
         }
-        WalHttpPullResult::Frames(content) => content,
+        if start_frame < end_frame {
+            // chunk which was sent from the server has ended early - so there is nothing left on server-side for pull
+            break DatabasePullRevision::Legacy {
+                generation,
+                synced_frame_no: Some(start_frame - 1),
+            };
+        }
+        if buffer_len != 0 {
+            return Err(Error::DatabaseSyncEngineError(format!(
+                "wal_pull: response has unexpected trailing data: buffer_len={buffer_len}"
+            )));
+        }
     };
-    loop {
-        while let Some(chunk) = data.poll_data()? {
-            let mut chunk = chunk.data();
-            while !chunk.is_empty() {
-                let to_fill = (WAL_FRAME_SIZE - buffer.len()).min(chunk.len());
-                buffer.extend_from_slice(&chunk[0..to_fill]);
-                chunk = &chunk[to_fill..];
 
-                assert!(
-                    buffer.capacity() == WAL_FRAME_SIZE,
-                    "buffer should not extend its capacity"
-                );
-                if buffer.len() < WAL_FRAME_SIZE {
-                    continue;
-                }
-                if !wal_session.in_txn() {
-                    wal_session.begin()?;
-                }
-                let frame_info = wal_session.insert_at(start_frame, &buffer)?;
-                if frame_info.is_commit_frame() {
-                    wal_session.end()?;
-                    // transaction boundary reached - safe to commit progress
-                    update(coro, start_frame).await?;
-                }
-                buffer.clear();
-                start_frame += 1;
-            }
-        }
-        if data.is_done()? {
-            break;
-        }
+    tracing::info!(
+        "wal_pull: generation={generation}, frame={start_frame}, last_offset={last_offset}, commited_len={committed_len}"
+    );
+    let c = Completion::new_trunc(move |result| {
+        let Ok(rc) = result else {
+            return;
+        };
+        assert!(rc as usize == 0);
+    });
+    let c = frames_file.truncate(committed_len, c)?;
+    while !c.is_completed() {
         coro.yield_(ProtocolCommand::IO).await?;
     }
-    if start_frame < end_frame {
-        // chunk which was sent from the server has ended early - so there is nothing left on server-side for pull
-        return Ok(WalPullResult::Done);
+
+    let c = Completion::new_sync(move |_| {
+        // todo(sivukhin): we need to error out in case of failed sync
+    });
+    let c = frames_file.sync(c)?;
+    while !c.is_completed() {
+        coro.yield_(ProtocolCommand::IO).await?;
     }
-    if !buffer.is_empty() {
-        return Err(Error::DatabaseSyncEngineError(format!(
-            "wal_pull: response has unexpected trailing data: buffer.len()={}",
-            buffer.len()
-        )));
-    }
-    Ok(WalPullResult::PullMore)
+
+    Ok(revision)
 }
 
 /// Push frame range [start_frame..end_frame) to the remote
@@ -207,8 +384,8 @@ pub async fn wal_pull<'a, C: ProtocolIO, U: AsyncFnMut(&'a Coro, u64) -> Result<
 /// Guarantees:
 /// 1. If there is a single client which calls wal_push, then this operation is idempotent for fixed generation
 ///    and can be called multiple times with same frame range
-pub async fn wal_push<C: ProtocolIO>(
-    coro: &Coro,
+pub async fn wal_push<C: ProtocolIO, Ctx>(
+    coro: &Coro<Ctx>,
     client: &C,
     wal_session: &mut WalSession,
     baton: Option<String>,
@@ -262,172 +439,17 @@ pub async fn wal_push<C: ProtocolIO>(
     }
 }
 
-const TURSO_SYNC_TABLE_NAME: &str = "turso_sync_last_change_id";
-const TURSO_SYNC_CREATE_TABLE: &str =
+pub const TURSO_SYNC_TABLE_NAME: &str = "turso_sync_last_change_id";
+pub const TURSO_SYNC_CREATE_TABLE: &str =
     "CREATE TABLE IF NOT EXISTS turso_sync_last_change_id (client_id TEXT PRIMARY KEY, pull_gen INTEGER, change_id INTEGER)";
+pub const TURSO_SYNC_INSERT_LAST_CHANGE_ID: &str =
+    "INSERT INTO turso_sync_last_change_id(client_id, pull_gen, change_id) VALUES (?, ?, ?)";
+pub const TURSO_SYNC_UPSERT_LAST_CHANGE_ID: &str =
+    "INSERT INTO turso_sync_last_change_id(client_id, pull_gen, change_id) VALUES (?, ?, ?) ON CONFLICT(client_id) DO UPDATE SET pull_gen=excluded.pull_gen, change_id=excluded.change_id";
+pub const TURSO_SYNC_UPDATE_LAST_CHANGE_ID: &str =
+    "UPDATE turso_sync_last_change_id SET pull_gen = ?, change_id = ? WHERE client_id = ?";
 const TURSO_SYNC_SELECT_LAST_CHANGE_ID: &str =
     "SELECT pull_gen, change_id FROM turso_sync_last_change_id WHERE client_id = ?";
-const TURSO_SYNC_INSERT_LAST_CHANGE_ID: &str =
-    "INSERT INTO turso_sync_last_change_id(client_id, pull_gen, change_id) VALUES (?, 0, 0)";
-const TURSO_SYNC_UPDATE_LAST_CHANGE_ID: &str =
-    "UPDATE turso_sync_last_change_id SET pull_gen = ?, change_id = ? WHERE client_id = ?";
-const TURSO_SYNC_UPSERT_LAST_CHANGE_ID: &str =
-    "INSERT INTO turso_sync_last_change_id(client_id, pull_gen, change_id) VALUES (?, ?, ?) ON CONFLICT(client_id) DO UPDATE SET pull_gen=excluded.pull_gen, change_id=excluded.change_id";
-
-/// Transfers row changes from source DB to target DB
-/// In order to guarantee atomicity and avoid conflicts - method maintain last_change_id counter in the target db table turso_sync_last_change_id
-pub async fn transfer_logical_changes(
-    coro: &Coro,
-    source: &DatabaseTape,
-    target: &DatabaseTape,
-    client_id: &str,
-    bump_pull_gen: bool,
-) -> Result<()> {
-    tracing::info!("transfer_logical_changes: client_id={client_id}");
-    let source_conn = connect_untracked(source)?;
-    let target_conn = connect_untracked(target)?;
-
-    // fetch last_change_id from the target DB in order to guarantee atomic replay of changes and avoid conflicts in case of failure
-    let source_pull_gen = 'source_pull_gen: {
-        let mut select_last_change_id_stmt =
-            match source_conn.prepare(TURSO_SYNC_SELECT_LAST_CHANGE_ID) {
-                Ok(stmt) => stmt,
-                Err(LimboError::ParseError(..)) => break 'source_pull_gen 0,
-                Err(err) => return Err(err.into()),
-            };
-
-        select_last_change_id_stmt
-            .bind_at(1.try_into().unwrap(), Value::Text(Text::new(client_id)));
-
-        match run_stmt_expect_one_row(coro, &mut select_last_change_id_stmt).await? {
-            Some(row) => row[0].as_int().ok_or_else(|| {
-                Error::DatabaseSyncEngineError("unexpected source pull_gen type".to_string())
-            })?,
-            None => {
-                tracing::info!("transfer_logical_changes: client_id={client_id}, turso_sync_last_change_id table is not found");
-                0
-            }
-        }
-    };
-    tracing::info!(
-        "transfer_logical_changes: client_id={client_id}, source_pull_gen={source_pull_gen}"
-    );
-
-    // fetch last_change_id from the target DB in order to guarantee atomic replay of changes and avoid conflicts in case of failure
-    let mut schema_stmt = target_conn.prepare(TURSO_SYNC_CREATE_TABLE)?;
-    exec_stmt(coro, &mut schema_stmt).await?;
-
-    let mut select_last_change_id_stmt = target_conn.prepare(TURSO_SYNC_SELECT_LAST_CHANGE_ID)?;
-    select_last_change_id_stmt.bind_at(1.try_into().unwrap(), Value::Text(Text::new(client_id)));
-
-    let mut last_change_id = match run_stmt_expect_one_row(coro, &mut select_last_change_id_stmt)
-        .await?
-    {
-        Some(row) => {
-            let target_pull_gen = row[0].as_int().ok_or_else(|| {
-                Error::DatabaseSyncEngineError("unexpected target pull_gen type".to_string())
-            })?;
-            let target_change_id = row[1].as_int().ok_or_else(|| {
-                Error::DatabaseSyncEngineError("unexpected target change_id type".to_string())
-            })?;
-            tracing::debug!(
-                "transfer_logical_changes: client_id={client_id}, target_pull_gen={target_pull_gen}, target_change_id={target_change_id}"
-            );
-            if target_pull_gen > source_pull_gen {
-                return Err(Error::DatabaseSyncEngineError(format!("protocol error: target_pull_gen > source_pull_gen: {target_pull_gen} > {source_pull_gen}")));
-            }
-            if target_pull_gen == source_pull_gen {
-                Some(target_change_id)
-            } else {
-                Some(0)
-            }
-        }
-        None => {
-            let mut insert_last_change_id_stmt =
-                target_conn.prepare(TURSO_SYNC_INSERT_LAST_CHANGE_ID)?;
-            insert_last_change_id_stmt
-                .bind_at(1.try_into().unwrap(), Value::Text(Text::new(client_id)));
-            exec_stmt(coro, &mut insert_last_change_id_stmt).await?;
-            None
-        }
-    };
-
-    tracing::debug!(
-        "transfer_logical_changes: last_change_id={:?}",
-        last_change_id
-    );
-    let replay_opts = DatabaseReplaySessionOpts {
-        use_implicit_rowid: false,
-    };
-
-    let source_schema_cookie = connect_untracked(source)?.read_schema_version()?;
-
-    let mut session = target.start_replay_session(coro, replay_opts).await?;
-
-    let iterate_opts = DatabaseChangesIteratorOpts {
-        first_change_id: last_change_id.map(|x| x + 1),
-        mode: DatabaseChangesIteratorMode::Apply,
-        ignore_schema_changes: false,
-        ..Default::default()
-    };
-    let mut rows_changed = 0;
-    let mut changes = source.iterate_changes(iterate_opts)?;
-    while let Some(operation) = changes.next(coro).await? {
-        match &operation {
-            DatabaseTapeOperation::RowChange(change) => {
-                assert!(
-                    last_change_id.is_none() || last_change_id.unwrap() < change.change_id,
-                    "change id must be strictly increasing: last_change_id={:?}, change.change_id={}",
-                    last_change_id,
-                    change.change_id
-                );
-                if change.table_name == TURSO_SYNC_TABLE_NAME {
-                    continue;
-                }
-                rows_changed += 1;
-                // we give user full control over CDC table - so let's not emit assert here for now
-                if last_change_id.is_some() && last_change_id.unwrap() + 1 != change.change_id {
-                    tracing::warn!(
-                        "out of order change sequence: {} -> {}",
-                        last_change_id.unwrap(),
-                        change.change_id
-                    );
-                }
-                last_change_id = Some(change.change_id);
-            }
-            DatabaseTapeOperation::Commit if rows_changed > 0 || bump_pull_gen => {
-                tracing::info!("prepare update stmt for turso_sync_last_change_id table with client_id={} and last_change_id={:?}", client_id, last_change_id);
-                // update turso_sync_last_change_id table with new value before commit
-                let mut set_last_change_id_stmt =
-                    session.conn().prepare(TURSO_SYNC_UPDATE_LAST_CHANGE_ID)?;
-                let (next_pull_gen, next_change_id) = if bump_pull_gen {
-                    (source_pull_gen + 1, 0)
-                } else {
-                    (source_pull_gen, last_change_id.unwrap_or(0))
-                };
-                tracing::info!("transfer_logical_changes: client_id={client_id}, set pull_gen={next_pull_gen}, change_id={next_change_id}, rows_changed={rows_changed}");
-                set_last_change_id_stmt
-                    .bind_at(1.try_into().unwrap(), Value::Integer(next_pull_gen));
-                set_last_change_id_stmt
-                    .bind_at(2.try_into().unwrap(), Value::Integer(next_change_id));
-                set_last_change_id_stmt
-                    .bind_at(3.try_into().unwrap(), Value::Text(Text::new(client_id)));
-                exec_stmt(coro, &mut set_last_change_id_stmt).await?;
-                let session_schema_cookie = session.conn().read_schema_version()?;
-                if session_schema_cookie <= source_schema_cookie {
-                    session
-                        .conn()
-                        .write_schema_version(source_schema_cookie + 1)?;
-                }
-            }
-            _ => {}
-        }
-        session.replay(coro, operation).await?;
-    }
-
-    tracing::info!("transfer_logical_changes: rows_changed={:?}", rows_changed);
-    Ok(())
-}
 
 fn convert_to_args(values: Vec<turso_core::Value>) -> Vec<server_proto::Value> {
     values
@@ -446,16 +468,95 @@ fn convert_to_args(values: Vec<turso_core::Value>) -> Vec<server_proto::Value> {
         .collect()
 }
 
-pub async fn push_logical_changes<C: ProtocolIO>(
-    coro: &Coro,
-    client: &C,
-    source: &DatabaseTape,
-    target: &DatabaseTape,
+pub async fn has_table<Ctx>(
+    coro: &Coro<Ctx>,
+    conn: &Arc<turso_core::Connection>,
+    table_name: &str,
+) -> Result<bool> {
+    let mut stmt =
+        conn.prepare("SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = ?")?;
+    stmt.bind_at(1.try_into().unwrap(), Value::Text(Text::new(table_name)));
+
+    let count = match run_stmt_expect_one_row(coro, &mut stmt).await? {
+        Some(row) => row[0]
+            .as_int()
+            .ok_or_else(|| Error::DatabaseSyncEngineError("unexpected column type".to_string()))?,
+        _ => panic!("expected single row"),
+    };
+    Ok(count > 0)
+}
+
+pub async fn count_local_changes<Ctx>(
+    coro: &Coro<Ctx>,
+    conn: &Arc<turso_core::Connection>,
+    change_id: i64,
+) -> Result<i64> {
+    let mut stmt = conn.prepare("SELECT COUNT(*) FROM turso_cdc WHERE change_id > ?")?;
+    stmt.bind_at(1.try_into().unwrap(), Value::Integer(change_id));
+
+    let count = match run_stmt_expect_one_row(coro, &mut stmt).await? {
+        Some(row) => row[0]
+            .as_int()
+            .ok_or_else(|| Error::DatabaseSyncEngineError("unexpected column type".to_string()))?,
+        _ => panic!("expected single row"),
+    };
+    Ok(count)
+}
+
+pub async fn update_last_change_id<Ctx>(
+    coro: &Coro<Ctx>,
+    conn: &Arc<turso_core::Connection>,
     client_id: &str,
+    pull_gen: i64,
+    change_id: i64,
 ) -> Result<()> {
-    tracing::info!("push_logical_changes: client_id={client_id}");
-    let source_conn = connect_untracked(source)?;
-    let target_conn = connect_untracked(target)?;
+    tracing::info!(
+        "update_last_change_id(client_id={client_id}): pull_gen={pull_gen}, change_id={change_id}"
+    );
+    conn.execute(TURSO_SYNC_CREATE_TABLE)?;
+    tracing::info!("update_last_change_id(client_id={client_id}): initialized table");
+    let mut select_stmt = conn.prepare(TURSO_SYNC_SELECT_LAST_CHANGE_ID)?;
+    select_stmt.bind_at(
+        1.try_into().unwrap(),
+        turso_core::Value::Text(turso_core::types::Text::new(client_id)),
+    );
+    let row = run_stmt_expect_one_row(coro, &mut select_stmt).await?;
+    tracing::info!("update_last_change_id(client_id={client_id}): selected client row if any");
+
+    if row.is_some() {
+        let mut update_stmt = conn.prepare(TURSO_SYNC_UPDATE_LAST_CHANGE_ID)?;
+        update_stmt.bind_at(1.try_into().unwrap(), turso_core::Value::Integer(pull_gen));
+        update_stmt.bind_at(2.try_into().unwrap(), turso_core::Value::Integer(change_id));
+        update_stmt.bind_at(
+            3.try_into().unwrap(),
+            turso_core::Value::Text(turso_core::types::Text::new(client_id)),
+        );
+        run_stmt_ignore_rows(coro, &mut update_stmt).await?;
+        tracing::info!("update_last_change_id(client_id={client_id}): updated row for the client");
+    } else {
+        let mut update_stmt = conn.prepare(TURSO_SYNC_INSERT_LAST_CHANGE_ID)?;
+        update_stmt.bind_at(
+            1.try_into().unwrap(),
+            turso_core::Value::Text(turso_core::types::Text::new(client_id)),
+        );
+        update_stmt.bind_at(2.try_into().unwrap(), turso_core::Value::Integer(pull_gen));
+        update_stmt.bind_at(3.try_into().unwrap(), turso_core::Value::Integer(change_id));
+        run_stmt_ignore_rows(coro, &mut update_stmt).await?;
+        tracing::info!(
+            "update_last_change_id(client_id={client_id}): inserted new row for the client"
+        );
+    }
+
+    Ok(())
+}
+
+pub async fn fetch_last_change_id<C: ProtocolIO, Ctx>(
+    coro: &Coro<Ctx>,
+    client: &C,
+    source_conn: &Arc<turso_core::Connection>,
+    client_id: &str,
+) -> Result<(i64, Option<i64>)> {
+    tracing::info!("fetch_last_change_id: client_id={client_id}");
 
     // fetch last_change_id from the target DB in order to guarantee atomic replay of changes and avoid conflicts in case of failure
     let source_pull_gen = 'source_pull_gen: {
@@ -474,61 +575,101 @@ pub async fn push_logical_changes<C: ProtocolIO>(
                 Error::DatabaseSyncEngineError("unexpected source pull_gen type".to_string())
             })?,
             None => {
-                tracing::info!("push_logical_changes: client_id={client_id}, turso_sync_last_change_id table is not found");
+                tracing::info!("fetch_last_change_id: client_id={client_id}, turso_sync_last_change_id table is not found");
                 0
             }
         }
     };
     tracing::info!(
-        "push_logical_changes: client_id={client_id}, source_pull_gen={source_pull_gen}"
+        "fetch_last_change_id: client_id={client_id}, source_pull_gen={source_pull_gen}"
     );
 
     // fetch last_change_id from the target DB in order to guarantee atomic replay of changes and avoid conflicts in case of failure
-    let mut schema_stmt = target_conn.prepare(TURSO_SYNC_CREATE_TABLE)?;
-    exec_stmt(coro, &mut schema_stmt).await?;
-
-    let mut select_last_change_id_stmt = target_conn.prepare(TURSO_SYNC_SELECT_LAST_CHANGE_ID)?;
-    select_last_change_id_stmt.bind_at(1.try_into().unwrap(), Value::Text(Text::new(client_id)));
-
-    let mut last_change_id = match run_stmt_expect_one_row(coro, &mut select_last_change_id_stmt)
-        .await?
-    {
-        Some(row) => {
-            let target_pull_gen = row[0].as_int().ok_or_else(|| {
-                Error::DatabaseSyncEngineError("unexpected target pull_gen type".to_string())
-            })?;
-            let target_change_id = row[1].as_int().ok_or_else(|| {
-                Error::DatabaseSyncEngineError("unexpected target change_id type".to_string())
-            })?;
-            tracing::debug!(
-                "push_logical_changes: client_id={client_id}, target_pull_gen={target_pull_gen}, target_change_id={target_change_id}"
-            );
-            if target_pull_gen > source_pull_gen {
-                return Err(Error::DatabaseSyncEngineError(format!("protocol error: target_pull_gen > source_pull_gen: {target_pull_gen} > {source_pull_gen}")));
-            }
-            if target_pull_gen == source_pull_gen {
-                Some(target_change_id)
-            } else {
-                Some(0)
-            }
-        }
-        None => {
-            let mut insert_last_change_id_stmt =
-                target_conn.prepare(TURSO_SYNC_INSERT_LAST_CHANGE_ID)?;
-            insert_last_change_id_stmt
-                .bind_at(1.try_into().unwrap(), Value::Text(Text::new(client_id)));
-            exec_stmt(coro, &mut insert_last_change_id_stmt).await?;
-            None
-        }
+    let init_hrana_request = server_proto::PipelineReqBody {
+        baton: None,
+        requests: vec![
+            // read pull_gen, change_id values for current client if they were set before
+            StreamRequest::Execute(ExecuteStreamReq {
+                stmt: Stmt {
+                    sql: Some(TURSO_SYNC_SELECT_LAST_CHANGE_ID.to_string()),
+                    sql_id: None,
+                    args: vec![server_proto::Value::Text {
+                        value: client_id.to_string(),
+                    }],
+                    named_args: Vec::new(),
+                    want_rows: Some(true),
+                    replication_index: None,
+                },
+            }),
+        ]
+        .into(),
     };
+
+    let response = match sql_execute_http(coro, client, init_hrana_request).await {
+        Ok(response) => response,
+        Err(Error::DatabaseSyncEngineError(err)) if err.contains("no such table") => {
+            return Ok((source_pull_gen, None));
+        }
+        Err(err) => return Err(err),
+    };
+    assert!(response.len() == 1);
+    let last_change_id_response = &response[0];
+    tracing::debug!("fetch_last_change_id: response={:?}", response);
+    assert!(last_change_id_response.rows.len() <= 1);
+    if last_change_id_response.rows.is_empty() {
+        return Ok((source_pull_gen, None));
+    }
+    let row = &last_change_id_response.rows[0].values;
+    let server_proto::Value::Integer {
+        value: target_pull_gen,
+    } = row[0]
+    else {
+        return Err(Error::DatabaseSyncEngineError(
+            "unexpected target pull_gen type".to_string(),
+        ));
+    };
+    let server_proto::Value::Integer {
+        value: target_change_id,
+    } = row[1]
+    else {
+        return Err(Error::DatabaseSyncEngineError(
+            "unexpected target change_id type".to_string(),
+        ));
+    };
+    tracing::debug!(
+            "fetch_last_change_id: client_id={client_id}, target_pull_gen={target_pull_gen}, target_change_id={target_change_id}"
+        );
+    if target_pull_gen > source_pull_gen {
+        return Err(Error::DatabaseSyncEngineError(format!("protocol error: target_pull_gen > source_pull_gen: {target_pull_gen} > {source_pull_gen}")));
+    }
+    let last_change_id = if target_pull_gen == source_pull_gen {
+        Some(target_change_id)
+    } else {
+        Some(0)
+    };
+    Ok((source_pull_gen, last_change_id))
+}
+
+pub async fn push_logical_changes<C: ProtocolIO, Ctx>(
+    coro: &Coro<Ctx>,
+    client: &C,
+    source: &DatabaseTape,
+    client_id: &str,
+    opts: &DatabaseSyncEngineOpts<Ctx>,
+) -> Result<(i64, i64)> {
+    tracing::info!("push_logical_changes: client_id={client_id}");
+    let source_conn = connect_untracked(source)?;
+
+    let (source_pull_gen, mut last_change_id) =
+        fetch_last_change_id(coro, client, &source_conn, client_id).await?;
 
     tracing::debug!("push_logical_changes: last_change_id={:?}", last_change_id);
     let replay_opts = DatabaseReplaySessionOpts {
         use_implicit_rowid: false,
+        transform: None,
     };
 
-    let conn = connect_untracked(target)?;
-    let generator = DatabaseReplayGenerator::new(conn, replay_opts);
+    let generator = DatabaseReplayGenerator::new(source_conn, replay_opts);
 
     let iterate_opts = DatabaseChangesIteratorOpts {
         first_change_id: last_change_id.map(|x| x + 1),
@@ -568,6 +709,10 @@ pub async fn push_logical_changes<C: ProtocolIO>(
                 if change.table_name == TURSO_SYNC_TABLE_NAME {
                     continue;
                 }
+                let ignore = &opts.tables_ignore;
+                if ignore.iter().any(|x| &change.table_name == x) {
+                    continue;
+                }
                 rows_changed += 1;
                 // we give user full control over CDC table - so let's not emit assert here for now
                 if last_change_id.is_some() && last_change_id.unwrap() + 1 != change.change_id {
@@ -579,19 +724,39 @@ pub async fn push_logical_changes<C: ProtocolIO>(
                 }
                 last_change_id = Some(change.change_id);
                 let replay_info = generator.replay_info(coro, &change).await?;
+                if !replay_info.is_ddl_replay {
+                    if let Some(transform) = &opts.transform {
+                        let mutation = generator.create_mutation(&replay_info, &change)?;
+                        if let Some(statement) = transform(&coro.ctx.borrow(), mutation)? {
+                            tracing::info!(
+                                "push_logical_changes: use mutation from custom transformer: sql={}, values={:?}",
+                                statement.sql,
+                                statement.values
+                            );
+                            sql_over_http_requests.push(Stmt {
+                                sql: Some(statement.sql),
+                                sql_id: None,
+                                args: convert_to_args(statement.values),
+                                named_args: Vec::new(),
+                                want_rows: Some(false),
+                                replication_index: None,
+                            });
+                            continue;
+                        }
+                    }
+                }
                 let change_type = (&change.change).into();
                 match change.change {
                     DatabaseTapeRowChangeType::Delete { before } => {
-                        assert!(replay_info.len() == 1);
                         let values = generator.replay_values(
-                            &replay_info[0],
+                            &replay_info,
                             change_type,
                             change.id,
                             before,
                             None,
                         );
                         sql_over_http_requests.push(Stmt {
-                            sql: Some(replay_info[0].query.clone()),
+                            sql: Some(replay_info.query.clone()),
                             sql_id: None,
                             args: convert_to_args(values),
                             named_args: Vec::new(),
@@ -600,16 +765,15 @@ pub async fn push_logical_changes<C: ProtocolIO>(
                         })
                     }
                     DatabaseTapeRowChangeType::Insert { after } => {
-                        assert!(replay_info.len() == 1);
                         let values = generator.replay_values(
-                            &replay_info[0],
+                            &replay_info,
                             change_type,
                             change.id,
                             after,
                             None,
                         );
                         sql_over_http_requests.push(Stmt {
-                            sql: Some(replay_info[0].query.clone()),
+                            sql: Some(replay_info.query.clone()),
                             sql_id: None,
                             args: convert_to_args(values),
                             named_args: Vec::new(),
@@ -622,16 +786,15 @@ pub async fn push_logical_changes<C: ProtocolIO>(
                         updates: Some(updates),
                         ..
                     } => {
-                        assert!(replay_info.len() == 1);
                         let values = generator.replay_values(
-                            &replay_info[0],
+                            &replay_info,
                             change_type,
                             change.id,
                             after,
                             Some(updates),
                         );
                         sql_over_http_requests.push(Stmt {
-                            sql: Some(replay_info[0].query.clone()),
+                            sql: Some(replay_info.query.clone()),
                             sql_id: None,
                             args: convert_to_args(values),
                             named_args: Vec::new(),
@@ -640,35 +803,19 @@ pub async fn push_logical_changes<C: ProtocolIO>(
                         })
                     }
                     DatabaseTapeRowChangeType::Update {
-                        before,
                         after,
                         updates: None,
+                        ..
                     } => {
-                        assert!(replay_info.len() == 2);
                         let values = generator.replay_values(
-                            &replay_info[0],
-                            change_type,
-                            change.id,
-                            before,
-                            None,
-                        );
-                        sql_over_http_requests.push(Stmt {
-                            sql: Some(replay_info[0].query.clone()),
-                            sql_id: None,
-                            args: convert_to_args(values),
-                            named_args: Vec::new(),
-                            want_rows: Some(false),
-                            replication_index: None,
-                        });
-                        let values = generator.replay_values(
-                            &replay_info[1],
+                            &replay_info,
                             change_type,
                             change.id,
                             after,
                             None,
                         );
                         sql_over_http_requests.push(Stmt {
-                            sql: Some(replay_info[1].query.clone()),
+                            sql: Some(replay_info.query.clone()),
                             sql_id: None,
                             args: convert_to_args(values),
                             named_args: Vec::new(),
@@ -682,9 +829,8 @@ pub async fn push_logical_changes<C: ProtocolIO>(
                 if rows_changed > 0 {
                     tracing::info!("prepare update stmt for turso_sync_last_change_id table with client_id={} and last_change_id={:?}", client_id, last_change_id);
                     // update turso_sync_last_change_id table with new value before commit
-                    let (next_pull_gen, next_change_id) =
-                        (source_pull_gen, last_change_id.unwrap_or(0));
-                    tracing::info!("transfer_logical_changes: client_id={client_id}, set pull_gen={next_pull_gen}, change_id={next_change_id}, rows_changed={rows_changed}");
+                    let next_change_id = last_change_id.unwrap_or(0);
+                    tracing::info!("push_logical_changes: client_id={client_id}, set pull_gen={source_pull_gen}, change_id={next_change_id}, rows_changed={rows_changed}");
                     sql_over_http_requests.push(Stmt {
                         sql: Some(TURSO_SYNC_UPSERT_LAST_CHANGE_ID.to_string()),
                         sql_id: None,
@@ -693,7 +839,7 @@ pub async fn push_logical_changes<C: ProtocolIO>(
                                 value: client_id.to_string(),
                             },
                             server_proto::Value::Integer {
-                                value: next_pull_gen,
+                                value: source_pull_gen,
                             },
                             server_proto::Value::Integer {
                                 value: next_change_id,
@@ -716,8 +862,8 @@ pub async fn push_logical_changes<C: ProtocolIO>(
         }
     }
 
-    tracing::debug!("hrana request: {:?}", sql_over_http_requests);
-    let request = server_proto::PipelineReqBody {
+    tracing::trace!("hrana request: {:?}", sql_over_http_requests);
+    let replay_hrana_request = server_proto::PipelineReqBody {
         baton: None,
         requests: sql_over_http_requests
             .into_iter()
@@ -725,74 +871,41 @@ pub async fn push_logical_changes<C: ProtocolIO>(
             .collect(),
     };
 
-    sql_execute_http(coro, client, request).await?;
+    let _ = sql_execute_http(coro, client, replay_hrana_request).await?;
     tracing::info!("push_logical_changes: rows_changed={:?}", rows_changed);
-    Ok(())
+    Ok((source_pull_gen, last_change_id.unwrap_or(0)))
 }
 
-/// Replace WAL frames [target_wal_match_watermark..) in the target DB with frames [source_wal_match_watermark..) from source DB
-/// Return the position in target DB wal which logically equivalent to the source_sync_watermark in the source DB WAL
-pub async fn transfer_physical_changes(
-    coro: &Coro,
-    source: &DatabaseTape,
-    target_session: WalSession,
-    source_wal_match_watermark: u64,
-    source_sync_watermark: u64,
-    target_wal_match_watermark: u64,
-) -> Result<u64> {
-    tracing::info!("transfer_physical_changes: source_wal_match_watermark={source_wal_match_watermark}, source_sync_watermark={source_sync_watermark}, target_wal_match_watermark={target_wal_match_watermark}");
-
-    let source_conn = connect(coro, source).await?;
-    let mut source_session = WalSession::new(source_conn.clone());
-    source_session.begin()?;
-
-    let source_frames_count = source_conn.wal_state()?.max_frame;
-    assert!(
-        source_frames_count >= source_wal_match_watermark,
-        "watermark can't be greater than current frames count: {source_frames_count} vs {source_wal_match_watermark}",
-    );
-    if source_frames_count == source_wal_match_watermark {
-        assert!(source_sync_watermark == source_wal_match_watermark);
-        return Ok(target_wal_match_watermark);
-    }
-    assert!(
-        (source_wal_match_watermark..=source_frames_count).contains(&source_sync_watermark),
-        "source_sync_watermark={source_sync_watermark} must be in range: {source_wal_match_watermark}..={source_frames_count}",
-    );
-
-    let target_sync_watermark = {
-        let mut target_session = DatabaseWalSession::new(coro, target_session).await?;
-        tracing::info!("rollback_changes_after: {target_wal_match_watermark}");
-
-        target_session.rollback_changes_after(target_wal_match_watermark)?;
-        let mut last_frame_info = None;
-        let mut frame = vec![0u8; WAL_FRAME_SIZE];
-        let mut target_sync_watermark = target_session.frames_count()?;
-        tracing::info!(
-            "transfer_physical_changes: start={}, end={}",
-            source_wal_match_watermark + 1,
-            source_frames_count
-        );
-        for source_frame_no in source_wal_match_watermark + 1..=source_frames_count {
-            let frame_info = source_conn.wal_get_frame(source_frame_no, &mut frame)?;
-            tracing::debug!("append page {} to target DB", frame_info.page_no);
-            target_session.append_page(frame_info.page_no, &frame[WAL_FRAME_HEADER..])?;
-            if source_frame_no == source_sync_watermark {
-                target_sync_watermark = target_session.frames_count()? + 1; // +1 because page will be actually commited on next iteration
-                tracing::info!("set target_sync_watermark to {}", target_sync_watermark);
-            }
-            last_frame_info = Some(frame_info);
+pub async fn read_wal_salt<Ctx>(
+    coro: &Coro<Ctx>,
+    wal: &Arc<dyn turso_core::File>,
+) -> Result<Option<Vec<u32>>> {
+    #[allow(clippy::arc_with_non_send_sync)]
+    let buffer = Arc::new(Buffer::new_temporary(WAL_HEADER));
+    let c = Completion::new_read(buffer.clone(), |result| {
+        let Ok((buffer, len)) = result else {
+            return;
+        };
+        if (len as usize) < WAL_HEADER {
+            buffer.as_mut_slice().fill(0);
         }
-        let db_size = last_frame_info.unwrap().db_size;
-        tracing::debug!("commit WAL session to target with db_size={db_size}");
-        target_session.commit(db_size)?;
-        assert!(target_sync_watermark != 0);
-        target_sync_watermark
-    };
-    Ok(target_sync_watermark)
+    });
+    let c = wal.pread(0, c)?;
+    while !c.is_completed() {
+        coro.yield_(ProtocolCommand::IO).await?;
+    }
+    if buffer.as_mut_slice() == [0u8; WAL_HEADER] {
+        return Ok(None);
+    }
+    let salt1 = u32::from_be_bytes(buffer.as_slice()[16..20].try_into().unwrap());
+    let salt2 = u32::from_be_bytes(buffer.as_slice()[20..24].try_into().unwrap());
+    Ok(Some(vec![salt1, salt2]))
 }
 
-pub async fn checkpoint_wal_file(coro: &Coro, conn: &Arc<turso_core::Connection>) -> Result<()> {
+pub async fn checkpoint_wal_file<Ctx>(
+    coro: &Coro<Ctx>,
+    conn: &Arc<turso_core::Connection>,
+) -> Result<()> {
     let mut checkpoint_stmt = conn.prepare("PRAGMA wal_checkpoint(TRUNCATE)")?;
     loop {
         match checkpoint_stmt.step()? {
@@ -809,8 +922,151 @@ pub async fn checkpoint_wal_file(coro: &Coro, conn: &Arc<turso_core::Connection>
     Ok(())
 }
 
-pub async fn reset_wal_file(
-    coro: &Coro,
+pub async fn bootstrap_db_file<C: ProtocolIO, Ctx>(
+    coro: &Coro<Ctx>,
+    client: &C,
+    io: &Arc<dyn turso_core::IO>,
+    main_db_path: &str,
+    protocol: DatabaseSyncEngineProtocolVersion,
+) -> Result<DatabasePullRevision> {
+    match protocol {
+        DatabaseSyncEngineProtocolVersion::Legacy => {
+            bootstrap_db_file_legacy(coro, client, io, main_db_path).await
+        }
+        DatabaseSyncEngineProtocolVersion::V1 => {
+            bootstrap_db_file_v1(coro, client, io, main_db_path).await
+        }
+    }
+}
+
+pub async fn bootstrap_db_file_v1<C: ProtocolIO, Ctx>(
+    coro: &Coro<Ctx>,
+    client: &C,
+    io: &Arc<dyn turso_core::IO>,
+    main_db_path: &str,
+) -> Result<DatabasePullRevision> {
+    let mut bytes = BytesMut::new();
+    let completion = client.http(
+        "GET",
+        "/pull-updates",
+        None,
+        &[
+            ("content-type", "application/protobuf"),
+            ("accept-encoding", "application/protobuf"),
+        ],
+    )?;
+    let Some(header) =
+        wait_proto_message::<Ctx, PullUpdatesRespProtoBody>(coro, &completion, &mut bytes).await?
+    else {
+        return Err(Error::DatabaseSyncEngineError(
+            "no header returned in the pull-updates protobuf call".to_string(),
+        ));
+    };
+    tracing::info!(
+        "bootstrap_db_file(path={}): got header={:?}",
+        main_db_path,
+        header
+    );
+    let file = io.open_file(main_db_path, OpenFlags::Create, false)?;
+    let c = Completion::new_trunc(move |result| {
+        let Ok(rc) = result else {
+            return;
+        };
+        assert!(rc as usize == 0);
+    });
+    let c = file.truncate(header.db_size as usize * PAGE_SIZE, c)?;
+    while !c.is_completed() {
+        coro.yield_(ProtocolCommand::IO).await?;
+    }
+
+    #[allow(clippy::arc_with_non_send_sync)]
+    let buffer = Arc::new(Buffer::new_temporary(PAGE_SIZE));
+    while let Some(page_data) =
+        wait_proto_message::<Ctx, PageData>(coro, &completion, &mut bytes).await?
+    {
+        let offset = page_data.page_id as usize * PAGE_SIZE;
+        let page = decode_page(&header, page_data)?;
+        if page.len() != PAGE_SIZE {
+            return Err(Error::DatabaseSyncEngineError(format!(
+                "page has unexpected size: {} != {}",
+                page.len(),
+                PAGE_SIZE
+            )));
+        }
+        buffer.as_mut_slice().copy_from_slice(&page);
+        let c = Completion::new_write(move |result| {
+            // todo(sivukhin): we need to error out in case of partial read
+            let Ok(size) = result else {
+                return;
+            };
+            assert!(size as usize == PAGE_SIZE);
+        });
+        let c = file.pwrite(offset, buffer.clone(), c)?;
+        while !c.is_completed() {
+            coro.yield_(ProtocolCommand::IO).await?;
+        }
+    }
+    Ok(DatabasePullRevision::V1 {
+        revision: header.server_revision,
+    })
+}
+
+fn decode_page(header: &PullUpdatesRespProtoBody, page_data: PageData) -> Result<Vec<u8>> {
+    if header.raw_encoding.is_some() && header.zstd_encoding.is_some() {
+        return Err(Error::DatabaseSyncEngineError(
+            "both of raw_encoding and zstd_encoding are set".to_string(),
+        ));
+    }
+    if header.raw_encoding.is_none() && header.zstd_encoding.is_none() {
+        return Err(Error::DatabaseSyncEngineError(
+            "none from raw_encoding and zstd_encoding are set".to_string(),
+        ));
+    }
+
+    if header.raw_encoding.is_some() {
+        return Ok(page_data.encoded_page.to_vec());
+    }
+    Err(Error::DatabaseSyncEngineError(
+        "zstd encoding is not supported".to_string(),
+    ))
+}
+
+pub async fn bootstrap_db_file_legacy<C: ProtocolIO, Ctx>(
+    coro: &Coro<Ctx>,
+    client: &C,
+    io: &Arc<dyn turso_core::IO>,
+    main_db_path: &str,
+) -> Result<DatabasePullRevision> {
+    tracing::info!("bootstrap_db_file(path={})", main_db_path);
+
+    let start_time = std::time::Instant::now();
+    // cleanup all files left from previous attempt to bootstrap
+    // we shouldn't write any WAL files - but let's truncate them too for safety
+    if let Some(file) = io.try_open(main_db_path)? {
+        io.truncate(coro, file, 0).await?;
+    }
+    if let Some(file) = io.try_open(&format!("{main_db_path}-wal"))? {
+        io.truncate(coro, file, 0).await?;
+    }
+
+    let file = io.create(main_db_path)?;
+    let db_info = db_bootstrap(coro, client, file).await?;
+
+    let elapsed = std::time::Instant::now().duration_since(start_time);
+    tracing::info!(
+        "bootstrap_db_files(path={}): finished: elapsed={:?}",
+        main_db_path,
+        elapsed
+    );
+
+    Ok(DatabasePullRevision::Legacy {
+        generation: db_info.current_generation,
+        synced_frame_no: None,
+    })
+}
+
+pub async fn reset_wal_file<Ctx>(
+    coro: &Coro<Ctx>,
     wal: Arc<dyn turso_core::File>,
     frames_count: u64,
 ) -> Result<()> {
@@ -821,8 +1077,8 @@ pub async fn reset_wal_file(
         WAL_HEADER + WAL_FRAME_SIZE * (frames_count as usize)
     };
     tracing::debug!("reset db wal to the size of {} frames", frames_count);
-    let c = Completion::new_trunc(move |res| {
-        let Ok(rc) = res else {
+    let c = Completion::new_trunc(move |result| {
+        let Ok(rc) = result else {
             return;
         };
         assert!(rc as usize == 0);
@@ -834,13 +1090,13 @@ pub async fn reset_wal_file(
     Ok(())
 }
 
-async fn sql_execute_http<C: ProtocolIO>(
-    coro: &Coro,
+async fn sql_execute_http<C: ProtocolIO, Ctx>(
+    coro: &Coro<Ctx>,
     client: &C,
     request: server_proto::PipelineReqBody,
-) -> Result<()> {
+) -> Result<Vec<StmtResult>> {
     let body = serde_json::to_vec(&request)?;
-    let completion = client.http("POST", "/v2/pipeline", Some(body))?;
+    let completion = client.http("POST", "/v2/pipeline", Some(body), &[])?;
     let status = wait_status(coro, &completion).await?;
     if status != http::StatusCode::OK {
         let error = format!("sql_execute_http: unexpected status code: {status}");
@@ -848,18 +1104,32 @@ async fn sql_execute_http<C: ProtocolIO>(
     }
     let response = wait_full_body(coro, &completion).await?;
     let response: server_proto::PipelineRespBody = serde_json::from_slice(&response)?;
+    tracing::debug!("hrana response: {:?}", response);
+    let mut results = Vec::new();
     for result in response.results {
-        if let server_proto::StreamResult::Error { error } = result {
-            return Err(Error::DatabaseSyncEngineError(format!(
-                "failed to execute sql: {error:?}"
-            )));
+        match result {
+            server_proto::StreamResult::Error { error } => {
+                return Err(Error::DatabaseSyncEngineError(format!(
+                    "failed to execute sql: {error:?}"
+                )))
+            }
+            server_proto::StreamResult::None => {
+                return Err(Error::DatabaseSyncEngineError(
+                    "unexpected None result".to_string(),
+                ));
+            }
+            server_proto::StreamResult::Ok { response } => match response {
+                server_proto::StreamResponse::Execute(execute) => {
+                    results.push(execute.result);
+                }
+            },
         }
     }
-    Ok(())
+    Ok(results)
 }
 
-async fn wal_pull_http<C: ProtocolIO>(
-    coro: &Coro,
+async fn wal_pull_http<C: ProtocolIO, Ctx>(
+    coro: &Coro<Ctx>,
     client: &C,
     generation: u64,
     start_frame: u64,
@@ -869,6 +1139,7 @@ async fn wal_pull_http<C: ProtocolIO>(
         "GET",
         &format!("/sync/{generation}/{start_frame}/{end_frame}"),
         None,
+        &[],
     )?;
     let status = wait_status(coro, &completion).await?;
     if status == http::StatusCode::BAD_REQUEST {
@@ -888,8 +1159,8 @@ async fn wal_pull_http<C: ProtocolIO>(
     Ok(WalHttpPullResult::Frames(completion))
 }
 
-async fn wal_push_http<C: ProtocolIO>(
-    coro: &Coro,
+async fn wal_push_http<C: ProtocolIO, Ctx>(
+    coro: &Coro<Ctx>,
     client: &C,
     baton: Option<String>,
     generation: u64,
@@ -904,6 +1175,7 @@ async fn wal_push_http<C: ProtocolIO>(
         "POST",
         &format!("/sync/{generation}/{start_frame}/{end_frame}{baton}"),
         Some(frames),
+        &[],
     )?;
     let status = wait_status(coro, &completion).await?;
     let status_body = wait_full_body(coro, &completion).await?;
@@ -916,8 +1188,8 @@ async fn wal_push_http<C: ProtocolIO>(
     Ok(serde_json::from_slice(&status_body)?)
 }
 
-async fn db_info_http<C: ProtocolIO>(coro: &Coro, client: &C) -> Result<DbSyncInfo> {
-    let completion = client.http("GET", "/info", None)?;
+async fn db_info_http<C: ProtocolIO, Ctx>(coro: &Coro<Ctx>, client: &C) -> Result<DbSyncInfo> {
+    let completion = client.http("GET", "/info", None, &[])?;
     let status = wait_status(coro, &completion).await?;
     let status_body = wait_full_body(coro, &completion).await?;
     if status != http::StatusCode::OK {
@@ -928,12 +1200,12 @@ async fn db_info_http<C: ProtocolIO>(coro: &Coro, client: &C) -> Result<DbSyncIn
     Ok(serde_json::from_slice(&status_body)?)
 }
 
-async fn db_bootstrap_http<C: ProtocolIO>(
-    coro: &Coro,
+async fn db_bootstrap_http<C: ProtocolIO, Ctx>(
+    coro: &Coro<Ctx>,
     client: &C,
     generation: u64,
 ) -> Result<C::DataCompletion> {
-    let completion = client.http("GET", &format!("/export/{generation}"), None)?;
+    let completion = client.http("GET", &format!("/export/{generation}"), None, &[])?;
     let status = wait_status(coro, &completion).await?;
     if status != http::StatusCode::OK.as_u16() {
         return Err(Error::DatabaseSyncEngineError(format!(
@@ -943,14 +1215,76 @@ async fn db_bootstrap_http<C: ProtocolIO>(
     Ok(completion)
 }
 
-pub async fn wait_status(coro: &Coro, completion: &impl DataCompletion) -> Result<u16> {
+pub async fn wait_status<Ctx>(coro: &Coro<Ctx>, completion: &impl DataCompletion) -> Result<u16> {
     while completion.status()?.is_none() {
         coro.yield_(ProtocolCommand::IO).await?;
     }
     Ok(completion.status()?.unwrap())
 }
 
-pub async fn wait_full_body(coro: &Coro, completion: &impl DataCompletion) -> Result<Vec<u8>> {
+#[inline(always)]
+pub fn read_varint(buf: &[u8]) -> Result<Option<(usize, usize)>> {
+    let mut v: u64 = 0;
+    for i in 0..9 {
+        match buf.get(i) {
+            Some(c) => {
+                v |= ((c & 0x7f) as u64) << (i * 7);
+                if (c & 0x80) == 0 {
+                    return Ok(Some((v as usize, i + 1)));
+                }
+            }
+            None => return Ok(None),
+        }
+    }
+    Err(Error::DatabaseSyncEngineError(format!(
+        "invalid variant byte: {:?}",
+        &buf[0..=8]
+    )))
+}
+
+pub async fn wait_proto_message<Ctx, T: prost::Message + Default>(
+    coro: &Coro<Ctx>,
+    completion: &impl DataCompletion,
+    bytes: &mut BytesMut,
+) -> Result<Option<T>> {
+    let start_time = std::time::Instant::now();
+    loop {
+        let length = read_varint(bytes)?;
+        let not_enough_bytes = match length {
+            None => true,
+            Some((message_length, prefix_length)) => message_length + prefix_length > bytes.len(),
+        };
+        if not_enough_bytes {
+            if let Some(poll) = completion.poll_data()? {
+                bytes.extend_from_slice(poll.data());
+            } else if !completion.is_done()? {
+                coro.yield_(ProtocolCommand::IO).await?;
+            } else if bytes.is_empty() {
+                return Ok(None);
+            } else {
+                return Err(Error::DatabaseSyncEngineError(
+                    "unexpected end of protobuf message".to_string(),
+                ));
+            }
+            continue;
+        }
+        let (message_length, prefix_length) = length.unwrap();
+        let message = T::decode_length_delimited(&**bytes).map_err(|e| {
+            Error::DatabaseSyncEngineError(format!("unable to deserialize protobuf message: {e}"))
+        })?;
+        let _ = bytes.split_to(message_length + prefix_length);
+        tracing::debug!(
+            "wait_proto_message: elapsed={:?}",
+            std::time::Instant::now().duration_since(start_time)
+        );
+        return Ok(Some(message));
+    }
+}
+
+pub async fn wait_full_body<Ctx>(
+    coro: &Coro<Ctx>,
+    completion: &impl DataCompletion,
+) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
     loop {
         while let Some(poll) = completion.poll_data()? {
@@ -965,183 +1299,90 @@ pub async fn wait_full_body(coro: &Coro, completion: &impl DataCompletion) -> Re
 }
 
 #[cfg(test)]
-pub mod tests {
-    use std::sync::Arc;
+mod tests {
+    use std::cell::RefCell;
 
-    use tempfile::NamedTempFile;
-    use turso_core::Value;
+    use bytes::{Bytes, BytesMut};
+    use prost::Message;
 
     use crate::{
-        database_sync_operations::{transfer_logical_changes, transfer_physical_changes},
-        database_tape::{run_stmt_once, DatabaseTape, DatabaseTapeOpts},
-        wal_session::WalSession,
+        database_sync_operations::wait_proto_message,
+        protocol_io::{DataCompletion, DataPollResult},
+        server_proto::PageData,
+        types::Coro,
         Result,
     };
 
-    #[test]
-    pub fn test_transfer_logical_changes() {
-        let temp_file1 = NamedTempFile::new().unwrap();
-        let db_path1 = temp_file1.path().to_str().unwrap();
-        let temp_file2 = NamedTempFile::new().unwrap();
-        let db_path2 = temp_file2.path().to_str().unwrap();
+    struct TestPollResult(Vec<u8>);
 
-        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
-        let db1 = turso_core::Database::open_file(io.clone(), db_path1, false, true).unwrap();
-        let db1 = Arc::new(DatabaseTape::new(db1));
+    impl DataPollResult for TestPollResult {
+        fn data(&self) -> &[u8] {
+            &self.0
+        }
+    }
 
-        let db2 = turso_core::Database::open_file(io.clone(), db_path2, false, true).unwrap();
-        let db2 = Arc::new(DatabaseTape::new(db2));
+    struct TestCompletion {
+        data: RefCell<Bytes>,
+        chunk: usize,
+    }
 
-        let mut gen = genawaiter::sync::Gen::new(|coro| async move {
-            let conn1 = db1.connect(&coro).await?;
-            conn1.execute("CREATE TABLE t(x, y)").unwrap();
-            conn1
-                .execute("INSERT INTO t VALUES (1, 2), (3, 4), (5, 6)")
-                .unwrap();
+    impl DataCompletion for TestCompletion {
+        type DataPollResult = TestPollResult;
 
-            let conn2 = db2.connect(&coro).await.unwrap();
+        fn status(&self) -> crate::Result<Option<u16>> {
+            Ok(Some(200))
+        }
 
-            transfer_logical_changes(&coro, &db1, &db2, "id-1", false)
-                .await
-                .unwrap();
-
-            let mut rows = Vec::new();
-            let mut stmt = conn2.prepare("SELECT x, y FROM t").unwrap();
-            while let Some(row) = run_stmt_once(&coro, &mut stmt).await.unwrap() {
-                rows.push(row.get_values().cloned().collect::<Vec<_>>());
+        fn poll_data(&self) -> crate::Result<Option<Self::DataPollResult>> {
+            let mut data = self.data.borrow_mut();
+            let len = data.len();
+            let chunk = data.split_to(len.min(self.chunk));
+            if chunk.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(TestPollResult(chunk.to_vec())))
             }
-            assert_eq!(
-                rows,
-                vec![
-                    vec![Value::Integer(1), Value::Integer(2)],
-                    vec![Value::Integer(3), Value::Integer(4)],
-                    vec![Value::Integer(5), Value::Integer(6)],
-                ]
-            );
+        }
 
-            conn1.execute("INSERT INTO t VALUES (7, 8)").unwrap();
-            transfer_logical_changes(&coro, &db1, &db2, "id-1", false)
-                .await
-                .unwrap();
-
-            let mut rows = Vec::new();
-            let mut stmt = conn2.prepare("SELECT x, y FROM t").unwrap();
-            while let Some(row) = run_stmt_once(&coro, &mut stmt).await.unwrap() {
-                rows.push(row.get_values().cloned().collect::<Vec<_>>());
-            }
-            assert_eq!(
-                rows,
-                vec![
-                    vec![Value::Integer(1), Value::Integer(2)],
-                    vec![Value::Integer(3), Value::Integer(4)],
-                    vec![Value::Integer(5), Value::Integer(6)],
-                    vec![Value::Integer(7), Value::Integer(8)],
-                ]
-            );
-
-            Result::Ok(())
-        });
-        loop {
-            match gen.resume_with(Ok(())) {
-                genawaiter::GeneratorState::Yielded(..) => io.run_once().unwrap(),
-                genawaiter::GeneratorState::Complete(result) => {
-                    result.unwrap();
-                    break;
-                }
-            }
+        fn is_done(&self) -> crate::Result<bool> {
+            Ok(self.data.borrow().is_empty())
         }
     }
 
     #[test]
-    pub fn test_transfer_physical_changes() {
-        let temp_file1 = NamedTempFile::new().unwrap();
-        let db_path1 = temp_file1.path().to_str().unwrap();
-        let temp_file2 = NamedTempFile::new().unwrap();
-        let db_path2 = temp_file2.path().to_str().unwrap();
-
-        let opts = DatabaseTapeOpts {
-            cdc_mode: Some("off".to_string()),
-            cdc_table: None,
+    pub fn wait_proto_message_test() {
+        let mut data = Vec::new();
+        for i in 0..1024 {
+            let page = PageData {
+                page_id: i as u64,
+                encoded_page: vec![0u8; 16 * 1024].into(),
+            };
+            data.extend_from_slice(&page.encode_length_delimited_to_vec());
+        }
+        let completion = TestCompletion {
+            data: RefCell::new(data.into()),
+            chunk: 128,
         };
-        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
-        let db1 = turso_core::Database::open_file(io.clone(), db_path1, false, true).unwrap();
-        let db1 = Arc::new(DatabaseTape::new_with_opts(db1, opts.clone()));
-
-        let db2 = turso_core::Database::open_file(io.clone(), db_path2, false, true).unwrap();
-        let db2 = Arc::new(DatabaseTape::new_with_opts(db2, opts.clone()));
-
-        let mut gen = genawaiter::sync::Gen::new(|coro| async move {
-            let conn1 = db1.connect(&coro).await?;
-            conn1.execute("CREATE TABLE t(x, y)")?;
-            conn1.execute("INSERT INTO t VALUES (1, 2)")?;
-            let conn1_match_watermark = conn1.wal_state().unwrap().max_frame;
-            conn1.execute("INSERT INTO t VALUES (3, 4)")?;
-            let conn1_sync_watermark = conn1.wal_state().unwrap().max_frame;
-            conn1.execute("INSERT INTO t VALUES (5, 6)")?;
-
-            let conn2 = db2.connect(&coro).await?;
-            conn2.execute("CREATE TABLE t(x, y)")?;
-            conn2.execute("INSERT INTO t VALUES (1, 2)")?;
-            let conn2_match_watermark = conn2.wal_state().unwrap().max_frame;
-            conn2.execute("INSERT INTO t VALUES (5, 6)")?;
-
-            // db1 WAL frames: [A1 A2] [A3] [A4] (sync_watermark) [A5]
-            // db2 WAL frames: [B1 B2] [B3] [B4]
-
-            let session = WalSession::new(conn2);
-            let conn2_sync_watermark = transfer_physical_changes(
-                &coro,
-                &db1,
-                session,
-                conn1_match_watermark,
-                conn1_sync_watermark,
-                conn2_match_watermark,
-            )
-            .await?;
-
-            // db2 WAL frames: [B1 B2] [B3] [B4] [B4^-1] [A4] (sync_watermark) [A5]
-            assert_eq!(conn2_sync_watermark, 6);
-
-            let conn2 = db2.connect(&coro).await.unwrap();
-            let mut rows = Vec::new();
-            let mut stmt = conn2.prepare("SELECT x, y FROM t").unwrap();
-            while let Some(row) = run_stmt_once(&coro, &mut stmt).await.unwrap() {
-                rows.push(row.get_values().cloned().collect::<Vec<_>>());
+        let mut gen = genawaiter::sync::Gen::new({
+            |coro| async move {
+                let coro: Coro<()> = coro.into();
+                let mut bytes = BytesMut::new();
+                let mut count = 0;
+                while wait_proto_message::<(), PageData>(&coro, &completion, &mut bytes)
+                    .await?
+                    .is_some()
+                {
+                    assert!(bytes.capacity() <= 16 * 1024 + 1024);
+                    count += 1;
+                }
+                assert_eq!(count, 1024);
+                Result::Ok(())
             }
-            assert_eq!(
-                rows,
-                vec![
-                    vec![Value::Integer(1), Value::Integer(2)],
-                    vec![Value::Integer(3), Value::Integer(4)],
-                    vec![Value::Integer(5), Value::Integer(6)],
-                ]
-            );
-
-            conn2.execute("INSERT INTO t VALUES (7, 8)")?;
-            let mut rows = Vec::new();
-            let mut stmt = conn2.prepare("SELECT x, y FROM t").unwrap();
-            while let Some(row) = run_stmt_once(&coro, &mut stmt).await.unwrap() {
-                rows.push(row.get_values().cloned().collect::<Vec<_>>());
-            }
-            assert_eq!(
-                rows,
-                vec![
-                    vec![Value::Integer(1), Value::Integer(2)],
-                    vec![Value::Integer(3), Value::Integer(4)],
-                    vec![Value::Integer(5), Value::Integer(6)],
-                    vec![Value::Integer(7), Value::Integer(8)],
-                ]
-            );
-
-            Result::Ok(())
         });
         loop {
             match gen.resume_with(Ok(())) {
-                genawaiter::GeneratorState::Yielded(..) => io.run_once().unwrap(),
-                genawaiter::GeneratorState::Complete(result) => {
-                    result.unwrap();
-                    break;
-                }
+                genawaiter::GeneratorState::Yielded(..) => {}
+                genawaiter::GeneratorState::Complete(result) => break result.unwrap(),
             }
         }
     }

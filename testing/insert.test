@@ -24,7 +24,14 @@ do_execsql_test_on_specific_db {:memory:} strict-basic-creation {
     SELECT * FROM test1;
 } {1|item1|10.5}
 
-do_execsql_test_in_memory_any_error  strict-require-datatype {
+# Reproducer for https://github.com/tursodatabase/turso/issues/2822
+do_execsql_test_on_specific_db {:memory:} strict-type-case-insensitivity {
+    CREATE TABLE test1 (id integer, name text, price real) STRICT;
+    INSERT INTO test1 VALUES(1, 'item1', 10.5);
+    SELECT * FROM test1;
+} {1|item1|10.5}
+
+do_execsql_test_in_memory_any_error strict-require-datatype {
     CREATE TABLE test2 (id INTEGER, name) STRICT;
 }
 

@@ -219,15 +219,22 @@ impl File for UnixFile {
     #[instrument(err, skip_all, level = Level::TRACE)]
     fn pwrite(&self, pos: usize, buffer: Arc<crate::Buffer>, c: Completion) -> Result<Completion> {
         let file = self.file.lock();
-        let result = { rustix::io::pwrite(file.as_fd(), buffer.as_slice(), pos as u64) };
-        match result {
-            Ok(n) => {
-                trace!("pwrite n: {}", n);
-                // Read succeeded immediately
-                c.complete(n as i32);
-                Ok(c)
-            }
-            Err(e) => Err(e.into()),
+        let result = unsafe {
+            libc::pwrite(
+                file.as_raw_fd(),
+                buffer.as_slice().as_ptr() as *const libc::c_void,
+                buffer.as_slice().len(),
+                pos as libc::off_t,
+            )
+        };
+        if result == -1 {
+            let e = std::io::Error::last_os_error();
+            Err(e.into())
+        } else {
+            trace!("pwrite n: {}", result);
+            // Write succeeded immediately
+            c.complete(result as i32);
+            Ok(c)
         }
     }
 

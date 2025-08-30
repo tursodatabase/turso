@@ -1,4 +1,0 @@
-# Ignore generated libraries directory
-/libs/*
-# But keep the directory structure
-!/libs/.gitkeep
