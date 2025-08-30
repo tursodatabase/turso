@@ -442,6 +442,19 @@ impl Database {
             .unwrap_or_default()
             .get();
 
+        let file_existed_on_disk = self.db_file.size().unwrap_or(0) > 0;
+        if file_existed_on_disk {
+            let reserved_bytes = pager.reserved_space();
+            tracing::trace!(
+                "file existed on disk, reserved bytes for checksums: {}",
+                reserved_bytes
+            );
+            if reserved_bytes == 0 {
+                tracing::trace!("old db found, resetting checksum context");
+                pager.reset_checksum_context();
+            }
+        }
+
         let conn = Arc::new(Connection {
             _db: self.clone(),
             pager: RefCell::new(Rc::new(pager)),
