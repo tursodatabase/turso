@@ -2,7 +2,79 @@ use crate::common::{do_flush, TempDatabase};
 use crate::query_processing::test_write_path::{run_query, run_query_on_row};
 use rand::{rng, RngCore};
 use std::panic;
-use turso_core::Row;
+use turso_core::{Connection, Row};
+
+#[test]
+fn test_encryption_from_uri() -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+
+    let db_name = format!("test-uri-{}.db", rng().next_u32());
+    let tmp_db = TempDatabase::new(&db_name, false);
+    let db_path = tmp_db.path.clone();
+
+    let key = "b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327";
+    let cipher = "aegis256";
+    let uri = format!(
+        "file:{}?cipher={}&hexkey={}",
+        db_path.to_str().unwrap(),
+        cipher,
+        key
+    );
+
+    {
+        let (_io, conn) = Connection::from_uri(&uri, true, false, false)?;
+
+        run_query(
+            &tmp_db,
+            &conn,
+            "CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT);",
+        )?;
+        run_query(
+            &tmp_db,
+            &conn,
+            "INSERT INTO test (value) VALUES ('Hello, from URI!')",
+        )?;
+
+        let mut row_count = 0;
+        run_query_on_row(&tmp_db, &conn, "SELECT * FROM test", |row: &Row| {
+            assert_eq!(row.get::<i64>(0).unwrap(), 1);
+            assert_eq!(row.get::<String>(1).unwrap(), "Hello, from URI!");
+            row_count += 1;
+        })?;
+        assert_eq!(row_count, 1);
+
+        do_flush(&conn, &tmp_db)?;
+    }
+
+    //Panic and fail
+    {
+        let conn_no_key = tmp_db.connect_limbo();
+
+        let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+            run_query_on_row(&tmp_db, &conn_no_key, "SELECT * FROM test", |_: &Row| {}).unwrap();
+        }));
+
+        assert!(
+            result.is_err(),
+            "Expected panic when accessing encrypted DB without key"
+        );
+    }
+
+    //reopen encrypted db with correct key and should not panic.
+    {
+        let (_io, conn) = Connection::from_uri(&uri, true, false, false)?;
+        let mut row_count = 0;
+
+        run_query_on_row(&tmp_db, &conn, "SELECT * FROM test", |row: &Row| {
+            assert_eq!(row.get::<i64>(0).unwrap(), 1);
+            assert_eq!(row.get::<String>(1).unwrap(), "Hello, from URI!");
+            row_count += 1;
+        })?;
+        assert_eq!(row_count, 1);
+    }
+
+    Ok(())
+}
 
 #[test]
 fn test_per_page_encryption() -> anyhow::Result<()> {

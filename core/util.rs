@@ -740,6 +740,8 @@ pub struct OpenOptions<'a> {
     pub cache: CacheMode,
     /// immutable=1|0 specifies that the database is stored on read-only media
     pub immutable: bool,
+    pub cipher: Option<String>,
+    pub hexkey: Option<String>,
 }
 
 pub const MEMORY_PATH: &str = ":memory:";
@@ -890,6 +892,8 @@ fn parse_query_params(query: &str, opts: &mut OpenOptions) -> Result<()> {
                 "cache" => opts.cache = decoded_value.as_str().into(),
                 "immutable" => opts.immutable = decoded_value == "1",
                 "vfs" => opts.vfs = Some(decoded_value),
+                "cipher" => opts.cipher = Some(decoded_value),
+                "hexkey" => opts.hexkey = Some(decoded_value),
                 _ => {}
             }
         }

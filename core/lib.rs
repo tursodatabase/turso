@@ -50,7 +50,7 @@ use crate::types::{WalFrameInfo, WalState};
 use crate::util::{OpenMode, OpenOptions};
 use crate::vdbe::metrics::ConnectionMetrics;
 use crate::vtab::VirtualTable;
-use core::str;
+use core::str::{self, FromStr};
 pub use error::{CompletionError, LimboError};
 pub use io::clock::{Clock, Instant};
 #[cfg(all(feature = "fs", target_family = "unix"))]
@@ -201,6 +201,21 @@ impl fmt::Debug for Database {
                 .load(std::sync::atomic::Ordering::Relaxed),
         );
         debug_struct.finish()
+    }
+}
+
+impl FromStr for CipherMode {
+    type Err = LimboError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            s if s.eq_ignore_ascii_case("aegis256") => Ok(CipherMode::Aegis256),
+            s if s.eq_ignore_ascii_case("aes256gcm") => Ok(CipherMode::Aes256Gcm),
+            _ => Err(LimboError::InvalidArgument(format!(
+                "Unsupported cipher: '{}'",
+                s
+            ))),
+        }
     }
 }
 
@@ -1249,34 +1264,50 @@ impl Connection {
         views: bool,
     ) -> Result<(Arc<dyn IO>, Arc<Connection>)> {
         use crate::util::MEMORY_PATH;
+
         let opts = OpenOptions::parse(uri)?;
         let flags = opts.get_flags()?;
-        if opts.path == MEMORY_PATH || matches!(opts.mode, OpenMode::Memory) {
-            let io = Arc::new(MemoryIO::new());
-            let db = Database::open_file_with_flags(
-                io.clone(),
-                MEMORY_PATH,
-                flags,
-                mvcc,
-                use_indexes,
-                views,
-            )?;
-            let conn = db.connect()?;
-            return Ok((io, conn));
+
+        let (io, conn): (Arc<dyn IO>, Arc<Connection>) =
+            if opts.path == MEMORY_PATH || matches!(opts.mode, OpenMode::Memory) {
+                let io = Arc::new(MemoryIO::new());
+                let db = Database::open_file_with_flags(
+                    io.clone(),
+                    MEMORY_PATH,
+                    flags,
+                    mvcc,
+                    use_indexes,
+                    views,
+                )?;
+                let conn = db.connect()?;
+                (io, conn)
+            } else {
+                let (io, db) = Database::open_new(
+                    &opts.path,
+                    opts.vfs.as_ref(),
+                    flags,
+                    use_indexes,
+                    mvcc,
+                    views,
+                )?;
+                if let Some(modeof) = opts.modeof {
+                    let perms = std::fs::metadata(modeof)?;
+                    std::fs::set_permissions(&opts.path, perms.permissions())?;
+                }
+                let conn = db.connect()?;
+                (io, conn)
+            };
+
+        if let Some(cipher_str) = opts.cipher {
+            let cipher = CipherMode::from_str(&cipher_str)?;
+            conn.set_encryption_cipher(cipher);
         }
-        let (io, db) = Database::open_new(
-            &opts.path,
-            opts.vfs.as_ref(),
-            flags,
-            use_indexes,
-            mvcc,
-            views,
-        )?;
-        if let Some(modeof) = opts.modeof {
-            let perms = std::fs::metadata(modeof)?;
-            std::fs::set_permissions(&opts.path, perms.permissions())?;
+
+        if let Some(hexkey) = opts.hexkey {
+            let encryption_key = EncryptionKey::from_hex_string(&hexkey)?;
+            conn.set_encryption_key(encryption_key);
         }
-        let conn = db.connect()?;
+
         Ok((io, conn))
     }
 
