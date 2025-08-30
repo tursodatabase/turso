@@ -278,8 +278,24 @@ impl CipherMode {
 
 #[derive(Clone)]
 pub enum Cipher {
-    Aes256Gcm(Box<Aes256Gcm>),
-    Aegis256(Box<Aegis256Cipher>),
+    Aes256Gcm(Box<Aes256GcmCipher<AES256GCM_TAG_SIZE>>),
+    Aegis256(Box<Aegis256Cipher<AEGIS_TAG_SIZE>>),
+}
+
+impl Cipher {
+    pub fn encrypt(&self, plaintext: &[u8], ad: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
+        match self {
+            Cipher::Aes256Gcm(cipher) => cipher.encrypt(plaintext, ad),
+            Cipher::Aegis256(cipher) => cipher.encrypt(plaintext, ad),
+        }
+    }
+
+    pub fn decrypt(&self, ciphertext: &[u8], nonce: &[u8], ad: &[u8]) -> Result<Vec<u8>> {
+        match self {
+            Cipher::Aes256Gcm(cipher) => cipher.decrypt(ciphertext, nonce, ad),
+            Cipher::Aegis256(cipher) => cipher.decrypt(ciphertext, nonce, ad),
+        }
+    }
 }
 
 impl std::fmt::Debug for Cipher {
