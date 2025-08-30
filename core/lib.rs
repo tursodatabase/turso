@@ -78,7 +78,7 @@ use std::{
 use storage::database::DatabaseFile;
 pub use storage::database::IOContext;
 pub use storage::encryption::{EncryptionContext, EncryptionKey};
-use storage::page_cache::DumbLruPageCache;
+use storage::page_cache::PageCache;
 use storage::pager::{AtomicDbState, DbState};
 use storage::sqlite3_ondisk::PageSize;
 pub use storage::{
@@ -138,7 +138,7 @@ pub struct Database {
     buffer_pool: Arc<BufferPool>,
     // Shared structures of a Database are the parts that are common to multiple threads that might
     // create DB connections.
-    _shared_page_cache: Arc<RwLock<DumbLruPageCache>>,
+    _shared_page_cache: Arc<RwLock<PageCache>>,
     maybe_shared_wal: RwLock<Option<Arc<UnsafeCell<WalFileShared>>>>,
     db_state: Arc<AtomicDbState>,
     init_lock: Arc<Mutex<()>>,
@@ -365,7 +365,7 @@ impl Database {
             DbState::Initialized
         };
 
-        let shared_page_cache = Arc::new(RwLock::new(DumbLruPageCache::default()));
+        let shared_page_cache = Arc::new(RwLock::new(PageCache::default()));
         let syms = SymbolTable::new();
         let arena_size = if std::env::var("TESTING").is_ok_and(|v| v.eq_ignore_ascii_case("true")) {
             BufferPool::TEST_ARENA_SIZE
@@ -563,7 +563,7 @@ impl Database {
                 self.db_file.clone(),
                 Some(wal),
                 self.io.clone(),
-                Arc::new(RwLock::new(DumbLruPageCache::default())),
+                Arc::new(RwLock::new(PageCache::default())),
                 buffer_pool.clone(),
                 db_state,
                 self.init_lock.clone(),
@@ -585,7 +585,7 @@ impl Database {
             self.db_file.clone(),
             None,
             self.io.clone(),
-            Arc::new(RwLock::new(DumbLruPageCache::default())),
+            Arc::new(RwLock::new(PageCache::default())),
             buffer_pool.clone(),
             db_state,
             Arc::new(Mutex::new(())),

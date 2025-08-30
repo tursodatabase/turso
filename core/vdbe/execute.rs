@@ -6,7 +6,7 @@ use crate::storage::btree::{
     integrity_check, IntegrityCheckError, IntegrityCheckState, PageCategory,
 };
 use crate::storage::database::DatabaseFile;
-use crate::storage::page_cache::DumbLruPageCache;
+use crate::storage::page_cache::PageCache;
 use crate::storage::pager::{AtomicDbState, CreateBTreeFlags, DbState};
 use crate::storage::sqlite3_ondisk::read_varint;
 use crate::translate::collate::CollationSeq;
@@ -6809,7 +6809,7 @@ pub fn op_open_ephemeral(
                 .get();
 
             let buffer_pool = program.connection._db.buffer_pool.clone();
-            let page_cache = Arc::new(RwLock::new(DumbLruPageCache::default()));
+            let page_cache = Arc::new(RwLock::new(PageCache::default()));
 
             let pager = Rc::new(Pager::new(
                 db_file,
