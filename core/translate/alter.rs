@@ -1,5 +1,8 @@
 use std::sync::Arc;
-use turso_parser::{ast, parser::Parser};
+use turso_parser::{
+    ast::{self, fmt::ToTokens as _},
+    parser::Parser,
+};
 
 use crate::{
     function::{AlterTableFunc, Func},
@@ -166,7 +169,7 @@ pub fn translate_alter_table(
             )?
         }
         ast::AlterTableBody::AddColumn(col_def) => {
-            let column = Column::from(col_def);
+            let column = Column::from(&col_def);
 
             if let Some(default) = &column.default {
                 if !matches!(
@@ -232,97 +235,6 @@ pub fn translate_alter_table(
                     });
                 },
             )?
-        }
-        ast::AlterTableBody::RenameColumn { old, new } => {
-            let rename_from = old.as_str();
-            let rename_to = new.as_str();
-
-            let Some((column_index, _)) = btree.get_column(rename_from) else {
-                return Err(LimboError::ParseError(format!(
-                    "no such column: \"{rename_from}\""
-                )));
-            };
-
-            if btree.get_column(rename_to).is_some() {
-                return Err(LimboError::ParseError(format!(
-                    "duplicate column name: \"{rename_from}\""
-                )));
-            };
-
-            let sqlite_schema = schema
-                .get_btree_table(SQLITE_TABLEID)
-                .expect("sqlite_schema should be on schema");
-
-            let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(sqlite_schema.clone()));
-
-            program.emit_insn(Insn::OpenWrite {
-                cursor_id,
-                root_page: RegisterOrLiteral::Literal(sqlite_schema.root_page),
-                db: 0,
-            });
-
-            program.cursor_loop(cursor_id, |program, rowid| {
-                let sqlite_schema_column_len = sqlite_schema.columns.len();
-                assert_eq!(sqlite_schema_column_len, 5);
-
-                let first_column = program.alloc_registers(sqlite_schema_column_len);
-
-                for i in 0..sqlite_schema_column_len {
-                    program.emit_column_or_rowid(cursor_id, i, first_column + i);
-                }
-
-                program.emit_string8_new_reg(table_name.to_string());
-                program.mark_last_insn_constant();
-
-                program.emit_string8_new_reg(rename_from.to_string());
-                program.mark_last_insn_constant();
-
-                program.emit_string8_new_reg(rename_to.to_string());
-                program.mark_last_insn_constant();
-
-                let out = program.alloc_registers(sqlite_schema_column_len);
-
-                program.emit_insn(Insn::Function {
-                    constant_mask: 0,
-                    start_reg: first_column,
-                    dest: out,
-                    func: crate::function::FuncCtx {
-                        func: Func::AlterTable(AlterTableFunc::RenameColumn),
-                        arg_count: 8,
-                    },
-                });
-
-                let record = program.alloc_register();
-
-                program.emit_insn(Insn::MakeRecord {
-                    start_reg: out,
-                    count: sqlite_schema_column_len,
-                    dest_reg: record,
-                    index_name: None,
-                });
-
-                program.emit_insn(Insn::Insert {
-                    cursor: cursor_id,
-                    key_reg: rowid,
-                    record_reg: record,
-                    flag: crate::vdbe::insn::InsertFlags(0),
-                    table_name: table_name.to_string(),
-                });
-            });
-
-            program.emit_insn(Insn::SetCookie {
-                db: 0,
-                cookie: Cookie::SchemaVersion,
-                value: schema.schema_version as i32 + 1,
-                p5: 0,
-            });
-            program.emit_insn(Insn::RenameColumn {
-                table: table_name.to_owned(),
-                column_index,
-                name: rename_to.to_owned(),
-            });
-
-            program
         }
         ast::AlterTableBody::RenameTo(new_name) => {
             let new_name = new_name.as_str();
@@ -407,6 +319,148 @@ pub fn translate_alter_table(
             program.emit_insn(Insn::RenameTable {
                 from: table_name.to_owned(),
                 to: new_name.to_owned(),
+            });
+
+            program
+        }
+        body @ (ast::AlterTableBody::AlterColumn { .. }
+        | ast::AlterTableBody::RenameColumn { .. }) => {
+            let from;
+            let definition;
+            let col_name;
+            let rename;
+
+            match body {
+                ast::AlterTableBody::AlterColumn { old, new } => {
+                    from = old;
+                    definition = new;
+                    col_name = definition.col_name.clone();
+                    rename = false;
+                }
+                ast::AlterTableBody::RenameColumn { old, new } => {
+                    from = old;
+                    definition = ast::ColumnDefinition {
+                        col_name: new.clone(),
+                        col_type: None,
+                        constraints: vec![],
+                    };
+                    col_name = new;
+                    rename = true;
+                }
+                _ => unreachable!(),
+            }
+
+            let from = from.as_str();
+            let col_name = col_name.as_str();
+
+            let Some((column_index, _)) = btree.get_column(from) else {
+                return Err(LimboError::ParseError(format!(
+                    "no such column: \"{from}\""
+                )));
+            };
+
+            if btree.get_column(col_name).is_some() {
+                return Err(LimboError::ParseError(format!(
+                    "duplicate column name: \"{col_name}\""
+                )));
+            };
+
+            if definition
+                .constraints
+                .iter()
+                .any(|c| matches!(c.constraint, ast::ColumnConstraint::PrimaryKey { .. }))
+            {
+                return Err(LimboError::ParseError(
+                    "PRIMARY KEY constraint cannot be altered".to_string(),
+                ));
+            }
+
+            if definition
+                .constraints
+                .iter()
+                .any(|c| matches!(c.constraint, ast::ColumnConstraint::Unique { .. }))
+            {
+                return Err(LimboError::ParseError(
+                    "UNIQUE constraint cannot be altered".to_string(),
+                ));
+            }
+
+            let sqlite_schema = schema
+                .get_btree_table(SQLITE_TABLEID)
+                .expect("sqlite_schema should be on schema");
+
+            let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(sqlite_schema.clone()));
+
+            program.emit_insn(Insn::OpenWrite {
+                cursor_id,
+                root_page: RegisterOrLiteral::Literal(sqlite_schema.root_page),
+                db: 0,
+            });
+
+            program.cursor_loop(cursor_id, |program, rowid| {
+                let sqlite_schema_column_len = sqlite_schema.columns.len();
+                assert_eq!(sqlite_schema_column_len, 5);
+
+                let first_column = program.alloc_registers(sqlite_schema_column_len);
+
+                for i in 0..sqlite_schema_column_len {
+                    program.emit_column_or_rowid(cursor_id, i, first_column + i);
+                }
+
+                program.emit_string8_new_reg(table_name.to_string());
+                program.mark_last_insn_constant();
+
+                program.emit_string8_new_reg(from.to_string());
+                program.mark_last_insn_constant();
+
+                program.emit_string8_new_reg(definition.format().unwrap());
+                program.mark_last_insn_constant();
+
+                let out = program.alloc_registers(sqlite_schema_column_len);
+
+                program.emit_insn(Insn::Function {
+                    constant_mask: 0,
+                    start_reg: first_column,
+                    dest: out,
+                    func: crate::function::FuncCtx {
+                        func: Func::AlterTable(if rename {
+                            AlterTableFunc::RenameColumn
+                        } else {
+                            AlterTableFunc::AlterColumn
+                        }),
+                        arg_count: 8,
+                    },
+                });
+
+                let record = program.alloc_register();
+
+                program.emit_insn(Insn::MakeRecord {
+                    start_reg: out,
+                    count: sqlite_schema_column_len,
+                    dest_reg: record,
+                    index_name: None,
+                });
+
+                program.emit_insn(Insn::Insert {
+                    cursor: cursor_id,
+                    key_reg: rowid,
+                    record_reg: record,
+                    flag: crate::vdbe::insn::InsertFlags(0),
+                    table_name: table_name.to_string(),
+                });
+            });
+
+            program.emit_insn(Insn::SetCookie {
+                db: 0,
+                cookie: Cookie::SchemaVersion,
+                value: schema.schema_version as i32 + 1,
+                p5: 0,
+            });
+            program.emit_insn(Insn::AlterColumn {
+                table: table_name.to_owned(),
+                column_index,
+                definition,
+                rename,
             });
 
             program

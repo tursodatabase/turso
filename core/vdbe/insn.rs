@@ -1053,10 +1053,11 @@ pub enum Insn {
         table: String,
         column: Column,
     },
-    RenameColumn {
+    AlterColumn {
         table: String,
         column_index: usize,
-        name: String,
+        definition: turso_parser::ast::ColumnDefinition,
+        rename: bool,
     },
     /// Try to set the maximum page count for database P1 to the value in P3.
     /// Do not let the maximum page count fall below the current page count and
@@ -1209,7 +1210,7 @@ impl Insn {
             Insn::RenameTable { .. } => execute::op_rename_table,
             Insn::DropColumn { .. } => execute::op_drop_column,
             Insn::AddColumn { .. } => execute::op_add_column,
-            Insn::RenameColumn { .. } => execute::op_rename_column,
+            Insn::AlterColumn { .. } => execute::op_alter_column,
             Insn::MaxPgcnt { .. } => execute::op_max_pgcnt,
             Insn::JournalMode { .. } => execute::op_journal_mode,
         }

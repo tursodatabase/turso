@@ -620,78 +620,7 @@ pub fn columns_from_create_table_body(
 
     use turso_parser::ast;
 
-    Ok(columns
-        .iter()
-        .map(
-            |ast::ColumnDefinition {
-                 col_name: name,
-                 col_type,
-                 constraints,
-             }| {
-                Column {
-                    name: Some(normalize_ident(name.as_str())),
-                    ty: match col_type {
-                        Some(ref data_type) => {
-                            // https://www.sqlite.org/datatype3.html
-                            let type_name = data_type.name.as_str().to_uppercase();
-                            if type_name.contains("INT") {
-                                Type::Integer
-                            } else if type_name.contains("CHAR")
-                                || type_name.contains("CLOB")
-                                || type_name.contains("TEXT")
-                            {
-                                Type::Text
-                            } else if type_name.contains("BLOB") || type_name.is_empty() {
-                                Type::Blob
-                            } else if type_name.contains("REAL")
-                                || type_name.contains("FLOA")
-                                || type_name.contains("DOUB")
-                            {
-                                Type::Real
-                            } else {
-                                Type::Numeric
-                            }
-                        }
-                        None => Type::Null,
-                    },
-                    default: constraints.iter().find_map(|c| match &c.constraint {
-                        ast::ColumnConstraint::Default(val) => Some(val.clone()),
-                        _ => None,
-                    }),
-                    notnull: constraints
-                        .iter()
-                        .any(|c| matches!(c.constraint, ast::ColumnConstraint::NotNull { .. })),
-                    ty_str: col_type
-                        .clone()
-                        .map(|t| t.name.to_string())
-                        .unwrap_or_default(),
-                    primary_key: constraints
-                        .iter()
-                        .any(|c| matches!(c.constraint, ast::ColumnConstraint::PrimaryKey { .. })),
-                    is_rowid_alias: false,
-                    unique: constraints
-                        .iter()
-                        .any(|c| matches!(c.constraint, ast::ColumnConstraint::Unique(..))),
-                    collation: constraints.iter().find_map(|c| match &c.constraint {
-                        // TODO: see if this should be the correct behavior
-                        // currently there cannot be any user defined collation sequences.
-                        // But in the future, when a user defines a collation sequence, creates a table with it,
-                        // then closes the db and opens it again. This may panic here if the collation seq is not registered
-                        // before reading the columns
-                        ast::ColumnConstraint::Collate { collation_name } => Some(
-                            CollationSeq::new(collation_name.as_str())
-                                .expect("collation should have been set correctly in create table"),
-                        ),
-                        _ => None,
-                    }),
-                    hidden: col_type
-                        .as_ref()
-                        .map(|data_type| data_type.name.as_str().contains("HIDDEN"))
-                        .unwrap_or(false),
-                }
-            },
-        )
-        .collect::<Vec<_>>())
+    Ok(columns.iter().map(Into::into).collect())
 }
 
 /// This function checks if a given expression is a constant value that can be pushed down to the database engine.

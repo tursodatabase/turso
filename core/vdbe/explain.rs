@@ -1672,14 +1672,14 @@ pub fn insn_to_str(
                 0,
                 format!("add_column({table}, {column:?})"),
             ),
-            Insn::RenameColumn { table, column_index, name } => (
-                "RenameColumn",
+            Insn::AlterColumn { table, column_index, definition: column, rename } => (
+                "AlterColumn",
                 0,
                 0,
                 0,
                 Value::build_text(""),
                 0,
-                format!("rename_column({table}, {column_index}, {name})"),
+                format!("alter_column({table}, {column_index}, {column:?}, {rename:?})"),
             ),
             Insn::MaxPgcnt { db, dest, new_max } => (
                 "MaxPgcnt",

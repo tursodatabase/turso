@@ -1,0 +1,24 @@
+#!/usr/bin/env tclsh
+
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+
+do_execsql_test_on_specific_db {:memory:} alter-column-rename-and-type {
+    CREATE TABLE t (a INTEGER);
+    CREATE INDEX i ON t (a);
+    ALTER TABLE t ALTER COLUMN a TO b BLOB;
+    SELECT sql FROM sqlite_schema;
+} {
+    "CREATE TABLE t (b BLOB)"
+    "CREATE INDEX i ON t (b)"
+}
+
+do_execsql_test_in_memory_any_error fail-alter-column-primary-key {
+    CREATE TABLE t (a);
+    ALTER TABLE t ALTER COLUMN a TO a PRIMARY KEY;
+}
+
+do_execsql_test_in_memory_any_error fail-alter-column-unique {
+    CREATE TABLE t (a);
+    ALTER TABLE t ALTER COLUMN a TO a UNIQUE;
+}

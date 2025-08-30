@@ -1409,6 +1409,13 @@ impl ToTokens for AlterTableBody {
                 s.append(TK_COLUMNKW, None)?;
                 def.to_tokens_with_context(s, context)
             }
+            Self::AlterColumn { old, new } => {
+                s.append(TK_ALTER, None)?;
+                s.append(TK_COLUMNKW, None)?;
+                old.to_tokens_with_context(s, context)?;
+                s.append(TK_TO, None)?;
+                new.to_tokens_with_context(s, context)
+            }
             Self::RenameColumn { old, new } => {
                 s.append(TK_RENAME, None)?;
                 s.append(TK_COLUMNKW, None)?;

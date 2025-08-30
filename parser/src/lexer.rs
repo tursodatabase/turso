@@ -17,7 +17,7 @@ pub fn is_identifier_continue(b: u8) -> bool {
         || b > b'\x7F'
 }
 
-#[derive(Clone, PartialEq, Eq)] // do not derive Copy for Token, just use .clone() when needed
+#[derive(Clone, PartialEq, Eq, Debug)] // do not derive Copy for Token, just use .clone() when needed
 pub struct Token<'a> {
     pub value: &'a [u8],
     pub token_type: Option<TokenType>, // None means Token is whitespaces or comments

@@ -982,6 +982,8 @@ pub enum AlterTableBody {
     RenameTo(Name),
     /// `ADD COLUMN`
     AddColumn(ColumnDefinition), // TODO distinction between ADD and ADD COLUMN
+    /// `ALTER COLUMN`
+    AlterColumn { old: Name, new: ColumnDefinition },
     /// `RENAME COLUMN`
     RenameColumn {
         /// old name
