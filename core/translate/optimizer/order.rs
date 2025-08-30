@@ -84,7 +84,10 @@ pub fn compute_order_target(
         ),
         // Only GROUP BY - we would like the joined result rows to be in the order specified by the GROUP BY
         (true, Some(group_by)) => OrderTarget::maybe_from_iterator(
-            group_by.exprs.iter().map(|expr| (expr.as_ref(), SortOrder::Asc)),
+            group_by
+                .exprs
+                .iter()
+                .map(|expr| (expr.as_ref(), SortOrder::Asc)),
             EliminatesSortBy::Group,
         ),
         // Both ORDER BY and GROUP BY:
@@ -107,7 +110,10 @@ pub fn compute_order_target(
             // If not, let's try to target an ordering that matches the group by -- we don't care about ASC/DESC
             if !group_by_contains_all {
                 return OrderTarget::maybe_from_iterator(
-                    group_by.exprs.iter().map(|expr| (expr.as_ref(), SortOrder::Asc)),
+                    group_by
+                        .exprs
+                        .iter()
+                        .map(|expr| (expr.as_ref(), SortOrder::Asc)),
                     EliminatesSortBy::Group,
                 );
             }
