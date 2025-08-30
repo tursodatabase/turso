@@ -12,11 +12,13 @@ impl ChecksumContext {
     }
 
     pub fn add_checksum_to_page(&self, page: &mut [u8], page_id: usize) -> Result<()> {
-        assert_eq!(
-            page.len(),
-            CHECKSUM_PAGE_SIZE,
-            "page size must be 4096 bytes"
-        );
+        if page.len() != CHECKSUM_PAGE_SIZE {
+            tracing::trace!(
+                "page size is {}, skipping checksum for page_id={page_id}",
+                page.len()
+            );
+            return Ok(());
+        }
 
         if page_id == 1 {
             // lets skip checksum verification for the first page (header page)
@@ -47,11 +49,13 @@ impl ChecksumContext {
         page: &mut [u8],
         page_id: usize,
     ) -> std::result::Result<(), CompletionError> {
-        assert_eq!(
-            page.len(),
-            CHECKSUM_PAGE_SIZE,
-            "page size must be 4096 bytes"
-        );
+        if page.len() != CHECKSUM_PAGE_SIZE {
+            tracing::trace!(
+                "page size is {}, skipping checksum for page_id={page_id}",
+                page.len()
+            );
+            return Ok(());
+        }
 
         if page_id == 1 {
             // lets skip checksum verification for the first page (header page)
