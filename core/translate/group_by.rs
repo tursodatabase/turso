@@ -139,7 +139,7 @@ pub fn init_group_by<'a>(
         let collations = group_by
             .exprs
             .iter()
-            .map(|expr| match expr {
+            .map(|expr| match expr.as_ref() {
                 ast::Expr::Collate(_, collation_name) => {
                     CollationSeq::new(collation_name.as_str()).map(Some)
                 }
@@ -243,9 +243,9 @@ fn collect_non_aggregate_expressions<'a>(
     let mut result_columns = Vec::new();
     for expr in root_result_columns
         .iter()
-        .map(|col| &col.expr)
+        .map(|col| col.expr.as_ref())
         .chain(order_by.iter().map(|(e, _)| e.as_ref()))
-        .chain(group_by.having.iter().flatten())
+        .chain(group_by.having.iter().flatten().map(|e| e.as_ref()))
     {
         collect_result_columns(expr, plan, &mut result_columns)?;
     }
@@ -285,7 +285,11 @@ fn collect_result_columns<'a>(
                 }
             }
             _ => {
-                if plan.aggregates.iter().any(|a| a.original_expr == *expr) {
+                if plan
+                    .aggregates
+                    .iter()
+                    .any(|a| *a.original_expr.as_ref() == *expr)
+                {
                     return Ok(WalkControl::SkipChildren);
                 }
             }
@@ -458,7 +462,7 @@ impl<'a> GroupByAggArgumentSource<'a> {
             GroupByAggArgumentSource::Register { aggregate, .. } => &aggregate.func,
         }
     }
-    pub fn args(&self) -> &[ast::Expr] {
+    pub fn args(&self) -> &[Box<ast::Expr>] {
         match self {
             GroupByAggArgumentSource::PseudoCursor { aggregate, .. } => &aggregate.args,
             GroupByAggArgumentSource::Register { aggregate, .. } => &aggregate.args,
@@ -950,20 +954,20 @@ pub fn translate_aggregation_step_groupby(
 
             let delimiter_reg = program.alloc_register();
 
-            let delimiter_expr: ast::Expr;
+            let default_delimiter_expr =
+                ast::Expr::Literal(ast::Literal::String(String::from("\",\"")));
+            let mut delimiter_expr = &default_delimiter_expr;
 
             if num_args == 2 {
-                match &agg_arg_source.args()[1] {
+                match agg_arg_source.args()[1].as_ref() {
                     arg @ ast::Expr::Column { .. } => {
-                        delimiter_expr = arg.clone();
+                        delimiter_expr = arg;
                     }
-                    ast::Expr::Literal(ast::Literal::String(s)) => {
-                        delimiter_expr = ast::Expr::Literal(ast::Literal::String(s.to_string()));
+                    arg @ ast::Expr::Literal(ast::Literal::String(_)) => {
+                        delimiter_expr = arg;
                     }
                     _ => crate::bail_parse_error!("Incorrect delimiter parameter"),
                 };
-            } else {
-                delimiter_expr = ast::Expr::Literal(ast::Literal::String(String::from("\",\"")));
             }
 
             let expr_reg = agg_arg_source.translate(program, 0)?;
@@ -971,7 +975,7 @@ pub fn translate_aggregation_step_groupby(
             translate_expr(
                 program,
                 Some(referenced_tables),
-                &delimiter_expr,
+                delimiter_expr,
                 delimiter_reg,
                 resolver,
             )?;
@@ -1053,11 +1057,9 @@ pub fn translate_aggregation_step_groupby(
 
             let delimiter_reg = program.alloc_register();
 
-            let delimiter_expr = match &agg_arg_source.args()[1] {
-                arg @ ast::Expr::Column { .. } => arg.clone(),
-                ast::Expr::Literal(ast::Literal::String(s)) => {
-                    ast::Expr::Literal(ast::Literal::String(s.to_string()))
-                }
+            let delimiter_expr = match agg_arg_source.args()[1].as_ref() {
+                arg @ ast::Expr::Column { .. } => arg,
+                arg @ ast::Expr::Literal(ast::Literal::String(_)) => arg,
                 _ => crate::bail_parse_error!("Incorrect delimiter parameter"),
             };
 
@@ -1066,7 +1068,7 @@ pub fn translate_aggregation_step_groupby(
             translate_expr(
                 program,
                 Some(referenced_tables),
-                &delimiter_expr,
+                delimiter_expr,
                 delimiter_reg,
                 resolver,
             )?;
