@@ -1112,7 +1112,6 @@ impl Wal for WalFile {
             let io_ctx = self.io_ctx.borrow();
             io_ctx.encryption_context().cloned()
         };
-        let (header, _) = sqlite3_ondisk::parse_wal_frame_header(frame);
         let complete = Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
             let Ok((buf, bytes_read)) = res else {
                 return;
@@ -1122,20 +1121,30 @@ impl Wal for WalFile {
                 bytes_read == buf_len as i32,
                 "read({bytes_read}) != expected({buf_len})"
             );
-            let buf_ptr = buf.as_mut_ptr();
+            let buf_ptr = buf.as_ptr();
+            let frame_ref: &mut [u8] =
+                unsafe { std::slice::from_raw_parts_mut(frame_ptr, frame_len) };
+
+            // Copy the just-read WAL frame into the destination buffer
+            unsafe {
+                std::ptr::copy_nonoverlapping(buf_ptr, frame_ptr, frame_len);
+            }
+
+            // Now parse the header from the freshly-copied data
+            let (header, raw_page) = sqlite3_ondisk::parse_wal_frame_header(frame_ref);
+
             if let Some(ctx) = encryption_ctx.clone() {
-                match ctx.decrypt_page(buf.as_slice(), header.page_number as usize) {
+                match ctx.decrypt_page(raw_page, header.page_number as usize) {
                     Ok(decrypted_data) => {
-                        buf.as_mut_slice().copy_from_slice(&decrypted_data);
+                        // Overwrite the page portion in the frame buffer with decrypted data
+                        let page_offset = frame_len - decrypted_data.len();
+                        frame_ref[page_offset..].copy_from_slice(&decrypted_data);
                     }
                     Err(_) => {
                         tracing::error!("Failed to decrypt page data for frame_id={frame_id}");
                         return;
                     }
                 }
-            }
-            unsafe {
-                std::ptr::copy_nonoverlapping(buf_ptr, frame_ptr, frame_len);
             }
         });
         let c =
