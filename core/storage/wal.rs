@@ -1137,7 +1137,7 @@ impl Wal for WalFile {
                 match ctx.decrypt_page(raw_page, header.page_number as usize) {
                     Ok(decrypted_data) => {
                         turso_assert!(
-                            (frame_len - WAL_FRAME_HEADER_SIZE) as usize == decrypted_data.len(),
+                            (frame_len - WAL_FRAME_HEADER_SIZE) == decrypted_data.len(),
                             "frame_len - header_size({}) != expected({})",
                             frame_len - WAL_FRAME_HEADER_SIZE,
                             decrypted_data.len()
