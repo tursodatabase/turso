@@ -100,21 +100,9 @@ impl PageCacheKey {
 }
 
 impl PageCacheEntry {
-    pub fn new(key: PageCacheKey, page: PageRef) -> Self {
-        Self {
-            key,
-            page: Some(page),
-            ref_bit: false.into(),
-        }
-    }
-
     #[inline]
     fn empty() -> Self {
         Self::default()
-    }
-    #[inline]
-    pub fn touch(&mut self) {
-        self.ref_bit.set(true);
     }
 }
 
