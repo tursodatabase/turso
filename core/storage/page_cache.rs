@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 
 use super::pager::PageRef;
 use crate::turso_assert;
@@ -234,8 +234,7 @@ impl PageCache {
             let s = &mut entries[slot_index];
             turso_assert!(s.page.is_none(), "page must be None in free slot");
             s.key = key;
-            s.page = Some(value.clone());
-            s.ref_bit.set(true);
+            s.page = Some(value);
         }
 
         // new entries go to the head, unmarked
@@ -314,6 +313,7 @@ impl PageCache {
         // remove from map/entries
         self.map.borrow_mut().remove(&key);
         self.entries.borrow_mut()[slot_idx].page = None;
+        self.entries.borrow_mut()[slot_idx].ref_bit.set(false);
 
         // push onto freelist: slot -> free_head
         {
