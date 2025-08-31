@@ -982,16 +982,20 @@ fn build_seek_def(
 
     // if we searching for exact key - emit definition immediately with prefix as a full key
     if last.eq.is_some() {
+        let (start_op, end_op) = match iter_dir {
+            IterationDirection::Forwards => (SeekOp::GE { eq_only: true }, SeekOp::GT),
+            IterationDirection::Backwards => (SeekOp::LE { eq_only: true }, SeekOp::LT),
+        };
         return Ok(SeekDef {
             prefix: key,
             iter_dir,
             start: SeekKey {
                 last_component: SeekKeyComponent::None,
-                op: SeekOp::GE { eq_only: true },
+                op: start_op,
             },
             end: SeekKey {
                 last_component: SeekKeyComponent::None,
-                op: SeekOp::GT,
+                op: end_op,
             },
         });
     }
@@ -1160,7 +1164,7 @@ fn build_seek_def(
                         // End key: end at first LT(x:10)
                         None => SeekKey {
                             last_component: SeekKeyComponent::None,
-                            op: SeekOp::GT,
+                            op: SeekOp::LT,
                         },
                         Some((op, _)) => {
                             crate::bail_parse_error!("build_seek_def: invalid operator: {:?}", op,)
