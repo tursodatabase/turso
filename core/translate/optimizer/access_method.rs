@@ -3,7 +3,9 @@ use std::sync::Arc;
 use turso_ext::{ConstraintInfo, ConstraintUsage, ResultCode};
 use turso_parser::ast::SortOrder;
 
-use crate::translate::optimizer::constraints::{convert_to_vtab_constraint, Constraint};
+use crate::translate::optimizer::constraints::{
+    convert_to_vtab_constraint, RangeConstraintRef, Constraint,
+};
 use crate::{
     schema::{Index, Table},
     translate::plan::{IterationDirection, JoinOrderMember, JoinedTable},
@@ -12,24 +14,24 @@ use crate::{
 };
 
 use super::{
-    constraints::{usable_constraints_for_join_order, ConstraintRef, TableConstraints},
+    constraints::{usable_constraints_for_join_order, TableConstraints},
     cost::{estimate_cost_for_scan_or_seek, Cost, IndexInfo},
     order::OrderTarget,
 };
 
 #[derive(Debug, Clone)]
 /// Represents a way to access a table.
-pub struct AccessMethod<'a> {
+pub struct AccessMethod {
     /// The estimated number of page fetches.
     /// We are ignoring CPU cost for now.
     pub cost: Cost,
     /// Table-type specific access method details.
-    pub params: AccessMethodParams<'a>,
+    pub params: AccessMethodParams,
 }
 
 /// Table‑specific details of how an [`AccessMethod`] operates.
 #[derive(Debug, Clone)]
-pub enum AccessMethodParams<'a> {
+pub enum AccessMethodParams {
     BTreeTable {
         /// The direction of iteration for the access method.
         /// Typically this is backwards only if it helps satisfy an [OrderTarget].
@@ -39,7 +41,7 @@ pub enum AccessMethodParams<'a> {
         /// The constraint references that are being used, if any.
         /// An empty list of constraint refs means a scan (full table or index);
         /// a non-empty list means a search.
-        constraint_refs: &'a [ConstraintRef],
+        constraint_refs: Vec<RangeConstraintRef>,
     },
     VirtualTable {
         /// Index identifier returned by the table's `best_index` method.
@@ -63,7 +65,7 @@ pub fn find_best_access_method_for_join_order<'a>(
     join_order: &[JoinOrderMember],
     maybe_order_target: Option<&OrderTarget>,
     input_cardinality: f64,
-) -> Result<Option<AccessMethod<'a>>> {
+) -> Result<Option<AccessMethod>> {
     match &rhs_table.table {
         Table::BTree(_) => find_best_access_method_for_btree(
             rhs_table,
@@ -85,19 +87,19 @@ pub fn find_best_access_method_for_join_order<'a>(
     }
 }
 
-fn find_best_access_method_for_btree<'a>(
+fn find_best_access_method_for_btree(
     rhs_table: &JoinedTable,
-    rhs_constraints: &'a TableConstraints,
+    rhs_constraints: &TableConstraints,
     join_order: &[JoinOrderMember],
     maybe_order_target: Option<&OrderTarget>,
     input_cardinality: f64,
-) -> Result<Option<AccessMethod<'a>>> {
+) -> Result<Option<AccessMethod>> {
     let table_no = join_order.last().unwrap().table_id;
     let mut best_cost = estimate_cost_for_scan_or_seek(None, &[], &[], input_cardinality);
     let mut best_params = AccessMethodParams::BTreeTable {
         iter_dir: IterationDirection::Forwards,
         index: None,
-        constraint_refs: &[],
+        constraint_refs: vec![],
     };
     let rowid_column_idx = rhs_table.columns().iter().position(|c| c.is_rowid_alias);
 
@@ -123,7 +125,7 @@ fn find_best_access_method_for_btree<'a>(
         let cost = estimate_cost_for_scan_or_seek(
             Some(index_info),
             &rhs_constraints.constraints,
-            usable_constraint_refs,
+            &usable_constraint_refs,
             input_cardinality,
         );
 
@@ -192,12 +194,12 @@ fn find_best_access_method_for_btree<'a>(
     }))
 }
 
-fn find_best_access_method_for_vtab<'a>(
+fn find_best_access_method_for_vtab(
     vtab: &VirtualTable,
     constraints: &[Constraint],
     join_order: &[JoinOrderMember],
     input_cardinality: f64,
-) -> Result<Option<AccessMethod<'a>>> {
+) -> Result<Option<AccessMethod>> {
     let vtab_constraints = convert_to_vtab_constraint(constraints, join_order);
 
     // TODO: get proper order_by information to pass to the vtab.
