@@ -533,27 +533,21 @@ impl PageCache {
     }
 
     pub fn clear(&mut self) -> Result<(), CacheError> {
+        // Check for dirty pages
         for e in self.entries.borrow().iter().flatten() {
             if e.page.is_dirty() {
                 return Err(CacheError::Dirty {
                     pgno: e.page.get().id,
                 });
             }
-            if e.page.is_locked() {
-                return Err(CacheError::Locked {
-                    pgno: e.page.get().id,
-                });
-            }
-            if e.page.is_pinned() {
-                return Err(CacheError::Pinned {
-                    pgno: e.page.get().id,
-                });
-            }
         }
+
+        // Clear all pages, even if locked or pinned
         for e in self.entries.borrow().iter().flatten() {
             e.page.clear_loaded();
             let _ = e.page.get().contents.take();
         }
+        // Reset all data structures
         self.entries.borrow_mut().fill(None);
         self.prev.borrow_mut().fill(NONE);
         {
@@ -832,7 +826,7 @@ mod tests {
     fn insert_page(cache: &mut PageCache, id: usize) -> PageCacheKey {
         let key = create_key(id);
         let page = page_with_content(id);
-        assert!(cache.insert(key.clone(), page).is_ok());
+        assert!(cache.insert(key, page).is_ok());
         key
     }
 
@@ -847,7 +841,7 @@ mod tests {
         cache.verify_cache_integrity();
         assert_eq!(cache.len(), 1);
 
-        assert!(cache.delete(key1.clone()).is_ok());
+        assert!(cache.delete(key1).is_ok());
 
         assert_eq!(
             cache.len(),
@@ -871,19 +865,19 @@ mod tests {
         assert_eq!(cache.len(), 3);
 
         // Delete middle element
-        assert!(cache.delete(key2.clone()).is_ok());
+        assert!(cache.delete(key2).is_ok());
         assert_eq!(cache.len(), 2, "Length should be 2 after deleting one");
         assert!(!cache.contains_key(&key2), "Should not contain deleted key");
         cache.verify_cache_integrity();
 
         // Delete another
-        assert!(cache.delete(key1.clone()).is_ok());
+        assert!(cache.delete(key1).is_ok());
         assert_eq!(cache.len(), 1, "Length should be 1 after deleting two");
         assert!(!cache.contains_key(&key1), "Should not contain deleted key");
         cache.verify_cache_integrity();
 
         // Delete last
-        assert!(cache.delete(key3.clone()).is_ok());
+        assert!(cache.delete(key3).is_ok());
         assert_eq!(cache.len(), 0, "Length should be 0 after deleting all");
         cache.verify_cache_integrity();
     }
@@ -894,11 +888,11 @@ mod tests {
         let mut cache = PageCache::default();
         let key1 = create_key(1);
         let page1 = page_with_content(1);
-        assert!(cache.insert(key1.clone(), page1.clone()).is_ok());
+        assert!(cache.insert(key1, page1.clone()).is_ok());
         assert!(page_has_content(&page1));
         cache.verify_cache_integrity();
 
-        let result = cache.delete(key1.clone());
+        let result = cache.delete(key1);
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), CacheError::ActiveRefs);
         assert_eq!(cache.len(), 1);
@@ -917,10 +911,10 @@ mod tests {
         let key1 = create_key(1);
         let page1_v1 = page_with_content(1);
         let page1_v2 = page_with_content(1);
-        assert!(cache.insert(key1.clone(), page1_v1.clone()).is_ok());
+        assert!(cache.insert(key1, page1_v1.clone()).is_ok());
         assert_eq!(cache.len(), 1);
         cache.verify_cache_integrity();
-        let _ = cache.insert(key1.clone(), page1_v2.clone()); // Panic
+        let _ = cache.insert(key1, page1_v2.clone()); // Panic
     }
 
     #[test]
@@ -928,7 +922,7 @@ mod tests {
         let mut cache = PageCache::default();
         let key_nonexist = create_key(99);
 
-        assert!(cache.delete(key_nonexist.clone()).is_ok()); // no-op
+        assert!(cache.delete(key_nonexist).is_ok()); // no-op
     }
 
     #[test]
@@ -1083,7 +1077,7 @@ mod tests {
     fn test_page_cache_delete() {
         let mut cache = PageCache::default();
         let key1 = insert_page(&mut cache, 1);
-        assert!(cache.delete(key1.clone()).is_ok());
+        assert!(cache.delete(key1).is_ok());
         assert!(cache.get(&key1).is_none());
     }
 
@@ -1245,7 +1239,7 @@ mod tests {
                     }
 
                     tracing::debug!("inserting page {:?}", key);
-                    match cache.insert(key.clone(), page.clone()) {
+                    match cache.insert(key, page.clone()) {
                         Err(CacheError::Full | CacheError::ActiveRefs) => {} // Ignore
                         Err(err) => {
                             panic!("Cache insertion failed: {err:?}");
@@ -1268,7 +1262,7 @@ mod tests {
                         PageCacheKey::new(id_page as usize)
                     } else {
                         let i = rng.next_u64() as usize % reference_map.len();
-                        reference_map.keys().nth(i).unwrap().clone()
+                        *reference_map.keys().nth(i).unwrap()
                     };
 
                     tracing::debug!("removing page {:?}", key);

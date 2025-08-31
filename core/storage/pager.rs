@@ -1174,7 +1174,7 @@ impl Pager {
     // Get a page from the cache, if it exists.
     pub fn cache_get(&self, page_idx: usize) -> Option<PageRef> {
         tracing::trace!("read_page(page_idx = {})", page_idx);
-        let mut page_cache = self.page_cache.write();
+        let page_cache = self.page_cache.read();
         let page_key = PageCacheKey::new(page_idx);
         page_cache.get(&page_key)
     }
@@ -1186,7 +1186,7 @@ impl Pager {
         target_frame: u64,
         seq: u32,
     ) -> Option<PageRef> {
-        let mut page_cache = self.page_cache.write();
+        let page_cache = self.page_cache.read();
         let page_key = PageCacheKey::new(page_idx);
         page_cache.get(&page_key).and_then(|page| {
             if page.is_valid_for_checkpoint(target_frame, seq) {
@@ -1259,7 +1259,7 @@ impl Pager {
         let commit_frame = None; // cacheflush only so we are not setting a commit frame here
         for (idx, page_id) in dirty_pages.iter().enumerate() {
             let page = {
-                let mut cache = self.page_cache.write();
+                let cache = self.page_cache.read();
                 let page_key = PageCacheKey::new(*page_id);
                 let page = cache.get(&page_key).expect("we somehow added a page to dirty list but we didn't mark it as dirty, causing cache to drop it.");
                 let page_type = page.get_contents().maybe_page_type();
@@ -2025,7 +2025,7 @@ impl Pager {
                     leaf_page.get_contents().as_ptr().fill(0);
                     let page_key = PageCacheKey::new(leaf_page.get().id);
                     {
-                        let mut page_cache = self.page_cache.write();
+                        let page_cache = self.page_cache.read();
                         turso_assert!(
                             page_cache.contains_key(&page_key),
                             "page {} is not in cache",
