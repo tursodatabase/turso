@@ -1017,7 +1017,13 @@ impl SeekDef {
     }
 }
 
-// TODO: add comment
+/// [SeekKeyComponent] enum represents optional last_component of the [SeekKey]
+///
+/// This component represented by separate enum instead of Option<E> because before there were third Sentinel value
+/// For now - we don't need this and it's enough to just either use some user-provided expression or omit last component of the key completely
+/// But as separate enum is almost never a harm - I decided to keep it here.
+///
+/// This enum accepts generic argument E in order to use both SeekKeyComponent<ast::Expr> and SeekKeyComponent<&ast::Expr>
 #[derive(Debug, Clone)]
 pub enum SeekKeyComponent<E> {
     Expr(E),
@@ -1027,7 +1033,7 @@ pub enum SeekKeyComponent<E> {
 /// A condition to use when seeking.
 #[derive(Debug, Clone)]
 pub struct SeekKey {
-    // TODO: add comment!
+    /// Complete key must be constructed from common [SeekDef::prefix] and optional last_component
     pub last_component: SeekKeyComponent<ast::Expr>,
 
     /// The comparison operator to use when seeking.
