@@ -1238,7 +1238,7 @@ fn emit_seek_termination(
 
     // For all index key values apart from the last one, we are guaranteed to use the same values
     // as these values were emited from common prefix, so we don't need to emit them again.
-        
+
     let num_regs = seek_def.size(&seek_def.end);
     let last_reg = start_reg + seek_def.prefix.len();
     match &seek_def.end.last_component {

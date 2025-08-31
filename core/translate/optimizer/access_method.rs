@@ -4,7 +4,7 @@ use turso_ext::{ConstraintInfo, ConstraintUsage, ResultCode};
 use turso_parser::ast::SortOrder;
 
 use crate::translate::optimizer::constraints::{
-    convert_to_vtab_constraint, RangeConstraintRef, Constraint,
+    convert_to_vtab_constraint, Constraint, RangeConstraintRef,
 };
 use crate::{
     schema::{Index, Table},

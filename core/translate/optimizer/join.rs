@@ -511,9 +511,7 @@ mod tests {
         translate::{
             optimizer::{
                 access_method::AccessMethodParams,
-                constraints::{
-                    constraints_from_where_clause, BinaryExprSide, RangeConstraintRef,
-                },
+                constraints::{constraints_from_where_clause, BinaryExprSide, RangeConstraintRef},
             },
             plan::{
                 ColumnUsedMask, IterationDirection, JoinInfo, Operation, TableReferences, WhereTerm,
