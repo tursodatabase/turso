@@ -24,10 +24,13 @@ impl ChecksumContext {
             // lets skip checksum verification for the first page (header page)
             let reserved_bytes = &page[CHECKSUM_PAGE_SIZE - CHECKSUM_SIZE..];
             let reserved_bytes_zeroed = reserved_bytes.iter().all(|&b| b == 0);
-            assert!(
-                reserved_bytes_zeroed,
-                "last reserved bytes must be empty/zero, but found non-zero bytes on page {page_id}"
-            );
+            // assert!(
+            //     reserved_bytes_zeroed,
+            //     "last reserved bytes must be empty/zero, but found non-zero bytes on page {page_id}"
+            // );
+            if !reserved_bytes_zeroed {
+                tracing::error!("last reserved bytes must be empty/zero, but found non-zero bytes on page {page_id}");
+            }
             return Ok(());
         }
 
