@@ -731,6 +731,7 @@ impl ColumnUsedMask {
 }
 
 #[derive(Clone, Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum Operation {
     // Scan operation
     // This operation is used to scan a table.
@@ -958,6 +959,7 @@ pub struct SeekDef {
     /// For example, given:
     /// - CREATE INDEX i ON t (x, y desc)
     /// - SELECT * FROM t WHERE x = 1 AND y >= 30
+    ///
     /// Then, prefix=[(eq=1, ASC)], start=Some((ge, Expr(30))), end=Some((gt, Sentinel))
     pub prefix: Vec<SeekRangeConstraint>,
     /// The condition to use when seeking. See [SeekKey] for more details.
@@ -998,7 +1000,7 @@ impl<'a> Iterator for SeekDefKeyIterator<'a> {
 impl SeekDef {
     /// returns amount of values in the given seek key
     /// - so, for SELECT * FROM t WHERE x = 10 AND y = 20 AND y >= 30 there will be 3 values (10, 20, 30)
-    pub fn size<'a>(&self, key: &'a SeekKey) -> usize {
+    pub fn size(&self, key: &'_ SeekKey) -> usize {
         self.prefix.len()
             + match key.last_component {
                 SeekKeyComponent::Expr(_) => 1,
@@ -1058,7 +1060,7 @@ pub enum Scan {
 
 /// An enum that represents a search operation that can be used to search for a row in a table using an index
 /// (i.e. a primary key or a secondary index)
-#[allow(clippy::enum_variant_names)]
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug)]
 pub enum Search {
     /// A rowid equality point lookup. This is a special case that uses the SeekRowid bytecode instruction and does not loop.

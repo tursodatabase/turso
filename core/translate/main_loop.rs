@@ -1126,7 +1126,7 @@ fn emit_seek(
     loop_end: BranchOffset,
     is_index: bool,
 ) -> Result<()> {
-    if seek_def.prefix.len() == 0 && matches!(seek_def.start.last_component, SeekKeyComponent::None)
+    if seek_def.prefix.is_empty() && matches!(seek_def.start.last_component, SeekKeyComponent::None)
     {
         // If there is no seek key, we start from the first or last row of the index,
         // depending on the iteration direction.
@@ -1231,7 +1231,7 @@ fn emit_seek_termination(
     loop_end: BranchOffset,
     is_index: bool,
 ) -> Result<()> {
-    if seek_def.prefix.len() == 0 && matches!(seek_def.end.last_component, SeekKeyComponent::None) {
+    if seek_def.prefix.is_empty() && matches!(seek_def.end.last_component, SeekKeyComponent::None) {
         program.preassign_label_to_next_insn(loop_start);
         return Ok(());
     };

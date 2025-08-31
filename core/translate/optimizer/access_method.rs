@@ -59,9 +59,9 @@ pub enum AccessMethodParams {
 }
 
 /// Return the best [AccessMethod] for a given join order.
-pub fn find_best_access_method_for_join_order<'a>(
+pub fn find_best_access_method_for_join_order(
     rhs_table: &JoinedTable,
-    rhs_constraints: &'a TableConstraints,
+    rhs_constraints: &'_ TableConstraints,
     join_order: &[JoinOrderMember],
     maybe_order_target: Option<&OrderTarget>,
     input_cardinality: f64,

@@ -977,7 +977,7 @@ fn build_seek_def(
     iter_dir: IterationDirection,
     mut key: Vec<SeekRangeConstraint>,
 ) -> Result<SeekDef> {
-    assert!(key.len() >= 1);
+    assert!(!key.is_empty());
     let last = key.last().unwrap();
 
     // if we searching for exact key - emit definition immediately with prefix as a full key
