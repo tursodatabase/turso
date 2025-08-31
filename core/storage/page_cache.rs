@@ -1,4 +1,4 @@
-use std::cell::{Cell, Ref, RefCell};
+use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::pager::PageRef;
@@ -10,34 +10,57 @@ use tracing::trace;
 const DEFAULT_PAGE_CACHE_SIZE_IN_PAGES_MAKE_ME_SMALLER_ONCE_WAL_SPILL_IS_IMPLEMENTED: usize =
     100000;
 
-#[derive(Debug, Eq, Hash, PartialEq, Clone)]
-pub struct PageCacheKey {
-    pgno: usize,
-}
+#[derive(Debug, Copy, Eq, Hash, PartialEq, Clone)]
+#[repr(transparent)]
+pub struct PageCacheKey(usize);
 
 struct PageCacheEntry {
     key: PageCacheKey,
     page: PageRef,
+    /// Reference bit for SIEVE algorithm: set on access, cleared on eviction scan
     reference_bit: AtomicBool,
 }
 
+/// Represents a "null" index in the linked lists
 const NONE: usize = usize::MAX;
 
+/// SIEVE-based page cache
+///
+/// The cache uses a slot-based design with three main components:
+/// 1. Slot array (`entries`): Fixed-size vec holding page entries
+/// 2. SIEVE queue: Doubly-linked list for eviction order (head=MRU, tail=LRU)
+/// 3. Free list: Singly-linked list of available slots
+/// 4. Hash map: For O(1) key lookups
+///
+/// The slot-based design avoids heap allocations during operation and provides
+/// better cache locality than pointer-based structures.
 pub struct PageCache {
+    /// Maximum number of pages the cache can hold
     capacity: usize,
+
+    /// Hash map for O(1) page lookups by key
     map: RefCell<PageHashMap>,
 
-    // SIEVE order: head = most recent position, tail = eviction point.
+    /// queue pointers:
+    /// most recently used position (new pages go here)
     head: Cell<usize>,
+    /// least recently used position (eviction happens here)
     tail: Cell<usize>,
 
-    // Next/prev pointers by slot index
+    /// Next pointers for both SIEVE queue and free list
+    /// For SIEVE entries: points to next older page
+    /// For free slots: points to next free slot
     next: RefCell<Vec<usize>>,
-    // SIEVE list, NONE for free slots
+
+    /// Previous pointers for SIEVE queue only
+    /// NONE for free slots (free list is singly-linked)
     prev: RefCell<Vec<usize>>,
 
+    /// Slot array containing the actual page entries
+    /// None = free slot, Some = occupied slot
     entries: RefCell<Vec<Option<Arc<PageCacheEntry>>>>,
 
+    /// Head of the free list (NONE if no free slots)
     free_head: Cell<usize>,
 }
 
@@ -77,7 +100,7 @@ pub enum CacheResizeResult {
 
 impl PageCacheKey {
     pub fn new(pgno: usize) -> Self {
-        Self { pgno }
+        Self(pgno)
     }
 }
 
@@ -115,6 +138,7 @@ impl PageCache {
     }
 
     #[inline]
+    /// Links a slot to the front (MRU position) of the SIEVE queue
     fn link_front(&self, slot: usize) {
         let mut next = self.next.borrow_mut();
         let mut prev = self.prev.borrow_mut();
@@ -132,6 +156,7 @@ impl PageCache {
     }
 
     #[inline]
+    /// Unlinks a slot from the SIEVE queue
     fn unlink(&self, slot: usize) {
         let mut next = self.next.borrow_mut();
         let mut prev = self.prev.borrow_mut();
@@ -155,6 +180,8 @@ impl PageCache {
     }
 
     #[inline]
+    /// Moves a slot from its current position to the front of the queue
+    /// Used when giving a page a "second chance" during eviction
     fn move_to_front(&self, slot: usize) {
         if self.head.get() == slot {
             return;
@@ -205,7 +232,7 @@ impl PageCache {
         self.make_room_for(1)?;
         let slot_index = self.find_free_slot()?;
 
-        let entry = Arc::new(PageCacheEntry::new(key.clone(), value));
+        let entry = Arc::new(PageCacheEntry::new(key, value));
         self.entries.borrow_mut()[slot_index] = Some(entry.clone());
         self.map.borrow_mut().insert(key, entry, slot_index);
 
@@ -232,12 +259,13 @@ impl PageCache {
     }
 
     #[inline]
+    /// Deletes a page from the cache
     pub fn delete(&mut self, key: PageCacheKey) -> Result<(), CacheError> {
         trace!("cache_delete(key={:?})", key);
         self._delete(key, true)
     }
 
-    pub fn _delete(&mut self, key: PageCacheKey, clean_page: bool) -> Result<(), CacheError> {
+    fn _delete(&mut self, key: PageCacheKey, clean_page: bool) -> Result<(), CacheError> {
         if !self.contains_key(&key) {
             return Ok(());
         }
@@ -288,14 +316,15 @@ impl PageCache {
     }
 
     #[inline]
-    /// Get page from the cache and promote the entry
+    /// Gets a page from the cache, marking it as recently accessed
     pub fn get(&self, key: &PageCacheKey) -> Option<PageRef> {
         let touch = true;
         self.peek(key, touch)
     }
 
     #[inline]
-    /// Get page without promoting entry
+    /// Gets a page from the cache without marking it as accessed
+    /// Useful for operations that shouldn't affect eviction order
     pub fn peek(&self, key: &PageCacheKey, touch: bool) -> Option<PageRef> {
         let map = self.map.borrow();
         let entry = map.get(key)?;
@@ -306,6 +335,10 @@ impl PageCache {
         Some(page)
     }
 
+    /// Resizes the cache to a new capacity
+    ///
+    /// If shrinking, attempts to evict pages using the SIEVE algorithm.
+    /// If growing, simply increases capacity.
     pub fn resize(&mut self, new_cap: usize) -> CacheResizeResult {
         if new_cap == self.capacity {
             return CacheResizeResult::Done;
@@ -328,7 +361,7 @@ impl PageCache {
                     if entry.reference_bit.swap(false, Ordering::Relaxed) {
                         self.move_to_front(tail_idx);
                     } else {
-                        match self._delete(entry.key.clone(), true) {
+                        match self._delete(entry.key, true) {
                             Ok(_) => {
                                 need -= 1;
                                 progress = true;
@@ -391,9 +424,7 @@ impl PageCache {
             let mut entries_mut = self.entries.borrow_mut();
             for (slot, entry) in survivors.iter().rev().enumerate().take(new_cap) {
                 entries_mut[slot] = Some(entry.clone());
-                self.map
-                    .borrow_mut()
-                    .insert(entry.key.clone(), entry.clone(), slot);
+                self.map.borrow_mut().insert(entry.key, entry.clone(), slot);
                 self.link_front(slot);
             }
         }
@@ -419,6 +450,15 @@ impl PageCache {
         CacheResizeResult::Done
     }
 
+    /// Ensures at least `n` free slots are available
+    ///
+    /// Uses the SIEVE algorithm to evict pages if necessary:
+    /// 1. Start at tail (LRU position)
+    /// 2. If page is marked, unmark and move to head (second chance)
+    /// 3. If page is unmarked, evict it
+    /// 4. If page is unevictable (dirty/locked/pinned), move to head
+    ///
+    /// Returns `CacheError::Full` if not enough pages can be evicted
     pub fn make_room_for(&mut self, n: usize) -> Result<(), CacheError> {
         if n > self.capacity {
             return Err(CacheError::Full);
@@ -454,7 +494,7 @@ impl PageCache {
                     self.move_to_front(tail);
                 } else {
                     // cold: try to evict
-                    let key = entry.key.clone();
+                    let key = entry.key;
                     match self._delete(key, true) {
                         Ok(_) => {
                             need -= 1;
@@ -535,12 +575,12 @@ impl PageCache {
         let entries = self.entries.borrow().clone();
 
         for entry in entries.iter().flatten() {
-            if entry.key.pgno > len {
+            if entry.key.0 > len {
                 turso_assert!(!entry.page.is_dirty(), "page must be clean");
                 turso_assert!(!entry.page.is_locked(), "page must be unlocked");
                 turso_assert!(!entry.page.is_pinned(), "page must be unpinned");
 
-                self.delete(entry.key.clone())?;
+                self.delete(entry.key)?;
             }
         }
 
@@ -571,7 +611,7 @@ impl PageCache {
         let entries = self.entries.borrow();
 
         for entry in entries.iter().flatten() {
-            keys.push(entry.key.clone());
+            keys.push(entry.key);
         }
 
         keys
@@ -735,16 +775,16 @@ impl PageHashMap {
 
     fn hash(&self, key: &PageCacheKey) -> usize {
         if self.capacity.is_power_of_two() {
-            key.pgno & (self.capacity - 1)
+            key.0 & (self.capacity - 1)
         } else {
-            key.pgno % self.capacity
+            key.0 % self.capacity
         }
     }
 
     fn rehash(&self, new_capacity: usize) -> PageHashMap {
         let mut new_hash_map = PageHashMap::new(new_capacity);
         for node in self.iter() {
-            new_hash_map.insert(node.key.clone(), node.value.clone(), node.slot_index);
+            new_hash_map.insert(node.key, node.value.clone(), node.slot_index);
         }
         new_hash_map
     }
@@ -1153,10 +1193,10 @@ mod tests {
 
         cache.truncate(4).unwrap();
 
-        assert!(cache.contains_key(&PageCacheKey { pgno: 1 }));
-        assert!(cache.contains_key(&PageCacheKey { pgno: 4 }));
-        assert!(!cache.contains_key(&PageCacheKey { pgno: 8 }));
-        assert!(!cache.contains_key(&PageCacheKey { pgno: 10 }));
+        assert!(cache.contains_key(&PageCacheKey(1)));
+        assert!(cache.contains_key(&PageCacheKey(4)));
+        assert!(!cache.contains_key(&PageCacheKey(8)));
+        assert!(!cache.contains_key(&PageCacheKey(10)));
         assert_eq!(cache.len(), 2);
         assert_eq!(cache.capacity(), 10);
         cache.verify_cache_integrity();
@@ -1170,8 +1210,8 @@ mod tests {
 
         cache.truncate(4).unwrap();
 
-        assert!(!cache.contains_key(&PageCacheKey { pgno: 8 }));
-        assert!(!cache.contains_key(&PageCacheKey { pgno: 10 }));
+        assert!(!cache.contains_key(&PageCacheKey(8)));
+        assert!(!cache.contains_key(&PageCacheKey(10)));
         assert_eq!(cache.len(), 0);
         assert_eq!(cache.capacity(), 10);
         cache.verify_cache_integrity();
@@ -1243,8 +1283,8 @@ mod tests {
             // Verify all pages in reference_map are in cache
             for (key, page) in &reference_map {
                 let cached_page = cache.peek(key, false).expect("Page should be in cache");
-                assert_eq!(cached_page.get().id, key.pgno);
-                assert_eq!(page.get().id, key.pgno);
+                assert_eq!(cached_page.get().id, key.0);
+                assert_eq!(page.get().id, key.0);
             }
         }
     }
