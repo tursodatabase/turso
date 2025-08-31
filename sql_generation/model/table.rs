@@ -154,6 +154,8 @@ impl Display for SimValue {
             types::Value::Null => write!(f, "NULL"),
             types::Value::Integer(i) => write!(f, "{i}"),
             types::Value::Float(fl) => write!(f, "{fl}"),
+            #[cfg(feature = "u128-support")]
+            types::Value::U128(i) => write!(f, "{i}"),
             value @ types::Value::Text(..) => write!(f, "'{value}'"),
             types::Value::Blob(b) => write!(f, "{}", to_sqlite_blob(b)),
         }
@@ -342,6 +344,8 @@ impl From<&SimValue> for ast::Literal {
         match &value.0 {
             types::Value::Null => Self::Null,
             types::Value::Integer(i) => Self::Numeric(i.to_string()),
+            #[cfg(feature = "u128-support")]
+            types::Value::U128(i) => Self::Numeric(i.to_string()),
             types::Value::Float(f) => Self::Numeric(f.to_string()),
             text @ types::Value::Text(..) => Self::String(escape_singlequotes(&text.to_string())),
             types::Value::Blob(blob) => Self::Blob(hex::encode(blob)),

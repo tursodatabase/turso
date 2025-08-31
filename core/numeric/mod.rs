@@ -43,6 +43,8 @@ pub enum Numeric {
     Null,
     Integer(i64),
     Float(NonNan),
+    #[cfg(feature = "u128-support")]
+    U128(u128),
 }
 
 impl Numeric {
@@ -62,6 +64,17 @@ impl From<Numeric> for NullableInteger {
             Numeric::Null => NullableInteger::Null,
             Numeric::Integer(v) => NullableInteger::Integer(v),
             Numeric::Float(v) => NullableInteger::Integer(f64::from(v) as i64),
+
+            #[cfg(feature = "u128-support")]
+            Numeric::U128(u) => {
+                // This is a lossy conversion. We must decide on the rule.
+                // Clamping to i64::MAX is a safe choice.
+                if u > i64::MAX as u128 {
+                    NullableInteger::Integer(i64::MAX)
+                } else {
+                    NullableInteger::Integer(u as i64)
+                }
+            }
         }
     }
 }
@@ -72,6 +85,8 @@ impl From<Numeric> for Value {
             Numeric::Null => Value::Null,
             Numeric::Integer(v) => Value::Integer(v),
             Numeric::Float(v) => Value::Float(v.into()),
+            #[cfg(feature = "u128-support")]
+            Numeric::U128(u) => Value::U128(u),
         }
     }
 }
@@ -106,6 +121,10 @@ impl From<&Value> for Numeric {
         match value {
             Value::Null => Self::Null,
             Value::Integer(v) => Self::Integer(*v),
+
+            #[cfg(feature = "u128-support")]
+            Value::U128(v) => Self::U128(*v),
+            // Value::U128(_) => Self::Null,
             Value::Float(v) => match NonNan::new(*v) {
                 Some(v) => Self::Float(v),
                 None => Self::Null,
@@ -135,6 +154,23 @@ impl std::ops::Add for Numeric {
             },
             (f @ Numeric::Float(_), Numeric::Integer(i))
             | (Numeric::Integer(i), f @ Numeric::Float(_)) => f + Numeric::Float(i.into()),
+
+            #[cfg(feature = "u128-support")]
+            (Numeric::U128(u1), Numeric::U128(u2)) => Numeric::U128(u1.saturating_add(u2)),
+
+            #[cfg(feature = "u128-support")]
+            (Numeric::U128(u), Numeric::Integer(i)) | (Numeric::Integer(i), Numeric::U128(u)) => {
+                if i >= 0 {
+                    Numeric::U128(u.saturating_add(i as u128))
+                } else {
+                    Numeric::U128(u.saturating_sub(i.abs() as u128))
+                }
+            }
+
+            #[cfg(feature = "u128-support")]
+            (Numeric::U128(_), Numeric::Float(_)) | (Numeric::Float(_), Numeric::U128(_)) => {
+                Numeric::Null
+            }
         }
     }
 }
@@ -155,6 +191,27 @@ impl std::ops::Sub for Numeric {
             },
             (f @ Numeric::Float(_), Numeric::Integer(i)) => f - Numeric::Float(i.into()),
             (Numeric::Integer(i), f @ Numeric::Float(_)) => Numeric::Float(i.into()) - f,
+
+            #[cfg(feature = "u128-support")]
+            (Numeric::U128(u1), Numeric::U128(u2)) => Numeric::U128(u1.saturating_sub(u2)),
+
+            #[cfg(feature = "u128-support")]
+            (Numeric::U128(u), Numeric::Integer(i)) => {
+                if i >= 0 {
+                    Numeric::U128(u.saturating_sub(i as u128))
+                } else {
+                    Numeric::U128(u.saturating_add(i.abs() as u128))
+                }
+            }
+
+            // Subtracting a large u128 from a small i64 is invalid.
+            #[cfg(feature = "u128-support")]
+            (Numeric::Integer(_), Numeric::U128(_)) => Numeric::Null,
+
+            #[cfg(feature = "u128-support")]
+            (Numeric::U128(_), Numeric::Float(_)) | (Numeric::Float(_), Numeric::U128(_)) => {
+                Numeric::Null
+            }
         }
     }
 }
@@ -164,6 +221,23 @@ impl std::ops::Mul for Numeric {
 
     fn mul(self, rhs: Self) -> Self::Output {
         match (self, rhs) {
+            #[cfg(feature = "u128-support")]
+            (Numeric::U128(u1), Numeric::U128(u2)) => Numeric::U128(u1.saturating_mul(u2)),
+
+            #[cfg(feature = "u128-support")]
+            (Numeric::U128(u), Numeric::Integer(i)) | (Numeric::Integer(i), Numeric::U128(u)) => {
+                if i < 0 {
+                    Numeric::Null
+                } else {
+                    Numeric::U128(u.saturating_mul(i as u128))
+                }
+            }
+
+            #[cfg(feature = "u128-support")]
+            (Numeric::U128(_), Numeric::Float(_)) | (Numeric::Float(_), Numeric::U128(_)) => {
+                Numeric::Null
+            }
+
             (Numeric::Null, _) | (_, Numeric::Null) => Numeric::Null,
             (Numeric::Float(lhs), Numeric::Float(rhs)) => match lhs * rhs {
                 Some(v) => Numeric::Float(v),
@@ -195,6 +269,40 @@ impl std::ops::Div for Numeric {
             },
             (f @ Numeric::Float(_), Numeric::Integer(i)) => f / Numeric::Float(i.into()),
             (Numeric::Integer(i), f @ Numeric::Float(_)) => Numeric::Float(i.into()) / f,
+
+            #[cfg(feature = "u128-support")]
+            (Numeric::U128(u1), Numeric::U128(u2)) => {
+                if u2 == 0 {
+                    Numeric::Null
+                } else {
+                    Numeric::U128(u1.saturating_div(u2))
+                }
+            }
+
+            #[cfg(feature = "u128-support")]
+            (Numeric::U128(u), Numeric::Integer(i)) => {
+                if i <= 0 {
+                    Numeric::Null
+                } else {
+                    Numeric::U128(u.saturating_div(i as u128))
+                }
+            }
+
+            #[cfg(feature = "u128-support")]
+            (Numeric::Integer(i), Numeric::U128(u)) => {
+                if u == 0 {
+                    Numeric::Null
+                } else if i < 0 || u > i as u128 {
+                    Numeric::Integer(0)
+                } else {
+                    Numeric::Integer((i as u128 / u) as i64)
+                }
+            }
+
+            #[cfg(feature = "u128-support")]
+            (Numeric::U128(_), Numeric::Float(_)) | (Numeric::Float(_), Numeric::U128(_)) => {
+                Numeric::Null
+            }
         }
     }
 }
@@ -204,6 +312,15 @@ impl std::ops::Neg for Numeric {
 
     fn neg(self) -> Self::Output {
         match self {
+            #[cfg(feature = "u128-support")]
+            Numeric::U128(u) => {
+                if u == 0 {
+                    Numeric::U128(0)
+                } else {
+                    // Negating a non-zero unsigned value is invalid.
+                    Numeric::Null
+                }
+            }
             Numeric::Null => Numeric::Null,
             Numeric::Integer(v) => match v.checked_neg() {
                 None => -Numeric::Float(v.into()),
@@ -246,6 +363,17 @@ impl From<&Value> for NullableInteger {
         match value {
             Value::Null => Self::Null,
             Value::Integer(v) => Self::Integer(*v),
+
+            #[cfg(feature = "u128-support")]
+            Value::U128(u) => {
+                // This is a lossy conversion , nullable integer can only hold i64 maybe we have to change this, idk  for now.
+                if *u > i64::MAX as u128 {
+                    Self::Integer(i64::MAX)
+                } else {
+                    Self::Integer(*u as i64)
+                }
+            }
+
             Value::Float(v) => Self::Integer(*v as i64),
             Value::Text(text) => Self::from(text.as_str()),
             Value::Blob(blob) => {

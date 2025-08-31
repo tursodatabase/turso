@@ -909,6 +909,10 @@ fn create_table(
                         let mut type_name = data_type.name.clone();
                         type_name.make_ascii_uppercase();
 
+                        if type_name.contains("U128") {
+                            break 'ty Type::U128;
+                        }
+
                         if type_name.is_empty() {
                             break 'ty Type::Blob;
                         }
@@ -1194,6 +1198,7 @@ pub enum Type {
     Integer,
     Real,
     Blob,
+    U128,
 }
 
 /// # SQLite Column Type Affinities
@@ -1334,6 +1339,7 @@ impl fmt::Display for Type {
             Self::Integer => "INTEGER",
             Self::Real => "REAL",
             Self::Blob => "BLOB",
+            Self::U128 => "U128",
         };
         write!(f, "{s}")
     }

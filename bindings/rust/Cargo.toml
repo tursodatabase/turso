@@ -14,6 +14,7 @@ default = ["experimental_indexes"]
 conn_raw_api = ["turso_core/conn_raw_api"]
 experimental_indexes = []
 antithesis = ["turso_core/antithesis"]
+u128-support = ["turso_core/u128-support"]
 
 [dependencies]
 turso_core = { workspace = true, features = ["io_uring"] }

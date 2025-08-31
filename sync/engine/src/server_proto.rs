@@ -199,6 +199,11 @@ pub enum Value {
         #[serde(with = "bytes_as_base64", rename = "base64")]
         value: Bytes,
     },
+    #[cfg(feature = "u128-support")]
+    U128 {
+        #[serde(with = "u128_as_str")]
+        value: u128,
+    },
 }
 
 pub mod option_u64_as_str {
@@ -294,6 +299,26 @@ mod i64_as_str {
     }
 
     pub fn deserialize<'de, D: de::Deserializer<'de>>(de: D) -> Result<i64, D::Error> {
+        let str_value = <&'de str as de::Deserialize>::deserialize(de)?;
+        str_value.parse().map_err(|_| {
+            D::Error::invalid_value(
+                de::Unexpected::Str(str_value),
+                &"decimal integer as a string",
+            )
+        })
+    }
+}
+
+#[cfg(feature = "u128-support")]
+mod u128_as_str {
+    use serde::{de, ser};
+    use serde::{de::Error as _, Serialize as _};
+
+    pub fn serialize<S: ser::Serializer>(value: &u128, ser: S) -> Result<S::Ok, S::Error> {
+        value.to_string().serialize(ser)
+    }
+
+    pub fn deserialize<'de, D: de::Deserializer<'de>>(de: D) -> Result<u128, D::Error> {
         let str_value = <&'de str as de::Deserialize>::deserialize(de)?;
         str_value.parse().map_err(|_| {
             D::Error::invalid_value(

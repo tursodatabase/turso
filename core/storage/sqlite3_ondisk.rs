@@ -1430,6 +1430,14 @@ pub fn read_value(buf: &[u8], serial_type: SerialType) -> Result<(RefValue, usiz
         }
         SerialTypeKind::ConstInt0 => Ok((RefValue::Integer(0), 0)),
         SerialTypeKind::ConstInt1 => Ok((RefValue::Integer(1), 0)),
+        #[cfg(feature = "u128-support")]
+        SerialTypeKind::U128 => {
+            if buf.len() < 16 {
+                crate::bail_corrupt_error!("Invalid U128 value");
+            }
+            let val = u128::from_be_bytes(buf[0..16].try_into().unwrap());
+            Ok((RefValue::U128(val), 16))
+        }
         SerialTypeKind::Blob => {
             let content_size = serial_type.size();
             if buf.len() < content_size {

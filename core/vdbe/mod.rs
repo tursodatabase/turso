@@ -680,6 +680,8 @@ pub fn registers_to_ref_values(registers: &[Register]) -> Vec<RefValue> {
                     subtype: t.subtype,
                 }),
                 Value::Blob(b) => RefValue::Blob(RawSlice::new(b.as_ptr(), b.len())),
+                #[cfg(feature = "u128-support")]
+                Value::U128(u) => RefValue::U128(*u),
             }
         })
         .collect()

@@ -540,6 +540,13 @@ fn to_js_value<'a>(
                 ToNapiValue::into_unknown(*i as f64, env)
             }
         }
+
+        #[cfg(feature = "u128-support")]
+        turso_core::Value::U128(i) => {
+            let bigint = BigInt::from(*i);
+            ToNapiValue::into_unknown(bigint, env)
+        }
+
         turso_core::Value::Float(f) => ToNapiValue::into_unknown(*f, env),
         turso_core::Value::Text(s) => ToNapiValue::into_unknown(s.as_str(), env),
         turso_core::Value::Blob(b) => {

@@ -36,3 +36,4 @@ tracing = "0.1.41"
 
 [features]
 encryption = ["turso_core/encryption"]
+u128-support = ["turso_core/u128-support"]

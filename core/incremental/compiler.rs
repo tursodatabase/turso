@@ -765,6 +765,13 @@ impl DbspCompiler {
                     Value::Text(t) => ast::Literal::String(t.to_string()),
                     Value::Blob(b) => ast::Literal::Blob(format!("{b:?}")),
                     Value::Null => ast::Literal::Null,
+                    #[cfg(feature = "u128-support")]
+                    Value::U128(_) => {
+                        // U128 literals are not supported in this context yet
+                        return Err(LimboError::InternalError(
+                            "U128 literals are not yet supported here".to_string(),
+                        ));
+                    }
                 };
                 Ok(ast::Expr::Literal(lit))
             }

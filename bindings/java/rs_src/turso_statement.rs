@@ -116,6 +116,9 @@ fn row_to_obj_array<'local>(
             }
             turso_core::Value::Text(s) => env.new_string(s.as_str())?.into(),
             turso_core::Value::Blob(b) => env.byte_array_from_slice(b.as_slice())?.into(),
+
+            #[cfg(feature = "u128-support")]
+            &Value::U128(v) => env.new_string(v.to_string())?.into(),
         };
         if let Err(e) = env.set_object_array_element(&obj_array, i as i32, obj) {
             eprintln!("Error on parsing row: {e:?}");

@@ -213,7 +213,7 @@ impl Limbo {
             _ => acc,
         }) {
             n if n < 0 => String::from(")x!...>"),
-            0 => String::from("   ...> "),
+            0 => String::from(" ...> "),
             n if n < 10 => format!("(x{n}...> "),
             _ => String::from("(.....> "),
         };
@@ -692,7 +692,6 @@ impl Limbo {
                                 if let Some(ref mut stats) = statistics {
                                     stats.execute_time_elapsed_samples.push(start.elapsed());
                                 }
-
                                 // Print headers if enabled and not already printed
                                 if self.opts.headers && !headers_printed {
                                     for i in 0..rows.num_columns() {
@@ -768,7 +767,7 @@ impl Limbo {
                         .set_content_arrangement(ContentArrangement::Dynamic)
                         .set_truncation_indicator("…")
                         .apply_modifier("││──├─┼┤│─┼├┤┬┴┌┐└┘");
-                    if rows.num_columns() > 0 {
+                    if self.opts.headers && rows.num_columns() > 0 {
                         let header = (0..rows.num_columns())
                             .map(|i| {
                                 let name = rows.get_column_name(i);
@@ -790,18 +789,17 @@ impl Limbo {
                                 let mut row = Row::new();
                                 row.max_height(1);
                                 for (idx, value) in record.get_values().enumerate() {
-                                    let (content, alignment) = match value {
-                                        Value::Null => {
-                                            (self.opts.null_value.clone(), CellAlignment::Left)
-                                        }
-                                        Value::Integer(_) => {
-                                            (format!("{value}"), CellAlignment::Right)
-                                        }
-                                        Value::Float(_) => {
-                                            (format!("{value}"), CellAlignment::Right)
-                                        }
-                                        Value::Text(_) => (format!("{value}"), CellAlignment::Left),
-                                        Value::Blob(_) => (format!("{value}"), CellAlignment::Left),
+                                    // dbg!(value);
+                                    let content = if matches!(value, Value::Null) {
+                                        self.opts.null_value.clone()
+                                    } else {
+                                        format!("{value}")
+                                    };
+                                    let alignment = match value {
+                                        Value::Integer(_) | Value::Float(_) => CellAlignment::Right,
+                                        #[cfg(feature = "u128-support")]
+                                        Value::U128(_) => CellAlignment::Right,
+                                        _ => CellAlignment::Left,
                                     };
                                     row.add_cell(
                                         Cell::new(content)
@@ -1222,7 +1220,7 @@ impl Limbo {
             None => String::from(
                 "SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY 1"
             ),
-        };
+    };
 
         let mut tables = String::new();
         let handler = |row: &turso_core::Row| -> anyhow::Result<()> {
@@ -1561,8 +1559,8 @@ impl Limbo {
         let sql = r#"
             SELECT name, sql FROM sqlite_schema
             WHERE sql NOT NULL
-              AND name NOT LIKE 'sqlite_%'
-              AND type IN ('index','trigger','view')
+            AND name NOT LIKE 'sqlite_%'
+            AND type IN ('index','trigger','view')
             ORDER BY CASE type WHEN 'view' THEN 1 WHEN 'index' THEN 2 WHEN 'trigger' THEN 3 END, rowid
         "#;
         if let Some(mut rows) = conn.query(sql)? {
@@ -1588,6 +1586,8 @@ impl Limbo {
         match v {
             Value::Null => out.write_all(b"NULL"),
             Value::Integer(i) => out.write_all(format!("{i}").as_bytes()),
+            #[cfg(feature = "u128-support")]
+            Value::U128(i) => out.write_all(format!("{i}").as_bytes()),
             Value::Float(f) => write!(out, "{f}").map(|_| ()),
             Value::Text(s) => {
                 out.write_all(b"'")?;

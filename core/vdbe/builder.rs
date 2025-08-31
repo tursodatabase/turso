@@ -877,6 +877,8 @@ impl ProgramBuilder {
                     Numeric::Null => Value::Null,
                     Numeric::Integer(v) => Value::Integer(v),
                     Numeric::Float(v) => Value::Float(v.into()),
+                    #[cfg(feature = "u128-support")]
+                    Numeric::U128(v) => Value::U128(v),
                 },
                 ast::Literal::Null => Value::Null,
                 ast::Literal::String(s) => Value::Text(sanitize_string(s).into()),

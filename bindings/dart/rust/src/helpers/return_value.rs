@@ -9,6 +9,8 @@ pub enum ReturnValue {
 impl From<turso_core::Value> for ReturnValue {
     fn from(value: turso_core::Value) -> Self {
         match value {
+            #[cfg(feature = "u128-support")]
+            turso_core::Value::U128(i) => ReturnValue::Text(i.to_string()),
             turso_core::Value::Integer(i) => ReturnValue::Integer(i),
             turso_core::Value::Float(f) => ReturnValue::Real(f),
             turso_core::Value::Text(t) => ReturnValue::Text(t.as_str().to_string()),

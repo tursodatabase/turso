@@ -13,6 +13,7 @@ build = "build.rs"
 capi = []
 lfs = []
 sqlite3 = []
+u128-support = ["turso_core/u128-support"]
 
 [package.metadata.dist]
 dist = true

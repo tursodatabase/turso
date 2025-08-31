@@ -3238,6 +3238,13 @@ pub fn emit_literal(
                         dest: target_register,
                     });
                 }
+                #[cfg(feature = "u128-support")]
+                Value::U128(u128_value) => {
+                    program.emit_insn(Insn::U128 {
+                        value: u128_value,
+                        dest: target_register,
+                    });
+                }
                 _ => unreachable!(),
             }
             Ok(target_register)

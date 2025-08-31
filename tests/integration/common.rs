@@ -210,6 +210,8 @@ pub(crate) fn limbo_exec_rows(
                 turso_core::Value::Float(x) => rusqlite::types::Value::Real(*x),
                 turso_core::Value::Text(x) => rusqlite::types::Value::Text(x.as_str().to_string()),
                 turso_core::Value::Blob(x) => rusqlite::types::Value::Blob(x.to_vec()),
+                #[cfg(feature = "u128-support")]
+                turso_core::Value::U128(x) => rusqlite::types::Value::Text(x.to_string()),
             })
             .collect();
         rows.push(row);

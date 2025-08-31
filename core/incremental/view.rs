@@ -350,6 +350,8 @@ impl IncrementalView {
             Value::Float(f) => f.to_string(),
             Value::Text(t) => format!("'{}'", t.as_str().replace('\'', "''")),
             Value::Blob(_) => "NULL".to_string(), // Blob literals not supported in WHERE clause yet
+            #[cfg(feature = "u128-support")]
+            Value::U128(i) => i.to_string(),
         }
     }
 

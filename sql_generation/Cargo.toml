@@ -22,3 +22,6 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 rand_chacha = "0.9.0"
+
+[features]
+u128-support = ["turso_core/u128-support"]

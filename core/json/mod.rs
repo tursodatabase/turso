@@ -112,6 +112,8 @@ pub fn convert_dbtype_to_jsonb(val: &Value, strict: Conv) -> crate::Result<Jsonb
                 RefValue::Text(TextRef::create_from(text.as_str().as_bytes(), text.subtype))
             }
             Value::Blob(items) => RefValue::Blob(RawSlice::create_from(items)),
+            #[cfg(feature = "u128-support")]
+            Value::U128(i) => RefValue::U128(*i),
         },
         strict,
     )
@@ -156,6 +158,10 @@ pub fn convert_ref_dbtype_to_jsonb(val: &RefValue, strict: Conv) -> crate::Resul
                 .map_err(|_| LimboError::ParseError("malformed JSON".to_string()))
         }
         RefValue::Integer(int) => Jsonb::from_str(&int.to_string())
+            .map_err(|_| LimboError::ParseError("malformed JSON".to_string())),
+
+        #[cfg(feature = "u128-support")]
+        RefValue::U128(int) => Jsonb::from_str(&int.to_string())
             .map_err(|_| LimboError::ParseError("malformed JSON".to_string())),
     }
 }
@@ -661,6 +667,8 @@ pub fn json_quote(value: &Value) -> crate::Result<Value> {
         Value::Float(ref float) => Ok(Value::Float(float.to_owned())),
         Value::Blob(_) => crate::bail_constraint_error!("JSON cannot hold BLOB values"),
         Value::Null => Ok(Value::build_text("null")),
+        #[cfg(feature = "u128-support")]
+        Value::U128(ref i) => Ok(Value::U128(i.to_owned())),
     }
 }
 

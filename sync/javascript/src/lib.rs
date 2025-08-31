@@ -81,6 +81,8 @@ fn core_value_to_js(value: turso_core::Value) -> Either5<Null, i64, f64, String,
     match value {
         turso_core::Value::Null => Either5::<Null, i64, f64, String, Vec<u8>>::A(Null),
         turso_core::Value::Integer(value) => Either5::<Null, i64, f64, String, Vec<u8>>::B(value),
+        #[cfg(feature = "u128-support")]
+        turso_core::Value::U128(value) => Either5::<_, _, _, _, _>::D(value.to_string()),
         turso_core::Value::Float(value) => Either5::<Null, i64, f64, String, Vec<u8>>::C(value),
         turso_core::Value::Text(value) => {
             Either5::<Null, i64, f64, String, Vec<u8>>::D(value.as_str().to_string())

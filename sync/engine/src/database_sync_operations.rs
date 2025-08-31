@@ -457,6 +457,13 @@ fn convert_to_args(values: Vec<turso_core::Value>) -> Vec<server_proto::Value> {
         .map(|value| match value {
             Value::Null => server_proto::Value::Null,
             Value::Integer(value) => server_proto::Value::Integer { value },
+
+            // #[cfg(feature = "u128-support")]
+            // Value::U128(value) => server_proto::Value::Blob { // do we want to change this?? this works for now tho
+            //     value: value.to_be_bytes().to_vec().into(),
+            // },
+            #[cfg(feature = "u128-support")]
+            Value::U128(value) => server_proto::Value::U128 { value },
             Value::Float(value) => server_proto::Value::Float { value },
             Value::Text(value) => server_proto::Value::Text {
                 value: value.as_str().to_string(),

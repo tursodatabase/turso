@@ -38,3 +38,6 @@ hex = "0.4.3"
 itertools = "0.14.0"
 sql_generation = { workspace = true }
 turso_parser = { workspace = true }
+
+[features]
+u128-support = ["turso_core/u128-support"]

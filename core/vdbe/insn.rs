@@ -500,6 +500,11 @@ pub enum Insn {
         dest: usize,
     },
 
+    #[cfg(feature = "u128-support")]
+    U128 {
+        value: u128,
+        dest: usize,
+    },
     /// Write a float value into a register
     Real {
         value: f64,
@@ -1133,6 +1138,8 @@ impl Insn {
             Insn::Gosub { .. } => execute::op_gosub,
             Insn::Return { .. } => execute::op_return,
             Insn::Integer { .. } => execute::op_integer,
+            #[cfg(feature = "u128-support")]
+            Insn::U128 { .. } => execute::op_u128,
             Insn::Real { .. } => execute::op_real,
             Insn::RealAffinity { .. } => execute::op_real_affinity,
             Insn::String8 { .. } => execute::op_string8,

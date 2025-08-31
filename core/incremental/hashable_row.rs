@@ -66,6 +66,10 @@ impl HashableRow {
                     4u8.hash(&mut hasher);
                     b.hash(&mut hasher);
                 }
+                #[cfg(feature = "u128-support")]
+                Value::U128(i) => {
+                    hasher.write_u128(*i);
+                }
             }
         }
 

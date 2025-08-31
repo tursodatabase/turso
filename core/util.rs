@@ -1132,6 +1132,11 @@ pub fn parse_numeric_literal(text: &str) -> Result<Value> {
         return Ok(Value::Integer(int_value));
     }
 
+    #[cfg(feature = "u128-support")]
+    if let Ok(u128_value) = text.parse::<u128>() {
+        return Ok(Value::U128(u128_value));
+    }
+
     let float_value = text.parse::<f64>()?;
     Ok(Value::Float(float_value))
 }

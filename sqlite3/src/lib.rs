@@ -94,6 +94,8 @@ pub struct sqlite3_stmt {
         *mut ffi::c_void,
     )>,
     pub(crate) next: *mut sqlite3_stmt,
+
+    pub(crate) u128_strings: Vec<CString>,
 }
 
 impl sqlite3_stmt {
@@ -103,6 +105,7 @@ impl sqlite3_stmt {
             stmt,
             destructors: Vec::new(),
             next: std::ptr::null_mut(),
+            u128_strings: Vec::new(),
         }
     }
 }
@@ -342,7 +345,10 @@ pub unsafe extern "C" fn sqlite3_step(stmt: *mut sqlite3_stmt) -> ffi::c_int {
                 }
                 turso_core::StepResult::Done => return SQLITE_DONE,
                 turso_core::StepResult::Interrupt => return SQLITE_INTERRUPT,
-                turso_core::StepResult::Row => return SQLITE_ROW,
+                turso_core::StepResult::Row => {
+                    stmt.u128_strings.clear();
+                    return SQLITE_ROW;
+                }
                 turso_core::StepResult::Busy => return SQLITE_BUSY,
             }
         } else {
@@ -845,6 +851,8 @@ pub unsafe extern "C" fn sqlite3_column_type(
         Ok(turso_core::Value::Text(_)) => SQLITE_TEXT,
         Ok(turso_core::Value::Float(_)) => SQLITE_FLOAT,
         Ok(turso_core::Value::Blob(_)) => SQLITE_BLOB,
+        #[cfg(feature = "u128-support")]
+        Ok(turso_core::Value::U128(_)) => SQLITE_TEXT,
         _ => SQLITE_NULL,
     }
 }
@@ -948,6 +956,8 @@ pub unsafe extern "C" fn sqlite3_column_bytes(
     match row.get::<&Value>(idx as usize) {
         Ok(turso_core::Value::Text(text)) => text.as_str().len() as ffi::c_int,
         Ok(turso_core::Value::Blob(blob)) => blob.len() as ffi::c_int,
+        #[cfg(feature = "u128-support")]
+        Ok(turso_core::Value::U128(i)) => i.to_string().len() as ffi::c_int,
         _ => 0,
     }
 }
@@ -957,11 +967,14 @@ pub unsafe extern "C" fn sqlite3_value_type(value: *mut ffi::c_void) -> ffi::c_i
     let value = value as *mut turso_core::Value;
     let value = &*value;
     match value {
+        // todo maybe replace these numbers with constanst defined above.?
         turso_core::Value::Null => 0,
         turso_core::Value::Integer(_) => 1,
         turso_core::Value::Float(_) => 2,
         turso_core::Value::Text(_) => 3,
         turso_core::Value::Blob(_) => 4,
+        #[cfg(feature = "u128-support")]
+        turso_core::Value::U128(_) => 3, //text? i m not sure but i think this is how it should be?
     }
 }
 
@@ -1028,6 +1041,14 @@ pub unsafe extern "C" fn sqlite3_column_text(
     };
     match row.get::<&Value>(idx as usize) {
         Ok(turso_core::Value::Text(text)) => text.as_str().as_ptr(),
+        #[cfg(feature = "u128-support")]
+        Ok(turso_core::Value::U128(i)) => {
+            let s = i.to_string();
+            let c_string = CString::new(s).unwrap();
+            let ptr = c_string.as_ptr();
+            stmt.u128_strings.push(c_string);
+            ptr as *const ffi::c_uchar
+        }
         _ => std::ptr::null(),
     }
 }

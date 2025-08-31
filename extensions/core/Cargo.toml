@@ -11,6 +11,7 @@ description = "Limbo extensions core"
 vfs = []
 core_only = []
 static = []
+u128-support = [] 
 
 [dependencies]
 turso_macros = { workspace = true }

@@ -1514,6 +1514,8 @@ fn print_row(row: &[SimValue]) -> String {
         .map(|v| match &v.0 {
             types::Value::Null => "NULL".to_string(),
             types::Value::Integer(i) => i.to_string(),
+            #[cfg(feature = "u128-support")]
+            types::Value::U128(i) => i.to_string(),
             types::Value::Float(f) => f.to_string(),
             types::Value::Text(t) => t.to_string(),
             types::Value::Blob(b) => format!(

@@ -698,6 +698,17 @@ pub fn insn_to_str(
                 0,
                 format!("r[{dest}]={value}"),
             ),
+
+            #[cfg(feature = "u128-support")]
+            Insn::U128 { value, dest } => (
+                "U128",
+                0,
+                *dest as i32,
+                0,
+                Value::build_text(value.to_string()),
+                0,
+                format!("r[{dest}]={value}"),
+            ),
             Insn::Real { value, dest } => (
                 "Real",
                 0,

@@ -1,15 +1,49 @@
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv6Addr};
 
 use ipnetwork::IpNetwork;
 use turso_ext::{register_extension, scalar, ResultCode, Value};
 
+#[cfg(feature = "u128-support")]
+register_extension! {
+    scalars: { ip_contains, ip_family, ip_host, ip_masklen, ip_network, ipv6_to_u128, u128_to_ipv6 },
+}
+
+#[cfg(not(feature = "u128-support"))]
 register_extension! {
     scalars: { ip_contains, ip_family, ip_host, ip_masklen, ip_network },
 }
 
+#[cfg(feature = "u128-support")]
+#[scalar(name = "ipv6_to_u128")]
+fn ipv6_to_u128(args: &[Value]) -> Value {
+    let Some(ip_text) = args.get(0).and_then(|v| v.to_text()) else {
+        return Value::error(ResultCode::InvalidArgs);
+    };
+
+    match ip_text.parse::<IpAddr>() {
+        Ok(IpAddr::V6(ipv6)) => Value::from_u128(u128::from(ipv6)),
+        _ => Value::null(),
+    }
+}
+
+#[cfg(feature = "u128-support")]
+#[scalar(name = "u128_to_ipv6")]
+fn u128_to_ipv6(args: &[Value]) -> Value {
+    let Some(value) = args.get(0) else {
+        return Value::error(ResultCode::InvalidArgs);
+    };
+
+    if let Some(num) = value.to_u128() {
+        let ipv6 = Ipv6Addr::from(num);
+        Value::from_text(ipv6.to_string())
+    } else {
+        Value::null()
+    }
+}
+
 #[scalar(name = "ipcontains")]
 fn ip_contains(args: &[Value]) -> Value {
-    let Some(cidr_arg) = args[0].to_text() else {
+    let Some(cidr_arg) = args.get(0).and_then(|v| v.to_text()) else {
         return Value::error(ResultCode::InvalidArgs);
     };
 
@@ -17,7 +51,7 @@ fn ip_contains(args: &[Value]) -> Value {
         return Value::error(ResultCode::InvalidArgs);
     };
 
-    let Some(ip_arg) = args[1].to_text() else {
+    let Some(ip_arg) = args.get(1).and_then(|v| v.to_text()) else {
         return Value::error(ResultCode::InvalidArgs);
     };
 
@@ -30,7 +64,7 @@ fn ip_contains(args: &[Value]) -> Value {
 
 #[scalar(name = "ipfamily")]
 fn ip_family(args: &[Value]) -> Value {
-    let Some(ip_addr) = args[0].to_text() else {
+    let Some(ip_addr) = args.get(0).and_then(|v| v.to_text()) else {
         return Value::error(ResultCode::InvalidArgs);
     };
 
@@ -43,7 +77,7 @@ fn ip_family(args: &[Value]) -> Value {
 
 #[scalar(name = "iphost")]
 fn ip_host(args: &[Value]) -> Value {
-    let Some(cidr_arg) = args[0].to_text() else {
+    let Some(cidr_arg) = args.get(0).and_then(|v| v.to_text()) else {
         return Value::error(ResultCode::InvalidArgs);
     };
 
@@ -51,12 +85,12 @@ fn ip_host(args: &[Value]) -> Value {
         return Value::error(ResultCode::InvalidArgs);
     };
 
-    return Value::from_text(network.ip().to_string());
+    Value::from_text(network.ip().to_string())
 }
 
 #[scalar(name = "ipmasklen")]
 fn ip_masklen(args: &[Value]) -> Value {
-    let Some(cidr_arg) = args[0].to_text() else {
+    let Some(cidr_arg) = args.get(0).and_then(|v| v.to_text()) else {
         return Value::error(ResultCode::InvalidArgs);
     };
 
@@ -69,7 +103,7 @@ fn ip_masklen(args: &[Value]) -> Value {
 
 #[scalar(name = "ipnetwork")]
 fn ip_network(args: &[Value]) -> Value {
-    let Some(cidr_arg) = args[0].to_text() else {
+    let Some(cidr_arg) = args.get(0).and_then(|v| v.to_text()) else {
         return Value::error(ResultCode::InvalidArgs);
     };
 
