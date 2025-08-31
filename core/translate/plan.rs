@@ -4,6 +4,7 @@ use turso_parser::ast::{self, SortOrder};
 use crate::{
     function::AggFunc,
     schema::{BTreeTable, Column, FromClauseSubquery, Index, Table},
+    translate::optimizer::constraints::SeekRangeConstraint,
     vdbe::{
         builder::{CursorKey, CursorType, ProgramBuilder},
         insn::{IdxInsertFlags, Insn},
@@ -773,7 +774,7 @@ impl Operation {
                 let Some(index) = index else {
                     return false;
                 };
-                index.unique && seek_def.seek.as_ref().is_some_and(|seek| seek.op.eq_only())
+                index.unique && seek_def.start.op.eq_only()
             }
         }
     }
@@ -950,54 +951,86 @@ impl JoinedTable {
 /// A definition of a rowid/index search.
 ///
 /// [SeekKey] is the condition that is used to seek to a specific row in a table/index.
-/// [TerminationKey] is the condition that is used to terminate the search after a seek.
+/// [SeekKey] also used to represent range scan termination condition.
 #[derive(Debug, Clone)]
 pub struct SeekDef {
-    /// The key to use when seeking and when terminating the scan that follows the seek.
+    /// Common prefix of the key which is shared between start/end fields
     /// For example, given:
     /// - CREATE INDEX i ON t (x, y desc)
     /// - SELECT * FROM t WHERE x = 1 AND y >= 30
-    ///
-    /// The key is [(1, ASC), (30, DESC)]
-    pub key: Vec<(ast::Expr, SortOrder)>,
+    /// Then, prefix=[(eq=1, ASC)], start=Some((ge, Expr(30))), end=Some((gt, Sentinel))
+    pub prefix: Vec<SeekRangeConstraint>,
     /// The condition to use when seeking. See [SeekKey] for more details.
-    pub seek: Option<SeekKey>,
-    /// The condition to use when terminating the scan that follows the seek. See [TerminationKey] for more details.
-    pub termination: Option<TerminationKey>,
+    pub start: SeekKey,
+    /// The condition to use when terminating the scan that follows the seek. See [SeekKey] for more details.
+    pub end: SeekKey,
     /// The direction of the scan that follows the seek.
     pub iter_dir: IterationDirection,
+}
+
+pub struct SeekDefKeyIterator<'a> {
+    seek_def: &'a SeekDef,
+    seek_key: &'a SeekKey,
+    pos: usize,
+}
+
+impl<'a> Iterator for SeekDefKeyIterator<'a> {
+    type Item = SeekKeyComponent<&'a ast::Expr>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let result = if self.pos < self.seek_def.prefix.len() {
+            Some(SeekKeyComponent::Expr(
+                &self.seek_def.prefix[self.pos].eq.as_ref().unwrap().1,
+            ))
+        } else if self.pos == self.seek_def.prefix.len() {
+            match &self.seek_key.last_component {
+                SeekKeyComponent::Expr(expr) => Some(SeekKeyComponent::Expr(expr)),
+                SeekKeyComponent::Sentinel => Some(SeekKeyComponent::Sentinel),
+                SeekKeyComponent::None => None,
+            }
+        } else {
+            None
+        };
+        self.pos += 1;
+        result
+    }
+}
+
+impl SeekDef {
+    /// returns amount of values in the given seek key
+    /// - so, for SELECT * FROM t WHERE x = 10 AND y = 20 AND y >= 30 there will be 3 values (10, 20, 30)
+    pub fn size<'a>(&self, key: &'a SeekKey) -> usize {
+        self.prefix.len()
+            + match key.last_component {
+                SeekKeyComponent::Expr(_) | SeekKeyComponent::Sentinel => 1,
+                SeekKeyComponent::None => 0,
+            }
+    }
+    /// iterate over value expressions in the given seek key
+    pub fn iter<'a>(&'a self, key: &'a SeekKey) -> SeekDefKeyIterator<'a> {
+        SeekDefKeyIterator {
+            seek_def: self,
+            seek_key: key,
+            pos: 0,
+        }
+    }
+}
+
+// TODO: add comment
+#[derive(Debug, Clone)]
+pub enum SeekKeyComponent<E> {
+    Expr(E),
+    Sentinel,
+    None,
 }
 
 /// A condition to use when seeking.
 #[derive(Debug, Clone)]
 pub struct SeekKey {
-    /// How many columns from [SeekDef::key] are used in seeking.
-    pub len: usize,
-    /// Whether to NULL pad the last column of the seek key to match the length of [SeekDef::key].
-    /// The reason it is done is that sometimes our full index key is not used in seeking,
-    /// but we want to find the lowest value that matches the non-null prefix of the key.
-    /// For example, given:
-    /// - CREATE INDEX i ON t (x, y)
-    /// - SELECT * FROM t WHERE x = 1 AND y < 30
-    ///
-    /// We want to seek to the first row where x = 1, and then iterate forwards.
-    /// In this case, the seek key is GT(1, NULL) since NULL is always LT in index key comparisons.
-    /// We can't use just GT(1) because in index key comparisons, only the given number of columns are compared,
-    /// so this means any index keys with (x=1) will compare equal, e.g. (x=1, y=usize::MAX) will compare equal to the seek key (x:1)
-    pub null_pad: bool,
-    /// The comparison operator to use when seeking.
-    pub op: SeekOp,
-}
+    // TODO: add comment!
+    pub last_component: SeekKeyComponent<ast::Expr>,
 
-#[derive(Debug, Clone)]
-/// A condition to use when terminating the scan that follows a seek.
-pub struct TerminationKey {
-    /// How many columns from [SeekDef::key] are used in terminating the scan that follows the seek.
-    pub len: usize,
-    /// Whether to NULL pad the last column of the termination key to match the length of [SeekDef::key].
-    /// See [SeekKey::null_pad].
-    pub null_pad: bool,
-    /// The comparison operator to use when terminating the scan that follows the seek.
+    /// The comparison operator to use when seeking.
     pub op: SeekOp,
 }
 
