@@ -985,7 +985,6 @@ impl<'a> Iterator for SeekDefKeyIterator<'a> {
         } else if self.pos == self.seek_def.prefix.len() {
             match &self.seek_key.last_component {
                 SeekKeyComponent::Expr(expr) => Some(SeekKeyComponent::Expr(expr)),
-                SeekKeyComponent::Sentinel => Some(SeekKeyComponent::Sentinel),
                 SeekKeyComponent::None => None,
             }
         } else {
@@ -1002,7 +1001,7 @@ impl SeekDef {
     pub fn size<'a>(&self, key: &'a SeekKey) -> usize {
         self.prefix.len()
             + match key.last_component {
-                SeekKeyComponent::Expr(_) | SeekKeyComponent::Sentinel => 1,
+                SeekKeyComponent::Expr(_) => 1,
                 SeekKeyComponent::None => 0,
             }
     }
@@ -1020,7 +1019,6 @@ impl SeekDef {
 #[derive(Debug, Clone)]
 pub enum SeekKeyComponent<E> {
     Expr(E),
-    Sentinel,
     None,
 }
 

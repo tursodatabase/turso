@@ -14,8 +14,12 @@ use crate::{
     parameters::PARAM_PREFIX,
     schema::{Index, IndexColumn, Schema, Table},
     translate::{
-        expr::walk_expr_mut, optimizer::access_method::AccessMethodParams,
-        optimizer::constraints::TableConstraints, plan::Scan, plan::TerminationKey,
+        expr::walk_expr_mut,
+        optimizer::{
+            access_method::AccessMethodParams,
+            constraints::{RangeConstraintRef, SeekRangeConstraint, TableConstraints},
+        },
+        plan::{Scan, SeekKeyComponent},
     },
     types::SeekOp,
     LimboError, Result,
@@ -326,31 +330,33 @@ fn optimize_table_access(
                         });
                         continue;
                     }
-                    let ephemeral_index = ephemeral_index_build(
-                        &joined_tables[table_idx],
-                        &table_constraints.constraints,
-                        usable_constraint_refs,
-                    );
+                    let ephemeral_index =
+                        ephemeral_index_build(&joined_tables[table_idx], &usable_constraint_refs);
                     let ephemeral_index = Arc::new(ephemeral_index);
                     joined_tables[table_idx].op = Operation::Search(Search::Seek {
                         index: Some(ephemeral_index),
                         seek_def: build_seek_def_from_constraints(
                             &table_constraints.constraints,
-                            usable_constraint_refs,
+                            &usable_constraint_refs,
                             *iter_dir,
                             where_clause,
                         )?,
                     });
                 } else {
                     for cref in constraint_refs.iter() {
-                        let constraint =
-                            &constraints_per_table[table_idx].constraints[cref.constraint_vec_pos];
-                        assert!(
-                            !where_clause[constraint.where_clause_pos.0].consumed,
-                            "trying to consume a where clause term twice: {:?}",
-                            where_clause[constraint.where_clause_pos.0]
-                        );
-                        where_clause[constraint.where_clause_pos.0].consumed = true;
+                        for constraint_vec_pos in &[cref.eq, cref.lower_bound, cref.upper_bound] {
+                            let Some(constraint_vec_pos) = constraint_vec_pos else {
+                                continue;
+                            };
+                            let constraint =
+                                &constraints_per_table[table_idx].constraints[*constraint_vec_pos];
+                            assert!(
+                                !where_clause[constraint.where_clause_pos.0].consumed,
+                                "trying to consume a where clause term twice: {:?}",
+                                where_clause[constraint.where_clause_pos.0]
+                            );
+                            where_clause[constraint.where_clause_pos.0].consumed = true;
+                        }
                     }
                     if let Some(index) = &index {
                         joined_tables[table_idx].op = Operation::Search(Search::Seek {
@@ -368,13 +374,14 @@ fn optimize_table_access(
                         constraint_refs.len() == 1,
                         "expected exactly one constraint for rowid seek, got {constraint_refs:?}"
                     );
-                    let constraint = &constraints_per_table[table_idx].constraints
-                        [constraint_refs[0].constraint_vec_pos];
-                    joined_tables[table_idx].op = match constraint.operator {
-                        ast::Operator::Equals => Operation::Search(Search::RowidEq {
-                            cmp_expr: constraint.get_constraining_expr(where_clause),
-                        }),
-                        _ => Operation::Search(Search::Seek {
+                    joined_tables[table_idx].op = if let Some(eq) = constraint_refs[0].eq {
+                        Operation::Search(Search::RowidEq {
+                            cmp_expr: constraints_per_table[table_idx].constraints[eq]
+                                .get_constraining_expr(where_clause)
+                                .1,
+                        })
+                    } else {
+                        Operation::Search(Search::Seek {
                             index: None,
                             seek_def: build_seek_def_from_constraints(
                                 &constraints_per_table[table_idx].constraints,
@@ -382,7 +389,7 @@ fn optimize_table_access(
                                 *iter_dir,
                                 where_clause,
                             )?,
-                        }),
+                        })
                     };
                 }
             }
@@ -454,7 +461,7 @@ fn build_vtab_scan_op(
         if usage.omit {
             where_clause[constraint.where_clause_pos.0].consumed = true;
         }
-        let expr = constraint.get_constraining_expr(where_clause);
+        let (_, expr) = constraint.get_constraining_expr(where_clause);
         constraints[zero_based_argv_index] = Some(expr);
         arg_count += 1;
     }
@@ -867,8 +874,7 @@ impl Optimizable for ast::Expr {
 
 fn ephemeral_index_build(
     table_reference: &JoinedTable,
-    constraints: &[Constraint],
-    constraint_refs: &[ConstraintRef],
+    constraint_refs: &[RangeConstraintRef],
 ) -> Index {
     let mut ephemeral_columns: Vec<IndexColumn> = table_reference
         .columns()
@@ -889,11 +895,11 @@ fn ephemeral_index_build(
         let a_constraint = constraint_refs
             .iter()
             .enumerate()
-            .find(|(_, c)| constraints[c.constraint_vec_pos].table_col_pos == a.pos_in_table);
+            .find(|(_, c)| c.table_col_pos == a.pos_in_table);
         let b_constraint = constraint_refs
             .iter()
             .enumerate()
-            .find(|(_, c)| constraints[c.constraint_vec_pos].table_col_pos == b.pos_in_table);
+            .find(|(_, c)| c.table_col_pos == b.pos_in_table);
         match (a_constraint, b_constraint) {
             (Some(_), None) => Ordering::Less,
             (None, Some(_)) => Ordering::Greater,
@@ -924,7 +930,7 @@ fn ephemeral_index_build(
 /// Build a [SeekDef] for a given list of [Constraint]s
 pub fn build_seek_def_from_constraints(
     constraints: &[Constraint],
-    constraint_refs: &[ConstraintRef],
+    constraint_refs: &[RangeConstraintRef],
     iter_dir: IterationDirection,
     where_clause: &[WhereTerm],
 ) -> Result<SeekDef> {
@@ -935,471 +941,289 @@ pub fn build_seek_def_from_constraints(
     // Extract the key values and operators
     let key = constraint_refs
         .iter()
-        .map(|cref| cref.as_seek_key_column(constraints, where_clause))
+        .map(|cref| cref.as_seek_range_constraint(constraints, where_clause))
         .collect();
 
-    // We know all but potentially the last term is an equality, so we can use the operator of the last term
-    // to form the SeekOp
-    let op = constraints[constraint_refs.last().unwrap().constraint_vec_pos].operator;
-
-    let seek_def = build_seek_def(op, iter_dir, key)?;
+    let seek_def = build_seek_def(iter_dir, key)?;
     Ok(seek_def)
 }
 
-/// Build a [SeekDef] for a given comparison operator and index key.
+/// Build a [SeekDef] for a given [SeekRangeConstraint] and [IterationDirection].
 /// To be usable as a seek key, all but potentially the last term must be equalities.
-/// The last term can be a nonequality.
-/// The comparison operator referred to by `op` is the operator of the last term.
+/// The last term can be a nonequality (range with potentially one unbounded range).
 ///
 /// There are two parts to the seek definition:
-/// 1. The [SeekKey], which specifies the key that we will use to seek to the first row that matches the index key.
-/// 2. The [TerminationKey], which specifies the key that we will use to terminate the index scan that follows the seek.
+/// 1. start [SeekKey], which specifies the key that we will use to seek to the first row that matches the index key.
+/// 2. end [SeekKey], which specifies the key that we will use to terminate the index scan that follows the seek.
 ///
-/// There are some nuances to how, and which parts of, the index key can be used in the [SeekKey] and [TerminationKey],
+/// There are some nuances to how, and which parts of, the index key can be used in the start and end [SeekKey]s,
 /// depending on the operator and iteration order. This function explains those nuances inline when dealing with
 /// each case.
 ///
 /// But to illustrate the general idea, consider the following examples:
 ///
 /// 1. For example, having two conditions like (x>10 AND y>20) cannot be used as a valid [SeekKey] GT(x:10, y:20)
-///    because the first row greater than (x:10, y:20) might be (x:10, y:21), which does not satisfy the where clause.
+///    because the first row greater than (x:10, y:20) might be (x:11, y:19), which does not satisfy the where clause.
 ///    In this case, only GT(x:10) must be used as the [SeekKey], and rows with y <= 20 must be filtered as a regular condition expression for each value of x.
 ///
 /// 2. In contrast, having (x=10 AND y>20) forms a valid index key GT(x:10, y:20) because after the seek, we can simply terminate as soon as x > 10,
-///    i.e. use GT(x:10, y:20) as the [SeekKey] and GT(x:10) as the [TerminationKey].
+///    i.e. use GT(x:10, y:20) as the start [SeekKey] and GT(x:10) as the end.
 ///
 /// The preceding examples are for an ascending index. The logic is similar for descending indexes, but an important distinction is that
 /// since a descending index is laid out in reverse order, the comparison operators are reversed, e.g. LT becomes GT, LE becomes GE, etc.
 /// So when you see e.g. a SeekOp::GT below for a descending index, it actually means that we are seeking the first row where the index key is LESS than the seek key.
 ///
 fn build_seek_def(
-    op: ast::Operator,
     iter_dir: IterationDirection,
-    key: Vec<(ast::Expr, SortOrder)>,
+    mut key: Vec<SeekRangeConstraint>,
 ) -> Result<SeekDef> {
-    let key_len = key.len();
-    let sort_order_of_last_key = key.last().unwrap().1;
+    assert!(key.len() >= 1);
+    let last = key.last().unwrap();
+
+    // if we searching for exact key - emit definition immediately with prefix as a full key
+    if last.eq.is_some() {
+        return Ok(SeekDef {
+            prefix: key,
+            iter_dir,
+            start: SeekKey {
+                last_component: SeekKeyComponent::None,
+                op: SeekOp::GE { eq_only: true },
+            },
+            end: SeekKey {
+                last_component: SeekKeyComponent::None,
+                op: SeekOp::GT,
+            },
+        });
+    }
+    assert!(last.lower_bound.is_some() || last.upper_bound.is_some());
+
+    // pop last key as we will do some form of range search
+    let last = key.pop().unwrap();
+
+    // after that all key components must be equality constraints
+    debug_assert!(key.iter().all(|k| k.eq.is_some()));
 
     // For the commented examples below, keep in mind that since a descending index is laid out in reverse order, the comparison operators are reversed, e.g. LT becomes GT, LE becomes GE, etc.
     // Also keep in mind that index keys are compared based on the number of columns given, so for example:
     // - if key is GT(x:10), then (x=10, y=usize::MAX) is not GT because only X is compared. (x=11, y=<any>) is GT.
     // - if key is GT(x:10, y:20), then (x=10, y=21) is GT because both X and Y are compared.
     // - if key is GT(x:10, y:NULL), then (x=10, y=0) is GT because NULL is always LT in index key comparisons.
-    Ok(match (iter_dir, op) {
-        // Forwards, EQ:
-        // Example: (x=10 AND y=20)
-        // Seek key: start from the first GE(x:10, y:20)
-        // Termination key: end at the first GT(x:10, y:20)
-        // Ascending vs descending doesn't matter because all the comparisons are equalities.
-        (IterationDirection::Forwards, ast::Operator::Equals) => SeekDef {
-            key,
-            iter_dir,
-            seek: Some(SeekKey {
-                len: key_len,
-                null_pad: false,
-                op: SeekOp::GE { eq_only: true },
-            }),
-            termination: Some(TerminationKey {
-                len: key_len,
-                null_pad: false,
-                op: SeekOp::GT,
-            }),
-        },
-        // Forwards, GT:
-        // Ascending index example: (x=10 AND y>20)
-        // Seek key: start from the first GT(x:10, y:20), e.g. (x=10, y=21)
-        // Termination key: end at the first GT(x:10), e.g. (x=11, y=0)
-        //
-        // Descending index example: (x=10 AND y>20)
-        // Seek key: start from the first LE(x:10), e.g. (x=10, y=usize::MAX), so reversed -> GE(x:10)
-        // Termination key: end at the first LE(x:10, y:20), e.g. (x=10, y=20) so reversed -> GE(x:10, y:20)
-        (IterationDirection::Forwards, ast::Operator::Greater) => {
-            let (seek_key_len, termination_key_len, seek_op, termination_op) =
-                if sort_order_of_last_key == SortOrder::Asc {
-                    (key_len, key_len - 1, SeekOp::GT, SeekOp::GT)
-                } else {
-                    (
-                        key_len - 1,
-                        key_len,
-                        SeekOp::LE { eq_only: false }.reverse(),
-                        SeekOp::LE { eq_only: false }.reverse(),
-                    )
-                };
+    Ok(match iter_dir {
+        IterationDirection::Forwards => {
+            let (start, end) = match last.sort_order {
+                SortOrder::Asc => {
+                    let start = match last.lower_bound {
+                        // Forwards, Asc, GT: (x=10 AND y>20)
+                        // Start key: start from the first GT(x:10, y:20)
+                        Some((ast::Operator::Greater, bound)) => SeekKey {
+                            last_component: SeekKeyComponent::Expr(bound),
+                            op: SeekOp::GT,
+                        },
+                        // Forwards, Asc, GE: (x=10 AND y>=20)
+                        // Start key: start from the first GE(x:10, y:20)
+                        Some((ast::Operator::GreaterEquals, bound)) => SeekKey {
+                            last_component: SeekKeyComponent::Expr(bound),
+                            op: SeekOp::GE { eq_only: false },
+                        },
+                        // Forwards, Asc, None, (x=10 AND y<30)
+                        // Start key: start from the first GE(x:10)
+                        None => SeekKey {
+                            last_component: SeekKeyComponent::None,
+                            op: SeekOp::GE { eq_only: false },
+                        },
+                        Some((op, _)) => {
+                            crate::bail_parse_error!("build_seek_def: invalid operator: {:?}", op,)
+                        }
+                    };
+                    let end = match last.upper_bound {
+                        // Forwards, Asc, LT, (x=10 AND y<30)
+                        // End key: end at first GE(x:10, y:30)
+                        Some((ast::Operator::Less, bound)) => SeekKey {
+                            last_component: SeekKeyComponent::Expr(bound),
+                            op: SeekOp::GE { eq_only: false },
+                        },
+                        // Forwards, Asc, LE, (x=10 AND y<=30)
+                        // End key: end at first GT(x:10, y:30)
+                        Some((ast::Operator::LessEquals, bound)) => SeekKey {
+                            last_component: SeekKeyComponent::Expr(bound),
+                            op: SeekOp::GT,
+                        },
+                        // Forwards, Asc, None, (x=10 AND y>20)
+                        // End key: end at first GT(x:10)
+                        None => SeekKey {
+                            last_component: SeekKeyComponent::None,
+                            op: SeekOp::GT,
+                        },
+                        Some((op, _)) => {
+                            crate::bail_parse_error!("build_seek_def: invalid operator: {:?}", op,)
+                        }
+                    };
+                    (start, end)
+                }
+                SortOrder::Desc => {
+                    let start = match last.upper_bound {
+                        // Forwards, Desc, LT: (x=10 AND y<30)
+                        // Start key: start from the first GT(x:10, y:30)
+                        Some((ast::Operator::Less, bound)) => SeekKey {
+                            last_component: SeekKeyComponent::Expr(bound),
+                            op: SeekOp::GT,
+                        },
+                        // Forwards, Desc, LE: (x=10 AND y<=30)
+                        // Start key: start from the first GE(x:10, y:30)
+                        Some((ast::Operator::LessEquals, bound)) => SeekKey {
+                            last_component: SeekKeyComponent::Expr(bound),
+                            op: SeekOp::GE { eq_only: false },
+                        },
+                        // Forwards, Desc, None: (x=10 AND y>20)
+                        // Start key: start from the first GE(x:10)
+                        None => SeekKey {
+                            last_component: SeekKeyComponent::None,
+                            op: SeekOp::GE { eq_only: false },
+                        },
+                        Some((op, _)) => {
+                            crate::bail_parse_error!("build_seek_def: invalid operator: {:?}", op,)
+                        }
+                    };
+                    let end = match last.lower_bound {
+                        // Forwards, Asc, GT, (x=10 AND y>20)
+                        // End key: end at first GE(x:10, y:20)
+                        Some((ast::Operator::Greater, bound)) => SeekKey {
+                            last_component: SeekKeyComponent::Expr(bound),
+                            op: SeekOp::GE { eq_only: false },
+                        },
+                        // Forwards, Asc, GE, (x=10 AND y>=20)
+                        // End key: end at first GT(x:10, y:20)
+                        Some((ast::Operator::GreaterEquals, bound)) => SeekKey {
+                            last_component: SeekKeyComponent::Expr(bound),
+                            op: SeekOp::GT,
+                        },
+                        // Forwards, Asc, None, (x=10 AND y<30)
+                        // End key: end at first GT(x:10)
+                        None => SeekKey {
+                            last_component: SeekKeyComponent::None,
+                            op: SeekOp::GT,
+                        },
+                        Some((op, _)) => {
+                            crate::bail_parse_error!("build_seek_def: invalid operator: {:?}", op,)
+                        }
+                    };
+                    (start, end)
+                }
+            };
             SeekDef {
-                key,
+                prefix: key,
                 iter_dir,
-                seek: if seek_key_len > 0 {
-                    Some(SeekKey {
-                        len: seek_key_len,
-                        op: seek_op,
-                        null_pad: false,
-                    })
-                } else {
-                    None
-                },
-                termination: if termination_key_len > 0 {
-                    Some(TerminationKey {
-                        len: termination_key_len,
-                        op: termination_op,
-                        null_pad: false,
-                    })
-                } else {
-                    None
-                },
+                start,
+                end,
             }
         }
-        // Forwards, GE:
-        // Ascending index example: (x=10 AND y>=20)
-        // Seek key: start from the first GE(x:10, y:20), e.g. (x=10, y=20)
-        // Termination key: end at the first GT(x:10), e.g. (x=11, y=0)
-        //
-        // Descending index example: (x=10 AND y>=20)
-        // Seek key: start from the first LE(x:10), e.g. (x=10, y=usize::MAX), so reversed -> GE(x:10)
-        // Termination key: end at the first LT(x:10, y:20), e.g. (x=10, y=19), so reversed -> GT(x:10, y:20)
-        (IterationDirection::Forwards, ast::Operator::GreaterEquals) => {
-            let (seek_key_len, termination_key_len, seek_op, termination_op) =
-                if sort_order_of_last_key == SortOrder::Asc {
-                    (
-                        key_len,
-                        key_len - 1,
-                        SeekOp::GE { eq_only: false },
-                        SeekOp::GT,
-                    )
-                } else {
-                    (
-                        key_len - 1,
-                        key_len,
-                        SeekOp::LE { eq_only: false }.reverse(),
-                        SeekOp::LT.reverse(),
-                    )
-                };
+        IterationDirection::Backwards => {
+            let (start, end) = match last.sort_order {
+                SortOrder::Asc => {
+                    let start = match last.upper_bound {
+                        // Backwards, Asc, LT: (x=10 AND y<30)
+                        // Start key: start from the first LT(x:10, y:30)
+                        Some((ast::Operator::Less, bound)) => SeekKey {
+                            last_component: SeekKeyComponent::Expr(bound),
+                            op: SeekOp::LT,
+                        },
+                        // Backwards, Asc, LT: (x=10 AND y<=30)
+                        // Start key: start from the first LE(x:10, y:30)
+                        Some((ast::Operator::LessEquals, bound)) => SeekKey {
+                            last_component: SeekKeyComponent::Expr(bound),
+                            op: SeekOp::LE { eq_only: false },
+                        },
+                        // Backwards, Asc, None: (x=10 AND y>20)
+                        // Start key: start from the first LE(x:10)
+                        None => SeekKey {
+                            last_component: SeekKeyComponent::None,
+                            op: SeekOp::LE { eq_only: false },
+                        },
+                        Some((op, _)) => {
+                            crate::bail_parse_error!("build_seek_def: invalid operator: {:?}", op)
+                        }
+                    };
+                    let end = match last.lower_bound {
+                        // Backwards, Asc, GT, (x=10 AND y>20)
+                        // End key: end at first LE(x:10, y:20)
+                        Some((ast::Operator::Greater, bound)) => SeekKey {
+                            last_component: SeekKeyComponent::Expr(bound),
+                            op: SeekOp::LE { eq_only: false },
+                        },
+                        // Backwards, Asc, GT, (x=10 AND y>=20)
+                        // End key: end at first LT(x:10, y:20)
+                        Some((ast::Operator::GreaterEquals, bound)) => SeekKey {
+                            last_component: SeekKeyComponent::Expr(bound),
+                            op: SeekOp::LT,
+                        },
+                        // Backwards, Asc, None, (x=10 AND y<30)
+                        // End key: end at first LT(x:10)
+                        None => SeekKey {
+                            last_component: SeekKeyComponent::None,
+                            op: SeekOp::GT,
+                        },
+                        Some((op, _)) => {
+                            crate::bail_parse_error!("build_seek_def: invalid operator: {:?}", op,)
+                        }
+                    };
+                    (start, end)
+                }
+                SortOrder::Desc => {
+                    let start = match last.lower_bound {
+                        // Backwards, Desc, LT: (x=10 AND y>20)
+                        // Start key: start from the first LT(x:10, y:20)
+                        Some((ast::Operator::Greater, bound)) => SeekKey {
+                            last_component: SeekKeyComponent::Expr(bound),
+                            op: SeekOp::LT,
+                        },
+                        // Backwards, Desc, LE: (x=10 AND y>=20)
+                        // Start key: start from the first LE(x:10, y:20)
+                        Some((ast::Operator::GreaterEquals, bound)) => SeekKey {
+                            last_component: SeekKeyComponent::Expr(bound),
+                            op: SeekOp::LE { eq_only: false },
+                        },
+                        // Backwards, Desc, LE: (x=10 AND y<30)
+                        // Start key: start from the first LE(x:10)
+                        None => SeekKey {
+                            last_component: SeekKeyComponent::None,
+                            op: SeekOp::LE { eq_only: false },
+                        },
+                        Some((op, _)) => {
+                            crate::bail_parse_error!("build_seek_def: invalid operator: {:?}", op,)
+                        }
+                    };
+                    let end = match last.upper_bound {
+                        // Backwards, Desc, LT, (x=10 AND y<30)
+                        // End key: end at first LE(x:10, y:30)
+                        Some((ast::Operator::Less, bound)) => SeekKey {
+                            last_component: SeekKeyComponent::Expr(bound),
+                            op: SeekOp::LE { eq_only: false },
+                        },
+                        // Backwards, Desc, LT, (x=10 AND y<=30)
+                        // End key: end at first LT(x:10, y:30)
+                        Some((ast::Operator::LessEquals, bound)) => SeekKey {
+                            last_component: SeekKeyComponent::Expr(bound),
+                            op: SeekOp::LT,
+                        },
+                        // Backwards, Desc, LT, (x=10 AND y>20)
+                        // End key: end at first LT(x:10)
+                        None => SeekKey {
+                            last_component: SeekKeyComponent::None,
+                            op: SeekOp::LT,
+                        },
+                        Some((op, _)) => {
+                            crate::bail_parse_error!("build_seek_def: invalid operator: {:?}", op,)
+                        }
+                    };
+                    (start, end)
+                }
+            };
             SeekDef {
-                key,
+                prefix: key,
                 iter_dir,
-                seek: if seek_key_len > 0 {
-                    Some(SeekKey {
-                        len: seek_key_len,
-                        op: seek_op,
-                        null_pad: false,
-                    })
-                } else {
-                    None
-                },
-                termination: if termination_key_len > 0 {
-                    Some(TerminationKey {
-                        len: termination_key_len,
-                        op: termination_op,
-                        null_pad: false,
-                    })
-                } else {
-                    None
-                },
+                start,
+                end,
             }
-        }
-        // Forwards, LT:
-        // Ascending index example: (x=10 AND y<20)
-        // Seek key: start from the first GT(x:10, y: NULL), e.g. (x=10, y=0)
-        // Termination key: end at the first GE(x:10, y:20), e.g. (x=10, y=20)
-        //
-        // Descending index example: (x=10 AND y<20)
-        // Seek key: start from the first LT(x:10, y:20), e.g. (x=10, y=19) so reversed -> GT(x:10, y:20)
-        // Termination key: end at the first LT(x:10), e.g. (x=9, y=usize::MAX), so reversed -> GE(x:10, NULL); i.e. GE the smallest possible (x=10, y) combination (NULL is always LT)
-        (IterationDirection::Forwards, ast::Operator::Less) => {
-            let (seek_key_len, termination_key_len, seek_op, termination_op) =
-                if sort_order_of_last_key == SortOrder::Asc {
-                    (
-                        key_len - 1,
-                        key_len,
-                        SeekOp::GT,
-                        SeekOp::GE { eq_only: false },
-                    )
-                } else {
-                    (
-                        key_len,
-                        key_len - 1,
-                        SeekOp::GT,
-                        SeekOp::GE { eq_only: false },
-                    )
-                };
-            SeekDef {
-                key,
-                iter_dir,
-                seek: if seek_key_len > 0 {
-                    Some(SeekKey {
-                        len: seek_key_len,
-                        op: seek_op,
-                        null_pad: sort_order_of_last_key == SortOrder::Asc,
-                    })
-                } else {
-                    None
-                },
-                termination: if termination_key_len > 0 {
-                    Some(TerminationKey {
-                        len: termination_key_len,
-                        op: termination_op,
-                        null_pad: sort_order_of_last_key == SortOrder::Desc,
-                    })
-                } else {
-                    None
-                },
-            }
-        }
-        // Forwards, LE:
-        // Ascending index example: (x=10 AND y<=20)
-        // Seek key: start from the first GE(x:10, y:NULL), e.g. (x=10, y=0)
-        // Termination key: end at the first GT(x:10, y:20), e.g. (x=10, y=21)
-        //
-        // Descending index example: (x=10 AND y<=20)
-        // Seek key: start from the first LE(x:10, y:20), e.g. (x=10, y=20) so reversed -> GE(x:10, y:20)
-        // Termination key: end at the first LT(x:10), e.g. (x=9, y=usize::MAX), so reversed -> GE(x:10, NULL); i.e. GE the smallest possible (x=10, y) combination (NULL is always LT)
-        (IterationDirection::Forwards, ast::Operator::LessEquals) => {
-            let (seek_key_len, termination_key_len, seek_op, termination_op) =
-                if sort_order_of_last_key == SortOrder::Asc {
-                    (key_len - 1, key_len, SeekOp::GT, SeekOp::GT)
-                } else {
-                    (
-                        key_len,
-                        key_len - 1,
-                        SeekOp::LE { eq_only: false }.reverse(),
-                        SeekOp::LE { eq_only: false }.reverse(),
-                    )
-                };
-            SeekDef {
-                key,
-                iter_dir,
-                seek: if seek_key_len > 0 {
-                    Some(SeekKey {
-                        len: seek_key_len,
-                        op: seek_op,
-                        null_pad: sort_order_of_last_key == SortOrder::Asc,
-                    })
-                } else {
-                    None
-                },
-                termination: if termination_key_len > 0 {
-                    Some(TerminationKey {
-                        len: termination_key_len,
-                        op: termination_op,
-                        null_pad: sort_order_of_last_key == SortOrder::Desc,
-                    })
-                } else {
-                    None
-                },
-            }
-        }
-        // Backwards, EQ:
-        // Example: (x=10 AND y=20)
-        // Seek key: start from the last LE(x:10, y:20)
-        // Termination key: end at the first LT(x:10, y:20)
-        // Ascending vs descending doesn't matter because all the comparisons are equalities.
-        (IterationDirection::Backwards, ast::Operator::Equals) => SeekDef {
-            key,
-            iter_dir,
-            seek: Some(SeekKey {
-                len: key_len,
-                op: SeekOp::LE { eq_only: true },
-                null_pad: false,
-            }),
-            termination: Some(TerminationKey {
-                len: key_len,
-                op: SeekOp::LT,
-                null_pad: false,
-            }),
-        },
-        // Backwards, LT:
-        // Ascending index example: (x=10 AND y<20)
-        // Seek key: start from the last LT(x:10, y:20), e.g. (x=10, y=19)
-        // Termination key: end at the first LE(x:10, NULL), e.g. (x=9, y=usize::MAX)
-        //
-        // Descending index example: (x=10 AND y<20)
-        // Seek key: start from the last GT(x:10, y:NULL), e.g. (x=10, y=0) so reversed -> LT(x:10, NULL)
-        // Termination key: end at the first GE(x:10, y:20), e.g. (x=10, y=20) so reversed -> LE(x:10, y:20)
-        (IterationDirection::Backwards, ast::Operator::Less) => {
-            let (seek_key_len, termination_key_len, seek_op, termination_op) =
-                if sort_order_of_last_key == SortOrder::Asc {
-                    (
-                        key_len,
-                        key_len - 1,
-                        SeekOp::LT,
-                        SeekOp::LE { eq_only: false },
-                    )
-                } else {
-                    (
-                        key_len - 1,
-                        key_len,
-                        SeekOp::GT.reverse(),
-                        SeekOp::GE { eq_only: false }.reverse(),
-                    )
-                };
-            SeekDef {
-                key,
-                iter_dir,
-                seek: if seek_key_len > 0 {
-                    Some(SeekKey {
-                        len: seek_key_len,
-                        op: seek_op,
-                        null_pad: sort_order_of_last_key == SortOrder::Desc,
-                    })
-                } else {
-                    None
-                },
-                termination: if termination_key_len > 0 {
-                    Some(TerminationKey {
-                        len: termination_key_len,
-                        op: termination_op,
-                        null_pad: sort_order_of_last_key == SortOrder::Asc,
-                    })
-                } else {
-                    None
-                },
-            }
-        }
-        // Backwards, LE:
-        // Ascending index example: (x=10 AND y<=20)
-        // Seek key: start from the last LE(x:10, y:20), e.g. (x=10, y=20)
-        // Termination key: end at the first LT(x:10, NULL), e.g. (x=9, y=usize::MAX)
-        //
-        // Descending index example: (x=10 AND y<=20)
-        // Seek key: start from the last GT(x:10, NULL), e.g. (x=10, y=0) so reversed -> LT(x:10, NULL)
-        // Termination key: end at the first GT(x:10, y:20), e.g. (x=10, y=21) so reversed -> LT(x:10, y:20)
-        (IterationDirection::Backwards, ast::Operator::LessEquals) => {
-            let (seek_key_len, termination_key_len, seek_op, termination_op) =
-                if sort_order_of_last_key == SortOrder::Asc {
-                    (
-                        key_len,
-                        key_len - 1,
-                        SeekOp::LE { eq_only: false },
-                        SeekOp::LE { eq_only: false },
-                    )
-                } else {
-                    (
-                        key_len - 1,
-                        key_len,
-                        SeekOp::GT.reverse(),
-                        SeekOp::GT.reverse(),
-                    )
-                };
-            SeekDef {
-                key,
-                iter_dir,
-                seek: if seek_key_len > 0 {
-                    Some(SeekKey {
-                        len: seek_key_len,
-                        op: seek_op,
-                        null_pad: sort_order_of_last_key == SortOrder::Desc,
-                    })
-                } else {
-                    None
-                },
-                termination: if termination_key_len > 0 {
-                    Some(TerminationKey {
-                        len: termination_key_len,
-                        op: termination_op,
-                        null_pad: sort_order_of_last_key == SortOrder::Asc,
-                    })
-                } else {
-                    None
-                },
-            }
-        }
-        // Backwards, GT:
-        // Ascending index example: (x=10 AND y>20)
-        // Seek key: start from the last LE(x:10), e.g. (x=10, y=usize::MAX)
-        // Termination key: end at the first LE(x:10, y:20), e.g. (x=10, y=20)
-        //
-        // Descending index example: (x=10 AND y>20)
-        // Seek key: start from the last GT(x:10, y:20), e.g. (x=10, y=21) so reversed -> LT(x:10, y:20)
-        // Termination key: end at the first GT(x:10), e.g. (x=11, y=0) so reversed -> LT(x:10)
-        (IterationDirection::Backwards, ast::Operator::Greater) => {
-            let (seek_key_len, termination_key_len, seek_op, termination_op) =
-                if sort_order_of_last_key == SortOrder::Asc {
-                    (
-                        key_len - 1,
-                        key_len,
-                        SeekOp::LE { eq_only: false },
-                        SeekOp::LE { eq_only: false },
-                    )
-                } else {
-                    (
-                        key_len,
-                        key_len - 1,
-                        SeekOp::GT.reverse(),
-                        SeekOp::GT.reverse(),
-                    )
-                };
-            SeekDef {
-                key,
-                iter_dir,
-                seek: if seek_key_len > 0 {
-                    Some(SeekKey {
-                        len: seek_key_len,
-                        op: seek_op,
-                        null_pad: false,
-                    })
-                } else {
-                    None
-                },
-                termination: if termination_key_len > 0 {
-                    Some(TerminationKey {
-                        len: termination_key_len,
-                        op: termination_op,
-                        null_pad: false,
-                    })
-                } else {
-                    None
-                },
-            }
-        }
-        // Backwards, GE:
-        // Ascending index example: (x=10 AND y>=20)
-        // Seek key: start from the last LE(x:10), e.g. (x=10, y=usize::MAX)
-        // Termination key: end at the first LT(x:10, y:20), e.g. (x=10, y=19)
-        //
-        // Descending index example: (x=10 AND y>=20)
-        // Seek key: start from the last GE(x:10, y:20), e.g. (x=10, y=20) so reversed -> LE(x:10, y:20)
-        // Termination key: end at the first GT(x:10), e.g. (x=11, y=0) so reversed -> LT(x:10)
-        (IterationDirection::Backwards, ast::Operator::GreaterEquals) => {
-            let (seek_key_len, termination_key_len, seek_op, termination_op) =
-                if sort_order_of_last_key == SortOrder::Asc {
-                    (
-                        key_len - 1,
-                        key_len,
-                        SeekOp::LE { eq_only: false },
-                        SeekOp::LT,
-                    )
-                } else {
-                    (
-                        key_len,
-                        key_len - 1,
-                        SeekOp::GE { eq_only: false }.reverse(),
-                        SeekOp::GT.reverse(),
-                    )
-                };
-            SeekDef {
-                key,
-                iter_dir,
-                seek: if seek_key_len > 0 {
-                    Some(SeekKey {
-                        len: seek_key_len,
-                        op: seek_op,
-                        null_pad: false,
-                    })
-                } else {
-                    None
-                },
-                termination: if termination_key_len > 0 {
-                    Some(TerminationKey {
-                        len: termination_key_len,
-                        op: termination_op,
-                        null_pad: false,
-                    })
-                } else {
-                    None
-                },
-            }
-        }
-        (_, op) => {
-            crate::bail_parse_error!("build_seek_def: invalid operator: {:?}", op,)
         }
     })
 }
