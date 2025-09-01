@@ -446,6 +446,8 @@ impl PageCache {
                 self.link_front(slot);
             }
         }
+        let new_map = self.map.borrow().rehash(new_cap);
+        self.map.replace(new_map);
         // rebuild freelist from first unused slot
         let used = survivors.len().min(new_cap);
         {
