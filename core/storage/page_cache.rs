@@ -711,7 +711,7 @@ impl PageHashMap {
         }
     }
 
-    pub fn insert(&mut self, key: PageCacheKey, slot_index: SlotIndex) -> Option<SlotIndex> {
+    pub fn insert(&mut self, key: PageCacheKey, slot_index: SlotIndex) {
         let bucket = self.hash(&key);
         let bucket = &mut self.buckets[bucket];
         let mut idx = 0;
@@ -719,13 +719,12 @@ impl PageHashMap {
             if node.key == key {
                 node.slot_index = slot_index;
                 node.key = key;
-                return Some(node.slot_index);
+                return;
             }
             idx += 1;
         }
         bucket.push(HashMapNode { key, slot_index });
         self.size += 1;
-        None
     }
 
     pub fn contains_key(&self, key: &PageCacheKey) -> bool {
