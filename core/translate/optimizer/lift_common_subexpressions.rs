@@ -34,7 +34,10 @@ pub(crate) fn lift_common_subexpressions_from_binary_or_terms(
 ) -> Result<()> {
     let mut i = 0;
     while i < where_clause.len() {
-        if !matches!(where_clause[i].expr, Expr::Binary(_, Operator::Or, _)) {
+        if !matches!(
+            where_clause[i].expr.as_ref(),
+            Expr::Binary(_, Operator::Or, _)
+        ) {
             // Not an OR term, skip.
             i += 1;
             continue;
@@ -53,7 +56,7 @@ pub(crate) fn lift_common_subexpressions_from_binary_or_terms(
         // It's safe to remove parentheses with `unwrap_parens_owned` because
         // we will add them back once we reconstruct the OR term's child expressions.
         // e.g. (a AND b) OR (c AND d) becomes effectively AND [[a,b], [c,d]].
-        let all_or_operands_conjunct_lists: Vec<(Vec<Expr>, usize)> = or_operands
+        let all_or_operands_conjunct_lists: Vec<(Vec<Box<Expr>>, usize)> = or_operands
             .into_iter()
             .map(|expr| {
                 let (expr, paren_count) = unwrap_parens_owned(expr)?;
@@ -104,7 +107,7 @@ pub(crate) fn lift_common_subexpressions_from_binary_or_terms(
             // If we unwrapped parentheses before, let's add them back.
             let mut top_level_expr = rebuild_and_expr_from_list(conjunct_list_for_or_branch);
             while num_unwrapped_parens > 0 {
-                top_level_expr = Expr::Parenthesized(vec![top_level_expr.into()]);
+                top_level_expr = Box::new(Expr::Parenthesized(vec![top_level_expr.into()]));
                 num_unwrapped_parens -= 1;
             }
             new_or_operands_for_original_term.push(top_level_expr);
@@ -136,27 +139,27 @@ pub(crate) fn lift_common_subexpressions_from_binary_or_terms(
 }
 
 /// Flatten an ast::Expr::Binary(lhs, OR, rhs) into a list of disjuncts.
-fn flatten_or_expr_owned(expr: Expr) -> Result<Vec<Expr>> {
-    let Expr::Binary(lhs, Operator::Or, rhs) = expr else {
+fn flatten_or_expr_owned(expr: Box<Expr>) -> Result<Vec<Box<Expr>>> {
+    let Expr::Binary(lhs, Operator::Or, rhs) = *expr else {
         return Ok(vec![expr]);
     };
-    let mut flattened = flatten_or_expr_owned(*lhs)?;
-    flattened.extend(flatten_or_expr_owned(*rhs)?);
+    let mut flattened = flatten_or_expr_owned(lhs)?;
+    flattened.extend(flatten_or_expr_owned(rhs)?);
     Ok(flattened)
 }
 
 /// Flatten an ast::Expr::Binary(lhs, AND, rhs) into a list of conjuncts.
-fn flatten_and_expr_owned(expr: Expr) -> Result<Vec<Expr>> {
-    let Expr::Binary(lhs, Operator::And, rhs) = expr else {
+fn flatten_and_expr_owned(expr: Box<Expr>) -> Result<Vec<Box<Expr>>> {
+    let Expr::Binary(lhs, Operator::And, rhs) = *expr else {
         return Ok(vec![expr]);
     };
-    let mut flattened = flatten_and_expr_owned(*lhs)?;
-    flattened.extend(flatten_and_expr_owned(*rhs)?);
+    let mut flattened = flatten_and_expr_owned(lhs)?;
+    flattened.extend(flatten_and_expr_owned(rhs)?);
     Ok(flattened)
 }
 
 /// Rebuild an ast::Expr::Binary(lhs, AND, rhs) for a list of conjuncts.
-fn rebuild_and_expr_from_list(mut conjuncts: Vec<Expr>) -> Expr {
+fn rebuild_and_expr_from_list(mut conjuncts: Vec<Box<Expr>>) -> Box<Expr> {
     assert!(!conjuncts.is_empty());
 
     if conjuncts.len() == 1 {
@@ -165,13 +168,13 @@ fn rebuild_and_expr_from_list(mut conjuncts: Vec<Expr>) -> Expr {
 
     let mut current_expr = conjuncts.remove(0);
     for next_expr in conjuncts {
-        current_expr = Expr::Binary(Box::new(current_expr), Operator::And, Box::new(next_expr));
+        current_expr = Box::new(Expr::Binary(current_expr, Operator::And, next_expr));
     }
     current_expr
 }
 
 /// Rebuild an ast::Expr::Binary(lhs, OR, rhs) for a list of operands.
-fn rebuild_or_expr_from_list(mut operands: Vec<Expr>) -> Expr {
+fn rebuild_or_expr_from_list(mut operands: Vec<Box<Expr>>) -> Box<Expr> {
     assert!(!operands.is_empty());
 
     if operands.len() == 1 {
@@ -180,7 +183,7 @@ fn rebuild_or_expr_from_list(mut operands: Vec<Expr>) -> Expr {
 
     let mut current_expr = operands.remove(0);
     for next_expr in operands {
-        current_expr = Expr::Binary(Box::new(current_expr), Operator::Or, Box::new(next_expr));
+        current_expr = Box::new(Expr::Binary(current_expr, Operator::Or, next_expr));
     }
     current_expr
 }
@@ -245,18 +248,26 @@ mod tests {
         // Create (a = 1 AND x = 1 AND b = 1) OR (a = 1 AND y = 1 AND b = 1)
         let or_expr = Expr::Binary(
             Box::new(ast::Expr::Parenthesized(vec![rebuild_and_expr_from_list(
-                vec![a_expr.clone(), x_expr.clone(), b_expr.clone()],
+                vec![
+                    a_expr.clone().into(),
+                    x_expr.clone().into(),
+                    b_expr.clone().into(),
+                ],
             )
             .into()])),
             Operator::Or,
             Box::new(ast::Expr::Parenthesized(vec![rebuild_and_expr_from_list(
-                vec![a_expr.clone(), y_expr.clone(), b_expr.clone()],
+                vec![
+                    a_expr.clone().into(),
+                    y_expr.clone().into(),
+                    b_expr.clone().into(),
+                ],
             )
             .into()])),
         );
 
         let mut where_clause = vec![WhereTerm {
-            expr: or_expr,
+            expr: or_expr.into(),
             from_outer_join: None,
             consumed: false,
         }];
@@ -279,9 +290,10 @@ mod tests {
                 Operator::Or,
                 Box::new(ast::Expr::Parenthesized(vec![y_expr.clone().into()]))
             )
+            .into()
         );
-        assert_eq!(nonconsumed_terms[1].expr, a_expr);
-        assert_eq!(nonconsumed_terms[2].expr, b_expr);
+        assert_eq!(*nonconsumed_terms[1].expr, a_expr);
+        assert_eq!(*nonconsumed_terms[2].expr, b_expr);
 
         Ok(())
     }
@@ -341,24 +353,24 @@ mod tests {
         let or_expr = Expr::Binary(
             Box::new(Expr::Binary(
                 Box::new(ast::Expr::Parenthesized(vec![rebuild_and_expr_from_list(
-                    vec![a_expr.clone(), x_expr.clone()],
+                    vec![a_expr.clone().into(), x_expr.clone().into()],
                 )
                 .into()])),
                 Operator::Or,
                 Box::new(ast::Expr::Parenthesized(vec![rebuild_and_expr_from_list(
-                    vec![a_expr.clone(), y_expr.clone()],
+                    vec![a_expr.clone().into(), y_expr.clone().into()],
                 )
                 .into()])),
             )),
             Operator::Or,
             Box::new(ast::Expr::Parenthesized(vec![rebuild_and_expr_from_list(
-                vec![a_expr.clone(), z_expr.clone()],
+                vec![a_expr.clone().into(), z_expr.clone().into()],
             )
             .into()])),
         );
 
         let mut where_clause = vec![WhereTerm {
-            expr: or_expr,
+            expr: or_expr.into(),
             from_outer_join: None,
             consumed: false,
         }];
@@ -374,7 +386,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(nonconsumed_terms.len(), 2);
         assert_eq!(
-            nonconsumed_terms[0].expr,
+            *nonconsumed_terms[0].expr,
             Expr::Binary(
                 Box::new(Expr::Binary(
                     Box::new(ast::Expr::Parenthesized(vec![x_expr.into()])),
@@ -385,7 +397,7 @@ mod tests {
                 Box::new(ast::Expr::Parenthesized(vec![z_expr.into()])),
             )
         );
-        assert_eq!(nonconsumed_terms[1].expr, a_expr);
+        assert_eq!(*nonconsumed_terms[1].expr, a_expr);
 
         Ok(())
     }
@@ -425,7 +437,7 @@ mod tests {
         );
 
         let mut where_clause = vec![WhereTerm {
-            expr: or_expr.clone(),
+            expr: or_expr.clone().into(),
             from_outer_join: None,
             consumed: false,
         }];
@@ -438,7 +450,7 @@ mod tests {
             .filter(|term| !term.consumed)
             .collect::<Vec<_>>();
         assert_eq!(nonconsumed_terms.len(), 1);
-        assert_eq!(nonconsumed_terms[0].expr, or_expr);
+        assert_eq!(*nonconsumed_terms[0].expr, or_expr);
 
         Ok(())
     }
@@ -483,18 +495,18 @@ mod tests {
 
         let or_expr = Expr::Binary(
             Box::new(ast::Expr::Parenthesized(vec![rebuild_and_expr_from_list(
-                vec![a_expr.clone(), x_expr.clone()],
+                vec![a_expr.clone().into(), x_expr.clone().into()],
             )
             .into()])),
             Operator::Or,
             Box::new(ast::Expr::Parenthesized(vec![rebuild_and_expr_from_list(
-                vec![a_expr.clone(), y_expr.clone()],
+                vec![a_expr.clone().into(), y_expr.clone().into()],
             )
             .into()])),
         );
 
         let mut where_clause = vec![WhereTerm {
-            expr: or_expr,
+            expr: or_expr.into(),
             from_outer_join: Some(TableInternalId::default()), // Set from_outer_join
             consumed: false,
         }];
@@ -508,7 +520,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(nonconsumed_terms.len(), 2);
         assert_eq!(
-            nonconsumed_terms[0].expr,
+            *nonconsumed_terms[0].expr,
             Expr::Binary(
                 Box::new(ast::Expr::Parenthesized(vec![x_expr.into()])),
                 Operator::Or,
@@ -519,7 +531,7 @@ mod tests {
             nonconsumed_terms[0].from_outer_join,
             Some(TableInternalId::default())
         );
-        assert_eq!(nonconsumed_terms[1].expr, a_expr);
+        assert_eq!(*nonconsumed_terms[1].expr, a_expr);
         assert_eq!(
             nonconsumed_terms[1].from_outer_join,
             Some(TableInternalId::default())
@@ -546,7 +558,7 @@ mod tests {
         );
 
         let mut where_clause = vec![WhereTerm {
-            expr: single_expr.clone(),
+            expr: single_expr.clone().into(),
             from_outer_join: None,
             consumed: false,
         }];
@@ -559,7 +571,7 @@ mod tests {
             .filter(|term| !term.consumed)
             .collect::<Vec<_>>();
         assert_eq!(nonconsumed_terms.len(), 1);
-        assert_eq!(nonconsumed_terms[0].expr, single_expr);
+        assert_eq!(*nonconsumed_terms[0].expr, single_expr);
 
         Ok(())
     }
@@ -599,7 +611,7 @@ mod tests {
         );
 
         let mut where_clause = vec![WhereTerm {
-            expr: or_expr,
+            expr: or_expr.into(),
             from_outer_join: None,
             consumed: false,
         }];
@@ -611,7 +623,7 @@ mod tests {
             .filter(|term| !term.consumed)
             .collect::<Vec<_>>();
         assert_eq!(nonconsumed_terms.len(), 1);
-        assert_eq!(nonconsumed_terms[0].expr, a_expr);
+        assert_eq!(*nonconsumed_terms[0].expr, a_expr);
 
         Ok(())
     }
