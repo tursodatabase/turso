@@ -212,7 +212,7 @@ impl PageCache {
         ignore_exists: bool,
     ) -> Result<(), CacheError> {
         if !ignore_exists {
-            if let Some(existing) = self.get(&key) {
+            if let Some(existing) = self.peek(&key, false) {
                 assert!(
                     Arc::ptr_eq(&value, &existing),
                     "Attempted to insert different page with same key: {key:?}"
@@ -230,6 +230,7 @@ impl PageCache {
             turso_assert!(s.page.is_none(), "page must be None in free slot");
             s.key = key;
             s.page = Some(value);
+            // new entries start unmakred
             s.ref_bit.set(false);
         }
 
@@ -327,14 +328,14 @@ impl PageCache {
     #[inline]
     pub fn peek(&self, key: &PageCacheKey, touch: bool) -> Option<PageRef> {
         let slot = self.map.borrow().get(key)?;
-        // avoid holding the borrow across clone
         let page = {
             let entries = self.entries.borrow();
-            entries[slot].page.as_ref()?.clone()
+            let maybe_page = entries[slot].page.as_ref()?.clone();
+            if touch {
+                entries[slot].ref_bit.set(true);
+            }
+            maybe_page
         };
-        if touch {
-            self.entries.borrow_mut()[slot].ref_bit.set(true);
-        }
         Some(page)
     }
 
@@ -356,8 +357,8 @@ impl PageCache {
             let mut progress = false;
             while need > 0 {
                 let tail_idx = match self.tail.get() {
-                    i if i != NULL => i,
-                    _ => break,
+                    NULL => break,
+                    i => i,
                 };
                 let (was_marked, key) = {
                     let mut entries = self.entries.borrow_mut();
