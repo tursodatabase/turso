@@ -183,15 +183,13 @@ impl PageCache {
     fn move_to_front(&self, slot: usize) {
         if self.head.get() == slot {
             return;
-        } // already head
-          // Only unlink if currently linked (prev != NONE or is head)
-        let linked = self.prev.borrow()[slot] != NULL;
-        if linked {
-            self.unlink(slot);
-        } else {
-            // was free/unlinked; just link it (defensive)
-            self.link_front(slot);
         }
+        turso_assert!(
+            self.entries.borrow()[slot].page.is_some(),
+            "must be called on linked page"
+        );
+        self.unlink(slot);
+        self.link_front(slot);
     }
 
     pub fn contains_key(&self, key: &PageCacheKey) -> bool {
@@ -434,19 +432,17 @@ impl PageCache {
         self.capacity = new_cap;
 
         // rebuild map + list compactly
-        self.map.borrow_mut().clear();
+        let mut new_map = PageHashMap::new(new_cap);
         self.head.set(NULL);
         self.tail.set(NULL);
-
         {
             let mut entries_mut = self.entries.borrow_mut();
             for (slot, entry) in survivors.iter().rev().enumerate().take(new_cap) {
                 entries_mut[slot] = entry.clone();
-                self.map.borrow_mut().insert(entry.key, slot);
+                new_map.insert(entry.key, slot);
                 self.link_front(slot);
             }
         }
-        let new_map = self.map.borrow().rehash(new_cap);
         self.map.replace(new_map);
         // rebuild freelist from first unused slot
         let used = survivors.len().min(new_cap);
@@ -548,19 +544,16 @@ impl PageCache {
     }
 
     pub fn clear(&mut self) -> Result<(), CacheError> {
-        // Check for dirty pages
-        for e in self.entries.borrow().iter() {
-            if e.page.as_ref().is_some_and(|p| p.is_dirty()) {
-                return Err(CacheError::Dirty {
-                    pgno: e.page.as_ref().unwrap().get().id,
-                });
-            }
-        }
-
         // Clear all pages, even if locked or pinned
         for e in self.entries.borrow().iter() {
             match e.page {
                 Some(ref p) => {
+                    if p.is_dirty() {
+                        // should have no dirty pages when clearing
+                        return Err(CacheError::Dirty {
+                            pgno: e.page.as_ref().unwrap().get().id,
+                        });
+                    }
                     p.clear_loaded();
                     let _ = p.get().contents.take();
                 }
