@@ -1,4 +1,4 @@
-use std::{cmp::Ordering, collections::HashMap, sync::Arc};
+use std::{cmp::Ordering, sync::Arc};
 
 use crate::{
     schema::{Column, Index},
@@ -7,6 +7,7 @@ use crate::{
         plan::{JoinOrderMember, TableReferences, WhereTerm},
         planner::{table_mask_from_expr, TableMask},
     },
+    types::CaseInsensitiveMap,
     Result,
 };
 use turso_ext::{ConstraintInfo, ConstraintOp};
@@ -174,7 +175,7 @@ fn estimate_selectivity(column: &Column, op: ast::Operator) -> f64 {
 pub fn constraints_from_where_clause(
     where_clause: &[WhereTerm],
     table_references: &TableReferences,
-    available_indexes: &HashMap<String, Vec<Arc<Index>>>,
+    available_indexes: &CaseInsensitiveMap<Vec<Arc<Index>>>,
 ) -> Result<Vec<TableConstraints>> {
     let mut constraints = Vec::new();
 

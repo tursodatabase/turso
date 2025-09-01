@@ -15,7 +15,9 @@ use crate::vdbe::sorter::Sorter;
 use crate::vdbe::Register;
 use crate::vtab::VirtualTableCursor;
 use crate::{turso_assert, Completion, Result, IO};
+use std::collections::hash_map::Entry;
 use std::fmt::{Debug, Display};
+use std::hash::{Hash, Hasher};
 
 const MAX_REAL_SIZE: u8 = 15;
 
@@ -2667,8 +2669,232 @@ impl WalFrameInfo {
     }
 }
 
+#[derive(Debug, Clone)]
+pub enum CaseInsensitiveString {
+    Borrowed(*const str),
+    Owned(String),
+}
+
+impl CaseInsensitiveString {
+    pub fn new_owned(s: &str) -> Self {
+        Self::Owned(s.to_string())
+    }
+    pub fn new_borrowed(s: &str) -> Self {
+        Self::Borrowed(s as *const str)
+    }
+
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Borrowed(s) => unsafe { std::mem::transmute::<*const str, &str>(*s) },
+            Self::Owned(s) => s,
+        }
+    }
+
+    pub fn to_string(&self) -> String {
+        match self {
+            Self::Borrowed(s) => unsafe {
+                let str = std::mem::transmute::<*const str, &str>(*s);
+                str.to_string()
+            },
+            Self::Owned(s) => s.clone(),
+        }
+    }
+}
+
+impl From<String> for CaseInsensitiveString {
+    fn from(value: String) -> Self {
+        Self::Owned(value)
+    }
+}
+impl From<&String> for CaseInsensitiveString {
+    fn from(value: &String) -> Self {
+        Self::new_owned(value)
+    }
+}
+
+impl From<&str> for CaseInsensitiveString {
+    fn from(value: &str) -> Self {
+        Self::new_owned(value)
+    }
+}
+
+impl AsRef<str> for CaseInsensitiveString {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl PartialEq<CaseInsensitiveString> for &str {
+    fn eq(&self, other: &CaseInsensitiveString) -> bool {
+        self.eq_ignore_ascii_case(other.as_str())
+    }
+}
+
+impl PartialEq<str> for CaseInsensitiveString {
+    fn eq(&self, other: &str) -> bool {
+        self.as_str().eq_ignore_ascii_case(other)
+    }
+}
+
+impl PartialEq<CaseInsensitiveString> for CaseInsensitiveString {
+    fn eq(&self, other: &CaseInsensitiveString) -> bool {
+        self.as_str().eq_ignore_ascii_case(other.as_str())
+    }
+}
+
+impl Eq for CaseInsensitiveString {}
+
+impl PartialOrd<CaseInsensitiveString> for CaseInsensitiveString {
+    fn partial_cmp(&self, other: &CaseInsensitiveString) -> Option<std::cmp::Ordering> {
+        self.as_str().partial_cmp(other.as_str())
+    }
+}
+
+impl Ord for CaseInsensitiveString {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.as_str().cmp(other.as_str())
+    }
+}
+
+impl Hash for CaseInsensitiveString {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        for ch in self.as_str().chars() {
+            for folded_ch in ch.to_lowercase() {
+                let mut buf = [0u8; 4];
+                let bytes = folded_ch.encode_utf8(&mut buf);
+                state.write(bytes.as_bytes());
+            }
+        }
+    }
+}
+
+impl Display for CaseInsensitiveString {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+pub type CaseInsensitiveMapInner<V> = std::collections::HashMap<CaseInsensitiveString, V>;
+pub type CaseInsensitiveSetInner = std::collections::HashSet<CaseInsensitiveString>;
+#[derive(Debug, Clone)]
+pub struct CaseInsensitiveMap<V> {
+    inner: CaseInsensitiveMapInner<V>,
+}
+
+impl<V> CaseInsensitiveMap<V> {
+    pub fn new() -> Self {
+        Self {
+            inner: CaseInsensitiveMapInner::new(),
+        }
+    }
+    pub fn get(&self, key: &str) -> Option<&V> {
+        self.inner.get(&CaseInsensitiveString::new_borrowed(key))
+    }
+    pub fn insert(&mut self, key: &str, value: V) {
+        self.inner
+            .insert(CaseInsensitiveString::new_owned(key), value);
+    }
+    pub fn remove(&mut self, key: &str) -> Option<V> {
+        self.inner.remove(&CaseInsensitiveString::new_borrowed(key))
+    }
+    pub fn get_mut(&mut self, key: &str) -> Option<&mut V> {
+        self.inner
+            .get_mut(&CaseInsensitiveString::new_borrowed(key))
+    }
+    pub fn contains_key(&self, key: &str) -> bool {
+        self.inner
+            .contains_key(&CaseInsensitiveString::new_borrowed(key))
+    }
+    pub fn iter(&self) -> impl Iterator<Item = (&CaseInsensitiveString, &V)> {
+        self.inner.iter()
+    }
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = (&CaseInsensitiveString, &mut V)> {
+        self.inner.iter_mut()
+    }
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+    pub fn clear(&mut self) {
+        self.inner.clear();
+    }
+
+    pub fn keys(&self) -> impl Iterator<Item = &str> {
+        self.inner.keys().map(|k| k.as_str())
+    }
+
+    pub fn entry(&mut self, key: &str) -> Entry<CaseInsensitiveString, V> {
+        self.inner.entry(CaseInsensitiveString::new_borrowed(key))
+    }
+
+    pub fn values(&self) -> impl Iterator<Item = &V> {
+        self.inner.values()
+    }
+}
+
+impl<V> Default for CaseInsensitiveMap<V> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<V> FromIterator<(CaseInsensitiveString, V)> for CaseInsensitiveMap<V> {
+    fn from_iter<T: IntoIterator<Item = (CaseInsensitiveString, V)>>(iter: T) -> Self {
+        let mut map = Self::new();
+        for (key, value) in iter {
+            map.inner.insert(key, value);
+        }
+        map
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CaseInsensitiveSet {
+    inner: CaseInsensitiveSetInner,
+}
+
+impl CaseInsensitiveSet {
+    pub fn new() -> Self {
+        Self {
+            inner: CaseInsensitiveSetInner::new(),
+        }
+    }
+    pub fn insert(&mut self, key: &str) {
+        self.inner.insert(CaseInsensitiveString::new_owned(key));
+    }
+    pub fn remove(&mut self, key: &str) {
+        self.inner.remove(&CaseInsensitiveString::new_borrowed(key));
+    }
+    pub fn contains(&self, key: &str) -> bool {
+        self.inner
+            .contains(&CaseInsensitiveString::new_borrowed(key))
+    }
+    pub fn iter(&self) -> impl Iterator<Item = &CaseInsensitiveString> {
+        self.inner.iter()
+    }
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+    pub fn clear(&mut self) {
+        self.inner.clear();
+    }
+}
+
+impl Default for CaseInsensitiveSet {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
     use crate::translate::collate::CollationSeq;
 
@@ -3561,5 +3787,66 @@ mod tests {
             buf.len(),
             header_length + size_of::<i8>() + size_of::<f64>() + text.len()
         );
+    }
+
+    #[test]
+    fn test_case_insensitive_string() {
+        let s1 = CaseInsensitiveString::new_owned("test");
+        let s2 = CaseInsensitiveString::new_owned("Test");
+        assert_eq!(s1, s2);
+    }
+
+    #[test]
+    fn test_case_insensitive_string_hash_map() {
+        let mut map = HashMap::new();
+        map.insert(CaseInsensitiveString::new_owned("test"), "test");
+        assert_eq!(
+            map.get(&CaseInsensitiveString::new_owned("Test")),
+            Some(&"test")
+        );
+    }
+
+    #[test]
+    fn test_case_insensitive_string_hash_map_with_str() {
+        let mut map = HashMap::new();
+        map.insert(CaseInsensitiveString::new_owned("test"), "test");
+
+        // Test case-insensitive lookup without allocation
+        // let first_get = map.get("test");
+        // assert_eq!(first_get, Some(&"test"));
+        println!("after insert");
+        assert_eq!(
+            map.get(&CaseInsensitiveString::new_borrowed("TEST")),
+            Some(&"test")
+        );
+        println!("after get");
+        assert_eq!(
+            map.get(&CaseInsensitiveString::new_borrowed("Test")),
+            Some(&"test")
+        );
+    }
+
+    #[test]
+    fn test_case_insensitive_hashmap_wrapper() {
+        let mut map = CaseInsensitiveMap::new();
+        map.insert("sqlite_schema", "value");
+
+        // Zero-allocation lookups with clean API
+        assert_eq!(map.get("sqlite_schema"), Some(&"value"));
+        assert_eq!(map.get("SQLITE_SCHEMA"), Some(&"value"));
+        assert_eq!(map.get("SQLite_Schema"), Some(&"value"));
+        assert_eq!(map.get("missing"), None);
+
+        assert!(map.contains_key("sqlite_schema"));
+        assert!(!map.contains_key("missing"));
+        assert_eq!(map.len(), 1);
+        assert!(!map.is_empty());
+        let map2 = map.clone();
+        assert_eq!(map2.get("sqlite_schema"), Some(&"value"));
+        assert_eq!(map2.get("SQLITE_SCHEMA"), Some(&"value"));
+        assert_eq!(map2.get("SQLite_Schema"), Some(&"value"));
+        assert_eq!(map2.get("missing"), None);
+        assert!(map2.contains_key("sqlite_schema"));
+        assert!(!map2.contains_key("missing"));
     }
 }

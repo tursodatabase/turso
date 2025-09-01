@@ -1064,7 +1064,7 @@ impl Connection {
         tracing::debug!(
             "reparse_schema: schema_version={}, tables={:?}",
             fresh.schema_version,
-            fresh.tables.keys()
+            fresh.tables.keys().collect::<Vec<_>>()
         );
         self.with_schema_mut(|schema| {
             *schema = fresh;
