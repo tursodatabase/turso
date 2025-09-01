@@ -381,23 +381,23 @@ pub struct WalHeader {
 #[derive(Debug, Default, Copy, Clone)]
 pub struct WalFrameHeader {
     /// Page number
-    pub(crate) page_number: u32,
+    pub page_number: u32,
 
     /// For commit records, the size of the database file in pages after the commit.
     /// For all other records, zero.
-    pub(crate) db_size: u32,
+    pub db_size: u32,
 
     /// Salt-1 copied from the WAL header
-    pub(crate) salt_1: u32,
+    pub salt_1: u32,
 
     /// Salt-2 copied from the WAL header
-    pub(crate) salt_2: u32,
+    pub salt_2: u32,
 
     /// Checksum-1: Cumulative checksum up through and including this page
-    pub(crate) checksum_1: u32,
+    pub checksum_1: u32,
 
     /// Checksum-2: Second half of the cumulative checksum
-    pub(crate) checksum_2: u32,
+    pub checksum_2: u32,
 }
 
 impl WalFrameHeader {
@@ -2219,6 +2219,7 @@ mod tests {
     use crate::Value;
 
     use super::*;
+    use rand::Rng;
     use rstest::rstest;
 
     #[rstest]
@@ -2349,4 +2350,31 @@ mod tests {
 
         assert_eq!(small_vec.get(8), None);
     }
+
+    #[test]
+    fn test_read_varint() {
+        let mut v = 0_i64;
+
+        for i in 0..=10000 {
+            let v = rand::thread_rng().gen::<i64>();
+            let mut buf = [0u8; 10];
+            let n = write_varint(&mut buf, v as u64);
+
+            let (result, len) = read_varint_slow(&buf[..n]).unwrap();
+            let result = result as i64;
+            assert_eq!(result, v);
+            assert_eq!(len, n);
+
+            let (result_fast, len_fast) = read_varint(&buf[..n]).unwrap();
+            let result_fast = result_fast as i64;
+            assert_eq!(result_fast, v);
+            assert_eq!(len_fast, n);
+        }
+    }
+}
+
+// At the bottom of the file
+#[cfg(test)]
+pub mod bench_exports {
+    pub use super::{read_varint, read_varint_slow, write_varint};
 }

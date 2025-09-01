@@ -598,9 +598,37 @@ fn bench_insert_rows(criterion: &mut Criterion) {
     group.finish();
 }
 
+fn bench_read_varint(criterion: &mut Criterion) {
+    let mut group = criterion.benchmark_group("Insert rows in batches");
+    let mut varints = Vec::new();
+    for i in 0..1000 {
+        let mut buf = vec![0u8; 10];
+        let n = turso_core::storage::sqlite3_ondisk::write_varint(&mut buf, i);
+        buf.truncate(n);
+        varints.push(buf);
+    }
+    group.bench_function("read_varint", |b| {
+        b.iter(|| {
+            for varint in varints.iter() {
+                let (v, _) = turso_core::storage::sqlite3_ondisk::read_varint(varint).unwrap();
+                black_box(v);
+            }
+        });
+    });
+    group.bench_function("read_varint_slow", |b| {
+        b.iter(|| {
+            for varint in varints.iter() {
+                let (v, _) = turso_core::storage::sqlite3_ondisk::read_varint_slow(varint).unwrap();
+                black_box(v);
+            }
+        });
+    });
+    group.finish();
+}
+
 criterion_group! {
     name = benches;
     config = Criterion::default().with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
-    targets = bench_open, bench_alter, bench_prepare_query, bench_execute_select_1, bench_execute_select_rows, bench_execute_select_count, bench_insert_rows
+    targets = bench_open, bench_alter, bench_prepare_query, bench_execute_select_1, bench_execute_select_rows, bench_execute_select_count, bench_insert_rows, bench_read_varint
 }
 criterion_main!(benches);
