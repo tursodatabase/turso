@@ -245,7 +245,6 @@ enum WriteSubState {
         new_payload: Vec<u8>,
         fill_cell_payload_state: FillCellPayloadState,
     },
-    None,
 }
 #[derive(Debug)]
 struct WriteState {
@@ -2137,22 +2136,16 @@ impl BTreeCursor {
     /// If the insert operation overflows the page, it will be split and the btree will be balanced.
     #[instrument(skip_all, level = Level::DEBUG)]
     fn insert_into_page(&mut self, bkey: &BTreeKey) -> Result<IOResult<()>> {
-        let record = bkey
-            .get_record()
-            .expect("expected record present on insert");
-        let record_values = record.get_values();
         if let CursorState::None = &self.state {
             self.state = CursorState::Write(WriteState {
                 step_fn: Some(BTreeCursor::insert_into_page_start),
                 sub_state: None,
             });
         }
-        let usable_space = self.usable_space();
         loop {
-            let CursorState::Write(WriteState { step_fn, sub_state }) = &self.state else {
+            let CursorState::Write(WriteState { step_fn, .. }) = &self.state else {
                 panic!("expected write state");
             };
-            // println!("step_fn: {:?}, sub_state: {:?}", step_fn, sub_state);
             if let Some(step_fn) = step_fn {
                 let pager = self.pager.clone();
                 return_if_io!(step_fn(self, bkey, &pager));
@@ -2190,8 +2183,6 @@ impl BTreeCursor {
 
         // get page and find cell
         let cell_idx = {
-            let page = page.get();
-
             self.pager.add_dirty(&page);
 
             self.stack.current_cell_index()
@@ -2205,8 +2196,8 @@ impl BTreeCursor {
 
         // if the cell index is less than the total cells, check: if its an existing
         // rowid, we are going to update / overwrite the cell
-        if cell_idx < page.get().get_contents().cell_count() {
-            let cell = page.get().get_contents().cell_get(cell_idx, usable_space)?;
+        if cell_idx < page.get_contents().cell_count() {
+            let cell = page.get_contents().cell_get(cell_idx, usable_space)?;
             match cell {
                 BTreeCell::TableLeafCell(tbl_leaf) => {
                     if tbl_leaf.rowid == bkey.to_rowid() {
@@ -2295,7 +2286,7 @@ impl BTreeCursor {
             panic!("expected insert state");
         };
         match fill_cell_payload(
-            page.get(),
+            page.clone(),
             bkey.maybe_rowid(),
             &mut new_payload,
             cell_idx,
@@ -2319,13 +2310,13 @@ impl BTreeCursor {
 
         {
             let page = page.get();
-            let contents = page.get().contents.as_mut().unwrap();
+            let contents = page.contents.as_mut().unwrap();
             tracing::debug!(name: "overflow", cell_count = contents.cell_count());
 
             insert_into_cell(contents, new_payload.as_slice(), cell_idx, usable_space)?;
         };
         self.stack.set_cell_index(cell_idx as i32);
-        let overflows = !page.get().get_contents().overflow_cells.is_empty();
+        let overflows = !page.get_contents().overflow_cells.is_empty();
         if overflows {
             let CursorState::Write(write_state) = &mut self.state else {
                 panic!("expected write state");
@@ -2356,11 +2347,7 @@ impl BTreeCursor {
         let _record_values = record.get_values();
         let page = self.stack.top();
         let usable_space = self.usable_space();
-        turso_assert!(
-            page.get().is_loaded(),
-            "page {}is not loaded",
-            page.get().get().id
-        );
+        turso_assert!(page.is_loaded(), "page {}is not loaded", page.get().id);
         let (page, cell_idx, mut state) = {
             let CursorState::Write(write_state) = &mut self.state else {
                 panic!("expected write state");
@@ -2388,9 +2375,9 @@ impl BTreeCursor {
             });
             return Ok(IOResult::IO(io));
         }
-        let overflows = !page.get().get_contents().overflow_cells.is_empty();
+        let overflows = !page.get_contents().overflow_cells.is_empty();
         let underflows = !overflows && {
-            let free_space = compute_free_space(page.get().get_contents(), usable_space);
+            let free_space = compute_free_space(page.get_contents(), usable_space);
             free_space * 3 > usable_space * 2
         };
         let CursorState::Write(write_state) = &mut self.state else {

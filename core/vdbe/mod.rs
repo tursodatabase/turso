@@ -34,7 +34,7 @@ use crate::{
     types::{IOCompletions, IOResult, RawSlice, TextRef},
     vdbe::execute::{
         OpColumnState, OpDeleteState, OpDeleteSubState, OpIdxInsertState, OpInsertState,
-        OpInsertSubState, OpNewRowidState, OpNoConflictState, OpRowIdState, OpSeekState,
+        OpNewRowidState, OpNoConflictState, OpRowIdState, OpSeekState,
     },
     vdbe::metrics::StatementMetrics,
     IOExt, RefValue,

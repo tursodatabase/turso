@@ -33,7 +33,7 @@ use crate::{
     },
 };
 use std::env::temp_dir;
-use std::ops::{ControlFlow, DerefMut};
+use std::ops::DerefMut;
 use std::{
     borrow::BorrowMut,
     rc::Rc,
@@ -5138,25 +5138,6 @@ pub fn op_yield(
 pub struct OpInsertState {
     pub step_fn: Option<InsertStepFn>,
     pub old_record: Option<(i64, Vec<Value>)>,
-}
-
-#[derive(Debug, PartialEq)]
-pub enum OpInsertSubState {
-    /// If this insert overwrites a record, capture the old record for incremental view maintenance.
-    MaybeCaptureRecord,
-    /// Seek to the correct position if needed.
-    /// In a table insert, if the caller does not pass InsertFlags::REQUIRE_SEEK, they must ensure that a seek has already happened to the correct location.
-    /// This typically happens by invoking either Insn::NewRowid or Insn::NotExists, because:
-    /// 1. op_new_rowid() seeks to the end of the table, which is the correct insertion position.
-    /// 2. op_not_exists() seeks to the position in the table where the target rowid would be inserted.
-    Seek,
-    /// Insert the row into the table.
-    Insert,
-    /// Updating last_insert_rowid may return IO, so we need a separate state for it so that we don't
-    /// start inserting the same row multiple times.
-    UpdateLastRowid,
-    /// If there are dependent incremental views, apply the change.
-    ApplyViewChange,
 }
 
 type InsertStepFn = fn(
