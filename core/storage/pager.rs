@@ -16,6 +16,7 @@ use crate::{
     Result, TransactionState,
 };
 use parking_lot::RwLock;
+use std::any::Any;
 use std::cell::{Cell, OnceCell, RefCell, UnsafeCell};
 use std::collections::HashSet;
 use std::hash;
@@ -1089,6 +1090,8 @@ impl Pager {
         page_idx: usize,
         frame_watermark: Option<u64>,
         allow_empty_read: bool,
+        ctx: Box<dyn Any>,
+        callback: impl FnOnce(Box<dyn Any>, PageRef) -> Result<IOResult<()>> + 'static,
     ) -> Result<(PageRef, Completion)> {
         tracing::trace!("read_page_no_cache(page_idx = {})", page_idx);
         let page = Arc::new(Page::new(page_idx));
@@ -1100,20 +1103,38 @@ impl Pager {
             );
 
             page.set_locked();
-            let c = self.begin_read_disk_page(page_idx, page.clone(), allow_empty_read, io_ctx)?;
+            let c = self.begin_read_disk_page(
+                page_idx,
+                page.clone(),
+                allow_empty_read,
+                io_ctx,
+                ctx,
+                callback,
+            )?;
             return Ok((page, c));
         };
 
         if let Some(frame_id) = wal.borrow().find_frame(page_idx as u64, frame_watermark)? {
-            let c = wal
-                .borrow()
-                .read_frame(frame_id, page.clone(), self.buffer_pool.clone())?;
+            let c = wal.borrow().read_frame(
+                frame_id,
+                page.clone(),
+                self.buffer_pool.clone(),
+                ctx,
+                Box::new(callback),
+            )?;
             // TODO(pere) should probably first insert to page cache, and if successful,
             // read frame or page
             return Ok((page, c));
         }
 
-        let c = self.begin_read_disk_page(page_idx, page.clone(), allow_empty_read, io_ctx)?;
+        let c = self.begin_read_disk_page(
+            page_idx,
+            page.clone(),
+            allow_empty_read,
+            io_ctx,
+            ctx,
+            callback,
+        )?;
         Ok((page, c))
     }
 
@@ -1127,7 +1148,35 @@ impl Pager {
             tracing::trace!("read_page(page_idx = {}) = cached", page_idx);
             return Ok((page.clone(), None));
         }
-        let (page, c) = self.read_page_no_cache(page_idx, None, false)?;
+        let ctx = Box::new(());
+        let callback = Box::new(move |_ctx, _page| Ok(IOResult::Done(())));
+        let (page, c) = self.read_page_no_cache(page_idx, None, false, ctx, callback)?;
+        self.cache_insert(page_idx, page.clone(), &mut page_cache)?;
+        Ok((page, Some(c)))
+    }
+
+    /// Reads a page from the database.
+    #[tracing::instrument(skip_all, level = Level::DEBUG)]
+    pub fn read_page_cb(
+        &self,
+        page_idx: usize,
+        ctx: Box<dyn Any>,
+        callback: impl FnOnce(Box<dyn Any>, PageRef) -> Result<IOResult<()>> + 'static,
+    ) -> Result<(PageRef, Option<Completion>)> {
+        tracing::trace!("read_page(page_idx = {})", page_idx);
+        let mut page_cache = self.page_cache.write();
+        let page_key = PageCacheKey::new(page_idx);
+        if let Some(page) = page_cache.get(&page_key) {
+            tracing::trace!("read_page(page_idx = {}) = cached", page_idx);
+            let result = callback(ctx, page.clone())?;
+            match result {
+                IOResult::Done(_) => return Ok((page, None)),
+                IOResult::IO(_) => {
+                    todo!()
+                }
+            }
+        }
+        let (page, c) = self.read_page_no_cache(page_idx, None, false, ctx, callback)?;
         self.cache_insert(page_idx, page.clone(), &mut page_cache)?;
         Ok((page, Some(c)))
     }
@@ -1138,6 +1187,8 @@ impl Pager {
         page: PageRef,
         allow_empty_read: bool,
         io_ctx: &IOContext,
+        ctx: Box<dyn Any>,
+        callback: impl FnOnce(Box<dyn Any>, PageRef) -> Result<IOResult<()>> + 'static,
     ) -> Result<Completion> {
         sqlite3_ondisk::begin_read_page(
             self.db_file.clone(),
@@ -1146,6 +1197,8 @@ impl Pager {
             page_idx,
             allow_empty_read,
             io_ctx,
+            ctx,
+            callback,
         )
     }
 

@@ -1,3 +1,4 @@
+use std::any::Any;
 use tracing::{instrument, Level};
 
 use crate::{
@@ -1215,6 +1216,26 @@ impl BTreeCursor {
         self.stack.clear();
         self.stack.push(mem_page);
         Ok(c)
+    }
+
+    /// Move the cursor to the root page of the btree.
+    #[instrument(skip_all, level = Level::DEBUG)]
+    fn move_to_root_cb(
+        &mut self,
+        callback: impl FnOnce(&mut Self) -> Result<IOResult<()>> + 'static,
+    ) -> Result<IOResult<()>> {
+        self.seek_state = CursorSeekState::Start;
+        self.going_upwards = false;
+        tracing::trace!(root_page = self.root_page);
+        let (mem_page, c) = self.read_page_cb(self.root_page, |cursor, mem_page| {
+            cursor.stack.clear();
+            cursor.stack.push(mem_page.clone());
+            callback(cursor)
+        })?;
+        if let Some(c) = c {
+            io_yield_one!(c);
+        }
+        Ok(IOResult::Done(()))
     }
 
     /// Move the cursor to the rightmost record in the btree.
@@ -4051,25 +4072,42 @@ impl BTreeCursor {
             return Ok(IOResult::Done(()));
         }
         loop {
-            match self.rewind_state {
+            match &self.rewind_state {
                 RewindState::Start => {
-                    self.rewind_state = RewindState::NextRecord;
                     if let Some(mv_cursor) = &self.mv_cursor {
                         let mut mv_cursor = mv_cursor.borrow_mut();
                         mv_cursor.rewind();
+                        drop(mv_cursor);
+                        return_if_io!(get_next_record(self, |cursor, cursor_has_record| {
+                            cursor.invalidate_record();
+                            cursor.has_record.replace(cursor_has_record);
+                            cursor.rewind_state = RewindState::Start;
+                        }));
+                        return Ok(IOResult::Done(()));
                     } else {
-                        let c = self.move_to_root()?;
-                        if let Some(c) = c {
-                            io_yield_one!(c);
+                        let result = self.move_to_root_cb(|cursor| {
+                            return_if_io!(get_next_record(cursor, |cursor, cursor_has_record| {
+                                cursor.invalidate_record();
+                                cursor.has_record.replace(cursor_has_record);
+                            }));
+                            return Ok(IOResult::Done(()));
+                        })?;
+                        match result {
+                            IOResult::Done(_) => {
+                                self.rewind_state = RewindState::Start;
+                                return Ok(IOResult::Done(()));
+                            }
+                            IOResult::IO(io) => {
+                                self.rewind_state = RewindState::Wait(io);
+                            }
                         }
                     }
                 }
-                RewindState::NextRecord => {
-                    return_if_io!(get_next_record(self, |cursor, cursor_has_record| {
-                        cursor.invalidate_record();
-                        cursor.has_record.replace(cursor_has_record);
-                        cursor.rewind_state = RewindState::Start;
-                    }));
+                RewindState::Wait(c) => {
+                    if !c.finished() {
+                        return Ok(IOResult::IO(c.clone()));
+                    }
+                    self.rewind_state = RewindState::Start;
                     return Ok(IOResult::Done(()));
                 }
             }
@@ -5242,6 +5280,15 @@ impl BTreeCursor {
         btree_read_page(&self.pager, page_idx)
     }
 
+    pub fn read_page_cb(
+        &mut self,
+        page_idx: usize,
+        callback: impl FnOnce(&mut BTreeCursor, Arc<Page>) -> Result<IOResult<()>> + 'static,
+    ) -> Result<(PageRef, Option<Completion>)> {
+        let pager = self.pager.clone();
+        btree_read_page_cb(&pager, page_idx, self, callback)
+    }
+
     pub fn allocate_page(&self, page_type: PageType, offset: usize) -> Result<IOResult<PageRef>> {
         self.pager
             .do_allocate_page(page_type, offset, BtreePageAllocMode::Any)
@@ -5803,6 +5850,24 @@ pub fn btree_read_page(
     page_idx: usize,
 ) -> Result<(Arc<Page>, Option<Completion>)> {
     pager.read_page(page_idx)
+}
+
+pub fn btree_read_page_cb(
+    pager: &Rc<Pager>,
+    page_idx: usize,
+    cursor: &mut BTreeCursor,
+    callback: impl FnOnce(&mut BTreeCursor, PageRef) -> Result<IOResult<()>> + 'static,
+) -> Result<(PageRef, Option<Completion>)> {
+    // We need to pass the cursor through the context so we can access it in the pager callback
+    let cursor_ptr = cursor as *mut BTreeCursor;
+    let ctx = Box::new(cursor_ptr);
+    let pager_callback = Box::new(move |ctx: Box<dyn Any>, mem_page: PageRef| {
+        // Extract the cursor pointer from the context
+        let cursor_ptr = *ctx.downcast::<*mut BTreeCursor>().unwrap();
+        let cursor = unsafe { &mut *cursor_ptr };
+        callback(cursor, mem_page)
+    });
+    pager.read_page_cb(page_idx, ctx, pager_callback)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

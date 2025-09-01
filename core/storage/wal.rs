@@ -1,5 +1,6 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+use std::any::Any;
 use std::array;
 use std::borrow::Cow;
 use std::cell::{RefCell, UnsafeCell};
@@ -247,6 +248,8 @@ pub trait Wal: Debug {
         frame_id: u64,
         page: PageRef,
         buffer_pool: Arc<BufferPool>,
+        ctx: Box<dyn Any>,
+        callback: Box<dyn FnOnce(Box<dyn Any>, PageRef) -> Result<IOResult<()>> + 'static>,
     ) -> Result<Completion>;
 
     /// Read a raw frame (header included) from the WAL.
@@ -1055,6 +1058,8 @@ impl Wal for WalFile {
         frame_id: u64,
         page: PageRef,
         buffer_pool: Arc<BufferPool>,
+        ctx: Box<dyn Any>,
+        callback: Box<dyn FnOnce(Box<dyn Any>, PageRef) -> Result<IOResult<()>> + 'static>,
     ) -> Result<Completion> {
         tracing::debug!(
             "read_frame(page_idx = {}, frame_id = {})",
@@ -1079,6 +1084,7 @@ impl Wal for WalFile {
             let cloned = frame.clone();
             finish_read_page(page.get().id, buf, cloned);
             frame.set_wal_tag(frame_id, seq);
+            let _ = callback(ctx, frame);
         });
         begin_read_wal_frame(
             &self.get_shared().file,

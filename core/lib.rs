@@ -64,6 +64,7 @@ pub use io::{
 use parking_lot::RwLock;
 use schema::Schema;
 use std::{
+    any::Any,
     borrow::Cow,
     cell::{Cell, RefCell, UnsafeCell},
     collections::HashMap,
@@ -1375,18 +1376,21 @@ impl Connection {
         page_idx: u32,
         page: &mut [u8],
         frame_watermark: Option<u64>,
+        ctx: Box<dyn Any>,
+        callback: impl FnOnce(Box<dyn Any>, PageRef) -> Result<IOResult<()>> + 'static,
     ) -> Result<bool> {
         let pager = self.pager.borrow();
-        let (page_ref, c) = match pager.read_page_no_cache(page_idx as usize, frame_watermark, true)
-        {
-            Ok(result) => result,
-            // on windows, zero read will trigger UnexpectedEof
-            #[cfg(target_os = "windows")]
-            Err(LimboError::CompletionError(CompletionError::IOError(
-                std::io::ErrorKind::UnexpectedEof,
-            ))) => return Ok(false),
-            Err(err) => return Err(err),
-        };
+        let (page_ref, c) =
+            match pager.read_page_no_cache(page_idx as usize, frame_watermark, true, ctx, callback)
+            {
+                Ok(result) => result,
+                // on windows, zero read will trigger UnexpectedEof
+                #[cfg(target_os = "windows")]
+                Err(LimboError::CompletionError(CompletionError::IOError(
+                    std::io::ErrorKind::UnexpectedEof,
+                ))) => return Ok(false),
+                Err(err) => return Err(err),
+            };
 
         pager.io.wait_for_completion(c)?;
 

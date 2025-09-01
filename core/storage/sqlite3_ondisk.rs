@@ -63,8 +63,10 @@ use crate::storage::pager::Pager;
 use crate::storage::wal::READMARK_NOT_USED;
 use crate::types::{RawSlice, RefValue, SerialType, SerialTypeKind, TextRef, TextSubtype};
 use crate::{
-    bail_corrupt_error, turso_assert, CompletionError, File, IOContext, Result, WalFileShared,
+    bail_corrupt_error, turso_assert, CompletionError, File, IOContext, IOResult, Result,
+    WalFileShared,
 };
+use std::any::Any;
 use std::cell::{Cell, UnsafeCell};
 use std::collections::{BTreeMap, HashMap};
 use std::mem::MaybeUninit;
@@ -901,6 +903,8 @@ pub fn begin_read_page(
     page_idx: usize,
     allow_empty_read: bool,
     io_ctx: &IOContext,
+    ctx: Box<dyn Any>,
+    callback: impl FnOnce(Box<dyn Any>, PageRef) -> Result<IOResult<()>> + 'static,
 ) -> Result<Completion> {
     tracing::trace!("begin_read_btree_page(page_idx = {})", page_idx);
     let buf = buffer_pool.get_page();
@@ -909,7 +913,7 @@ pub fn begin_read_page(
     let complete = Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
         let Ok((mut buf, bytes_read)) = res else {
             page.clear_locked();
-            return;
+            todo!();
         };
         let buf_len = buf.len();
         turso_assert!(
@@ -921,6 +925,7 @@ pub fn begin_read_page(
             buf = Arc::new(Buffer::new_temporary(0));
         }
         finish_read_page(page_idx, buf, page.clone());
+        callback(ctx, page).unwrap();
     });
     let c = Completion::new_read(buf, complete);
     db_file.read_page(page_idx, io_ctx, c)

@@ -128,12 +128,20 @@ pub struct Completion {
     inner: Arc<CompletionInner>,
 }
 
-#[derive(Debug)]
 struct CompletionInner {
     completion_type: CompletionType,
     /// None means we completed successfully
     // Thread safe with OnceLock
     result: std::sync::OnceLock<Option<CompletionError>>,
+}
+
+impl Debug for CompletionInner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CompletionInner")
+            .field("completion_type", &self.completion_type)
+            .field("result", &self.result)
+            .finish()
+    }
 }
 
 impl Debug for CompletionType {
@@ -226,7 +234,7 @@ impl Completion {
             match &self.inner.completion_type {
                 CompletionType::Read(r) => r.callback(result),
                 CompletionType::Write(w) => w.callback(result),
-                CompletionType::Sync(s) => s.callback(result), // fix
+                CompletionType::Sync(s) => s.callback(result),
                 CompletionType::Truncate(t) => t.callback(result),
             };
         }
@@ -238,7 +246,7 @@ impl Completion {
             match &self.inner.completion_type {
                 CompletionType::Read(r) => r.callback(result),
                 CompletionType::Write(w) => w.callback(result),
-                CompletionType::Sync(s) => s.callback(result), // fix
+                CompletionType::Sync(s) => s.callback(result),
                 CompletionType::Truncate(t) => t.callback(result),
             };
         }

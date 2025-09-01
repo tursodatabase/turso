@@ -1,4 +1,4 @@
-use crate::PageRef;
+use crate::{types::IOCompletions, PageRef};
 
 #[derive(Debug, Clone)]
 pub enum EmptyTableState {
@@ -18,10 +18,10 @@ pub enum SeekToLastState {
     IsEmpty,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 pub enum RewindState {
     Start,
-    NextRecord,
+    Wait(IOCompletions),
 }
 
 #[derive(Debug, Clone, Copy)]

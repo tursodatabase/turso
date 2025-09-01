@@ -252,7 +252,13 @@ impl<P: ProtocolIO, Ctx> DatabaseSyncEngine<P, Ctx> {
         let revert_conn = self.open_revert_db_conn()?;
 
         let mut page = [0u8; PAGE_SIZE];
-        let db_size = if revert_conn.try_wal_watermark_read_page(1, &mut page, None)? {
+        let db_size = if revert_conn.try_wal_watermark_read_page(
+            1,
+            &mut page,
+            None,
+            Box::new(()),
+            |_, _| Ok(Ok(())),
+        )? {
             db_size_from_page(&page)
         } else {
             0
@@ -308,7 +314,13 @@ impl<P: ProtocolIO, Ctx> DatabaseSyncEngine<P, Ctx> {
                     );
                     continue;
                 }
-                if !main_conn.try_wal_watermark_read_page(page_no, &mut page, Some(watermark))? {
+                if !main_conn.try_wal_watermark_read_page(
+                    page_no,
+                    &mut page,
+                    Some(watermark),
+                    Box::new(()),
+                    |_, _| Ok(Ok(())),
+                )? {
                     tracing::info!(
                         "checkpoint(path={:?}): skip page {} as it was allocated in the wAL portion for revert",
                         self.main_db_path,

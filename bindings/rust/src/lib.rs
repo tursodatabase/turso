@@ -207,10 +207,10 @@ impl Connection {
             .inner
             .lock()
             .map_err(|e| Error::MutexError(e.to_string()))?;
-        conn.try_wal_watermark_read_page(page_idx, page, frame_watermark)
-            .map_err(|e| {
-                Error::WalOperationError(format!("try_wal_watermark_read_page failed: {e}"))
-            })
+        conn.try_wal_watermark_read_page(page_idx, page, frame_watermark, Box::new(()), |_, _| {
+            Ok(Ok(()))
+        })
+        .map_err(|e| Error::WalOperationError(format!("try_wal_watermark_read_page failed: {e}")))
     }
 
     #[cfg(feature = "conn_raw_api")]
