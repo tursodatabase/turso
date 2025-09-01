@@ -32,9 +32,6 @@ const NULL: SlotIndex = usize::MAX;
 /// 1. Slot array (`entries`): Fixed-size vec holding page entries
 /// 2. SIEVE queue: Doubly-linked list for eviction order (head=MRU, tail=LRU)
 /// 3. Singly-linked free list for tracking available slots
-///
-/// The slot-based design avoids heap allocations during operation and provides
-/// better cache locality
 pub struct PageCache {
     /// Maximum number of pages the cache can hold
     capacity: usize,
@@ -233,6 +230,7 @@ impl PageCache {
             turso_assert!(s.page.is_none(), "page must be None in free slot");
             s.key = key;
             s.page = Some(value);
+            s.ref_bit.set(false);
         }
 
         // new entries go to the head, unmarked
@@ -254,7 +252,6 @@ impl PageCache {
         // pop head
         self.free_head.set(next[fh]);
         next[fh] = NULL;
-        self.prev.borrow_mut()[fh] = NULL;
         Ok(fh)
     }
 
@@ -316,7 +313,6 @@ impl PageCache {
         // push onto freelist: slot -> free_head
         {
             let mut next = self.next.borrow_mut();
-            self.prev.borrow_mut()[slot_idx] = NULL;
             next[slot_idx] = self.free_head.get();
             self.free_head.set(slot_idx);
         }
@@ -448,17 +444,13 @@ impl PageCache {
         let used = survivors.len().min(new_cap);
         {
             let mut next = self.next.borrow_mut();
-            let mut prev = self.prev.borrow_mut();
             if used < new_cap {
                 self.free_head.set(used);
                 for i in used..new_cap - 1 {
                     // freelist links in next
                     next[i] = i + 1;
-                    // keep free slots unlinked in SIEVE list
-                    prev[i] = NULL;
                 }
                 next[new_cap - 1] = NULL;
-                prev[new_cap - 1] = NULL;
             } else {
                 self.free_head.set(NULL);
             }
@@ -487,12 +479,12 @@ impl PageCache {
         }
         let mut need = n - available;
 
-        // evict from tail, if marked, unmark and move to front, otherwise evict
-        let start = self.tail.get();
-        let mut wrapped = false;
-        let mut progress = false;
+        // Track how many slots we've examined without making progress
+        let mut examined = 0;
+        // Allow examining each entry twice
+        let max_examinations = self.len() * 2;
 
-        while need > 0 {
+        while need > 0 && examined < max_examinations {
             let tail_idx = match self.tail.get() {
                 NULL => {
                     return Err(CacheError::InternalError(
@@ -501,7 +493,6 @@ impl PageCache {
                 }
                 t => t,
             };
-
             let (was_marked, key) = {
                 let mut entries = self.entries.borrow_mut();
                 let s = &mut entries[tail_idx];
@@ -509,14 +500,14 @@ impl PageCache {
                 let marked = s.ref_bit.replace(false);
                 (marked, s.key)
             };
-
+            examined += 1;
             if was_marked {
                 self.move_to_front(tail_idx);
             } else {
                 match self._delete(key, true) {
                     Ok(_) => {
                         need -= 1;
-                        progress = true;
+                        examined = 0; // Reset counter on successful eviction
                     }
                     Err(
                         CacheError::Dirty { .. }
@@ -528,17 +519,9 @@ impl PageCache {
                     Err(e) => return Err(e),
                 }
             }
-
-            // detect wrap: if we came back to the original tail and made no progress, give up
-            if self.tail.get() == start {
-                if wrapped {
-                    if !progress {
-                        return Err(CacheError::Full);
-                    }
-                    progress = false;
-                }
-                wrapped = true;
-            }
+        }
+        if need > 0 {
+            return Err(CacheError::Full);
         }
         Ok(())
     }
