@@ -1188,109 +1188,6 @@ impl BTreeCursor {
             .any(|idx| !node_states[idx].is_at_end())
     }
 
-    /// Move the cursor to the next record and return it.
-    /// Used in forwards iteration, which is the default.
-    #[instrument(skip(self), level = Level::DEBUG, name = "next")]
-    fn get_next_record(&mut self) -> Result<IOResult<bool>> {
-        if let Some(mv_cursor) = &self.mv_cursor {
-            let mut mv_cursor = mv_cursor.borrow_mut();
-            mv_cursor.forward();
-            let rowid = mv_cursor.current_row_id();
-            match rowid {
-                Some(_rowid) => {
-                    return Ok(IOResult::Done(true));
-                }
-                None => return Ok(IOResult::Done(false)),
-            }
-        }
-        loop {
-            let mem_page = self.stack.top();
-            let contents = mem_page.get_contents();
-            let cell_count = contents.cell_count();
-            tracing::debug!(
-                id = mem_page.get().id,
-                cell = self.stack.current_cell_index(),
-                cell_count,
-                "current_before_advance",
-            );
-
-            let is_index = mem_page.is_index();
-            let should_skip_advance = is_index
-                && self.going_upwards // we are going upwards, this means we still need to visit divider cell in an index
-                && self.stack.current_cell_index() >= 0 && self.stack.current_cell_index() < cell_count as i32; // if we weren't on a
-                                                                                                                // valid cell then it means we will have to move upwards again or move to right page,
-                                                                                                                // anyways, we won't visit this invalid cell index
-            if should_skip_advance {
-                tracing::debug!(
-                    going_upwards = self.going_upwards,
-                    page = mem_page.get().id,
-                    cell_idx = self.stack.current_cell_index(),
-                    "skipping advance",
-                );
-                self.going_upwards = false;
-                return Ok(IOResult::Done(true));
-            }
-
-            // Important to advance only after loading the page in order to not advance > 1 times
-            self.stack.advance();
-            let cell_idx = self.stack.current_cell_index() as usize;
-            tracing::debug!(id = mem_page.get().id, cell = cell_idx, "current");
-
-            if cell_idx >= cell_count {
-                let rightmost_already_traversed = cell_idx > cell_count;
-                match (contents.rightmost_pointer(), rightmost_already_traversed) {
-                    (Some(right_most_pointer), false) => {
-                        // do rightmost
-                        self.stack.advance();
-                        let (mem_page, c) = self.read_page(right_most_pointer as usize)?;
-                        self.stack.push(mem_page);
-                        if let Some(c) = c {
-                            io_yield_one!(c);
-                        }
-                        continue;
-                    }
-                    _ => {
-                        if self.ancestor_pages_have_more_children() {
-                            tracing::trace!("moving simple upwards");
-                            self.going_upwards = true;
-                            self.stack.pop();
-                            continue;
-                        } else {
-                            // If none of the ancestor pages have more children to iterate, that means we are at the end of the btree and should stop iterating.
-                            return Ok(IOResult::Done(false));
-                        }
-                    }
-                }
-            }
-
-            turso_assert!(
-                cell_idx < contents.cell_count(),
-                "cell index out of bounds: cell_idx={}, cell_count={}, page_type={:?} page_id={}",
-                cell_idx,
-                contents.cell_count(),
-                contents.page_type(),
-                mem_page.get().id
-            );
-
-            if contents.is_leaf() {
-                return Ok(IOResult::Done(true));
-            }
-            if is_index && self.going_upwards {
-                // This means we just came up from a child, so now we need to visit the divider cell before going back to another child page.
-                // This is because index interior cells have payloads, so unless we do this we will be skipping an entry when traversing the tree.
-                self.going_upwards = false;
-                return Ok(IOResult::Done(true));
-            }
-
-            let left_child_page = contents.cell_interior_read_left_child_page(cell_idx);
-            let (mem_page, c) = self.read_page(left_child_page as usize)?;
-            self.stack.push(mem_page);
-            if let Some(c) = c {
-                io_yield_one!(c);
-            }
-        }
-    }
-
     /// Move the cursor to the record that matches the seek key and seek operation.
     /// This may be used to seek to a specific record in a point query (e.g. SELECT * FROM table WHERE col = 10)
     /// or e.g. find the first record greater than the seek key in a range query (e.g. SELECT * FROM table WHERE col > 10).
@@ -4168,7 +4065,7 @@ impl BTreeCursor {
                     }
                 }
                 RewindState::NextRecord => {
-                    let cursor_has_record = return_if_io!(self.get_next_record());
+                    let cursor_has_record = return_if_io!(get_next_record(self));
                     self.invalidate_record();
                     self.has_record.replace(cursor_has_record);
                     self.rewind_state = RewindState::Start;
@@ -4200,7 +4097,7 @@ impl BTreeCursor {
                     self.advance_state = AdvanceState::Advance;
                 }
                 AdvanceState::Advance => {
-                    let cursor_has_record = return_if_io!(self.get_next_record());
+                    let cursor_has_record = return_if_io!(get_next_record(self));
                     self.has_record.replace(cursor_has_record);
                     self.invalidate_record();
                     self.advance_state = AdvanceState::Start;
@@ -5297,7 +5194,7 @@ impl BTreeCursor {
         if let CursorValidState::RequireAdvance(direction) = self.valid_state {
             let has_record = return_if_io!(match direction {
                 // Avoid calling next()/prev() directly because they immediately call restore_context()
-                IterationDirection::Forwards => self.get_next_record(),
+                IterationDirection::Forwards => get_next_record(self),
                 IterationDirection::Backwards => self.get_prev_record(),
             });
             self.has_record.set(has_record);
@@ -5341,6 +5238,109 @@ impl BTreeCursor {
 
     pub fn get_mvcc_cursor(&self) -> Rc<RefCell<MvCursor>> {
         self.mv_cursor.as_ref().unwrap().clone()
+    }
+}
+
+/// Move the cursor to the next record and return it.
+/// Used in forwards iteration, which is the default.
+#[instrument(skip(cursor), level = Level::DEBUG, name = "next")]
+fn get_next_record(cursor: &mut BTreeCursor) -> Result<IOResult<bool>> {
+    if let Some(mv_cursor) = &cursor.mv_cursor {
+        let mut mv_cursor = mv_cursor.borrow_mut();
+        mv_cursor.forward();
+        let rowid = mv_cursor.current_row_id();
+        match rowid {
+            Some(_rowid) => {
+                return Ok(IOResult::Done(true));
+            }
+            None => return Ok(IOResult::Done(false)),
+        }
+    }
+    loop {
+        let mem_page = cursor.stack.top();
+        let contents = mem_page.get_contents();
+        let cell_count = contents.cell_count();
+        tracing::debug!(
+            id = mem_page.get().id,
+            cell = cursor.stack.current_cell_index(),
+            cell_count,
+            "current_before_advance",
+        );
+
+        let is_index = mem_page.is_index();
+        let should_skip_advance = is_index
+            && cursor.going_upwards // we are going upwards, this means we still need to visit divider cell in an index
+            && cursor.stack.current_cell_index() >= 0 && cursor.stack.current_cell_index() < cell_count as i32; // if we weren't on a
+                                                                                                                // valid cell then it means we will have to move upwards again or move to right page,
+                                                                                                                // anyways, we won't visit this invalid cell index
+        if should_skip_advance {
+            tracing::debug!(
+                going_upwards = cursor.going_upwards,
+                page = mem_page.get().id,
+                cell_idx = cursor.stack.current_cell_index(),
+                "skipping advance",
+            );
+            cursor.going_upwards = false;
+            return Ok(IOResult::Done(true));
+        }
+
+        // Important to advance only after loading the page in order to not advance > 1 times
+        cursor.stack.advance();
+        let cell_idx = cursor.stack.current_cell_index() as usize;
+        tracing::debug!(id = mem_page.get().id, cell = cell_idx, "current");
+
+        if cell_idx >= cell_count {
+            let rightmost_already_traversed = cell_idx > cell_count;
+            match (contents.rightmost_pointer(), rightmost_already_traversed) {
+                (Some(right_most_pointer), false) => {
+                    // do rightmost
+                    cursor.stack.advance();
+                    let (mem_page, c) = cursor.read_page(right_most_pointer as usize)?;
+                    cursor.stack.push(mem_page);
+                    if let Some(c) = c {
+                        io_yield_one!(c);
+                    }
+                    continue;
+                }
+                _ => {
+                    if cursor.ancestor_pages_have_more_children() {
+                        tracing::trace!("moving simple upwards");
+                        cursor.going_upwards = true;
+                        cursor.stack.pop();
+                        continue;
+                    } else {
+                        // If none of the ancestor pages have more children to iterate, that means we are at the end of the btree and should stop iterating.
+                        return Ok(IOResult::Done(false));
+                    }
+                }
+            }
+        }
+
+        turso_assert!(
+            cell_idx < contents.cell_count(),
+            "cell index out of bounds: cell_idx={}, cell_count={}, page_type={:?} page_id={}",
+            cell_idx,
+            contents.cell_count(),
+            contents.page_type(),
+            mem_page.get().id
+        );
+
+        if contents.is_leaf() {
+            return Ok(IOResult::Done(true));
+        }
+        if is_index && cursor.going_upwards {
+            // This means we just came up from a child, so now we need to visit the divider cell before going back to another child page.
+            // This is because index interior cells have payloads, so unless we do this we will be skipping an entry when traversing the tree.
+            cursor.going_upwards = false;
+            return Ok(IOResult::Done(true));
+        }
+
+        let left_child_page = contents.cell_interior_read_left_child_page(cell_idx);
+        let (mem_page, c) = cursor.read_page(left_child_page as usize)?;
+        cursor.stack.push(mem_page);
+        if let Some(c) = c {
+            io_yield_one!(c);
+        }
     }
 }
 
