@@ -314,7 +314,7 @@ fn optimize_table_access(
                     let mut temp_constraint_refs = (0..table_constraints.constraints.len())
                         .map(|i| ConstraintRef {
                             constraint_vec_pos: i,
-                            index_col_pos: table_constraints.constraints[i].table_col_pos,
+                            index_col_pos: i,
                             sort_order: SortOrder::Asc,
                         })
                         .collect::<Vec<_>>();
