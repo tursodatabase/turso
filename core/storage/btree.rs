@@ -4065,10 +4065,11 @@ impl BTreeCursor {
                     }
                 }
                 RewindState::NextRecord => {
-                    let cursor_has_record = return_if_io!(get_next_record(self));
-                    self.invalidate_record();
-                    self.has_record.replace(cursor_has_record);
-                    self.rewind_state = RewindState::Start;
+                    return_if_io!(get_next_record(self, |cursor, cursor_has_record| {
+                        cursor.invalidate_record();
+                        cursor.has_record.replace(cursor_has_record);
+                        cursor.rewind_state = RewindState::Start;
+                    }));
                     return Ok(IOResult::Done(()));
                 }
             }
@@ -4097,11 +4098,12 @@ impl BTreeCursor {
                     self.advance_state = AdvanceState::Advance;
                 }
                 AdvanceState::Advance => {
-                    let cursor_has_record = return_if_io!(get_next_record(self));
-                    self.has_record.replace(cursor_has_record);
-                    self.invalidate_record();
-                    self.advance_state = AdvanceState::Start;
-                    return Ok(IOResult::Done(cursor_has_record));
+                    return_if_io!(get_next_record(self, |cursor, cursor_has_record| {
+                        cursor.has_record.replace(cursor_has_record);
+                        cursor.invalidate_record();
+                        cursor.advance_state = AdvanceState::Start;
+                    }));
+                    return Ok(IOResult::Done(self.has_record.get()));
                 }
             }
         }
@@ -5192,15 +5194,24 @@ impl BTreeCursor {
             return Ok(IOResult::Done(()));
         }
         if let CursorValidState::RequireAdvance(direction) = self.valid_state {
-            let has_record = return_if_io!(match direction {
+            match direction {
                 // Avoid calling next()/prev() directly because they immediately call restore_context()
-                IterationDirection::Forwards => get_next_record(self),
-                IterationDirection::Backwards => self.get_prev_record(),
-            });
-            self.has_record.set(has_record);
-            self.invalidate_record();
-            self.context = None;
-            self.valid_state = CursorValidState::Valid;
+                IterationDirection::Forwards => {
+                    return_if_io!(get_next_record(self, |cursor, cursor_has_record| {
+                        cursor.has_record.replace(cursor_has_record);
+                        cursor.invalidate_record();
+                        cursor.context = None;
+                        cursor.valid_state = CursorValidState::Valid;
+                    }));
+                }
+                IterationDirection::Backwards => {
+                    let has_record = return_if_io!(self.get_prev_record());
+                    self.has_record.set(has_record);
+                    self.invalidate_record();
+                    self.context = None;
+                    self.valid_state = CursorValidState::Valid;
+                }
+            }
             return Ok(IOResult::Done(()));
         }
         let ctx = self.context.take().unwrap();
@@ -5243,17 +5254,25 @@ impl BTreeCursor {
 
 /// Move the cursor to the next record and return it.
 /// Used in forwards iteration, which is the default.
-#[instrument(skip(cursor), level = Level::DEBUG, name = "next")]
-fn get_next_record(cursor: &mut BTreeCursor) -> Result<IOResult<bool>> {
+#[instrument(skip(cursor, callback), level = Level::DEBUG, name = "next")]
+fn get_next_record<F>(cursor: &mut BTreeCursor, callback: F) -> Result<IOResult<()>>
+where
+    F: FnOnce(&mut BTreeCursor, bool),
+{
     if let Some(mv_cursor) = &cursor.mv_cursor {
         let mut mv_cursor = mv_cursor.borrow_mut();
         mv_cursor.forward();
         let rowid = mv_cursor.current_row_id();
+        drop(mv_cursor);
         match rowid {
             Some(_rowid) => {
-                return Ok(IOResult::Done(true));
+                callback(cursor, true);
+                return Ok(IOResult::Done(()));
             }
-            None => return Ok(IOResult::Done(false)),
+            None => {
+                callback(cursor, false);
+                return Ok(IOResult::Done(()));
+            }
         }
     }
     loop {
@@ -5281,7 +5300,8 @@ fn get_next_record(cursor: &mut BTreeCursor) -> Result<IOResult<bool>> {
                 "skipping advance",
             );
             cursor.going_upwards = false;
-            return Ok(IOResult::Done(true));
+            callback(cursor, true);
+            return Ok(IOResult::Done(()));
         }
 
         // Important to advance only after loading the page in order to not advance > 1 times
@@ -5310,7 +5330,8 @@ fn get_next_record(cursor: &mut BTreeCursor) -> Result<IOResult<bool>> {
                         continue;
                     } else {
                         // If none of the ancestor pages have more children to iterate, that means we are at the end of the btree and should stop iterating.
-                        return Ok(IOResult::Done(false));
+                        callback(cursor, false);
+                        return Ok(IOResult::Done(()));
                     }
                 }
             }
@@ -5326,13 +5347,15 @@ fn get_next_record(cursor: &mut BTreeCursor) -> Result<IOResult<bool>> {
         );
 
         if contents.is_leaf() {
-            return Ok(IOResult::Done(true));
+            callback(cursor, true);
+            return Ok(IOResult::Done(()));
         }
         if is_index && cursor.going_upwards {
             // This means we just came up from a child, so now we need to visit the divider cell before going back to another child page.
             // This is because index interior cells have payloads, so unless we do this we will be skipping an entry when traversing the tree.
             cursor.going_upwards = false;
-            return Ok(IOResult::Done(true));
+            callback(cursor, true);
+            return Ok(IOResult::Done(()));
         }
 
         let left_child_page = contents.cell_interior_read_left_child_page(cell_idx);
