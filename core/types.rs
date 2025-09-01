@@ -842,83 +842,89 @@ impl Ord for Value {
 impl std::ops::Add<Value> for Value {
     type Output = Value;
 
-    fn add(self, rhs: Self) -> Self::Output {
-        match (self, rhs) {
-            (Self::Integer(int_left), Self::Integer(int_right)) => {
-                Self::Integer(int_left + int_right)
-            }
-            (Self::Integer(int_left), Self::Float(float_right)) => {
-                Self::Float(int_left as f64 + float_right)
-            }
-            (Self::Float(float_left), Self::Integer(int_right)) => {
-                Self::Float(float_left + int_right as f64)
-            }
-            (Self::Float(float_left), Self::Float(float_right)) => {
-                Self::Float(float_left + float_right)
-            }
-            (Self::Text(string_left), Self::Text(string_right)) => {
-                Self::build_text(&(string_left.as_str().to_string() + string_right.as_str()))
-            }
-            (Self::Text(string_left), Self::Integer(int_right)) => {
-                Self::build_text(&(string_left.as_str().to_string() + &int_right.to_string()))
-            }
-            (Self::Integer(int_left), Self::Text(string_right)) => {
-                Self::build_text(&(int_left.to_string() + string_right.as_str()))
-            }
-            (Self::Text(string_left), Self::Float(float_right)) => {
-                let string_right = Self::Float(float_right).to_string();
-                Self::build_text(&(string_left.as_str().to_string() + &string_right))
-            }
-            (Self::Float(float_left), Self::Text(string_right)) => {
-                let string_left = Self::Float(float_left).to_string();
-                Self::build_text(&(string_left + string_right.as_str()))
-            }
-            (lhs, Self::Null) => lhs,
-            (Self::Null, rhs) => rhs,
-            _ => Self::Float(0.0),
-        }
+    fn add(mut self, rhs: Self) -> Self::Output {
+        self += rhs;
+        self
     }
 }
 
 impl std::ops::Add<f64> for Value {
     type Output = Value;
 
-    fn add(self, rhs: f64) -> Self::Output {
-        match self {
-            Self::Integer(int_left) => Self::Float(int_left as f64 + rhs),
-            Self::Float(float_left) => Self::Float(float_left + rhs),
-            _ => unreachable!(),
-        }
+    fn add(mut self, rhs: f64) -> Self::Output {
+        self += rhs;
+        self
     }
 }
 
 impl std::ops::Add<i64> for Value {
     type Output = Value;
 
-    fn add(self, rhs: i64) -> Self::Output {
-        match self {
-            Self::Integer(int_left) => Self::Integer(int_left + rhs),
-            Self::Float(float_left) => Self::Float(float_left + rhs as f64),
-            _ => unreachable!(),
-        }
+    fn add(mut self, rhs: i64) -> Self::Output {
+        self += rhs;
+        self
     }
 }
 
 impl std::ops::AddAssign for Value {
-    fn add_assign(&mut self, rhs: Self) {
-        *self = self.clone() + rhs;
+    fn add_assign(mut self: &mut Self, rhs: Self) {
+        match (&mut self, rhs) {
+            (Self::Integer(int_left), Self::Integer(int_right)) => *int_left += int_right,
+            (Self::Integer(int_left), Self::Float(float_right)) => {
+                *self = Self::Float(*int_left as f64 + float_right)
+            }
+            (Self::Float(float_left), Self::Integer(int_right)) => {
+                *self = Self::Float(*float_left + int_right as f64)
+            }
+            (Self::Float(float_left), Self::Float(float_right)) => {
+                *float_left += float_right;
+            }
+            (Self::Text(string_left), Self::Text(string_right)) => {
+                string_left.value.extend_from_slice(&string_right.value);
+                string_left.subtype = TextSubtype::Text;
+            }
+            (Self::Text(string_left), Self::Integer(int_right)) => {
+                let string_right = int_right.to_string();
+                string_left.value.extend_from_slice(string_right.as_bytes());
+                string_left.subtype = TextSubtype::Text;
+            }
+            (Self::Integer(int_left), Self::Text(string_right)) => {
+                let string_left = int_left.to_string();
+                *self = Self::build_text(&(string_left + string_right.as_str()));
+            }
+            (Self::Text(string_left), Self::Float(float_right)) => {
+                let string_right = Self::Float(float_right).to_string();
+                string_left.value.extend_from_slice(string_right.as_bytes());
+                string_left.subtype = TextSubtype::Text;
+            }
+            (Self::Float(float_left), Self::Text(string_right)) => {
+                let string_left = Self::Float(*float_left).to_string();
+                *self = Self::build_text(&(string_left + string_right.as_str()));
+            }
+            (_, Self::Null) => {}
+            (Self::Null, rhs) => *self = rhs,
+            _ => *self = Self::Float(0.0),
+        }
     }
 }
 
 impl std::ops::AddAssign<i64> for Value {
     fn add_assign(&mut self, rhs: i64) {
-        *self = self.clone() + rhs;
+        match self {
+            Self::Integer(int_left) => *int_left += rhs,
+            Self::Float(float_left) => *float_left += rhs as f64,
+            _ => unreachable!(),
+        }
     }
 }
 
 impl std::ops::AddAssign<f64> for Value {
     fn add_assign(&mut self, rhs: f64) {
-        *self = self.clone() + rhs;
+        match self {
+            Self::Integer(int_left) => *self = Self::Float(*int_left as f64 + rhs),
+            Self::Float(float_left) => *float_left += rhs,
+            _ => unreachable!(),
+        }
     }
 }
 
@@ -2542,9 +2548,10 @@ impl<T> IOResult<T> {
 #[macro_export]
 macro_rules! return_if_io {
     ($expr:expr) => {
-        match $expr? {
-            IOResult::Done(v) => v,
-            IOResult::IO(io) => return Ok(IOResult::IO(io)),
+        match $expr {
+            Ok(IOResult::Done(v)) => v,
+            Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
+            Err(err) => return Err(err),
         }
     };
 }

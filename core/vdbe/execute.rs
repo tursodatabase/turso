@@ -118,9 +118,10 @@ macro_rules! load_insn {
 
 macro_rules! return_if_io {
     ($expr:expr) => {
-        match $expr? {
-            IOResult::Done(v) => v,
-            IOResult::IO(io) => return Ok(InsnFunctionStepResult::IO(io)),
+        match $expr {
+            Ok(IOResult::Done(v)) => v,
+            Ok(IOResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(io)),
+            Err(err) => return Err(err),
         }
     };
 }
@@ -3390,22 +3391,22 @@ pub fn op_agg_step(
             }
         }
         AggFunc::Count | AggFunc::Count0 => {
-            let col = state.registers[*col].get_value().clone();
+            let skip = (matches!(func, AggFunc::Count)
+                && matches!(state.registers[*col].get_value(), Value::Null));
             if matches!(&state.registers[*acc_reg], Register::Value(Value::Null)) {
                 state.registers[*acc_reg] =
                     Register::Aggregate(AggContext::Count(Value::Integer(0)));
             }
-            let Register::Aggregate(agg) = state.registers[*acc_reg].borrow_mut() else {
+            let Register::Aggregate(agg) = &mut state.registers[*acc_reg] else {
                 panic!(
                     "Unexpected value {:?} in AggStep at register {}",
                     state.registers[*acc_reg], *acc_reg
                 );
             };
-            let AggContext::Count(count) = agg.borrow_mut() else {
+            let AggContext::Count(count) = agg else {
                 unreachable!();
             };
-
-            if !(matches!(func, AggFunc::Count) && matches!(col, Value::Null)) {
+            if !skip {
                 *count += 1;
             };
         }

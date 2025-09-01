@@ -721,6 +721,7 @@ impl BTreeCursor {
                     continue;
                 }
             }
+
             if cell_idx >= cell_count as i32 {
                 self.stack.set_cell_index(cell_count as i32 - 1);
             } else if !self.stack.current_cell_index_less_than_min() {
@@ -756,6 +757,7 @@ impl BTreeCursor {
                 continue;
             }
             if contents.is_leaf() {
+                self.going_upwards = false;
                 return Ok(IOResult::Done(true));
             }
 
@@ -1204,6 +1206,14 @@ impl BTreeCursor {
             }
         }
         loop {
+            let cell_idx = self.stack.current_cell_index();
+            let cell_count = self.stack.leaf_cell_count();
+            if cell_idx != -1 && cell_count.is_some() && cell_idx + 1 < cell_count.unwrap() {
+                self.stack.advance();
+                return Ok(IOResult::Done(true));
+            }
+            self.stack.set_leaf_cell_count(None);
+
             let mem_page = self.stack.top();
             let contents = mem_page.get_contents();
             let cell_count = contents.cell_count();
@@ -1273,6 +1283,7 @@ impl BTreeCursor {
             );
 
             if contents.is_leaf() {
+                self.stack.set_leaf_cell_count(Some(cell_count as i32));
                 return Ok(IOResult::Done(true));
             }
             if is_index && self.going_upwards {
@@ -4203,7 +4214,6 @@ impl BTreeCursor {
                     let cursor_has_record = return_if_io!(self.get_next_record());
                     self.has_record.replace(cursor_has_record);
                     self.invalidate_record();
-                    self.advance_state = AdvanceState::Start;
                     return Ok(IOResult::Done(cursor_has_record));
                 }
             }
@@ -4231,7 +4241,6 @@ impl BTreeCursor {
                     let cursor_has_record = return_if_io!(self.get_prev_record());
                     self.has_record.replace(cursor_has_record);
                     self.invalidate_record();
-                    self.advance_state = AdvanceState::Start;
                     return Ok(IOResult::Done(cursor_has_record));
                 }
             }
@@ -5148,7 +5157,8 @@ impl BTreeCursor {
     }
 
     fn get_immutable_record_or_create(&self) -> std::cell::RefMut<'_, Option<ImmutableRecord>> {
-        if self.reusable_immutable_record.borrow().is_none() {
+        let mut reusable_immutable_record = self.reusable_immutable_record.borrow_mut();
+        if reusable_immutable_record.is_none() {
             let page_size = self
                 .pager
                 .page_size
@@ -5156,9 +5166,9 @@ impl BTreeCursor {
                 .expect("page size is not set")
                 .get();
             let record = ImmutableRecord::new(page_size as usize);
-            self.reusable_immutable_record.replace(Some(record));
+            reusable_immutable_record.replace(record);
         }
-        self.reusable_immutable_record.borrow_mut()
+        reusable_immutable_record
     }
 
     fn get_immutable_record(&self) -> std::cell::RefMut<'_, Option<ImmutableRecord>> {
@@ -5304,7 +5314,7 @@ impl BTreeCursor {
             self.context = None;
             self.valid_state = CursorValidState::Valid;
             return Ok(IOResult::Done(()));
-        }
+        };
         let ctx = self.context.take().unwrap();
         let seek_key = match ctx.key {
             CursorContextKey::TableRowId(rowid) => SeekKey::TableRowId(rowid),
@@ -5985,9 +5995,12 @@ impl PageStack {
             page.unpin();
         }
 
+        assert!(current > 0);
         self.node_states[current] = BTreeNodeState::default();
         self.stack[current] = None;
-        assert!(current > 0);
+        // cell_count must be unset for last stack page by default
+        // (otherwise caller can think that he is at the leaf and enable hot-path optimization)
+        self.node_states[current - 1].cell_count = None;
         self.current_page -= 1;
     }
 
@@ -6003,6 +6016,7 @@ impl PageStack {
     }
 
     /// Current page pointer being used
+    #[inline(always)]
     fn current(&self) -> usize {
         assert!(self.current_page >= 0);
         let current = self.current_page as usize;
@@ -6015,6 +6029,20 @@ impl PageStack {
         self.node_states[current].cell_idx
     }
 
+    /// Cell count of the current leaf page
+    /// Caller must ensure that this method will be called for the leag page only
+    fn leaf_cell_count(&self) -> Option<i32> {
+        let current = self.current();
+        self.node_states[current].cell_count
+    }
+
+    // Set cell count for current leaf page
+    // Caller must ensure that this method will be called for the leag page only
+    fn set_leaf_cell_count(&mut self, cell_count: Option<i32>) {
+        let current = self.current();
+        self.node_states[current].cell_count = cell_count;
+    }
+
     /// Check if the current cell index is less than 0.
     /// This means we have been iterating backwards and have reached the start of the page.
     fn current_cell_index_less_than_min(&self) -> bool {
@@ -6024,13 +6052,14 @@ impl PageStack {
 
     /// Advance the current cell index of the current page to the next cell.
     /// We usually advance after going traversing a new page
-    #[instrument(skip(self), level = Level::DEBUG, name = "pagestack::advance",)]
+    // #[instrument(skip(self), level = Level::DEBUG, name = "pagestack::advance",)]
+    #[inline(always)]
     fn advance(&mut self) {
         let current = self.current();
-        tracing::trace!(
-            curr_cell_index = self.node_states[current].cell_idx,
-            node_states = ?self.node_states.iter().map(|state| state.cell_idx).collect::<Vec<_>>(),
-        );
+        // tracing::trace!(
+        //     curr_cell_index = self.node_states[current].cell_idx,
+        //     node_states = ?self.node_states.iter().map(|state| state.cell_idx).collect::<Vec<_>>(),
+        // );
         self.node_states[current].cell_idx += 1;
     }
 
