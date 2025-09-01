@@ -1552,135 +1552,133 @@ pub fn read_varint_slow(buf: &[u8]) -> Result<(u64, usize)> {
 // 3. We have some magic constants that are basically masks over this bits that are being used. They also exclude the highest bit 8 or 24 after being read from the pointer
 //    as that one is only relevant information if there is another byte.
 
+#[inline(always)]
 pub fn read_varint(buf: &[u8]) -> Result<(u64, usize)> {
-    unsafe {
-        const SLOT_2_0: u32 = 0x001fc07f;
-        const SLOT_4_2_0: u32 = 0xf01fc07f;
-        // Mask for first byte without 7 high bits
-        const MASK_FIRST_BYTE: u32 = 0x7f;
-        let mut p = buf.as_ptr();
-        // if the first byte is not negative, then we can return early as we know the highest bit is 0.
-        // Highest bit == 1 means we have more bytes to process, by casting this unsigned u8 to i8, we can check if the highest bit is 1.
+    let mut pos = 0;
+    const SLOT_2_0: u32 = 0x001fc07f;
+    const SLOT_4_2_0: u32 = 0xf01fc07f;
+    // Mask for first byte without 7 high bits
+    const MASK_FIRST_BYTE: u32 = 0x7f;
+    // if the first byte is not negative, then we can return early as we know the highest bit is 0.
+    // Highest bit == 1 means we have more bytes to process, by casting this unsigned u8 to i8, we can check if the highest bit is 1.
 
-        if *p as i8 >= 0 {
-            return Ok((*p as u64, 1));
-        }
-
-        // Case where we have 2 bytes, same trick but we also include first bytes data.
-        if *p.add(1) as i8 >= 0 {
-            let v = *p as u32 & MASK_FIRST_BYTE;
-            let v = v << 7;
-            let v = v | (*p.add(1) as u32);
-            return Ok((v as u64, 2));
-        }
-
-        // Here is where magic happens.
-        // On even_bytes we store bytes even bytes in the first 7 bits and the bits from 17..24 are used.
-        // On odd_bytes we too store bytes odd bytes in the first 7 bits and the bits from 17..24 are used.
-        // These two can be merged by (even_bytes << 7) | odd_bytes.
-        let mut even_bytes = (*p as u32) << 14;
-        let mut odd_bytes = *p.add(1) as u32;
-        p = p.add(2);
-        even_bytes = even_bytes | *p as u32;
-        // Case 3 bytes
-        if even_bytes & 0x80 == 0 {
-            // We reconstruct the value from byte 0 and 2 that are stored in a, and byte 1 is in b.
-            even_bytes &= SLOT_2_0;
-            odd_bytes &= MASK_FIRST_BYTE;
-            odd_bytes = odd_bytes << 7;
-            even_bytes = even_bytes | odd_bytes;
-            return Ok((even_bytes as u64, 3));
-        }
-
-        // Case 4 bytes
-        // clear high bits
-        even_bytes &= SLOT_2_0;
-        p = p.add(1);
-        odd_bytes = odd_bytes << 14;
-        odd_bytes |= *p as u32;
-        if odd_bytes & 0x80 == 0 {
-            odd_bytes &= SLOT_2_0;
-            // move bytes so that they align
-            even_bytes = even_bytes << 7;
-            // now combine them
-            even_bytes = even_bytes | odd_bytes;
-            return Ok((even_bytes as u64, 4));
-        }
-
-        // Case 5 bytes
-        odd_bytes &= SLOT_2_0;
-
-        let mut s = even_bytes;
-        p = p.add(1);
-        even_bytes = even_bytes << 14;
-        even_bytes |= *p as u32;
-        if even_bytes & 0x80 == 0 {
-            odd_bytes = odd_bytes << 7;
-            even_bytes = even_bytes | odd_bytes;
-            s = s >> 18;
-            let a = ((s as u64) << 32) | even_bytes as u64;
-            return Ok((a, 5));
-        }
-        // Case 6 bytes
-        // save stuff
-        s = s << 7;
-        s |= odd_bytes;
-
-        p = p.add(1);
-        odd_bytes = odd_bytes << 14;
-        odd_bytes |= *p as u32;
-        if odd_bytes & 0x80 == 0 {
-            even_bytes &= SLOT_2_0;
-            even_bytes = even_bytes << 7;
-            even_bytes = even_bytes | odd_bytes;
-            s = s >> 18;
-            let v = ((s as u64) << 32) | even_bytes as u64;
-            return Ok((v, 6));
-        }
-        // Case 7 bytes
-        p = p.add(1);
-        even_bytes = even_bytes << 14;
-        even_bytes |= *p as u32;
-        if even_bytes & 0x80 == 0 {
-            even_bytes &= SLOT_4_2_0;
-            odd_bytes &= SLOT_2_0;
-            odd_bytes = odd_bytes << 7;
-            even_bytes = even_bytes | odd_bytes;
-            s = s >> 11;
-            let v = ((s as u64) << 32) | even_bytes as u64;
-            return Ok((v, 7));
-        }
-        // Case 8 bytes
-        even_bytes &= SLOT_2_0;
-        p = p.add(1);
-        odd_bytes = odd_bytes << 14;
-        odd_bytes |= *p as u32;
-        if odd_bytes & 0x80 == 0 {
-            odd_bytes &= SLOT_4_2_0;
-
-            even_bytes = even_bytes << 7;
-            even_bytes = even_bytes | odd_bytes;
-            s = s >> 4;
-            let v = ((s as u64) << 32) | even_bytes as u64;
-            return Ok((v, 8));
-        }
-        // Case 9 bytes
-        p = p.add(1);
-        even_bytes = even_bytes << 15;
-        even_bytes |= *p as u32;
-
-        odd_bytes &= SLOT_2_0;
-        odd_bytes = odd_bytes << 8;
-        even_bytes |= odd_bytes;
-
-        s = s << 4;
-        odd_bytes = (*p.sub(4)) as u32;
-        odd_bytes &= MASK_FIRST_BYTE;
-        odd_bytes = odd_bytes >> 3;
-        s = s | odd_bytes;
-        let v = ((s as u64) << 32) | even_bytes as u64;
-        return Ok((v, 9));
+    if buf[0] as i8 >= 0 {
+        return Ok((buf[0] as u64, 1));
     }
+
+    // Case where we have 2 bytes, same trick but we also include first bytes data.
+    if buf[1] as i8 >= 0 {
+        let v = buf[0] as u32 & MASK_FIRST_BYTE;
+        let v = v << 7;
+        let v = v | (buf[1] as u32);
+        return Ok((v as u64, 2));
+    }
+
+    // On even_bytes we store bytes even bytes in the first 7 bits and the bits from 17..24 are used.
+    // On odd_bytes we too store bytes odd bytes in the first 7 bits and the bits from 17..24 are used.
+    // These two can be merged by (even_bytes << 7) | odd_bytes.
+    let mut even_bytes = (buf[0] as u32) << 14;
+    let mut odd_bytes = buf[1] as u32;
+    pos += 2;
+    even_bytes = even_bytes | (buf[2] as u32);
+    // Case 3 bytes
+    if even_bytes & 0x80 == 0 {
+        // We reconstruct the value from byte 0 and 2 that are stored in a, and byte 1 is in b.
+        even_bytes &= SLOT_2_0;
+        odd_bytes &= MASK_FIRST_BYTE;
+        odd_bytes = odd_bytes << 7;
+        even_bytes = even_bytes | odd_bytes;
+        return Ok((even_bytes as u64, 3));
+    }
+
+    // Case 4 bytes
+    // clear high bits
+    even_bytes &= SLOT_2_0;
+    pos += 1;
+    odd_bytes = odd_bytes << 14;
+    odd_bytes |= buf[pos] as u32;
+    if odd_bytes & 0x80 == 0 {
+        odd_bytes &= SLOT_2_0;
+        // move bytes so that they align
+        even_bytes = even_bytes << 7;
+        // now combine them
+        even_bytes = even_bytes | odd_bytes;
+        return Ok((even_bytes as u64, 4));
+    }
+
+    // Case 5 bytes
+    odd_bytes &= SLOT_2_0;
+
+    let mut s = even_bytes;
+    pos += 1;
+    even_bytes = even_bytes << 14;
+    even_bytes |= buf[pos] as u32;
+    if even_bytes & 0x80 == 0 {
+        odd_bytes = odd_bytes << 7;
+        even_bytes = even_bytes | odd_bytes;
+        s = s >> 18;
+        let a = ((s as u64) << 32) | even_bytes as u64;
+        return Ok((a, 5));
+    }
+    // Case 6 bytes
+    // save stuff
+    s = s << 7;
+    s |= odd_bytes;
+
+    pos += 1;
+    odd_bytes = odd_bytes << 14;
+    odd_bytes |= buf[pos] as u32;
+    if odd_bytes & 0x80 == 0 {
+        even_bytes &= SLOT_2_0;
+        even_bytes = even_bytes << 7;
+        even_bytes = even_bytes | odd_bytes;
+        s = s >> 18;
+        let v = ((s as u64) << 32) | even_bytes as u64;
+        return Ok((v, 6));
+    }
+    // Case 7 bytes
+    pos += 1;
+    even_bytes = even_bytes << 14;
+    even_bytes |= buf[pos] as u32;
+    if even_bytes & 0x80 == 0 {
+        even_bytes &= SLOT_4_2_0;
+        odd_bytes &= SLOT_2_0;
+        odd_bytes = odd_bytes << 7;
+        even_bytes = even_bytes | odd_bytes;
+        s = s >> 11;
+        let v = ((s as u64) << 32) | even_bytes as u64;
+        return Ok((v, 7));
+    }
+    // Case 8 bytes
+    even_bytes &= SLOT_2_0;
+    pos += 1;
+    odd_bytes = odd_bytes << 14;
+    odd_bytes |= buf[pos] as u32;
+    if odd_bytes & 0x80 == 0 {
+        odd_bytes &= SLOT_4_2_0;
+
+        even_bytes = even_bytes << 7;
+        even_bytes = even_bytes | odd_bytes;
+        s = s >> 4;
+        let v = ((s as u64) << 32) | even_bytes as u64;
+        return Ok((v, 8));
+    }
+    // Case 9 bytes
+    pos += 1;
+    even_bytes = even_bytes << 15;
+    even_bytes |= buf[pos] as u32;
+
+    odd_bytes &= SLOT_2_0;
+    odd_bytes = odd_bytes << 8;
+    even_bytes |= odd_bytes;
+
+    s = s << 4;
+    odd_bytes = buf[pos - 4] as u32;
+    odd_bytes &= MASK_FIRST_BYTE;
+    odd_bytes = odd_bytes >> 3;
+    s = s | odd_bytes;
+    let v = ((s as u64) << 32) | even_bytes as u64;
+    return Ok((v, 9));
 }
 
 pub fn varint_len(value: u64) -> usize {
