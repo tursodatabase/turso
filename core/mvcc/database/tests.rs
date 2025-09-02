@@ -1258,9 +1258,13 @@ fn test_concurrent_writes() {
         conn.execute("CREATE TABLE test (x)").unwrap();
         conn.close().unwrap();
     }
-    for i in 0..2 {
+    let num_connections = 2;
+    let num_inserts_per_connection = 100;
+    for i in 0..num_connections {
         let conn = db.connect();
-        let mut inserts = ((100 * i)..(100 * (i + 1))).collect::<Vec<_>>();
+        let mut inserts = ((num_inserts_per_connection * i)
+            ..(num_inserts_per_connection * (i + 1)))
+            .collect::<Vec<i64>>();
         inserts.reverse();
         connecitons.push(ConnectionState {
             conn,
@@ -1278,7 +1282,7 @@ fn test_concurrent_writes() {
             }
         }
         for (conn_id, conn) in connecitons.iter_mut().enumerate() {
-            println!("connection {conn_id} inserts: {:?}", conn.inserts);
+            // println!("connection {conn_id} inserts: {:?}", conn.inserts);
             if conn.current_statement.is_none() && !conn.inserts.is_empty() {
                 let write = conn.inserts.pop().unwrap();
                 println!("inserting row {write} from connection {conn_id}");
@@ -1291,6 +1295,7 @@ fn test_concurrent_writes() {
             if conn.current_statement.is_none() {
                 continue;
             }
+            println!("connection step {conn_id}");
             let stmt = conn.current_statement.as_mut().unwrap();
             match stmt.step().unwrap() {
                 // These you be only possible cases in write concurrency.
@@ -1298,6 +1303,7 @@ fn test_concurrent_writes() {
                 // No interrupt because insert doesn't interrupt
                 // No busy because insert in mvcc should be multi concurrent write
                 StepResult::Done => {
+                    println!("connection {conn_id} done");
                     conn.current_statement = None;
                 }
                 StepResult::IO => {
@@ -1314,4 +1320,17 @@ fn test_concurrent_writes() {
             break;
         }
     }
+
+    // Now let's find out if we wrote everything we intended to write.
+    let conn = db.connect();
+    let rows = get_rows(&conn, "SELECT * FROM test ORDER BY x ASC");
+    dbg!(&rows);
+    assert_eq!(
+        rows.len() as i64,
+        num_connections * num_inserts_per_connection
+    );
+    for (row_id, row) in rows.iter().enumerate() {
+        assert_eq!(row[0].as_int().unwrap(), row_id as i64);
+    }
+    conn.close().unwrap();
 }
