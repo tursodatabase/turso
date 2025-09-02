@@ -820,7 +820,7 @@ impl BTreeCursor {
                 page,
             } = read_overflow_state.as_mut().unwrap();
 
-            ensure_page_loaded_without_error(&page)?;
+            ensure_page_loaded_without_error(page)?;
             tracing::debug!(next_page, remaining_to_read, "reading overflow page");
             let contents = page.get_contents();
             // The first four bytes of each overflow page are a big-endian integer which is the page number of the next page in the chain, or zero for the final page in the chain.
@@ -2639,7 +2639,7 @@ impl BTreeCursor {
                         .take(balance_info.sibling_count)
                     {
                         let page = page.as_ref().unwrap();
-                        ensure_page_loaded_without_error(&page)?;
+                        ensure_page_loaded_without_error(page)?;
 
                         #[cfg(debug_assertions)]
                         let page_type_of_siblings = balance_info.pages_to_balance[0]
