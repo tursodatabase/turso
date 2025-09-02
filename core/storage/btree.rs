@@ -757,7 +757,6 @@ impl BTreeCursor {
                 continue;
             }
             if contents.is_leaf() {
-                self.going_upwards = false;
                 return Ok(IOResult::Done(true));
             }
 
@@ -5998,9 +5997,6 @@ impl PageStack {
         assert!(current > 0);
         self.node_states[current] = BTreeNodeState::default();
         self.stack[current] = None;
-        // cell_count must be unset for last stack page by default
-        // (otherwise caller can think that he is at the leaf and enable hot-path optimization)
-        self.node_states[current - 1].cell_count = None;
         self.current_page -= 1;
     }
 
