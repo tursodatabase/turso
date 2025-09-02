@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use sql_generation::generation::pick_index;
 use tracing::instrument;
-use turso_core::{Connection, LimboError, Result, StepResult};
+use turso_core::{Connection, Result, StepResult, TursoError};
 
 use crate::generation::{
     Shadow as _,
@@ -47,11 +47,11 @@ impl ExecutionHistory {
 
 pub(crate) struct ExecutionResult {
     pub(crate) history: ExecutionHistory,
-    pub(crate) error: Option<LimboError>,
+    pub(crate) error: Option<TursoError>,
 }
 
 impl ExecutionResult {
-    pub(crate) fn new(history: ExecutionHistory, error: Option<LimboError>) -> Self {
+    pub(crate) fn new(history: ExecutionHistory, error: Option<TursoError>) -> Self {
         Self { history, error }
     }
 }
@@ -95,7 +95,7 @@ pub(crate) fn execute_plans(
         if now.elapsed().as_secs() >= env.opts.max_time_simulation as u64 {
             return ExecutionResult::new(
                 history,
-                Some(LimboError::InternalError(
+                Some(TursoError::InternalError(
                     "maximum time for simulation reached".into(),
                 )),
             );
@@ -275,19 +275,19 @@ fn limbo_integrity_check(conn: &Arc<Connection>) -> Result<()> {
                 break;
             }
             StepResult::Busy => {
-                return Err(LimboError::Busy);
+                return Err(TursoError::Busy);
             }
         }
     }
 
     if result.is_empty() {
-        return Err(LimboError::InternalError(
+        return Err(TursoError::InternalError(
             "PRAGMA integrity_check did not return a value".to_string(),
         ));
     }
     let message = result.join("\n");
     if message != "ok" {
-        return Err(LimboError::InternalError(format!(
+        return Err(TursoError::InternalError(format!(
             "Integrity Check Failed: {message}"
         )));
     }

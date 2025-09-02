@@ -8,7 +8,7 @@ use crate::{
         plan::{JoinOrderMember, JoinedTable},
         planner::TableMask,
     },
-    LimboError, Result,
+    Result, TursoError,
 };
 
 use super::{
@@ -160,7 +160,7 @@ pub fn compute_best_join_order<'a>(
                 best_plan: plan,
                 best_ordered_plan: None,
             })),
-            None => Err(LimboError::PlanningError(
+            None => Err(TursoError::PlanningError(
                 "No valid query plan found".to_string(),
             )),
         };
@@ -391,7 +391,7 @@ pub fn compute_best_join_order<'a>(
                 best_ordered_plan
             },
         })),
-        None => Err(LimboError::PlanningError(
+        None => Err(TursoError::PlanningError(
             "No valid query plan found".to_string(),
         )),
     }

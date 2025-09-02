@@ -3,7 +3,7 @@ use thiserror::Error;
 use crate::storage::page_cache::CacheError;
 
 #[derive(Debug, Clone, Error, miette::Diagnostic)]
-pub enum LimboError {
+pub enum TursoError {
     #[error("Corrupt database: {0}")]
     Corrupt(String),
     #[error("File is not a database")]
@@ -82,21 +82,21 @@ pub enum LimboError {
 }
 
 // We only propagate the error kind so we can avoid string allocation in hot path and copying/cloning enums is cheaper
-impl From<std::io::Error> for LimboError {
+impl From<std::io::Error> for TursoError {
     fn from(value: std::io::Error) -> Self {
         Self::CompletionError(CompletionError::IOError(value.kind()))
     }
 }
 
 #[cfg(target_family = "unix")]
-impl From<rustix::io::Errno> for LimboError {
+impl From<rustix::io::Errno> for TursoError {
     fn from(value: rustix::io::Errno) -> Self {
         CompletionError::from(value).into()
     }
 }
 
 #[cfg(all(target_os = "linux", feature = "io_uring"))]
-impl From<&'static str> for LimboError {
+impl From<&'static str> for TursoError {
     fn from(value: &'static str) -> Self {
         CompletionError::UringIOError(value).into()
     }
@@ -129,27 +129,27 @@ pub enum CompletionError {
 #[macro_export]
 macro_rules! bail_parse_error {
     ($($arg:tt)*) => {
-        return Err($crate::error::LimboError::ParseError(format!($($arg)*)))
+        return Err($crate::error::TursoError::ParseError(format!($($arg)*)))
     };
 }
 
 #[macro_export]
 macro_rules! bail_corrupt_error {
     ($($arg:tt)*) => {
-        return Err($crate::error::LimboError::Corrupt(format!($($arg)*)))
+        return Err($crate::error::TursoError::Corrupt(format!($($arg)*)))
     };
 }
 
 #[macro_export]
 macro_rules! bail_constraint_error {
     ($($arg:tt)*) => {
-        return Err($crate::error::LimboError::Constraint(format!($($arg)*)))
+        return Err($crate::error::TursoError::Constraint(format!($($arg)*)))
     };
 }
 
-impl From<turso_ext::ResultCode> for LimboError {
+impl From<turso_ext::ResultCode> for TursoError {
     fn from(err: turso_ext::ResultCode) -> Self {
-        LimboError::ExtensionError(err.to_string())
+        TursoError::ExtensionError(err.to_string())
     }
 }
 

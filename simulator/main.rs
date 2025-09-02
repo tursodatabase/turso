@@ -627,7 +627,7 @@ fn run_simulation_default(
         let ic = integrity_check(&env.get_db_path());
         if let Err(err) = ic {
             tracing::error!("integrity check failed: {}", err);
-            result.error = Some(turso_core::LimboError::InternalError(err.to_string()));
+            result.error = Some(turso_core::TursoError::InternalError(err.to_string()));
         } else {
             tracing::info!("integrity check passed");
         }

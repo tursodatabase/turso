@@ -1,4 +1,4 @@
-use crate::{Clock, Completion, File, Instant, LimboError, OpenFlags, Result, IO};
+use crate::{Clock, Completion, File, Instant, TursoError, OpenFlags, Result, IO};
 use parking_lot::RwLock;
 use std::io::{Read, Seek, Write};
 use std::sync::Arc;

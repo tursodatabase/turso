@@ -1,4 +1,4 @@
-use turso_core::{LimboError, Result, StepResult, Value};
+use turso_core::{Result, StepResult, TursoError, Value};
 
 use crate::common::TempDatabase;
 
@@ -12,7 +12,7 @@ fn test_txn_error_doesnt_rollback_txn() -> Result<()> {
     // should fail
     assert!(conn
         .execute("begin")
-        .inspect_err(|e| assert!(matches!(e, LimboError::TxError(_))))
+        .inspect_err(|e| assert!(matches!(e, TursoError::TxError(_))))
         .is_err());
     conn.execute("insert into t values (1)")?;
     conn.execute("commit")?;

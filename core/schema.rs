@@ -23,7 +23,7 @@ use crate::translate::plan::SelectPlan;
 use crate::util::{
     module_args_from_sql, module_name_from_sql, type_from_name, IOExt, UnparsedFromSqlIndex,
 };
-use crate::{return_if_io, LimboError, MvCursor, Pager, RefValue, SymbolTable, VirtualTable};
+use crate::{return_if_io, MvCursor, Pager, RefValue, SymbolTable, TursoError, VirtualTable};
 use crate::{util::normalize_ident, Result};
 use core::fmt;
 use std::cell::RefCell;
@@ -133,7 +133,7 @@ impl Schema {
             self.materialized_views.remove(&name);
             Ok(())
         } else {
-            Err(crate::LimboError::ParseError(format!(
+            Err(crate::TursoError::ParseError(format!(
                 "no such view: {name}"
             )))
         }
@@ -177,7 +177,7 @@ impl Schema {
         for view in self.materialized_views.values() {
             let mut view = view
                 .lock()
-                .map_err(|_| LimboError::InternalError("Failed to lock view".to_string()))?;
+                .map_err(|_| TursoError::InternalError("Failed to lock view".to_string()))?;
             return_if_io!(view.populate_from_table(conn));
         }
         Ok(IOResult::Done(()))
@@ -295,7 +295,7 @@ impl Schema {
         let mut materialized_views_to_process: Vec<(String, Vec<String>)> = Vec::new();
 
         if matches!(pager.begin_read_tx()?, LimboResult::Busy) {
-            return Err(LimboError::Busy);
+            return Err(TursoError::Busy);
         }
 
         pager.io.block(|| cursor.rewind())?;
@@ -308,17 +308,17 @@ impl Schema {
             let mut record_cursor = cursor.record_cursor.borrow_mut();
             let ty_value = record_cursor.get_value(&row, 0)?;
             let RefValue::Text(ty) = ty_value else {
-                return Err(LimboError::ConversionError("Expected text value".into()));
+                return Err(TursoError::ConversionError("Expected text value".into()));
             };
             match ty.as_str() {
                 "table" => {
                     let root_page_value = record_cursor.get_value(&row, 3)?;
                     let RefValue::Integer(root_page) = root_page_value else {
-                        return Err(LimboError::ConversionError("Expected integer value".into()));
+                        return Err(TursoError::ConversionError("Expected integer value".into()));
                     };
                     let sql_value = record_cursor.get_value(&row, 4)?;
                     let RefValue::Text(sql_text) = sql_value else {
-                        return Err(LimboError::ConversionError("Expected text value".into()));
+                        return Err(TursoError::ConversionError("Expected text value".into()));
                     };
                     let sql = sql_text.as_str();
                     let create_virtual = "create virtual";
@@ -327,7 +327,7 @@ impl Schema {
                     {
                         let name_value = record_cursor.get_value(&row, 1)?;
                         let RefValue::Text(name_text) = name_value else {
-                            return Err(LimboError::ConversionError("Expected text value".into()));
+                            return Err(TursoError::ConversionError("Expected text value".into()));
                         };
                         let name = name_text.as_str();
 
@@ -356,13 +356,13 @@ impl Schema {
                 "index" => {
                     let root_page_value = record_cursor.get_value(&row, 3)?;
                     let RefValue::Integer(root_page) = root_page_value else {
-                        return Err(LimboError::ConversionError("Expected integer value".into()));
+                        return Err(TursoError::ConversionError("Expected integer value".into()));
                     };
                     match record_cursor.get_value(&row, 4) {
                         Ok(RefValue::Text(sql_text)) => {
                             let table_name_value = record_cursor.get_value(&row, 2)?;
                             let RefValue::Text(table_name_text) = table_name_value else {
-                                return Err(LimboError::ConversionError(
+                                return Err(TursoError::ConversionError(
                                     "Expected text value".into(),
                                 ));
                             };
@@ -376,14 +376,14 @@ impl Schema {
                         _ => {
                             let index_name_value = record_cursor.get_value(&row, 1)?;
                             let RefValue::Text(index_name_text) = index_name_value else {
-                                return Err(LimboError::ConversionError(
+                                return Err(TursoError::ConversionError(
                                     "Expected text value".into(),
                                 ));
                             };
 
                             let table_name_value = record_cursor.get_value(&row, 2)?;
                             let RefValue::Text(table_name_text) = table_name_value else {
-                                return Err(LimboError::ConversionError(
+                                return Err(TursoError::ConversionError(
                                     "Expected text value".into(),
                                 ));
                             };
@@ -408,13 +408,13 @@ impl Schema {
                 "view" => {
                     let name_value = record_cursor.get_value(&row, 1)?;
                     let RefValue::Text(name_text) = name_value else {
-                        return Err(LimboError::ConversionError("Expected text value".into()));
+                        return Err(TursoError::ConversionError("Expected text value".into()));
                     };
                     let name = name_text.as_str();
 
                     let sql_value = record_cursor.get_value(&row, 4)?;
                     let RefValue::Text(sql_text) = sql_value else {
-                        return Err(LimboError::ConversionError("Expected text value".into()));
+                        return Err(TursoError::ConversionError("Expected text value".into()));
                     };
                     let sql = sql_text.as_str();
 
@@ -1259,7 +1259,7 @@ impl Affinity {
             SQLITE_AFF_NONE => Ok(Affinity::Blob),
             SQLITE_AFF_REAL => Ok(Affinity::Real),
             SQLITE_AFF_NUMERIC => Ok(Affinity::Numeric),
-            _ => Err(LimboError::InternalError(format!(
+            _ => Err(TursoError::InternalError(format!(
                 "Invalid affinity character: {char}"
             ))),
         }
@@ -1269,7 +1269,7 @@ impl Affinity {
         self.aff_mask() as u8
     }
 
-    pub fn from_char_code(code: u8) -> Result<Self, LimboError> {
+    pub fn from_char_code(code: u8) -> Result<Self, TursoError> {
         Self::from_char(code as char)
     }
 
@@ -1418,7 +1418,7 @@ impl Index {
                 for col in columns.into_iter() {
                     let name = normalize_ident(&col.expr.to_string());
                     let Some((pos_in_table, _)) = table.get_column(&name) else {
-                        return Err(crate::LimboError::InternalError(format!(
+                        return Err(crate::TursoError::InternalError(format!(
                             "Column {} is in index {} but not found in table {}",
                             name, index_name, table.name
                         )));
@@ -1550,7 +1550,7 @@ impl Index {
 
         if table.primary_key_columns.is_empty() && indices.is_empty() && table.unique_sets.is_none()
         {
-            return Err(crate::LimboError::InternalError(
+            return Err(crate::TursoError::InternalError(
                 "Cannot create automatic index for table without primary key or unique constraint"
                     .to_string(),
             ));
@@ -1642,7 +1642,7 @@ impl Index {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::LimboError;
+    use crate::TursoError;
 
     #[test]
     pub fn test_has_rowid_true() -> Result<()> {
@@ -1970,7 +1970,7 @@ mod tests {
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
-            LimboError::InternalError(msg) if msg.contains("without primary key")
+            TursoError::InternalError(msg) if msg.contains("without primary key")
         ));
         Ok(())
     }

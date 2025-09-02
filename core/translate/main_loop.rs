@@ -278,7 +278,7 @@ pub fn init_loop(
                         OperationMode::INSERT | OperationMode::UPDATE | OperationMode::DELETE
                     );
                     if is_write && tbl.readonly() {
-                        return Err(crate::LimboError::ReadOnly);
+                        return Err(crate::TursoError::ReadOnly);
                     }
                     if let Some(cursor_id) = table_cursor_id {
                         program.emit_insn(Insn::VOpen { cursor_id });

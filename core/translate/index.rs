@@ -351,7 +351,7 @@ pub fn translate_drop_index(
         if if_exists {
             return Ok(program);
         } else {
-            return Err(crate::error::LimboError::InvalidArgument(format!(
+            return Err(crate::error::TursoError::InvalidArgument(format!(
                 "No such index: {}",
                 &idx_name
             )));
@@ -360,7 +360,7 @@ pub fn translate_drop_index(
     // Return an error if the index is associated with a unique or primary key constraint.
     if let Some(idx) = maybe_index {
         if idx.unique {
-            return Err(crate::error::LimboError::InvalidArgument(
+            return Err(crate::error::TursoError::InvalidArgument(
                 "index associated with UNIQUE or PRIMARY KEY constraint cannot be dropped"
                     .to_string(),
             ));

@@ -23,8 +23,8 @@ use crate::util::PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX;
 use crate::vdbe::builder::CursorType;
 use crate::vdbe::insn::Cookie;
 use crate::vdbe::insn::{CmpInsFlags, InsertFlags, Insn};
-use crate::LimboError;
 use crate::SymbolTable;
+use crate::TursoError;
 use crate::{bail_parse_error, Result};
 
 use turso_ext::VTabKind;
@@ -343,7 +343,7 @@ fn check_automatic_pk_index_required(
                                     is_descending: matches!(col.order, Some(ast::SortOrder::Desc)),
                                 })
                             }
-                            _ => Err(LimboError::ParseError(
+                            _ => Err(TursoError::ParseError(
                                 "expressions prohibited in PRIMARY KEY and UNIQUE constraints"
                                     .to_string(),
                             )),
@@ -834,7 +834,7 @@ pub fn translate_drop_table(
             // But this line here below is a safeguard in case this behavior changes in the future
             // And mirrors what SQLite does.
             if matches!(vtab.kind, turso_ext::VTabKind::TableValuedFunction) {
-                return Err(crate::LimboError::ParseError(format!(
+                return Err(crate::TursoError::ParseError(format!(
                     "table {} may not be dropped",
                     vtab.name
                 )));

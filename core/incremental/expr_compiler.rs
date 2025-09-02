@@ -418,7 +418,7 @@ impl CompiledExpression {
                     // Execute the instruction
                     match insn_fn(program, &mut state, insn, &pager, None)? {
                         crate::vdbe::execute::InsnFunctionStepResult::IO(_) => {
-                            return Err(crate::LimboError::InternalError(
+                            return Err(crate::TursoError::InternalError(
                                 "Expression evaluation encountered unexpected I/O".to_string(),
                             ));
                         }
@@ -426,17 +426,17 @@ impl CompiledExpression {
                             break;
                         }
                         crate::vdbe::execute::InsnFunctionStepResult::Row => {
-                            return Err(crate::LimboError::InternalError(
+                            return Err(crate::TursoError::InternalError(
                                 "Expression evaluation produced unexpected row".to_string(),
                             ));
                         }
                         crate::vdbe::execute::InsnFunctionStepResult::Interrupt => {
-                            return Err(crate::LimboError::InternalError(
+                            return Err(crate::TursoError::InternalError(
                                 "Expression evaluation was interrupted".to_string(),
                             ));
                         }
                         crate::vdbe::execute::InsnFunctionStepResult::Busy => {
-                            return Err(crate::LimboError::InternalError(
+                            return Err(crate::TursoError::InternalError(
                                 "Expression evaluation encountered busy state".to_string(),
                             ));
                         }

@@ -21,7 +21,7 @@ use crate::translate::schema::translate_create_table;
 use crate::util::{normalize_ident, parse_signed_number, parse_string, IOExt as _};
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
 use crate::vdbe::insn::{Cookie, Insn};
-use crate::{bail_parse_error, CaptureDataChangesMode, LimboError, SymbolTable, Value};
+use crate::{bail_parse_error, CaptureDataChangesMode, SymbolTable, TursoError, Value};
 use std::str::FromStr;
 use strum::IntoEnumIterator;
 
@@ -220,14 +220,14 @@ fn update_pragma(
                         b"full" => 1,
                         b"incremental" => 2,
                         _ => {
-                            return Err(LimboError::InvalidArgument(
+                            return Err(TursoError::InvalidArgument(
                                 "invalid auto vacuum mode".to_string(),
                             ));
                         }
                     })
                 }
                 _ => {
-                    return Err(LimboError::InvalidArgument(
+                    return Err(TursoError::InvalidArgument(
                         "invalid auto vacuum mode".to_string(),
                     ))
                 }
@@ -237,7 +237,7 @@ fn update_pragma(
                 1 => update_auto_vacuum_mode(AutoVacuumMode::Full, 1, pager)?,
                 2 => update_auto_vacuum_mode(AutoVacuumMode::Incremental, 1, pager)?,
                 _ => {
-                    return Err(LimboError::InvalidArgument(
+                    return Err(TursoError::InvalidArgument(
                         "invalid auto vacuum mode".to_string(),
                     ))
                 }
@@ -431,7 +431,7 @@ fn query_pragma(
                 Some(ast::Expr::Name(name)) => {
                     let mode_name = normalize_ident(name.as_str());
                     CheckpointMode::from_str(&mode_name).map_err(|e| {
-                        LimboError::ParseError(format!("Unknown Checkpoint Mode: {e}"))
+                        TursoError::ParseError(format!("Unknown Checkpoint Mode: {e}"))
                     })?
                 }
                 _ => CheckpointMode::Passive {
@@ -582,7 +582,7 @@ fn query_pragma(
                         })
                     }
                     _ => {
-                        return Err(LimboError::ParseError(format!(
+                        return Err(TursoError::ParseError(format!(
                             "Invalid value for PRAGMA query_only: {value_expr:?}"
                         )));
                     }
@@ -709,7 +709,7 @@ fn update_cache_size(
             .unwrap_or_default()
             .get() as i64;
         if page_size == 0 {
-            return Err(LimboError::InternalError(
+            return Err(TursoError::InternalError(
                 "Page size cannot be zero".to_string(),
             ));
         }
@@ -739,7 +739,7 @@ fn update_cache_size(
 
     pager
         .change_page_cache_size(final_cache_size as usize)
-        .map_err(|e| LimboError::InternalError(format!("Failed to update page cache size: {e}")))?;
+        .map_err(|e| TursoError::InternalError(format!("Failed to update page cache size: {e}")))?;
 
     Ok(())
 }

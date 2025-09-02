@@ -1,5 +1,5 @@
 #![allow(unused_variables, dead_code)]
-use crate::{LimboError, Result};
+use crate::{Result, TursoError};
 use aegis::aegis256::Aegis256;
 use aes_gcm::aead::{AeadCore, OsRng};
 use std::ops::Deref;
@@ -21,9 +21,9 @@ impl EncryptionKey {
     pub fn from_hex_string(s: &str) -> Result<Self> {
         let hex_str = s.trim();
         let bytes = hex::decode(hex_str)
-            .map_err(|e| LimboError::InvalidArgument(format!("Invalid hex string: {e}")))?;
+            .map_err(|e| TursoError::InvalidArgument(format!("Invalid hex string: {e}")))?;
         let key: [u8; 32] = bytes.try_into().map_err(|v: Vec<u8>| {
-            LimboError::InvalidArgument(format!(
+            TursoError::InvalidArgument(format!(
                 "Hex string must decode to exactly 32 bytes, got {}",
                 v.len()
             ))
@@ -117,20 +117,20 @@ impl AeadCipher for Aegis256Cipher {
 
     fn decrypt(&self, ciphertext: &[u8], nonce: &[u8], ad: &[u8]) -> Result<Vec<u8>> {
         if ciphertext.len() < AEGIS_TAG_SIZE {
-            return Err(LimboError::InternalError("Ciphertext too short".into()));
+            return Err(TursoError::InternalError("Ciphertext too short".into()));
         }
         let (ct, tag) = ciphertext.split_at(ciphertext.len() - AEGIS_TAG_SIZE);
         let tag_array: [u8; AEGIS_TAG_SIZE] = tag.try_into().map_err(|_| {
-            LimboError::InternalError(format!("Invalid tag size for AEGIS-256 {AEGIS_TAG_SIZE}"))
+            TursoError::InternalError(format!("Invalid tag size for AEGIS-256 {AEGIS_TAG_SIZE}"))
         })?;
 
         let nonce_array: [u8; 32] = nonce
             .try_into()
-            .map_err(|_| LimboError::InternalError("Invalid nonce size for AEGIS-256".into()))?;
+            .map_err(|_| TursoError::InternalError("Invalid nonce size for AEGIS-256".into()))?;
 
         Aegis256::<AEGIS_TAG_SIZE>::new(self.key.as_bytes(), &nonce_array)
             .decrypt(ct, &tag_array, ad)
-            .map_err(|_| LimboError::InternalError("AEGIS-256 decryption failed".into()))
+            .map_err(|_| TursoError::InternalError("AEGIS-256 decryption failed".into()))
     }
 
     fn encrypt_detached(&self, plaintext: &[u8], ad: &[u8]) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
@@ -149,15 +149,15 @@ impl AeadCipher for Aegis256Cipher {
         ad: &[u8],
     ) -> Result<Vec<u8>> {
         let tag_array: [u8; AEGIS_TAG_SIZE] = tag.try_into().map_err(|_| {
-            LimboError::InternalError(format!("Invalid tag size for AEGIS-256 {AEGIS_TAG_SIZE}"))
+            TursoError::InternalError(format!("Invalid tag size for AEGIS-256 {AEGIS_TAG_SIZE}"))
         })?;
         let nonce_array: [u8; 32] = nonce
             .try_into()
-            .map_err(|_| LimboError::InternalError("Invalid nonce size for AEGIS-256".into()))?;
+            .map_err(|_| TursoError::InternalError("Invalid nonce size for AEGIS-256".into()))?;
 
         Aegis256::<AEGIS_TAG_SIZE>::new(self.key.as_bytes(), &nonce_array)
             .decrypt(ciphertext, &tag_array, ad)
-            .map_err(|_| LimboError::InternalError("AEGIS-256 decrypt_detached failed".into()))
+            .map_err(|_| TursoError::InternalError("AEGIS-256 decrypt_detached failed".into()))
     }
 }
 
@@ -178,13 +178,13 @@ impl AeadCipher for Aes256GcmCipher {
         use aes_gcm::Aes256Gcm;
 
         let cipher = Aes256Gcm::new_from_slice(self.key.as_bytes())
-            .map_err(|_| LimboError::InternalError("Bad AES key".into()))?;
+            .map_err(|_| TursoError::InternalError("Bad AES key".into()))?;
         let nonce = Aes256Gcm::generate_nonce(&mut rand::thread_rng());
         let mut buffer = plaintext.to_vec();
 
         let tag = cipher
             .encrypt_in_place_detached(&nonce, b"", &mut buffer)
-            .map_err(|_| LimboError::InternalError("AES-GCM encrypt failed".into()))?;
+            .map_err(|_| TursoError::InternalError("AES-GCM encrypt failed".into()))?;
 
         buffer.extend_from_slice(&tag[..AES256GCM_TAG_SIZE]);
         Ok((buffer, nonce.to_vec()))
@@ -195,18 +195,18 @@ impl AeadCipher for Aes256GcmCipher {
         use aes_gcm::{Aes256Gcm, Nonce};
 
         if ciphertext.len() < AES256GCM_TAG_SIZE {
-            return Err(LimboError::InternalError("Ciphertext too short".into()));
+            return Err(TursoError::InternalError("Ciphertext too short".into()));
         }
         let (ct, tag) = ciphertext.split_at(ciphertext.len() - AES256GCM_TAG_SIZE);
 
         let cipher = Aes256Gcm::new_from_slice(self.key.as_bytes())
-            .map_err(|_| LimboError::InternalError("Bad AES key".into()))?;
+            .map_err(|_| TursoError::InternalError("Bad AES key".into()))?;
         let nonce = Nonce::from_slice(nonce);
 
         let mut buffer = ct.to_vec();
         cipher
             .decrypt_in_place_detached(nonce, ad, &mut buffer, tag.into())
-            .map_err(|_| LimboError::InternalError("AES-GCM decrypt failed".into()))?;
+            .map_err(|_| TursoError::InternalError("AES-GCM decrypt failed".into()))?;
 
         Ok(buffer)
     }
@@ -216,13 +216,13 @@ impl AeadCipher for Aes256GcmCipher {
         use aes_gcm::Aes256Gcm;
 
         let cipher = Aes256Gcm::new_from_slice(self.key.as_bytes())
-            .map_err(|_| LimboError::InternalError("Bad AES key".into()))?;
+            .map_err(|_| TursoError::InternalError("Bad AES key".into()))?;
         let nonce = Aes256Gcm::generate_nonce(&mut rand::thread_rng());
 
         let mut buffer = plaintext.to_vec();
         let tag = cipher
             .encrypt_in_place_detached(&nonce, ad, &mut buffer)
-            .map_err(|_| LimboError::InternalError("AES-GCM encrypt_detached failed".into()))?;
+            .map_err(|_| TursoError::InternalError("AES-GCM encrypt_detached failed".into()))?;
 
         Ok((buffer, nonce.to_vec(), tag.to_vec()))
     }
@@ -238,13 +238,13 @@ impl AeadCipher for Aes256GcmCipher {
         use aes_gcm::{Aes256Gcm, Nonce};
 
         let cipher = Aes256Gcm::new_from_slice(self.key.as_bytes())
-            .map_err(|_| LimboError::InternalError("Bad AES key".into()))?;
+            .map_err(|_| TursoError::InternalError("Bad AES key".into()))?;
         let nonce = Nonce::from_slice(nonce);
 
         let mut buffer = ciphertext.to_vec();
         cipher
             .decrypt_in_place_detached(nonce, ad, &mut buffer, tag.into())
-            .map_err(|_| LimboError::InternalError("AES-GCM decrypt_detached failed".into()))?;
+            .map_err(|_| TursoError::InternalError("AES-GCM decrypt_detached failed".into()))?;
 
         Ok(buffer)
     }
@@ -265,14 +265,14 @@ pub enum CipherMode {
 }
 
 impl TryFrom<&str> for CipherMode {
-    type Error = LimboError;
+    type Error = TursoError;
 
     fn try_from(s: &str) -> Result<Self, Self::Error> {
         let s_bytes = s.as_bytes();
         match_ignore_ascii_case!(match s_bytes {
             b"aes256gcm" | b"aes-256-gcm" | b"aes_256_gcm" => Ok(CipherMode::Aes256Gcm),
             b"aegis256" | b"aegis-256" | b"aegis_256" => Ok(CipherMode::Aegis256),
-            _ => Err(LimboError::InvalidArgument(format!(
+            _ => Err(TursoError::InvalidArgument(format!(
                 "Unknown cipher name: {s}"
             ))),
         })
@@ -355,7 +355,7 @@ impl EncryptionContext {
     pub fn new(cipher_mode: CipherMode, key: &EncryptionKey, page_size: usize) -> Result<Self> {
         let required_size = cipher_mode.required_key_size();
         if key.as_slice().len() != required_size {
-            return Err(crate::LimboError::InvalidArgument(format!(
+            return Err(crate::TursoError::InvalidArgument(format!(
                 "Invalid key size for {:?}: expected {} bytes, got {}",
                 cipher_mode,
                 required_size,
@@ -490,14 +490,14 @@ impl EncryptionContext {
 
     #[cfg(not(feature = "encryption"))]
     pub fn encrypt_page(&self, _page: &[u8], _page_id: usize) -> Result<Vec<u8>> {
-        Err(LimboError::InvalidArgument(
+        Err(TursoError::InvalidArgument(
             "encryption is not enabled, cannot encrypt page. enable via passing `--features encryption`".into(),
         ))
     }
 
     #[cfg(not(feature = "encryption"))]
     pub fn decrypt_page(&self, _encrypted_page: &[u8], _page_id: usize) -> Result<Vec<u8>> {
-        Err(LimboError::InvalidArgument(
+        Err(TursoError::InvalidArgument(
             "encryption is not enabled, cannot decrypt page. enable via passing `--features encryption`".into(),
         ))
     }

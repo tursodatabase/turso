@@ -460,7 +460,7 @@ impl Interaction {
                     &query_str[0..query_str.len().min(4096)],
                     err
                 );
-                if let Some(turso_core::LimboError::ParseError(e)) = err {
+                if let Some(turso_core::TursoError::ParseError(e)) = err {
                     panic!("Unexpected parse error: {e}");
                 }
                 return Err(err.unwrap());
@@ -488,7 +488,7 @@ impl Interaction {
                         break;
                     }
                     StepResult::Busy => {
-                        return Err(turso_core::LimboError::Busy);
+                        return Err(turso_core::TursoError::Busy);
                     }
                 }
             }
@@ -509,11 +509,11 @@ impl Interaction {
                 let result = assertion.func.as_ref()(stack, env);
                 match result {
                     Ok(Ok(())) => Ok(()),
-                    Ok(Err(message)) => Err(turso_core::LimboError::InternalError(format!(
+                    Ok(Err(message)) => Err(turso_core::TursoError::InternalError(format!(
                         "Assertion '{}' failed: {}",
                         assertion.name, message
                     ))),
-                    Err(err) => Err(turso_core::LimboError::InternalError(format!(
+                    Err(err) => Err(turso_core::TursoError::InternalError(format!(
                         "Assertion '{}' execution error: {}",
                         assertion.name, err
                     ))),
@@ -535,11 +535,11 @@ impl Interaction {
                 let result = assumption.func.as_ref()(stack, env);
                 match result {
                     Ok(Ok(())) => Ok(()),
-                    Ok(Err(message)) => Err(turso_core::LimboError::InternalError(format!(
+                    Ok(Err(message)) => Err(turso_core::TursoError::InternalError(format!(
                         "Assumption '{}' failed: {}",
                         assumption.name, message
                     ))),
-                    Err(err) => Err(turso_core::LimboError::InternalError(format!(
+                    Err(err) => Err(turso_core::TursoError::InternalError(format!(
                         "Assumption '{}' execution error: {}",
                         assumption.name, err
                     ))),
@@ -559,7 +559,7 @@ impl Interaction {
                         if env.connections[conn_index].is_connected() {
                             env.connections[conn_index].disconnect();
                         } else {
-                            return Err(turso_core::LimboError::InternalError(
+                            return Err(turso_core::TursoError::InternalError(
                                 "connection already disconnected".into(),
                             ));
                         }
@@ -619,7 +619,7 @@ impl Interaction {
                         break;
                     }
                     StepResult::Busy => {
-                        return Err(turso_core::LimboError::Busy);
+                        return Err(turso_core::TursoError::Busy);
                     }
                     StepResult::Interrupt => {}
                 }
@@ -647,7 +647,7 @@ impl Interaction {
                     &query_str[0..query_str.len().min(4096)],
                     err
                 );
-                if let Some(turso_core::LimboError::ParseError(e)) = err {
+                if let Some(turso_core::TursoError::ParseError(e)) = err {
                     panic!("Unexpected parse error: {e}");
                 }
                 return Err(err.unwrap());
@@ -687,7 +687,7 @@ impl Interaction {
                         break;
                     }
                     StepResult::Busy => {
-                        return Err(turso_core::LimboError::Busy);
+                        return Err(turso_core::TursoError::Busy);
                     }
                     StepResult::Interrupt => {}
                 }

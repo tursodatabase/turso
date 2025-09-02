@@ -21,7 +21,7 @@ use crate::vector::{vector_concat, vector_slice};
 use crate::MvCursor;
 use crate::{
     error::{
-        LimboError, SQLITE_CONSTRAINT, SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY,
+        TursoError, SQLITE_CONSTRAINT, SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY,
     },
     ext::ExtValue,
     function::{AggFunc, ExtFunc, MathFunc, MathFuncArity, ScalarFunc, VectorFunc},
@@ -349,7 +349,7 @@ pub fn op_checkpoint(
         // when a checkpoint is attempted. We don't have table locks, so return TableLocked for any
         // attempt to checkpoint in an interactive transaction. This does not end the transaction,
         // however.
-        return Err(LimboError::TableLocked);
+        return Err(TursoError::TableLocked);
     }
     let result = program.connection.checkpoint(*checkpoint_mode);
     match result {
@@ -435,7 +435,7 @@ pub fn op_compare(
     let collation = collation.unwrap_or_default();
 
     if start_reg_a + count > start_reg_b {
-        return Err(LimboError::InternalError(
+        return Err(TursoError::InternalError(
             "Compare registers overlap".to_string(),
         ));
     }
@@ -479,7 +479,7 @@ pub fn op_jump(
     assert!(target_pc_gt.is_offset());
     let cmp = state.last_compare.take();
     if cmp.is_none() {
-        return Err(LimboError::InternalError(
+        return Err(TursoError::InternalError(
             "Jump without compare".to_string(),
         ));
     }
@@ -547,7 +547,7 @@ pub fn op_if_pos(
             state.pc += 1;
         }
         _ => {
-            return Err(LimboError::InternalError(
+            return Err(TursoError::InternalError(
                 "IfPos: the value in the register is not an integer".into(),
             ));
         }
@@ -1035,7 +1035,7 @@ pub fn op_vcreate(
         if let Register::Record(rec) = &state.registers[*args_reg] {
             rec.get_values().iter().map(|v| v.to_ffi()).collect()
         } else {
-            return Err(LimboError::InternalError(
+            return Err(TursoError::InternalError(
                 "VCreate: args_reg is not a record".to_string(),
             ));
         }
@@ -1146,11 +1146,11 @@ pub fn op_vupdate(
         panic!("VUpdate on non-virtual table cursor");
     };
     if virtual_table.readonly() {
-        return Err(LimboError::ReadOnly);
+        return Err(TursoError::ReadOnly);
     }
 
     if *arg_count < 2 {
-        return Err(LimboError::InternalError(
+        return Err(TursoError::InternalError(
             "VUpdate: arg_count must be at least 2 (rowid and insert_rowid)".to_string(),
         ));
     }
@@ -1159,7 +1159,7 @@ pub fn op_vupdate(
         if let Some(value) = state.registers.get(*start_reg + i) {
             argv.push(value.get_value().clone());
         } else {
-            return Err(LimboError::InternalError(format!(
+            return Err(TursoError::InternalError(format!(
                 "VUpdate: register out of bounds at {}",
                 *start_reg + i
             )));
@@ -1180,7 +1180,7 @@ pub fn op_vupdate(
         }
         Err(e) => {
             // virtual table update failed
-            return Err(LimboError::ExtensionError(format!(
+            return Err(TursoError::ExtensionError(format!(
                 "Virtual table update failed: {e}"
             )));
         }
@@ -1228,7 +1228,7 @@ pub fn op_vdestroy(
     let conn = program.connection.clone();
     {
         let Some(vtab) = conn.syms.borrow_mut().vtabs.remove(table_name) else {
-            return Err(crate::LimboError::InternalError(
+            return Err(crate::TursoError::InternalError(
                 "Could not find Virtual Table to Destroy".to_string(),
             ));
         };
@@ -1518,7 +1518,7 @@ pub fn op_column(
                                     n if n >= 13 && n & 1 == 1 => (n - 13) >> 1,
                                     // Reserved
                                     10 | 11 => {
-                                        return Err(LimboError::Corrupt(format!(
+                                        return Err(TursoError::Corrupt(format!(
                                             "Reserved serial type: {serial_type}"
                                         )))
                                     }
@@ -1927,17 +1927,17 @@ pub fn halt(
     match err_code {
         0 => {}
         SQLITE_CONSTRAINT_PRIMARYKEY => {
-            return Err(LimboError::Constraint(format!(
+            return Err(TursoError::Constraint(format!(
                 "UNIQUE constraint failed: {description} (19)"
             )));
         }
         SQLITE_CONSTRAINT_NOTNULL => {
-            return Err(LimboError::Constraint(format!(
+            return Err(TursoError::Constraint(format!(
                 "NOT NULL constraint failed: {description} (19)"
             )));
         }
         _ => {
-            return Err(LimboError::Constraint(format!(
+            return Err(TursoError::Constraint(format!(
                 "undocumented halt error code {description}"
             )));
         }
@@ -2011,7 +2011,7 @@ pub fn op_transaction(
     );
     let conn = program.connection.clone();
     if *write && conn._db.open_flags.contains(OpenFlags::ReadOnly) {
-        return Err(LimboError::ReadOnly);
+        return Err(TursoError::ReadOnly);
     }
 
     let pager = program.get_pager_from_database_index(db);
@@ -2072,7 +2072,7 @@ pub fn op_transaction(
             //     .io
             //     .block(|| pager.with_header(|header| header.schema_cookie.get()))?;
             // if header_schema_cookie != *schema_cookie {
-            //     return Err(LimboError::SchemaUpdated);
+            //     return Err(TursoError::SchemaUpdated);
             // }
             let tx_id = mv_store.begin_tx(pager.clone());
             conn.mv_transactions.borrow_mut().push(tx_id);
@@ -2136,11 +2136,11 @@ pub fn op_transaction(
                     header_schema_cookie,
                     *schema_cookie
                 );
-                return Err(LimboError::SchemaUpdated);
+                return Err(TursoError::SchemaUpdated);
             }
         }
         // This means we are starting a read_tx and we do not have a page 1 yet, so we just continue execution
-        Err(LimboError::Page1NotAlloc) => {}
+        Err(TursoError::Page1NotAlloc) => {}
         Err(err) => {
             return Err(err);
         }
@@ -2181,15 +2181,15 @@ pub fn op_auto_commit(
             conn.auto_commit.replace(*auto_commit);
         }
     } else if !*auto_commit {
-        return Err(LimboError::TxError(
+        return Err(TursoError::TxError(
             "cannot start a transaction within a transaction".to_string(),
         ));
     } else if *rollback {
-        return Err(LimboError::TxError(
+        return Err(TursoError::TxError(
             "cannot rollback - no transaction is active".to_string(),
         ));
     } else {
-        return Err(LimboError::TxError(
+        return Err(TursoError::TxError(
             "cannot commit - no transaction is active".to_string(),
         ));
     }
@@ -2252,7 +2252,7 @@ pub fn op_return(
         state.pc = pc;
     } else {
         if !*can_fallthrough {
-            return Err(LimboError::InternalError(
+            return Err(TursoError::InternalError(
                 "Return register is not an integer".to_string(),
             ));
         }
@@ -2344,7 +2344,7 @@ pub fn op_row_data(
         let record_option = return_if_io!(cursor.record());
 
         let record = record_option.ok_or_else(|| {
-            LimboError::InternalError("RowData: cursor has no record".to_string())
+            TursoError::InternalError("RowData: cursor has no record".to_string())
         })?;
 
         record.clone()
@@ -2446,7 +2446,7 @@ pub fn op_row_id(
                         state.registers[*dest] = Register::Value(Value::Null);
                     }
                 } else {
-                    return Err(LimboError::InternalError(
+                    return Err(TursoError::InternalError(
                         "RowId: cursor is not a table or virtual cursor".to_string(),
                     ));
                 }
@@ -4452,7 +4452,7 @@ pub fn op_function(
                     match unixepoch {
                         Ok(time) => state.registers[*dest] = Register::Value(time),
                         Err(e) => {
-                            return Err(LimboError::ParseError(format!(
+                            return Err(TursoError::ParseError(format!(
                                 "Error encountered while parsing datetime value: {e}"
                             )));
                         }
@@ -4509,7 +4509,7 @@ pub fn op_function(
                 assert_eq!(arg_count, 1);
                 #[cfg(not(feature = "json"))]
                 {
-                    return Err(LimboError::InvalidArgument(
+                    return Err(TursoError::InvalidArgument(
                         "table_columns_json_array: turso must be compiled with JSON support"
                             .to_string(),
                     ));
@@ -4520,7 +4520,7 @@ pub fn op_function(
 
                     let table = state.registers[*start_reg].get_value();
                     let Value::Text(table) = table else {
-                        return Err(LimboError::InvalidArgument(
+                        return Err(TursoError::InvalidArgument(
                             "table_columns_json_array: function argument must be of type TEXT"
                                 .to_string(),
                         ));
@@ -4530,7 +4530,7 @@ pub fn op_function(
                         match schema.get_table(table.as_str()) {
                             Some(table) => table,
                             None => {
-                                return Err(LimboError::InvalidArgument(format!(
+                                return Err(TursoError::InvalidArgument(format!(
                                     "table_columns_json_array: table {table} doesn't exists"
                                 )))
                             }
@@ -4561,7 +4561,7 @@ pub fn op_function(
                 assert_eq!(arg_count, 2);
                 #[cfg(not(feature = "json"))]
                 {
-                    return Err(LimboError::InvalidArgument(
+                    return Err(TursoError::InvalidArgument(
                         "bin_record_json_object: turso must be compiled with JSON support"
                             .to_string(),
                     ));
@@ -4574,7 +4574,7 @@ pub fn op_function(
                     let columns_str = state.registers[*start_reg].get_value();
                     let bin_record = state.registers[*start_reg + 1].get_value();
                     let Value::Text(columns_str) = columns_str else {
-                        return Err(LimboError::InvalidArgument(
+                        return Err(TursoError::InvalidArgument(
                             "bin_record_json_object: function arguments must be of type TEXT and BLOB correspondingly".to_string()
                         ));
                     };
@@ -4585,7 +4585,7 @@ pub fn op_function(
                     }
 
                     let Value::Blob(bin_record) = bin_record else {
-                        return Err(LimboError::InvalidArgument(
+                        return Err(TursoError::InvalidArgument(
                             "bin_record_json_object: function arguments must be of type TEXT and BLOB correspondingly".to_string()
                         ));
                     };
@@ -4613,7 +4613,7 @@ pub fn op_function(
 
                         let val = record_cursor.get_value(&record, i)?;
                         if let RefValue::Blob(..) = val {
-                            return Err(LimboError::InvalidArgument(
+                            return Err(TursoError::InvalidArgument(
                                 "bin_record_json_object: formatting of BLOB values stored in binary record is not supported".to_string()
                             ));
                         }
@@ -4637,13 +4637,13 @@ pub fn op_function(
                 let _key = state.registers[*start_reg + 2].get_value(); // Not used in read-only implementation
 
                 let Value::Text(filename_str) = filename else {
-                    return Err(LimboError::InvalidArgument(
+                    return Err(TursoError::InvalidArgument(
                         "attach: filename argument must be text".to_string(),
                     ));
                 };
 
                 let Value::Text(dbname_str) = dbname else {
-                    return Err(LimboError::InvalidArgument(
+                    return Err(TursoError::InvalidArgument(
                         "attach: database name argument must be text".to_string(),
                     ));
                 };
@@ -4659,7 +4659,7 @@ pub fn op_function(
                 let dbname = state.registers[*start_reg].get_value();
 
                 let Value::Text(dbname_str) = dbname else {
-                    return Err(LimboError::InvalidArgument(
+                    return Err(TursoError::InvalidArgument(
                         "detach: database name argument must be text".to_string(),
                     ));
                 };
@@ -5473,7 +5473,7 @@ pub fn op_delete(
                     // Get the current key
                     let maybe_key = return_if_io!(cursor.rowid());
                     let key = maybe_key.ok_or_else(|| {
-                        LimboError::InternalError("Cannot delete: no current row".to_string())
+                        TursoError::InternalError("Cannot delete: no current row".to_string())
                     })?;
                     // Get the current record before deletion and extract values
                     let maybe_record = return_if_io!(cursor.record());
@@ -5599,7 +5599,7 @@ pub fn op_idx_delete(
                     // Also, do not raise this (self-correcting and non-critical) error if in writable_schema mode.
                     if *raise_error_if_no_matching_entry {
                         let record = make_record(&state.registers, start_reg, num_regs);
-                        return Err(LimboError::Corrupt(format!(
+                        return Err(TursoError::Corrupt(format!(
                             "IdxDelete: no matching index entry found for record {record:?}"
                         )));
                     }
@@ -5617,7 +5617,7 @@ pub fn op_idx_delete(
                 };
 
                 if rowid.is_none() && *raise_error_if_no_matching_entry {
-                    return Err(LimboError::Corrupt(format!(
+                    return Err(TursoError::Corrupt(format!(
                         "IdxDelete: no matching index entry found for record {:?}",
                         make_record(&state.registers, start_reg, num_regs)
                     )));
@@ -5675,7 +5675,7 @@ pub fn op_idx_insert(
     let record_to_insert = match &state.registers[record_reg] {
         Register::Record(ref r) => r,
         o => {
-            return Err(LimboError::InternalError(format!(
+            return Err(TursoError::InternalError(format!(
                 "expected record, got {o:?}"
             )));
         }
@@ -5751,7 +5751,7 @@ pub fn op_idx_insert(
                     if flags.has(IdxInsertFlags::NO_OP_DUPLICATE) {
                         break 'i true;
                     }
-                    return Err(LimboError::Constraint(
+                    return Err(TursoError::Constraint(
                         "UNIQUE constraint failed: duplicate key".into(),
                     ));
                 }
@@ -5878,7 +5878,7 @@ pub fn op_new_rowid(
 
             OpNewRowidState::GeneratingRandom { attempts } => {
                 if *attempts >= MAX_ATTEMPTS {
-                    return Err(LimboError::DatabaseFull("Unable to find an unused rowid after 100 attempts - database is probably full".to_string()));
+                    return Err(TursoError::DatabaseFull("Unable to find an unused rowid after 100 attempts - database is probably full".to_string()));
                 }
 
                 // Generate a random i64 and constrain it to the lower half of the rowid range.
@@ -6027,7 +6027,7 @@ pub fn op_no_conflict(
                 let contains_nulls = match &record_source {
                     RecordSource::Packed { record_reg } => {
                         let Register::Record(record) = &state.registers[*record_reg] else {
-                            return Err(LimboError::InternalError(
+                            return Err(TursoError::InternalError(
                                 "NoConflict: expected a record in the register".into(),
                             ));
                         };
@@ -6136,7 +6136,7 @@ pub fn op_offset_limit(
     let limit_val = match state.registers[*limit_reg].get_value() {
         Value::Integer(val) => val,
         _ => {
-            return Err(LimboError::InternalError(
+            return Err(TursoError::InternalError(
                 "OffsetLimit: the value in limit_reg is not an integer".into(),
             ));
         }
@@ -6145,7 +6145,7 @@ pub fn op_offset_limit(
         Value::Integer(val) if *val < 0 => 0,
         Value::Integer(val) if *val >= 0 => *val,
         _ => {
-            return Err(LimboError::InternalError(
+            return Err(TursoError::InternalError(
                 "OffsetLimit: the value in offset_reg is not an integer".into(),
             ));
         }
@@ -6179,7 +6179,7 @@ pub fn op_open_write(
         insn
     );
     if program.connection.is_readonly(*db) {
-        return Err(LimboError::ReadOnly);
+        return Err(TursoError::ReadOnly);
     }
     let pager = program.get_pager_from_database_index(db);
 
@@ -6188,7 +6188,7 @@ pub fn op_open_write(
         RegisterOrLiteral::Register(reg) => match &state.registers[*reg].get_value() {
             Value::Integer(val) => *val as u64,
             _ => {
-                return Err(LimboError::InternalError(
+                return Err(TursoError::InternalError(
                     "OpenWrite: the value in root_page is not an integer".into(),
                 ));
             }
@@ -6281,7 +6281,7 @@ pub fn op_create_btree(
     assert_eq!(*db, 0);
 
     if program.connection.is_readonly(*db) {
-        return Err(LimboError::ReadOnly);
+        return Err(TursoError::ReadOnly);
     }
     if *db > 0 {
         // TODO: implement temp databases
@@ -6359,7 +6359,7 @@ pub fn op_drop_view(
     let conn = program.connection.clone();
     conn.with_schema_mut(|schema| {
         schema.remove_view(view_name)?;
-        Ok::<(), crate::LimboError>(())
+        Ok::<(), crate::TursoError>(())
     })?;
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -6808,7 +6808,7 @@ pub fn op_open_ephemeral(
             let rand_path =
                 std::path::Path::new(&temp_dir).join(format!("tursodb-ephemeral-{rand_num}"));
             let Some(rand_path_str) = rand_path.to_str() else {
-                return Err(LimboError::InternalError(
+                return Err(TursoError::InternalError(
                     "Failed to convert path to string".to_string(),
                 ));
             };
@@ -7050,7 +7050,7 @@ pub fn op_affinity(
     );
 
     if affinities.len() != count.get() {
-        return Err(LimboError::InternalError(
+        return Err(TursoError::InternalError(
             "Affinity: the length of affinities does not match the count".into(),
         ));
     }
@@ -7555,7 +7555,7 @@ impl Value {
                     Some(y) => Ok(Value::Integer(y)),
                     // Special case: if we do the abs of "-9223372036854775808", it causes overflow.
                     // return IntegerOverflow error
-                    None => Err(LimboError::IntegerOverflow),
+                    None => Err(TursoError::IntegerOverflow),
                 }
             }
             Value::Float(x) => {
@@ -8792,7 +8792,7 @@ pub fn op_max_pgcnt(
     load_insn!(MaxPgcnt { db, dest, new_max }, insn);
 
     if *db > 0 {
-        return Err(LimboError::InternalError(
+        return Err(TursoError::InternalError(
             "temp/attached databases not implemented yet".to_string(),
         ));
     }
@@ -8819,7 +8819,7 @@ pub fn op_journal_mode(
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(JournalMode { db, dest, new_mode }, insn);
     if *db > 0 {
-        return Err(LimboError::InternalError(
+        return Err(TursoError::InternalError(
             "temp/attached databases not implemented yet".to_string(),
         ));
     }
@@ -8836,7 +8836,7 @@ pub fn op_journal_mode(
             }
             _ => {
                 // Invalid journal mode
-                return Err(LimboError::ParseError(format!(
+                return Err(TursoError::ParseError(format!(
                     "Unknown journal mode: {mode}"
                 )));
             }

@@ -51,7 +51,7 @@ use crate::util::{OpenMode, OpenOptions};
 use crate::vdbe::metrics::ConnectionMetrics;
 use crate::vtab::VirtualTable;
 use core::str;
-pub use error::{CompletionError, LimboError};
+pub use error::{CompletionError, TursoError};
 pub use io::clock::{Clock, Instant};
 #[cfg(all(feature = "fs", target_family = "unix"))]
 pub use io::UnixIO;
@@ -145,7 +145,7 @@ impl DatabaseOpts {
     }
 }
 
-pub type Result<T, E = LimboError> = std::result::Result<T, E>;
+pub type Result<T, E = TursoError> = std::result::Result<T, E>;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum TransactionState {
@@ -429,7 +429,7 @@ impl Database {
                         pager.end_read_tx()?;
                         Err(e)
                     });
-                if let Err(LimboError::ExtensionError(e)) = result {
+                if let Err(TursoError::ExtensionError(e)) = result {
                     // this means that a vtab exists and we no longer have the module loaded. we print
                     // a warning to the user to load the module
                     eprintln!("Warning: {e}");
@@ -465,7 +465,7 @@ impl Database {
             schema: RefCell::new(
                 self.schema
                     .lock()
-                    .map_err(|_| LimboError::SchemaLocked)?
+                    .map_err(|_| TursoError::SchemaLocked)?
                     .clone(),
             ),
             database_schemas: RefCell::new(std::collections::HashMap::new()),
@@ -656,7 +656,7 @@ impl Database {
                         #[cfg(all(target_os = "linux", feature = "io_uring"))]
                         "io_uring" => Arc::new(UringIO::new()?),
                         other => {
-                            return Err(LimboError::InvalidArgument(format!(
+                            return Err(TursoError::InvalidArgument(format!(
                                 "no such VFS: {other}"
                             )));
                         }
@@ -678,17 +678,17 @@ impl Database {
 
     #[inline]
     pub(crate) fn with_schema_mut<T>(&self, f: impl FnOnce(&mut Schema) -> Result<T>) -> Result<T> {
-        let mut schema_ref = self.schema.lock().map_err(|_| LimboError::SchemaLocked)?;
+        let mut schema_ref = self.schema.lock().map_err(|_| TursoError::SchemaLocked)?;
         let schema = Arc::make_mut(&mut *schema_ref);
         f(schema)
     }
     pub(crate) fn clone_schema(&self) -> Result<Arc<Schema>> {
-        let schema = self.schema.lock().map_err(|_| LimboError::SchemaLocked)?;
+        let schema = self.schema.lock().map_err(|_| TursoError::SchemaLocked)?;
         Ok(schema.clone())
     }
 
     pub(crate) fn update_schema_if_newer(&self, another: Arc<Schema>) -> Result<()> {
-        let mut schema = self.schema.lock().map_err(|_| LimboError::SchemaLocked)?;
+        let mut schema = self.schema.lock().map_err(|_| TursoError::SchemaLocked)?;
         if schema.schema_version < another.schema_version {
             tracing::debug!(
                 "DB schema is outdated: {} < {}",
@@ -739,7 +739,7 @@ impl CaptureDataChangesMode {
             "before" => Ok(CaptureDataChangesMode::Before { table: table.to_string() }),
             "after" => Ok(CaptureDataChangesMode::After { table: table.to_string() }),
             "full" => Ok(CaptureDataChangesMode::Full { table: table.to_string() }),
-            _ => Err(LimboError::InvalidArgument(
+            _ => Err(TursoError::InvalidArgument(
                 "unexpected pragma value: expected '<mode>' or '<mode>,<cdc-table-name>' parameter where mode is one of off|id|before|after|full".to_string(),
             ))
         }
@@ -945,10 +945,10 @@ impl Connection {
     #[instrument(skip_all, level = Level::INFO)]
     pub fn prepare(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<Statement> {
         if self.closed.get() {
-            return Err(LimboError::InternalError("Connection closed".to_string()));
+            return Err(TursoError::InternalError("Connection closed".to_string()));
         }
         if sql.as_ref().is_empty() {
-            return Err(LimboError::InvalidArgument(
+            return Err(TursoError::InvalidArgument(
                 "The supplied SQL string contains no statements".to_string(),
             ));
         }
@@ -996,7 +996,7 @@ impl Connection {
 
         let on_disk_schema_version = match on_disk_schema_version {
             Ok(db_schema_version) => db_schema_version.get(),
-            Err(LimboError::Page1NotAlloc) => {
+            Err(TursoError::Page1NotAlloc) => {
                 // this means this is a fresh db, so return a schema version of 0
                 0
             }
@@ -1102,10 +1102,10 @@ impl Connection {
     #[instrument(skip_all, level = Level::INFO)]
     pub fn prepare_execute_batch(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<()> {
         if self.closed.get() {
-            return Err(LimboError::InternalError("Connection closed".to_string()));
+            return Err(TursoError::InternalError("Connection closed".to_string()));
         }
         if sql.as_ref().is_empty() {
-            return Err(LimboError::InvalidArgument(
+            return Err(TursoError::InvalidArgument(
                 "The supplied SQL string contains no statements".to_string(),
             ));
         }
@@ -1143,7 +1143,7 @@ impl Connection {
     #[instrument(skip_all, level = Level::INFO)]
     pub fn query(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<Option<Statement>> {
         if self.closed.get() {
-            return Err(LimboError::InternalError("Connection closed".to_string()));
+            return Err(TursoError::InternalError("Connection closed".to_string()));
         }
         let sql = sql.as_ref();
         tracing::trace!("Querying: {}", sql);
@@ -1166,7 +1166,7 @@ impl Connection {
         input: &str,
     ) -> Result<Option<Statement>> {
         if self.closed.get() {
-            return Err(LimboError::InternalError("Connection closed".to_string()));
+            return Err(TursoError::InternalError("Connection closed".to_string()));
         }
         let syms = self.syms.borrow();
         let pager = self.pager.borrow().clone();
@@ -1216,7 +1216,7 @@ impl Connection {
     #[instrument(skip_all, level = Level::INFO)]
     pub fn execute(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<()> {
         if self.closed.get() {
-            return Err(LimboError::InternalError("Connection closed".to_string()));
+            return Err(TursoError::InternalError("Connection closed".to_string()));
         }
         let sql = sql.as_ref();
         let mut parser = Parser::new(sql.as_bytes());
@@ -1331,7 +1331,7 @@ impl Connection {
             ._db
             .schema
             .lock()
-            .map_err(|_| LimboError::SchemaLocked)?;
+            .map_err(|_| TursoError::SchemaLocked)?;
         if matches!(self.transaction_state.get(), TransactionState::None)
             && current_schema_version != schema.schema_version
         {
@@ -1358,7 +1358,7 @@ impl Connection {
     #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
     pub fn write_schema_version(self: &Arc<Connection>, version: u32) -> Result<()> {
         let TransactionState::Write { .. } = self.transaction_state.get() else {
-            return Err(LimboError::InternalError(
+            return Err(TursoError::InternalError(
                 "write_schema_version must be called from within Write transaction".to_string(),
             ));
         };
@@ -1395,7 +1395,7 @@ impl Connection {
             Ok(result) => result,
             // on windows, zero read will trigger UnexpectedEof
             #[cfg(target_os = "windows")]
-            Err(LimboError::CompletionError(CompletionError::IOError(
+            Err(TursoError::CompletionError(CompletionError::IOError(
                 std::io::ErrorKind::UnexpectedEof,
             ))) => return Ok(false),
             Err(err) => return Err(err),
@@ -1450,7 +1450,7 @@ impl Connection {
     pub fn wal_insert_begin(&self) -> Result<()> {
         let pager = self.pager.borrow();
         match pager.begin_read_tx()? {
-            result::LimboResult::Busy => return Err(LimboError::Busy),
+            result::LimboResult::Busy => return Err(TursoError::Busy),
             result::LimboResult::Ok => {}
         }
         match pager.io.block(|| pager.begin_write_tx()).inspect_err(|_| {
@@ -1458,7 +1458,7 @@ impl Connection {
         })? {
             result::LimboResult::Busy => {
                 pager.end_read_tx().expect("read txn must be closed");
-                return Err(LimboError::Busy);
+                return Err(TursoError::Busy);
             }
             result::LimboResult::Ok => {}
         }
@@ -1480,7 +1480,7 @@ impl Connection {
             let pager = self.pager.borrow();
 
             let Some(wal) = pager.wal.as_ref() else {
-                return Err(LimboError::InternalError(
+                return Err(TursoError::InternalError(
                     "wal_insert_end called without a wal".to_string(),
                 ));
             };
@@ -1521,7 +1521,7 @@ impl Connection {
     /// Flush dirty pages to disk.
     pub fn cacheflush(&self) -> Result<Vec<Completion>> {
         if self.closed.get() {
-            return Err(LimboError::InternalError("Connection closed".to_string()));
+            return Err(TursoError::InternalError("Connection closed".to_string()));
         }
         self.pager.borrow().cacheflush()
     }
@@ -1533,7 +1533,7 @@ impl Connection {
 
     pub fn checkpoint(&self, mode: CheckpointMode) -> Result<CheckpointResult> {
         if self.closed.get() {
-            return Err(LimboError::InternalError("Connection closed".to_string()));
+            return Err(TursoError::InternalError("Connection closed".to_string()));
         }
         self.pager.borrow().wal_checkpoint(mode)
     }
@@ -1698,7 +1698,7 @@ impl Connection {
 
     pub fn parse_schema_rows(self: &Arc<Connection>) -> Result<()> {
         if self.closed.get() {
-            return Err(LimboError::InternalError("Connection closed".to_string()));
+            return Err(TursoError::InternalError("Connection closed".to_string()));
         }
         let rows = self
             .query("SELECT * FROM sqlite_schema")?
@@ -1706,7 +1706,7 @@ impl Connection {
         let syms = self.syms.borrow();
         self.with_schema_mut(|schema| {
             let existing_views = schema.materialized_views.clone();
-            if let Err(LimboError::ExtensionError(e)) =
+            if let Err(TursoError::ExtensionError(e)) =
                 parse_schema_rows(rows, schema, &syms, None, existing_views)
             {
                 // this means that a vtab exists and we no longer have the module loaded. we print
@@ -1721,7 +1721,7 @@ impl Connection {
     /// Query the current rows/values of `pragma_name`.
     pub fn pragma_query(self: &Arc<Connection>, pragma_name: &str) -> Result<Vec<Vec<Value>>> {
         if self.closed.get() {
-            return Err(LimboError::InternalError("Connection closed".to_string()));
+            return Err(TursoError::InternalError("Connection closed".to_string()));
         }
         let pragma = format!("PRAGMA {pragma_name}");
         let mut stmt = self.prepare(pragma)?;
@@ -1738,7 +1738,7 @@ impl Connection {
         pragma_value: V,
     ) -> Result<Vec<Vec<Value>>> {
         if self.closed.get() {
-            return Err(LimboError::InternalError("Connection closed".to_string()));
+            return Err(TursoError::InternalError("Connection closed".to_string()));
         }
         let pragma = format!("PRAGMA {pragma_name} = {pragma_value}");
         let mut stmt = self.prepare(pragma)?;
@@ -1765,7 +1765,7 @@ impl Connection {
         pragma_value: V,
     ) -> Result<Vec<Vec<Value>>> {
         if self.closed.get() {
-            return Err(LimboError::InternalError("Connection closed".to_string()));
+            return Err(TursoError::InternalError("Connection closed".to_string()));
         }
         let pragma = format!("PRAGMA {pragma_name}({pragma_value})");
         let mut stmt = self.prepare(pragma)?;
@@ -1777,7 +1777,7 @@ impl Connection {
                     results.push(row);
                 }
                 vdbe::StepResult::Interrupt | vdbe::StepResult::Busy => {
-                    return Err(LimboError::Busy);
+                    return Err(TursoError::Busy);
                 }
                 _ => break,
             }
@@ -1816,7 +1816,7 @@ impl Connection {
     /// Attach a database file with the given alias name
     #[cfg(not(feature = "fs"))]
     pub(crate) fn attach_database(&self, _path: &str, _alias: &str) -> Result<()> {
-        return Err(LimboError::InvalidArgument(format!(
+        return Err(TursoError::InvalidArgument(format!(
             "attach not available in this build (no-fs)"
         )));
     }
@@ -1825,18 +1825,18 @@ impl Connection {
     #[cfg(feature = "fs")]
     pub(crate) fn attach_database(&self, path: &str, alias: &str) -> Result<()> {
         if self.closed.get() {
-            return Err(LimboError::InternalError("Connection closed".to_string()));
+            return Err(TursoError::InternalError("Connection closed".to_string()));
         }
 
         if self.is_attached(alias) {
-            return Err(LimboError::InvalidArgument(format!(
+            return Err(TursoError::InvalidArgument(format!(
                 "database {alias} is already in use"
             )));
         }
 
         // Check for reserved database names
         if alias.eq_ignore_ascii_case("main") || alias.eq_ignore_ascii_case("temp") {
-            return Err(LimboError::InvalidArgument(format!(
+            return Err(TursoError::InvalidArgument(format!(
                 "reserved name {alias} is already in use"
             )));
         }
@@ -1845,7 +1845,7 @@ impl Connection {
             ._db
             .schema
             .lock()
-            .map_err(|_| LimboError::SchemaLocked)?
+            .map_err(|_| TursoError::SchemaLocked)?
             .indexes_enabled();
         let use_mvcc = self._db.mv_store.is_some();
         let use_views = self._db.experimental_views_enabled();
@@ -1869,11 +1869,11 @@ impl Connection {
     // Detach a database by alias name
     fn detach_database(&self, alias: &str) -> Result<()> {
         if self.closed.get() {
-            return Err(LimboError::InternalError("Connection closed".to_string()));
+            return Err(TursoError::InternalError("Connection closed".to_string()));
         }
 
         if alias == "main" || alias == "temp" {
-            return Err(LimboError::InvalidArgument(format!(
+            return Err(TursoError::InvalidArgument(format!(
                 "cannot detach database: {alias}"
             )));
         }
@@ -1881,7 +1881,7 @@ impl Connection {
         // Remove from attached databases
         let mut attached_dbs = self.attached_databases.borrow_mut();
         if attached_dbs.remove(alias).is_none() {
-            return Err(LimboError::InvalidArgument(format!(
+            return Err(TursoError::InvalidArgument(format!(
                 "no such database: {alias}"
             )));
         }
@@ -1921,7 +1921,7 @@ impl Connection {
                 if let Some((idx, _attached_db)) = self.get_attached_database(&db_name_normalized) {
                     Ok(idx)
                 } else {
-                    Err(LimboError::InvalidArgument(format!(
+                    Err(TursoError::InvalidArgument(format!(
                         "no such database: {db_name_normalized}"
                     )))
                 }
@@ -2113,7 +2113,7 @@ impl Statement {
                     .step(&mut self.state, self.mv_store.clone(), self.pager.clone());
             for attempt in 0..MAX_SCHEMA_RETRY {
                 // Only reprepare if we still need to update schema
-                if !matches!(res, Err(LimboError::SchemaUpdated)) {
+                if !matches!(res, Err(TursoError::SchemaUpdated)) {
                     break;
                 }
                 tracing::debug!("reprepare: attempt={}", attempt);
@@ -2141,7 +2141,7 @@ impl Statement {
                 vdbe::StepResult::IO => self.run_once()?,
                 vdbe::StepResult::Row => continue,
                 vdbe::StepResult::Interrupt | vdbe::StepResult::Busy => {
-                    return Err(LimboError::Busy)
+                    return Err(TursoError::Busy)
                 }
             }
         }
@@ -2158,7 +2158,7 @@ impl Statement {
                     continue;
                 }
                 vdbe::StepResult::Interrupt | vdbe::StepResult::Busy => {
-                    return Err(LimboError::Busy)
+                    return Err(TursoError::Busy)
                 }
             }
         }
@@ -2322,7 +2322,7 @@ pub fn resolve_ext_path(extpath: &str) -> Result<std::path::PathBuf> {
     let path = std::path::Path::new(extpath);
     if !path.exists() {
         if is_shared_library(path) {
-            return Err(LimboError::ExtensionError(format!(
+            return Err(TursoError::ExtensionError(format!(
                 "Extension file not found: {extpath}"
             )));
         };
@@ -2330,7 +2330,7 @@ pub fn resolve_ext_path(extpath: &str) -> Result<std::path::PathBuf> {
         maybe
             .exists()
             .then_some(maybe)
-            .ok_or(LimboError::ExtensionError(format!(
+            .ok_or(TursoError::ExtensionError(format!(
                 "Extension file not found: {extpath}"
             )))
     } else {
@@ -2399,7 +2399,7 @@ impl Iterator for QueryRunner<'_> {
                 Some(self.conn.run_cmd(cmd, input))
             }
             Ok(None) => None,
-            Err(err) => Some(Result::Err(LimboError::from(err))),
+            Err(err) => Some(Result::Err(TursoError::from(err))),
         }
     }
 }

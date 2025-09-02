@@ -29,7 +29,7 @@ use std::{
 
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
-use turso_core::{Connection, Database, LimboError, OpenFlags, Statement, StepResult, Value};
+use turso_core::{Connection, Database, OpenFlags, Statement, StepResult, TursoError, Value};
 
 #[derive(Parser, Debug)]
 #[command(name = "Turso")]
@@ -181,7 +181,7 @@ impl Limbo {
         self
     }
 
-    fn first_run(&mut self, sql: Option<String>, quiet: bool) -> Result<(), LimboError> {
+    fn first_run(&mut self, sql: Option<String>, quiet: bool) -> Result<(), TursoError> {
         // Skip startup messages and SQL execution in MCP mode
         if self.is_mcp_mode() {
             return Ok(());
@@ -201,7 +201,7 @@ impl Limbo {
         Ok(())
     }
 
-    fn handle_first_input(&mut self, cmd: &str) -> Result<(), LimboError> {
+    fn handle_first_input(&mut self, cmd: &str) -> Result<(), TursoError> {
         if cmd.trim().starts_with('.') {
             self.handle_dot_command(&cmd[1..]);
         } else {
@@ -284,7 +284,7 @@ impl Limbo {
         self.input_buff.clear();
     }
 
-    pub fn close_conn(&mut self) -> Result<(), LimboError> {
+    pub fn close_conn(&mut self) -> Result<(), TursoError> {
         self.conn.close()
     }
 
@@ -677,7 +677,7 @@ impl Limbo {
     fn print_query_result(
         &mut self,
         sql: &str,
-        mut output: Result<Option<Statement>, LimboError>,
+        mut output: Result<Option<Statement>, TursoError>,
         mut statistics: Option<&mut QueryStatistics>,
     ) -> anyhow::Result<()> {
         match output {

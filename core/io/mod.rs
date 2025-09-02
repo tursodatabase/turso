@@ -52,7 +52,7 @@ pub trait File: Send + Sync {
             if let Err(e) = self.pwrite(pos, buf.clone(), child_c) {
                 // best-effort: mark as abort so caller won't wait forever
                 // TODO: when we have `pwrite` and other I/O methods return CompletionError
-                // instead of LimboError, store the error inside
+                // instead of TursoError, store the error inside
                 c.abort();
                 return Err(e);
             }
@@ -112,7 +112,7 @@ pub trait IO: Clock + Send + Sync {
     }
 
     fn register_fixed_buffer(&self, _ptr: NonNull<u8>, _len: usize) -> Result<u32> {
-        Err(crate::LimboError::InternalError(
+        Err(crate::TursoError::InternalError(
             "unsupported operation".to_string(),
         ))
     }

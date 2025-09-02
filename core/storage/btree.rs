@@ -29,7 +29,7 @@ use crate::{
 use crate::{
     return_corrupt, return_if_io,
     types::{compare_immutable, IOResult, ImmutableRecord, RefValue, SeekKey, SeekOp, Value},
-    LimboError, Result,
+    Result, TursoError,
 };
 
 use super::{
@@ -936,7 +936,7 @@ impl BTreeCursor {
             let cell_idx = self.stack.current_cell_index() as usize - 1;
 
             if cell_idx >= contents.cell_count() {
-                return Err(LimboError::Corrupt("Invalid cell index".into()));
+                return Err(TursoError::Corrupt("Invalid cell index".into()));
             }
 
             let usable_size = self.usable_space();
@@ -953,7 +953,7 @@ impl BTreeCursor {
                     (cell.payload, cell.payload_size, cell.first_overflow_page)
                 }
                 BTreeCell::TableInteriorCell(_) => {
-                    return Err(LimboError::Corrupt(
+                    return Err(TursoError::Corrupt(
                         "Cannot access payload of table interior cell".into(),
                     ));
                 }
@@ -985,7 +985,7 @@ impl BTreeCursor {
 
             if amount > 0 {
                 if first_overflow_page.is_none() {
-                    return Err(LimboError::Corrupt(
+                    return Err(TursoError::Corrupt(
                         "Expected overflow page but none found".into(),
                     ));
                 }
@@ -1050,7 +1050,7 @@ impl BTreeCursor {
                     let next = contents.read_u32_no_offset(0);
 
                     if next == 0 {
-                        return Err(LimboError::Corrupt(
+                        return Err(TursoError::Corrupt(
                             "Overflow chain ends prematurely".into(),
                         ));
                     }
@@ -1116,7 +1116,7 @@ impl BTreeCursor {
                     }
                     let next = contents.read_u32_no_offset(0);
                     if next == 0 {
-                        return Err(LimboError::Corrupt(
+                        return Err(TursoError::Corrupt(
                             "Overflow chain ends prematurely".into(),
                         ));
                     }
@@ -1140,7 +1140,7 @@ impl BTreeCursor {
                     }
                 }
                 _ => {
-                    return Err(LimboError::InternalError(
+                    return Err(TursoError::InternalError(
                         "Invalid state for continue_payload_overflow_with_offset".into(),
                     ))
                 }
@@ -4807,7 +4807,7 @@ impl BTreeCursor {
                                     .get()
                         {
                             self.overflow_state = OverflowState::Start;
-                            return Err(LimboError::Corrupt("Invalid overflow page number".into()));
+                            return Err(TursoError::Corrupt("Invalid overflow page number".into()));
                         }
                         let (page, c) = self.read_page(next_page as usize)?;
                         self.overflow_state = OverflowState::ProcessPage { next_page: page };
@@ -4839,7 +4839,7 @@ impl BTreeCursor {
                                     .get()
                         {
                             self.overflow_state = OverflowState::Start;
-                            return Err(LimboError::Corrupt("Invalid overflow page number".into()));
+                            return Err(TursoError::Corrupt("Invalid overflow page number".into()));
                         }
                         let (page, c) = self.read_page(next as usize)?;
                         self.overflow_state = OverflowState::ProcessPage { next_page: page };

@@ -1,7 +1,7 @@
 use super::{slot_bitmap::SlotBitmap, sqlite3_ondisk::WAL_FRAME_HEADER_SIZE};
 use crate::fast_lock::SpinLock;
 use crate::io::TEMP_BUFFER_CACHE;
-use crate::{turso_assert, Buffer, LimboError, IO};
+use crate::{turso_assert, Buffer, TursoError, IO};
 use parking_lot::Mutex;
 use std::cell::UnsafeCell;
 use std::ptr::NonNull;
@@ -288,7 +288,7 @@ impl PoolInner {
             }
             Err(e) => {
                 tracing::error!("Failed to create arena: {:?}", e);
-                return Err(LimboError::InternalError(format!(
+                return Err(TursoError::InternalError(format!(
                     "Failed to create arena: {e}",
                 )));
             }
@@ -308,7 +308,7 @@ impl PoolInner {
             }
             Err(e) => {
                 tracing::error!("Failed to create WAL frame arena: {:?}", e);
-                return Err(LimboError::InternalError(format!(
+                return Err(TursoError::InternalError(format!(
                     "Failed to create WAL frame arena: {e}",
                 )));
             }

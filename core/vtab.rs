@@ -1,7 +1,7 @@
 use crate::pragma::{PragmaVirtualTable, PragmaVirtualTableCursor};
 use crate::schema::Column;
 use crate::util::columns_from_create_table_body;
-use crate::{Connection, LimboError, SymbolTable, Value};
+use crate::{Connection, SymbolTable, TursoError, Value};
 
 use std::ffi::c_void;
 use std::ptr::NonNull;
@@ -56,7 +56,7 @@ impl VirtualTable {
             ExtVirtualTable::create(name, module, Vec::new(), VTabKind::TableValuedFunction)
                 .map(|(vtab, columns)| (VirtualTableType::External(vtab), columns))?
         } else {
-            return Err(LimboError::ParseError(format!(
+            return Err(TursoError::ParseError(format!(
                 "No such table-valued function: {name}"
             )));
         };
@@ -106,11 +106,11 @@ impl VirtualTable {
     fn resolve_columns(schema: String) -> crate::Result<Vec<Column>> {
         let mut parser = Parser::new(schema.as_bytes());
         if let ast::Cmd::Stmt(ast::Stmt::CreateTable { body, .. }) = parser.next_cmd()?.ok_or(
-            LimboError::ParseError("Failed to parse schema from virtual table module".to_string()),
+            TursoError::ParseError("Failed to parse schema from virtual table module".to_string()),
         )? {
             columns_from_create_table_body(&body)
         } else {
-            Err(LimboError::ParseError(
+            Err(TursoError::ParseError(
                 "Failed to parse schema from virtual table module".to_string(),
             ))
         }
@@ -132,9 +132,9 @@ impl VirtualTable {
 
     pub(crate) fn update(&self, args: &[Value]) -> crate::Result<Option<i64>> {
         match &self.vtab_type {
-            VirtualTableType::Pragma(_) => Err(LimboError::ReadOnly),
+            VirtualTableType::Pragma(_) => Err(TursoError::ReadOnly),
             VirtualTableType::External(table) => table.update(args),
-            VirtualTableType::View(_) => Err(LimboError::ReadOnly),
+            VirtualTableType::View(_) => Err(TursoError::ReadOnly),
         }
     }
 
@@ -239,7 +239,7 @@ impl ExtVirtualTable {
         args: Vec<turso_ext::Value>,
         kind: VTabKind,
     ) -> crate::Result<(Self, String)> {
-        let module = module.ok_or(LimboError::ExtensionError(format!(
+        let module = module.ok_or(TursoError::ExtensionError(format!(
             "Virtual table module not found: {module_name}"
         )))?;
         if kind != module.module_kind {
@@ -247,7 +247,7 @@ impl ExtVirtualTable {
                 VTabKind::VirtualTable => "virtual table",
                 VTabKind::TableValuedFunction => "table-valued function",
             };
-            return Err(LimboError::ExtensionError(format!(
+            return Err(TursoError::ExtensionError(format!(
                 "{module_name} is not a {expected} module"
             )));
         }
@@ -275,7 +275,7 @@ impl ExtVirtualTable {
         let Some(cursor) = NonNull::new(unsafe {
             (self.implementation.open)(self.table_ptr, ext_conn_ptr.as_ptr()) as *mut c_void
         }) else {
-            return Err(LimboError::ExtensionError("Open returned null".to_string()));
+            return Err(TursoError::ExtensionError("Open returned null".to_string()));
         };
         ExtVirtualTableCursor::new(cursor, ext_conn_ptr, self.implementation.clone())
     }
@@ -300,7 +300,7 @@ impl ExtVirtualTable {
         match rc {
             ResultCode::OK => Ok(None),
             ResultCode::RowID => Ok(Some(newrowid)),
-            _ => Err(LimboError::ExtensionError(rc.to_string())),
+            _ => Err(TursoError::ExtensionError(rc.to_string())),
         }
     }
 
@@ -308,7 +308,7 @@ impl ExtVirtualTable {
         let rc = unsafe { (self.implementation.destroy)(self.table_ptr) };
         match rc {
             ResultCode::OK => Ok(()),
-            _ => Err(LimboError::ExtensionError(rc.to_string())),
+            _ => Err(TursoError::ExtensionError(rc.to_string())),
         }
     }
 }
@@ -369,7 +369,7 @@ impl ExtVirtualTableCursor {
         match rc {
             ResultCode::OK => Ok(true),
             ResultCode::EOF => Ok(false),
-            _ => Err(LimboError::ExtensionError(rc.to_string())),
+            _ => Err(TursoError::ExtensionError(rc.to_string())),
         }
     }
 
@@ -383,7 +383,7 @@ impl ExtVirtualTableCursor {
         match rc {
             ResultCode::OK => Ok(true),
             ResultCode::EOF => Ok(false),
-            _ => Err(LimboError::ExtensionError("Next failed".to_string())),
+            _ => Err(TursoError::ExtensionError("Next failed".to_string())),
         }
     }
 }

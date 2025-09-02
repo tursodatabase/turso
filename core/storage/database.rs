@@ -1,4 +1,4 @@
-use crate::error::LimboError;
+use crate::error::TursoError;
 use crate::storage::encryption::EncryptionContext;
 use crate::{io::Completion, Buffer, CompletionError, Result};
 use std::sync::Arc;
@@ -89,10 +89,10 @@ impl DatabaseStorage for DatabaseFile {
         let size = r.buf().len();
         assert!(page_idx > 0);
         if !(512..=65536).contains(&size) || size & (size - 1) != 0 {
-            return Err(LimboError::NotADB);
+            return Err(TursoError::NotADB);
         }
         let Some(pos) = (page_idx as u64 - 1).checked_mul(size as u64) else {
-            return Err(LimboError::IntegerOverflow);
+            return Err(TursoError::IntegerOverflow);
         };
 
         if let Some(ctx) = io_ctx.encryption_context() {
@@ -148,7 +148,7 @@ impl DatabaseStorage for DatabaseFile {
         assert!(buffer_size <= 65536);
         assert_eq!(buffer_size & (buffer_size - 1), 0);
         let Some(pos) = (page_idx as u64 - 1).checked_mul(buffer_size as u64) else {
-            return Err(LimboError::IntegerOverflow);
+            return Err(TursoError::IntegerOverflow);
         };
         let buffer = {
             if let Some(ctx) = io_ctx.encryption_context() {
@@ -174,7 +174,7 @@ impl DatabaseStorage for DatabaseFile {
         assert_eq!(page_size & (page_size - 1), 0);
 
         let Some(pos) = (first_page_idx as u64 - 1).checked_mul(page_size as u64) else {
-            return Err(LimboError::IntegerOverflow);
+            return Err(TursoError::IntegerOverflow);
         };
         let buffers = {
             if let Some(ctx) = io_ctx.encryption_context() {

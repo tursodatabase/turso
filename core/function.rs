@@ -4,7 +4,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use turso_ext::{FinalizeFunction, InitAggFunction, ScalarFunction, StepFunction};
 
-use crate::LimboError;
+use crate::TursoError;
 
 pub struct ExternalFunc {
     pub name: String,
@@ -643,7 +643,7 @@ impl Func {
             Self::AlterTable(_) => true,
         }
     }
-    pub fn resolve_function(name: &str, arg_count: usize) -> Result<Self, LimboError> {
+    pub fn resolve_function(name: &str, arg_count: usize) -> Result<Self, TursoError> {
         let normalized_name = crate::util::normalize_ident(name);
         match normalized_name.as_str() {
             "avg" => {

@@ -576,7 +576,7 @@ impl turso_core::DatabaseStorage for DatabaseFile {
         let size = r.buf().len();
         assert!(page_idx > 0);
         if !(512..=65536).contains(&size) || size & (size - 1) != 0 {
-            return Err(turso_core::LimboError::NotADB);
+            return Err(turso_core::TursoError::NotADB);
         }
         let pos = (page_idx as u64 - 1) * size as u64;
         self.file.pread(pos, c)

@@ -3,7 +3,7 @@
 use super::{common, Completion, CompletionInner, File, OpenFlags, IO};
 use crate::io::clock::{Clock, Instant};
 use crate::storage::wal::CKPT_BATCH_PAGES;
-use crate::{turso_assert, LimboError, Result};
+use crate::{turso_assert, TursoError, Result};
 use rustix::fs::{self, FlockOperation, OFlags};
 use std::ptr::NonNull;
 use std::{
@@ -626,7 +626,7 @@ impl File for UringFile {
                 }
                 _ => format!("Failed locking file, {io_error}"),
             };
-            LimboError::LockingError(message)
+            TursoError::LockingError(message)
         })?;
 
         Ok(())
@@ -635,7 +635,7 @@ impl File for UringFile {
     fn unlock_file(&self) -> Result<()> {
         let fd = self.file.as_fd();
         fs::fcntl_lock(fd, FlockOperation::NonBlockingUnlock).map_err(|e| {
-            LimboError::LockingError(format!(
+            TursoError::LockingError(format!(
                 "Failed to release file lock: {}",
                 std::io::Error::from(e)
             ))

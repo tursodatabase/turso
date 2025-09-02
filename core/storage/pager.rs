@@ -12,8 +12,8 @@ use crate::types::{IOCompletions, WalState};
 use crate::util::IOExt as _;
 use crate::{io_yield_many, io_yield_one, IOContext};
 use crate::{
-    return_if_io, turso_assert, types::WalFrameInfo, Completion, Connection, IOResult, LimboError,
-    Result, TransactionState,
+    return_if_io, turso_assert, types::WalFrameInfo, Completion, Connection, IOResult, Result,
+    TransactionState, TursoError,
 };
 use parking_lot::RwLock;
 use std::cell::{Cell, OnceCell, RefCell, UnsafeCell};
@@ -47,7 +47,7 @@ impl HeaderRef {
             match state {
                 HeaderRefState::Start => {
                     if !pager.db_state.is_initialized() {
-                        return Err(LimboError::Page1NotAlloc);
+                        return Err(TursoError::Page1NotAlloc);
                     }
 
                     let (page, c) = pager.read_page(DatabaseHeader::PAGE_ID)?;
@@ -87,7 +87,7 @@ impl HeaderRefMut {
             match state {
                 HeaderRefState::Start => {
                     if !pager.db_state.is_initialized() {
-                        return Err(LimboError::Page1NotAlloc);
+                        return Err(TursoError::Page1NotAlloc);
                     }
 
                     let (page, c) = pager.read_page(DatabaseHeader::PAGE_ID)?;
@@ -692,7 +692,7 @@ impl Pager {
                     let page_content: &PageContent = match ptrmap_page_inner.contents.as_ref() {
                         Some(content) => content,
                         None => {
-                            return Err(LimboError::InternalError(format!(
+                            return Err(TursoError::InternalError(format!(
                                 "Ptrmap page {ptrmap_pg_no} content not loaded"
                             )));
                         }
@@ -703,7 +703,7 @@ impl Pager {
                     // Ptrmap pages are not page 1, so their internal offset within their buffer should be 0.
                     // The actual page data starts at page_content.offset within the full_buffer_slice.
                     if ptrmap_pg_no != 1 && page_content.offset != 0 {
-                        return Err(LimboError::Corrupt(format!(
+                        return Err(TursoError::Corrupt(format!(
                             "Ptrmap page {} has unexpected internal offset {}",
                             ptrmap_pg_no, page_content.offset
                         )));
@@ -713,7 +713,7 @@ impl Pager {
 
                     // Check if the calculated offset for the entry is within the bounds of the actual page data length.
                     if offset_in_ptrmap_page + PTRMAP_ENTRY_SIZE > actual_data_length {
-                        return Err(LimboError::InternalError(format!(
+                        return Err(TursoError::InternalError(format!(
                         "Ptrmap offset {offset_in_ptrmap_page} + entry size {PTRMAP_ENTRY_SIZE} out of bounds for page {ptrmap_pg_no} (actual data len {actual_data_length})"
                     )));
                     }
@@ -723,7 +723,7 @@ impl Pager {
                     self.ptrmap_get_state.replace(PtrMapGetState::Start);
                     break match PtrmapEntry::deserialize(entry_slice) {
                         Some(entry) => Ok(IOResult::Done(Some(entry))),
-                        None => Err(LimboError::Corrupt(format!(
+                        None => Err(TursoError::Corrupt(format!(
                             "Failed to deserialize ptrmap entry for page {target_page_num} from ptrmap page {ptrmap_pg_no}"
                         ))),
                     };
@@ -758,7 +758,7 @@ impl Pager {
                     if db_page_no_to_update < FIRST_PTRMAP_PAGE_NO
                         || is_ptrmap_page(db_page_no_to_update, page_size)
                     {
-                        return Err(LimboError::InternalError(format!(
+                        return Err(TursoError::InternalError(format!(
                         "Cannot set ptrmap entry for page {db_page_no_to_update}: it's a header/ptrmap page or invalid."
                     )));
                     }
@@ -796,7 +796,7 @@ impl Pager {
                     let page_content = match ptrmap_page_inner.contents.as_ref() {
                         Some(content) => content,
                         None => {
-                            return Err(LimboError::InternalError(format!(
+                            return Err(TursoError::InternalError(format!(
                                 "Ptrmap page {ptrmap_pg_no} content not loaded"
                             )))
                         }
@@ -805,7 +805,7 @@ impl Pager {
                     let full_buffer_slice = page_content.buffer.as_mut_slice();
 
                     if offset_in_ptrmap_page + PTRMAP_ENTRY_SIZE > full_buffer_slice.len() {
-                        return Err(LimboError::InternalError(format!(
+                        return Err(TursoError::InternalError(format!(
                         "Ptrmap offset {} + entry size {} out of bounds for page {} (actual data len {})",
                         offset_in_ptrmap_page,
                         PTRMAP_ENTRY_SIZE,
@@ -1221,7 +1221,7 @@ impl Pager {
 
     pub fn wal_state(&self) -> Result<WalState> {
         let Some(wal) = self.wal.as_ref() else {
-            return Err(LimboError::InternalError(
+            return Err(TursoError::InternalError(
                 "wal_state() called on database without WAL".to_string(),
             ));
         };
@@ -1238,7 +1238,7 @@ impl Pager {
         let Some(wal) = self.wal.as_ref() else {
             // TODO: when ephemeral table spills to disk, it should cacheflush pages directly to the temporary database file.
             // This handling is not yet implemented, but it should be when spilling is implemented.
-            return Err(LimboError::InternalError(
+            return Err(TursoError::InternalError(
                 "cacheflush() called on database without WAL".to_string(),
             ));
         };
@@ -1307,7 +1307,7 @@ impl Pager {
         sync_mode: crate::SyncMode,
     ) -> Result<IOResult<PagerCommitResult>> {
         let Some(wal) = self.wal.as_ref() else {
-            return Err(LimboError::InternalError(
+            return Err(TursoError::InternalError(
                 "commit_dirty_pages() called on database without WAL".to_string(),
             ));
         };
@@ -1452,7 +1452,7 @@ impl Pager {
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn wal_get_frame(&self, frame_no: u64, frame: &mut [u8]) -> Result<Completion> {
         let Some(wal) = self.wal.as_ref() else {
-            return Err(LimboError::InternalError(
+            return Err(TursoError::InternalError(
                 "wal_get_frame() called on database without WAL".to_string(),
             ));
         };
@@ -1463,7 +1463,7 @@ impl Pager {
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn wal_insert_frame(&self, frame_no: u64, frame: &[u8]) -> Result<WalFrameInfo> {
         let Some(wal) = self.wal.as_ref() else {
-            return Err(LimboError::InternalError(
+            return Err(TursoError::InternalError(
                 "wal_insert_frame() called on database without WAL".to_string(),
             ));
         };
@@ -1494,7 +1494,7 @@ impl Pager {
             tracing::debug!("truncate page_cache as first page was written: {}", db_size);
             let mut page_cache = self.page_cache.write();
             page_cache.truncate(db_size.get() as usize).map_err(|e| {
-                LimboError::InternalError(format!("Failed to truncate page cache: {e:?}"))
+                TursoError::InternalError(format!("Failed to truncate page cache: {e:?}"))
             })?;
         }
         if header.is_commit_frame() {
@@ -1515,7 +1515,7 @@ impl Pager {
     #[instrument(skip_all, level = Level::DEBUG, name = "pager_checkpoint",)]
     pub fn checkpoint(&self) -> Result<IOResult<CheckpointResult>> {
         let Some(wal) = self.wal.as_ref() else {
-            return Err(LimboError::InternalError(
+            return Err(TursoError::InternalError(
                 "checkpoint() called on database without WAL".to_string(),
             ));
         };
@@ -1574,7 +1574,7 @@ impl Pager {
         let mut attempts = 0;
         {
             let Some(wal) = self.wal.as_ref() else {
-                return Err(LimboError::InternalError(
+                return Err(TursoError::InternalError(
                     "checkpoint_shutdown() called on database without WAL".to_string(),
                 ));
             };
@@ -1584,7 +1584,7 @@ impl Pager {
             self.io.wait_for_completion(c)?;
         }
         if !wal_auto_checkpoint_disabled {
-            while let Err(LimboError::Busy) = self.wal_checkpoint(CheckpointMode::Truncate {
+            while let Err(TursoError::Busy) = self.wal_checkpoint(CheckpointMode::Truncate {
                 upper_bound_inclusive: None,
             }) {
                 if attempts == 3 {
@@ -1605,7 +1605,7 @@ impl Pager {
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn wal_checkpoint(&self, mode: CheckpointMode) -> Result<CheckpointResult> {
         let Some(wal) = self.wal.as_ref() else {
-            return Err(LimboError::InternalError(
+            return Err(TursoError::InternalError(
                 "wal_checkpoint() called on database without WAL".to_string(),
             ));
         };
@@ -1650,7 +1650,7 @@ impl Pager {
         self.page_cache
             .write()
             .clear()
-            .map_err(|e| LimboError::InternalError(format!("Failed to clear page cache: {e:?}")))?;
+            .map_err(|e| TursoError::InternalError(format!("Failed to clear page cache: {e:?}")))?;
         Ok(checkpoint_result)
     }
 
@@ -1681,7 +1681,7 @@ impl Pager {
             match &mut *state {
                 FreePageState::Start => {
                     if page_id < 2 || page_id > header.database_size.get() as usize {
-                        return Err(LimboError::Corrupt(format!(
+                        return Err(TursoError::Corrupt(format!(
                             "Invalid page number {page_id} for free operation"
                         )));
                     }
@@ -1836,7 +1836,7 @@ impl Pager {
                 let page_key = PageCacheKey::new(page.get().id);
                 let mut cache = self.page_cache.write();
                 cache.insert(page_key, page.clone()).map_err(|e| {
-                    LimboError::InternalError(format!("Failed to insert page 1 into cache: {e:?}"))
+                    TursoError::InternalError(format!("Failed to insert page 1 into cache: {e:?}"))
                 })?;
                 self.db_state.set(DbState::Initialized);
                 self.allocate_page1_state.replace(AllocatePage1State::Done);
@@ -2054,7 +2054,7 @@ impl Pager {
                     // Check if allocating a new page would exceed the maximum page count
                     let max_page_count = self.get_max_page_count();
                     if new_db_size > max_page_count {
-                        return Err(LimboError::DatabaseFull(
+                        return Err(TursoError::DatabaseFull(
                             "database or disk is full".to_string(),
                         ));
                     }
@@ -2084,7 +2084,7 @@ impl Pager {
         &self,
         id: usize,
         page: PageRef,
-    ) -> Result<(), LimboError> {
+    ) -> Result<(), TursoError> {
         let mut cache = self.page_cache.write();
         let page_key = PageCacheKey::new(id);
 
@@ -2093,7 +2093,7 @@ impl Pager {
         cache
             .insert_ignore_existing(page_key, page.clone())
             .map_err(|e| {
-                LimboError::InternalError(format!(
+                TursoError::InternalError(format!(
                     "Failed to insert loaded page {id} into cache: {e:?}"
                 ))
             })?;
@@ -2107,7 +2107,7 @@ impl Pager {
         schema_did_change: bool,
         connection: &Connection,
         is_write: bool,
-    ) -> Result<(), LimboError> {
+    ) -> Result<(), TursoError> {
         tracing::debug!(schema_did_change);
         if is_write {
             self.dirty_pages.borrow_mut().clear();
@@ -2249,7 +2249,7 @@ impl CreateBTreeFlags {
 */
 #[cfg(not(feature = "omit_autovacuum"))]
 mod ptrmap {
-    use crate::{storage::sqlite3_ondisk::PageSize, LimboError, Result};
+    use crate::{storage::sqlite3_ondisk::PageSize, Result, TursoError};
 
     // Constants
     pub const PTRMAP_ENTRY_SIZE: usize = 5;
@@ -2289,7 +2289,7 @@ mod ptrmap {
     impl PtrmapEntry {
         pub fn serialize(&self, buffer: &mut [u8]) -> Result<()> {
             if buffer.len() < PTRMAP_ENTRY_SIZE {
-                return Err(LimboError::InternalError(format!(
+                return Err(TursoError::InternalError(format!(
                     "Buffer too small to serialize ptrmap entry. Expected at least {} bytes, got {}",
                     PTRMAP_ENTRY_SIZE,
                     buffer.len()
@@ -2374,12 +2374,12 @@ mod ptrmap {
         if db_page_no_to_query < first_data_page_mapped
             || db_page_no_to_query > last_data_page_mapped
         {
-            return Err(LimboError::InternalError(format!(
+            return Err(TursoError::InternalError(format!(
                 "Page {db_page_no_to_query} is not mapped by the data page range [{first_data_page_mapped}, {last_data_page_mapped}] of ptrmap page {ptrmap_page_no}"
             )));
         }
         if is_ptrmap_page(db_page_no_to_query, page_size) {
-            return Err(LimboError::InternalError(format!(
+            return Err(TursoError::InternalError(format!(
                 "Page {db_page_no_to_query} is a pointer map page and should not have an entry calculated this way."
             )));
         }

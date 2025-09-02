@@ -316,7 +316,7 @@ mod tests {
             assert_eq!(ret, vec![vec![Value::Integer(1)]]);
 
             let err = limbo_exec_rows_error(&db, &conn, "INSERT INTO t values (1)").unwrap_err();
-            assert!(matches!(err, turso_core::LimboError::ReadOnly), "{err:?}");
+            assert!(matches!(err, turso_core::TursoError::ReadOnly), "{err:?}");
         }
         Ok(())
     }

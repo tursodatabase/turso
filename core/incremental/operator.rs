@@ -243,7 +243,7 @@ impl FilterPredicate {
         use turso_parser::ast::*;
 
         let Expr::Binary(lhs, op, rhs) = expr else {
-            return Err(crate::LimboError::ParseError(
+            return Err(crate::TursoError::ParseError(
                 "Unsupported WHERE clause for incremental views: not a binary expression"
                     .to_string(),
             ));
@@ -266,7 +266,7 @@ impl FilterPredicate {
 
         // Handle comparison operators
         let Expr::Id(column_name) = &**lhs else {
-            return Err(crate::LimboError::ParseError(
+            return Err(crate::TursoError::ParseError(
                 "Unsupported WHERE clause for incremental views: left-hand-side is not a column reference".to_string(),
             ));
         };
@@ -287,7 +287,7 @@ impl FilterPredicate {
                 } else if let Ok(f) = n.parse::<f64>() {
                     Value::Float(f)
                 } else {
-                    return Err(crate::LimboError::ParseError(
+                    return Err(crate::TursoError::ParseError(
                         "Unsupported WHERE clause for incremental views: right-hand-side is not a numeric literal".to_string(),
                     ));
                 }
@@ -295,13 +295,13 @@ impl FilterPredicate {
             Expr::Literal(Literal::Null) => Value::Null,
             Expr::Literal(Literal::Blob(_)) => {
                 // Blob comparison not yet supported
-                return Err(crate::LimboError::ParseError(
+                return Err(crate::TursoError::ParseError(
                     "Unsupported WHERE clause for incremental views: comparison with blob literals is not supported".to_string(),
                 ));
             }
             other => {
                 // Complex expressions not yet supported
-                return Err(crate::LimboError::ParseError(
+                return Err(crate::TursoError::ParseError(
                     format!("Unsupported WHERE clause for incremental views: comparison with {other:?} is not supported"),
                 ));
             }
@@ -315,7 +315,7 @@ impl FilterPredicate {
             Operator::GreaterEquals => Ok(FilterPredicate::GreaterThanOrEqual { column, value }),
             Operator::Less => Ok(FilterPredicate::LessThan { column, value }),
             Operator::LessEquals => Ok(FilterPredicate::LessThanOrEqual { column, value }),
-            other => Err(crate::LimboError::ParseError(
+            other => Err(crate::TursoError::ParseError(
                 format!("Unsupported WHERE clause for incremental views: comparison operator {other:?} is not supported"),
             )),
         }
@@ -335,7 +335,7 @@ impl FilterPredicate {
                 Ok(FilterPredicate::None)
             }
         } else {
-            Err(crate::LimboError::ParseError(
+            Err(crate::TursoError::ParseError(
                 "Unsupported WHERE clause for incremental views: not a single SELECT statement"
                     .to_string(),
             ))
@@ -729,7 +729,7 @@ impl ProjectOperator {
                         }
                     }
                     x => {
-                        return Err(crate::LimboError::ParseError(format!(
+                        return Err(crate::TursoError::ParseError(format!(
                             "Unsupported {x:?} clause when compiling project operator",
                         )));
                     }
@@ -737,13 +737,13 @@ impl ProjectOperator {
             }
 
             if columns.is_empty() {
-                return Err(crate::LimboError::ParseError(
+                return Err(crate::TursoError::ParseError(
                     "No columns found when compiling project operator".to_string(),
                 ));
             }
             columns
         } else {
-            return Err(crate::LimboError::ParseError(
+            return Err(crate::TursoError::ParseError(
                 "Expression is not a valid SELECT expression".to_string(),
             ));
         };
