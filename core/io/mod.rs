@@ -128,32 +128,97 @@ pub type TruncateComplete = dyn FnOnce(Result<i32, CompletionError>);
 
 #[derive(Debug, Default)]
 pub struct CompletionBuilder {
-    inner: LinkedList<CompletionMutAdapter>,
+    list: LinkedList<CompletionBuilderAdapter>,
 }
 
 impl CompletionBuilder {
     fn add(&mut self, completion_type: CompletionType) {
-        self.inner.push_back(Box::new(CompletionNode {
+        self.list.push_back(Box::new(CompletionNode {
             link: LinkedListLink::new(),
             inner: CompletionInner::new(completion_type),
         }));
     }
 
     fn append(&mut self, list: Self) {
-        self.inner.back_mut().splice_after(list.inner);
+        self.list.back_mut().splice_after(list.list);
     }
 }
 
 #[must_use]
 #[derive(Debug)]
-/// Mutable completion
+/// Completion Node that is stored in intrusive linked list
 struct CompletionNode {
     link: LinkedListLink,
     inner: CompletionInner,
 }
 
 // TODO: see about implementing `PointerOps` trait for CompletionBuilder to avoid boxing
-intrusive_adapter!(CompletionMutAdapter = Box<CompletionNode>: CompletionNode { link: LinkedListLink });
+intrusive_adapter!(CompletionBuilderAdapter = Box<CompletionNode>: CompletionNode { link: LinkedListLink });
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct IOBuilder;
+
+impl IOBuilder {
+    pub fn pread<F>(&self, pos: u64, buffer: Arc<Buffer>, callback: F) -> CompletionBuilder
+    where
+        F: FnOnce(Result<(Arc<Buffer>, i32), CompletionError>) + 'static,
+    {
+        let mut builder = CompletionBuilder::default();
+        let completion = CompletionType::Read(ReadCompletion::new(buffer, pos, Box::new(callback)));
+        builder.add(completion);
+        builder
+    }
+
+    pub fn pwrite<F>(&self, pos: u64, buffer: Arc<Buffer>, callback: F) -> CompletionBuilder
+    where
+        F: FnOnce(Result<i32, CompletionError>) + 'static,
+    {
+        let mut builder = CompletionBuilder::default();
+        let completion =
+            CompletionType::Write(WriteCompletion::new(buffer, pos, Box::new(callback)));
+        builder.add(completion);
+        builder
+    }
+
+    pub fn pwritev<F>(&self, pos: u64, buffers: Vec<Arc<Buffer>>, callback: F) -> CompletionBuilder
+    where
+        F: FnOnce(Result<i32, CompletionError>) + 'static,
+    {
+        let mut builder = CompletionBuilder::default();
+        let completion =
+            CompletionType::WriteV(WriteVCompletion::new(buffers, pos, Box::new(callback)));
+        builder.add(completion);
+        builder
+    }
+
+    pub fn sync<F>(&self, callback: F) -> CompletionBuilder
+    where
+        F: FnOnce(Result<i32, CompletionError>) + 'static,
+    {
+        let mut builder = CompletionBuilder::default();
+        let completion = CompletionType::Sync(SyncCompletion::new(Box::new(callback)));
+        builder.add(completion);
+        builder
+    }
+
+    pub fn truncate<F>(&self, len: u64, callback: F) -> CompletionBuilder
+    where
+        F: FnOnce(Result<i32, CompletionError>) + 'static,
+    {
+        let mut builder = CompletionBuilder::default();
+        let completion = CompletionType::Truncate(TruncateCompletion::new(len, Box::new(callback)));
+        builder.add(completion);
+        builder
+    }
+
+    /// Creates a completion that is always ready
+    pub fn ready() -> CompletionBuilder {
+        let mut builder = CompletionBuilder::default();
+        let completion = CompletionType::Ready;
+        builder.add(completion);
+        builder
+    }
+}
 
 #[must_use]
 #[derive(Debug, Clone)]
@@ -175,8 +240,10 @@ impl Debug for CompletionType {
         match self {
             Self::Read(..) => f.debug_tuple("Read").finish(),
             Self::Write(..) => f.debug_tuple("Write").finish(),
+            Self::WriteV(..) => f.debug_tuple("WriteV").finish(),
             Self::Sync(..) => f.debug_tuple("Sync").finish(),
             Self::Truncate(..) => f.debug_tuple("Truncate").finish(),
+            Self::Ready => f.debug_tuple("Ready").finish(),
         }
     }
 }
@@ -193,8 +260,11 @@ impl CompletionInner {
 pub enum CompletionType {
     Read(ReadCompletion),
     Write(WriteCompletion),
+    WriteV(WriteVCompletion),
     Sync(SyncCompletion),
     Truncate(TruncateCompletion),
+    /// Completion that is always ready
+    Ready,
 }
 
 impl Completion {
@@ -258,7 +328,7 @@ impl Completion {
         ))))
     }
 
-    pub fn new_trunc<F>(complete: F) -> Self
+    pub fn new_trunc<F>(len: u64, complete: F) -> Self
     where
         F: FnOnce(Result<i32, CompletionError>) + 'static,
     {
@@ -296,8 +366,10 @@ impl Completion {
         match &self.inner.completion_type {
             CompletionType::Read(r) => r.callback(result),
             CompletionType::Write(w) => w.callback(result),
+            CompletionType::WriteV(w) => w.callback(result),
             CompletionType::Sync(s) => s.callback(result), // fix
             CompletionType::Truncate(t) => t.callback(result),
+            CompletionType::Ready => {}
         };
         self.inner
             .result
@@ -310,8 +382,10 @@ impl Completion {
         match &self.inner.completion_type {
             CompletionType::Read(r) => r.callback(result),
             CompletionType::Write(w) => w.callback(result),
+            CompletionType::WriteV(w) => w.callback(result),
             CompletionType::Sync(s) => s.callback(result), // fix
             CompletionType::Truncate(t) => t.callback(result),
+            CompletionType::Ready => {}
         };
         self.inner
             .result
@@ -345,14 +419,16 @@ impl Completion {
 pub struct ReadCompletion {
     pub buf: Arc<Buffer>,
     pub complete: Option<Box<ReadComplete>>,
+    pub offset: u64,
     called: AtomicBool,
 }
 
 impl ReadCompletion {
-    pub fn new(buf: Arc<Buffer>, complete: Box<ReadComplete>) -> Self {
+    pub fn new(buf: Arc<Buffer>, pos: u64, complete: Box<ReadComplete>) -> Self {
         Self {
             buf,
             complete: Some(complete),
+            offset: pos,
             called: AtomicBool::new(false),
         }
     }
@@ -381,12 +457,47 @@ impl ReadCompletion {
 
 pub struct WriteCompletion {
     pub complete: Option<Box<WriteComplete>>,
+    pub buf: Arc<Buffer>,
+    pub offset: u64,
     called: AtomicBool,
 }
 
 impl WriteCompletion {
-    pub fn new(complete: Box<WriteComplete>) -> Self {
+    pub fn new(buf: Arc<Buffer>, pos: u64, complete: Box<WriteComplete>) -> Self {
         Self {
+            buf,
+            offset: pos,
+            complete: Some(complete),
+            called: AtomicBool::new(false),
+        }
+    }
+
+    pub fn callback(&self, bytes_written: Result<i32, CompletionError>) {
+        assert!(
+            !self.called.swap(true, Ordering::SeqCst),
+            "Completion callback called more than once"
+        );
+        let complete = unsafe {
+            let ptr = &self.complete as *const Option<Box<WriteComplete>>
+                as *mut Option<Box<WriteComplete>>;
+            (*ptr).take().unwrap()
+        };
+        (complete)(bytes_written);
+    }
+}
+
+pub struct WriteVCompletion {
+    pub complete: Option<Box<WriteComplete>>,
+    pub buffers: Vec<Arc<Buffer>>,
+    pub offset: u64,
+    called: AtomicBool,
+}
+
+impl WriteVCompletion {
+    pub fn new(buffers: Vec<Arc<Buffer>>, pos: u64, complete: Box<WriteComplete>) -> Self {
+        Self {
+            buffers,
+            offset: pos,
             complete: Some(complete),
             called: AtomicBool::new(false),
         }
@@ -435,12 +546,14 @@ impl SyncCompletion {
 
 pub struct TruncateCompletion {
     pub complete: Option<Box<TruncateComplete>>,
+    pub len: u64,
     called: AtomicBool,
 }
 
 impl TruncateCompletion {
-    pub fn new(complete: Box<TruncateComplete>) -> Self {
+    pub fn new(len: u64, complete: Box<TruncateComplete>) -> Self {
         Self {
+            len,
             complete: Some(complete),
             called: AtomicBool::new(false),
         }
