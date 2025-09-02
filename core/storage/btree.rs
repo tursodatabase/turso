@@ -5314,7 +5314,7 @@ impl BTreeCursor {
             self.context = None;
             self.valid_state = CursorValidState::Valid;
             return Ok(IOResult::Done(()));
-        };
+        }
         let ctx = self.context.take().unwrap();
         let seek_key = match ctx.key {
             CursorContextKey::TableRowId(rowid) => SeekKey::TableRowId(rowid),
