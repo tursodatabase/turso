@@ -155,12 +155,6 @@ impl GenerateSeriesCursor {
     fn is_invalid_range(&self) -> bool {
         self.is_invalid_ascending_series() || self.is_invalid_descending_series()
     }
-
-    /// Returns true if we would exceed the stop value in the current direction
-    fn would_exceed(&self) -> bool {
-        (self.step > 0 && self.current.saturating_add(self.step) > self.stop)
-            || (self.step < 0 && self.current.saturating_add(self.step) < self.stop)
-    }
 }
 
 impl VTabCursor for GenerateSeriesCursor {
