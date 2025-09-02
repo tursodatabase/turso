@@ -9,7 +9,7 @@ use crate::{
         builder::{CursorType, ProgramBuilder},
         insn::{Cookie, Insn, RegisterOrLiteral},
     },
-    LimboError, Result, SymbolTable,
+    Result, SymbolTable, TursoError,
 };
 
 use super::{schema::SQLITE_TABLEID, update::translate_update_for_schema_change};
@@ -37,7 +37,7 @@ pub fn translate_alter_table(
     }
 
     let Some(original_btree) = schema.get_table(table_name).and_then(|table| table.btree()) else {
-        return Err(LimboError::ParseError(format!(
+        return Err(TursoError::ParseError(format!(
             "no such table: {table_name}"
         )));
     };
@@ -52,17 +52,17 @@ pub fn translate_alter_table(
             assert_ne!(btree.columns.len(), 0);
 
             if btree.columns.len() == 1 {
-                return Err(LimboError::ParseError(format!(
+                return Err(TursoError::ParseError(format!(
                     "cannot drop column \"{column_name}\": no other columns exist"
                 )));
             }
 
             let (dropped_index, column) = btree.get_column(column_name).ok_or_else(|| {
-                LimboError::ParseError(format!("no such column: \"{column_name}\""))
+                TursoError::ParseError(format!("no such column: \"{column_name}\""))
             })?;
 
             if column.primary_key {
-                return Err(LimboError::ParseError(format!(
+                return Err(TursoError::ParseError(format!(
                     "cannot drop column \"{column_name}\": PRIMARY KEY"
                 )));
             }
@@ -75,7 +75,7 @@ pub fn translate_alter_table(
                     })
                 })
             {
-                return Err(LimboError::ParseError(format!(
+                return Err(TursoError::ParseError(format!(
                     "cannot drop column \"{column_name}\": UNIQUE"
                 )));
             }
@@ -180,7 +180,7 @@ pub fn translate_alter_table(
                 ) {
                     // TODO: This is slightly inaccurate since sqlite returns a `Runtime
                     // error`.
-                    return Err(LimboError::ParseError(
+                    return Err(TursoError::ParseError(
                         "Cannot add a column with non-constant default".to_string(),
                     ));
                 }
@@ -243,7 +243,7 @@ pub fn translate_alter_table(
                     .flatten()
                     .any(|index| index.name == normalize_ident(new_name))
             {
-                return Err(LimboError::ParseError(format!(
+                return Err(TursoError::ParseError(format!(
                     "there is already another table or index with this name: {new_name}"
                 )));
             };
@@ -351,13 +351,13 @@ pub fn translate_alter_table(
             let col_name = col_name.as_str();
 
             let Some((column_index, _)) = btree.get_column(from) else {
-                return Err(LimboError::ParseError(format!(
+                return Err(TursoError::ParseError(format!(
                     "no such column: \"{from}\""
                 )));
             };
 
             if btree.get_column(col_name).is_some() {
-                return Err(LimboError::ParseError(format!(
+                return Err(TursoError::ParseError(format!(
                     "duplicate column name: \"{col_name}\""
                 )));
             };
@@ -367,7 +367,7 @@ pub fn translate_alter_table(
                 .iter()
                 .any(|c| matches!(c.constraint, ast::ColumnConstraint::PrimaryKey { .. }))
             {
-                return Err(LimboError::ParseError(
+                return Err(TursoError::ParseError(
                     "PRIMARY KEY constraint cannot be altered".to_string(),
                 ));
             }
@@ -377,7 +377,7 @@ pub fn translate_alter_table(
                 .iter()
                 .any(|c| matches!(c.constraint, ast::ColumnConstraint::Unique { .. }))
             {
-                return Err(LimboError::ParseError(
+                return Err(TursoError::ParseError(
                     "UNIQUE constraint cannot be altered".to_string(),
                 ));
             }

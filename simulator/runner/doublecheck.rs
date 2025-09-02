@@ -70,7 +70,7 @@ pub(crate) fn run_simulation(
                 doublecheck_env.get_db_path().display()
             );
             result.error = result.error.or_else(|| {
-                Some(turso_core::LimboError::InternalError(
+                Some(turso_core::TursoError::InternalError(
                     "database files are different, check binary diffs for more details.".into(),
                 ))
             });
@@ -128,7 +128,7 @@ pub(crate) fn execute_plans(
         if now.elapsed().as_secs() >= env.opts.max_time_simulation as u64 {
             return ExecutionResult::new(
                 history,
-                Some(turso_core::LimboError::InternalError(
+                Some(turso_core::TursoError::InternalError(
                     "maximum time for simulation reached".into(),
                 )),
             );
@@ -195,7 +195,7 @@ fn execute_plan(
                             next_execution,
                             next_execution_doublecheck
                         );
-                        return Err(turso_core::LimboError::InternalError(
+                        return Err(turso_core::TursoError::InternalError(
                             "expected next executions of limbo and doublecheck do not match".into(),
                         ));
                     }
@@ -215,7 +215,7 @@ fn execute_plan(
                                             "doublecheck values {:?}",
                                             doublecheck_values
                                         );
-                                        return Err(turso_core::LimboError::InternalError(
+                                        return Err(turso_core::TursoError::InternalError(
                                             "returned values from limbo and doublecheck results do not match".into(),
                                         ));
                                     }
@@ -227,7 +227,7 @@ fn execute_plan(
                                         );
                                         tracing::error!("limbo error {}", limbo_err);
                                         tracing::error!("doublecheck error {}", doublecheck_err);
-                                        return Err(turso_core::LimboError::InternalError(
+                                        return Err(turso_core::TursoError::InternalError(
                                             "limbo and doublecheck errors do not match".into(),
                                         ));
                                     }
@@ -238,7 +238,7 @@ fn execute_plan(
                                     );
                                     tracing::error!("limbo values {:?}", limbo_result);
                                     tracing::error!("doublecheck error {}", doublecheck_err);
-                                    return Err(turso_core::LimboError::InternalError(
+                                    return Err(turso_core::TursoError::InternalError(
                                         "limbo and doublecheck results do not match".into(),
                                     ));
                                 }
@@ -247,7 +247,7 @@ fn execute_plan(
                                         "limbo and doublecheck results do not match, limbo failed but doublecheck returned values"
                                     );
                                     tracing::error!("limbo error {}", limbo_err);
-                                    return Err(turso_core::LimboError::InternalError(
+                                    return Err(turso_core::TursoError::InternalError(
                                         "limbo and doublecheck results do not match".into(),
                                     ));
                                 }
@@ -256,7 +256,7 @@ fn execute_plan(
                         (None, None) => {}
                         _ => {
                             tracing::error!("limbo and doublecheck results do not match");
-                            return Err(turso_core::LimboError::InternalError(
+                            return Err(turso_core::TursoError::InternalError(
                                 "limbo and doublecheck results do not match".into(),
                             ));
                         }
@@ -299,7 +299,7 @@ fn execute_plan(
                         tracing::error!("limbo and doublecheck errors do not match");
                         tracing::error!("limbo error {}", err);
                         tracing::error!("doublecheck error {}", err_doublecheck);
-                        return Err(turso_core::LimboError::InternalError(
+                        return Err(turso_core::TursoError::InternalError(
                             "limbo and doublecheck errors do not match".into(),
                         ));
                     }

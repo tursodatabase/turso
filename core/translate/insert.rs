@@ -472,7 +472,7 @@ pub fn translate_insert(
         for (i, column_mapping) in column_mappings.clone().enumerate() {
             // copy from the table's column register over to the index's scratch register
             let Some(col_mapping) = column_mapping else {
-                return Err(crate::LimboError::PlanningError(
+                return Err(crate::TursoError::PlanningError(
                     "Column not found in INSERT".to_string(),
                 ));
             };

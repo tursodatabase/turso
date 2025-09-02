@@ -45,10 +45,10 @@ impl Display for Error {
 
 impl std::error::Error for Error {}
 
-impl From<Error> for crate::LimboError {
+impl From<Error> for crate::TursoError {
     fn from(err: Error) -> Self {
         match err {
-            Error::Message { msg, .. } => crate::LimboError::ParseError(msg),
+            Error::Message { msg, .. } => crate::TursoError::ParseError(msg),
         }
     }
 }

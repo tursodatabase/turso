@@ -27,6 +27,6 @@ pub(crate) mod wal;
 #[macro_export]
 macro_rules! return_corrupt {
     ($msg:expr) => {
-        return Err(LimboError::Corrupt($msg.into()));
+        return Err(TursoError::Corrupt($msg.into()));
     };
 }

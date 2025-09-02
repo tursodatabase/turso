@@ -486,7 +486,7 @@ fn prepare_one_select_plan(
                                         );
                                     }
                                     Err(e) => match e {
-                                        crate::LimboError::ParseError(e) => {
+                                        crate::TursoError::ParseError(e) => {
                                             crate::bail_parse_error!("{}", e);
                                         }
                                         _ => {

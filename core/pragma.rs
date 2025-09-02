@@ -1,4 +1,4 @@
-use crate::{Connection, LimboError, Statement, StepResult, Value};
+use crate::{Connection, Statement, StepResult, TursoError, Value};
 use bitflags::bitflags;
 use std::sync::Arc;
 use strum::IntoEnumIterator;
@@ -272,7 +272,7 @@ impl PragmaVirtualTableCursor {
         let stmt = self
             .stmt
             .as_mut()
-            .ok_or_else(|| LimboError::InternalError("Statement is missing".into()))?;
+            .ok_or_else(|| TursoError::InternalError("Statement is missing".into()))?;
         let result = stmt.step()?;
         match result {
             StepResult::Done => Ok(false),
@@ -288,9 +288,9 @@ impl PragmaVirtualTableCursor {
             let value = self
                 .stmt
                 .as_ref()
-                .ok_or_else(|| LimboError::InternalError("Statement is missing".into()))?
+                .ok_or_else(|| TursoError::InternalError("Statement is missing".into()))?
                 .row()
-                .ok_or_else(|| LimboError::InternalError("No row available".into()))?
+                .ok_or_else(|| TursoError::InternalError("No row available".into()))?
                 .get_value(idx)
                 .clone();
             return Ok(value);
@@ -308,7 +308,7 @@ impl PragmaVirtualTableCursor {
 
     pub(crate) fn filter(&mut self, args: Vec<Value>) -> crate::Result<bool> {
         if args.len() > self.max_arg_count {
-            return Err(LimboError::ParseError(format!(
+            return Err(TursoError::ParseError(format!(
                 "Too many arguments for pragma {}: expected at most {}, got {}",
                 self.pragma_name,
                 self.max_arg_count,
@@ -328,7 +328,7 @@ impl PragmaVirtualTableCursor {
 
         if let Some(schema) = schema {
             // Schema-qualified PRAGMA statements are not supported yet
-            return Err(LimboError::ParseError(format!(
+            return Err(TursoError::ParseError(format!(
                 "Schema argument is not supported yet (got schema: '{schema}')"
             )));
         }

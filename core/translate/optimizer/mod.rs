@@ -18,7 +18,7 @@ use crate::{
         optimizer::constraints::TableConstraints, plan::Scan, plan::TerminationKey,
     },
     types::SeekOp,
-    LimboError, Result,
+    Result, TursoError,
 };
 
 use super::{
@@ -415,7 +415,7 @@ fn build_vtab_scan_op(
     constraint_usages: &[ConstraintUsage],
 ) -> Result<Operation> {
     if constraint_usages.len() != vtab_constraints.len() {
-        return Err(LimboError::ExtensionError(format!(
+        return Err(TursoError::ExtensionError(format!(
             "Constraint usage count mismatch (expected {}, got {})",
             vtab_constraints.len(),
             constraint_usages.len()
@@ -430,7 +430,7 @@ fn build_vtab_scan_op(
         let argv_index = match usage.argv_index {
             Some(idx) if idx >= 1 && (idx as usize) <= constraint_usages.len() => idx,
             Some(idx) => {
-                return Err(LimboError::ExtensionError(format!(
+                return Err(TursoError::ExtensionError(format!(
                     "argv_index {} is out of valid range [1..{}]",
                     idx,
                     constraint_usages.len()
@@ -441,7 +441,7 @@ fn build_vtab_scan_op(
 
         let zero_based_argv_index = (argv_index - 1) as usize;
         if constraints[zero_based_argv_index].is_some() {
-            return Err(LimboError::ExtensionError(format!(
+            return Err(TursoError::ExtensionError(format!(
                 "duplicate argv_index {argv_index}"
             )));
         }
@@ -462,7 +462,7 @@ fn build_vtab_scan_op(
         .enumerate()
         .map(|(i, c)| {
             c.ok_or_else(|| {
-                LimboError::ExtensionError(format!(
+                TursoError::ExtensionError(format!(
                     "argv_index values must form contiguous sequence starting from 1, missing index {}",
                     i + 1
                 ))

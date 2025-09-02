@@ -134,7 +134,7 @@ impl SimulatorFile {
 impl File for SimulatorFile {
     fn lock_file(&self, exclusive: bool) -> Result<()> {
         if self.fault.get() {
-            return Err(turso_core::LimboError::InternalError(
+            return Err(turso_core::TursoError::InternalError(
                 FAULT_ERROR_MSG.into(),
             ));
         }
@@ -143,7 +143,7 @@ impl File for SimulatorFile {
 
     fn unlock_file(&self) -> Result<()> {
         if self.fault.get() {
-            return Err(turso_core::LimboError::InternalError(
+            return Err(turso_core::TursoError::InternalError(
                 FAULT_ERROR_MSG.into(),
             ));
         }
@@ -155,7 +155,7 @@ impl File for SimulatorFile {
         if self.fault.get() {
             tracing::debug!("pread fault");
             self.nr_pread_faults.set(self.nr_pread_faults.get() + 1);
-            return Err(turso_core::LimboError::InternalError(
+            return Err(turso_core::TursoError::InternalError(
                 FAULT_ERROR_MSG.into(),
             ));
         }
@@ -181,7 +181,7 @@ impl File for SimulatorFile {
         if self.fault.get() {
             tracing::debug!("pwrite fault");
             self.nr_pwrite_faults.set(self.nr_pwrite_faults.get() + 1);
-            return Err(turso_core::LimboError::InternalError(
+            return Err(turso_core::TursoError::InternalError(
                 FAULT_ERROR_MSG.into(),
             ));
         }
@@ -235,7 +235,7 @@ impl File for SimulatorFile {
         if self.fault.get() {
             tracing::debug!("pwritev fault");
             self.nr_pwrite_faults.set(self.nr_pwrite_faults.get() + 1);
-            return Err(turso_core::LimboError::InternalError(
+            return Err(turso_core::TursoError::InternalError(
                 FAULT_ERROR_MSG.into(),
             ));
         }
@@ -259,7 +259,7 @@ impl File for SimulatorFile {
 
     fn truncate(&self, len: u64, c: turso_core::Completion) -> Result<turso_core::Completion> {
         if self.fault.get() {
-            return Err(turso_core::LimboError::InternalError(
+            return Err(turso_core::TursoError::InternalError(
                 FAULT_ERROR_MSG.into(),
             ));
         }

@@ -8,7 +8,7 @@ use crate::{
     schema::{Index, Table},
     translate::plan::{IterationDirection, JoinOrderMember, JoinedTable},
     vtab::VirtualTable,
-    LimboError, Result,
+    Result, TursoError,
 };
 
 use super::{
@@ -218,6 +218,6 @@ fn find_best_access_method_for_vtab<'a>(
             }))
         }
         Err(ResultCode::ConstraintViolation) => Ok(None),
-        Err(e) => Err(LimboError::from(e)),
+        Err(e) => Err(TursoError::from(e)),
     }
 }

@@ -24,7 +24,7 @@ use crate::storage::sqlite3_ondisk::{
 use crate::types::{IOCompletions, IOResult};
 use crate::{
     bail_corrupt_error, io_yield_many, turso_assert, Buffer, Completion, CompletionError,
-    IOContext, LimboError, Result,
+    IOContext, Result, TursoError,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -721,7 +721,7 @@ impl CheckpointLocks {
         if !shared.checkpoint_lock.write() {
             tracing::trace!("CheckpointGuard::new: checkpoint lock failed, returning Busy");
             // we hold the exclusive checkpoint lock no matter which mode for the duration
-            return Err(LimboError::Busy);
+            return Err(TursoError::Busy);
         }
         match mode {
             // Passive mode is the only mode not requiring a write lock, as it doesn't block
@@ -734,7 +734,7 @@ impl CheckpointLocks {
                     shared.checkpoint_lock.unlock();
                     tracing::trace!("CheckpointGuard: read0 lock failed, returning Busy");
                     // for passive and full we need to hold the read0 lock
-                    return Err(LimboError::Busy);
+                    return Err(TursoError::Busy);
                 }
                 Ok(Self::Read0 { ptr })
             }
@@ -744,13 +744,13 @@ impl CheckpointLocks {
                 if !read0.write() {
                     shared.checkpoint_lock.unlock();
                     tracing::trace!("CheckpointGuard: read0 lock failed (Full), Busy");
-                    return Err(LimboError::Busy);
+                    return Err(TursoError::Busy);
                 }
                 if !shared.write_lock.write() {
                     read0.unlock();
                     shared.checkpoint_lock.unlock();
                     tracing::trace!("CheckpointGuard: write lock failed (Full), Busy");
-                    return Err(LimboError::Busy);
+                    return Err(TursoError::Busy);
                 }
                 Ok(Self::Writer { ptr })
             }
@@ -761,7 +761,7 @@ impl CheckpointLocks {
                 if !read0.write() {
                     shared.checkpoint_lock.unlock();
                     tracing::trace!("CheckpointGuard: read0 lock failed, returning Busy");
-                    return Err(LimboError::Busy);
+                    return Err(TursoError::Busy);
                 }
                 // if we are resetting the log we must hold the write lock for the duration.
                 // ensures no writer can append frames while we reset the log.
@@ -769,7 +769,7 @@ impl CheckpointLocks {
                     shared.checkpoint_lock.unlock();
                     read0.unlock();
                     tracing::trace!("CheckpointGuard: write lock failed, returning Busy");
-                    return Err(LimboError::Busy);
+                    return Err(TursoError::Busy);
                 }
                 Ok(Self::Writer { ptr })
             }
@@ -912,7 +912,7 @@ impl Wal for WalFile {
             || cksm2 != last_checksum
             || ckpt_seq2 != checkpoint_seq
         {
-            return Err(LimboError::Busy);
+            return Err(TursoError::Busy);
         }
         self.max_frame = best_mark as u64;
         self.max_frame_read_lock_index.set(best_idx as usize);
@@ -1159,7 +1159,7 @@ impl Wal for WalFile {
         tracing::debug!("write_raw_frame({})", frame_id);
         // if page_size wasn't initialized before - we will initialize it during that raw write
         if self.page_size() != 0 && page.len() != self.page_size() as usize {
-            return Err(LimboError::InvalidArgument(format!(
+            return Err(TursoError::InvalidArgument(format!(
                 "unexpected page size in frame: got={}, expected={}",
                 page.len(),
                 self.page_size(),
@@ -1167,7 +1167,7 @@ impl Wal for WalFile {
         }
         if frame_id > self.max_frame + 1 {
             // attempt to write frame out of sequential order - error out
-            return Err(LimboError::InvalidArgument(format!(
+            return Err(TursoError::InvalidArgument(format!(
                 "frame_id is beyond next frame in the WAL: frame_id={}, max_frame={}",
                 frame_id, self.max_frame
             )));
@@ -1204,7 +1204,7 @@ impl Wal for WalFile {
             )?;
             self.io.wait_for_completion(c)?;
             return if conflict.get() {
-                Err(LimboError::Conflict(format!(
+                Err(TursoError::Conflict(format!(
                     "frame content differs from the WAL: frame_id={frame_id}"
                 )))
             } else {
@@ -1702,7 +1702,7 @@ impl WalFile {
                     {
                         if max_frame > upper_bound {
                             tracing::info!("abort checkpoint because latest frame in WAL is greater than upper_bound in TRUNCATE mode: {max_frame} != {upper_bound}");
-                            return Err(LimboError::Busy);
+                            return Err(TursoError::Busy);
                         }
                     }
                     if let CheckpointMode::Passive {
@@ -1897,7 +1897,7 @@ impl WalFile {
                         .store(self.ongoing_checkpoint.max_frame, Ordering::Release);
 
                     if mode.require_all_backfilled() && !checkpoint_result.everything_backfilled() {
-                        return Err(LimboError::Busy);
+                        return Err(TursoError::Busy);
                     }
                     if mode.should_restart_log() {
                         self.restart_log(mode)?;
@@ -2019,14 +2019,14 @@ impl WalFile {
                         shared.read_locks[j].unlock();
                     }
                     // Reader is active, cannot proceed
-                    return Err(LimboError::Busy);
+                    return Err(TursoError::Busy);
                 }
                 // after the log is reset, we must set all secondary marks to READMARK_NOT_USED so the next reader selects a fresh slot
                 lock.set_value_exclusive(READMARK_NOT_USED);
             }
         }
 
-        let unlock = |e: Option<&LimboError>| {
+        let unlock = |e: Option<&TursoError>| {
             // release all read locks we just acquired, the caller will take care of the others
             let shared = unsafe { self.shared.get().as_mut().unwrap() };
             for idx in 1..shared.read_locks.len() {
@@ -2277,8 +2277,8 @@ pub mod test {
         },
         types::IOResult,
         util::IOExt,
-        CheckpointMode, CheckpointResult, Completion, Connection, Database, LimboError, PlatformIO,
-        StepResult, Wal, WalFile, WalFileShared, IO,
+        CheckpointMode, CheckpointResult, Completion, Connection, Database, PlatformIO, StepResult,
+        TursoError, Wal, WalFile, WalFileShared, IO,
     };
     #[cfg(unix)]
     use std::os::unix::fs::MetadataExt;
@@ -2626,7 +2626,7 @@ pub mod test {
                 }
                 e => {
                     assert!(
-                        matches!(e, Err(LimboError::Busy)),
+                        matches!(e, Err(TursoError::Busy)),
                         "reader is holding readmark0 we should return Busy"
                     );
                     break;
@@ -2658,7 +2658,7 @@ pub mod test {
                 }
                 Err(e) => {
                     assert!(
-                        matches!(e, LimboError::Busy),
+                        matches!(e, TursoError::Busy),
                         "should return busy if we have readers"
                     );
                     break;
@@ -2833,7 +2833,7 @@ pub mod test {
         };
 
         assert!(
-            matches!(result, Err(LimboError::Busy)),
+            matches!(result, Err(TursoError::Busy)),
             "Restart checkpoint should fail when write lock is held"
         );
 
@@ -3231,7 +3231,7 @@ pub mod test {
             let result = wal.checkpoint(&pager, CheckpointMode::Restart);
 
             assert!(
-                matches!(result, Err(LimboError::Busy)),
+                matches!(result, Err(TursoError::Busy)),
                 "RESTART checkpoint should fail when a reader is using slot 0"
             );
         }
@@ -3337,7 +3337,7 @@ pub mod test {
                         // Drive any pending IO (should quickly become Busy or Done)
                         io.wait(db.io.as_ref()).unwrap();
                     }
-                    Err(LimboError::Busy) => {
+                    Err(TursoError::Busy) => {
                         break;
                     }
                     other => panic!("expected Busy from FULL with old reader, got {other:?}"),

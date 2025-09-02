@@ -1,7 +1,7 @@
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("database error: {0}")]
-    TursoError(#[from] turso_core::LimboError),
+    TursoError(#[from] turso_core::TursoError),
     #[error("database tape error: {0}")]
     DatabaseTapeError(String),
     #[error("deserialization error: {0}")]
@@ -17,6 +17,6 @@ pub enum Error {
 #[cfg(test)]
 impl From<turso::Error> for Error {
     fn from(value: turso::Error) -> Self {
-        Self::TursoError(turso_core::LimboError::InternalError(value.to_string()))
+        Self::TursoError(turso_core::TursoError::InternalError(value.to_string()))
     }
 }

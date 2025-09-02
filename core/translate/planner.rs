@@ -261,7 +261,7 @@ pub fn bind_column_references(
                 let table = connection
                     .with_schema(database_id, |schema| schema.get_table(tbl_name.as_str()))
                     .ok_or_else(|| {
-                        crate::LimboError::ParseError(format!(
+                        crate::TursoError::ParseError(format!(
                             "no such table: {}.{}",
                             db_name.as_str(),
                             tbl_name.as_str()
@@ -278,7 +278,7 @@ pub fn bind_column_references(
                             .is_some_and(|name| name.eq_ignore_ascii_case(&normalized_col_name))
                     })
                     .ok_or_else(|| {
-                        crate::LimboError::ParseError(format!(
+                        crate::TursoError::ParseError(format!(
                             "Column: {}.{}.{} not found",
                             db_name.as_str(),
                             tbl_name.as_str(),
@@ -308,7 +308,7 @@ pub fn bind_column_references(
                     };
                     referenced_tables.mark_column_used(tbl_id, col_idx);
                 } else {
-                    return Err(crate::LimboError::ParseError(format!(
+                    return Err(crate::TursoError::ParseError(format!(
                         "table {normalized_tbl_name} is not in FROM clause - cross-database column references require the table to be explicitly joined"
                     )));
                 }
@@ -437,7 +437,7 @@ fn parse_table(
         } else if let Table::BTree(table) = table.as_ref() {
             Table::BTree(table.clone())
         } else {
-            return Err(crate::LimboError::InvalidArgument(
+            return Err(crate::TursoError::InvalidArgument(
                 "Table type not supported".to_string(),
             ));
         };
@@ -574,7 +574,7 @@ fn transform_args_into_where_terms(
     }
 
     if args_iter.next().is_some() {
-        return Err(crate::LimboError::ParseError(format!(
+        return Err(crate::TursoError::ParseError(format!(
             "Too many arguments for {}: expected at most {}, got {}",
             table.get_name(),
             hidden_count,

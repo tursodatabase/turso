@@ -495,7 +495,7 @@ fn test_fuzzy_read() {
     let update_result = db
         .mvcc_store
         .update(tx2, tx2_newrow, conn2.pager.borrow().clone());
-    assert!(matches!(update_result, Err(LimboError::WriteWriteConflict)));
+    assert!(matches!(update_result, Err(TursoError::WriteWriteConflict)));
 }
 
 #[test]
@@ -536,13 +536,13 @@ fn test_lost_update() {
     assert!(matches!(
         db.mvcc_store
             .update(tx3, tx3_row, conn3.pager.borrow().clone(),),
-        Err(LimboError::WriteWriteConflict)
+        Err(TursoError::WriteWriteConflict)
     ));
 
     commit_tx(db.mvcc_store.clone(), &conn2, tx2).unwrap();
     assert!(matches!(
         commit_tx(db.mvcc_store.clone(), &conn3, tx3),
-        Err(LimboError::TxTerminated)
+        Err(TursoError::TxTerminated)
     ));
 
     let conn4 = db.db.connect().unwrap();
@@ -733,7 +733,7 @@ pub(crate) fn commit_tx_no_conn(
     db: &MvccTestDbNoConn,
     tx_id: u64,
     conn: &Arc<Connection>,
-) -> Result<(), LimboError> {
+) -> Result<(), TursoError> {
     let mv_store = db.get_mvcc_store();
     let mut sm = mv_store
         .commit_tx(tx_id, conn.pager.borrow().clone(), conn)
@@ -1226,7 +1226,7 @@ fn test_commit_without_tx() {
 
     // expect error on trying to commit a non-existent interactive transaction
     let err = conn.execute("COMMIT").unwrap_err();
-    if let LimboError::TxError(e) = err {
+    if let TursoError::TxError(e) = err {
         assert_eq!(e.to_string(), "cannot commit - no transaction is active");
     } else {
         panic!("Expected TxError");

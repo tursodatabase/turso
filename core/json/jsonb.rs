@@ -1,5 +1,5 @@
 use crate::json::error::{Error as PError, Result as PResult};
-use crate::{bail_parse_error, LimboError, Result};
+use crate::{bail_parse_error, Result, TursoError};
 use std::{
     borrow::Cow,
     collections::{HashMap, VecDeque},
@@ -238,7 +238,7 @@ impl From<ElementType> for String {
 }
 
 impl TryFrom<u8> for ElementType {
-    type Error = LimboError;
+    type Error = TursoError;
 
     fn try_from(value: u8) -> std::result::Result<Self, Self::Error> {
         match value {
@@ -1090,7 +1090,7 @@ impl Jsonb {
             // Can be serialized as is. Do not need escaping
             ElementType::TEXT => {
                 let word = from_utf8(word_slice).map_err(|_| {
-                    LimboError::ParseError("Failed to serialize string!".to_string())
+                    TursoError::ParseError("Failed to serialize string!".to_string())
                 })?;
                 string.push_str(word);
             }
@@ -1098,7 +1098,7 @@ impl Jsonb {
             // Contain standard json escapes
             ElementType::TEXTJ => {
                 let word = from_utf8(word_slice).map_err(|_| {
-                    LimboError::ParseError("Failed to serialize string!".to_string())
+                    TursoError::ParseError("Failed to serialize string!".to_string())
                 })?;
                 string.push_str(word);
             }
@@ -1215,7 +1215,7 @@ impl Jsonb {
 
             ElementType::TEXTRAW => {
                 let word = from_utf8(word_slice).map_err(|_| {
-                    LimboError::ParseError("Failed to serialize string!".to_string())
+                    TursoError::ParseError("Failed to serialize string!".to_string())
                 })?;
 
                 for ch in word.chars() {
@@ -1255,7 +1255,7 @@ impl Jsonb {
     ) -> Result<usize> {
         let current_cursor = cursor + len;
         let num_slice = from_utf8(&self.data[cursor..current_cursor])
-            .map_err(|_| LimboError::ParseError("Failed to parse integer".to_string()))?;
+            .map_err(|_| TursoError::ParseError("Failed to parse integer".to_string()))?;
 
         match kind {
             ElementType::INT | ElementType::FLOAT => {
@@ -1305,7 +1305,7 @@ impl Jsonb {
                 value = value * 16 + ch.to_digit(16).unwrap_or(0) as u64;
             }
             write!(string, "{value}")
-                .map_err(|_| LimboError::ParseError("Error writing string to json!".to_string()))?;
+                .map_err(|_| TursoError::ParseError("Error writing string to json!".to_string()))?;
         } else {
             string.push_str(hex_str);
         }
@@ -2737,7 +2737,7 @@ impl Jsonb {
             }
         };
 
-        Err(LimboError::ParseError("Not found".to_string()))
+        Err(TursoError::ParseError("Not found".to_string()))
     }
 
     fn skip_element(&self, mut pos: usize) -> Result<usize> {
@@ -2781,7 +2781,7 @@ impl Jsonb {
             while patch_key_cursor < patch_end {
                 let (key_header, key_header_size) = patch.read_header(patch_key_cursor)?;
                 if !key_header.0.is_valid_key() {
-                    return Err(LimboError::ParseError("Invalid key type".to_string()));
+                    return Err(TursoError::ParseError("Invalid key type".to_string()));
                 }
 
                 let key_start = patch_key_cursor + key_header_size;

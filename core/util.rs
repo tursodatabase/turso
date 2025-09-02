@@ -5,7 +5,7 @@ use crate::{
     schema::{self, Column, MaterializedViewsMap, Schema, Type},
     translate::{collate::CollationSeq, expr::walk_expr, plan::JoinOrderMember},
     types::{Value, ValueType},
-    LimboError, OpenFlags, Result, Statement, StepResult, SymbolTable,
+    OpenFlags, Result, Statement, StepResult, SymbolTable, TursoError,
 };
 use crate::{Connection, IO};
 use std::{
@@ -399,7 +399,7 @@ pub fn module_name_from_sql(sql: &str) -> Result<&str> {
             + start;
         Ok(sql[start..end].trim())
     } else {
-        Err(LimboError::InvalidArgument(
+        Err(TursoError::InvalidArgument(
             "Expected 'USING' in module name".to_string(),
         ))
     }
@@ -412,10 +412,10 @@ pub fn module_args_from_sql(sql: &str) -> Result<Vec<turso_ext::Value>> {
         return Ok(vec![]);
     }
     let start = sql.find('(').ok_or_else(|| {
-        LimboError::InvalidArgument("Expected '(' in module argument list".to_string())
+        TursoError::InvalidArgument("Expected '(' in module argument list".to_string())
     })? + 1;
     let end = sql.rfind(')').ok_or_else(|| {
-        LimboError::InvalidArgument("Expected ')' in module argument list".to_string())
+        TursoError::InvalidArgument("Expected ')' in module argument list".to_string())
     })?;
 
     let mut args = Vec::new();
@@ -443,7 +443,7 @@ pub fn module_args_from_sql(sql: &str) -> Result<Vec<turso_ext::Value>> {
                             } else if nc.is_whitespace() {
                                 chars.next();
                             } else {
-                                return Err(LimboError::InvalidArgument(
+                                return Err(TursoError::InvalidArgument(
                                     "Unexpected characters after quoted argument".to_string(),
                                 ));
                             }
@@ -474,7 +474,7 @@ pub fn module_args_from_sql(sql: &str) -> Result<Vec<turso_ext::Value>> {
     }
 
     if in_quotes {
-        return Err(LimboError::InvalidArgument(
+        return Err(TursoError::InvalidArgument(
             "Unterminated string literal in module arguments".to_string(),
         ));
     }
@@ -701,7 +701,7 @@ pub fn columns_from_create_table_body(
     body: &turso_parser::ast::CreateTableBody,
 ) -> crate::Result<Vec<Column>> {
     let CreateTableBody::ColumnsAndConstraints { columns, .. } = body else {
-        return Err(crate::LimboError::ParseError(
+        return Err(crate::TursoError::ParseError(
             "CREATE TABLE body must contain columns and constraints".to_string(),
         ));
     };
@@ -799,7 +799,7 @@ impl OpenMode {
             b"rw" => Ok(OpenMode::ReadWrite),
             b"memory" => Ok(OpenMode::Memory),
             b"rwc" => Ok(OpenMode::ReadWriteCreate),
-            _ => Err(LimboError::InvalidArgument(format!(
+            _ => Err(TursoError::InvalidArgument(format!(
                 "Invalid mode: '{s}'. Expected one of 'ro', 'rw', 'memory', 'rwc'"
             ))),
         })
@@ -860,7 +860,7 @@ impl<'a> OpenOptions<'a> {
 
             // sqlite allows only `localhost` or empty authority.
             if !(authority.is_empty() || authority == "localhost") {
-                return Err(LimboError::InvalidArgument(format!(
+                return Err(TursoError::InvalidArgument(format!(
                     "Invalid authority '{authority}'. Only '' or 'localhost' allowed."
                 )));
             }
@@ -888,7 +888,7 @@ impl<'a> OpenOptions<'a> {
     pub fn get_flags(&self) -> Result<OpenFlags> {
         // Only use modeof if we're in a mode that can create files
         if self.mode != OpenMode::ReadWriteCreate && self.modeof.is_some() {
-            return Err(LimboError::InvalidArgument(
+            return Err(TursoError::InvalidArgument(
                 "modeof is not applicable without mode=rwc".to_string(),
             ));
         }
@@ -1147,7 +1147,7 @@ pub fn parse_numeric_literal(text: &str) -> Result<Value> {
     } else if text.starts_with("-0x") || text.starts_with("-0X") {
         let value = u64::from_str_radix(&text[3..], 16)? as i64;
         if value == i64::MIN {
-            return Err(LimboError::IntegerOverflow);
+            return Err(TursoError::IntegerOverflow);
         }
         return Ok(Value::Integer(-value));
     }
@@ -1171,11 +1171,11 @@ pub fn parse_signed_number(expr: &Expr) -> Result<Value> {
             (UnaryOperator::Positive, Expr::Literal(Literal::Numeric(num))) => {
                 parse_numeric_literal(num)
             }
-            _ => Err(LimboError::InvalidArgument(
+            _ => Err(TursoError::InvalidArgument(
                 "signed-number must follow the format: ([+|-] numeric-literal)".to_string(),
             )),
         },
-        _ => Err(LimboError::InvalidArgument(
+        _ => Err(TursoError::InvalidArgument(
             "signed-number must follow the format: ([+|-] numeric-literal)".to_string(),
         )),
     }
@@ -1188,7 +1188,7 @@ pub fn parse_string(expr: &Expr) -> Result<String> {
         {
             Ok(s[1..s.len() - 1].to_string())
         }
-        _ => Err(LimboError::InvalidArgument(format!(
+        _ => Err(TursoError::InvalidArgument(format!(
             "string parameter expected, got {expr:?} instead"
         ))),
     }
@@ -1211,7 +1211,7 @@ pub fn parse_pragma_bool(expr: &Expr) -> Result<bool> {
             return Ok(false);
         }
     }
-    Err(LimboError::InvalidArgument(
+    Err(TursoError::InvalidArgument(
         "boolean pragma value must be either 0|1 integer or yes|true|on|no|false|off token"
             .to_string(),
     ))

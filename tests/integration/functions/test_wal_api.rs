@@ -6,7 +6,7 @@ use rusqlite::types::Value;
 use tempfile::TempDir;
 use turso_core::{
     types::{WalFrameInfo, WalState},
-    CheckpointMode, LimboError, StepResult,
+    CheckpointMode, StepResult, TursoError,
 };
 
 use crate::common::{limbo_exec_rows, rng_from_time, TempDatabase};
@@ -104,11 +104,11 @@ fn test_wal_frame_transfer_various_schema_changes() {
     sync();
     assert!(matches!(
         conn2.prepare("SELECT * FROM t").err().unwrap(),
-        turso_core::LimboError::ParseError(error) if error == "no such table: t"
+        turso_core::TursoError::ParseError(error) if error == "no such table: t"
     ));
     assert!(matches!(
         conn3.prepare("SELECT * FROM t").err().unwrap(),
-        turso_core::LimboError::ParseError(error) if error == "no such table: t"
+        turso_core::TursoError::ParseError(error) if error == "no such table: t"
     ));
 
     conn1.execute("CREATE TABLE a(x)").unwrap();
@@ -539,7 +539,7 @@ fn test_wal_upper_bound_truncate() {
     };
     assert!(matches!(
         writer.checkpoint(mode).err().unwrap(),
-        LimboError::Busy
+        TursoError::Busy
     ));
     writer
         .execute("insert into test values (3, 'final')")

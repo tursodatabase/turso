@@ -418,7 +418,7 @@ mod tests {
         // Test error handling
         let error_result = cache_cell.get_or_insert_with(&key, |_| {
             // Return an error
-            Err(crate::LimboError::Constraint("Test error".to_string()))
+            Err(crate::TursoError::Constraint("Test error".to_string()))
         });
 
         // Should propagate the error

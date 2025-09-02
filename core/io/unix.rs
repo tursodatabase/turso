@@ -1,5 +1,5 @@
 use super::{Completion, File, OpenFlags, IO};
-use crate::error::LimboError;
+use crate::error::TursoError;
 use crate::io::clock::{Clock, Instant};
 use crate::io::common;
 use crate::Result;
@@ -153,7 +153,7 @@ impl File for UnixFile {
                 }
                 _ => format!("Failed locking file, {io_error}"),
             };
-            LimboError::LockingError(message)
+            TursoError::LockingError(message)
         })?;
 
         Ok(())
@@ -163,7 +163,7 @@ impl File for UnixFile {
         let fd = self.file.lock();
         let fd = fd.as_fd();
         fs::fcntl_lock(fd, FlockOperation::NonBlockingUnlock).map_err(|e| {
-            LimboError::LockingError(format!(
+            TursoError::LockingError(format!(
                 "Failed to release file lock: {}",
                 std::io::Error::from(e)
             ))

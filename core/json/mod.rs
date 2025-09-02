@@ -12,7 +12,7 @@ pub use crate::json::ops::{
 use crate::json::path::{json_path, JsonPath, PathElement};
 use crate::types::{RawSlice, Text, TextRef, TextSubtype, Value, ValueType};
 use crate::vdbe::Register;
-use crate::{bail_constraint_error, bail_parse_error, LimboError, RefValue};
+use crate::{bail_constraint_error, bail_parse_error, RefValue, TursoError};
 pub use cache::JsonCacheCell;
 use jsonb::{ElementType, Jsonb, JsonbHeader, PathOperationMode, SearchOperation, SetOperation};
 use std::borrow::Cow;
@@ -140,7 +140,7 @@ pub fn convert_ref_dbtype_to_jsonb(val: &RefValue, strict: Conv) -> crate::Resul
                 str.push('"');
                 Jsonb::from_str(&str)
             };
-            res.map_err(|_| LimboError::ParseError("malformed JSON".to_string()))
+            res.map_err(|_| TursoError::ParseError("malformed JSON".to_string()))
         }
         RefValue::Blob(blob) => {
             let json = Jsonb::from_raw_data(blob.to_slice());
@@ -153,10 +153,10 @@ pub fn convert_ref_dbtype_to_jsonb(val: &RefValue, strict: Conv) -> crate::Resul
         RefValue::Float(float) => {
             let mut buff = ryu::Buffer::new();
             Jsonb::from_str(buff.format(*float))
-                .map_err(|_| LimboError::ParseError("malformed JSON".to_string()))
+                .map_err(|_| TursoError::ParseError("malformed JSON".to_string()))
         }
         RefValue::Integer(int) => Jsonb::from_str(&int.to_string())
-            .map_err(|_| LimboError::ParseError("malformed JSON".to_string())),
+            .map_err(|_| TursoError::ParseError("malformed JSON".to_string())),
     }
 }
 
@@ -560,7 +560,7 @@ pub fn json_error_position(json: &Value) -> crate::Result<Value> {
                     let one_indexed = loc + 1;
                     Ok(Value::Integer(one_indexed as i64))
                 } else {
-                    Err(crate::error::LimboError::InternalError(
+                    Err(crate::error::TursoError::InternalError(
                         "failed to determine json error position".into(),
                     ))
                 }

@@ -4,7 +4,7 @@ use log::debug;
 use std::io::{Read, Seek, Write};
 use std::sync::Arc;
 use turso_core::{
-    CheckpointMode, Connection, Database, LimboError, Row, Statement, StepResult, Value,
+    CheckpointMode, Connection, Database, Row, Statement, StepResult, TursoError, Value,
 };
 
 const WAL_HEADER_SIZE: usize = 32;
@@ -724,9 +724,9 @@ fn test_wal_bad_frame() -> anyhow::Result<()> {
         match result {
             Err(error) => {
                 dbg!(&error);
-                let panic_msg = error.downcast_ref::<LimboError>().unwrap();
+                let panic_msg = error.downcast_ref::<TursoError>().unwrap();
                 let msg = match panic_msg {
-                    LimboError::ParseError(message) => message,
+                    TursoError::ParseError(message) => message,
                     _ => panic!("Unexpected panic message: {panic_msg}"),
                 };
 
@@ -779,7 +779,7 @@ fn test_insert_with_column_names() -> anyhow::Result<()> {
         Ok(_) => panic!("Expected error but query succeeded."),
         Err(error) => {
             let error_msg = match error {
-                LimboError::ParseError(msg) => msg,
+                TursoError::ParseError(msg) => msg,
                 _ => panic!("Unexpected {error}"),
             };
 

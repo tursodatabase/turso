@@ -10,7 +10,7 @@ use tempfile;
 use crate::types::IOCompletions;
 use crate::util::IOExt;
 use crate::{
-    error::LimboError,
+    error::TursoError,
     io::{Buffer, Completion, File, OpenFlags, IO},
     storage::sqlite3_ondisk::{read_varint, varint_len, write_varint},
     translate::collate::CollationSeq,
@@ -422,7 +422,7 @@ impl SortedChunk {
                                     Ok((record_size, bytes_read)) => {
                                         (record_size as usize, bytes_read)
                                     }
-                                    Err(LimboError::Corrupt(_))
+                                    Err(TursoError::Corrupt(_))
                                         if self.io_state.get() != SortedChunkIOState::ReadEOF =>
                                     {
                                         // Failed to decode a partial varint.
@@ -577,7 +577,7 @@ struct SortableImmutableRecord {
     key_values: RefCell<Vec<RefValue>>,
     index_key_info: Rc<Vec<KeyInfo>>,
     /// The key deserialization error, if any.
-    deserialization_error: RefCell<Option<LimboError>>,
+    deserialization_error: RefCell<Option<TursoError>>,
 }
 
 impl SortableImmutableRecord {

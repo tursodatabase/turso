@@ -68,8 +68,8 @@ pub enum Error {
     ConversionFailure(String),
 }
 
-impl From<turso_core::LimboError> for Error {
-    fn from(err: turso_core::LimboError) -> Self {
+impl From<turso_core::TursoError> for Error {
+    fn from(err: turso_core::TursoError) -> Self {
         Error::SqlExecutionFailure(err.to_string())
     }
 }

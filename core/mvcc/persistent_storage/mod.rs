@@ -1,7 +1,7 @@
 use std::fmt::Debug;
 
 use crate::mvcc::database::LogRecord;
-use crate::{LimboError, Result};
+use crate::{Result, TursoError};
 
 #[derive(Debug)]
 pub enum Storage {
@@ -24,7 +24,7 @@ impl Storage {
 
     pub fn read_tx_log(&self) -> Result<Vec<LogRecord>> {
         match self {
-            Self::Noop => Err(LimboError::InternalError(
+            Self::Noop => Err(TursoError::InternalError(
                 "cannot read from Noop storage".to_string(),
             )),
         }

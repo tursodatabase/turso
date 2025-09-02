@@ -5,7 +5,7 @@ use crate::schema::{BTreeTable, Column, Schema};
 use crate::translate::logical::LogicalPlanBuilder;
 use crate::types::{IOCompletions, IOResult, Value};
 use crate::util::extract_view_columns;
-use crate::{io_yield_one, Completion, LimboError, Result, Statement};
+use crate::{io_yield_one, Completion, Result, Statement, TursoError};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::sync::{Arc, Mutex};
@@ -97,7 +97,7 @@ impl IncrementalView {
         // Check for JOINs
         let (join_tables, join_condition) = Self::extract_join_info(select);
         if join_tables.is_some() || join_condition.is_some() {
-            return Err(LimboError::ParseError(
+            return Err(TursoError::ParseError(
                 "JOINs in views are not yet supported".to_string(),
             ));
         }
@@ -156,7 +156,7 @@ impl IncrementalView {
                 columns: _,
                 select,
             }) => IncrementalView::from_stmt(view_name, select, schema),
-            _ => Err(LimboError::ParseError(format!(
+            _ => Err(TursoError::ParseError(format!(
                 "View is not a CREATE MATERIALIZED VIEW statement: {sql}"
             ))),
         }
@@ -176,7 +176,7 @@ impl IncrementalView {
 
         let (join_tables, join_condition) = Self::extract_join_info(&select);
         if join_tables.is_some() || join_condition.is_some() {
-            return Err(LimboError::ParseError(
+            return Err(TursoError::ParseError(
                 "JOINs in views are not yet supported".to_string(),
             ));
         }
@@ -186,12 +186,12 @@ impl IncrementalView {
             if let Some(table) = schema.get_btree_table(&base_table_name) {
                 table.clone()
             } else {
-                return Err(LimboError::ParseError(format!(
+                return Err(TursoError::ParseError(format!(
                     "Table '{base_table_name}' not found in schema"
                 )));
             }
         } else {
-            return Err(LimboError::ParseError(
+            return Err(TursoError::ParseError(
                 "views without a base table not supported yet".to_string(),
             ));
         };
@@ -459,7 +459,7 @@ impl IncrementalView {
                                 return Ok(IOResult::Done(()));
                             }
                             crate::vdbe::StepResult::Interrupt | crate::vdbe::StepResult::Busy => {
-                                return Err(LimboError::Busy);
+                                return Err(TursoError::Busy);
                             }
                             crate::vdbe::StepResult::IO => {
                                 // Process current batch before yielding

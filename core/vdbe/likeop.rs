@@ -2,15 +2,15 @@ use std::collections::HashMap;
 
 use regex::{Regex, RegexBuilder};
 
-use crate::{types::Value, LimboError};
+use crate::{types::Value, TursoError};
 
-pub fn construct_like_escape_arg(escape_value: &Value) -> Result<char, LimboError> {
+pub fn construct_like_escape_arg(escape_value: &Value) -> Result<char, TursoError> {
     match escape_value {
         Value::Text(text) => {
             let mut escape_chars = text.as_str().chars();
             match (escape_chars.next(), escape_chars.next()) {
                 (Some(escape), None) => Ok(escape),
-                _ => Err(LimboError::Constraint(
+                _ => Err(TursoError::Constraint(
                     "ESCAPE expression must be a single character".to_string(),
                 )),
             }
@@ -95,7 +95,7 @@ fn push_char_to_regex_pattern(c: char, regex_pattern: &mut String) {
     regex_pattern.push(c);
 }
 
-fn construct_glob_regex(pattern: &str) -> Result<Regex, LimboError> {
+fn construct_glob_regex(pattern: &str) -> Result<Regex, TursoError> {
     let mut regex_pattern = String::with_capacity(pattern.len() * 2);
 
     regex_pattern.push('^');
@@ -175,7 +175,7 @@ fn construct_glob_regex(pattern: &str) -> Result<Regex, LimboError> {
     if bracket_closed {
         Ok(Regex::new(&regex_pattern).unwrap())
     } else {
-        Err(LimboError::Constraint(
+        Err(TursoError::Constraint(
             "blob pattern is not closed".to_string(),
         ))
     }

@@ -4,7 +4,7 @@
 use std::ffi::{self, CStr, CString};
 use std::num::{NonZero, NonZeroUsize};
 use tracing::trace;
-use turso_core::{CheckpointMode, LimboError, Value};
+use turso_core::{CheckpointMode, TursoError, Value};
 
 use std::sync::{Arc, Mutex};
 
@@ -1494,7 +1494,7 @@ pub unsafe extern "C" fn sqlite3_wal_checkpoint_v2(
         }
         Err(e) => {
             println!("Checkpoint error: {e}");
-            if matches!(e, turso_core::LimboError::Busy) {
+            if matches!(e, turso_core::TursoError::Busy) {
                 SQLITE_BUSY
             } else {
                 SQLITE_ERROR
@@ -1610,7 +1610,7 @@ pub unsafe extern "C" fn libsql_wal_insert_frame(
     let frame = std::slice::from_raw_parts(p_frame, frame_len as usize);
     match db.conn.wal_insert_frame(frame_no as u64, frame) {
         Ok(_) => SQLITE_OK,
-        Err(LimboError::Conflict(..)) => {
+        Err(TursoError::Conflict(..)) => {
             if !p_conflict.is_null() {
                 *p_conflict = 1;
             }

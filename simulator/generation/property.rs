@@ -12,7 +12,7 @@ use sql_generation::{
         table::SimValue,
     },
 };
-use turso_core::{LimboError, types};
+use turso_core::{TursoError, types};
 use turso_parser::ast::{self, Distinctness};
 
 use crate::{
@@ -312,7 +312,7 @@ impl Property {
                                 }
                                 Ok(Ok(()))
                             }
-                            Err(err) => Err(LimboError::InternalError(err.to_string())),
+                            Err(err) => Err(TursoError::InternalError(err.to_string())),
                         }
                     }),
                 });
@@ -391,7 +391,7 @@ impl Property {
                                     )))
                                 }
                             }
-                            Err(err) => Err(LimboError::InternalError(err.to_string())),
+                            Err(err) => Err(TursoError::InternalError(err.to_string())),
                         }
                     }),
                 });
@@ -567,7 +567,7 @@ impl Property {
                                     )))
                                 }
                             }
-                            Err(err) => Err(LimboError::InternalError(err.to_string())),
+                            Err(err) => Err(TursoError::InternalError(err.to_string())),
                         }
                     }),
                 });
@@ -689,7 +689,7 @@ impl Property {
                             (Ok(rows1), Ok(rows2)) => {
                                 // If rows1 results have more than 1 column, there is a problem
                                 if rows1.iter().any(|vs| vs.len() > 1) {
-                                    return Err(LimboError::InternalError(
+                                    return Err(TursoError::InternalError(
                                                 "Select query without the star should return only one column".to_string(),
                                             ));
                                 }
@@ -722,7 +722,7 @@ impl Property {
                             }
                             (Err(e), _) | (_, Err(e)) => {
                                 tracing::error!("Error in select1 OR select2: {}", e);
-                                Err(LimboError::InternalError(e.to_string()))
+                                Err(TursoError::InternalError(e.to_string()))
                             }
                         }
                     }),
@@ -851,7 +851,7 @@ impl Property {
                     name: "select and select_tlp should return the same rows".to_string(),
                     func: Box::new(move |stack: &Vec<ResultSet>, _: &mut SimulatorEnv| {
                         if stack.len() < 2 {
-                            return Err(LimboError::InternalError(
+                            return Err(TursoError::InternalError(
                                 "Not enough result sets on the stack".to_string(),
                             ));
                         }
@@ -911,7 +911,7 @@ impl Property {
                             }
                             (Err(e), _) | (_, Err(e)) => {
                                 tracing::error!("Error in select or select_tlp: {}", e);
-                                Err(LimboError::InternalError(e.to_string()))
+                                Err(TursoError::InternalError(e.to_string()))
                             }
                         }
                     }),
@@ -936,7 +936,7 @@ impl Property {
                         name: "UNION ALL should preserve cardinality".to_string(),
                         func: Box::new(move |stack: &Vec<ResultSet>, _: &mut SimulatorEnv| {
                             if stack.len() < 3 {
-                                return Err(LimboError::InternalError(
+                                return Err(TursoError::InternalError(
                                     "Not enough result sets on the stack".to_string(),
                                 ));
                             }
@@ -960,7 +960,7 @@ impl Property {
                                 }
                                 (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
                                     tracing::error!("Error in select queries: {}", e);
-                                    Err(LimboError::InternalError(e.to_string()))
+                                    Err(TursoError::InternalError(e.to_string()))
                                 }
                             }
                         }),
@@ -984,7 +984,7 @@ fn assert_all_table_values(tables: &[String]) -> impl Iterator<Item = Interactio
                 let table = table.clone();
                 move |stack: &Vec<ResultSet>, env: &mut SimulatorEnv| {
                     let table = env.tables.iter().find(|t| t.name == table).ok_or_else(|| {
-                        LimboError::InternalError(format!(
+                        TursoError::InternalError(format!(
                             "table {table} should exist in simulator env"
                         ))
                     })?;
@@ -1020,7 +1020,7 @@ fn assert_all_table_values(tables: &[String]) -> impl Iterator<Item = Interactio
                                 Ok(Ok(()))
                             }
                         }
-                        Err(err) => Err(LimboError::InternalError(format!("{err}"))),
+                        Err(err) => Err(TursoError::InternalError(format!("{err}"))),
                     }
                 }
             }),

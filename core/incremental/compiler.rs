@@ -12,7 +12,7 @@ use crate::incremental::operator::{
 // Note: logical module must be made pub(crate) in translate/mod.rs
 use crate::translate::logical::{BinaryOperator, LogicalExpr, LogicalPlan, SchemaRef};
 use crate::types::Value;
-use crate::{LimboError, Result};
+use crate::{Result, TursoError};
 use std::collections::HashMap;
 use std::fmt::{self, Display, Formatter};
 
@@ -159,7 +159,7 @@ impl DbspCircuit {
         if let Some(root_id) = self.root {
             self.initialize_node(root_id, &input_data)
         } else {
-            Err(LimboError::ParseError(
+            Err(TursoError::ParseError(
                 "Circuit has no root node".to_string(),
             ))
         }
@@ -175,7 +175,7 @@ impl DbspCircuit {
         let inputs = self
             .nodes
             .get(&node_id)
-            .ok_or_else(|| LimboError::ParseError("Node not found".to_string()))?
+            .ok_or_else(|| TursoError::ParseError("Node not found".to_string()))?
             .inputs
             .clone();
 
@@ -190,7 +190,7 @@ impl DbspCircuit {
         let node = self
             .nodes
             .get_mut(&node_id)
-            .ok_or_else(|| LimboError::ParseError("Node not found".to_string()))?;
+            .ok_or_else(|| TursoError::ParseError("Node not found".to_string()))?;
 
         // Initialize based on operator type
         let result = match &node.operator {
@@ -240,7 +240,7 @@ impl DbspCircuit {
         if let Some(root_id) = self.root {
             self.execute_node(root_id, &input_data, &uncommitted_data)
         } else {
-            Err(LimboError::ParseError(
+            Err(TursoError::ParseError(
                 "Circuit has no root node".to_string(),
             ))
         }
@@ -268,7 +268,7 @@ impl DbspCircuit {
         let inputs = self
             .nodes
             .get(&node_id)
-            .ok_or_else(|| LimboError::ParseError("Node not found".to_string()))?
+            .ok_or_else(|| TursoError::ParseError("Node not found".to_string()))?
             .inputs
             .clone();
 
@@ -283,7 +283,7 @@ impl DbspCircuit {
         let node = self
             .nodes
             .get_mut(&node_id)
-            .ok_or_else(|| LimboError::ParseError("Node not found".to_string()))?;
+            .ok_or_else(|| TursoError::ParseError("Node not found".to_string()))?;
 
         // Commit based on operator type
         let result = match &node.operator {
@@ -327,7 +327,7 @@ impl DbspCircuit {
         let inputs = self
             .nodes
             .get(&node_id)
-            .ok_or_else(|| LimboError::ParseError("Node not found".to_string()))?
+            .ok_or_else(|| TursoError::ParseError("Node not found".to_string()))?
             .inputs
             .clone();
 
@@ -342,7 +342,7 @@ impl DbspCircuit {
         let node = self
             .nodes
             .get(&node_id)
-            .ok_or_else(|| LimboError::ParseError("Node not found".to_string()))?;
+            .ok_or_else(|| TursoError::ParseError("Node not found".to_string()))?;
 
         // Execute based on operator type
         let result = match &node.operator {
@@ -549,7 +549,7 @@ impl DbspCompiler {
                         group_by_columns.push(col.name.clone());
                         dbsp_group_exprs.push(DbspExpr::Column(col.name.clone()));
                     } else {
-                        return Err(LimboError::ParseError(
+                        return Err(TursoError::ParseError(
                             "Only column references are supported in GROUP BY for incremental views".to_string()
                         ));
                     }
@@ -568,25 +568,25 @@ impl DbspCompiler {
                             }
                             AggFunc::Sum => {
                                 if args.is_empty() {
-                                    return Err(LimboError::ParseError("SUM requires an argument".to_string()));
+                                    return Err(TursoError::ParseError("SUM requires an argument".to_string()));
                                 }
                                 // Extract column name from the argument
                                 if let LogicalExpr::Column(col) = &args[0] {
                                     AggregateFunction::Sum(col.name.clone())
                                 } else {
-                                    return Err(LimboError::ParseError(
+                                    return Err(TursoError::ParseError(
                                         "Only column references are supported in aggregate functions for incremental views".to_string()
                                     ));
                                 }
                             }
                             AggFunc::Avg => {
                                 if args.is_empty() {
-                                    return Err(LimboError::ParseError("AVG requires an argument".to_string()));
+                                    return Err(TursoError::ParseError("AVG requires an argument".to_string()));
                                 }
                                 if let LogicalExpr::Column(col) = &args[0] {
                                     AggregateFunction::Avg(col.name.clone())
                                 } else {
-                                    return Err(LimboError::ParseError(
+                                    return Err(TursoError::ParseError(
                                         "Only column references are supported in aggregate functions for incremental views".to_string()
                                     ));
                                 }
@@ -598,24 +598,24 @@ impl DbspCompiler {
                             // require O(n) storage. Until a more efficient solution is found, MIN/MAX
                             // aggregations are not supported in materialized views.
                             AggFunc::Min => {
-                                return Err(LimboError::ParseError(
+                                return Err(TursoError::ParseError(
                                     "MIN aggregation is not supported in incremental materialized views due to O(n) storage overhead required for handling deletions".to_string()
                                 ));
                             }
                             AggFunc::Max => {
-                                return Err(LimboError::ParseError(
+                                return Err(TursoError::ParseError(
                                     "MAX aggregation is not supported in incremental materialized views due to O(n) storage overhead required for handling deletions".to_string()
                                 ));
                             }
                             _ => {
-                                return Err(LimboError::ParseError(
+                                return Err(TursoError::ParseError(
                                     format!("Unsupported aggregate function in DBSP compiler: {fun:?}")
                                 ));
                             }
                         };
                         aggregate_functions.push(agg_fn);
                     } else {
-                        return Err(LimboError::ParseError(
+                        return Err(TursoError::ParseError(
                             "Expected aggregate function in aggregate expressions".to_string()
                         ));
                     }
@@ -655,7 +655,7 @@ impl DbspCompiler {
                 );
                 Ok(node_id)
             }
-            _ => Err(LimboError::ParseError(
+            _ => Err(TursoError::ParseError(
                 format!("Unsupported operator in DBSP compiler: only Filter, Projection and Aggregate are supported, got: {:?}",
                     match plan {
                         LogicalPlan::Sort(_) => "Sort",
@@ -812,7 +812,7 @@ impl DbspCompiler {
                     crate::function::AggFunc::Min => "MIN",
                     crate::function::AggFunc::Max => "MAX",
                     _ => {
-                        return Err(LimboError::ParseError(format!(
+                        return Err(TursoError::ParseError(format!(
                             "Unsupported aggregate function: {fun:?}"
                         )))
                     }
@@ -833,7 +833,7 @@ impl DbspCompiler {
                     },
                 })
             }
-            _ => Err(LimboError::ParseError(format!(
+            _ => Err(TursoError::ParseError(format!(
                 "Cannot convert LogicalExpr to AST Expr: {expr:?}"
             ))),
         }
@@ -890,7 +890,7 @@ impl DbspCompiler {
                                 Box::new(right_pred),
                             ))
                         }
-                        _ => Err(LimboError::ParseError(format!(
+                        _ => Err(TursoError::ParseError(format!(
                             "Unsupported operator in filter: {op:?}"
                         ))),
                     }
@@ -910,12 +910,12 @@ impl DbspCompiler {
                         _ => unreachable!(),
                     }
                 } else {
-                    Err(LimboError::ParseError(
+                    Err(TursoError::ParseError(
                         "Filter predicate must be column op value".to_string(),
                     ))
                 }
             }
-            _ => Err(LimboError::ParseError(format!(
+            _ => Err(TursoError::ParseError(format!(
                 "Unsupported filter expression: {expr:?}"
             ))),
         }
@@ -1115,7 +1115,7 @@ mod tests {
             let node = circuit
                 .nodes
                 .get(&root_id)
-                .ok_or_else(|| LimboError::ParseError("Root node not found".to_string()))?;
+                .ok_or_else(|| TursoError::ParseError("Root node not found".to_string()))?;
 
             if let Some(ref executable) = node.executable {
                 Ok(executable.get_current_state())
@@ -1124,7 +1124,7 @@ mod tests {
                 Ok(Delta::new())
             }
         } else {
-            Err(LimboError::ParseError(
+            Err(TursoError::ParseError(
                 "Circuit has no root node".to_string(),
             ))
         }
