@@ -3,6 +3,8 @@ use crate::storage::sqlite3_ondisk::WAL_FRAME_HEADER_SIZE;
 use crate::{BufferPool, CompletionError, Result};
 use bitflags::bitflags;
 use cfg_block::cfg_block;
+use intrusive_collections::intrusive_adapter;
+use intrusive_collections::{LinkedList, LinkedListLink};
 use std::cell::RefCell;
 use std::fmt;
 use std::ptr::NonNull;
@@ -124,6 +126,35 @@ pub type WriteComplete = dyn FnOnce(Result<i32, CompletionError>);
 pub type SyncComplete = dyn FnOnce(Result<i32, CompletionError>);
 pub type TruncateComplete = dyn FnOnce(Result<i32, CompletionError>);
 
+#[derive(Debug, Default)]
+pub struct CompletionBuilder {
+    inner: LinkedList<CompletionMutAdapter>,
+}
+
+impl CompletionBuilder {
+    fn add(&mut self, completion_type: CompletionType) {
+        self.inner.push_back(Box::new(CompletionNode {
+            link: LinkedListLink::new(),
+            inner: CompletionInner::new(completion_type),
+        }));
+    }
+
+    fn append(&mut self, list: Self) {
+        self.inner.back_mut().splice_after(list.inner);
+    }
+}
+
+#[must_use]
+#[derive(Debug)]
+/// Mutable completion
+struct CompletionNode {
+    link: LinkedListLink,
+    inner: CompletionInner,
+}
+
+// TODO: see about implementing `PointerOps` trait for CompletionBuilder to avoid boxing
+intrusive_adapter!(CompletionMutAdapter = Box<CompletionNode>: CompletionNode { link: LinkedListLink });
+
 #[must_use]
 #[derive(Debug, Clone)]
 pub struct Completion {
@@ -146,6 +177,15 @@ impl Debug for CompletionType {
             Self::Write(..) => f.debug_tuple("Write").finish(),
             Self::Sync(..) => f.debug_tuple("Sync").finish(),
             Self::Truncate(..) => f.debug_tuple("Truncate").finish(),
+        }
+    }
+}
+
+impl CompletionInner {
+    pub fn new(completion_type: CompletionType) -> Self {
+        CompletionInner {
+            completion_type,
+            result: OnceLock::new(),
         }
     }
 }

@@ -78,6 +78,7 @@ aes-gcm = { version = "0.10.3"}
 aes = { version = "0.8.4"}
 turso_parser = { workspace = true }
 aegis = "0.9.0"
+intrusive-collections = "0.9.7"
 
 [build-dependencies]
 chrono = { version = "0.4.38", default-features = false }
