@@ -908,12 +908,9 @@ pub fn begin_read_page(
     let buf = Arc::new(buf);
     let complete = Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
         let Ok((mut buf, bytes_read)) = res else {
-            match res.unwrap_err() {
-                CompletionError::DecryptionError { page_idx } => {
-                    tracing::error!("Page {} failed to decrypt, marking as error", page_idx);
-                    page.set_error();
-                }
-                _ => {}
+            if let Err(e) = res {
+                tracing::error!("Page {} failed to read, marking as error: {e}", page_idx);
+                page.set_error();
             }
             page.clear_locked();
             return;

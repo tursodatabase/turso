@@ -686,9 +686,7 @@ impl BTreeCursor {
                     }
                 }
                 EmptyTableState::ReadPage { page } => {
-                    if let Err(e) = ensure_page_loaded_without_error(&page) {
-                        return Err(e);
-                    }
+                    ensure_page_loaded_without_error(&page)?;
                     let cell_count = page.get_contents().cell_count();
                     break Ok(IOResult::Done(cell_count == 0));
                 }
@@ -822,9 +820,7 @@ impl BTreeCursor {
                 page,
             } = read_overflow_state.as_mut().unwrap();
 
-            if let Err(e) = ensure_page_loaded_without_error(&page) {
-                return Err(e);
-            }
+            ensure_page_loaded_without_error(&page)?;
             tracing::debug!(next_page, remaining_to_read, "reading overflow page");
             let contents = page.get_contents();
             // The first four bytes of each overflow page are a big-endian integer which is the page number of the next page in the chain, or zero for the final page in the chain.
@@ -1085,9 +1081,7 @@ impl BTreeCursor {
                     mut buffer_offset,
                     is_write,
                 }) => {
-                    if let Err(e) = ensure_page_loaded_without_error(&page) {
-                        return Err(e);
-                    }
+                    ensure_page_loaded_without_error(&page)?;
 
                     let contents = page.get_contents();
                     let overflow_size = usable_space - 4;
@@ -2645,9 +2639,7 @@ impl BTreeCursor {
                         .take(balance_info.sibling_count)
                     {
                         let page = page.as_ref().unwrap();
-                        if let Err(e) = ensure_page_loaded_without_error(&page) {
-                            return Err(e);
-                        }
+                        ensure_page_loaded_without_error(&page)?;
 
                         #[cfg(debug_assertions)]
                         let page_type_of_siblings = balance_info.pages_to_balance[0]
@@ -4828,9 +4820,7 @@ impl BTreeCursor {
                     }
                 }
                 OverflowState::ProcessPage { next_page: page } => {
-                    if let Err(e) = ensure_page_loaded_without_error(&page) {
-                        return Err(e);
-                    }
+                    ensure_page_loaded_without_error(&page)?;
 
                     let contents = page.get_contents();
                     let next = contents.read_u32_no_offset(0);
@@ -5152,9 +5142,7 @@ impl BTreeCursor {
         dest_offset: usize,
         new_payload: &[u8],
     ) -> Result<IOResult<()>> {
-        if let Err(e) = ensure_page_loaded_without_error(&page) {
-            return Err(e);
-        }
+        ensure_page_loaded_without_error(&page)?;
         let buf = page.get_contents().as_ptr();
         buf[dest_offset..dest_offset + new_payload.len()].copy_from_slice(new_payload);
 
@@ -5541,9 +5529,7 @@ pub fn integrity_check(
                 state.page.take().expect("page should be present")
             }
         };
-        if let Err(e) = ensure_page_loaded_without_error(&page) {
-            return Err(e);
-        }
+        ensure_page_loaded_without_error(&page)?;
         state.page_stack.pop();
 
         let contents = page.get_contents();
@@ -6026,9 +6012,7 @@ impl PageStack {
             .unwrap()
             .clone();
         tracing::trace!(current = self.current(), page_id = page.get().id);
-        if let Err(e) = ensure_page_loaded_without_error(&page) {
-            return Err(e);
-        }
+        ensure_page_loaded_without_error(&page)?;
         Ok(page)
     }
 
