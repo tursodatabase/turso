@@ -5938,7 +5938,7 @@ impl PageStack {
         // Pin the page to prevent it from being evicted while on the stack
         page.pin();
 
-        self.stack[current] = Some(page.clone());
+        self.stack[current] = Some(page);
         self.node_states[current] = BTreeNodeState {
             cell_idx: starting_cell_idx,
             cell_count: None, // we don't know the cell count yet, so we set it to None. any code pushing a child page onto the stack MUST set the parent page's cell_count.
@@ -6019,8 +6019,7 @@ impl PageStack {
     #[inline(always)]
     fn current(&self) -> usize {
         assert!(self.current_page >= 0);
-        let current = self.current_page as usize;
-        current
+        self.current_page as usize
     }
 
     /// Cell index of the current page
@@ -6052,14 +6051,9 @@ impl PageStack {
 
     /// Advance the current cell index of the current page to the next cell.
     /// We usually advance after going traversing a new page
-    // #[instrument(skip(self), level = Level::DEBUG, name = "pagestack::advance",)]
     #[inline(always)]
     fn advance(&mut self) {
         let current = self.current();
-        // tracing::trace!(
-        //     curr_cell_index = self.node_states[current].cell_idx,
-        //     node_states = ?self.node_states.iter().map(|state| state.cell_idx).collect::<Vec<_>>(),
-        // );
         self.node_states[current].cell_idx += 1;
     }
 
