@@ -1205,7 +1205,8 @@ pub fn op_vnext(
     let has_more = {
         let mut cursor = state.get_cursor(*cursor_id);
         let cursor = cursor.as_virtual_mut();
-        cursor.next()?
+        cursor.next()?;
+        !cursor.eof()
     };
     if has_more {
         // Increment metrics for row read from virtual table (including materialized views)

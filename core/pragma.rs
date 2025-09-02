@@ -342,6 +342,13 @@ impl PragmaVirtualTableCursor {
 
         self.next()
     }
+
+    pub fn eof(&self) -> bool {
+        self.stmt
+            .as_ref()
+            .map(|stmt| stmt.row().is_none())
+            .unwrap_or(true)
+    }
 }
 
 #[cfg(test)]
