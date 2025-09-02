@@ -148,7 +148,7 @@ impl DatabaseStorage for DatabaseFile {
         let pos = (page_idx - 1) * buffer_size;
         let buffer = {
             if let Some(ctx) = io_ctx.encryption_context() {
-                encrypt_buffer(page_idx, buffer, ctx)
+                encrypt_buffer(page_idx, buffer, ctx)?
             } else {
                 buffer
             }
@@ -176,7 +176,7 @@ impl DatabaseStorage for DatabaseFile {
                     .into_iter()
                     .enumerate()
                     .map(|(i, buffer)| encrypt_buffer(first_page_idx + i, buffer, ctx))
-                    .collect::<Vec<_>>()
+                    .collect::<Result<Vec<_>>>()?
             } else {
                 buffers
             }
@@ -210,7 +210,11 @@ impl DatabaseFile {
     }
 }
 
-fn encrypt_buffer(page_idx: usize, buffer: Arc<Buffer>, ctx: &EncryptionContext) -> Arc<Buffer> {
-    let encrypted_data = ctx.encrypt_page(buffer.as_slice(), page_idx).unwrap();
-    Arc::new(Buffer::new(encrypted_data.to_vec()))
+fn encrypt_buffer(
+    page_idx: usize,
+    buffer: Arc<Buffer>,
+    ctx: &EncryptionContext,
+) -> Result<Arc<Buffer>> {
+    let encrypted_data = ctx.encrypt_page(buffer.as_slice(), page_idx)?;
+    Ok(Arc::new(Buffer::new(encrypted_data.to_vec())))
 }

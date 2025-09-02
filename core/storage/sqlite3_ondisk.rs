@@ -908,6 +908,13 @@ pub fn begin_read_page(
     let buf = Arc::new(buf);
     let complete = Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
         let Ok((mut buf, bytes_read)) = res else {
+            match res.unwrap_err() {
+                CompletionError::DecryptionError { page_idx } => {
+                    tracing::error!("Page {} failed to decrypt, marking as error", page_idx);
+                    page.set_error();
+                }
+                _ => {}
+            }
             page.clear_locked();
             return;
         };
@@ -1391,7 +1398,7 @@ pub fn read_value(buf: &[u8], serial_type: SerialType) -> Result<(RefValue, usiz
             if buf.len() < 6 {
                 crate::bail_corrupt_error!("Invalid BEInt48 value");
             }
-            let sign_extension = if buf[0] <= 127 { 0 } else { 255 };
+            let sign_extension = if buf[0] <= 0x7F { 0 } else { 0xFF };
             Ok((
                 RefValue::Integer(i64::from_be_bytes([
                     sign_extension,

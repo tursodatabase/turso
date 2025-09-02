@@ -176,6 +176,8 @@ const PAGE_LOCKED: usize = 0b010;
 const PAGE_DIRTY: usize = 0b1000;
 /// Page's contents are loaded in memory.
 const PAGE_LOADED: usize = 0b10000;
+/// Page has an error (e.g., decryption failed).
+const PAGE_ERROR: usize = 0b100000;
 
 impl Page {
     pub fn new(id: usize) -> Self {
@@ -309,6 +311,20 @@ impl Page {
     pub fn is_valid_for_checkpoint(&self, target_frame: u64, seq: u32) -> bool {
         let (f, s) = self.wal_tag_pair();
         f == target_frame && s == seq && !self.is_dirty()
+    }
+
+    pub fn has_error(&self) -> bool {
+        self.get().flags.load(Ordering::Acquire) & PAGE_ERROR != 0
+    }
+
+    pub fn set_error(&self) {
+        tracing::debug!("set_error(page={})", self.get().id);
+        self.get().flags.fetch_or(PAGE_ERROR, Ordering::Release);
+    }
+
+    pub fn clear_error(&self) {
+        tracing::debug!("clear_error(page={})", self.get().id);
+        self.get().flags.fetch_and(!PAGE_ERROR, Ordering::Release);
     }
 }
 

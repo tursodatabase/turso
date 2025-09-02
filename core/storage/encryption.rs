@@ -251,41 +251,45 @@ impl EncryptionContext {
             return Ok(page.to_vec());
         }
         tracing::debug!("encrypting page {}", page_id);
-        assert_eq!(
-            page.len(),
-            self.page_size,
-            "Page data must be exactly {} bytes",
-            self.page_size
-        );
+        if page.len() != self.page_size {
+            return Err(LimboError::InvalidArgument(format!(
+                "Page data must be exactly {} bytes, got {}",
+                self.page_size,
+                page.len()
+            )));
+        }
 
         let metadata_size = self.cipher_mode.metadata_size();
         let reserved_bytes = &page[self.page_size - metadata_size..];
         let reserved_bytes_zeroed = reserved_bytes.iter().all(|&b| b == 0);
-        assert!(
-            reserved_bytes_zeroed,
-            "last reserved bytes must be empty/zero, but found non-zero bytes"
-        );
+        if !reserved_bytes_zeroed {
+            return Err(LimboError::Corrupt(
+                "last reserved bytes must be zero for encryption metadata".into(),
+            ));
+        }
 
         let payload = &page[..self.page_size - metadata_size];
         let (encrypted, nonce) = self.encrypt_raw(payload)?;
 
         let nonce_size = self.cipher_mode.nonce_size();
-        assert_eq!(
-            encrypted.len(),
-            self.page_size - nonce_size,
-            "Encrypted page must be exactly {} bytes",
-            self.page_size - nonce_size
-        );
+        if encrypted.len() != self.page_size - nonce_size {
+            return Err(LimboError::InternalError(format!(
+                "Encrypted page must be exactly {} bytes, got {}",
+                self.page_size - nonce_size,
+                encrypted.len()
+            )));
+        }
 
         let mut result = Vec::with_capacity(self.page_size);
         result.extend_from_slice(&encrypted);
         result.extend_from_slice(&nonce);
-        assert_eq!(
-            result.len(),
-            self.page_size,
-            "Encrypted page must be exactly {} bytes",
-            self.page_size
-        );
+        if result.len() != self.page_size {
+            return Err(LimboError::InternalError(format!(
+                "Encrypted page must be exactly {} bytes, got {}",
+                self.page_size,
+                result.len()
+            )));
+        }
         Ok(result)
     }
 
@@ -296,12 +300,13 @@ impl EncryptionContext {
             return Ok(encrypted_page.to_vec());
         }
         tracing::debug!("decrypting page {}", page_id);
-        assert_eq!(
-            encrypted_page.len(),
-            self.page_size,
-            "Encrypted page data must be exactly {} bytes",
-            self.page_size
-        );
+        if encrypted_page.len() != self.page_size {
+            return Err(LimboError::InvalidArgument(format!(
+                "Encrypted page data must be exactly {} bytes, got {}",
+                self.page_size,
+                encrypted_page.len()
+            )));
+        }
 
         let nonce_size = self.cipher_mode.nonce_size();
         let nonce_start = encrypted_page.len() - nonce_size;
@@ -311,22 +316,24 @@ impl EncryptionContext {
         let decrypted_data = self.decrypt_raw(payload, nonce)?;
 
         let metadata_size = self.cipher_mode.metadata_size();
-        assert_eq!(
-            decrypted_data.len(),
-            self.page_size - metadata_size,
-            "Decrypted page data must be exactly {} bytes",
-            self.page_size - metadata_size
-        );
+        if decrypted_data.len() != self.page_size - metadata_size {
+            return Err(LimboError::InternalError(format!(
+                "Decrypted page data must be exactly {} bytes, got {}",
+                self.page_size - metadata_size,
+                decrypted_data.len()
+            )));
+        }
 
         let mut result = Vec::with_capacity(self.page_size);
         result.extend_from_slice(&decrypted_data);
         result.resize(self.page_size, 0);
-        assert_eq!(
-            result.len(),
-            self.page_size,
-            "Decrypted page data must be exactly {} bytes",
-            self.page_size
-        );
+        if result.len() != self.page_size {
+            return Err(LimboError::InternalError(format!(
+                "Decrypted page data must be exactly {} bytes, got {}",
+                self.page_size,
+                result.len()
+            )));
+        }
         Ok(result)
     }
 
