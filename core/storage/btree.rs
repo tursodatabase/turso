@@ -4463,7 +4463,7 @@ impl BTreeCursor {
                     // FIXME: skip this work if we determine deletion wont result in balancing
                     // Right now we calculate the key every time for simplicity/debugging
                     // since it won't affect correctness which is more important
-                    let page =  self.stack.top()?;
+                    let page = self.stack.top()?;
                     let target_key = if page.is_index() {
                         let record = match return_if_io!(self.record()) {
                             Some(record) => record.clone(),
@@ -4499,7 +4499,7 @@ impl BTreeCursor {
                 DeleteState::FindCell {
                     post_balancing_seek_key,
                 } => {
-                    let page =  self.stack.top()?;
+                    let page = self.stack.top()?;
                     let cell_idx = self.stack.current_cell_index() as usize;
                     let contents = page.get_contents();
                     if cell_idx >= contents.cell_count() {
@@ -4546,7 +4546,7 @@ impl BTreeCursor {
                         unreachable!("expected clear overflow pages state");
                     };
 
-                    let page =  self.stack.top()?;
+                    let page = self.stack.top()?;
                     let contents = page.get_contents();
 
                     if !contents.is_leaf() {
@@ -4600,7 +4600,7 @@ impl BTreeCursor {
                         .expect("parent page should be on the stack")
                         .cell_idx = cell_idx as i32;
                     let (cell_payload, leaf_cell_idx) = {
-                        let leaf_page =  self.stack.top()?;
+                        let leaf_page = self.stack.top()?;
                         let leaf_contents = leaf_page.get_contents();
                         assert!(leaf_contents.is_leaf());
                         assert!(leaf_contents.cell_count() > 0);
@@ -4637,7 +4637,7 @@ impl BTreeCursor {
                         (cell_payload, leaf_cell_idx)
                     };
 
-                    let leaf_page =  self.stack.top()?;
+                    let leaf_page = self.stack.top()?;
 
                     self.pager.add_dirty(page);
                     self.pager.add_dirty(&leaf_page);
@@ -4675,7 +4675,7 @@ impl BTreeCursor {
                 }
 
                 DeleteState::CheckNeedsBalancing { btree_depth, .. } => {
-                    let page =  self.stack.top()?;
+                    let page = self.stack.top()?;
                     // Check if either the leaf page we took the replacement cell from underflows, or if the interior page we inserted it into overflows OR underflows.
                     // If the latter is true, we must always balance that level regardless of whether the leaf page (or any ancestor pages in between) need balancing.
 
@@ -4914,7 +4914,7 @@ impl BTreeCursor {
                     destroy_info.state = DestroyState::LoadPage;
                 }
                 DestroyState::LoadPage => {
-                    let _page =  self.stack.top()?;
+                    let _page = self.stack.top()?;
 
                     let destroy_info = self
                         .state
@@ -4923,7 +4923,7 @@ impl BTreeCursor {
                     destroy_info.state = DestroyState::ProcessPage;
                 }
                 DestroyState::ProcessPage => {
-                    let page =  self.stack.top()?;
+                    let page = self.stack.top()?;
                     assert!(page.is_loaded()); //  page should be loaded at this time
                     self.stack.advance();
                     let contents = page.get_contents();
@@ -5045,7 +5045,7 @@ impl BTreeCursor {
                     }
                 }
                 DestroyState::FreePage => {
-                    let page =  self.stack.top()?;
+                    let page = self.stack.top()?;
                     let page_id = page.get().id;
 
                     return_if_io!(self.pager.free_page(Some(page), page_id));
@@ -5206,7 +5206,7 @@ impl BTreeCursor {
                     }
                 }
                 CountState::Loop => {
-                    mem_page =  self.stack.top()?;
+                    mem_page = self.stack.top()?;
                     turso_assert!(mem_page.is_loaded(), "page should be loaded");
                     contents = mem_page.get_contents();
 
@@ -5237,7 +5237,7 @@ impl BTreeCursor {
                             // Move to parent
                             self.stack.pop();
 
-                            mem_page =  self.stack.top()?;
+                            mem_page = self.stack.top()?;
                             turso_assert!(mem_page.is_loaded(), "page should be loaded");
                             contents = mem_page.get_contents();
 
