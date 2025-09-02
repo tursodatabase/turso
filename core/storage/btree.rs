@@ -1206,17 +1206,18 @@ impl BTreeCursor {
             }
         }
         loop {
+            let mem_page = self.stack.top_ref();
+            let contents = mem_page.get_contents();
             let cell_idx = self.stack.current_cell_index();
-            let cell_count = self.stack.leaf_cell_count();
-            if cell_idx != -1 && cell_count.is_some() && cell_idx + 1 < cell_count.unwrap() {
+            let cell_count = contents.cell_count();
+            let is_leaf = contents.is_leaf();
+            if cell_idx != -1 && is_leaf && cell_idx as usize + 1 < cell_count {
                 self.stack.advance();
                 return Ok(IOResult::Done(true));
             }
-            self.stack.set_leaf_cell_count(None);
 
-            let mem_page = self.stack.top();
+            let mem_page = mem_page.clone();
             let contents = mem_page.get_contents();
-            let cell_count = contents.cell_count();
             tracing::debug!(
                 id = mem_page.get().id,
                 cell = self.stack.current_cell_index(),
@@ -1274,16 +1275,15 @@ impl BTreeCursor {
             }
 
             turso_assert!(
-                cell_idx < contents.cell_count(),
+                cell_idx < cell_count,
                 "cell index out of bounds: cell_idx={}, cell_count={}, page_type={:?} page_id={}",
                 cell_idx,
-                contents.cell_count(),
+                cell_count,
                 contents.page_type(),
                 mem_page.get().id
             );
 
-            if contents.is_leaf() {
-                self.stack.set_leaf_cell_count(Some(cell_count as i32));
+            if is_leaf {
                 return Ok(IOResult::Done(true));
             }
             if is_index && self.going_upwards {
@@ -6006,11 +6006,16 @@ impl PageStack {
 
     /// Get the top page on the stack.
     /// This is the page that is currently being traversed.
-    #[instrument(skip(self), level = Level::DEBUG, name = "pagestack::top")]
     fn top(&self) -> Arc<Page> {
         let current = self.current();
         let page = self.stack[current].clone().unwrap();
-        tracing::trace!(current = current, page_id = page.get().id);
+        turso_assert!(page.is_loaded(), "page should be loaded");
+        page
+    }
+
+    fn top_ref(&self) -> &Arc<Page> {
+        let current = self.current();
+        let page = self.stack[current].as_ref().unwrap();
         turso_assert!(page.is_loaded(), "page should be loaded");
         page
     }
@@ -6026,20 +6031,6 @@ impl PageStack {
     fn current_cell_index(&self) -> i32 {
         let current = self.current();
         self.node_states[current].cell_idx
-    }
-
-    /// Cell count of the current leaf page
-    /// Caller must ensure that this method will be called for the leag page only
-    fn leaf_cell_count(&self) -> Option<i32> {
-        let current = self.current();
-        self.node_states[current].cell_count
-    }
-
-    // Set cell count for current leaf page
-    // Caller must ensure that this method will be called for the leag page only
-    fn set_leaf_cell_count(&mut self, cell_count: Option<i32>) {
-        let current = self.current();
-        self.node_states[current].cell_count = cell_count;
     }
 
     /// Check if the current cell index is less than 0.
