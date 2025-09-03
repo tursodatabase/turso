@@ -812,13 +812,6 @@ impl Limbo {
                                         Value::Blob(_) => (format!("{value}"), CellAlignment::Left),
                                     };
 
-                                    // let (content, alignment) = match value {
-                                    //     Value::Integer(_) | Value::Float(_) => {
-                                    //         (value.to_display(), CellAlignment::Right)
-                                    //     }
-                                    //     _ => (value.to_display(), CellAlignment::Left),
-                                    // };
-
                                     row.add_cell(
                                         Cell::new(content)
                                             .set_alignment(alignment)
@@ -915,8 +908,6 @@ impl Limbo {
                                         self.write(format!("{value}").as_bytes())?;
                                     }
 
-                                    // self.write(value.to_display().as_bytes())?;
-                                    // self.writeln("")?;
                                 }
                             }
                             Ok(StepResult::IO) => {

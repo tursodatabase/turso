@@ -15,6 +15,7 @@ use crate::vdbe::sorter::Sorter;
 use crate::vdbe::Register;
 use crate::vtab::VirtualTableCursor;
 use crate::{turso_assert, Completion, CompletionError, Result, IO};
+use crate::numeric::DoubleDouble;
 use std::fmt::{Debug, Display, Write};
 
 const MAX_REAL_SIZE: u8 = 15;
@@ -401,72 +402,6 @@ pub struct ExternalAggState {
     pub finalized_value: Option<Value>,
 }
 
-const MAX_EXACT: u64 = u64::MAX << 11;
-
-#[derive(Debug, Clone, Copy)]
-struct DoubleDouble(pub f64, pub f64);
-
-impl From<u64> for DoubleDouble {
-    fn from(value: u64) -> Self {
-        let r = value as f64;
-
-        let rr = if r <= MAX_EXACT as f64 {
-            let round_tripped = value as f64 as u64;
-            let sign = if value >= round_tripped { 1.0 } else { -1.0 };
-
-            sign * value.abs_diff(round_tripped) as f64
-        } else {
-            0.0
-        };
-
-        DoubleDouble(r, rr)
-    }
-}
-
-impl From<f64> for DoubleDouble {
-    fn from(value: f64) -> Self {
-        DoubleDouble(value, 0.0)
-    }
-}
-
-impl From<DoubleDouble> for f64 {
-    fn from(DoubleDouble(a, aa): DoubleDouble) -> Self {
-        a + aa
-    }
-}
-
-impl std::ops::Mul for DoubleDouble {
-    type Output = Self;
-
-    fn mul(self, rhs: Self) -> Self::Output {
-        let mask = u64::MAX << 26;
-
-        let hx = f64::from_bits(self.0.to_bits() & mask);
-        let tx = self.0 - hx;
-
-        let hy = f64::from_bits(rhs.0.to_bits() & mask);
-        let ty = rhs.0 - hy;
-
-        let p = hx * hy;
-        let q = hx * ty + tx * hy;
-
-        let c = p + q;
-        let cc = p - c + q + tx * ty;
-        let cc = self.0 * rhs.1 + self.1 * rhs.0 + cc;
-
-        let r = c + cc;
-        let rr = (c - r) + cc;
-
-        DoubleDouble(r, rr)
-    }
-}
-
-impl std::ops::MulAssign for DoubleDouble {
-    fn mul_assign(&mut self, rhs: Self) {
-        *self = *self * rhs;
-    }
-}
-
 pub fn f64_to_string(val: f64) -> String {
     if val.is_nan() {
         return "NaN".to_string();
@@ -562,7 +497,6 @@ pub fn f64_to_string(val: f64) -> String {
                 if j == 0 {
                     start_index -= 1;
                     z_buf[start_index] = b'1';
-                    n += 1;
                     i_dp += 1;
                     break;
                 }
