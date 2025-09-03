@@ -493,6 +493,12 @@ impl Database {
         let builtin_syms = self.builtin_syms.borrow();
         // add built-in extensions symbols to the connection to prevent having to load each time
         conn.syms.borrow_mut().extend(&builtin_syms);
+
+        if self.mv_store.is_some() {
+            // With MVCC enabled, we deal with fsyncs differently.
+            // We try to batch commits on fsync to amortize the cost.
+            conn.sync_mode.set(SyncMode::Off);
+        }
         Ok(conn)
     }
 

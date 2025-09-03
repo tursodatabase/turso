@@ -8,6 +8,7 @@ use crate::state_machine::TransitionResult;
 use crate::storage::btree::BTreeCursor;
 use crate::storage::btree::BTreeKey;
 use crate::storage::wal::TursoRwLock;
+use crate::types::IOCompletions;
 use crate::types::IOResult;
 use crate::types::ImmutableRecord;
 use crate::Completion;
@@ -22,6 +23,7 @@ use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::ops::Bound;
 use std::rc::Rc;
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -252,6 +254,7 @@ pub enum CommitState {
     WriteRowStateMachine { end_ts: u64, write_set_index: usize },
     DeleteRowStateMachine { end_ts: u64, write_set_index: usize },
     CommitPagerTxn { end_ts: u64 },
+    SyncWal { end_ts: u64 },
     Commit { end_ts: u64 },
 }
 
@@ -273,6 +276,7 @@ pub struct CommitStateMachine<Clock: LogicalClock> {
     write_row_state_machine: Option<StateMachine<WriteRowStateMachine>>,
     delete_row_state_machine: Option<StateMachine<DeleteRowStateMachine>>,
     current_committer: Arc<TursoRwLock>,
+    commits_waiting: Arc<AtomicUsize>,
     _phantom: PhantomData<Clock>,
 }
 
@@ -318,6 +322,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
         tx_id: TxID,
         connection: Arc<Connection>,
         current_committer: Arc<TursoRwLock>,
+        commits_waiting: Arc<AtomicUsize>,
     ) -> Self {
         Self {
             state,
@@ -329,6 +334,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
             write_row_state_machine: None,
             delete_row_state_machine: None,
             current_committer,
+            commits_waiting,
             _phantom: PhantomData,
         }
     }
@@ -477,6 +483,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 // NOTE: since we are blocking for `begin_write_tx` we do not care about re-entrancy right now.
                 let locked = self.current_committer.write();
                 if !locked {
+                    self.commits_waiting.fetch_add(1, Ordering::SeqCst);
                     // FIXME: IOCompletions still needs a yield variant...
                     return Ok(TransitionResult::Io(crate::types::IOCompletions::Single(
                         Completion::new_dummy(),
@@ -594,15 +601,25 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                         .map_err(|e| LimboError::InternalError(e.to_string()))
                         .unwrap();
                     match result {
-                        crate::types::IOResult::Done(_) => {
+                        IOResult::Done(_) => {
                             self.current_committer.unlock();
-                            self.state = CommitState::Commit { end_ts };
+                            self.state = CommitState::SyncWal { end_ts };
                             return Ok(TransitionResult::Continue);
                         }
-                        crate::types::IOResult::IO(io) => {
+                        IOResult::IO(io) => {
                             return Ok(TransitionResult::Io(io));
                         }
                     }
+                }
+            }
+            CommitState::SyncWal { end_ts } => {
+                let mut wal = self.pager.wal.as_ref().unwrap().borrow_mut();
+                let c = wal.sync()?;
+                if c.is_completed() {
+                    self.state = CommitState::Commit { end_ts };
+                    return Ok(TransitionResult::Continue);
+                } else {
+                    return Ok(TransitionResult::Io(IOCompletions::Single(c)));
                 }
             }
             CommitState::Commit { end_ts } => {
@@ -863,6 +880,7 @@ pub struct MvStore<Clock: LogicalClock> {
     /// exclusive transactions to support single-writer semantics for compatibility with SQLite.
     exclusive_tx: RwLock<Option<TxID>>,
     current_committer: Arc<TursoRwLock>,
+    commits_waiting: Arc<AtomicUsize>,
 }
 
 impl<Clock: LogicalClock> MvStore<Clock> {
@@ -878,6 +896,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             loaded_tables: RwLock::new(HashSet::new()),
             exclusive_tx: RwLock::new(None),
             current_committer: Arc::new(TursoRwLock::new()),
+            commits_waiting: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -1230,6 +1249,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 tx_id,
                 connection.clone(),
                 self.current_committer.clone(),
+                self.commits_waiting.clone(),
             ));
         Ok(state_machine)
     }
