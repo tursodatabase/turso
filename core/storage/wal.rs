@@ -981,13 +981,11 @@ impl Wal for WalFile {
             drop(shared);
             self.last_checksum = last_checksum;
             self.min_frame = nbackfills + 1;
-            println!("wal begin_write_txn ok");
             return Ok(LimboResult::Ok);
         }
 
         // Snapshot is stale, give up and let caller retry from scratch
         tracing::debug!("unable to upgrade transaction from read to write: snapshot is stale, give up and let caller retry from scratch, self.max_frame={}, shared_max={}", self.max_frame, shared_max);
-        println!("wal begin_write_txn stale?");
         shared.write_lock.unlock();
         Ok(LimboResult::Busy)
     }
@@ -996,7 +994,6 @@ impl Wal for WalFile {
     #[instrument(skip_all, level = Level::DEBUG)]
     fn end_write_tx(&self) {
         tracing::debug!("end_write_txn");
-        println!("wal end_write_txn");
         self.get_shared().write_lock.unlock();
     }
 
