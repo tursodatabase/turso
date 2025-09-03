@@ -716,7 +716,7 @@ impl Limbo {
                                         let _ = self.write(b"|");
                                     }
 
-                                         if matches!(value, Value::Null) {
+                                    if matches!(value, Value::Null) {
                                         let bytes = self.opts.null_value.clone();
                                         self.write(bytes.as_bytes())?;
                                     } else {

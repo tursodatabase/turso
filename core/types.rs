@@ -15,7 +15,7 @@ use crate::vdbe::sorter::Sorter;
 use crate::vdbe::Register;
 use crate::vtab::VirtualTableCursor;
 use crate::{turso_assert, Completion, CompletionError, Result, IO};
-use std::fmt::{Debug, Display,Write};
+use std::fmt::{Debug, Display, Write};
 
 const MAX_REAL_SIZE: u8 = 15;
 
@@ -401,9 +401,6 @@ pub struct ExternalAggState {
     pub finalized_value: Option<Value>,
 }
 
-
-
-
 const MAX_EXACT: u64 = u64::MAX << 11;
 
 #[derive(Debug, Clone, Copy)]
@@ -441,9 +438,7 @@ impl From<DoubleDouble> for f64 {
 impl std::ops::Mul for DoubleDouble {
     type Output = Self;
 
- 
     fn mul(self, rhs: Self) -> Self::Output {
-
         let mask = u64::MAX << 26;
 
         let hx = f64::from_bits(self.0.to_bits() & mask);
@@ -628,12 +623,8 @@ pub fn f64_to_string(val: f64) -> String {
         }
     }
 
- 
-
-   result.replace("e+", "e")
+    result
 }
-
-
 
 impl ExternalAggState {
     pub fn cache_final_value(&mut self, value: Value) -> &Value {
@@ -660,11 +651,10 @@ impl Display for Value {
                 write!(f, "{i}")
             }
 
-
-             Self::Float(fl) => {
+            Self::Float(fl) => {
                 write!(f, "{}", f64_to_string(*fl))
             }
-       
+
             Self::Text(s) => {
                 write!(f, "{}", s.as_str())
             }
