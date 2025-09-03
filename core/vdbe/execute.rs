@@ -8037,6 +8037,10 @@ impl Value {
             None => return Value::Null,
         };
 
+        if f <= 0.0 {
+            return Value::Null;
+        }
+
         let base = match base {
             Some(base) => match base.to_f64() {
                 Some(f) => f,
