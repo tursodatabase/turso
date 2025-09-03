@@ -907,7 +907,6 @@ impl Limbo {
                                     } else {
                                         self.write(format!("{value}").as_bytes())?;
                                     }
-
                                 }
                             }
                             Ok(StepResult::IO) => {

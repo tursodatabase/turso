@@ -5,6 +5,7 @@ use turso_parser::ast::SortOrder;
 
 use crate::error::LimboError;
 use crate::ext::{ExtValue, ExtValueType};
+use crate::numeric::DoubleDouble;
 use crate::pseudo::PseudoCursor;
 use crate::schema::Index;
 use crate::storage::btree::BTreeCursor;
@@ -15,7 +16,6 @@ use crate::vdbe::sorter::Sorter;
 use crate::vdbe::Register;
 use crate::vtab::VirtualTableCursor;
 use crate::{turso_assert, Completion, CompletionError, Result, IO};
-use crate::numeric::DoubleDouble;
 use std::fmt::{Debug, Display, Write};
 
 const MAX_REAL_SIZE: u8 = 15;
@@ -433,25 +433,25 @@ pub fn f64_to_string(val: f64) -> String {
 
     let mut rr = DoubleDouble::from(r);
     let mut exp = 0;
-    if r > 9.223372036854774784e+18 {
-        while rr.0 > 9.223372036854774784e+118 {
+    if r > 9.223_372_036_854_775e18 {
+        while rr.0 > 9.223_372_036_854_774e118 {
             exp += 100;
-            rr *= DoubleDouble(1.0e-100, -1.99918998026028836196e-117);
+            rr *= DoubleDouble(1.0e-100, -1.999_189_980_260_288_3e-117);
         }
-        while rr.0 > 9.223372036854774784e+28 {
+        while rr.0 > 9.223_372_036_854_774e28 {
             exp += 10;
-            rr *= DoubleDouble(1.0e-10, -3.6432197315497741579e-27);
+            rr *= DoubleDouble(1.0e-10, -3.643_219_731_549_774e-27);
         }
-        while rr.0 > 9.223372036854774784e+18 {
+        while rr.0 > 9.223_372_036_854_775e18 {
             exp += 1;
-            rr *= DoubleDouble(1.0e-01, -5.5511151231257827021e-18);
+            rr *= DoubleDouble(1.0e-01, -5.551_115_123_125_783e-18);
         }
     } else {
-        while rr.0 < 9.223372036854774784e-83 {
+        while rr.0 < 9.223_372_036_854_775e-83 {
             exp -= 100;
-            rr *= DoubleDouble(1.0e+100, -1.5902891109759918046e+83);
+            rr *= DoubleDouble(1.0e+100, -1.590_289_110_975_991_8e83);
         }
-        while rr.0 < 9.223372036854774784e+07 {
+        while rr.0 < 9.223_372_036_854_775e7 {
             exp -= 10;
             rr *= DoubleDouble(1.0e+10, 0.0);
         }
@@ -529,30 +529,28 @@ pub fn f64_to_string(val: f64) -> String {
                 result.push(digit as char);
             }
         }
-        let _ = write!(result, "e{:+}", e);
+        let _ = write!(result, "e{e:+}");
+    } else if i_dp <= 0 {
+        result.push_str("0.");
+        result.push_str(&"0".repeat(i_dp.unsigned_abs() as usize));
+        for &digit in digits {
+            result.push(digit as char);
+        }
     } else {
-        if i_dp <= 0 {
-            result.push_str("0.");
-            result.push_str(&"0".repeat(i_dp.abs() as usize));
+        let dp = i_dp as usize;
+        if dp >= n {
             for &digit in digits {
                 result.push(digit as char);
             }
+            result.push_str(&"0".repeat(dp - n));
+            result.push_str(".0");
         } else {
-            let dp = i_dp as usize;
-            if dp >= n {
-                for &digit in digits {
-                    result.push(digit as char);
-                }
-                result.push_str(&"0".repeat(dp - n));
-                result.push_str(".0");
-            } else {
-                for &digit in &digits[..dp] {
-                    result.push(digit as char);
-                }
-                result.push('.');
-                for &digit in &digits[dp..] {
-                    result.push(digit as char);
-                }
+            for &digit in &digits[..dp] {
+                result.push(digit as char);
+            }
+            result.push('.');
+            for &digit in &digits[dp..] {
+                result.push(digit as char);
             }
         }
     }
