@@ -82,3 +82,15 @@ do_execsql_test_any_error invalid-numberic-literal-3 {
 do_execsql_test_any_error invalid-numberic-literal-4 {
   SELECT 1e;
 }
+
+do_execsql_test float-literal-1.1 {
+  SELECT 5e-324;
+} {4.94065645841247e-324}
+
+do_execsql_test float-literal-1.2 {
+  SELECT 9.93e-322;
+} {9.93071948140905e-322}
+
+do_execsql_test float-literal-1.3 {
+  SELECT -1e-320;
+} {-9.99988867182683e-321}

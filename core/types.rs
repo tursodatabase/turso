@@ -18,7 +18,7 @@ use crate::vtab::VirtualTableCursor;
 use crate::{turso_assert, Completion, CompletionError, Result, IO};
 use std::fmt::{Debug, Display, Write};
 
-const MAX_REAL_SIZE: u8 = 15;
+// const MAX_REAL_SIZE: u8 = 15;
 
 /// SQLite by default uses 2000 as maximum numbers in a row.
 /// It controlld by the constant called SQLITE_MAX_COLUMN
@@ -455,7 +455,7 @@ pub fn f64_to_string(val: f64) -> String {
             exp -= 10;
             rr *= DoubleDouble(1.0e+10, 0.0);
         }
-        while rr.0 < 9.22337203685477478e+17 {
+        while rr.0 < 9.223_372_036_854_775e17 {
             exp -= 1;
             rr *= DoubleDouble(1.0e+01, 0.0);
         }
