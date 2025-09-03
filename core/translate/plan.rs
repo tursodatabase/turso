@@ -154,8 +154,8 @@ pub enum Plan {
     CompoundSelect {
         left: Vec<(SelectPlan, ast::CompoundOperator)>,
         right_most: SelectPlan,
-        limit: Option<isize>,
-        offset: Option<isize>,
+        limit_expr: Option<Box<ast::Expr>>,
+        offset_expr: Option<Box<ast::Expr>>,
         order_by: Option<Vec<(ast::Expr, SortOrder)>>,
     },
     Delete(DeletePlan),
@@ -292,9 +292,9 @@ pub struct SelectPlan {
     /// all the aggregates collected from the result columns, order by, and (TODO) having clauses
     pub aggregates: Vec<Aggregate>,
     /// limit clause
-    pub limit: Option<isize>,
+    pub limit_expr: Option<Box<ast::Expr>>,
     /// offset clause
-    pub offset: Option<isize>,
+    pub offset_expr: Option<Box<ast::Expr>>,
     /// query contains a constant condition that is always false
     pub contains_constant_false_condition: bool,
     /// the destination of the resulting rows from this plan.
@@ -378,9 +378,9 @@ pub struct DeletePlan {
     /// order by clause
     pub order_by: Vec<(Box<ast::Expr>, SortOrder)>,
     /// limit clause
-    pub limit: Option<isize>,
+    pub limit_expr: Option<Box<ast::Expr>>,
     /// offset clause
-    pub offset: Option<isize>,
+    pub offset_expr: Option<Box<ast::Expr>>,
     /// query contains a constant condition that is always false
     pub contains_constant_false_condition: bool,
     /// Indexes that must be updated by the delete operation.
@@ -394,8 +394,10 @@ pub struct UpdatePlan {
     pub set_clauses: Vec<(usize, Box<ast::Expr>)>,
     pub where_clause: Vec<WhereTerm>,
     pub order_by: Vec<(Box<ast::Expr>, SortOrder)>,
-    pub limit: Option<isize>,
-    pub offset: Option<isize>,
+    /// limit clause
+    pub limit_expr: Option<Box<ast::Expr>>,
+    /// offset clause
+    pub offset_expr: Option<Box<ast::Expr>>,
     // TODO: optional RETURNING clause
     pub returning: Option<Vec<ResultSetColumn>>,
     // whether the WHERE clause is always false

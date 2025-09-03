@@ -227,11 +227,15 @@ fn emit_program_for_select(
     );
 
     // Trivial exit on LIMIT 0
-    if let Some(limit) = plan.limit {
-        if limit == 0 {
-            program.result_columns = plan.result_columns;
-            program.table_references.extend(plan.table_references);
-            return Ok(());
+    if let Some(limit_expr) = &plan.limit_expr {
+        if let ast::Expr::Literal(ast::Literal::Numeric(n)) = limit_expr.as_ref() {
+            if let Ok(limit_val) = n.parse::<isize>() {
+                if limit_val == 0 {
+                    program.result_columns = plan.result_columns;
+                    program.table_references.extend(plan.table_references);
+                    return Ok(());
+                }
+            }
         }
     }
     // Emit main parts of query
@@ -256,7 +260,12 @@ pub fn emit_query<'a>(
     // Emit subqueries first so the results can be read in the main query loop.
     emit_subqueries(program, t_ctx, &mut plan.table_references)?;
 
-    init_limit(program, t_ctx, plan.limit, plan.offset);
+    init_limit(
+        program,
+        t_ctx,
+        plan.limit_expr.as_deref(),
+        plan.offset_expr.as_deref(),
+    )?;
 
     // No rows will be read from source table loops if there is a constant false condition eg. WHERE 0
     // however an aggregation might still happen,
@@ -404,13 +413,15 @@ fn emit_program_for_delete(
     );
 
     // exit early if LIMIT 0
-    if let Some(0) = plan.limit {
-        program.result_columns = plan.result_columns;
-        program.table_references.extend(plan.table_references);
-        return Ok(());
+    if let Some(ast::Expr::Literal(ast::Literal::Numeric(n))) = plan.limit_expr.as_deref() {
+        if n.parse::<isize>().unwrap_or(-1) == 0 {
+            program.result_columns = plan.result_columns;
+            program.table_references.extend(plan.table_references);
+            return Ok(());
+        }
     }
 
-    init_limit(program, &mut t_ctx, plan.limit, None);
+    init_limit(program, &mut t_ctx, plan.limit_expr.as_deref(), None)?;
 
     // No rows will be read from source table loops if there is a constant false condition eg. WHERE 0
     let after_main_loop_label = program.allocate_label();
@@ -660,13 +671,20 @@ fn emit_program_for_update(
     );
 
     // Exit on LIMIT 0
-    if let Some(0) = plan.limit {
-        program.result_columns = plan.returning.unwrap_or_default();
-        program.table_references.extend(plan.table_references);
-        return Ok(());
+    if let Some(ast::Expr::Literal(ast::Literal::Numeric(n))) = plan.limit_expr.as_deref() {
+        if n.parse::<isize>().unwrap_or(-1) == 0 {
+            program.result_columns = plan.returning.unwrap_or_default();
+            program.table_references.extend(plan.table_references);
+            return Ok(());
+        }
     }
 
-    init_limit(program, &mut t_ctx, plan.limit, plan.offset);
+    init_limit(
+        program,
+        &mut t_ctx,
+        plan.limit_expr.as_deref(),
+        plan.offset_expr.as_deref(),
+    )?;
     let after_main_loop_label = program.allocate_label();
     t_ctx.label_main_loop_end = Some(after_main_loop_label);
     if plan.contains_constant_false_condition {
@@ -1548,34 +1566,47 @@ pub fn emit_cdc_insns(
 fn init_limit(
     program: &mut ProgramBuilder,
     t_ctx: &mut TranslateCtx,
-    limit: Option<isize>,
-    offset: Option<isize>,
-) {
+    limit_expr: Option<&ast::Expr>,
+    offset_expr: Option<&ast::Expr>,
+) -> crate::Result<()> {
     if t_ctx.limit_ctx.is_none() {
-        t_ctx.limit_ctx = limit.map(|_| LimitCtx::new(program));
+        t_ctx.limit_ctx = limit_expr.map(|_| LimitCtx::new(program));
     }
     let Some(limit_ctx) = t_ctx.limit_ctx else {
-        return;
+        return Ok(());
     };
+
     if limit_ctx.initialize_counter {
-        program.emit_insn(Insn::Integer {
-            value: limit.expect("limit must be Some if limit_ctx is Some") as i64,
-            dest: limit_ctx.reg_limit,
-        });
+        let limit_expr = limit_expr.expect("limit_expr must be Some if limit_ctx is Some");
+        translate_expr(
+            program,
+            None,
+            limit_expr,
+            limit_ctx.reg_limit,
+            &t_ctx.resolver,
+        )?;
     }
-    if t_ctx.reg_offset.is_none() && offset.is_some_and(|n| n.ne(&0)) {
-        let reg = program.alloc_register();
-        t_ctx.reg_offset = Some(reg);
-        program.emit_insn(Insn::Integer {
-            value: offset.unwrap() as i64,
-            dest: reg,
-        });
-        let combined_reg = program.alloc_register();
-        t_ctx.reg_limit_offset_sum = Some(combined_reg);
-        program.emit_insn(Insn::OffsetLimit {
-            limit_reg: t_ctx.limit_ctx.unwrap().reg_limit,
-            offset_reg: reg,
-            combined_reg,
-        });
+
+    if let Some(offset_expr) = offset_expr {
+        // Check if this offset expression represents a non-zero value
+        let should_create_offset = match offset_expr {
+            Expr::Literal(ast::Literal::Numeric(n)) => n.parse::<isize>().unwrap_or(0) != 0,
+            _ => true, // For variables and other expressions, assume they might be non-zero
+        };
+
+        if t_ctx.reg_offset.is_none() && should_create_offset {
+            let reg = program.alloc_register();
+            t_ctx.reg_offset = Some(reg);
+            translate_expr(program, None, offset_expr, reg, &t_ctx.resolver)?;
+
+            let combined_reg = program.alloc_register();
+            t_ctx.reg_limit_offset_sum = Some(combined_reg);
+            program.emit_insn(Insn::OffsetLimit {
+                limit_reg: t_ctx.limit_ctx.unwrap().reg_limit,
+                offset_reg: reg,
+                combined_reg,
+            });
+        }
     }
+    Ok(())
 }

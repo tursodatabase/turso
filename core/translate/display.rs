@@ -36,20 +36,21 @@ impl Display for Plan {
             Self::CompoundSelect {
                 left,
                 right_most,
-                limit,
-                offset,
+                limit_expr,
+                offset_expr,
                 order_by,
+                ..
             } => {
                 for (plan, operator) in left {
                     plan.fmt(f)?;
                     writeln!(f, "{operator}")?;
                 }
                 right_most.fmt(f)?;
-                if let Some(limit) = limit {
-                    writeln!(f, "LIMIT: {limit}")?;
+                if let Some(limit_expr) = limit_expr {
+                    writeln!(f, "LIMIT: {limit_expr}")?;
                 }
-                if let Some(offset) = offset {
-                    writeln!(f, "OFFSET: {offset}")?;
+                if let Some(offset_expr) = offset_expr {
+                    writeln!(f, "OFFSET: {offset_expr}")?;
                 }
                 if let Some(order_by) = order_by {
                     writeln!(f, "ORDER BY:")?;
@@ -217,8 +218,8 @@ impl fmt::Display for UpdatePlan {
                 )?;
             }
         }
-        if let Some(limit) = self.limit {
-            writeln!(f, "LIMIT: {limit}")?;
+        if let Some(limit_expr) = &self.limit_expr {
+            writeln!(f, "LIMIT: {limit_expr}")?;
         }
         if let Some(ret) = &self.returning {
             writeln!(f, "RETURNING:")?;
@@ -273,9 +274,10 @@ impl ToTokens for Plan {
             Self::CompoundSelect {
                 left,
                 right_most,
-                limit,
-                offset,
+                limit_expr,
+                offset_expr,
                 order_by,
+                ..
             } => {
                 let all_refs = left
                     .iter()
@@ -305,14 +307,14 @@ impl ToTokens for Plan {
                     )?;
                 }
 
-                if let Some(limit) = &limit {
+                if let Some(limit_expr) = &limit_expr {
                     s.append(TokenType::TK_LIMIT, None)?;
-                    s.append(TokenType::TK_FLOAT, Some(&limit.to_string()))?;
+                    limit_expr.to_tokens(s, context)?;
                 }
 
-                if let Some(offset) = &offset {
+                if let Some(offset_expr) = &offset_expr {
                     s.append(TokenType::TK_OFFSET, None)?;
-                    s.append(TokenType::TK_FLOAT, Some(&offset.to_string()))?;
+                    offset_expr.to_tokens(s, context)?;
                 }
             }
             Self::Delete(delete) => delete.to_tokens(s, context)?,
@@ -458,14 +460,14 @@ impl ToTokens for SelectPlan {
             )?;
         }
 
-        if let Some(limit) = &self.limit {
+        if let Some(limit_expr) = &self.limit_expr {
             s.append(TokenType::TK_LIMIT, None)?;
-            s.append(TokenType::TK_FLOAT, Some(&limit.to_string()))?;
+            limit_expr.to_tokens(s, context)?;
         }
 
-        if let Some(offset) = &self.offset {
+        if let Some(offset_expr) = &self.offset_expr {
             s.append(TokenType::TK_OFFSET, None)?;
-            s.append(TokenType::TK_FLOAT, Some(&offset.to_string()))?;
+            offset_expr.to_tokens(s, context)?;
         }
 
         Ok(())
@@ -520,14 +522,14 @@ impl ToTokens for DeletePlan {
             )?;
         }
 
-        if let Some(limit) = &self.limit {
+        if let Some(limit_expr) = &self.limit_expr {
             s.append(TokenType::TK_LIMIT, None)?;
-            s.append(TokenType::TK_FLOAT, Some(&limit.to_string()))?;
+            limit_expr.to_tokens(s, context)?;
         }
 
-        if let Some(offset) = &self.offset {
+        if let Some(offset_expr) = &self.offset_expr {
             s.append(TokenType::TK_OFFSET, None)?;
-            s.append(TokenType::TK_FLOAT, Some(&offset.to_string()))?;
+            offset_expr.to_tokens(s, context)?;
         }
 
         Ok(())
@@ -601,13 +603,13 @@ impl ToTokens for UpdatePlan {
             )?;
         }
 
-        if let Some(limit) = &self.limit {
+        if let Some(limit_expr) = &self.limit_expr {
             s.append(TokenType::TK_LIMIT, None)?;
-            s.append(TokenType::TK_FLOAT, Some(&limit.to_string()))?;
+            limit_expr.to_tokens(s, context)?;
         }
-        if let Some(offset) = &self.offset {
+        if let Some(offset_expr) = &self.offset_expr {
             s.append(TokenType::TK_OFFSET, None)?;
-            s.append(TokenType::TK_FLOAT, Some(&offset.to_string()))?;
+            offset_expr.to_tokens(s, context)?;
         }
 
         Ok(())

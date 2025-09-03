@@ -7,8 +7,8 @@ use crate::schema::Table;
 use crate::translate::optimizer::optimize_plan;
 use crate::translate::plan::{GroupBy, Plan, ResultSetColumn, SelectPlan};
 use crate::translate::planner::{
-    bind_column_references, break_predicate_at_and_boundaries, parse_from, parse_limit,
-    parse_where, resolve_aggregates,
+    bind_column_references, break_predicate_at_and_boundaries, parse_from, parse_where,
+    resolve_aggregates,
 };
 use crate::util::normalize_ident;
 use crate::vdbe::builder::{ProgramBuilderOpts, TableRefIdCounter};
@@ -148,10 +148,6 @@ pub fn prepare_select_plan(
                     crate::bail_parse_error!("SELECTs to the left and right of {} do not have the same number of result columns", operator);
                 }
             }
-            let (limit, offset) = select
-                .limit
-                .as_ref()
-                .map_or(Ok((None, None)), parse_limit)?;
 
             // FIXME: handle ORDER BY for compound selects
             if !select.order_by.is_empty() {
@@ -164,8 +160,8 @@ pub fn prepare_select_plan(
             Ok(Plan::CompoundSelect {
                 left,
                 right_most: last,
-                limit,
-                offset,
+                limit_expr: select.limit.as_ref().map(|l| l.expr.clone()),
+                offset_expr: select.limit.as_ref().and_then(|l| l.offset.clone()),
                 order_by: None,
             })
         }
@@ -275,8 +271,8 @@ fn prepare_one_select_plan(
                 group_by: None,
                 order_by: vec![],
                 aggregates: vec![],
-                limit: None,
-                offset: None,
+                limit_expr: None,
+                offset_expr: None,
                 contains_constant_false_condition: false,
                 query_destination,
                 distinctness: Distinctness::from_ast(distinctness.as_ref()),
@@ -430,8 +426,9 @@ fn prepare_one_select_plan(
             }
             plan.order_by = key;
 
-            // Parse the LIMIT/OFFSET clause
-            (plan.limit, plan.offset) = limit.as_ref().map_or(Ok((None, None)), parse_limit)?;
+            // Store the LIMIT/OFFSET AST expressions
+            plan.limit_expr = limit.as_ref().map(|l| l.expr.clone());
+            plan.offset_expr = limit.as_ref().and_then(|l| l.offset.clone());
 
             // Return the unoptimized query plan
             Ok(plan)
@@ -455,8 +452,8 @@ fn prepare_one_select_plan(
                 group_by: None,
                 order_by: vec![],
                 aggregates: vec![],
-                limit: None,
-                offset: None,
+                limit_expr: None,
+                offset_expr: None,
                 contains_constant_false_condition: false,
                 query_destination,
                 distinctness: Distinctness::NonDistinct,

@@ -22,7 +22,7 @@ use super::plan::{
     UpdatePlan,
 };
 use super::planner::bind_column_references;
-use super::planner::{parse_limit, parse_where};
+use super::planner::parse_where;
 /*
 * Update is simple. By default we scan the table, and for each row, we check the WHERE
 * clause. If it evaluates to true, we build the new record with the updated value and insert.
@@ -291,13 +291,13 @@ pub fn prepare_update_plan(
             group_by: None,     // N/A
             order_by: vec![],   // N/A
             aggregates: vec![], // N/A
-            limit: None,        // N/A
+            limit_expr: None,   // N/A
             query_destination: QueryDestination::EphemeralTable {
                 cursor_id: temp_cursor_id,
                 table,
             },
             join_order: vec![],
-            offset: None,
+            offset_expr: None,
             contains_constant_false_condition: false,
             distinctness: super::plan::Distinctness::NonDistinct,
             values: vec![],
@@ -330,8 +330,9 @@ pub fn prepare_update_plan(
         )?;
     };
 
-    // Parse the LIMIT/OFFSET clause
-    let (limit, offset) = body.limit.as_ref().map_or(Ok((None, None)), parse_limit)?;
+    // Store the LIMIT/OFFSET AST expressions
+    let limit_expr = body.limit.as_ref().map(|l| l.expr.clone());
+    let offset_expr = body.limit.as_ref().and_then(|l| l.offset.clone());
 
     // Check what indexes will need to be updated by checking set_clauses and see
     // if a column is contained in an index.
@@ -367,8 +368,8 @@ pub fn prepare_update_plan(
             Some(result_columns)
         },
         order_by,
-        limit,
-        offset,
+        limit_expr,
+        offset_expr,
         contains_constant_false_condition: false,
         indexes_to_update,
         ephemeral_plan,

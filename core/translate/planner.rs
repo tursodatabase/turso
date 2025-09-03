@@ -23,8 +23,8 @@ use crate::{
 use turso_macros::match_ignore_ascii_case;
 use turso_parser::ast::Literal::Null;
 use turso_parser::ast::{
-    self, As, Expr, FromClause, JoinType, Limit, Literal, Materialized, QualifiedName,
-    TableInternalId, UnaryOperator, With,
+    self, As, Expr, FromClause, JoinType, Literal, Materialized, QualifiedName, TableInternalId,
+    With,
 };
 
 pub const ROWID: &str = "rowid";
@@ -1143,44 +1143,6 @@ fn parse_join(
     rightmost_table.join_info = Some(JoinInfo { outer, using });
 
     Ok(())
-}
-
-pub fn parse_limit(limit: &Limit) -> Result<(Option<isize>, Option<isize>)> {
-    let offset_val = match &limit.offset {
-        Some(offset_expr) => match offset_expr.as_ref() {
-            Expr::Literal(ast::Literal::Numeric(n)) => n.parse().ok(),
-            // If OFFSET is negative, the result is as if OFFSET is zero
-            Expr::Unary(UnaryOperator::Negative, expr) => {
-                if let Expr::Literal(ast::Literal::Numeric(ref n)) = &**expr {
-                    n.parse::<isize>().ok().map(|num| -num)
-                } else {
-                    crate::bail_parse_error!("Invalid OFFSET clause");
-                }
-            }
-            _ => crate::bail_parse_error!("Invalid OFFSET clause"),
-        },
-        None => Some(0),
-    };
-
-    if let Expr::Literal(ast::Literal::Numeric(n)) = limit.expr.as_ref() {
-        Ok((n.parse().ok(), offset_val))
-    } else if let Expr::Unary(UnaryOperator::Negative, expr) = limit.expr.as_ref() {
-        if let Expr::Literal(ast::Literal::Numeric(n)) = expr.as_ref() {
-            let limit_val = n.parse::<isize>().ok().map(|num| -num);
-            Ok((limit_val, offset_val))
-        } else {
-            crate::bail_parse_error!("Invalid LIMIT clause");
-        }
-    } else if let Expr::Id(id) = limit.expr.as_ref() {
-        let id_bytes = id.as_str().as_bytes();
-        match_ignore_ascii_case!(match id_bytes {
-            b"true" => Ok((Some(1), offset_val)),
-            b"false" => Ok((Some(0), offset_val)),
-            _ => crate::bail_parse_error!("Invalid LIMIT clause"),
-        })
-    } else {
-        crate::bail_parse_error!("Invalid LIMIT clause");
-    }
 }
 
 pub fn break_predicate_at_and_boundaries(predicate: &Expr, out_predicates: &mut Vec<Expr>) {

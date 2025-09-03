@@ -1,5 +1,6 @@
 use crate::schema::{Index, IndexColumn, Schema};
-use crate::translate::emitter::{emit_query, LimitCtx, TranslateCtx};
+use crate::translate::emitter::{emit_query, LimitCtx, Resolver, TranslateCtx};
+use crate::translate::expr::translate_expr;
 use crate::translate::plan::{Plan, QueryDestination, SelectPlan};
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::Insn;
@@ -7,7 +8,7 @@ use crate::vdbe::BranchOffset;
 use crate::SymbolTable;
 use std::sync::Arc;
 use tracing::instrument;
-use turso_parser::ast::{CompoundOperator, SortOrder};
+use turso_parser::ast::{self, CompoundOperator, SortOrder};
 
 use tracing::Level;
 
@@ -21,8 +22,8 @@ pub fn emit_program_for_compound_select(
     let Plan::CompoundSelect {
         left: _left,
         right_most,
-        limit,
-        offset,
+        limit_expr,
+        offset_expr,
         ..
     } = &plan
     else {
@@ -31,30 +32,30 @@ pub fn emit_program_for_compound_select(
 
     let right_plan = right_most.clone();
     // Trivial exit on LIMIT 0
-    if let Some(limit) = limit {
-        if *limit == 0 {
-            program.result_columns = right_plan.result_columns;
-            program.table_references.extend(right_plan.table_references);
-            return Ok(());
+    if let Some(limit_expr) = limit_expr {
+        if let ast::Expr::Literal(ast::Literal::Numeric(n)) = limit_expr.as_ref() {
+            if let Ok(limit_val) = n.parse::<isize>() {
+                if limit_val == 0 {
+                    program.result_columns = right_plan.result_columns;
+                    program.table_references.extend(right_plan.table_references);
+                    return Ok(());
+                }
+            }
         }
     }
 
     // Each subselect shares the same limit_ctx and offset, because the LIMIT, OFFSET applies to
     // the entire compound select, not just a single subselect.
-    let limit_ctx = limit.map(|limit| {
+    let limit_ctx = limit_expr.as_ref().map(|limit_expr| {
         let reg = program.alloc_register();
-        program.emit_insn(Insn::Integer {
-            value: limit as i64,
-            dest: reg,
-        });
+        let resolver = Resolver::new(schema, syms);
+        translate_expr(program, None, limit_expr, reg, &resolver).unwrap();
         LimitCtx::new_shared(reg)
     });
-    let offset_reg = offset.map(|offset| {
+    let offset_reg = offset_expr.as_ref().map(|offset_expr| {
         let reg = program.alloc_register();
-        program.emit_insn(Insn::Integer {
-            value: offset as i64,
-            dest: reg,
-        });
+        let resolver = Resolver::new(schema, syms);
+        translate_expr(program, None, offset_expr, reg, &resolver).unwrap();
 
         let combined_reg = program.alloc_register();
         program.emit_insn(Insn::OffsetLimit {
@@ -110,8 +111,8 @@ fn emit_compound_select(
     let Plan::CompoundSelect {
         mut left,
         mut right_most,
-        limit,
-        offset,
+        limit_expr,
+        offset_expr,
         order_by,
     } = plan
     else {
@@ -137,8 +138,8 @@ fn emit_compound_select(
                 let compound_select = Plan::CompoundSelect {
                     left,
                     right_most: plan,
-                    limit,
-                    offset,
+                    limit_expr: limit_expr.clone(),
+                    offset_expr: offset_expr.clone(),
                     order_by,
                 };
                 emit_compound_select(
@@ -159,11 +160,11 @@ fn emit_compound_select(
                         target_pc: label_next_select,
                         jump_if_null: true,
                     });
-                    right_most.limit = limit;
+                    right_most.limit_expr = limit_expr.clone();
                     right_most_ctx.limit_ctx = Some(limit_ctx);
                 }
                 if offset_reg.is_some() {
-                    right_most.offset = offset;
+                    right_most.offset_expr = offset_expr.clone();
                     right_most_ctx.reg_offset = offset_reg;
                 }
                 emit_query(program, &mut right_most, &mut right_most_ctx)?;
@@ -188,8 +189,8 @@ fn emit_compound_select(
                 let compound_select = Plan::CompoundSelect {
                     left,
                     right_most: plan,
-                    limit,
-                    offset,
+                    limit_expr: limit_expr.clone(),
+                    offset_expr: offset_expr.clone(),
                     order_by,
                 };
                 emit_compound_select(
@@ -239,8 +240,8 @@ fn emit_compound_select(
                 let compound_select = Plan::CompoundSelect {
                     left,
                     right_most: plan,
-                    limit,
-                    offset,
+                    limit_expr: limit_expr.clone(),
+                    offset_expr: offset_expr.clone(),
                     order_by,
                 };
                 emit_compound_select(
@@ -292,8 +293,8 @@ fn emit_compound_select(
                 let compound_select = Plan::CompoundSelect {
                     left,
                     right_most: plan,
-                    limit,
-                    offset,
+                    limit_expr: limit_expr.clone(),
+                    offset_expr: offset_expr.clone(),
                     order_by,
                 };
                 emit_compound_select(
@@ -322,10 +323,10 @@ fn emit_compound_select(
         None => {
             if let Some(limit_ctx) = limit_ctx {
                 right_most_ctx.limit_ctx = Some(limit_ctx);
-                right_most.limit = limit;
+                right_most.limit_expr = limit_expr.clone();
             }
             if offset_reg.is_some() {
-                right_most.offset = offset;
+                right_most.offset_expr = offset_expr.clone();
                 right_most_ctx.reg_offset = offset_reg;
             }
             emit_query(program, &mut right_most, &mut right_most_ctx)?;

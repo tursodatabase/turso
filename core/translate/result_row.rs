@@ -12,6 +12,7 @@ use super::{
     expr::translate_expr,
     plan::{Distinctness, QueryDestination, SelectPlan},
 };
+use turso_parser::ast;
 
 /// Emits the bytecode for:
 /// - all result columns
@@ -141,14 +142,14 @@ pub fn emit_result_row_and_limit(
         }
     }
 
-    if plan.limit.is_some() {
+    if plan.limit_expr.is_some() {
         if label_on_limit_reached.is_none() {
             // There are cases where LIMIT is ignored, e.g. aggregation without a GROUP BY clause.
             // We already early return on LIMIT 0, so we can just return here since the n of rows
             // is always 1 here.
             return Ok(());
         }
-        let limit_ctx = limit_ctx.expect("limit_ctx must be Some if plan.limit is Some");
+        let limit_ctx = limit_ctx.expect("limit_ctx must be Some if plan.limit_expr is Some");
 
         program.emit_insn(Insn::DecrJumpZero {
             reg: limit_ctx.reg_limit,
@@ -164,8 +165,14 @@ pub fn emit_offset(
     jump_to: BranchOffset,
     reg_offset: Option<usize>,
 ) {
-    match plan.offset {
-        Some(offset) if offset > 0 => {
+    if let Some(offset_expr) = &plan.offset_expr {
+        // Check if this is a literal 0 (optimization case)
+        let should_emit = match offset_expr.as_ref() {
+            ast::Expr::Literal(ast::Literal::Numeric(n)) => n.parse::<isize>().unwrap_or(-1) > 0,
+            _ => true, // For variables and other expressions, assume they might be > 0
+        };
+
+        if should_emit {
             program.add_comment(program.offset(), "OFFSET");
             program.emit_insn(Insn::IfPos {
                 reg: reg_offset.expect("reg_offset must be Some"),
@@ -173,6 +180,5 @@ pub fn emit_offset(
                 decrement_by: 1,
             });
         }
-        _ => {}
     }
 }
