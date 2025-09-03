@@ -339,3 +339,26 @@ async fn test_index() {
     assert!(row.get::<String>(1).unwrap() == "b@d.e");
     assert!(rows.next().await.unwrap().is_none());
 }
+
+#[tokio::test]
+async fn test_parameterized_limit_clause() {
+    let db = Builder::new_local(":memory:").build().await.unwrap();
+    let conn = db.connect().unwrap();
+
+    conn.execute("CREATE TABLE t(x)", ()).await.unwrap();
+    conn.execute("INSERT INTO t VALUES (1), (2), (3), (4), (5)", ())
+        .await
+        .unwrap();
+
+    let limit = 2;
+    let mut rows = conn
+        .query("SELECT * FROM t LIMIT ?", (limit,))
+        .await
+        .unwrap();
+
+    let mut count = 0;
+    while rows.next().await.unwrap().is_some() {
+        count += 1;
+    }
+    assert_eq!(count, 2);
+}
