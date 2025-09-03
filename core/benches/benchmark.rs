@@ -2,7 +2,7 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 use pprof::criterion::{Output, PProfProfiler};
 use regex::Regex;
 use std::{sync::Arc, time::Instant};
-use turso_core::{Database, PlatformIO};
+use turso_core::{Database, MemoryIO, PlatformIO, StepResult};
 
 #[cfg(not(target_family = "wasm"))]
 #[global_allocator]
@@ -631,9 +631,216 @@ fn bench_insert_rows(criterion: &mut Criterion) {
     group.finish();
 }
 
+#[inline(never)]
+fn bench_limbo(mvcc: bool, num_connections: i64, num_inserts_per_connection: i64) {
+    struct ConnectionState {
+        conn: Arc<turso_core::Connection>,
+        inserts: Vec<i64>,
+        current_statement: Option<turso_core::Statement>,
+    }
+    #[allow(clippy::arc_with_non_send_sync)]
+    let io = Arc::new(PlatformIO::new().unwrap());
+    let temp_dir = tempfile::tempdir().unwrap();
+    let path = temp_dir.path().join("bench.db");
+    let db = Database::open_file(io.clone(), path.to_str().unwrap(), mvcc, false).unwrap();
+    let mut connecitons = Vec::new();
+    {
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE test (x)").unwrap();
+        conn.close().unwrap();
+    }
+    for i in 0..num_connections {
+        let conn = db.connect().unwrap();
+        let mut inserts = ((num_inserts_per_connection * i)
+            ..(num_inserts_per_connection * (i + 1)))
+            .collect::<Vec<i64>>();
+        inserts.reverse();
+        connecitons.push(ConnectionState {
+            conn,
+            inserts,
+            current_statement: None,
+        });
+    }
+    loop {
+        let mut all_finished = true;
+        for conn in &mut connecitons {
+            if !conn.inserts.is_empty() || conn.current_statement.is_some() {
+                all_finished = false;
+                break;
+            }
+        }
+        for (_, conn) in connecitons.iter_mut().enumerate() {
+            if conn.current_statement.is_none() && !conn.inserts.is_empty() {
+                let write = conn.inserts.pop().unwrap();
+                conn.current_statement = Some(
+                    conn.conn
+                        .prepare(&format!("INSERT INTO test (x) VALUES ({write})"))
+                        .unwrap(),
+                );
+            }
+            if conn.current_statement.is_none() {
+                continue;
+            }
+            let stmt = conn.current_statement.as_mut().unwrap();
+            match stmt.step().unwrap() {
+                // These you be only possible cases in write concurrency.
+                // No rows because insert doesn't return
+                // No interrupt because insert doesn't interrupt
+                // No busy because insert in mvcc should be multi concurrent write
+                StepResult::Done => {
+                    conn.current_statement = None;
+                }
+                StepResult::IO => {
+                    // let's skip doing I/O here, we want to perform io only after all the statements are stepped
+                }
+                StepResult::Busy => {
+                    // We need to restart statement
+                    if mvcc {
+                        unreachable!();
+                    }
+                    stmt.reset();
+                }
+                _ => {
+                    unreachable!()
+                }
+            }
+        }
+        db.io.run_once().unwrap();
+
+        if all_finished {
+            break;
+        }
+    }
+}
+
+#[inline(never)]
+fn bench_limbo_mvcc(mvcc: bool, num_connections: i64, num_inserts_per_connection: i64) {
+    struct ConnectionState {
+        conn: Arc<turso_core::Connection>,
+        inserts: Vec<i64>,
+        current_statement: Option<turso_core::Statement>,
+    }
+    #[allow(clippy::arc_with_non_send_sync)]
+    let io = Arc::new(PlatformIO::new().unwrap());
+    let temp_dir = tempfile::tempdir().unwrap();
+    let path = temp_dir.path().join("bench.db");
+    let db = Database::open_file(io.clone(), path.to_str().unwrap(), mvcc, false).unwrap();
+    let mut connecitons = Vec::new();
+    {
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE test (x)").unwrap();
+        conn.close().unwrap();
+    }
+    for i in 0..num_connections {
+        let conn = db.connect().unwrap();
+        let mut inserts = ((num_inserts_per_connection * i)
+            ..(num_inserts_per_connection * (i + 1)))
+            .collect::<Vec<i64>>();
+        inserts.reverse();
+        connecitons.push(ConnectionState {
+            conn,
+            inserts,
+            current_statement: None,
+        });
+    }
+    loop {
+        let mut all_finished = true;
+        for conn in &mut connecitons {
+            if !conn.inserts.is_empty() || conn.current_statement.is_some() {
+                all_finished = false;
+                break;
+            }
+        }
+        for (_, conn) in connecitons.iter_mut().enumerate() {
+            if conn.current_statement.is_none() && !conn.inserts.is_empty() {
+                let write = conn.inserts.pop().unwrap();
+                conn.current_statement = Some(
+                    conn.conn
+                        .prepare(&format!("INSERT INTO test (x) VALUES ({write})"))
+                        .unwrap(),
+                );
+            }
+            if conn.current_statement.is_none() {
+                continue;
+            }
+            let stmt = conn.current_statement.as_mut().unwrap();
+            match stmt.step().unwrap() {
+                // These you be only possible cases in write concurrency.
+                // No rows because insert doesn't return
+                // No interrupt because insert doesn't interrupt
+                // No busy because insert in mvcc should be multi concurrent write
+                StepResult::Done => {
+                    conn.current_statement = None;
+                }
+                StepResult::IO => {
+                    stmt.run_once().unwrap();
+                    // let's skip doing I/O here, we want to perform io only after all the statements are stepped
+                }
+                StepResult::Busy => {
+                    // We need to restart statement
+                    if mvcc {
+                        unreachable!();
+                    }
+                    println!("resetting statement");
+                    stmt.reset();
+                }
+                _ => {
+                    unreachable!()
+                }
+            }
+        }
+        db.io.run_once().unwrap();
+
+        if all_finished {
+            break;
+        }
+    }
+}
+
+fn bench_concurrent_writes(criterion: &mut Criterion) {
+    let mut group = criterion.benchmark_group("Concurrent writes");
+
+    let num_connections = 2;
+    let num_inserts_per_connection = 100;
+
+    group.bench_function("limbo_wal_concurrent_writes", |b| {
+        b.iter(|| {
+            bench_limbo(false, num_connections, num_inserts_per_connection);
+        });
+    });
+    group.bench_function("limbo_mvcc_concurrent_writes", |b| {
+        b.iter(|| {
+            bench_limbo_mvcc(true, num_connections, num_inserts_per_connection);
+        });
+    });
+    group.bench_function("sqlite_concurrent_writes", |b| {
+        b.iter(|| {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let path = temp_dir.path().join("bench.db");
+            {
+                let conn = rusqlite::Connection::open(path.to_str().unwrap()).unwrap();
+                conn.pragma_update(None, "synchronous", "FULL").unwrap();
+                conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+                conn.pragma_update(None, "locking_mode", "EXCLUSIVE")
+                    .unwrap();
+                conn.execute("CREATE TABLE test (x INTEGER)", []).unwrap();
+            }
+
+            for i in 0..num_connections {
+                let conn = rusqlite::Connection::open(path.to_str().unwrap()).unwrap();
+                for j in 0..num_inserts_per_connection {
+                    let value = (num_inserts_per_connection * i) + j;
+                    conn.execute("INSERT INTO test (x) VALUES (?1)", [value])
+                        .unwrap();
+                }
+            }
+        });
+    });
+}
+
 criterion_group! {
     name = benches;
     config = Criterion::default().with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
-    targets = bench_open, bench_alter, bench_prepare_query, bench_execute_select_1, bench_execute_select_rows, bench_execute_select_count, bench_insert_rows
+    targets = bench_open, bench_alter, bench_prepare_query, bench_execute_select_1, bench_execute_select_rows, bench_execute_select_count, bench_insert_rows, bench_concurrent_writes
 }
 criterion_main!(benches);
