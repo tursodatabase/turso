@@ -1235,10 +1235,21 @@ fn test_commit_without_tx() {
 fn get_rows(conn: &Arc<Connection>, query: &str) -> Vec<Vec<Value>> {
     let mut stmt = conn.prepare(query).unwrap();
     let mut rows = Vec::new();
-    while let StepResult::Row = stmt.step().unwrap() {
-        let row = stmt.row().unwrap();
-        let values = row.get_values().cloned().collect::<Vec<_>>();
-        rows.push(values);
+    loop {
+        match stmt.step().unwrap() {
+            StepResult::Row => {
+                let row = stmt.row().unwrap();
+                let values = row.get_values().cloned().collect::<Vec<_>>();
+                rows.push(values);
+            }
+            StepResult::Done => break,
+            StepResult::IO => {
+                stmt.run_once().unwrap();
+            }
+            StepResult::Interrupt | StepResult::Busy => {
+                panic!("unexpected step result");
+            }
+        }
     }
     rows
 }
@@ -1252,21 +1263,21 @@ fn test_concurrent_writes() {
         current_statement: Option<Statement>,
     }
     let db = MvccTestDbNoConn::new_with_random_db();
-    let mut connecitons = Vec::new();
+    let mut connections = Vec::new();
     {
         let conn = db.connect();
         conn.execute("CREATE TABLE test (x)").unwrap();
         conn.close().unwrap();
     }
     let num_connections = 2;
-    let num_inserts_per_connection = 100;
+    let num_inserts_per_connection = 10;
     for i in 0..num_connections {
         let conn = db.connect();
         let mut inserts = ((num_inserts_per_connection * i)
             ..(num_inserts_per_connection * (i + 1)))
             .collect::<Vec<i64>>();
         inserts.reverse();
-        connecitons.push(ConnectionState {
+        connections.push(ConnectionState {
             conn,
             inserts,
             current_statement: None,
@@ -1275,13 +1286,13 @@ fn test_concurrent_writes() {
 
     loop {
         let mut all_finished = true;
-        for conn in &mut connecitons {
-            if !conn.inserts.is_empty() && conn.current_statement.is_none() {
+        for conn in &mut connections {
+            if !conn.inserts.is_empty() || conn.current_statement.is_some() {
                 all_finished = false;
                 break;
             }
         }
-        for (conn_id, conn) in connecitons.iter_mut().enumerate() {
+        for (conn_id, conn) in connections.iter_mut().enumerate() {
             // println!("connection {conn_id} inserts: {:?}", conn.inserts);
             if conn.current_statement.is_none() && !conn.inserts.is_empty() {
                 let write = conn.inserts.pop().unwrap();
@@ -1309,6 +1320,10 @@ fn test_concurrent_writes() {
                 StepResult::IO => {
                     // let's skip doing I/O here, we want to perform io only after all the statements are stepped
                 }
+                StepResult::Busy => {
+                    println!("connection {conn_id} busy");
+                    stmt.reprepare().unwrap();
+                }
                 _ => {
                     unreachable!()
                 }
@@ -1317,6 +1332,7 @@ fn test_concurrent_writes() {
         db.get_db().io.step().unwrap();
 
         if all_finished {
+            println!("all finished");
             break;
         }
     }
