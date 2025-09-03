@@ -715,12 +715,7 @@ impl Limbo {
                                     if i > 0 {
                                         let _ = self.write(b"|");
                                     }
-                                    if matches!(value, Value::Null) {
-                                        let bytes = self.opts.null_value.clone();
-                                        self.write(bytes.as_bytes())?;
-                                    } else {
-                                        self.write(format!("{value}").as_bytes())?;
-                                    }
+                                    self.write(value.to_display().as_bytes())?;
                                 }
                                 let _ = self.writeln("");
                             }
@@ -795,19 +790,27 @@ impl Limbo {
                                 let mut row = Row::new();
                                 row.max_height(1);
                                 for (idx, value) in record.get_values().enumerate() {
+                                    // let (content, alignment) = match value {
+                                    //     Value::Null => {
+                                    //         (self.opts.null_value.clone(), CellAlignment::Left)
+                                    //     }
+                                    //     Value::Integer(_) => {
+                                    //         (format!("{value}"), CellAlignment::Right)
+                                    //     }
+                                    //     Value::Float(_) => {
+                                    //         (format!("{value}"), CellAlignment::Right)
+                                    //     }
+                                    //     Value::Text(_) => (format!("{value}"), CellAlignment::Left),
+                                    //     Value::Blob(_) => (format!("{value}"), CellAlignment::Left),
+                                    // };
+
                                     let (content, alignment) = match value {
-                                        Value::Null => {
-                                            (self.opts.null_value.clone(), CellAlignment::Left)
+                                        Value::Integer(_) | Value::Float(_) => {
+                                            (value.to_display(), CellAlignment::Right)
                                         }
-                                        Value::Integer(_) => {
-                                            (format!("{value}"), CellAlignment::Right)
-                                        }
-                                        Value::Float(_) => {
-                                            (format!("{value}"), CellAlignment::Right)
-                                        }
-                                        Value::Text(_) => (format!("{value}"), CellAlignment::Left),
-                                        Value::Blob(_) => (format!("{value}"), CellAlignment::Left),
+                                        _ => (value.to_display(), CellAlignment::Left),
                                     };
+
                                     row.add_cell(
                                         Cell::new(content)
                                             .set_alignment(alignment)
@@ -897,12 +900,14 @@ impl Limbo {
                                 for (i, value) in record.get_values().enumerate() {
                                     self.write(&formatted_columns[i])?;
                                     self.write(b" = ")?;
-                                    if matches!(value, Value::Null) {
-                                        let bytes = self.opts.null_value.clone();
-                                        self.write(bytes.as_bytes())?;
-                                    } else {
-                                        self.write(format!("{value}").as_bytes())?;
-                                    }
+                                    // if matches!(value, Value::Null) {
+                                    //     let bytes = self.opts.null_value.clone();
+                                    //     self.write(bytes.as_bytes())?;
+                                    // } else {
+                                    //     self.write(format!("{value}").as_bytes())?;
+                                    // }
+
+                                    self.write(value.to_display().as_bytes())?;
                                     self.writeln("")?;
                                 }
                             }

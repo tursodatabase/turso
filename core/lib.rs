@@ -2403,3 +2403,15 @@ impl Iterator for QueryRunner<'_> {
         }
     }
 }
+
+impl Value {
+    pub fn to_display(&self) -> String {
+        match self {
+            Value::Null => "NULL".to_string(),
+            Value::Integer(i) => i.to_string(),
+            Value::Float(f) => crate::numeric::f64_to_string(*f),
+            Value::Text(t) => t.to_string(),
+            Value::Blob(b) => format!("BLOB({} bytes)", b.len()),
+        }
+    }
+}
