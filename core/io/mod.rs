@@ -3,10 +3,12 @@ use crate::storage::sqlite3_ondisk::WAL_FRAME_HEADER_SIZE;
 use crate::{BufferPool, CompletionError, Result};
 use bitflags::bitflags;
 use cfg_block::cfg_block;
-use intrusive_collections::intrusive_adapter;
+use intrusive_collections::{intrusive_adapter, PointerOps};
 use intrusive_collections::{LinkedList, LinkedListLink};
 use std::cell::RefCell;
 use std::fmt;
+use std::mem::offset_of;
+use std::ops::Deref;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -126,104 +128,482 @@ pub type WriteComplete = dyn FnOnce(Result<i32, CompletionError>);
 pub type SyncComplete = dyn FnOnce(Result<i32, CompletionError>);
 pub type TruncateComplete = dyn FnOnce(Result<i32, CompletionError>);
 
-#[derive(Debug, Default)]
-pub struct CompletionBuilder {
-    list: LinkedList<CompletionBuilderAdapter>,
+pub enum Operation {
+    Read {
+        file: Arc<dyn File>,
+        offset: u64,
+    },
+    Write {
+        file: Arc<dyn File>,
+        buffer: Arc<Buffer>,
+        offset: u64,
+    },
+    WriteV {
+        file: Arc<dyn File>,
+        buffers: Vec<Arc<Buffer>>,
+        offset: u64,
+    },
+    Sync {
+        file: Arc<dyn File>,
+    },
+    Truncate {
+        file: Arc<dyn File>,
+        len: u64,
+    },
+    Ready,
 }
 
-impl CompletionBuilder {
-    fn add(&mut self, completion_type: CompletionType) {
-        self.list.push_back(Box::new(CompletionNode {
-            link: LinkedListLink::new(),
-            inner: CompletionInner::new(completion_type),
-        }));
+impl Debug for Operation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Read { offset, .. } => f.debug_struct("Read").field("offset", offset).finish(),
+            Self::Write { buffer, offset, .. } => f
+                .debug_struct("Write")
+                .field("buffer", buffer)
+                .field("offset", offset)
+                .finish(),
+            Self::WriteV {
+                buffers, offset, ..
+            } => f
+                .debug_struct("WriteV")
+                .field("buffers", buffers)
+                .field("offset", offset)
+                .finish(),
+            Self::Sync { .. } => f.debug_struct("Sync").finish(),
+            Self::Truncate { len, .. } => f.debug_struct("Truncate").field("len", len).finish(),
+            Self::Ready => write!(f, "Ready"),
+        }
     }
-
-    fn append(&mut self, list: Self) {
-        self.list.back_mut().splice_after(list.list);
-    }
 }
-
-#[must_use]
-#[derive(Debug)]
-/// Completion Node that is stored in intrusive linked list
-struct CompletionNode {
-    link: LinkedListLink,
-    inner: CompletionInner,
-}
-
-// TODO: see about implementing `PointerOps` trait for CompletionBuilder to avoid boxing
-intrusive_adapter!(CompletionBuilderAdapter = Box<CompletionNode>: CompletionNode { link: LinkedListLink });
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct IOBuilder;
 
 impl IOBuilder {
-    pub fn pread<F>(&self, pos: u64, buffer: Arc<Buffer>, callback: F) -> CompletionBuilder
+    pub fn pread<F>(
+        &self,
+        file: Arc<dyn File>,
+        pos: u64,
+        buffer: Arc<Buffer>,
+        callback: F,
+    ) -> CompletionBuilder
     where
         F: FnOnce(Result<(Arc<Buffer>, i32), CompletionError>) + 'static,
     {
         let mut builder = CompletionBuilder::default();
-        let completion = CompletionType::Read(ReadCompletion::new(buffer, pos, Box::new(callback)));
-        builder.add(completion);
+        let op = Operation::Read { file, offset: pos };
+        let completion = Completion::new_read(buffer, callback);
+        builder.add(op, completion);
         builder
     }
 
-    pub fn pwrite<F>(&self, pos: u64, buffer: Arc<Buffer>, callback: F) -> CompletionBuilder
+    pub fn pwrite<F>(
+        &self,
+        file: Arc<dyn File>,
+        pos: u64,
+        buffer: Arc<Buffer>,
+        callback: F,
+    ) -> CompletionBuilder
     where
         F: FnOnce(Result<i32, CompletionError>) + 'static,
     {
         let mut builder = CompletionBuilder::default();
-        let completion =
-            CompletionType::Write(WriteCompletion::new(buffer, pos, Box::new(callback)));
-        builder.add(completion);
+        let op = Operation::Write {
+            file,
+            buffer,
+            offset: pos,
+        };
+        let completion = Completion::new_write(callback);
+        builder.add(op, completion);
         builder
     }
 
-    pub fn pwritev<F>(&self, pos: u64, buffers: Vec<Arc<Buffer>>, callback: F) -> CompletionBuilder
+    pub fn pwritev<F>(
+        &self,
+        file: Arc<dyn File>,
+        pos: u64,
+        buffers: Vec<Arc<Buffer>>,
+        callback: F,
+    ) -> CompletionBuilder
     where
         F: FnOnce(Result<i32, CompletionError>) + 'static,
     {
         let mut builder = CompletionBuilder::default();
-        let completion =
-            CompletionType::WriteV(WriteVCompletion::new(buffers, pos, Box::new(callback)));
-        builder.add(completion);
+        let op = Operation::WriteV {
+            file,
+            buffers,
+            offset: pos,
+        };
+        let completion = Completion::new_writev(callback);
+        builder.add(op, completion);
         builder
     }
 
-    pub fn sync<F>(&self, callback: F) -> CompletionBuilder
+    pub fn sync<F>(&self, file: Arc<dyn File>, callback: F) -> CompletionBuilder
     where
         F: FnOnce(Result<i32, CompletionError>) + 'static,
     {
         let mut builder = CompletionBuilder::default();
-        let completion = CompletionType::Sync(SyncCompletion::new(Box::new(callback)));
-        builder.add(completion);
+        let op = Operation::Sync { file };
+        let completion = Completion::new_sync(callback);
+        builder.add(op, completion);
         builder
     }
 
-    pub fn truncate<F>(&self, len: u64, callback: F) -> CompletionBuilder
+    pub fn truncate<F>(&self, file: Arc<dyn File>, len: u64, callback: F) -> CompletionBuilder
     where
         F: FnOnce(Result<i32, CompletionError>) + 'static,
     {
         let mut builder = CompletionBuilder::default();
-        let completion = CompletionType::Truncate(TruncateCompletion::new(len, Box::new(callback)));
-        builder.add(completion);
+        let op = Operation::Truncate { file, len };
+        let completion = Completion::new_trunc(callback);
+        builder.add(op, completion);
         builder
     }
 
     /// Creates a completion that is always ready
     pub fn ready() -> CompletionBuilder {
         let mut builder = CompletionBuilder::default();
-        let completion = CompletionType::Ready;
-        builder.add(completion);
+        let operation = Operation::Ready;
+        let completion = Completion::new_ready();
+        builder.add(operation, completion);
         builder
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct CompletionBuilder {
+    op_list: LinkedList<CompletionBuilderAdapter>,
+    completion_list: LinkedList<CompletionChainAdapter>,
+}
+
+impl CompletionBuilder {
+    pub fn add(&mut self, operation: Operation, completion: Completion) {
+        self.op_list.push_back(Box::new(CompletionNodeBuilder {
+            link: LinkedListLink::new(),
+            operation,
+        }));
+        self.completion_list.push_back(completion);
+    }
+
+    pub fn append(&mut self, list: Self) {
+        self.op_list.back_mut().splice_after(list.op_list);
+        self.completion_list
+            .back_mut()
+            .splice_after(list.completion_list);
+    }
+
+    pub fn build(self) -> Result<CompletionChain> {
+        {
+            let front = self.op_list.front().get();
+            assert!(
+                front.is_some(),
+                "CompletionBuilder must have at least one completion in it"
+            );
+        }
+
+        let mut cursor = self.completion_list.front();
+        // Completion list should have the same size of op_list
+        for node in self.op_list {
+            let c = cursor.clone_pointer().unwrap();
+            match node.operation {
+                Operation::Read { file, offset } => {
+                    file.pread(offset, c)?;
+                }
+                Operation::Write {
+                    file,
+                    buffer,
+                    offset,
+                } => {
+                    file.pwrite(offset, buffer, c)?;
+                }
+                Operation::WriteV {
+                    file,
+                    buffers,
+                    offset,
+                } => {
+                    file.pwritev(offset, buffers, c)?;
+                }
+                Operation::Sync { file } => {
+                    file.sync(c)?;
+                }
+                Operation::Truncate { file, len } => {
+                    file.truncate(len, c)?;
+                }
+                Operation::Ready => {}
+            };
+            cursor.move_next();
+        }
+        assert!(cursor.is_null());
+        Ok(CompletionChain {
+            list: self.completion_list,
+        })
+    }
+}
+
+intrusive_adapter!(CompletionBuilderAdapter = Box<CompletionNodeBuilder>: CompletionNodeBuilder { link: LinkedListLink });
+
+#[must_use]
+#[derive(Debug)]
+/// Completion Node that is stored in the Completion Builder intrusive linked list
+pub struct CompletionNodeBuilder {
+    link: LinkedListLink,
+    operation: Operation,
+}
+
+#[must_use]
+#[derive(Debug)]
+/// Completion Node that is stored in the Completion Chain intrusive linked list
+pub struct CompletionNodeChain {
+    link: LinkedListLink,
+    inner: CompletionInner,
+}
+
+impl Deref for CompletionNodeChain {
+    type Target = CompletionInner;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
     }
 }
 
 #[must_use]
 #[derive(Debug, Clone)]
 pub struct Completion {
-    inner: Arc<CompletionInner>,
+    inner: Arc<CompletionNodeChain>,
+}
+
+impl Deref for Completion {
+    type Target = CompletionInner;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl Completion {
+    pub fn new(completion_type: CompletionType) -> Self {
+        Completion {
+            inner: Arc::new(CompletionNodeChain {
+                link: LinkedListLink::new(),
+                inner: CompletionInner::new(completion_type),
+            }),
+        }
+    }
+
+    pub fn new_linked(completion_type: CompletionType) -> Self {
+        Completion {
+            inner: Arc::new(CompletionNodeChain {
+                link: LinkedListLink::new(),
+                inner: CompletionInner {
+                    completion_type,
+                    result: OnceLock::new(),
+                    needs_link: true,
+                },
+            }),
+        }
+    }
+
+    pub fn needs_link(&self) -> bool {
+        self.inner.needs_link
+    }
+
+    pub fn new_write_linked<F>(complete: F) -> Self
+    where
+        F: Fn(Result<i32, CompletionError>) + 'static,
+    {
+        Self::new_linked(CompletionType::Write(WriteCompletion::new(Box::new(
+            complete,
+        ))))
+    }
+
+    pub fn new_read<F>(buf: Arc<Buffer>, complete: F) -> Self
+    where
+        F: FnOnce(Result<(Arc<Buffer>, i32), CompletionError>) + 'static,
+    {
+        Self::new(CompletionType::Read(ReadCompletion::new(
+            buf,
+            Box::new(complete),
+        )))
+    }
+
+    pub fn new_write<F>(complete: F) -> Self
+    where
+        F: FnOnce(Result<i32, CompletionError>) + 'static,
+    {
+        Self::new(CompletionType::Write(WriteCompletion::new(Box::new(
+            complete,
+        ))))
+    }
+
+    pub fn new_writev<F>(complete: F) -> Self
+    where
+        F: FnOnce(Result<i32, CompletionError>) + 'static,
+    {
+        Self::new(CompletionType::WriteV(WriteVCompletion::new(Box::new(
+            complete,
+        ))))
+    }
+
+    pub fn new_sync<F>(complete: F) -> Self
+    where
+        F: FnOnce(Result<i32, CompletionError>) + 'static,
+    {
+        Self::new(CompletionType::Sync(SyncCompletion::new(Box::new(
+            complete,
+        ))))
+    }
+
+    pub fn new_trunc<F>(complete: F) -> Self
+    where
+        F: FnOnce(Result<i32, CompletionError>) + 'static,
+    {
+        Self::new(CompletionType::Truncate(TruncateCompletion::new(Box::new(
+            complete,
+        ))))
+    }
+
+    pub fn new_ready() -> Self {
+        Self::new(CompletionType::Ready)
+    }
+}
+
+// Adapter Code acquired by modifying the `instrusive_adapter` macro to use Completion instead of `Arc<CompletionNodeChain>`
+#[derive(Debug, Copy, Clone, Default)]
+struct CompletionPointerOps;
+
+unsafe impl PointerOps for CompletionPointerOps {
+    type Value = CompletionNodeChain;
+
+    type Pointer = Completion;
+
+    unsafe fn from_raw(&self, value: *const Self::Value) -> Self::Pointer {
+        Completion {
+            inner: Arc::from_raw(value),
+        }
+    }
+
+    fn into_raw(&self, ptr: Self::Pointer) -> *const Self::Value {
+        Arc::into_raw(ptr.inner)
+    }
+}
+
+#[allow(explicit_outlives_requirements)]
+struct CompletionChainAdapter {
+    link_ops: <LinkedListLink as intrusive_collections::DefaultLinkOps>::Ops,
+    pointer_ops: CompletionPointerOps,
+}
+unsafe impl Send for CompletionChainAdapter {}
+
+unsafe impl Sync for CompletionChainAdapter {}
+
+impl Copy for CompletionChainAdapter {}
+
+impl Clone for CompletionChainAdapter {
+    #[inline]
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl Default for CompletionChainAdapter {
+    #[inline]
+    fn default() -> Self {
+        Self::NEW
+    }
+}
+
+#[allow(dead_code)]
+impl CompletionChainAdapter {
+    pub const NEW: Self = CompletionChainAdapter {
+        link_ops: <LinkedListLink as intrusive_collections::DefaultLinkOps>::NEW,
+        pointer_ops: CompletionPointerOps,
+    };
+    #[inline]
+    pub fn new() -> Self {
+        Self::NEW
+    }
+}
+
+#[allow(dead_code, unsafe_code)]
+unsafe impl intrusive_collections::Adapter for CompletionChainAdapter {
+    type LinkOps = <LinkedListLink as intrusive_collections::DefaultLinkOps>::Ops;
+    type PointerOps = CompletionPointerOps;
+    #[inline]
+    unsafe fn get_value(
+        &self,
+        link: <Self::LinkOps as intrusive_collections::LinkOps>::LinkPtr,
+    ) -> *const <Self::PointerOps as intrusive_collections::PointerOps>::Value {
+        #[allow(clippy::cast_ptr_alignment)]
+        {
+            ((link.as_ptr()) as *const _ as *const u8).sub({
+                {
+                    offset_of!(CompletionNodeChain, link)
+                }
+            }) as *const CompletionNodeChain
+        }
+    }
+    #[inline]
+    unsafe fn get_link(
+        &self,
+        value: *const <Self::PointerOps as intrusive_collections::PointerOps>::Value,
+    ) -> <Self::LinkOps as intrusive_collections::LinkOps>::LinkPtr {
+        let ptr = (value as *const u8).add({
+            {
+                offset_of!(CompletionNodeChain, link)
+            }
+        });
+        core::ptr::NonNull::new_unchecked(ptr as *mut _)
+    }
+    #[inline]
+    fn link_ops(&self) -> &Self::LinkOps {
+        &self.link_ops
+    }
+    #[inline]
+    fn link_ops_mut(&mut self) -> &mut Self::LinkOps {
+        &mut self.link_ops
+    }
+    #[inline]
+    fn pointer_ops(&self) -> &Self::PointerOps {
+        &self.pointer_ops
+    }
+}
+
+#[derive(Debug)]
+/// Completion Chain that is ready to be sent to IO
+pub struct CompletionChain {
+    list: LinkedList<CompletionChainAdapter>,
+}
+
+impl CompletionChain {
+    /// Checks if the entire Completion chain is completed or errored
+    pub fn finished(&self) -> bool {
+        self.list.back().get().unwrap().inner.finished()
+    }
+
+    pub fn is_completed(&self) -> bool {
+        self.list.back().get().unwrap().inner.is_completed()
+    }
+
+    pub fn has_error(&self) -> bool {
+        self.list.back().get().unwrap().inner.has_error()
+    }
+
+    pub fn get_error(&self) -> Option<CompletionError> {
+        self.list.back().get().unwrap().inner.get_error()
+    }
+
+    pub fn error(&self, err: CompletionError) {
+        let mut cursor = self.list.front();
+        // Cancel all remaining completions
+        while let Some(node) = cursor.get() {
+            node.inner.error(err);
+            cursor.move_next();
+        }
+    }
+
+    pub fn abort(&self) {
+        self.error(CompletionError::Aborted);
+    }
 }
 
 #[derive(Debug)]
@@ -253,6 +633,86 @@ impl CompletionInner {
         CompletionInner {
             completion_type,
             result: OnceLock::new(),
+            needs_link: false,
+        }
+    }
+
+    pub fn is_completed(&self) -> bool {
+        if matches!(self.completion_type, CompletionType::Ready) {
+            return true;
+        }
+        self.result.get().is_some_and(|val| val.is_none())
+    }
+
+    pub fn has_error(&self) -> bool {
+        if matches!(self.completion_type, CompletionType::Ready) {
+            return false;
+        }
+        self.result.get().is_some_and(|val| val.is_some())
+    }
+
+    pub fn get_error(&self) -> Option<CompletionError> {
+        if matches!(self.completion_type, CompletionType::Ready) {
+            return None;
+        }
+        self.result.get().and_then(|res| *res)
+    }
+
+    /// Checks if the Completion completed or errored
+    pub fn finished(&self) -> bool {
+        if matches!(self.completion_type, CompletionType::Ready) {
+            return true;
+        }
+        self.result.get().is_some()
+    }
+
+    pub fn complete(&self, result: i32) {
+        let result = Ok(result);
+        match &self.completion_type {
+            CompletionType::Read(r) => r.callback(result),
+            CompletionType::Write(w) => w.callback(result),
+            CompletionType::WriteV(w) => w.callback(result),
+            CompletionType::Sync(s) => s.callback(result), // fix
+            CompletionType::Truncate(t) => t.callback(result),
+            CompletionType::Ready => {}
+        };
+        self.result.set(None).expect("result must be set only once");
+    }
+
+    pub fn error(&self, err: CompletionError) {
+        let result = Err(err);
+        match &self.completion_type {
+            CompletionType::Read(r) => r.callback(result),
+            CompletionType::Write(w) => w.callback(result),
+            CompletionType::WriteV(w) => w.callback(result),
+            CompletionType::Sync(s) => s.callback(result), // fix
+            CompletionType::Truncate(t) => t.callback(result),
+            CompletionType::Ready => {}
+        };
+        self.result
+            .set(Some(err))
+            .expect("result must be set only once");
+    }
+
+    pub fn abort(&self) {
+        self.error(CompletionError::Aborted);
+    }
+
+    /// only call this method if you are sure that the completion is
+    /// a ReadCompletion, panics otherwise
+    pub fn as_read(&self) -> &ReadCompletion {
+        match self.completion_type {
+            CompletionType::Read(ref r) => r,
+            _ => unreachable!(),
+        }
+    }
+
+    /// only call this method if you are sure that the completion is
+    /// a WriteCompletion, panics otherwise
+    pub fn as_write(&self) -> &WriteCompletion {
+        match self.completion_type {
+            CompletionType::Write(ref w) => w,
+            _ => unreachable!(),
         }
     }
 }
@@ -267,168 +727,17 @@ pub enum CompletionType {
     Ready,
 }
 
-impl Completion {
-    pub fn new(completion_type: CompletionType) -> Self {
-        Self {
-            inner: Arc::new(CompletionInner {
-                completion_type,
-                result: OnceLock::new(),
-                needs_link: false,
-            }),
-        }
-    }
-
-    pub fn new_linked(completion_type: CompletionType) -> Self {
-        Self {
-            inner: Arc::new(CompletionInner {
-                completion_type,
-                result: OnceLock::new(),
-                needs_link: true,
-            }),
-        }
-    }
-
-    pub fn needs_link(&self) -> bool {
-        self.inner.needs_link
-    }
-
-    pub fn new_write_linked<F>(complete: F) -> Self
-    where
-        F: Fn(Result<i32, CompletionError>) + 'static,
-    {
-        Self::new_linked(CompletionType::Write(WriteCompletion::new(Box::new(
-            complete,
-        ))))
-    }
-
-    pub fn new_write<F>(complete: F) -> Self
-    where
-        F: FnOnce(Result<i32, CompletionError>) + 'static,
-    {
-        Self::new(CompletionType::Write(WriteCompletion::new(Box::new(
-            complete,
-        ))))
-    }
-
-    pub fn new_read<F>(buf: Arc<Buffer>, complete: F) -> Self
-    where
-        F: FnOnce(Result<(Arc<Buffer>, i32), CompletionError>) + 'static,
-    {
-        Self::new(CompletionType::Read(ReadCompletion::new(
-            buf,
-            Box::new(complete),
-        )))
-    }
-    pub fn new_sync<F>(complete: F) -> Self
-    where
-        F: FnOnce(Result<i32, CompletionError>) + 'static,
-    {
-        Self::new(CompletionType::Sync(SyncCompletion::new(Box::new(
-            complete,
-        ))))
-    }
-
-    pub fn new_trunc<F>(len: u64, complete: F) -> Self
-    where
-        F: FnOnce(Result<i32, CompletionError>) + 'static,
-    {
-        Self::new(CompletionType::Truncate(TruncateCompletion::new(Box::new(
-            complete,
-        ))))
-    }
-
-    /// Create a dummy completed completion
-    pub fn new_dummy() -> Self {
-        let c = Self::new_write(|_| {});
-        c.complete(0);
-        c
-    }
-
-    pub fn is_completed(&self) -> bool {
-        self.inner.result.get().is_some_and(|val| val.is_none())
-    }
-
-    pub fn has_error(&self) -> bool {
-        self.inner.result.get().is_some_and(|val| val.is_some())
-    }
-
-    pub fn get_error(&self) -> Option<CompletionError> {
-        self.inner.result.get().and_then(|res| *res)
-    }
-
-    /// Checks if the Completion completed or errored
-    pub fn finished(&self) -> bool {
-        self.inner.result.get().is_some()
-    }
-
-    pub fn complete(&self, result: i32) {
-        let result = Ok(result);
-        match &self.inner.completion_type {
-            CompletionType::Read(r) => r.callback(result),
-            CompletionType::Write(w) => w.callback(result),
-            CompletionType::WriteV(w) => w.callback(result),
-            CompletionType::Sync(s) => s.callback(result), // fix
-            CompletionType::Truncate(t) => t.callback(result),
-            CompletionType::Ready => {}
-        };
-        self.inner
-            .result
-            .set(None)
-            .expect("result must be set only once");
-    }
-
-    pub fn error(&self, err: CompletionError) {
-        let result = Err(err);
-        match &self.inner.completion_type {
-            CompletionType::Read(r) => r.callback(result),
-            CompletionType::Write(w) => w.callback(result),
-            CompletionType::WriteV(w) => w.callback(result),
-            CompletionType::Sync(s) => s.callback(result), // fix
-            CompletionType::Truncate(t) => t.callback(result),
-            CompletionType::Ready => {}
-        };
-        self.inner
-            .result
-            .set(Some(err))
-            .expect("result must be set only once");
-    }
-
-    pub fn abort(&self) {
-        self.error(CompletionError::Aborted);
-    }
-
-    /// only call this method if you are sure that the completion is
-    /// a ReadCompletion, panics otherwise
-    pub fn as_read(&self) -> &ReadCompletion {
-        match self.inner.completion_type {
-            CompletionType::Read(ref r) => r,
-            _ => unreachable!(),
-        }
-    }
-
-    /// only call this method if you are sure that the completion is
-    /// a WriteCompletion, panics otherwise
-    pub fn as_write(&self) -> &WriteCompletion {
-        match self.inner.completion_type {
-            CompletionType::Write(ref w) => w,
-            _ => unreachable!(),
-        }
-    }
-}
-
 pub struct ReadCompletion {
     pub buf: Arc<Buffer>,
     pub complete: Option<Box<ReadComplete>>,
-    pub offset: u64,
     called: AtomicBool,
 }
 
 impl ReadCompletion {
-    pub fn new(buf: Arc<Buffer>, pos: u64, complete: Box<ReadComplete>) -> Self {
+    pub fn new(buf: Arc<Buffer>, complete: Box<ReadComplete>) -> Self {
         Self {
             buf,
             complete: Some(complete),
-            offset: pos,
             called: AtomicBool::new(false),
         }
     }
@@ -457,16 +766,12 @@ impl ReadCompletion {
 
 pub struct WriteCompletion {
     pub complete: Option<Box<WriteComplete>>,
-    pub buf: Arc<Buffer>,
-    pub offset: u64,
     called: AtomicBool,
 }
 
 impl WriteCompletion {
-    pub fn new(buf: Arc<Buffer>, pos: u64, complete: Box<WriteComplete>) -> Self {
+    pub fn new(complete: Box<WriteComplete>) -> Self {
         Self {
-            buf,
-            offset: pos,
             complete: Some(complete),
             called: AtomicBool::new(false),
         }
@@ -488,16 +793,12 @@ impl WriteCompletion {
 
 pub struct WriteVCompletion {
     pub complete: Option<Box<WriteComplete>>,
-    pub buffers: Vec<Arc<Buffer>>,
-    pub offset: u64,
     called: AtomicBool,
 }
 
 impl WriteVCompletion {
-    pub fn new(buffers: Vec<Arc<Buffer>>, pos: u64, complete: Box<WriteComplete>) -> Self {
+    pub fn new(complete: Box<WriteComplete>) -> Self {
         Self {
-            buffers,
-            offset: pos,
             complete: Some(complete),
             called: AtomicBool::new(false),
         }
@@ -546,14 +847,12 @@ impl SyncCompletion {
 
 pub struct TruncateCompletion {
     pub complete: Option<Box<TruncateComplete>>,
-    pub len: u64,
     called: AtomicBool,
 }
 
 impl TruncateCompletion {
-    pub fn new(len: u64, complete: Box<TruncateComplete>) -> Self {
+    pub fn new(complete: Box<TruncateComplete>) -> Self {
         Self {
-            len,
             complete: Some(complete),
             called: AtomicBool::new(false),
         }
