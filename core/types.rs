@@ -15,7 +15,7 @@ use crate::vdbe::sorter::Sorter;
 use crate::vdbe::Register;
 use crate::vtab::VirtualTableCursor;
 use crate::{turso_assert, Completion, CompletionError, Result, IO};
-use std::fmt::{Debug, Display};
+use std::fmt::{Debug, Display,Write};
 
 const MAX_REAL_SIZE: u8 = 15;
 
@@ -401,6 +401,240 @@ pub struct ExternalAggState {
     pub finalized_value: Option<Value>,
 }
 
+
+
+
+const MAX_EXACT: u64 = u64::MAX << 11;
+
+#[derive(Debug, Clone, Copy)]
+struct DoubleDouble(pub f64, pub f64);
+
+impl From<u64> for DoubleDouble {
+    fn from(value: u64) -> Self {
+        let r = value as f64;
+
+        let rr = if r <= MAX_EXACT as f64 {
+            let round_tripped = value as f64 as u64;
+            let sign = if value >= round_tripped { 1.0 } else { -1.0 };
+
+            sign * value.abs_diff(round_tripped) as f64
+        } else {
+            0.0
+        };
+
+        DoubleDouble(r, rr)
+    }
+}
+
+impl From<f64> for DoubleDouble {
+    fn from(value: f64) -> Self {
+        DoubleDouble(value, 0.0)
+    }
+}
+
+impl From<DoubleDouble> for f64 {
+    fn from(DoubleDouble(a, aa): DoubleDouble) -> Self {
+        a + aa
+    }
+}
+
+impl std::ops::Mul for DoubleDouble {
+    type Output = Self;
+
+ 
+    fn mul(self, rhs: Self) -> Self::Output {
+
+        let mask = u64::MAX << 26;
+
+        let hx = f64::from_bits(self.0.to_bits() & mask);
+        let tx = self.0 - hx;
+
+        let hy = f64::from_bits(rhs.0.to_bits() & mask);
+        let ty = rhs.0 - hy;
+
+        let p = hx * hy;
+        let q = hx * ty + tx * hy;
+
+        let c = p + q;
+        let cc = p - c + q + tx * ty;
+        let cc = self.0 * rhs.1 + self.1 * rhs.0 + cc;
+
+        let r = c + cc;
+        let rr = (c - r) + cc;
+
+        DoubleDouble(r, rr)
+    }
+}
+
+impl std::ops::MulAssign for DoubleDouble {
+    fn mul_assign(&mut self, rhs: Self) {
+        *self = *self * rhs;
+    }
+}
+
+pub fn f64_to_string(val: f64) -> String {
+    if val.is_nan() {
+        return "NaN".to_string();
+    }
+    if val.is_infinite() {
+        return if val.is_sign_positive() {
+            "Inf"
+        } else {
+            "-Inf"
+        }
+        .to_string();
+    }
+    if val == 0.0 {
+        return "0.0".to_string();
+    }
+
+    // too small
+    if val.abs() < 5e-324 {
+        return "0.0".to_string();
+    }
+
+    let mut r = val;
+    let sign = if r < 0.0 {
+        r = -r;
+        '-'
+    } else {
+        '+'
+    };
+
+    let mut rr = DoubleDouble::from(r);
+    let mut exp = 0;
+    if r > 9.223372036854774784e+18 {
+        while rr.0 > 9.223372036854774784e+118 {
+            exp += 100;
+            rr *= DoubleDouble(1.0e-100, -1.99918998026028836196e-117);
+        }
+        while rr.0 > 9.223372036854774784e+28 {
+            exp += 10;
+            rr *= DoubleDouble(1.0e-10, -3.6432197315497741579e-27);
+        }
+        while rr.0 > 9.223372036854774784e+18 {
+            exp += 1;
+            rr *= DoubleDouble(1.0e-01, -5.5511151231257827021e-18);
+        }
+    } else {
+        while rr.0 < 9.223372036854774784e-83 {
+            exp -= 100;
+            rr *= DoubleDouble(1.0e+100, -1.5902891109759918046e+83);
+        }
+        while rr.0 < 9.223372036854774784e+07 {
+            exp -= 10;
+            rr *= DoubleDouble(1.0e+10, 0.0);
+        }
+        while rr.0 < 9.22337203685477478e+17 {
+            exp -= 1;
+            rr *= DoubleDouble(1.0e+01, 0.0);
+        }
+    }
+
+    let v = if rr.1 < 0.0 {
+        (rr.0 as u64).saturating_sub((-rr.1) as u64)
+    } else {
+        (rr.0 as u64).saturating_add(rr.1 as u64)
+    };
+
+    let mut z_buf = [0u8; 40];
+    let mut i = z_buf.len() - 1;
+    let mut temp_v = v;
+    loop {
+        z_buf[i] = (temp_v % 10) as u8 + b'0';
+        temp_v /= 10;
+        if temp_v == 0 {
+            break;
+        }
+        i -= 1;
+    }
+
+    let mut start_index = i;
+    let mut n = z_buf.len() - start_index;
+    let mut i_dp = n as i32 + exp;
+
+    let mx_round = 15;
+    if n > mx_round {
+        let digits = &mut z_buf[start_index..];
+        if digits[mx_round] >= b'5' {
+            let mut j = mx_round - 1;
+            loop {
+                digits[j] += 1;
+                if digits[j] <= b'9' {
+                    break;
+                }
+                digits[j] = b'0';
+                if j == 0 {
+                    start_index -= 1;
+                    z_buf[start_index] = b'1';
+                    n += 1;
+                    i_dp += 1;
+                    break;
+                }
+                j -= 1;
+            }
+        }
+        n = mx_round;
+    }
+
+    let mut digits = &z_buf[start_index..start_index + n];
+
+    while digits.len() > 1 && digits[digits.len() - 1] == b'0' {
+        digits = &digits[..digits.len() - 1];
+    }
+
+    let mut result = String::with_capacity(32);
+    if sign == '-' {
+        result.push('-');
+    }
+
+    let n = digits.len();
+    let e = i_dp - 1;
+
+    // Use scientific notation if exponent is too small or too large
+    if e < -4 || e >= mx_round as i32 {
+        result.push(digits[0] as char);
+        if n > 1 {
+            result.push('.');
+            for &digit in &digits[1..] {
+                result.push(digit as char);
+            }
+        }
+        let _ = write!(result, "e{:+}", e);
+    } else {
+        if i_dp <= 0 {
+            result.push_str("0.");
+            result.push_str(&"0".repeat(i_dp.abs() as usize));
+            for &digit in digits {
+                result.push(digit as char);
+            }
+        } else {
+            let dp = i_dp as usize;
+            if dp >= n {
+                for &digit in digits {
+                    result.push(digit as char);
+                }
+                result.push_str(&"0".repeat(dp - n));
+                result.push_str(".0");
+            } else {
+                for &digit in &digits[..dp] {
+                    result.push(digit as char);
+                }
+                result.push('.');
+                for &digit in &digits[dp..] {
+                    result.push(digit as char);
+                }
+            }
+        }
+    }
+
+ 
+
+   result.replace("e+", "e")
+}
+
+
+
 impl ExternalAggState {
     pub fn cache_final_value(&mut self, value: Value) -> &Value {
         self.finalized_value = Some(value);
@@ -425,108 +659,12 @@ impl Display for Value {
             Self::Integer(i) => {
                 write!(f, "{i}")
             }
-            Self::Float(fl) => {
-                let fl = *fl;
-                if fl == f64::INFINITY {
-                    return write!(f, "Inf");
-                }
-                if fl == f64::NEG_INFINITY {
-                    return write!(f, "-Inf");
-                }
-                if fl.is_nan() {
-                    return write!(f, "");
-                }
-                // handle negative 0
-                if fl == -0.0 {
-                    return write!(f, "{:.1}", fl.abs());
-                }
 
-                // handle scientific notation without trailing zeros
-                if (fl.abs() < 1e-4 || fl.abs() >= 1e15) && fl != 0.0 {
-                    let sci_notation = format!("{fl:.14e}");
-                    let parts: Vec<&str> = sci_notation.split('e').collect();
 
-                    if parts.len() == 2 {
-                        let mantissa = parts[0];
-                        let exponent = parts[1];
-
-                        let decimal_parts: Vec<&str> = mantissa.split('.').collect();
-                        if decimal_parts.len() == 2 {
-                            let whole = decimal_parts[0];
-                            // 1.{this part}
-                            let mut fraction = String::from(decimal_parts[1]);
-
-                            //removing trailing 0 from fraction
-                            while fraction.ends_with('0') {
-                                fraction.pop();
-                            }
-
-                            let trimmed_mantissa = if fraction.is_empty() {
-                                whole.to_string()
-                            } else {
-                                format!("{whole}.{fraction}")
-                            };
-                            let (prefix, exponent) =
-                                if let Some(stripped_exponent) = exponent.strip_prefix('-') {
-                                    ("-0", &stripped_exponent[1..])
-                                } else {
-                                    ("+", exponent)
-                                };
-                            return write!(f, "{trimmed_mantissa}e{prefix}{exponent}");
-                        }
-                    }
-
-                    // fallback
-                    return write!(f, "{sci_notation}");
-                }
-
-                // handle floating point max size is 15.
-                // If left > right && right + left > 15 go to sci notation
-                // If right > left && right + left > 15 truncate left so right + left == 15
-                let rounded = fl.round();
-                if (fl - rounded).abs() < 1e-14 {
-                    // if we very close to integer trim decimal part to 1 digit
-                    if rounded == rounded as i64 as f64 {
-                        return write!(f, "{fl:.1}");
-                    }
-                }
-
-                let fl_str = format!("{fl}");
-                let splitted = fl_str.split('.').collect::<Vec<&str>>();
-                // fallback
-                if splitted.len() != 2 {
-                    return write!(f, "{fl:.14e}");
-                }
-
-                let first_part = if fl < 0.0 {
-                    // remove -
-                    &splitted[0][1..]
-                } else {
-                    splitted[0]
-                };
-
-                let second = splitted[1];
-
-                // We want more precision for smaller numbers. in SQLite case we want 15 non zero digits in 0 < number < 1
-                // leading zeroes added to max real size. But if float < 1e-4 we go to scientific notation
-                let leading_zeros = second.chars().take_while(|c| c == &'0').count();
-                let reminder = if first_part != "0" {
-                    MAX_REAL_SIZE as isize - first_part.len() as isize
-                } else {
-                    MAX_REAL_SIZE as isize + leading_zeros as isize
-                };
-                // float that have integer part > 15 converted to sci notation
-                if reminder < 0 {
-                    return write!(f, "{fl:.14e}");
-                }
-                // trim decimal part to reminder or self len so total digits is 15;
-                let mut fl = format!("{:.*}", second.len().min(reminder as usize), fl);
-                // if decimal part ends with 0 we trim it
-                while fl.ends_with('0') {
-                    fl.pop();
-                }
-                write!(f, "{fl}")
+             Self::Float(fl) => {
+                write!(f, "{}", f64_to_string(*fl))
             }
+       
             Self::Text(s) => {
                 write!(f, "{}", s.as_str())
             }
