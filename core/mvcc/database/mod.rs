@@ -483,6 +483,10 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                         Completion::new_dummy(),
                     )));
                 }
+                {
+                    let mut wal = self.pager.wal.as_ref().unwrap().borrow_mut();
+                    wal.update_max_frame();
+                }
                 println!("begin_write_tx(tx_id={})", self.tx_id);
                 let result = self.pager.io.block(|| self.pager.begin_write_tx())?;
                 if let crate::result::LimboResult::Busy = result {

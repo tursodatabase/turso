@@ -306,6 +306,11 @@ pub trait Wal: Debug {
 
     fn set_io_context(&mut self, ctx: IOContext);
 
+    /// Update the max frame to the current shared max frame.
+    /// Currently this is only used for MVCC as it takes care of write conflicts on its own.
+    /// This should't be used with regular WAL mode.
+    fn update_max_frame(&mut self);
+
     #[cfg(debug_assertions)]
     fn as_any(&self) -> &dyn std::any::Any;
 }
@@ -1598,6 +1603,10 @@ impl Wal for WalFile {
 
     fn set_io_context(&mut self, ctx: IOContext) {
         self.io_ctx.replace(ctx);
+    }
+
+    fn update_max_frame(&mut self) {
+        self.max_frame = self.get_shared().max_frame.load(Ordering::Acquire);
     }
 }
 

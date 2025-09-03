@@ -1324,7 +1324,6 @@ fn test_concurrent_writes() {
     // Now let's find out if we wrote everything we intended to write.
     let conn = db.connect();
     let rows = get_rows(&conn, "SELECT * FROM test ORDER BY x ASC");
-    dbg!(&rows);
     assert_eq!(
         rows.len() as i64,
         num_connections * num_inserts_per_connection
