@@ -119,7 +119,7 @@ impl File for VfsFileImpl {
         Ok(())
     }
 
-    fn pread(&self, pos: u64, c: Completion) -> Result<Completion> {
+    fn pread(&self, pos: u64, c: Completion) -> Result<()> {
         if self.vfs.is_null() {
             c.complete(-1);
             return Err(LimboError::ExtensionError("VFS is null".to_string()));
@@ -140,10 +140,10 @@ impl File for VfsFileImpl {
         if res.is_error() {
             return Err(LimboError::ExtensionError("pread failed".to_string()));
         }
-        Ok(c)
+        Ok(())
     }
 
-    fn pwrite(&self, pos: u64, buffer: Arc<Buffer>, c: Completion) -> Result<Completion> {
+    fn pwrite(&self, pos: u64, buffer: Arc<Buffer>, c: Completion) -> Result<()> {
         if self.vfs.is_null() {
             c.complete(-1);
             return Err(LimboError::ExtensionError("VFS is null".to_string()));
@@ -163,10 +163,10 @@ impl File for VfsFileImpl {
         if res.is_error() {
             return Err(LimboError::ExtensionError("pwrite failed".to_string()));
         }
-        Ok(c)
+        Ok(())
     }
 
-    fn sync(&self, c: Completion) -> Result<Completion> {
+    fn sync(&self, c: Completion) -> Result<()> {
         if self.vfs.is_null() {
             c.complete(-1);
             return Err(LimboError::ExtensionError("VFS is null".to_string()));
@@ -177,7 +177,7 @@ impl File for VfsFileImpl {
         if res.is_error() {
             return Err(LimboError::ExtensionError("sync failed".to_string()));
         }
-        Ok(c)
+        Ok(())
     }
 
     fn size(&self) -> Result<u64> {
@@ -190,7 +190,7 @@ impl File for VfsFileImpl {
         }
     }
 
-    fn truncate(&self, len: u64, c: Completion) -> Result<Completion> {
+    fn truncate(&self, len: u64, c: Completion) -> Result<()> {
         if self.vfs.is_null() {
             c.complete(-1);
             return Err(LimboError::ExtensionError("VFS is null".to_string()));
@@ -201,7 +201,7 @@ impl File for VfsFileImpl {
         if res.is_error() {
             return Err(LimboError::ExtensionError("truncate failed".to_string()));
         }
-        Ok(c)
+        Ok(())
     }
 }
 

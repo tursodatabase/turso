@@ -68,7 +68,7 @@ impl File for GenericFile {
     }
 
     #[instrument(skip(self, c), level = Level::TRACE)]
-    fn pread(&self, pos: u64, c: Completion) -> Result<Completion> {
+    fn pread(&self, pos: u64, c: Completion) -> Result<()> {
         let mut file = self.file.write();
         file.seek(std::io::SeekFrom::Start(pos))?;
         let nr = {
@@ -79,33 +79,33 @@ impl File for GenericFile {
             buf.len() as i32
         };
         c.complete(nr);
-        Ok(c)
+        Ok(())
     }
 
     #[instrument(skip(self, c, buffer), level = Level::TRACE)]
-    fn pwrite(&self, pos: u64, buffer: Arc<crate::Buffer>, c: Completion) -> Result<Completion> {
+    fn pwrite(&self, pos: u64, buffer: Arc<crate::Buffer>, c: Completion) -> Result<()> {
         let mut file = self.file.write();
         file.seek(std::io::SeekFrom::Start(pos))?;
         let buf = buffer.as_slice();
         file.write_all(buf)?;
         c.complete(buffer.len() as i32);
-        Ok(c)
+        Ok(())
     }
 
     #[instrument(err, skip_all, level = Level::TRACE)]
-    fn sync(&self, c: Completion) -> Result<Completion> {
+    fn sync(&self, c: Completion) -> Result<()> {
         let file = self.file.write();
         file.sync_all()?;
         c.complete(0);
-        Ok(c)
+        Ok(())
     }
 
     #[instrument(err, skip_all, level = Level::TRACE)]
-    fn truncate(&self, len: u64, c: Completion) -> Result<Completion> {
+    fn truncate(&self, len: u64, c: Completion) -> Result<()> {
         let file = self.file.write();
         file.set_len(len)?;
         c.complete(0);
-        Ok(c)
+        Ok(())
     }
 
     fn size(&self) -> Result<u64> {

@@ -18,14 +18,14 @@ use std::{fmt::Debug, pin::Pin};
 pub trait File: Send + Sync {
     fn lock_file(&self, exclusive: bool) -> Result<()>;
     fn unlock_file(&self) -> Result<()>;
-    fn pread(&self, pos: u64, c: Completion) -> Result<Completion>;
-    fn pwrite(&self, pos: u64, buffer: Arc<Buffer>, c: Completion) -> Result<Completion>;
-    fn sync(&self, c: Completion) -> Result<Completion>;
-    fn pwritev(&self, pos: u64, buffers: Vec<Arc<Buffer>>, c: Completion) -> Result<Completion> {
+    fn pread(&self, pos: u64, c: Completion) -> Result<()>;
+    fn pwrite(&self, pos: u64, buffer: Arc<Buffer>, c: Completion) -> Result<()>;
+    fn sync(&self, c: Completion) -> Result<()>;
+    fn pwritev(&self, pos: u64, buffers: Vec<Arc<Buffer>>, c: Completion) -> Result<()> {
         use std::sync::atomic::{AtomicUsize, Ordering};
         if buffers.is_empty() {
             c.complete(0);
-            return Ok(c);
+            return Ok(());
         }
         if buffers.len() == 1 {
             return self.pwrite(pos, buffers[0].clone(), c);
@@ -64,10 +64,10 @@ pub trait File: Send + Sync {
             }
             pos += len as u64;
         }
-        Ok(c)
+        Ok(())
     }
     fn size(&self) -> Result<u64>;
-    fn truncate(&self, len: u64, c: Completion) -> Result<Completion>;
+    fn truncate(&self, len: u64, c: Completion) -> Result<()>;
 }
 
 #[derive(Debug, Copy, Clone, PartialEq)]

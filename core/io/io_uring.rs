@@ -690,7 +690,7 @@ impl File for UringFile {
         Ok(())
     }
 
-    fn pread(&self, pos: u64, c: Completion) -> Result<Completion> {
+    fn pread(&self, pos: u64, c: Completion) -> Result<()> {
         let r = c.as_read();
         let read_e = {
             let buf = r.buf();
@@ -723,10 +723,10 @@ impl File for UringFile {
             })
         };
         self.io.lock().ring.submit_entry(&read_e);
-        Ok(c)
+        Ok(())
     }
 
-    fn pwrite(&self, pos: u64, buffer: Arc<crate::Buffer>, c: Completion) -> Result<Completion> {
+    fn pwrite(&self, pos: u64, buffer: Arc<crate::Buffer>, c: Completion) -> Result<()> {
         let mut io = self.io.lock();
         let mut write = {
             let ptr = buffer.as_ptr();
@@ -766,10 +766,10 @@ impl File for UringFile {
         }
 
         io.ring.submit_entry(&write);
-        Ok(c)
+        Ok(())
     }
 
-    fn sync(&self, c: Completion) -> Result<Completion> {
+    fn sync(&self, c: Completion) -> Result<()> {
         let mut io = self.io.lock();
         trace!("sync()");
         let sync = with_fd!(self, |fd| {
@@ -780,7 +780,7 @@ impl File for UringFile {
         // sync always ends the chain of linked operations
         io.ring.pending_link.store(false, Ordering::Release);
         io.ring.submit_entry(&sync);
-        Ok(c)
+        Ok(())
     }
 
     fn pwritev(
@@ -788,7 +788,7 @@ impl File for UringFile {
         pos: u64,
         bufs: Vec<Arc<crate::Buffer>>,
         c: Completion,
-    ) -> Result<Completion> {
+    ) -> Result<()> {
         // for a single buffer use pwrite directly
         if bufs.len().eq(&1) {
             return self.pwrite(pos, bufs[0].clone(), c.clone());
@@ -801,14 +801,14 @@ impl File for UringFile {
         let continue_chain = !linked && io.ring.pending_link.load(Ordering::Acquire);
         io.ring
             .submit_writev(get_key(c.clone()), state, continue_chain);
-        Ok(c)
+        Ok(())
     }
 
     fn size(&self) -> Result<u64> {
         Ok(self.file.metadata()?.len())
     }
 
-    fn truncate(&self, len: u64, c: Completion) -> Result<Completion> {
+    fn truncate(&self, len: u64, c: Completion) -> Result<()> {
         let mut truncate = with_fd!(self, |fd| {
             io_uring::opcode::Ftruncate::new(fd, len)
                 .build()
@@ -819,7 +819,7 @@ impl File for UringFile {
             truncate = truncate.flags(io_uring::squeue::Flags::IO_LINK);
         }
         io.ring.submit_entry(&truncate);
-        Ok(c)
+        Ok(())
     }
 }
 

@@ -87,19 +87,19 @@ impl File for MemoryFile {
         Ok(())
     }
 
-    fn pread(&self, pos: u64, c: Completion) -> Result<Completion> {
+    fn pread(&self, pos: u64, c: Completion) -> Result<()> {
         tracing::debug!("pread(path={}): pos={}", self.path, pos);
         let r = c.as_read();
         let buf_len = r.buf().len() as u64;
         if buf_len == 0 {
             c.complete(0);
-            return Ok(c);
+            return Ok(());
         }
 
         let file_size = self.size.get();
         if pos >= file_size {
             c.complete(0);
-            return Ok(c);
+            return Ok(());
         }
 
         let read_len = buf_len.min(file_size - pos);
@@ -126,10 +126,10 @@ impl File for MemoryFile {
             }
         }
         c.complete(read_len as i32);
-        Ok(c)
+        Ok(())
     }
 
-    fn pwrite(&self, pos: u64, buffer: Arc<Buffer>, c: Completion) -> Result<Completion> {
+    fn pwrite(&self, pos: u64, buffer: Arc<Buffer>, c: Completion) -> Result<()> {
         tracing::debug!(
             "pwrite(path={}): pos={}, size={}",
             self.path,
@@ -139,7 +139,7 @@ impl File for MemoryFile {
         let buf_len = buffer.len();
         if buf_len == 0 {
             c.complete(0);
-            return Ok(c);
+            return Ok(());
         }
 
         let mut offset = pos as usize;
@@ -167,17 +167,17 @@ impl File for MemoryFile {
             .set(core::cmp::max(pos + buf_len as u64, self.size.get()));
 
         c.complete(buf_len as i32);
-        Ok(c)
+        Ok(())
     }
 
-    fn sync(&self, c: Completion) -> Result<Completion> {
+    fn sync(&self, c: Completion) -> Result<()> {
         tracing::debug!("sync(path={})", self.path);
         // no-op
         c.complete(0);
-        Ok(c)
+        Ok(())
     }
 
-    fn truncate(&self, len: u64, c: Completion) -> Result<Completion> {
+    fn truncate(&self, len: u64, c: Completion) -> Result<()> {
         tracing::debug!("truncate(path={}): len={}", self.path, len);
         if len < self.size.get() {
             // Truncate pages
@@ -188,10 +188,10 @@ impl File for MemoryFile {
         }
         self.size.set(len);
         c.complete(0);
-        Ok(c)
+        Ok(())
     }
 
-    fn pwritev(&self, pos: u64, buffers: Vec<Arc<Buffer>>, c: Completion) -> Result<Completion> {
+    fn pwritev(&self, pos: u64, buffers: Vec<Arc<Buffer>>, c: Completion) -> Result<()> {
         tracing::debug!(
             "pwritev(path={}): pos={}, buffers={:?}",
             self.path,
@@ -231,7 +231,7 @@ impl File for MemoryFile {
         c.complete(total_written as i32);
         self.size
             .set(core::cmp::max(pos + total_written as u64, self.size.get()));
-        Ok(c)
+        Ok(())
     }
 
     fn size(&self) -> Result<u64> {

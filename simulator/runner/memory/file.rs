@@ -180,7 +180,7 @@ impl File for MemorySimFile {
         Ok(())
     }
 
-    fn pread(&self, pos: u64, c: Completion) -> Result<Completion> {
+    fn pread(&self, pos: u64, c: Completion) -> Result<()> {
         self.io_tracker.borrow_mut().pread_calls += 1;
 
         let op = OperationType::Read {
@@ -188,7 +188,7 @@ impl File for MemorySimFile {
             offset: pos as usize,
         };
         self.insert_op(op);
-        Ok(c)
+        Ok(())
     }
 
     fn pwrite(
@@ -196,7 +196,7 @@ impl File for MemorySimFile {
         pos: u64,
         buffer: Arc<turso_core::Buffer>,
         c: Completion,
-    ) -> Result<Completion> {
+    ) -> Result<()> {
         self.io_tracker.borrow_mut().pwrite_calls += 1;
         let op = OperationType::Write {
             buffer,
@@ -204,7 +204,7 @@ impl File for MemorySimFile {
             offset: pos as usize,
         };
         self.insert_op(op);
-        Ok(c)
+        Ok(())
     }
 
     fn pwritev(
@@ -212,7 +212,7 @@ impl File for MemorySimFile {
         pos: u64,
         buffers: Vec<Arc<turso_core::Buffer>>,
         c: Completion,
-    ) -> Result<Completion> {
+    ) -> Result<()> {
         if buffers.len() == 1 {
             return self.pwrite(pos, buffers[0].clone(), c);
         }
@@ -223,16 +223,16 @@ impl File for MemorySimFile {
             offset: pos as usize,
         };
         self.insert_op(op);
-        Ok(c)
+        Ok(())
     }
 
-    fn sync(&self, c: Completion) -> Result<Completion> {
+    fn sync(&self, c: Completion) -> Result<()> {
         self.io_tracker.borrow_mut().sync_calls += 1;
         let op = OperationType::Sync {
             completion: c.clone(),
         };
         self.insert_op(op);
-        Ok(c)
+        Ok(())
     }
 
     fn size(&self) -> Result<u64> {
@@ -241,13 +241,13 @@ impl File for MemorySimFile {
         Ok(self.buffer.borrow().len() as u64)
     }
 
-    fn truncate(&self, len: u64, c: Completion) -> Result<Completion> {
+    fn truncate(&self, len: u64, c: Completion) -> Result<()> {
         self.io_tracker.borrow_mut().truncate_calls += 1;
         let op = OperationType::Truncate {
             completion: c.clone(),
             len: len as usize,
         };
         self.insert_op(op);
-        Ok(c)
+        Ok(())
     }
 }
