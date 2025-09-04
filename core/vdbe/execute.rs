@@ -6493,6 +6493,10 @@ pub fn op_parse_schema(
     conn.is_nested_stmt.set(false);
     conn.auto_commit.set(previous_auto_commit);
     maybe_nested_stmt_err?;
+
+    // let updated_local_schema = conn.schema.borrow().clone();
+    // conn._db.update_schema_if_newer(updated_local_schema)?;
+
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }

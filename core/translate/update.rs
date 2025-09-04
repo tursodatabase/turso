@@ -258,6 +258,7 @@ pub fn prepare_update_plan(
             root_page: 0, // Not relevant for ephemeral table definition
             name: "ephemeral_scratch".to_string(),
             has_rowid: true,
+            has_autoincrement: false,
             primary_key_columns: vec![],
             columns: vec![Column {
                 name: Some("rowid".to_string()),

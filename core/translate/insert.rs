@@ -34,6 +34,7 @@ use super::expr::{translate_expr, translate_expr_no_constant_opt, NoConstantOptR
 use super::optimizer::rewrite_expr;
 use super::plan::QueryDestination;
 use super::select::translate_select;
+use crate::schema::sqlite_schema_table;
 
 struct TempTableCtx {
     cursor_id: usize,
@@ -362,11 +363,28 @@ pub fn translate_insert(
     }
 
     // Create new rowid if a) not provided by user or b) provided by user but is NULL
-    program.emit_insn(Insn::NewRowid {
-        cursor: cursor_id,
-        rowid_reg: insertion.key_register(),
-        prev_largest_reg: 0,
-    });
+    // program.emit_insn(Insn::NewRowid {
+    //     cursor: cursor_id,
+    //     rowid_reg: insertion.key_register(),
+    //     prev_largest_reg: 0,
+    // });
+
+    if btree_table.has_autoincrement {
+        // Table has AUTOINCREMENT, use the sqlite_sequence logic.
+        emit_autoincrement_logic(
+            &mut program,
+            schema,
+            &btree_table,
+            cursor_id,
+            insertion.key_register(),
+        )?;
+    } else {
+        program.emit_insn(Insn::NewRowid {
+            cursor: cursor_id,
+            rowid_reg: insertion.key_register(),
+            prev_largest_reg: 0,
+        });
+    }
 
     if let Some(must_be_int_label) = check_rowid_is_integer_label {
         program.resolve_label(must_be_int_label, program.offset());
@@ -1131,4 +1149,192 @@ fn translate_virtual_table_insert(
     program.resolve_label(halt_label, program.offset());
 
     Ok(program)
+}
+
+fn emit_autoincrement_logic(
+    program: &mut ProgramBuilder,
+    schema: &Schema,
+    table: &schema::BTreeTable,
+    main_cursor_id: usize,
+    key_register: usize,
+) -> Result<()> {
+    let seq_table = schema.get_btree_table("sqlite_sequence").ok_or_else(|| {
+        crate::error::LimboError::InternalError("sqlite_sequence table not found".to_string())
+    })?;
+
+    let seq_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(seq_table.clone()));
+    program.emit_insn(Insn::OpenWrite {
+        cursor_id: seq_cursor_id,
+        root_page: seq_table.root_page.into(),
+        db: 0,
+    });
+
+    let table_name_reg = program.emit_string8_new_reg(table.name.clone());
+    let r_seq = program.alloc_register();
+    let r_max = program.alloc_register();
+    let r_seq_rowid = program.alloc_register();
+
+    program.emit_insn(Insn::Integer {
+        dest: r_seq,
+        value: 0,
+    });
+
+    program.emit_insn(Insn::Null {
+        dest: r_seq_rowid,
+        dest_end: None,
+    });
+
+    let loop_start_label = program.allocate_label();
+    let loop_end_label = program.allocate_label();
+    let found_label = program.allocate_label();
+
+    program.emit_insn(Insn::Rewind {
+        cursor_id: seq_cursor_id,
+        pc_if_empty: loop_end_label,
+    });
+    program.preassign_label_to_next_insn(loop_start_label);
+
+    let name_col_reg = program.alloc_register();
+
+    // Read 'name' column (index 0)
+
+    program.emit_column_or_rowid(seq_cursor_id, 0, name_col_reg);
+
+    program.emit_insn(Insn::Ne {
+        // If name != our_table, continue
+        lhs: table_name_reg,
+        rhs: name_col_reg,
+        target_pc: found_label,
+        flags: Default::default(),
+        collation: None,
+    });
+
+    // Read 'seq' column (index 1)
+    program.emit_column_or_rowid(seq_cursor_id, 1, r_seq);
+    program.emit_insn(Insn::RowId {
+        cursor_id: seq_cursor_id,
+        dest: r_seq_rowid,
+    });
+    program.emit_insn(Insn::Goto {
+        target_pc: loop_end_label,
+    });
+
+    program.preassign_label_to_next_insn(found_label);
+    program.emit_insn(Insn::Next {
+        cursor_id: seq_cursor_id,
+        pc_if_next: loop_start_label,
+    });
+    program.preassign_label_to_next_insn(loop_end_label);
+
+    // get the largest
+    let dummy_reg = program.alloc_register();
+    program.emit_insn(Insn::NewRowid {
+        cursor: main_cursor_id,
+        rowid_reg: dummy_reg,
+        prev_largest_reg: r_max,
+    });
+
+    let r_max_is_bigger_label = program.allocate_label();
+    let continue_label = program.allocate_label();
+    program.emit_insn(Insn::Ge {
+        lhs: r_max,
+        rhs: r_seq,
+        target_pc: r_max_is_bigger_label,
+        flags: Default::default(),
+        collation: None,
+    });
+    program.emit_insn(Insn::Copy {
+        src_reg: r_seq,
+        dst_reg: key_register,
+        extra_amount: 0,
+    });
+    program.emit_insn(Insn::Goto {
+        target_pc: continue_label,
+    });
+
+    program.preassign_label_to_next_insn(r_max_is_bigger_label);
+    program.emit_insn(Insn::Copy {
+        src_reg: r_max,
+        dst_reg: key_register,
+        extra_amount: 0,
+    });
+    program.preassign_label_to_next_insn(continue_label);
+
+    program.emit_insn(Insn::AddImm {
+        register: key_register,
+        value: 1,
+    });
+
+    let record_reg = program.alloc_register();
+    let record_start_reg = program.alloc_registers(2);
+    program.emit_insn(Insn::Copy {
+        src_reg: table_name_reg,
+        dst_reg: record_start_reg,
+        extra_amount: 0,
+    });
+    program.emit_insn(Insn::Copy {
+        src_reg: key_register,
+        dst_reg: record_start_reg + 1,
+        extra_amount: 0,
+    });
+
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: record_start_reg,
+        count: 2,
+        dest_reg: record_reg,
+        index_name: None,
+    });
+
+    let update_existing_label = program.allocate_label();
+
+    let end_update_label = program.allocate_label();
+    program.emit_insn(Insn::NotNull {
+        reg: r_seq_rowid,
+        target_pc: update_existing_label,
+    });
+
+    program.emit_insn(Insn::NewRowid {
+        cursor: seq_cursor_id,
+        rowid_reg: r_seq_rowid,
+        prev_largest_reg: 0,
+    });
+    program.emit_insn(Insn::Insert {
+        cursor: seq_cursor_id,
+        key_reg: r_seq_rowid,
+        record_reg,
+        flag: InsertFlags::new(),
+        table_name: "sqlite_sequence".to_string(),
+    });
+    program.emit_insn(Insn::Goto {
+        target_pc: end_update_label,
+    });
+
+    program.preassign_label_to_next_insn(update_existing_label);
+    program.emit_insn(Insn::Insert {
+        cursor: seq_cursor_id,
+        key_reg: r_seq_rowid, // Use the rowid we found
+        record_reg,
+        flag: InsertFlags(turso_parser::ast::ResolveType::Replace.bit_value() as u8),
+        table_name: "sqlite_sequence".to_string(),
+    });
+
+    // program.emit_insn(Insn::Goto { target_pc: end_update_label });
+
+    // program.preassign_label_to_next_insn(insert_new_label);
+    // program.emit_insn(Insn::NewRowid { cursor: seq_cursor_id, rowid_reg: r_seq_rowid, prev_largest_reg: 0 });
+    // program.emit_insn(Insn::Insert {
+    //     cursor: seq_cursor_id,
+    //     key_reg: r_seq_rowid,
+    //     record_reg,
+    //     flag: InsertFlags::new(),
+    //     table_name: "sqlite_sequence".to_string(),
+    // });
+
+    program.preassign_label_to_next_insn(end_update_label);
+
+    program.emit_insn(Insn::Close {
+        cursor_id: seq_cursor_id,
+    });
+
+    Ok(())
 }

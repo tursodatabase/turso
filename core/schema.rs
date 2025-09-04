@@ -672,6 +672,7 @@ pub struct BTreeTable {
     pub columns: Vec<Column>,
     pub has_rowid: bool,
     pub is_strict: bool,
+    pub has_autoincrement: bool,
     pub unique_sets: Option<Vec<Vec<(String, SortOrder)>>>,
 }
 
@@ -830,6 +831,7 @@ fn create_table(
     let table_name = normalize_ident(tbl_name.name.as_str());
     trace!("Creating table {}", table_name);
     let mut has_rowid = true;
+    let mut has_autoincrement = false;
     let mut primary_key_columns = vec![];
     let mut cols = vec![];
     let is_strict: bool;
@@ -922,12 +924,25 @@ fn create_table(
                 let mut collation = None;
                 for c_def in constraints {
                     match c_def.constraint {
-                        ast::ColumnConstraint::PrimaryKey { order: o, .. } => {
+                        ast::ColumnConstraint::PrimaryKey {
+                            order: o,
+                            auto_increment,
+                            ..
+                        } => {
                             primary_key = true;
+                            if auto_increment {
+                                has_autoincrement = true;
+                            }
                             if let Some(o) = o {
                                 order = o;
                             }
                         }
+                        // ast::ColumnConstraint::PrimaryKey { order: o, .. } => {
+                        //     primary_key = true;
+                        //     if let Some(o) = o {
+                        //         order = o;
+                        //     }
+                        // }
                         ast::ColumnConstraint::NotNull { nullable, .. } => {
                             notnull = !nullable;
                         }
@@ -986,6 +1001,7 @@ fn create_table(
         name: table_name,
         has_rowid,
         primary_key_columns,
+        has_autoincrement,
         columns: cols,
         is_strict,
         unique_sets: if unique_sets.is_empty() {
@@ -1302,6 +1318,7 @@ pub fn sqlite_schema_table() -> BTreeTable {
         name: "sqlite_schema".to_string(),
         has_rowid: true,
         is_strict: false,
+        has_autoincrement: false,
         primary_key_columns: vec![],
         columns: vec![
             Column {
@@ -1984,6 +2001,7 @@ mod tests {
             name: "t1".to_string(),
             has_rowid: true,
             is_strict: false,
+            has_autoincrement: false,
             primary_key_columns: vec![("nonexistent".to_string(), SortOrder::Asc)],
             columns: vec![Column {
                 name: Some("a".to_string()),

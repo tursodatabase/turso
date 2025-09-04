@@ -438,6 +438,7 @@ impl Limbo {
         }
 
         self.reset_input();
+
     }
 
     fn print_query_performance_stats(&mut self, start: Instant, stats: QueryStatistics) {
