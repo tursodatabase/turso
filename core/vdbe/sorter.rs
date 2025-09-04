@@ -7,6 +7,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use tempfile;
 
+use crate::io::CompletionBuilder;
 use crate::types::IOCompletions;
 use crate::util::IOExt;
 use crate::{
@@ -480,7 +481,7 @@ impl SortedChunk {
         }
     }
 
-    fn read(&mut self) -> Result<Completion> {
+    fn read(&mut self) -> Result<CompletionBuilder> {
         self.io_state.set(SortedChunkIOState::WaitingForRead);
 
         let read_buffer_size = self.buffer.borrow().len() - self.buffer_len.get();
@@ -531,7 +532,7 @@ impl SortedChunk {
         records: &mut Vec<SortableImmutableRecord>,
         record_size_lengths: Vec<usize>,
         chunk_size: usize,
-    ) -> Result<Completion> {
+    ) -> Result<CompletionBuilder> {
         assert!(self.io_state.get() == SortedChunkIOState::None);
         self.io_state.set(SortedChunkIOState::WaitingForWrite);
         self.chunk_size = chunk_size;

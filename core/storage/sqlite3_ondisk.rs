@@ -51,7 +51,7 @@ use super::pager::PageRef;
 use super::wal::TursoRwLock;
 use crate::error::LimboError;
 use crate::fast_lock::SpinLock;
-use crate::io::{Buffer, Completion, ReadComplete};
+use crate::io::{Buffer, Completion, CompletionBuilder, ReadComplete};
 use crate::storage::btree::offset::{
     BTREE_CELL_CONTENT_AREA, BTREE_CELL_COUNT, BTREE_FIRST_FREEBLOCK, BTREE_FRAGMENTED_BYTES_COUNT,
     BTREE_PAGE_TYPE, BTREE_RIGHTMOST_PTR,
@@ -902,7 +902,7 @@ pub fn begin_read_page(
     page_idx: usize,
     allow_empty_read: bool,
     io_ctx: &IOContext,
-) -> Result<Completion> {
+) -> Result<CompletionBuilder> {
     tracing::trace!("begin_read_btree_page(page_idx = {})", page_idx);
     let buf = buffer_pool.get_page();
     #[allow(clippy::arc_with_non_send_sync)]
@@ -947,7 +947,7 @@ pub fn finish_read_page(page_idx: usize, buffer_ref: Arc<Buffer>, page: PageRef)
 }
 
 #[instrument(skip_all, level = Level::DEBUG)]
-pub fn begin_write_btree_page(pager: &Pager, page: &PageRef) -> Result<Completion> {
+pub fn begin_write_btree_page(pager: &Pager, page: &PageRef) -> Result<CompletionBuilder> {
     tracing::trace!("begin_write_btree_page(page={})", page.get().id);
     let page_source = &pager.db_file;
     let page_finish = page.clone();
@@ -997,7 +997,7 @@ pub fn write_pages_vectored(
     batch: BTreeMap<usize, Arc<Buffer>>,
     done_flag: Arc<AtomicBool>,
     final_write: bool,
-) -> Result<Vec<Completion>> {
+) -> Result<CompletionBuilder> {
     if batch.is_empty() {
         done_flag.store(true, Ordering::Relaxed);
         return Ok(Vec::new());
@@ -1104,7 +1104,7 @@ pub fn write_pages_vectored(
 pub fn begin_sync(
     db_file: Arc<dyn DatabaseStorage>,
     syncing: Rc<Cell<bool>>,
-) -> Result<Completion> {
+) -> Result<CompletionBuilder> {
     assert!(!syncing.get());
     syncing.set(true);
     let completion = Completion::new_sync(move |_| {
@@ -1856,7 +1856,7 @@ pub fn begin_read_wal_frame_raw(
     io: &Arc<dyn File>,
     offset: u64,
     complete: Box<ReadComplete>,
-) -> Result<Completion> {
+) -> Result<CompletionBuilder> {
     tracing::trace!("begin_read_wal_frame_raw(offset={})", offset);
     let buf = Arc::new(buffer_pool.get_wal_frame());
     #[allow(clippy::arc_with_non_send_sync)]
@@ -1872,7 +1872,7 @@ pub fn begin_read_wal_frame(
     complete: Box<ReadComplete>,
     page_idx: usize,
     io_ctx: &IOContext,
-) -> Result<Completion> {
+) -> Result<CompletionBuilder> {
     tracing::trace!(
         "begin_read_wal_frame(offset={}, page_idx={})",
         offset,
@@ -1972,7 +1972,7 @@ pub fn prepare_wal_frame(
     (final_checksum, Arc::new(buffer))
 }
 
-pub fn begin_write_wal_header(io: &Arc<dyn File>, header: &WalHeader) -> Result<Completion> {
+pub fn begin_write_wal_header(io: &Arc<dyn File>, header: &WalHeader) -> Result<CompletionBuilder> {
     tracing::trace!("begin_write_wal_header");
     let buffer = {
         let buffer = Buffer::new_temporary(WAL_HEADER_SIZE);

@@ -251,6 +251,23 @@ pub struct CompletionBuilder {
 }
 
 impl CompletionBuilder {
+    pub fn is_empty(&self) -> bool {
+        self.completion_list.is_empty()
+    }
+
+    /// Asserts that the CompletionBuilder contains only a Single Completion and returns it
+    pub fn get_single(&self) -> Completion {
+        let cursor = self.completion_list.front();
+        let c = cursor
+            .clone_pointer()
+            .expect("Completion Builder should contain 1 Completion");
+        assert!(
+            cursor.peek_next().is_null(),
+            "Completion Builder should contain only 1 Completion",
+        );
+        c
+    }
+
     pub fn add(&mut self, operation: Operation, completion: Completion) {
         self.op_list.push_back(Box::new(CompletionNodeBuilder {
             link: LinkedListLink::new(),

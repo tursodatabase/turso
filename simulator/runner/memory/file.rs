@@ -191,12 +191,7 @@ impl File for MemorySimFile {
         Ok(())
     }
 
-    fn pwrite(
-        &self,
-        pos: u64,
-        buffer: Arc<turso_core::Buffer>,
-        c: Completion,
-    ) -> Result<()> {
+    fn pwrite(&self, pos: u64, buffer: Arc<turso_core::Buffer>, c: Completion) -> Result<()> {
         self.io_tracker.borrow_mut().pwrite_calls += 1;
         let op = OperationType::Write {
             buffer,

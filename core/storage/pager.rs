@@ -1,3 +1,4 @@
+use crate::io::CompletionBuilder;
 use crate::result::LimboResult;
 use crate::storage::wal::IOV_MAX;
 use crate::storage::{
@@ -1089,7 +1090,7 @@ impl Pager {
         page_idx: usize,
         frame_watermark: Option<u64>,
         allow_empty_read: bool,
-    ) -> Result<(PageRef, Completion)> {
+    ) -> Result<(PageRef, CompletionBuilder)> {
         tracing::trace!("read_page_no_cache(page_idx = {})", page_idx);
         let page = Arc::new(Page::new(page_idx));
         let io_ctx = &self.io_ctx.borrow();
@@ -1138,7 +1139,7 @@ impl Pager {
         page: PageRef,
         allow_empty_read: bool,
         io_ctx: &IOContext,
-    ) -> Result<Completion> {
+    ) -> Result<CompletionBuilder> {
         sqlite3_ondisk::begin_read_page(
             self.db_file.clone(),
             self.buffer_pool.clone(),
@@ -1234,7 +1235,7 @@ impl Pager {
     /// Flush all dirty pages to disk.
     /// Unlike commit_dirty_pages, this function does not commit, checkpoint now sync the WAL/Database.
     #[instrument(skip_all, level = Level::INFO)]
-    pub fn cacheflush(&self) -> Result<Vec<Completion>> {
+    pub fn cacheflush(&self) -> Result<CompletionBuilder> {
         let Some(wal) = self.wal.as_ref() else {
             // TODO: when ephemeral table spills to disk, it should cacheflush pages directly to the temporary database file.
             // This handling is not yet implemented, but it should be when spilling is implemented.
@@ -1450,7 +1451,7 @@ impl Pager {
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
-    pub fn wal_get_frame(&self, frame_no: u64, frame: &mut [u8]) -> Result<Completion> {
+    pub fn wal_get_frame(&self, frame_no: u64, frame: &mut [u8]) -> Result<CompletionBuilder> {
         let Some(wal) = self.wal.as_ref() else {
             return Err(LimboError::InternalError(
                 "wal_get_frame() called on database without WAL".to_string(),
