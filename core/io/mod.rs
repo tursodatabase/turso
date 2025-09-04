@@ -181,83 +181,55 @@ impl Debug for Operation {
 pub struct IOBuilder;
 
 impl IOBuilder {
-    pub fn pread<F>(
-        &self,
-        file: Arc<dyn File>,
-        pos: u64,
-        buffer: Arc<Buffer>,
-        callback: F,
-    ) -> CompletionBuilder
-    where
-        F: FnOnce(Result<(Arc<Buffer>, i32), CompletionError>) + 'static,
-    {
+    pub fn pread(file: Arc<dyn File>, pos: u64, completion: Completion) -> CompletionBuilder {
         let mut builder = CompletionBuilder::default();
         let op = Operation::Read { file, offset: pos };
-        let completion = Completion::new_read(buffer, callback);
         builder.add(op, completion);
         builder
     }
 
-    pub fn pwrite<F>(
-        &self,
+    pub fn pwrite(
         file: Arc<dyn File>,
         pos: u64,
         buffer: Arc<Buffer>,
-        callback: F,
-    ) -> CompletionBuilder
-    where
-        F: FnOnce(Result<i32, CompletionError>) + 'static,
-    {
+        completion: Completion,
+    ) -> CompletionBuilder {
         let mut builder = CompletionBuilder::default();
         let op = Operation::Write {
             file,
             buffer,
             offset: pos,
         };
-        let completion = Completion::new_write(callback);
         builder.add(op, completion);
         builder
     }
 
-    pub fn pwritev<F>(
-        &self,
+    pub fn pwritev(
         file: Arc<dyn File>,
         pos: u64,
         buffers: Vec<Arc<Buffer>>,
-        callback: F,
-    ) -> CompletionBuilder
-    where
-        F: FnOnce(Result<i32, CompletionError>) + 'static,
-    {
+        completion: Completion,
+    ) -> CompletionBuilder {
         let mut builder = CompletionBuilder::default();
         let op = Operation::WriteV {
             file,
             buffers,
             offset: pos,
         };
-        let completion = Completion::new_writev(callback);
         builder.add(op, completion);
         builder
     }
 
-    pub fn sync<F>(&self, file: Arc<dyn File>, callback: F) -> CompletionBuilder
-    where
-        F: FnOnce(Result<i32, CompletionError>) + 'static,
-    {
+    pub fn sync(file: Arc<dyn File>, completion: Completion) -> CompletionBuilder {
         let mut builder = CompletionBuilder::default();
         let op = Operation::Sync { file };
-        let completion = Completion::new_sync(callback);
         builder.add(op, completion);
         builder
     }
 
-    pub fn truncate<F>(&self, file: Arc<dyn File>, len: u64, callback: F) -> CompletionBuilder
-    where
-        F: FnOnce(Result<i32, CompletionError>) + 'static,
-    {
+    pub fn truncate(file: Arc<dyn File>, len: u64, completion: Completion) -> CompletionBuilder {
         let mut builder = CompletionBuilder::default();
         let op = Operation::Truncate { file, len };
-        let completion = Completion::new_trunc(callback);
         builder.add(op, completion);
         builder
     }
