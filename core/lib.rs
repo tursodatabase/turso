@@ -49,7 +49,6 @@ use crate::types::{WalFrameInfo, WalState};
 use crate::util::{OpenMode, OpenOptions};
 use crate::vdbe::metrics::ConnectionMetrics;
 use crate::vtab::VirtualTable;
-use crate::{incremental::view::ViewTransactionState, io::CompletionBuilder};
 use core::str;
 pub use error::{CompletionError, LimboError};
 pub use io::clock::{Clock, Instant};
@@ -58,8 +57,8 @@ pub use io::UnixIO;
 #[cfg(all(feature = "fs", target_os = "linux", feature = "io_uring"))]
 pub use io::UringIO;
 pub use io::{
-    Buffer, Completion, CompletionType, File, MemoryIO, OpenFlags, PlatformIO, SyscallIO,
-    WriteCompletion, IO,
+    Buffer, Completion, CompletionBuilder, CompletionType, File, IOBuilder, MemoryIO, OpenFlags,
+    PlatformIO, SyscallIO, WriteCompletion, IO,
 };
 use parking_lot::RwLock;
 use schema::Schema;

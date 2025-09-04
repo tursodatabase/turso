@@ -379,9 +379,7 @@ impl Connection {
             .map_err(|e| Error::MutexError(e.to_string()))?;
         let completions = conn.cacheflush()?;
         let pager = conn.get_pager();
-        for c in completions {
-            pager.io.wait_for_completion(c)?;
-        }
+        completions.wait(pager.io.as_ref())?;
         Ok(())
     }
 

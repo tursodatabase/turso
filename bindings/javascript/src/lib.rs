@@ -18,6 +18,7 @@ use std::{
     num::NonZeroUsize,
     sync::Arc,
 };
+use turso_core::IOBuilder;
 
 /// Step result constants
 const STEP_ROW: u32 = 1;
@@ -563,15 +564,18 @@ impl DatabaseFile {
 }
 
 impl turso_core::DatabaseStorage for DatabaseFile {
-    fn read_header(&self, c: turso_core::Completion) -> turso_core::Result<turso_core::Completion> {
-        self.file.pread(0, c)
+    fn read_header(
+        &self,
+        c: turso_core::Completion,
+    ) -> turso_core::Result<turso_core::CompletionBuilder> {
+        Ok(IOBuilder::pread(self.file.clone(), 0, c))
     }
     fn read_page(
         &self,
         page_idx: usize,
         _io_ctx: &turso_core::IOContext,
         c: turso_core::Completion,
-    ) -> turso_core::Result<turso_core::Completion> {
+    ) -> turso_core::Result<turso_core::CompletionBuilder> {
         let r = c.as_read();
         let size = r.buf().len();
         assert!(page_idx > 0);
@@ -579,7 +583,7 @@ impl turso_core::DatabaseStorage for DatabaseFile {
             return Err(turso_core::LimboError::NotADB);
         }
         let pos = (page_idx as u64 - 1) * size as u64;
-        self.file.pread(pos, c)
+        Ok(IOBuilder::pread(self.file.clone(), pos, c))
     }
 
     fn write_page(
@@ -588,10 +592,10 @@ impl turso_core::DatabaseStorage for DatabaseFile {
         buffer: Arc<turso_core::Buffer>,
         _io_ctx: &turso_core::IOContext,
         c: turso_core::Completion,
-    ) -> turso_core::Result<turso_core::Completion> {
+    ) -> turso_core::Result<turso_core::CompletionBuilder> {
         let size = buffer.len();
         let pos = (page_idx as u64 - 1) * size as u64;
-        self.file.pwrite(pos, buffer, c)
+        Ok(IOBuilder::pwrite(self.file.clone(), pos, buffer, c))
     }
 
     fn write_pages(
@@ -601,14 +605,14 @@ impl turso_core::DatabaseStorage for DatabaseFile {
         buffers: Vec<Arc<turso_core::Buffer>>,
         _io_ctx: &turso_core::IOContext,
         c: turso_core::Completion,
-    ) -> turso_core::Result<turso_core::Completion> {
+    ) -> turso_core::Result<turso_core::CompletionBuilder> {
         let pos = first_page_idx.saturating_sub(1) as u64 * page_size as u64;
-        let c = self.file.pwritev(pos, buffers, c)?;
+        let c = IOBuilder::pwritev(self.file.clone(), pos, buffers, c);
         Ok(c)
     }
 
-    fn sync(&self, c: turso_core::Completion) -> turso_core::Result<turso_core::Completion> {
-        self.file.sync(c)
+    fn sync(&self, c: turso_core::Completion) -> turso_core::Result<turso_core::CompletionBuilder> {
+        Ok(IOBuilder::sync(self.file.clone(), c))
     }
 
     fn size(&self) -> turso_core::Result<u64> {
@@ -617,10 +621,10 @@ impl turso_core::DatabaseStorage for DatabaseFile {
 
     fn truncate(
         &self,
-        len: usize,
+        len: u64,
         c: turso_core::Completion,
-    ) -> turso_core::Result<turso_core::Completion> {
-        let c = self.file.truncate(len as u64, c)?;
+    ) -> turso_core::Result<turso_core::CompletionBuilder> {
+        let c = IOBuilder::truncate(self.file.clone(), len, c);
         Ok(c)
     }
 }
