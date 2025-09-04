@@ -160,11 +160,11 @@ fn emit_compound_select(
                         target_pc: label_next_select,
                         jump_if_null: true,
                     });
-                    right_most.limit_expr = limit_expr.clone();
+                    right_most.limit_expr = limit_expr;
                     right_most_ctx.limit_ctx = Some(limit_ctx);
                 }
                 if offset_reg.is_some() {
-                    right_most.offset_expr = offset_expr.clone();
+                    right_most.offset_expr = offset_expr;
                     right_most_ctx.reg_offset = offset_reg;
                 }
                 emit_query(program, &mut right_most, &mut right_most_ctx)?;
@@ -189,8 +189,8 @@ fn emit_compound_select(
                 let compound_select = Plan::CompoundSelect {
                     left,
                     right_most: plan,
-                    limit_expr: limit_expr.clone(),
-                    offset_expr: offset_expr.clone(),
+                    limit_expr,
+                    offset_expr,
                     order_by,
                 };
                 emit_compound_select(
@@ -240,8 +240,8 @@ fn emit_compound_select(
                 let compound_select = Plan::CompoundSelect {
                     left,
                     right_most: plan,
-                    limit_expr: limit_expr.clone(),
-                    offset_expr: offset_expr.clone(),
+                    limit_expr,
+                    offset_expr,
                     order_by,
                 };
                 emit_compound_select(
@@ -293,8 +293,8 @@ fn emit_compound_select(
                 let compound_select = Plan::CompoundSelect {
                     left,
                     right_most: plan,
-                    limit_expr: limit_expr.clone(),
-                    offset_expr: offset_expr.clone(),
+                    limit_expr,
+                    offset_expr,
                     order_by,
                 };
                 emit_compound_select(
@@ -323,10 +323,10 @@ fn emit_compound_select(
         None => {
             if let Some(limit_ctx) = limit_ctx {
                 right_most_ctx.limit_ctx = Some(limit_ctx);
-                right_most.limit_expr = limit_expr.clone();
+                right_most.limit_expr = limit_expr;
             }
             if offset_reg.is_some() {
-                right_most.offset_expr = offset_expr.clone();
+                right_most.offset_expr = offset_expr;
                 right_most_ctx.reg_offset = offset_reg;
             }
             emit_query(program, &mut right_most, &mut right_most_ctx)?;

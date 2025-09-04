@@ -157,11 +157,15 @@ pub fn prepare_select_plan(
             if select.with.is_some() {
                 crate::bail_parse_error!("WITH is not supported for compound SELECTs yet");
             }
+            let (limit_expr, offset_expr) = select
+                .limit
+                .map(|l| (Some(l.expr), l.offset))
+                .unwrap_or((None, None));
             Ok(Plan::CompoundSelect {
                 left,
                 right_most: last,
-                limit_expr: select.limit.as_ref().map(|l| l.expr.clone()),
-                offset_expr: select.limit.as_ref().and_then(|l| l.offset.clone()),
+                limit_expr,
+                offset_expr,
                 order_by: None,
             })
         }
@@ -427,8 +431,9 @@ fn prepare_one_select_plan(
             plan.order_by = key;
 
             // Store the LIMIT/OFFSET AST expressions
-            plan.limit_expr = limit.as_ref().map(|l| l.expr.clone());
-            plan.offset_expr = limit.as_ref().and_then(|l| l.offset.clone());
+            (plan.limit_expr, plan.offset_expr) = limit
+                .map(|l| (Some(l.expr), l.offset))
+                .unwrap_or((None, None));
 
             // Return the unoptimized query plan
             Ok(plan)
