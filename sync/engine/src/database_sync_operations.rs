@@ -77,7 +77,7 @@ pub async fn db_bootstrap<C: ProtocolIO, Ctx>(
                 };
                 assert!(size as usize == content_len);
             });
-            let c = db.pwrite(pos, buffer.clone(), c)?;
+            db.pwrite(pos, buffer.clone(), c.clone())?;
             while !c.is_completed() {
                 coro.yield_(ProtocolCommand::IO).await?;
             }
@@ -93,7 +93,7 @@ pub async fn db_bootstrap<C: ProtocolIO, Ctx>(
     let c = Completion::new_sync(move |_| {
         // todo(sivukhin): we need to error out in case of failed sync
     });
-    let c = db.sync(c)?;
+    db.sync(c.clone())?;
     while !c.is_completed() {
         coro.yield_(ProtocolCommand::IO).await?;
     }
@@ -123,7 +123,7 @@ pub async fn wal_apply_from_file<Ctx>(
             // todo(sivukhin): we need to error out in case of partial read
             assert!(size as usize == WAL_FRAME_SIZE);
         });
-        let c = frames_file.pread(offset, c)?;
+        frames_file.pread(offset, c.clone())?;
         while !c.is_completed() {
             coro.yield_(ProtocolCommand::IO).await?;
         }
@@ -239,7 +239,7 @@ pub async fn wal_pull_to_file_v1<C: ProtocolIO, Ctx>(
             assert!(size as usize == WAL_FRAME_SIZE);
         });
 
-        let c = frames_file.pwrite(offset, buffer.clone(), c)?;
+        frames_file.pwrite(offset, buffer.clone(), c.clone())?;
         while !c.is_completed() {
             coro.yield_(ProtocolCommand::IO).await?;
         }
@@ -249,7 +249,7 @@ pub async fn wal_pull_to_file_v1<C: ProtocolIO, Ctx>(
     let c = Completion::new_sync(move |_| {
         // todo(sivukhin): we need to error out in case of failed sync
     });
-    let c = frames_file.sync(c)?;
+    frames_file.sync(c.clone())?;
     while !c.is_completed() {
         coro.yield_(ProtocolCommand::IO).await?;
     }
@@ -318,7 +318,7 @@ pub async fn wal_pull_to_file_legacy<C: ProtocolIO, Ctx>(
                         };
                         assert!(size as usize == WAL_FRAME_SIZE);
                     });
-                    let c = frames_file.pwrite(last_offset, buffer.clone(), c)?;
+                    frames_file.pwrite(last_offset, buffer.clone(), c.clone())?;
                     while !c.is_completed() {
                         coro.yield_(ProtocolCommand::IO).await?;
                     }
@@ -361,7 +361,7 @@ pub async fn wal_pull_to_file_legacy<C: ProtocolIO, Ctx>(
         };
         assert!(rc as usize == 0);
     });
-    let c = frames_file.truncate(committed_len, c)?;
+    frames_file.truncate(committed_len, c.clone())?;
     while !c.is_completed() {
         coro.yield_(ProtocolCommand::IO).await?;
     }
@@ -369,7 +369,7 @@ pub async fn wal_pull_to_file_legacy<C: ProtocolIO, Ctx>(
     let c = Completion::new_sync(move |_| {
         // todo(sivukhin): we need to error out in case of failed sync
     });
-    let c = frames_file.sync(c)?;
+    frames_file.sync(c.clone())?;
     while !c.is_completed() {
         coro.yield_(ProtocolCommand::IO).await?;
     }
@@ -890,7 +890,7 @@ pub async fn read_wal_salt<Ctx>(
             buffer.as_mut_slice().fill(0);
         }
     });
-    let c = wal.pread(0, c)?;
+    wal.pread(0, c.clone())?;
     while !c.is_completed() {
         coro.yield_(ProtocolCommand::IO).await?;
     }
@@ -974,7 +974,7 @@ pub async fn bootstrap_db_file_v1<C: ProtocolIO, Ctx>(
         };
         assert!(rc as usize == 0);
     });
-    let c = file.truncate(header.db_size * PAGE_SIZE as u64, c)?;
+    file.truncate(header.db_size * PAGE_SIZE as u64, c.clone())?;
     while !c.is_completed() {
         coro.yield_(ProtocolCommand::IO).await?;
     }
@@ -1001,7 +1001,7 @@ pub async fn bootstrap_db_file_v1<C: ProtocolIO, Ctx>(
             };
             assert!(size as usize == PAGE_SIZE);
         });
-        let c = file.pwrite(offset, buffer.clone(), c)?;
+        file.pwrite(offset, buffer.clone(), c.clone())?;
         while !c.is_completed() {
             coro.yield_(ProtocolCommand::IO).await?;
         }
@@ -1083,7 +1083,7 @@ pub async fn reset_wal_file<Ctx>(
         };
         assert!(rc as usize == 0);
     });
-    let c = wal.truncate(wal_size, c)?;
+    wal.truncate(wal_size, c.clone())?;
     while !c.is_completed() {
         coro.yield_(ProtocolCommand::IO).await?;
     }
