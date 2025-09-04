@@ -312,6 +312,12 @@ impl CompletionBuilder {
             list: self.completion_list,
         })
     }
+
+    /// Builds the CompletionBuilder and then waits for the CompletionChain to finish
+    pub fn wait<I: IO + ?Sized>(self, io: &I) -> Result<()> {
+        let chain = self.build()?;
+        chain.wait(io)
+    }
 }
 
 intrusive_adapter!(CompletionBuilderAdapter = Box<CompletionNodeBuilder>: CompletionNodeBuilder { link: LinkedListLink });
@@ -607,6 +613,15 @@ impl CompletionChain {
 
     pub fn abort(&self) {
         self.error(CompletionError::Aborted);
+    }
+
+    pub fn wait<I: IO + ?Sized>(&self, io: &I) -> Result<()> {
+        let mut cursor = self.list.front();
+        while let Some(c) = cursor.clone_pointer() {
+            io.wait_for_completion(c)?;
+            cursor.move_next();
+        }
+        Ok(())
     }
 }
 

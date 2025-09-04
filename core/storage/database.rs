@@ -73,7 +73,7 @@ pub trait DatabaseStorage: Send + Sync {
     ) -> Result<CompletionBuilder>;
     fn sync(&self, c: Completion) -> Result<CompletionBuilder>;
     fn size(&self) -> Result<u64>;
-    fn truncate(&self, len: usize, c: Completion) -> Result<CompletionBuilder>;
+    fn truncate(&self, len: u64, c: Completion) -> Result<CompletionBuilder>;
 }
 
 #[cfg(feature = "fs")]
@@ -219,7 +219,7 @@ impl DatabaseStorage for DatabaseFile {
     }
 
     #[instrument(skip_all, level = Level::INFO)]
-    fn truncate(&self, len: usize, c: Completion) -> Result<CompletionBuilder> {
+    fn truncate(&self, len: u64, c: Completion) -> Result<CompletionBuilder> {
         Ok(IOBuilder::truncate(self.file.clone(), len as u64, c))
     }
 }

@@ -1622,27 +1622,29 @@ impl Pager {
                     let page_size = self.page_size.get().unwrap_or_default();
                     let expected = (db_size * page_size.get()) as u64;
                     if expected < self.db_file.size()? {
-                        self.io.wait_for_completion(self.db_file.truncate(
-                            expected as usize,
-                            Completion::new_trunc(move |_| {
-                                tracing::trace!(
-                                    "Database file truncated to expected size: {} bytes",
-                                    expected
-                                );
-                            }),
-                        )?)?;
-                        self.io
-                            .wait_for_completion(self.db_file.sync(Completion::new_sync(
-                                move |_| {
-                                    tracing::trace!("Database file syncd after truncation");
-                                },
-                            ))?)?;
+                        self.db_file
+                            .truncate(
+                                expected,
+                                Completion::new_trunc(move |_| {
+                                    tracing::trace!(
+                                        "Database file truncated to expected size: {} bytes",
+                                        expected
+                                    );
+                                }),
+                            )?
+                            .wait(self.io.as_ref())?;
+                        self.db_file
+                            .sync(Completion::new_sync(move |_| {
+                                tracing::trace!("Database file syncd after truncation");
+                            }))?
+                            .wait(self.io.as_ref())?;
                         break 'ensure_sync;
                     }
                 }
                 // if we backfilled at all, we have to sync the db-file here
-                self.io
-                    .wait_for_completion(self.db_file.sync(Completion::new_sync(move |_| {}))?)?;
+                self.db_file
+                    .sync(Completion::new_sync(move |_| {}))?
+                    .wait(self.io.as_ref())?;
             }
         }
         checkpoint_result.release_guard();
