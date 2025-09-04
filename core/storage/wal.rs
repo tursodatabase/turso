@@ -2239,7 +2239,9 @@ impl WalFileShared {
     ) -> Result<Arc<RwLock<WalFileShared>>> {
         let file = io.open_file(path, crate::io::OpenFlags::Create, false)?;
         if file.size()? > 0 {
-            let wal_file_shared = sqlite3_ondisk::read_entire_wal_dumb(&file)?;
+            let (wal_file_shared, completion) = sqlite3_ondisk::read_entire_wal_dumb(&file)?;
+            // TODO: use the chain to track the IO
+            let _chain = completion.build()?;
             // TODO: Return a completion instead.
             let mut max_loops = 100_000;
             while !wal_file_shared.read().loaded.load(Ordering::Acquire) {
@@ -3402,9 +3404,7 @@ pub mod test {
 
         // Ensure frames are flushed to the WAL
         let completions = conn.pager.borrow_mut().cacheflush().unwrap();
-        for c in completions {
-            db.io.wait_for_completion(c).unwrap();
-        }
+        completions.wait(db.io.as_ref()).unwrap();
 
         // Snapshot the current mxFrame before running FULL
         let wal_shared = db.shared_wal.clone();

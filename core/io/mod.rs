@@ -244,6 +244,7 @@ impl IOBuilder {
     }
 }
 
+#[must_use]
 #[derive(Debug, Default)]
 pub struct CompletionBuilder {
     op_list: LinkedList<CompletionBuilderAdapter>,
@@ -596,7 +597,7 @@ unsafe impl intrusive_collections::Adapter for CompletionChainAdapter {
 }
 
 #[derive(Debug, Default)]
-/// Completion Chain that is ready to be sent to IO
+/// Completion Chain that is used to track IO
 pub struct CompletionChain {
     list: LinkedList<CompletionChainAdapter>,
 }
