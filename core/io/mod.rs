@@ -3,7 +3,8 @@ use crate::storage::sqlite3_ondisk::WAL_FRAME_HEADER_SIZE;
 use crate::{BufferPool, CompletionError, Result};
 use bitflags::bitflags;
 use cfg_block::cfg_block;
-use intrusive_collections::{intrusive_adapter, PointerOps};
+use intrusive_collections::linked_list::LinkedListOps;
+use intrusive_collections::{intrusive_adapter, Adapter, PointerOps};
 use intrusive_collections::{LinkedList, LinkedListLink};
 use std::cell::RefCell;
 use std::fmt;
@@ -466,6 +467,37 @@ impl Completion {
     pub fn new_ready() -> Self {
         Self::new(CompletionType::Ready)
     }
+
+    /// # Safety
+    /// This operation is only safe when the list this Completion belongs to is Immutable
+    /// because with that we know we cannot be traversing a list that is being appended to
+    pub fn error(&self, err: CompletionError) {
+        self.inner.error(err);
+
+        let adapter = CompletionChainAdapter::new();
+
+        unsafe {
+            let mut current = adapter.link_ops.next(NonNull::from(&self.inner.link));
+            // Iterate forwards
+            while let Some(x) = current {
+                let val = &*adapter.get_value(x);
+                val.error(err);
+                current = adapter.link_ops.next(x);
+            }
+
+            let mut current = adapter.link_ops.next(NonNull::from(&self.inner.link));
+            // Iterate backwards
+            while let Some(x) = current {
+                let val = &*adapter.get_value(x);
+                val.error(err);
+                current = adapter.link_ops.prev(x);
+            }
+        }
+    }
+
+    pub fn abort(&self) {
+        self.error(CompletionError::Aborted)
+    }
 }
 
 // Adapter Code acquired by modifying the `instrusive_adapter` macro to use Completion instead of `Arc<CompletionNodeChain>`
@@ -568,7 +600,7 @@ unsafe impl intrusive_collections::Adapter for CompletionChainAdapter {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 /// Completion Chain that is ready to be sent to IO
 pub struct CompletionChain {
     list: LinkedList<CompletionChainAdapter>,
@@ -606,8 +638,15 @@ impl CompletionChain {
     }
 }
 
+/// Abort completions if dropped
+impl Drop for CompletionChain {
+    fn drop(&mut self) {
+        self.abort();
+    }
+}
+
 #[derive(Debug)]
-struct CompletionInner {
+pub struct CompletionInner {
     completion_type: CompletionType,
     /// None means we completed successfully
     // Thread safe with OnceLock
@@ -1061,3 +1100,26 @@ pub use memory::MemoryIO;
 pub mod clock;
 mod common;
 pub use clock::Clock;
+
+#[cfg(test)]
+mod tests {
+    use std::array;
+
+    use crate::{io::CompletionChain, Completion};
+
+    #[test]
+    fn test_completion_chain_error() {
+        let mut chain = CompletionChain::default();
+        let completions: [Completion; 10] = array::from_fn(|_| Completion::new_write(|_| {}));
+        for c in completions.iter().cloned() {
+            chain.list.push_back(c);
+        }
+
+        let cancel_c = completions[4].clone();
+        cancel_c.abort();
+
+        for c in completions {
+            assert!(c.has_error());
+        }
+    }
+}

@@ -1,7 +1,7 @@
 use super::{Buffer, Completion, File, OpenFlags, IO};
 use crate::ext::VfsMod;
 use crate::io::clock::{Clock, Instant};
-use crate::io::CompletionInner;
+use crate::io::CompletionNodeChain;
 use crate::{LimboError, Result};
 use std::ffi::{c_void, CString};
 use std::ptr::NonNull;
@@ -86,7 +86,7 @@ impl VfsMod {
 /// that the into_raw/from_raw contract will hold
 unsafe extern "C" fn callback_fn(result: i32, ctx: SendPtr) {
     let completion = Completion {
-        inner: (Arc::from_raw(ctx.inner().as_ptr() as *mut CompletionInner)),
+        inner: (Arc::from_raw(ctx.inner().as_ptr() as *mut CompletionNodeChain)),
     };
     completion.complete(result);
 }
