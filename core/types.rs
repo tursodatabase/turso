@@ -2474,7 +2474,7 @@ impl Cursor {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 #[must_use]
 pub enum IOCompletions {
     Single(Completion),

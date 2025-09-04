@@ -6,6 +6,7 @@ use cfg_block::cfg_block;
 use std::cell::RefCell;
 use std::fmt;
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::{fmt::Debug, pin::Pin};
 
@@ -118,10 +119,10 @@ pub trait IO: Clock + Send + Sync {
     }
 }
 
-pub type ReadComplete = dyn Fn(Result<(Arc<Buffer>, i32), CompletionError>);
-pub type WriteComplete = dyn Fn(Result<i32, CompletionError>);
-pub type SyncComplete = dyn Fn(Result<i32, CompletionError>);
-pub type TruncateComplete = dyn Fn(Result<i32, CompletionError>);
+pub type ReadComplete = dyn FnOnce(Result<(Arc<Buffer>, i32), CompletionError>);
+pub type WriteComplete = dyn FnOnce(Result<i32, CompletionError>);
+pub type SyncComplete = dyn FnOnce(Result<i32, CompletionError>);
+pub type TruncateComplete = dyn FnOnce(Result<i32, CompletionError>);
 
 #[must_use]
 #[derive(Debug, Clone)]
@@ -129,12 +130,20 @@ pub struct Completion {
     inner: Arc<CompletionInner>,
 }
 
-#[derive(Debug)]
 struct CompletionInner {
     completion_type: CompletionType,
     /// None means we completed successfully
     // Thread safe with OnceLock
     result: std::sync::OnceLock<Option<CompletionError>>,
+}
+
+impl Debug for CompletionInner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CompletionInner")
+            .field("completion_type", &self.completion_type)
+            .field("result", &self.result)
+            .finish()
+    }
 }
 
 impl Debug for CompletionType {
@@ -167,7 +176,7 @@ impl Completion {
 
     pub fn new_write<F>(complete: F) -> Self
     where
-        F: Fn(Result<i32, CompletionError>) + 'static,
+        F: FnOnce(Result<i32, CompletionError>) + 'static,
     {
         Self::new(CompletionType::Write(WriteCompletion::new(Box::new(
             complete,
@@ -176,7 +185,7 @@ impl Completion {
 
     pub fn new_read<F>(buf: Arc<Buffer>, complete: F) -> Self
     where
-        F: Fn(Result<(Arc<Buffer>, i32), CompletionError>) + 'static,
+        F: FnOnce(Result<(Arc<Buffer>, i32), CompletionError>) + 'static,
     {
         Self::new(CompletionType::Read(ReadCompletion::new(
             buf,
@@ -185,7 +194,7 @@ impl Completion {
     }
     pub fn new_sync<F>(complete: F) -> Self
     where
-        F: Fn(Result<i32, CompletionError>) + 'static,
+        F: FnOnce(Result<i32, CompletionError>) + 'static,
     {
         Self::new(CompletionType::Sync(SyncCompletion::new(Box::new(
             complete,
@@ -194,7 +203,7 @@ impl Completion {
 
     pub fn new_trunc<F>(complete: F) -> Self
     where
-        F: Fn(Result<i32, CompletionError>) + 'static,
+        F: FnOnce(Result<i32, CompletionError>) + 'static,
     {
         Self::new(CompletionType::Truncate(TruncateCompletion::new(Box::new(
             complete,
@@ -231,7 +240,7 @@ impl Completion {
             match &self.inner.completion_type {
                 CompletionType::Read(r) => r.callback(result),
                 CompletionType::Write(w) => w.callback(result),
-                CompletionType::Sync(s) => s.callback(result), // fix
+                CompletionType::Sync(s) => s.callback(result),
                 CompletionType::Truncate(t) => t.callback(result),
             };
         }
@@ -243,7 +252,7 @@ impl Completion {
             match &self.inner.completion_type {
                 CompletionType::Read(r) => r.callback(result),
                 CompletionType::Write(w) => w.callback(result),
-                CompletionType::Sync(s) => s.callback(result), // fix
+                CompletionType::Sync(s) => s.callback(result),
                 CompletionType::Truncate(t) => t.callback(result),
             };
         }
@@ -274,12 +283,17 @@ impl Completion {
 
 pub struct ReadCompletion {
     pub buf: Arc<Buffer>,
-    pub complete: Box<ReadComplete>,
+    pub complete: Option<Box<ReadComplete>>,
+    called: AtomicBool,
 }
 
 impl ReadCompletion {
     pub fn new(buf: Arc<Buffer>, complete: Box<ReadComplete>) -> Self {
-        Self { buf, complete }
+        Self {
+            buf,
+            complete: Some(complete),
+            called: AtomicBool::new(false),
+        }
     }
 
     pub fn buf(&self) -> &Buffer {
@@ -287,7 +301,16 @@ impl ReadCompletion {
     }
 
     pub fn callback(&self, bytes_read: Result<i32, CompletionError>) {
-        (self.complete)(bytes_read.map(|b| (self.buf.clone(), b)));
+        assert!(
+            !self.called.swap(true, Ordering::SeqCst),
+            "Completion callback called more than once"
+        );
+        let complete = unsafe {
+            let ptr = &self.complete as *const Option<Box<ReadComplete>>
+                as *mut Option<Box<ReadComplete>>;
+            (*ptr).take().unwrap()
+        };
+        (complete)(bytes_read.map(|b| (self.buf.clone(), b)));
     }
 
     pub fn buf_arc(&self) -> Arc<Buffer> {
@@ -296,44 +319,83 @@ impl ReadCompletion {
 }
 
 pub struct WriteCompletion {
-    pub complete: Box<WriteComplete>,
+    pub complete: Option<Box<WriteComplete>>,
+    called: AtomicBool,
 }
 
 impl WriteCompletion {
     pub fn new(complete: Box<WriteComplete>) -> Self {
-        Self { complete }
+        Self {
+            complete: Some(complete),
+            called: AtomicBool::new(false),
+        }
     }
 
     pub fn callback(&self, bytes_written: Result<i32, CompletionError>) {
-        (self.complete)(bytes_written);
+        assert!(
+            !self.called.swap(true, Ordering::SeqCst),
+            "Completion callback called more than once"
+        );
+        let complete = unsafe {
+            let ptr = &self.complete as *const Option<Box<WriteComplete>>
+                as *mut Option<Box<WriteComplete>>;
+            (*ptr).take().unwrap()
+        };
+        (complete)(bytes_written);
     }
 }
 
 pub struct SyncCompletion {
-    pub complete: Box<SyncComplete>,
+    pub complete: Option<Box<SyncComplete>>,
+    called: AtomicBool,
 }
 
 impl SyncCompletion {
     pub fn new(complete: Box<SyncComplete>) -> Self {
-        Self { complete }
+        Self {
+            complete: Some(complete),
+            called: AtomicBool::new(false),
+        }
     }
 
     pub fn callback(&self, res: Result<i32, CompletionError>) {
-        (self.complete)(res);
+        assert!(
+            !self.called.swap(true, Ordering::SeqCst),
+            "Completion callback called more than once"
+        );
+        let complete = unsafe {
+            let ptr = &self.complete as *const Option<Box<SyncComplete>>
+                as *mut Option<Box<SyncComplete>>;
+            (*ptr).take().unwrap()
+        };
+        (complete)(res);
     }
 }
 
 pub struct TruncateCompletion {
-    pub complete: Box<TruncateComplete>,
+    pub complete: Option<Box<TruncateComplete>>,
+    called: AtomicBool,
 }
 
 impl TruncateCompletion {
     pub fn new(complete: Box<TruncateComplete>) -> Self {
-        Self { complete }
+        Self {
+            complete: Some(complete),
+            called: AtomicBool::new(false),
+        }
     }
 
     pub fn callback(&self, res: Result<i32, CompletionError>) {
-        (self.complete)(res);
+        assert!(
+            !self.called.swap(true, Ordering::SeqCst),
+            "Completion callback called more than once"
+        );
+        let complete = unsafe {
+            let ptr = &self.complete as *const Option<Box<TruncateComplete>>
+                as *mut Option<Box<TruncateComplete>>;
+            (*ptr).take().unwrap()
+        };
+        (complete)(res);
     }
 }
 
