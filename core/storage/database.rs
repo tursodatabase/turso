@@ -220,7 +220,7 @@ impl DatabaseStorage for DatabaseFile {
 
     #[instrument(skip_all, level = Level::INFO)]
     fn truncate(&self, len: u64, c: Completion) -> Result<CompletionBuilder> {
-        Ok(IOBuilder::truncate(self.file.clone(), len as u64, c))
+        Ok(IOBuilder::truncate(self.file.clone(), len, c))
     }
 }
 

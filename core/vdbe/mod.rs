@@ -28,8 +28,8 @@ pub mod sorter;
 use crate::{
     error::LimboError,
     function::{AggFunc, FuncCtx},
-    mvcc::{database::CommitStateMachine, LocalClock},
     io::CompletionChain,
+    mvcc::{database::CommitStateMachine, LocalClock},
     state_machine::{StateMachine, StateTransition, TransitionResult},
     storage::sqlite3_ondisk::SmallVec,
     translate::{collate::CollationSeq, plan::TableReferences},

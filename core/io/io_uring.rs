@@ -1,6 +1,6 @@
 #![allow(clippy::arc_with_non_send_sync)]
 
-use super::{common, Completion, CompletionInner, File, OpenFlags, IO};
+use super::{common, Completion, CompletionNodeChain, File, OpenFlags, IO};
 use crate::io::clock::{Clock, Instant};
 use crate::storage::wal::CKPT_BATCH_PAGES;
 use crate::{turso_assert, LimboError, Result};
@@ -627,7 +627,7 @@ fn get_key(c: Completion) -> u64 {
 #[inline(always)]
 /// convert the user_data back to an Completion pointer
 fn completion_from_key(key: u64) -> Completion {
-    let c_inner = unsafe { Arc::from_raw(key as *const CompletionInner) };
+    let c_inner = unsafe { Arc::from_raw(key as *const CompletionNodeChain) };
     Completion { inner: c_inner }
 }
 
@@ -783,12 +783,7 @@ impl File for UringFile {
         Ok(())
     }
 
-    fn pwritev(
-        &self,
-        pos: u64,
-        bufs: Vec<Arc<crate::Buffer>>,
-        c: Completion,
-    ) -> Result<()> {
+    fn pwritev(&self, pos: u64, bufs: Vec<Arc<crate::Buffer>>, c: Completion) -> Result<()> {
         // for a single buffer use pwrite directly
         if bufs.len().eq(&1) {
             return self.pwrite(pos, bufs[0].clone(), c.clone());
