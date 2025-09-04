@@ -41,7 +41,6 @@ Turso aims to be fully compatible with SQLite, with opt-in features not supporte
 ### Limitations
 
 * ⛔️ Concurrent access from multiple processes is not supported.
-* ⛔️ Savepoints are not supported.
 * ⛔️ Triggers are not supported.
 * ⛔️ Vacuum is not supported.
 

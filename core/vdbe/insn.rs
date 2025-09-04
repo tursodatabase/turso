@@ -1085,6 +1085,20 @@ pub enum Insn {
         reg: usize,
         target_pc: BranchOffset,
     },
+    /// Open, release or rollback the savepoint named by parameter name.
+    /// P1 determines the operation: 0=begin, 1=release, 2=rollback
+    Savepoint {
+        op: SavepointOp,
+        name: String,
+    },
+}
+
+/// Savepoint operation types
+#[derive(Clone, Copy, Debug)]
+pub enum SavepointOp {
+    Begin = 0,
+    Release = 1,
+    Rollback = 2,
 }
 
 impl Insn {
@@ -1222,7 +1236,11 @@ impl Insn {
             Insn::AlterColumn { .. } => execute::op_alter_column,
             Insn::MaxPgcnt { .. } => execute::op_max_pgcnt,
             Insn::JournalMode { .. } => execute::op_journal_mode,
+<<<<<<< HEAD
             Insn::IfNeg { .. } => execute::op_if_neg,
+=======
+            Insn::Savepoint { .. } => execute::op_savepoint,
+>>>>>>> 90a49b9e (Basic implementation of savepoints)
         }
     }
 }
