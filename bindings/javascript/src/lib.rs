@@ -10,14 +10,21 @@
 //! - Iterating through query results
 //! - Managing the I/O event loop
 
+pub mod opfs;
+
 use napi::bindgen_prelude::*;
 use napi::{Env, Task};
 use napi_derive::napi;
+use std::sync::OnceLock;
 use std::{
     cell::{Cell, RefCell},
     num::NonZeroUsize,
     sync::Arc,
 };
+use tracing_subscriber::filter::LevelFilter;
+use tracing_subscriber::fmt::format::FmtSpan;
+
+use crate::opfs::{Opfs, OpfsRegistry};
 
 /// Step result constants
 const STEP_ROW: u32 = 1;
@@ -44,6 +51,18 @@ pub struct Database {
     default_safe_integers: Cell<bool>,
 }
 
+static TRACING_INIT: OnceLock<()> = OnceLock::new();
+fn init_tracing(level_filter: LevelFilter) {
+    TRACING_INIT.get_or_init(|| {
+        tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_thread_ids(true)
+            .with_span_events(FmtSpan::ACTIVE)
+            .with_max_level(level_filter)
+            .init();
+    });
+}
+
 #[napi]
 impl Database {
     /// Creates a new database instance.
@@ -51,14 +70,26 @@ impl Database {
     /// # Arguments
     /// * `path` - The path to the database file.
     #[napi(constructor)]
-    pub fn new(path: String) -> Result<Self> {
-        let is_memory = path == ":memory:";
-        let io: Arc<dyn turso_core::IO> = if is_memory {
-            Arc::new(turso_core::MemoryIO::new())
-        } else {
-            Arc::new(turso_core::PlatformIO::new().map_err(|e| {
-                Error::new(Status::GenericFailure, format!("Failed to create IO: {e}"))
-            })?)
+    pub fn new(env: Env, target: Either<String, OpfsRegistry>) -> Result<Self> {
+        // init_tracing(LevelFilter::TRACE);
+        let (is_memory, path) = match &target {
+            Either::A(path) => {
+                let is_memory = path == ":memory:";
+                (is_memory, path.clone())
+            }
+            Either::B(opfs) => (false, opfs.path.clone()),
+        };
+        let io: Arc<dyn turso_core::IO> = match target {
+            Either::A(_) => {
+                if is_memory {
+                    Arc::new(turso_core::MemoryIO::new())
+                } else {
+                    Arc::new(turso_core::PlatformIO::new().map_err(|e| {
+                        Error::new(Status::GenericFailure, format!("Failed to create IO: {e}"))
+                    })?)
+                }
+            }
+            Either::B(registry) => Arc::new(Opfs::new(env, registry)?),
         };
 
         let file = io

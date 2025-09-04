@@ -1,0 +1,44 @@
+{
+  "name": "@tursodatabase/database-browser",
+  "version": "0.1.5-pre.2",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/tursodatabase/turso"
+  },
+  "description": "The Turso database library specifically for browser/web environment",
+  "module": "./promise.js",
+  "main": "./promise.js",
+  "type": "module",
+  "files": [
+    "turso-browser.wasm32-wasi.wasm",
+    "promise.js",
+    "worker.js",
+    "dist/**"
+  ],
+  "types": "index.d.ts",
+  "license": "MIT",
+  "devDependencies": {
+    "ava": "^6.0.1",
+    "typescript": "^5.9.2"
+  },
+  "ava": {
+    "timeout": "3m"
+  },
+  "engines": {
+    "node": ">= 10"
+  },
+  "scripts": {
+    "artifacts": "napi artifacts",
+    "build": "npm exec tsc && napi build --platform --release --esm",
+    "build:debug": "npm exec tsc && napi build --platform",
+    "prepublishOnly": "npm exec tsc && napi prepublish -t npm --skip-optional-publish",
+    "test": "true",
+    "universal": "napi universalize",
+    "version": "napi version"
+  },
+  "packageManager": "yarn@4.9.2",
+  "dependencies": {
+    "@napi-rs/wasm-runtime": "^1.0.3",
+    "threads": "^1.7.0"
+  }
+}
