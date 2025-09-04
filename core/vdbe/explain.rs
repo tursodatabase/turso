@@ -1732,6 +1732,21 @@ pub fn insn_to_row(
                 format!("r[{dest}]=journal_mode(db[{db}]{})",
                     new_mode.as_ref().map_or(String::new(), |m| format!(",'{m}'"))),
             ),
+            Insn::Savepoint { op, name } => (
+                "Savepoint",
+                *op as i32,
+                0,
+                0,
+                Value::build_text(name),
+                0,
+                format!("savepoint {} '{}'",
+                    match op {
+                        crate::vdbe::insn::SavepointOp::Begin => "begin",
+                        crate::vdbe::insn::SavepointOp::Release => "release",
+                        crate::vdbe::insn::SavepointOp::Rollback => "rollback",
+                    },
+                    name),
+            ),
             Insn::CollSeq { reg, collation } => (
                 "CollSeq",
                 reg.unwrap_or(0) as i32,

@@ -9389,6 +9389,52 @@ where
     }
 }
 
+pub fn op_savepoint(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+    mv_store: Option<&Arc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    use crate::vdbe::insn::SavepointOp;
+
+    load_insn!(Savepoint { op, name }, insn);
+    let conn = program.connection.clone();
+
+    match op {
+        SavepointOp::Begin => {
+            let mut savepoint_stack = conn.savepoint_stack.borrow_mut();
+            let is_outermost = savepoint_stack.is_empty()
+                && conn.transaction_state.get() == TransactionState::None;
+
+            if let Some(wal) = pager.as_ref().wal.as_ref() {
+                savepoint_stack.push_savepoint(name.clone(), is_outermost, wal.clone());
+            } else {
+                return Err(LimboError::InternalError(
+                    "WAL is not available for the pager".to_string(),
+                ));
+            }
+        }
+
+        SavepointOp::Release => {}
+        SavepointOp::Rollback => {
+            let mut savepoint_stack = conn.savepoint_stack.borrow_mut();
+            let mut savepoint = savepoint_stack.rollback_to_savepoint(name.as_str())?;
+            if let Some(wal) = pager.as_ref().wal.as_ref() {
+                let mut wal = wal.as_ref().borrow_mut();
+                wal.undo_savepoint(&mut savepoint.wal_data)?;
+            } else {
+                return Err(LimboError::InternalError(
+                    "WAL is not available for the pager".to_string(),
+                ));
+            }
+        }
+    }
+
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

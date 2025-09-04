@@ -16,6 +16,7 @@ pub mod mvcc;
 mod parameters;
 mod pragma;
 mod pseudo;
+mod savepoint;
 mod schema;
 #[cfg(feature = "series")]
 mod series;
@@ -39,7 +40,9 @@ pub mod numeric;
 #[cfg(not(feature = "fuzz"))]
 mod numeric;
 
+use crate::savepoint::SavepointStack;
 use crate::storage::checksum::CHECKSUM_REQUIRED_RESERVED_BYTES;
+use crate::storage::encryption::CipherMode;
 use crate::translate::pragma::TURSO_CDC_DEFAULT_TABLE_NAME;
 #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
 use crate::types::{WalFrameInfo, WalState};
@@ -78,7 +81,7 @@ use std::{
 #[cfg(feature = "fs")]
 use storage::database::DatabaseFile;
 pub use storage::database::IOContext;
-pub use storage::encryption::{CipherMode, EncryptionContext, EncryptionKey};
+pub use storage::encryption::{EncryptionContext, EncryptionKey};
 use storage::page_cache::PageCache;
 use storage::pager::{AtomicDbState, DbState};
 use storage::sqlite3_ondisk::PageSize;
@@ -516,6 +519,7 @@ impl Database {
             sync_mode: Cell::new(SyncMode::Full),
             data_sync_retry: Cell::new(false),
             busy_timeout: Cell::new(None),
+            savepoint_stack: RefCell::new(SavepointStack::new()),
         });
         self.n_connections
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -1009,6 +1013,7 @@ pub struct Connection {
     data_sync_retry: Cell<bool>,
     /// User defined max accumulated Busy timeout duration
     busy_timeout: Cell<Option<std::time::Duration>>,
+    savepoint_stack: RefCell<SavepointStack>,
 }
 
 impl Drop for Connection {

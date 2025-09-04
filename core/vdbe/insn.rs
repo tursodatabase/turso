@@ -1132,6 +1132,20 @@ pub enum Insn {
         p2: Option<usize>, // P2: address of parent explain instruction
         detail: String,    // P4: detail text
     },
+    /// Open, release or rollback the savepoint named by parameter name.
+    /// P1 determines the operation: 0=begin, 1=release, 2=rollback
+    Savepoint {
+        op: SavepointOp,
+        name: String,
+    },
+}
+
+/// Savepoint operation types
+#[derive(Clone, Copy, Debug)]
+pub enum SavepointOp {
+    Begin = 0,
+    Release = 1,
+    Rollback = 2,
 }
 
 const fn get_insn_virtual_table() -> [InsnFunction; InsnVariants::COUNT] {
@@ -1207,6 +1221,7 @@ impl InsnVariants {
             InsnVariants::Halt => execute::op_halt,
             InsnVariants::HaltIfNull => execute::op_halt_if_null,
             InsnVariants::Transaction => execute::op_transaction,
+            InsnVariants::Savepoint => execute::op_savepoint,
             InsnVariants::AutoCommit => execute::op_auto_commit,
             InsnVariants::Goto => execute::op_goto,
             InsnVariants::Gosub => execute::op_gosub,
