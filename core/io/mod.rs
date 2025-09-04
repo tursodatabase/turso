@@ -285,14 +285,6 @@ impl CompletionBuilder {
     }
 
     pub fn build(self) -> Result<CompletionChain> {
-        {
-            let front = self.op_list.front().get();
-            assert!(
-                front.is_some(),
-                "CompletionBuilder must have at least one completion in it"
-            );
-        }
-
         let mut cursor = self.completion_list.front();
         // Completion list should have the same size of op_list
         for node in self.op_list {
