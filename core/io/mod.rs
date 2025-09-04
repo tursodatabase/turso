@@ -50,9 +50,6 @@ pub trait File: Send + Sync {
                 })
             };
             if let Err(e) = self.pwrite(pos, buf.clone(), child_c) {
-                // best-effort: mark as abort so caller won't wait forever
-                // TODO: when we have `pwrite` and other I/O methods return CompletionError
-                // instead of LimboError, store the error inside
                 c.abort();
                 return Err(e);
             }
@@ -88,6 +85,15 @@ pub trait IO: Clock + Send + Sync {
     fn remove_file(&self, path: &str) -> Result<()>;
 
     fn run_once(&self) -> Result<()> {
+        Ok(())
+    }
+
+    fn cancel(&self, c: &[Completion]) -> Result<()> {
+        c.iter().for_each(|c| c.abort());
+        Ok(())
+    }
+
+    fn drain(&self) -> Result<()> {
         Ok(())
     }
 
