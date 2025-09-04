@@ -49,6 +49,7 @@ use crate::types::{WalFrameInfo, WalState};
 use crate::util::{OpenMode, OpenOptions};
 use crate::vdbe::metrics::ConnectionMetrics;
 use crate::vtab::VirtualTable;
+use crate::{incremental::view::ViewTransactionState, io::CompletionBuilder};
 use core::str;
 pub use error::{CompletionError, LimboError};
 pub use io::clock::{Clock, Instant};
@@ -514,7 +515,7 @@ impl Database {
         let buf = Arc::new(Buffer::new_temporary(PageSize::MIN as usize));
         let c = Completion::new_read(buf.clone(), move |_res| {});
         let c = self.db_file.read_header(c)?;
-        self.io.wait_for_completion(c)?;
+        c.wait(self.io.as_ref())?;
         let page_size = u16::from_be_bytes(buf.as_slice()[16..18].try_into().unwrap());
         let page_size = PageSize::new_from_header_u16(page_size)?;
         Ok(page_size)
@@ -1393,7 +1394,7 @@ impl Connection {
             Err(err) => return Err(err),
         };
 
-        pager.io.wait_for_completion(c)?;
+        c.wait(pager.io.as_ref())?;
 
         let content = page_ref.get_contents();
         // empty read - attempt to read absent page
@@ -1421,7 +1422,7 @@ impl Connection {
         use crate::storage::sqlite3_ondisk::parse_wal_frame_header;
 
         let c = self.pager.borrow().wal_get_frame(frame_no, frame)?;
-        self._db.io.wait_for_completion(c)?;
+        c.wait(self._db.io.as_ref())?;
         let (header, _) = parse_wal_frame_header(frame);
         Ok(WalFrameInfo {
             page_no: header.page_number,
