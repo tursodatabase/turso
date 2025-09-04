@@ -704,31 +704,35 @@ impl CompletionInner {
     }
 
     pub fn complete(&self, result: i32) {
-        let result = Ok(result);
-        match &self.completion_type {
-            CompletionType::Read(r) => r.callback(result),
-            CompletionType::Write(w) => w.callback(result),
-            CompletionType::WriteV(w) => w.callback(result),
-            CompletionType::Sync(s) => s.callback(result), // fix
-            CompletionType::Truncate(t) => t.callback(result),
-            CompletionType::Ready => {}
-        };
-        self.result.set(None).expect("result must be set only once");
+        if !self.completion_type.done() {
+            let result = Ok(result);
+            match &self.completion_type {
+                CompletionType::Read(r) => r.callback(result),
+                CompletionType::Write(w) => w.callback(result),
+                CompletionType::WriteV(w) => w.callback(result),
+                CompletionType::Sync(s) => s.callback(result), // fix
+                CompletionType::Truncate(t) => t.callback(result),
+                CompletionType::Ready => {}
+            };
+            self.result.set(None).expect("result must be set only once");
+        }
     }
 
     pub fn error(&self, err: CompletionError) {
-        let result = Err(err);
-        match &self.completion_type {
-            CompletionType::Read(r) => r.callback(result),
-            CompletionType::Write(w) => w.callback(result),
-            CompletionType::WriteV(w) => w.callback(result),
-            CompletionType::Sync(s) => s.callback(result), // fix
-            CompletionType::Truncate(t) => t.callback(result),
-            CompletionType::Ready => {}
-        };
-        self.result
-            .set(Some(err))
-            .expect("result must be set only once");
+        if !self.completion_type.done() {
+            let result = Err(err);
+            match &self.completion_type {
+                CompletionType::Read(r) => r.callback(result),
+                CompletionType::Write(w) => w.callback(result),
+                CompletionType::WriteV(w) => w.callback(result),
+                CompletionType::Sync(s) => s.callback(result), // fix
+                CompletionType::Truncate(t) => t.callback(result),
+                CompletionType::Ready => {}
+            };
+            self.result
+                .set(Some(err))
+                .expect("result must be set only once");
+        }
     }
 
     pub fn abort(&self) {
@@ -762,6 +766,19 @@ pub enum CompletionType {
     Truncate(TruncateCompletion),
     /// Completion that is always ready
     Ready,
+}
+
+impl CompletionType {
+    fn done(&self) -> bool {
+        match self {
+            CompletionType::Read(r) => r.called.load(Ordering::Relaxed),
+            CompletionType::Write(w) => w.called.load(Ordering::Relaxed),
+            CompletionType::WriteV(w) => w.called.load(Ordering::Relaxed),
+            CompletionType::Sync(s) => s.called.load(Ordering::Relaxed),
+            CompletionType::Truncate(t) => t.called.load(Ordering::Relaxed),
+            CompletionType::Ready => true,
+        }
+    }
 }
 
 pub struct ReadCompletion {
