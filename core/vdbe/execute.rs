@@ -1,5 +1,6 @@
 #![allow(unused_variables)]
 use crate::function::AlterTableFunc;
+use crate::io::CompletionBuilder;
 use crate::numeric::{NullableInteger, Numeric};
 use crate::schema::Table;
 use crate::storage::btree::{
@@ -11,8 +12,7 @@ use crate::storage::pager::{AtomicDbState, CreateBTreeFlags, DbState};
 use crate::storage::sqlite3_ondisk::read_varint;
 use crate::translate::collate::CollationSeq;
 use crate::types::{
-    compare_immutable, compare_records_generic, Extendable, IOCompletions, ImmutableRecord,
-    SeekResult, Text,
+    compare_immutable, compare_records_generic, Extendable, ImmutableRecord, SeekResult, Text,
 };
 use crate::util::{normalize_ident, IOExt as _};
 use crate::vdbe::insn::InsertFlags;
@@ -153,7 +153,7 @@ fn compare_with_collation(
 
 pub enum InsnFunctionStepResult {
     Done,
-    IO(IOCompletions),
+    IO(CompletionBuilder),
     Row,
     Interrupt,
     Busy,
@@ -2783,7 +2783,7 @@ pub fn op_seek(
 pub enum SeekInternalResult {
     Found,
     NotFound,
-    IO(IOCompletions),
+    IO(CompletionBuilder),
 }
 #[derive(Clone)]
 pub enum RecordSource {

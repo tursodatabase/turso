@@ -22,10 +22,10 @@ use crate::storage::sqlite3_ondisk::{
     begin_read_wal_frame, begin_read_wal_frame_raw, finish_read_page, prepare_wal_frame,
     write_pages_vectored, PageSize, WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE,
 };
-use crate::types::{IOCompletions, IOResult};
+use crate::types::IOResult;
 use crate::{
-    bail_corrupt_error, io_yield_many, turso_assert, Buffer, Completion, CompletionError,
-    IOContext, LimboError, Result,
+    bail_corrupt_error, io_yield, turso_assert, Buffer, Completion, CompletionError, IOContext,
+    LimboError, Result,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -1900,7 +1900,7 @@ impl WalFile {
                     }
 
                     if !completions.is_empty() {
-                        io_yield_many!(completions);
+                        io_yield!(completions);
                     } else if self.ongoing_checkpoint.complete() {
                         // if we are completely done backfilling, we need to unpin any pages we used from the page cache.
                         for (page_id, _, cached) in

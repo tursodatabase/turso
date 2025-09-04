@@ -8,7 +8,6 @@ use std::sync::Arc;
 use tempfile;
 
 use crate::io::{CompletionBuilder, IOBuilder};
-use crate::types::IOCompletions;
 use crate::util::IOExt;
 use crate::{
     error::LimboError,
@@ -19,7 +18,7 @@ use crate::{
     types::{IOResult, ImmutableRecord, KeyInfo, RecordCursor, RefValue},
     Result,
 };
-use crate::{io_yield_many, io_yield_one, return_if_io, CompletionError};
+use crate::{io_yield, return_if_io, CompletionError};
 
 #[derive(Debug, Clone, Copy)]
 enum SortState {
@@ -153,7 +152,7 @@ impl Sorter {
                 SortState::Flush => {
                     self.sort_state = SortState::InitHeap;
                     if let Some(c) = self.flush()? {
-                        io_yield_one!(c);
+                        io_yield!(c);
                     }
                 }
                 SortState::InitHeap => {
@@ -208,7 +207,7 @@ impl Sorter {
                     self.insert_state = InsertState::Insert;
                     if self.current_buffer_size + payload_size > self.max_buffer_size {
                         if let Some(c) = self.flush()? {
-                            io_yield_one!(c);
+                            io_yield!(c);
                         }
                     }
                 }
@@ -243,7 +242,7 @@ impl Sorter {
                     completions.append(c)
                 }
                 self.init_chunk_heap_state = InitChunkHeapState::PushChunk;
-                io_yield_many!(completions);
+                io_yield!(completions);
             }
             InitChunkHeapState::PushChunk => {
                 // Make sure all chunks read at least one record into their buffer.
@@ -465,7 +464,7 @@ impl SortedChunk {
                             self.io_state.set(SortedChunkIOState::ReadEOF);
                         } else {
                             let c = self.read()?;
-                            io_yield_one!(c);
+                            io_yield!(c);
                         }
                     }
                 }

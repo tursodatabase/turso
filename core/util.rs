@@ -22,15 +22,9 @@ use turso_parser::ast::{
 use turso_parser::parser::Parser;
 
 #[macro_export]
-macro_rules! io_yield_one {
+macro_rules! io_yield {
     ($c:expr) => {
-        return Ok(IOResult::IO(IOCompletions::Single($c)));
-    };
-}
-#[macro_export]
-macro_rules! io_yield_many {
-    ($v:expr) => {
-        return Ok(IOResult::IO(IOCompletions::Many($v)));
+        return Ok(IOResult::IO($c));
     };
 }
 

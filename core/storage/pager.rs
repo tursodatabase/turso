@@ -1,4 +1,4 @@
-use crate::io::CompletionBuilder;
+use crate::io::{CompletionBuilder, IOBuilder};
 use crate::result::LimboResult;
 use crate::storage::wal::IOV_MAX;
 use crate::storage::{
@@ -9,9 +9,9 @@ use crate::storage::{
     },
     wal::{CheckpointResult, Wal},
 };
-use crate::types::{IOCompletions, WalState};
+use crate::types::WalState;
 use crate::util::IOExt as _;
-use crate::{io_yield_many, io_yield_one, IOContext};
+use crate::{io_yield, IOContext};
 use crate::{
     return_if_io, turso_assert, types::WalFrameInfo, Completion, Connection, IOResult, LimboError,
     Result, TransactionState,
@@ -54,7 +54,7 @@ impl HeaderRef {
                     let (page, c) = pager.read_page(DatabaseHeader::PAGE_ID)?;
                     *pager.header_ref_state.borrow_mut() = HeaderRefState::CreateHeader { page };
                     if let Some(c) = c {
-                        io_yield_one!(c);
+                        io_yield!(c);
                     }
                 }
                 HeaderRefState::CreateHeader { page } => {
@@ -94,7 +94,7 @@ impl HeaderRefMut {
                     let (page, c) = pager.read_page(DatabaseHeader::PAGE_ID)?;
                     *pager.header_ref_state.borrow_mut() = HeaderRefState::CreateHeader { page };
                     if let Some(c) = c {
-                        io_yield_one!(c);
+                        io_yield!(c);
                     }
                 }
                 HeaderRefState::CreateHeader { page } => {
@@ -679,7 +679,7 @@ impl Pager {
                         offset_in_ptrmap_page,
                     });
                     if let Some(c) = c {
-                        io_yield_one!(c);
+                        io_yield!(c);
                     }
                 }
                 PtrMapGetState::Deserialize {
@@ -783,7 +783,7 @@ impl Pager {
                         offset_in_ptrmap_page,
                     });
                     if let Some(c) = c {
-                        io_yield_one!(c);
+                        io_yield!(c);
                     }
                 }
                 PtrMapPutState::Deserialize {
@@ -1015,7 +1015,7 @@ impl Pager {
                 }
             }
             // Give a chance for the allocation to happen elsewhere
-            io_yield_one!(Completion::new_ready());
+            io_yield!(IOBuilder::ready());
         }
         Ok(IOResult::Done(()))
     }
@@ -1377,12 +1377,12 @@ impl Pager {
                             self.commit_info.state.set(CommitState::SyncWal);
                         }
                     }
-                    io_yield_many!(completions);
+                    io_yield!(completions);
                 }
                 CommitState::SyncWal => {
                     self.commit_info.state.set(CommitState::AfterSyncWal);
                     let c = wal.borrow_mut().sync()?;
-                    io_yield_one!(c);
+                    io_yield!(c);
                 }
                 CommitState::AfterSyncWal => {
                     turso_assert!(!wal.borrow().is_syncing(), "wal should have synced");
@@ -1404,7 +1404,7 @@ impl Pager {
                 CommitState::SyncDbFile => {
                     let c = sqlite3_ondisk::begin_sync(self.db_file.clone(), self.syncing.clone())?;
                     self.commit_info.state.set(CommitState::AfterSyncDbFile);
-                    io_yield_one!(c);
+                    io_yield!(c);
                 }
                 CommitState::AfterSyncDbFile => {
                     turso_assert!(!self.syncing.get(), "should have finished syncing");
@@ -1520,7 +1520,7 @@ impl Pager {
                     let c = sqlite3_ondisk::begin_sync(self.db_file.clone(), self.syncing.clone())?;
                     self.checkpoint_state
                         .replace(CheckpointState::CheckpointDone { res });
-                    io_yield_one!(c);
+                    io_yield!(c);
                 }
                 CheckpointState::CheckpointDone { res } => {
                     turso_assert!(!self.syncing.get(), "syncing should be done");
@@ -1711,7 +1711,7 @@ impl Pager {
                         let (page, c) = self.read_page(trunk_page_id as usize)?;
                         trunk_page.replace(page);
                         if let Some(c) = c {
-                            io_yield_one!(c);
+                            io_yield!(c);
                         }
                     }
                     let trunk_page = trunk_page.as_ref().unwrap();
@@ -1813,7 +1813,7 @@ impl Pager {
 
                 self.allocate_page1_state
                     .replace(AllocatePage1State::Writing { page: page1 });
-                io_yield_one!(c);
+                io_yield!(c);
             }
             AllocatePage1State::Writing { page } => {
                 turso_assert!(page.is_loaded(), "page should be loaded");
@@ -1900,7 +1900,7 @@ impl Pager {
                         current_db_size: new_db_size,
                     };
                     if let Some(c) = c {
-                        io_yield_one!(c);
+                        io_yield!(c);
                     }
                 }
                 AllocatePageState::SearchAvailableFreeListLeaf {
@@ -1938,7 +1938,7 @@ impl Pager {
                             number_of_freelist_leaves,
                         };
                         if let Some(c) = c {
-                            io_yield_one!(c);
+                            io_yield!(c);
                         }
                         continue;
                     }

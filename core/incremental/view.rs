@@ -1,6 +1,7 @@
 use super::compiler::{DbspCircuit, DbspCompiler, DeltaSet};
 use super::dbsp::Delta;
 use super::operator::{ComputationTracker, FilterPredicate};
+use crate::io::IOBuilder;
 use crate::schema::{BTreeTable, Column, Schema};
 use crate::storage::btree::BTreeCursor;
 use crate::translate::logical::LogicalPlanBuilder;

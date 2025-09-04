@@ -596,6 +596,7 @@ unsafe impl intrusive_collections::Adapter for CompletionChainAdapter {
     }
 }
 
+#[must_use]
 #[derive(Debug, Default)]
 /// Completion Chain that is used to track IO
 pub struct CompletionChain {
