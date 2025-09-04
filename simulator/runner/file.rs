@@ -44,7 +44,7 @@ pub(crate) struct SimulatorFile {
     pub clock: Arc<SimulatorClock>,
 }
 
-type IoOperation = Box<dyn FnOnce(&SimulatorFile) -> Result<turso_core::Completion>>;
+type IoOperation = Box<dyn FnOnce(&SimulatorFile) -> Result<()>>;
 
 pub struct DelayedIo {
     pub time: turso_core::Instant,
@@ -150,7 +150,7 @@ impl File for SimulatorFile {
         self.inner.unlock_file()
     }
 
-    fn pread(&self, pos: u64, c: turso_core::Completion) -> Result<turso_core::Completion> {
+    fn pread(&self, pos: u64, c: turso_core::Completion) -> Result<()> {
         self.nr_pread_calls.set(self.nr_pread_calls.get() + 1);
         if self.fault.get() {
             tracing::debug!("pread fault");
@@ -165,7 +165,7 @@ impl File for SimulatorFile {
             self.queued_io
                 .borrow_mut()
                 .push(DelayedIo { time: latency, op });
-            Ok(c)
+            Ok(())
         } else {
             self.inner.pread(pos, c)
         }
@@ -176,7 +176,7 @@ impl File for SimulatorFile {
         pos: u64,
         buffer: Arc<turso_core::Buffer>,
         c: turso_core::Completion,
-    ) -> Result<turso_core::Completion> {
+    ) -> Result<()> {
         self.nr_pwrite_calls.set(self.nr_pwrite_calls.get() + 1);
         if self.fault.get() {
             tracing::debug!("pwrite fault");
@@ -191,13 +191,13 @@ impl File for SimulatorFile {
             self.queued_io
                 .borrow_mut()
                 .push(DelayedIo { time: latency, op });
-            Ok(c)
+            Ok(())
         } else {
             self.inner.pwrite(pos, buffer, c)
         }
     }
 
-    fn sync(&self, c: turso_core::Completion) -> Result<turso_core::Completion> {
+    fn sync(&self, c: turso_core::Completion) -> Result<()> {
         self.nr_sync_calls.set(self.nr_sync_calls.get() + 1);
         if self.fault.get() {
             // TODO: Enable this when https://github.com/tursodatabase/turso/issues/2091 is fixed.
@@ -206,23 +206,21 @@ impl File for SimulatorFile {
             );
             self.fault.set(false);
         }
-        let c = if let Some(latency) = self.generate_latency_duration() {
+        if let Some(latency) = self.generate_latency_duration() {
             let cloned_c = c.clone();
             let op = Box::new(|file: &SimulatorFile| -> Result<_> {
-                let c = file.inner.sync(cloned_c)?;
-                *file.sync_completion.borrow_mut() = Some(c.clone());
-                Ok(c)
+                file.inner.sync(cloned_c.clone())?;
+                *file.sync_completion.borrow_mut() = Some(cloned_c);
+                Ok(())
             });
             self.queued_io
                 .borrow_mut()
                 .push(DelayedIo { time: latency, op });
-            c
         } else {
-            let c = self.inner.sync(c)?;
+            self.inner.sync(c.clone())?;
             *self.sync_completion.borrow_mut() = Some(c.clone());
-            c
-        };
-        Ok(c)
+        }
+        Ok(())
     }
 
     fn pwritev(
@@ -230,7 +228,7 @@ impl File for SimulatorFile {
         pos: u64,
         buffers: Vec<Arc<turso_core::Buffer>>,
         c: turso_core::Completion,
-    ) -> Result<turso_core::Completion> {
+    ) -> Result<()> {
         self.nr_pwrite_calls.set(self.nr_pwrite_calls.get() + 1);
         if self.fault.get() {
             tracing::debug!("pwritev fault");
@@ -246,10 +244,9 @@ impl File for SimulatorFile {
             self.queued_io
                 .borrow_mut()
                 .push(DelayedIo { time: latency, op });
-            Ok(c)
+            Ok(())
         } else {
-            let c = self.inner.pwritev(pos, buffers, c)?;
-            Ok(c)
+            self.inner.pwritev(pos, buffers, c)
         }
     }
 
@@ -257,23 +254,22 @@ impl File for SimulatorFile {
         self.inner.size()
     }
 
-    fn truncate(&self, len: u64, c: turso_core::Completion) -> Result<turso_core::Completion> {
+    fn truncate(&self, len: u64, c: turso_core::Completion) -> Result<()> {
         if self.fault.get() {
             return Err(turso_core::LimboError::InternalError(
                 FAULT_ERROR_MSG.into(),
             ));
         }
-        let c = if let Some(latency) = self.generate_latency_duration() {
+        if let Some(latency) = self.generate_latency_duration() {
             let cloned_c = c.clone();
             let op = Box::new(move |file: &SimulatorFile| file.inner.truncate(len, cloned_c));
             self.queued_io
                 .borrow_mut()
                 .push(DelayedIo { time: latency, op });
-            c
+            Ok(())
         } else {
-            self.inner.truncate(len, c)?
-        };
-        Ok(c)
+            self.inner.truncate(len, c)
+        }
     }
 }
 
