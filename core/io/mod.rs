@@ -598,28 +598,29 @@ pub struct CompletionChain {
 impl CompletionChain {
     /// Checks if the entire Completion chain is completed or errored
     pub fn finished(&self) -> bool {
-        self.list.back().get().unwrap().inner.finished()
+        self.list.iter().all(|node| node.finished())
     }
 
     pub fn is_completed(&self) -> bool {
-        self.list.back().get().unwrap().inner.is_completed()
+        self.list.iter().all(|node| node.is_completed())
     }
 
     pub fn has_error(&self) -> bool {
-        self.list.back().get().unwrap().inner.has_error()
+        self.list.iter().any(|node| node.has_error())
     }
 
     pub fn get_error(&self) -> Option<CompletionError> {
-        self.list.back().get().unwrap().inner.get_error()
+        for node in self.list.iter() {
+            if let Some(err) = node.get_error() {
+                return Some(err);
+            }
+        }
+        None
     }
 
     pub fn error(&self, err: CompletionError) {
-        let mut cursor = self.list.front();
         // Cancel all remaining completions
-        while let Some(node) = cursor.get() {
-            node.inner.error(err);
-            cursor.move_next();
-        }
+        self.list.iter().for_each(|node| node.error(err));
     }
 
     pub fn abort(&self) {
@@ -636,12 +637,12 @@ impl CompletionChain {
     }
 }
 
-/// Abort completions if dropped
-impl Drop for CompletionChain {
-    fn drop(&mut self) {
-        self.abort();
-    }
-}
+// /// Abort completions if dropped
+// impl Drop for CompletionChain {
+//     fn drop(&mut self) {
+//         self.abort();
+//     }
+// }
 
 #[derive(Debug)]
 pub struct CompletionInner {
@@ -729,9 +730,11 @@ impl CompletionInner {
                 CompletionType::Truncate(t) => t.callback(result),
                 CompletionType::Ready => {}
             };
+
             self.result
                 .set(Some(err))
                 .expect("result must be set only once");
+            tracing::error!("aborted I/O: {err}");
         }
     }
 
