@@ -1,6 +1,7 @@
 use tracing::{instrument, Level};
 
 use crate::{
+    io::CompletionBuilder,
     io_yield_many, io_yield_one,
     schema::Index,
     storage::{
@@ -5330,7 +5331,7 @@ impl BTreeCursor {
         }
     }
 
-    pub fn read_page(&self, page_idx: usize) -> Result<(PageRef, Option<Completion>)> {
+    pub fn read_page(&self, page_idx: usize) -> Result<(PageRef, Option<CompletionBuilder>)> {
         btree_read_page(&self.pager, page_idx)
     }
 
@@ -5778,7 +5779,7 @@ pub fn integrity_check(
 pub fn btree_read_page(
     pager: &Rc<Pager>,
     page_idx: usize,
-) -> Result<(Arc<Page>, Option<Completion>)> {
+) -> Result<(Arc<Page>, Option<CompletionBuilder>)> {
     pager.read_page(page_idx)
 }
 

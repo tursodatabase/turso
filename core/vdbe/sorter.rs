@@ -7,7 +7,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use tempfile;
 
-use crate::io::CompletionBuilder;
+use crate::io::{CompletionBuilder, IOBuilder};
 use crate::types::IOCompletions;
 use crate::util::IOExt;
 use crate::{
@@ -237,14 +237,10 @@ impl Sorter {
     fn init_chunk_heap(&mut self) -> Result<IOResult<()>> {
         match self.init_chunk_heap_state {
             InitChunkHeapState::Start => {
-                let mut completions: Vec<Completion> = Vec::with_capacity(self.chunks.len());
+                let mut completions = CompletionBuilder::default();
                 for chunk in self.chunks.iter_mut() {
-                    let c = chunk.read().inspect_err(|_| {
-                        for c in completions.iter() {
-                            c.abort();
-                        }
-                    })?;
-                    completions.push(c);
+                    let c = chunk.read()?;
+                    completions.append(c)
                 }
                 self.init_chunk_heap_state = InitChunkHeapState::PushChunk;
                 io_yield_many!(completions);
@@ -307,7 +303,7 @@ impl Sorter {
         Ok(IOResult::Done(()))
     }
 
-    fn flush(&mut self) -> Result<Option<Completion>> {
+    fn flush(&mut self) -> Result<Option<CompletionBuilder>> {
         if self.records.is_empty() {
             // Dummy completion to not complicate logic handling
             return Ok(None);
@@ -521,9 +517,11 @@ impl SortedChunk {
         });
 
         let c = Completion::new_read(read_buffer_ref, read_complete);
-        let c = self
-            .file
-            .pread(self.start_offset + self.total_bytes_read.get() as u64, c)?;
+        let c = IOBuilder::pread(
+            self.file.clone(),
+            self.start_offset + self.total_bytes_read.get() as u64,
+            c,
+        );
         Ok(c)
     }
 
@@ -567,7 +565,7 @@ impl SortedChunk {
         });
 
         let c = Completion::new_write(write_complete);
-        let c = self.file.pwrite(self.start_offset, buffer_ref, c)?;
+        let c = IOBuilder::pwrite(self.file.clone(), self.start_offset, buffer_ref, c);
         Ok(c)
     }
 }

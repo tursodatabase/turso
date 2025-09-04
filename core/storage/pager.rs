@@ -1120,7 +1120,7 @@ impl Pager {
 
     /// Reads a page from the database.
     #[tracing::instrument(skip_all, level = Level::DEBUG)]
-    pub fn read_page(&self, page_idx: usize) -> Result<(PageRef, Option<Completion>)> {
+    pub fn read_page(&self, page_idx: usize) -> Result<(PageRef, Option<CompletionBuilder>)> {
         tracing::trace!("read_page(page_idx = {})", page_idx);
         let mut page_cache = self.page_cache.write();
         let page_key = PageCacheKey::new(page_idx);
@@ -1250,7 +1250,7 @@ impl Pager {
             .copied()
             .collect::<Vec<usize>>();
         let len = dirty_pages.len().min(IOV_MAX);
-        let mut completions: Vec<Completion> = Vec::new();
+        let mut completions = CompletionBuilder::default();
         let mut pages = Vec::with_capacity(len);
         let page_sz = self.page_size.get().unwrap_or_default();
         let commit_frame = None; // cacheflush only so we are not setting a commit frame here
@@ -1265,34 +1265,24 @@ impl Pager {
             };
             pages.push(page);
             if pages.len() == IOV_MAX {
-                let c = wal
-                    .borrow_mut()
-                    .append_frames_vectored(
-                        std::mem::replace(
-                            &mut pages,
-                            Vec::with_capacity(std::cmp::min(IOV_MAX, dirty_pages.len() - idx)),
-                        ),
-                        page_sz,
-                        commit_frame,
-                    )
-                    .inspect_err(|_| {
-                        for c in completions.iter() {
-                            c.abort();
-                        }
-                    })?;
-                completions.push(c);
+                let c = wal.borrow_mut().append_frames_vectored(
+                    std::mem::replace(
+                        &mut pages,
+                        Vec::with_capacity(std::cmp::min(IOV_MAX, dirty_pages.len() - idx)),
+                    ),
+                    page_sz,
+                    commit_frame,
+                )?;
+                // No need to abort completions on error as they were not scheduled yet
+                completions.append(c);
             }
         }
         if !pages.is_empty() {
             let c = wal
                 .borrow_mut()
-                .append_frames_vectored(pages, page_sz, commit_frame)
-                .inspect_err(|_| {
-                    for c in completions.iter() {
-                        c.abort();
-                    }
-                })?;
-            completions.push(c);
+                .append_frames_vectored(pages, page_sz, commit_frame)?;
+            // No need to abort completions on error as they were not scheduled yet
+            completions.append(c);
         }
         Ok(completions)
     }
@@ -1333,7 +1323,7 @@ impl Pager {
                     }
 
                     let page_sz = self.page_size.get().expect("page size not set");
-                    let mut completions: Vec<Completion> = Vec::new();
+                    let mut completions = CompletionBuilder::default();
                     let mut pages: Vec<PageRef> = Vec::with_capacity(dirty_ids.len().min(IOV_MAX));
                     let total = dirty_ids.len();
 
@@ -1367,11 +1357,9 @@ impl Pager {
                                 commit_flag,
                             );
                             match r {
-                                Ok(c) => completions.push(c),
+                                Ok(c) => completions.append(c),
                                 Err(e) => {
-                                    for c in &completions {
-                                        c.abort();
-                                    }
+                                    // No need to abort completions here, as they were not scheduled yet
                                     return Err(e);
                                 }
                             }
@@ -1389,16 +1377,12 @@ impl Pager {
                             self.commit_info.state.set(CommitState::SyncWal);
                         }
                     }
-                    if !completions.iter().all(|c| c.is_completed()) {
-                        io_yield_many!(completions);
-                    }
+                    io_yield_many!(completions);
                 }
                 CommitState::SyncWal => {
                     self.commit_info.state.set(CommitState::AfterSyncWal);
                     let c = wal.borrow_mut().sync()?;
-                    if !c.is_completed() {
-                        io_yield_one!(c);
-                    }
+                    io_yield_one!(c);
                 }
                 CommitState::AfterSyncWal => {
                     turso_assert!(!wal.borrow().is_syncing(), "wal should have synced");
@@ -1420,9 +1404,7 @@ impl Pager {
                 CommitState::SyncDbFile => {
                     let c = sqlite3_ondisk::begin_sync(self.db_file.clone(), self.syncing.clone())?;
                     self.commit_info.state.set(CommitState::AfterSyncDbFile);
-                    if !c.is_completed() {
-                        io_yield_one!(c);
-                    }
+                    io_yield_one!(c);
                 }
                 CommitState::AfterSyncDbFile => {
                     turso_assert!(!self.syncing.get(), "should have finished syncing");
@@ -1582,7 +1564,7 @@ impl Pager {
             let mut wal = wal.borrow_mut();
             // fsync the wal syncronously before beginning checkpoint
             let c = wal.sync()?;
-            self.io.wait_for_completion(c)?;
+            c.wait(self.io.as_ref())?;
         }
         if !wal_auto_checkpoint_disabled {
             while let Err(LimboError::Busy) = self.wal_checkpoint(CheckpointMode::Truncate {
