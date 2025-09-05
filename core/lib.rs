@@ -471,7 +471,7 @@ impl Database {
                 "file existed on disk, reserved bytes for checksums: {}",
                 reserved_bytes
             );
-            if reserved_bytes == 0 {
+            if reserved_bytes != 16 {
                 tracing::trace!("old db found, resetting checksum context");
                 pager.reset_checksum_context();
             }
