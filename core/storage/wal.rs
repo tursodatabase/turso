@@ -18,6 +18,7 @@ use super::sqlite3_ondisk::{self, checksum_wal, WalHeader, WAL_MAGIC_BE, WAL_MAG
 use crate::fast_lock::SpinLock;
 use crate::io::{clock, File, IO};
 use crate::result::LimboResult;
+use crate::storage::database::EncryptionOrChecksum;
 use crate::storage::sqlite3_ondisk::{
     begin_read_wal_frame, begin_read_wal_frame_raw, finish_read_page, prepare_wal_frame,
     write_pages_vectored, PageSize, WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE,
@@ -1303,18 +1304,17 @@ impl Wal for WalFile {
             let page_buf = page_content.as_ptr();
 
             let io_ctx = self.io_ctx.borrow();
-            let encryption_ctx = io_ctx.encryption_context();
-            let encrypted_data = {
-                if let Some(key) = encryption_ctx.as_ref() {
-                    Some(key.encrypt_page(page_buf, page_id)?)
-                } else {
-                    None
+            let processed_data;
+            let data_to_write = match &io_ctx.encryption_or_checksum() {
+                EncryptionOrChecksum::Encryption(ctx) => {
+                    processed_data = ctx.encrypt_page(page_buf, page_id)?;
+                    processed_data.as_slice()
                 }
-            };
-            let data_to_write = if encryption_ctx.as_ref().is_some() {
-                encrypted_data.as_ref().unwrap().as_slice()
-            } else {
-                page_buf
+                EncryptionOrChecksum::Checksum(ctx) => {
+                    ctx.add_checksum_to_page(page_buf, page_id)?;
+                    page_buf
+                }
+                EncryptionOrChecksum::None => page_buf,
             };
 
             let seq = header.checkpoint_seq;
@@ -1512,11 +1512,15 @@ impl Wal for WalFile {
 
             let data_to_write: std::borrow::Cow<[u8]> = {
                 let io_ctx = self.io_ctx.borrow();
-                let ectx = io_ctx.encryption_context();
-                if let Some(ctx) = ectx.as_ref() {
-                    Cow::Owned(ctx.encrypt_page(plain, page_id)?)
-                } else {
-                    Cow::Borrowed(plain)
+                match &io_ctx.encryption_or_checksum() {
+                    EncryptionOrChecksum::Encryption(ctx) => {
+                        Cow::Owned(ctx.encrypt_page(plain, page_id)?)
+                    }
+                    EncryptionOrChecksum::Checksum(ctx) => {
+                        ctx.add_checksum_to_page(plain, page_id)?;
+                        Cow::Borrowed(plain)
+                    }
+                    EncryptionOrChecksum::None => Cow::Borrowed(plain),
                 }
             };
 

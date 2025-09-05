@@ -1,4 +1,5 @@
 #![allow(clippy::arc_with_non_send_sync)]
+extern crate core;
 
 mod assert;
 mod error;
@@ -454,6 +455,19 @@ impl Database {
             .block(|| pager.with_header(|header| header.default_page_cache_size))
             .unwrap_or_default()
             .get();
+
+        let file_existed_on_disk = self.db_file.size().unwrap_or(0) > 0;
+        if file_existed_on_disk {
+            let reserved_bytes = pager.reserved_space();
+            tracing::trace!(
+                "file existed on disk, reserved bytes for checksums: {}",
+                reserved_bytes
+            );
+            if reserved_bytes != 16 {
+                tracing::trace!("old db found, resetting checksum context");
+                pager.reset_checksum_context();
+            }
+        }
 
         let conn = Arc::new(Connection {
             _db: self.clone(),

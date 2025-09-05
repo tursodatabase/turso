@@ -16,7 +16,7 @@ use crate::{
     Result, TransactionState,
 };
 use parking_lot::RwLock;
-use std::cell::{Cell, OnceCell, RefCell, UnsafeCell};
+use std::cell::{Cell, RefCell, UnsafeCell};
 use std::collections::HashSet;
 use std::hash;
 use std::rc::Rc;
@@ -43,7 +43,7 @@ impl HeaderRef {
     pub fn from_pager(pager: &Pager) -> Result<IOResult<Self>> {
         loop {
             let state = pager.header_ref_state.borrow().clone();
-            tracing::trace!(?state);
+            tracing::trace!("HeaderRef::from_pager - {:?}", state);
             match state {
                 HeaderRefState::Start => {
                     if !pager.db_state.is_initialized() {
@@ -489,7 +489,7 @@ pub struct Pager {
     /// `usable_space` calls. TODO: Invalidate reserved_space when we add the functionality
     /// to change it.
     pub(crate) page_size: Cell<Option<PageSize>>,
-    reserved_space: OnceCell<u8>,
+    reserved_space: Cell<Option<u8>>,
     free_page_state: RefCell<FreePageState>,
     /// Maximum number of pages allowed in the database. Default is 1073741823 (SQLite default).
     max_page_count: Cell<u32>,
@@ -595,7 +595,7 @@ impl Pager {
             init_lock,
             allocate_page1_state,
             page_size: Cell::new(None),
-            reserved_space: OnceCell::new(),
+            reserved_space: Cell::new(None),
             free_page_state: RefCell::new(FreePageState::Start),
             allocate_page_state: RefCell::new(AllocatePageState::Start),
             max_page_count: Cell::new(DEFAULT_MAX_PAGE_COUNT),
@@ -967,13 +967,24 @@ impl Pager {
                 .unwrap_or_default()
         });
 
-        let reserved_space = *self.reserved_space.get_or_init(|| {
-            self.io
-                .block(|| self.with_header(|header| header.reserved_space))
-                .unwrap_or_default()
-        });
+        let reserved_space = self.reserved_space();
 
         (page_size.get() as usize) - (reserved_space as usize)
+    }
+
+    pub fn reserved_space(&self) -> u8 {
+        tracing::debug!("fetching reserved_space from header",);
+        match self.reserved_space.get() {
+            Some(value) => value,
+            None => {
+                let value = self
+                    .io
+                    .block(|| self.with_header(|header| header.reserved_space))
+                    .unwrap_or_default();
+                self.reserved_space.set(Some(value));
+                value
+            }
+        }
     }
 
     /// Set the initial page size for the database. Should only be called before the database is initialized
@@ -1120,7 +1131,11 @@ impl Pager {
     /// Reads a page from the database.
     #[tracing::instrument(skip_all, level = Level::DEBUG)]
     pub fn read_page(&self, page_idx: usize) -> Result<(PageRef, Option<Completion>)> {
-        tracing::trace!("read_page(page_idx = {})", page_idx);
+        tracing::trace!(
+            "read_page(page_idx = {}) (usable: {})",
+            page_idx,
+            self.usable_space()
+        );
         let mut page_cache = self.page_cache.write();
         let page_key = PageCacheKey::new(page_idx);
         if let Some(page) = page_cache.get(&page_key)? {
@@ -1800,6 +1815,12 @@ impl Pager {
                 let io_ctx = self.io_ctx.borrow();
                 if let Some(ctx) = io_ctx.encryption_context() {
                     default_header.reserved_space = ctx.required_reserved_bytes()
+                } else {
+                    tracing::info!(
+                        "no encryption context, using default reserved space of 16 bytes"
+                    );
+                    default_header.reserved_space = 16;
+                    self.reserved_space.set(Some(16));
                 }
 
                 if let Some(size) = self.page_size.get() {
@@ -1832,7 +1853,10 @@ impl Pager {
             }
             AllocatePage1State::Writing { page } => {
                 turso_assert!(page.is_loaded(), "page should be loaded");
-                tracing::trace!("allocate_page1(Writing done)");
+                tracing::trace!(
+                    "allocate_page1(Writing done) (usable_space={})",
+                    self.usable_space()
+                );
                 let page_key = PageCacheKey::new(page.get().id);
                 let mut cache = self.page_cache.write();
                 cache.insert(page_key, page.clone()).map_err(|e| {
@@ -2182,6 +2206,16 @@ impl Pager {
         wal.borrow_mut()
             .set_io_context(self.io_ctx.borrow().clone());
         Ok(())
+    }
+
+    pub fn reset_checksum_context(&self) {
+        {
+            let mut io_ctx = self.io_ctx.borrow_mut();
+            io_ctx.reset_encryption_or_checksum();
+        }
+        let Some(wal) = self.wal.as_ref() else { return };
+        wal.borrow_mut()
+            .set_io_context(self.io_ctx.borrow().clone())
     }
 }
 

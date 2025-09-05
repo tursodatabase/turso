@@ -6225,7 +6225,12 @@ fn find_free_slot(
 pub fn btree_init_page(page: &PageRef, page_type: PageType, offset: usize, usable_space: usize) {
     // setup btree page
     let contents = page.get_contents();
-    tracing::debug!("btree_init_page(id={}, offset={})", page.get().id, offset);
+    tracing::debug!(
+        "btree_init_page(id={}, offset={}, usable_space={})",
+        page.get().id,
+        offset,
+        usable_space
+    );
     contents.offset = offset;
     let id = page_type as u8;
     contents.write_page_type(id);
@@ -7707,7 +7712,7 @@ mod tests {
         // FIXME: handle page cache is full
         let _ = run_until_done(|| pager.allocate_page1(), &pager);
         let page2 = run_until_done(|| pager.allocate_page(), &pager).unwrap();
-        btree_init_page(&page2, PageType::TableLeaf, 0, 4096);
+        btree_init_page(&page2, PageType::TableLeaf, 0, pager.usable_space());
         (pager, page2.get().id, db, conn)
     }
 
