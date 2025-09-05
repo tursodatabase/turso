@@ -15,14 +15,97 @@ do_execsql_test_on_specific_db testing/testing.db schema {
         city TEXT,
         state TEXT,
         zipcode TEXT,
-        age INTEGER
+        age INTEGER,
+        created_at TIMESTAMP,
+        updated_at TIMESTAMP
     );
 CREATE TABLE products (
         id INTEGER PRIMARY KEY,
         name TEXT,
         price REAL
     );
-CREATE INDEX age_idx on users (age);"}
+CREATE TABLE orders (
+        id INTEGER PRIMARY KEY,
+        user_id INTEGER,
+        order_date TIMESTAMP,
+        total_amount REAL,
+        status TEXT,
+        shipping_address TEXT,
+        shipping_city TEXT,
+        shipping_state TEXT,
+        shipping_zip TEXT,
+        payment_method TEXT,
+        tracking_number TEXT,
+        notes TEXT,
+        FOREIGN KEY (user_id) REFERENCES users(id)
+    );
+CREATE TABLE order_items (
+        id INTEGER PRIMARY KEY,
+        order_id INTEGER,
+        product_id INTEGER,
+        quantity INTEGER,
+        unit_price REAL,
+        discount REAL,
+        tax REAL,
+        total_price REAL,
+        FOREIGN KEY (order_id) REFERENCES orders(id),
+        FOREIGN KEY (product_id) REFERENCES products(id)
+    );
+CREATE TABLE reviews (
+        id INTEGER PRIMARY KEY,
+        product_id INTEGER,
+        user_id INTEGER,
+        rating INTEGER,
+        title TEXT,
+        comment TEXT,
+        helpful_count INTEGER,
+        verified_purchase BOOLEAN,
+        review_date TIMESTAMP,
+        FOREIGN KEY (product_id) REFERENCES products(id),
+        FOREIGN KEY (user_id) REFERENCES users(id)
+    );
+CREATE TABLE inventory_transactions (
+        id INTEGER PRIMARY KEY,
+        product_id INTEGER,
+        transaction_type TEXT,
+        quantity INTEGER,
+        previous_quantity INTEGER,
+        new_quantity INTEGER,
+        transaction_date TIMESTAMP,
+        reference_type TEXT,
+        reference_id INTEGER,
+        notes TEXT,
+        performed_by TEXT,
+        FOREIGN KEY (product_id) REFERENCES products(id)
+    );
+CREATE TABLE customer_support_tickets (
+        id INTEGER PRIMARY KEY,
+        user_id INTEGER,
+        order_id INTEGER,
+        ticket_number TEXT,
+        category TEXT,
+        priority TEXT,
+        status TEXT,
+        subject TEXT,
+        description TEXT,
+        created_at TIMESTAMP,
+        updated_at TIMESTAMP,
+        resolved_at TIMESTAMP,
+        assigned_to TEXT,
+        resolution_notes TEXT,
+        FOREIGN KEY (user_id) REFERENCES users(id),
+        FOREIGN KEY (order_id) REFERENCES orders(id)
+    );
+CREATE INDEX age_idx on users (age);
+CREATE INDEX idx_orders_user_id ON orders(user_id);
+CREATE INDEX idx_orders_status ON orders(status);
+CREATE INDEX idx_order_items_order_id ON order_items(order_id);
+CREATE INDEX idx_order_items_product_id ON order_items(product_id);
+CREATE INDEX idx_reviews_product_id ON reviews(product_id);
+CREATE INDEX idx_reviews_user_id ON reviews(user_id);
+CREATE INDEX idx_inventory_product_id ON inventory_transactions(product_id);
+CREATE INDEX idx_tickets_user_id ON customer_support_tickets(user_id);
+CREATE INDEX idx_tickets_status ON customer_support_tickets(status);"}
 
 # FIXME sqlite does something different with .schema than what we are doing
 #do_execsql_test_on_specific_db testing/testing_norowidalias.db schema {
@@ -58,7 +141,9 @@ do_execsql_test_on_specific_db testing/testing.db schema-1 {
         city TEXT,
         state TEXT,
         zipcode TEXT,
-        age INTEGER
+        age INTEGER,
+        created_at TIMESTAMP,
+        updated_at TIMESTAMP
     );
 CREATE INDEX age_idx on users (age);"}
 

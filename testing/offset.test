@@ -17,19 +17,19 @@ do_execsql_test select-offset-negative {
 
 do_execsql_test select-offset-0-groupby {
   SELECT COUNT(*) FROM users GROUP BY STATE ORDER BY STATE LIMIT 5 OFFSET 0;
-} {168
-166
-162
-153
-166}
+} {289
+255
+256
+243
+246}
 
 do_execsql_test select-offset-1-groupby {
   SELECT COUNT(*) FROM users GROUP BY STATE ORDER BY STATE LIMIT 5 OFFSET 1;
-} {166
-162
-153
-166
-170}
+} {255
+256
+243
+246
+230}
 
 do_execsql_test select-offset-subquery {
     SELECT id, first_name, age 
@@ -40,8 +40,8 @@ do_execsql_test select-offset-subquery {
         LIMIT 5 OFFSET 2
     )
     ORDER BY id DESC;
-} {7|Aimee|24
-6|Nicholas|89
-5|Edward|15
-4|Jennifer|33
-3|Tommy|18}
+} {7|Nancy|61
+6|Robert|47
+5|Jennifer|21
+4|Anne|56
+3|Matthew|67}

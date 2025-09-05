@@ -50,20 +50,26 @@ do_execsql_test where-glob-or {
 
 do_execsql_test where-glob-another-column {
     select first_name, last_name from users where last_name glob first_name;
-} {James|James
-Daniel|Daniel
-Taylor|Taylor}
+} {Frank|Frank
+Taylor|Taylor
+Blake|Blake
+Thomas|Thomas}
 
 do_execsql_test where-glob-another-column-prefix {
     select first_name, last_name from users where last_name glob concat(first_name, '*');
-} {James|James
-Daniel|Daniel
+} {John|Johnson
+John|Johnson
+Frank|Frank
 William|Williams
-John|Johnson
 Taylor|Taylor
-John|Johnson
-Stephen|Stephens
-Robert|Roberts}
+Steven|Stevens
+William|Williams
+William|Williams
+Blake|Blake
+William|Williams
+Steven|Stevens
+Thomas|Thomas
+William|Williams}
 
 do_execsql_test where-glob-impossible {
     select * from products where 'foobar' glob 'fooba';
