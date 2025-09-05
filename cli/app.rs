@@ -488,55 +488,43 @@ impl Limbo {
         Ok(())
     }
 
-    pub fn handle_input_line(&mut self, line: &str) -> anyhow::Result<()> {
-        if self.input_buff.is_empty() {
-            if line.is_empty() {
-                return Ok(());
-            }
-            if let Some(command) = line.strip_prefix('.') {
-                self.handle_dot_command(command);
-                let _ = self.reset_line(line);
-                return Ok(());
-            }
-        }
-        if line.trim_start().starts_with("--") {
-            if let Some(remaining) = line.split_once('\n') {
-                let after_comment = remaining.1.trim();
-                if !after_comment.is_empty() {
-                    if after_comment.ends_with(';') {
-                        self.run_query(after_comment);
-                        if self.opts.echo {
-                            let _ = self.writeln(after_comment);
-                        }
-                        let conn = self.conn.clone();
-                        let runner = conn.query_runner(after_comment.as_bytes());
-                        for output in runner {
-                            if let Err(e) = self.print_query_result(after_comment, output, None) {
-                                let _ = self.writeln(e.to_string());
-                            }
-                        }
-                        self.reset_input();
-                        return self.handle_input_line(after_comment);
-                    } else {
-                        self.set_multiline_prompt();
-                        let _ = self.reset_line(line);
-                        return Ok(());
-                    }
-                }
-            }
+pub fn handle_input_line(&mut self, line: &str) -> anyhow::Result<()> {
+    // If the main buffer is empty, check for dot commands first.
+    if self.input_buff.is_empty() {
+        if line.trim().is_empty() {
             return Ok(());
         }
-        self.reset_line(line)?;
-        if line.ends_with(';') {
-            self.buffer_input(line);
-            let buff = self.input_buff.clone();
-            self.run_query(buff.as_str());
-        } else {
-            self.buffer_input(format!("{line}\n").as_str());
-            self.set_multiline_prompt();
+        if let Some(command) = line.trim().strip_prefix('.') {
+            self.handle_dot_command(command);
+            self.reset_line(line)?;
+            return Ok(());
         }
-        Ok(())
     }
+
+    self.input_buff.push_str(line);
+    self.input_buff.push('\n');
+
+    if self.input_buff.trim_end().ends_with(';') {
+    
+        let completed_command = self.input_buff.clone();
+
+        self.run_query(&completed_command);
+        self.reset_line(&completed_command)?;
+
+    } else {
+        self.set_multiline_prompt();
+    }
+
+    Ok(())
+}
+
+
+
+
+
+
+
+
 
     pub fn handle_dot_command(&mut self, line: &str) {
         let args: Vec<&str> = line.split_whitespace().collect();
