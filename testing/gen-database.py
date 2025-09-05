@@ -25,20 +25,27 @@ cursor.execute("""
     )
 """)
 
-cursor.execute("""
-    CREATE TABLE IF NOT EXISTS products (
+cursor.execute(
+    """
+CREATE TABLE products (
         id INTEGER PRIMARY KEY,
         name TEXT,
-        description TEXT,
-        price REAL,
-        cost REAL,
-        sku TEXT,
-        category TEXT,
-        stock_quantity INTEGER,
-        manufacturer TEXT,
-        created_at TIMESTAMP
-    )
-""")
+        price REAL
+    );
+""",
+    [],
+)
+cursor.execute("INSERT INTO products VALUES(1,'hat',79.0);")
+cursor.execute("INSERT INTO products VALUES(2,'cap',82.0);")
+cursor.execute("INSERT INTO products VALUES(3,'shirt',18.0);")
+cursor.execute("INSERT INTO products VALUES(4,'sweater',25.0);")
+cursor.execute("INSERT INTO products VALUES(5,'sweatshirt',74.0);")
+cursor.execute("INSERT INTO products VALUES(6,'shorts',70.0);")
+cursor.execute("INSERT INTO products VALUES(7,'jeans',78.0);")
+cursor.execute("INSERT INTO products VALUES(8,'sneakers',82.0);")
+cursor.execute("INSERT INTO products VALUES(9,'boots',1.0);")
+cursor.execute("INSERT INTO products VALUES(10,'coat',33.0);")
+cursor.execute("INSERT INTO products VALUES(11,'accessories',81.0);")
 
 cursor.execute("""
     CREATE TABLE IF NOT EXISTS orders (
@@ -158,58 +165,6 @@ cursor.executemany(
     users_data,
 )
 
-print("Generating products...")
-categories = [
-    "Electronics",
-    "Clothing",
-    "Home & Garden",
-    "Sports",
-    "Books",
-    "Toys",
-    "Food",
-    "Beauty",
-    "Automotive",
-    "Health",
-]
-manufacturers = [
-    "TechCorp",
-    "FashionBrand",
-    "HomeGoods Inc",
-    "SportsMaster",
-    "BookPublisher",
-    "ToyMaker",
-    "FoodCo",
-    "BeautyBrand",
-    "AutoParts",
-    "HealthCo",
-]
-
-products_data = []
-for i in range(12000):
-    if i % 1000 == 0:
-        print(f"  Generated {i} products...")
-
-    name = fake.catch_phrase()
-    description = fake.text(max_nb_chars=200)
-    price = round(random.uniform(0.99, 999.99), 2)
-    cost = round(price * random.uniform(0.3, 0.7), 2)
-    sku = fake.ean13()
-    category = random.choice(categories)
-    stock_quantity = random.randint(0, 1000)
-    manufacturer = random.choice(manufacturers)
-    created_at = fake.date_time_between(start_date="-2y", end_date="now")
-
-    products_data.append((name, description, price, cost, sku, category, stock_quantity, manufacturer, created_at))
-
-cursor.executemany(
-    """
-    INSERT INTO products (name, description, price, cost, sku, category,
-                         stock_quantity, manufacturer, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-""",
-    products_data,
-)
-
 print("Generating orders...")
 order_statuses = ["pending", "processing", "shipped", "delivered", "cancelled", "refunded"]
 payment_methods = ["credit_card", "debit_card", "paypal", "apple_pay", "google_pay", "bank_transfer"]
@@ -276,7 +231,7 @@ for order_id in range(1, 20001):
 
 cursor.executemany(
     """
-    INSERT INTO order_items (order_id, product_id, quantity, unit_price, 
+    INSERT INTO order_items (order_id, product_id, quantity, unit_price,
                             discount, tax, total_price)
     VALUES (?, ?, ?, ?, ?, ?, ?)
 """,
@@ -412,6 +367,7 @@ cursor.executemany(
 )
 
 print("Creating indexes...")
+cursor.execute("CREATE INDEX age_idx on users (age)")
 cursor.execute("CREATE INDEX IF NOT EXISTS idx_orders_user_id ON orders(user_id)")
 cursor.execute("CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status)")
 cursor.execute("CREATE INDEX IF NOT EXISTS idx_order_items_order_id ON order_items(order_id)")
