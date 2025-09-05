@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-import sqlite3
-from faker import Faker
 import random
+import sqlite3
+
+from faker import Faker
 
 conn = sqlite3.connect("database.db")
 cursor = conn.cursor()
