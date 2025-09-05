@@ -1125,9 +1125,19 @@ impl Pager {
         let page_key = PageCacheKey::new(page_idx);
         if let Some(page) = page_cache.get(&page_key)? {
             tracing::trace!("read_page(page_idx = {}) = cached", page_idx);
+            turso_assert!(
+                page_idx == page.get().id,
+                "attempted to read page {page_idx} but got page {}",
+                page.get().id
+            );
             return Ok((page.clone(), None));
         }
         let (page, c) = self.read_page_no_cache(page_idx, None, false)?;
+        turso_assert!(
+            page_idx == page.get().id,
+            "attempted to read page {page_idx} but got page {}",
+            page.get().id
+        );
         self.cache_insert(page_idx, page.clone(), &mut page_cache)?;
         Ok((page, Some(c)))
     }
