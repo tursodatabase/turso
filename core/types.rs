@@ -5,7 +5,7 @@ use turso_parser::ast::SortOrder;
 
 use crate::error::LimboError;
 use crate::ext::{ExtValue, ExtValueType};
-use crate::io::CompletionBuilder;
+use crate::io::CompletionFuture;
 use crate::numeric::format_float;
 use crate::pseudo::PseudoCursor;
 use crate::schema::Index;
@@ -2412,7 +2412,7 @@ impl Cursor {
 #[must_use]
 pub enum IOResult<T> {
     Done(T),
-    IO(CompletionBuilder),
+    IO(CompletionFuture),
 }
 
 impl<T> IOResult<T> {

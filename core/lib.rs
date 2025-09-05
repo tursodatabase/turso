@@ -57,7 +57,7 @@ pub use io::UnixIO;
 #[cfg(all(feature = "fs", target_os = "linux", feature = "io_uring"))]
 pub use io::UringIO;
 pub use io::{
-    Buffer, Completion, CompletionBuilder, CompletionType, File, IOBuilder, MemoryIO, OpenFlags,
+    Buffer, Completion, CompletionFuture, CompletionType, File, IOBuilder, MemoryIO, OpenFlags,
     PlatformIO, SyscallIO, WriteCompletion, IO,
 };
 use parking_lot::RwLock;
@@ -1511,7 +1511,7 @@ impl Connection {
     }
 
     /// Flush dirty pages to disk.
-    pub fn cacheflush(&self) -> Result<CompletionBuilder> {
+    pub fn cacheflush(&self) -> Result<CompletionFuture> {
         if self.closed.get() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }

@@ -1,4 +1,4 @@
-use crate::io::{CompletionBuilder, IOBuilder};
+use crate::io::{CompletionFuture, IOBuilder};
 use crate::result::LimboResult;
 use crate::storage::wal::IOV_MAX;
 use crate::storage::{
@@ -1090,7 +1090,7 @@ impl Pager {
         page_idx: usize,
         frame_watermark: Option<u64>,
         allow_empty_read: bool,
-    ) -> Result<(PageRef, CompletionBuilder)> {
+    ) -> Result<(PageRef, CompletionFuture)> {
         tracing::trace!("read_page_no_cache(page_idx = {})", page_idx);
         let page = Arc::new(Page::new(page_idx));
         let io_ctx = &self.io_ctx.borrow();
@@ -1120,7 +1120,7 @@ impl Pager {
 
     /// Reads a page from the database.
     #[tracing::instrument(skip_all, level = Level::DEBUG)]
-    pub fn read_page(&self, page_idx: usize) -> Result<(PageRef, Option<CompletionBuilder>)> {
+    pub fn read_page(&self, page_idx: usize) -> Result<(PageRef, Option<CompletionFuture>)> {
         tracing::trace!("read_page(page_idx = {})", page_idx);
         let mut page_cache = self.page_cache.write();
         let page_key = PageCacheKey::new(page_idx);
@@ -1139,7 +1139,7 @@ impl Pager {
         page: PageRef,
         allow_empty_read: bool,
         io_ctx: &IOContext,
-    ) -> Result<CompletionBuilder> {
+    ) -> Result<CompletionFuture> {
         sqlite3_ondisk::begin_read_page(
             self.db_file.clone(),
             self.buffer_pool.clone(),
@@ -1235,7 +1235,7 @@ impl Pager {
     /// Flush all dirty pages to disk.
     /// Unlike commit_dirty_pages, this function does not commit, checkpoint now sync the WAL/Database.
     #[instrument(skip_all, level = Level::INFO)]
-    pub fn cacheflush(&self) -> Result<CompletionBuilder> {
+    pub fn cacheflush(&self) -> Result<CompletionFuture> {
         let Some(wal) = self.wal.as_ref() else {
             // TODO: when ephemeral table spills to disk, it should cacheflush pages directly to the temporary database file.
             // This handling is not yet implemented, but it should be when spilling is implemented.
@@ -1250,7 +1250,7 @@ impl Pager {
             .copied()
             .collect::<Vec<usize>>();
         let len = dirty_pages.len().min(IOV_MAX);
-        let mut completions = CompletionBuilder::default();
+        let mut completions = CompletionFuture::default();
         let mut pages = Vec::with_capacity(len);
         let page_sz = self.page_size.get().unwrap_or_default();
         let commit_frame = None; // cacheflush only so we are not setting a commit frame here
@@ -1323,7 +1323,7 @@ impl Pager {
                     }
 
                     let page_sz = self.page_size.get().expect("page size not set");
-                    let mut completions = CompletionBuilder::default();
+                    let mut completions = CompletionFuture::default();
                     let mut pages: Vec<PageRef> = Vec::with_capacity(dirty_ids.len().min(IOV_MAX));
                     let total = dirty_ids.len();
 
@@ -1433,7 +1433,7 @@ impl Pager {
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
-    pub fn wal_get_frame(&self, frame_no: u64, frame: &mut [u8]) -> Result<CompletionBuilder> {
+    pub fn wal_get_frame(&self, frame_no: u64, frame: &mut [u8]) -> Result<CompletionFuture> {
         let Some(wal) = self.wal.as_ref() else {
             return Err(LimboError::InternalError(
                 "wal_get_frame() called on database without WAL".to_string(),

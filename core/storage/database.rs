@@ -2,7 +2,7 @@ use crate::error::LimboError;
 #[cfg(feature = "fs")]
 use crate::storage::encryption::EncryptionContext;
 use crate::{
-    io::{Completion, CompletionBuilder, IOBuilder},
+    io::{Completion, CompletionFuture, IOBuilder},
     Buffer, CompletionError, Result,
 };
 
@@ -48,21 +48,21 @@ impl Default for IOContext {
 /// the storage medium. A database can either be a file on disk, like in SQLite,
 /// or something like a remote page server service.
 pub trait DatabaseStorage: Send + Sync {
-    fn read_header(&self, c: Completion) -> Result<CompletionBuilder>;
+    fn read_header(&self, c: Completion) -> Result<CompletionFuture>;
 
     fn read_page(
         &self,
         page_idx: usize,
         io_ctx: &IOContext,
         c: Completion,
-    ) -> Result<CompletionBuilder>;
+    ) -> Result<CompletionFuture>;
     fn write_page(
         &self,
         page_idx: usize,
         buffer: Arc<Buffer>,
         io_ctx: &IOContext,
         c: Completion,
-    ) -> Result<CompletionBuilder>;
+    ) -> Result<CompletionFuture>;
     fn write_pages(
         &self,
         first_page_idx: usize,
@@ -70,10 +70,10 @@ pub trait DatabaseStorage: Send + Sync {
         buffers: Vec<Arc<Buffer>>,
         io_ctx: &IOContext,
         c: Completion,
-    ) -> Result<CompletionBuilder>;
-    fn sync(&self, c: Completion) -> Result<CompletionBuilder>;
+    ) -> Result<CompletionFuture>;
+    fn sync(&self, c: Completion) -> Result<CompletionFuture>;
     fn size(&self) -> Result<u64>;
-    fn truncate(&self, len: u64, c: Completion) -> Result<CompletionBuilder>;
+    fn truncate(&self, len: u64, c: Completion) -> Result<CompletionFuture>;
 }
 
 #[cfg(feature = "fs")]
@@ -89,7 +89,7 @@ unsafe impl Sync for DatabaseFile {}
 #[cfg(feature = "fs")]
 impl DatabaseStorage for DatabaseFile {
     #[instrument(skip_all, level = Level::DEBUG)]
-    fn read_header(&self, c: Completion) -> Result<CompletionBuilder> {
+    fn read_header(&self, c: Completion) -> Result<CompletionFuture> {
         Ok(IOBuilder::pread(self.file.clone(), 0, c))
     }
 
@@ -99,7 +99,7 @@ impl DatabaseStorage for DatabaseFile {
         page_idx: usize,
         io_ctx: &IOContext,
         c: Completion,
-    ) -> Result<CompletionBuilder> {
+    ) -> Result<CompletionFuture> {
         let r = c.as_read();
         let size = r.buf().len();
         assert!(page_idx > 0);
@@ -158,7 +158,7 @@ impl DatabaseStorage for DatabaseFile {
         buffer: Arc<Buffer>,
         io_ctx: &IOContext,
         c: Completion,
-    ) -> Result<CompletionBuilder> {
+    ) -> Result<CompletionFuture> {
         let buffer_size = buffer.len();
         assert!(page_idx > 0);
         assert!(buffer_size >= 512);
@@ -184,7 +184,7 @@ impl DatabaseStorage for DatabaseFile {
         buffers: Vec<Arc<Buffer>>,
         io_ctx: &IOContext,
         c: Completion,
-    ) -> Result<CompletionBuilder> {
+    ) -> Result<CompletionFuture> {
         assert!(first_page_idx > 0);
         assert!(page_size >= 512);
         assert!(page_size <= 65536);
@@ -209,7 +209,7 @@ impl DatabaseStorage for DatabaseFile {
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
-    fn sync(&self, c: Completion) -> Result<CompletionBuilder> {
+    fn sync(&self, c: Completion) -> Result<CompletionFuture> {
         Ok(IOBuilder::sync(self.file.clone(), c))
     }
 
@@ -219,7 +219,7 @@ impl DatabaseStorage for DatabaseFile {
     }
 
     #[instrument(skip_all, level = Level::INFO)]
-    fn truncate(&self, len: u64, c: Completion) -> Result<CompletionBuilder> {
+    fn truncate(&self, len: u64, c: Completion) -> Result<CompletionFuture> {
         Ok(IOBuilder::truncate(self.file.clone(), len, c))
     }
 }

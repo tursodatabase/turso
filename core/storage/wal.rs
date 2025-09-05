@@ -16,7 +16,7 @@ use super::buffer_pool::BufferPool;
 use super::pager::{PageRef, Pager};
 use super::sqlite3_ondisk::{self, checksum_wal, WalHeader, WAL_MAGIC_BE, WAL_MAGIC_LE};
 use crate::fast_lock::SpinLock;
-use crate::io::{clock, CompletionBuilder, File, IOBuilder, IO};
+use crate::io::{clock, CompletionFuture, File, IOBuilder, IO};
 use crate::result::LimboResult;
 use crate::storage::sqlite3_ondisk::{
     begin_read_wal_frame, begin_read_wal_frame_raw, finish_read_page, prepare_wal_frame,
@@ -248,10 +248,10 @@ pub trait Wal: Debug {
         frame_id: u64,
         page: PageRef,
         buffer_pool: Arc<BufferPool>,
-    ) -> Result<CompletionBuilder>;
+    ) -> Result<CompletionFuture>;
 
     /// Read a raw frame (header included) from the WAL.
-    fn read_frame_raw(&self, frame_id: u64, frame: &mut [u8]) -> Result<CompletionBuilder>;
+    fn read_frame_raw(&self, frame_id: u64, frame: &mut [u8]) -> Result<CompletionFuture>;
 
     /// Write a raw frame (header included) from the WAL.
     /// Note, that turso-db will use page_no and size_after fields from the header, but will overwrite checksum with proper value
@@ -274,14 +274,14 @@ pub trait Wal: Debug {
         page: PageRef,
         page_size: PageSize,
         db_size: u32,
-    ) -> Result<CompletionBuilder>;
+    ) -> Result<CompletionFuture>;
 
     fn append_frames_vectored(
         &mut self,
         pages: Vec<PageRef>,
         page_sz: PageSize,
         db_size_on_commit: Option<u32>,
-    ) -> Result<CompletionBuilder>;
+    ) -> Result<CompletionFuture>;
 
     /// Complete append of frames by updating shared wal state. Before this
     /// all changes were stored locally.
@@ -293,7 +293,7 @@ pub trait Wal: Debug {
         pager: &Pager,
         mode: CheckpointMode,
     ) -> Result<IOResult<CheckpointResult>>;
-    fn sync(&mut self) -> Result<CompletionBuilder>;
+    fn sync(&mut self) -> Result<CompletionFuture>;
     fn is_syncing(&self) -> bool;
     fn get_max_frame_in_wal(&self) -> u64;
     fn get_checkpoint_seq(&self) -> u32;
@@ -1064,7 +1064,7 @@ impl Wal for WalFile {
         frame_id: u64,
         page: PageRef,
         buffer_pool: Arc<BufferPool>,
-    ) -> Result<CompletionBuilder> {
+    ) -> Result<CompletionFuture> {
         tracing::debug!(
             "read_frame(page_idx = {}, frame_id = {})",
             page.get().id,
@@ -1106,7 +1106,7 @@ impl Wal for WalFile {
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
-    fn read_frame_raw(&self, frame_id: u64, frame: &mut [u8]) -> Result<CompletionBuilder> {
+    fn read_frame_raw(&self, frame_id: u64, frame: &mut [u8]) -> Result<CompletionFuture> {
         tracing::debug!("read_frame({})", frame_id);
         let offset = self.frame_offset(frame_id);
         let (frame_ptr, frame_len) = (frame.as_mut_ptr(), frame.len());
@@ -1278,7 +1278,7 @@ impl Wal for WalFile {
         page: PageRef,
         page_size: PageSize,
         db_size: u32,
-    ) -> Result<CompletionBuilder> {
+    ) -> Result<CompletionFuture> {
         self.ensure_header_if_needed(page_size)?;
         let shared_page_size = {
             let shared = self.get_shared();
@@ -1377,7 +1377,7 @@ impl Wal for WalFile {
     }
 
     #[instrument(err, skip_all, level = Level::DEBUG)]
-    fn sync(&mut self) -> Result<CompletionBuilder> {
+    fn sync(&mut self) -> Result<CompletionFuture> {
         tracing::debug!("wal_sync");
         let syncing = self.syncing.clone();
         let completion = Completion::new_sync(move |_| {
@@ -1474,7 +1474,7 @@ impl Wal for WalFile {
         pages: Vec<PageRef>,
         page_sz: PageSize,
         db_size_on_commit: Option<u32>,
-    ) -> Result<CompletionBuilder> {
+    ) -> Result<CompletionFuture> {
         turso_assert!(
             pages.len() <= IOV_MAX,
             "we limit number of iovecs to IOV_MAX"
@@ -1827,7 +1827,7 @@ impl WalFile {
                 // if at all possible, at the cost of some batching potential.
                 CheckpointState::Processing => {
                     // Gather I/O completions, estimate with MAX_INFLIGHT_WRITES to prevent realloc
-                    let mut completions = CompletionBuilder::default();
+                    let mut completions = CompletionFuture::default();
 
                     // Check and clean any completed writes from pending flush
                     if self.ongoing_checkpoint.process_inflight_writes() {
@@ -2186,7 +2186,7 @@ impl WalFile {
         &self,
         page_id: usize,
         frame_id: u64,
-    ) -> Result<(InflightRead, CompletionBuilder)> {
+    ) -> Result<(InflightRead, CompletionFuture)> {
         let offset = self.frame_offset(frame_id);
         let buf_slot = Arc::new(SpinLock::new(None));
 

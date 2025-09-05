@@ -7,7 +7,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use tempfile;
 
-use crate::io::{CompletionBuilder, IOBuilder};
+use crate::io::{CompletionFuture, IOBuilder};
 use crate::util::IOExt;
 use crate::{
     error::LimboError,
@@ -236,7 +236,7 @@ impl Sorter {
     fn init_chunk_heap(&mut self) -> Result<IOResult<()>> {
         match self.init_chunk_heap_state {
             InitChunkHeapState::Start => {
-                let mut completions = CompletionBuilder::default();
+                let mut completions = CompletionFuture::default();
                 for chunk in self.chunks.iter_mut() {
                     let c = chunk.read()?;
                     completions.append(c)
@@ -302,7 +302,7 @@ impl Sorter {
         Ok(IOResult::Done(()))
     }
 
-    fn flush(&mut self) -> Result<Option<CompletionBuilder>> {
+    fn flush(&mut self) -> Result<Option<CompletionFuture>> {
         if self.records.is_empty() {
             // Dummy completion to not complicate logic handling
             return Ok(None);
@@ -476,7 +476,7 @@ impl SortedChunk {
         }
     }
 
-    fn read(&mut self) -> Result<CompletionBuilder> {
+    fn read(&mut self) -> Result<CompletionFuture> {
         self.io_state.set(SortedChunkIOState::WaitingForRead);
 
         let read_buffer_size = self.buffer.borrow().len() - self.buffer_len.get();
@@ -529,7 +529,7 @@ impl SortedChunk {
         records: &mut Vec<SortableImmutableRecord>,
         record_size_lengths: Vec<usize>,
         chunk_size: usize,
-    ) -> Result<CompletionBuilder> {
+    ) -> Result<CompletionFuture> {
         assert!(self.io_state.get() == SortedChunkIOState::None);
         self.io_state.set(SortedChunkIOState::WaitingForWrite);
         self.chunk_size = chunk_size;

@@ -567,7 +567,7 @@ impl turso_core::DatabaseStorage for DatabaseFile {
     fn read_header(
         &self,
         c: turso_core::Completion,
-    ) -> turso_core::Result<turso_core::CompletionBuilder> {
+    ) -> turso_core::Result<turso_core::CompletionFuture> {
         Ok(IOBuilder::pread(self.file.clone(), 0, c))
     }
     fn read_page(
@@ -575,7 +575,7 @@ impl turso_core::DatabaseStorage for DatabaseFile {
         page_idx: usize,
         _io_ctx: &turso_core::IOContext,
         c: turso_core::Completion,
-    ) -> turso_core::Result<turso_core::CompletionBuilder> {
+    ) -> turso_core::Result<turso_core::CompletionFuture> {
         let r = c.as_read();
         let size = r.buf().len();
         assert!(page_idx > 0);
@@ -592,7 +592,7 @@ impl turso_core::DatabaseStorage for DatabaseFile {
         buffer: Arc<turso_core::Buffer>,
         _io_ctx: &turso_core::IOContext,
         c: turso_core::Completion,
-    ) -> turso_core::Result<turso_core::CompletionBuilder> {
+    ) -> turso_core::Result<turso_core::CompletionFuture> {
         let size = buffer.len();
         let pos = (page_idx as u64 - 1) * size as u64;
         Ok(IOBuilder::pwrite(self.file.clone(), pos, buffer, c))
@@ -605,13 +605,13 @@ impl turso_core::DatabaseStorage for DatabaseFile {
         buffers: Vec<Arc<turso_core::Buffer>>,
         _io_ctx: &turso_core::IOContext,
         c: turso_core::Completion,
-    ) -> turso_core::Result<turso_core::CompletionBuilder> {
+    ) -> turso_core::Result<turso_core::CompletionFuture> {
         let pos = first_page_idx.saturating_sub(1) as u64 * page_size as u64;
         let c = IOBuilder::pwritev(self.file.clone(), pos, buffers, c);
         Ok(c)
     }
 
-    fn sync(&self, c: turso_core::Completion) -> turso_core::Result<turso_core::CompletionBuilder> {
+    fn sync(&self, c: turso_core::Completion) -> turso_core::Result<turso_core::CompletionFuture> {
         Ok(IOBuilder::sync(self.file.clone(), c))
     }
 
@@ -623,7 +623,7 @@ impl turso_core::DatabaseStorage for DatabaseFile {
         &self,
         len: u64,
         c: turso_core::Completion,
-    ) -> turso_core::Result<turso_core::CompletionBuilder> {
+    ) -> turso_core::Result<turso_core::CompletionFuture> {
         let c = IOBuilder::truncate(self.file.clone(), len, c);
         Ok(c)
     }

@@ -181,8 +181,8 @@ impl Debug for Operation {
 pub struct IOBuilder;
 
 impl IOBuilder {
-    pub fn pread(file: Arc<dyn File>, pos: u64, completion: Completion) -> CompletionBuilder {
-        let mut builder = CompletionBuilder::default();
+    pub fn pread(file: Arc<dyn File>, pos: u64, completion: Completion) -> CompletionFuture {
+        let mut builder = CompletionFuture::default();
         let op = Operation::Read { file, offset: pos };
         builder.add(op, completion);
         builder
@@ -193,8 +193,8 @@ impl IOBuilder {
         pos: u64,
         buffer: Arc<Buffer>,
         completion: Completion,
-    ) -> CompletionBuilder {
-        let mut builder = CompletionBuilder::default();
+    ) -> CompletionFuture {
+        let mut builder = CompletionFuture::default();
         let op = Operation::Write {
             file,
             buffer,
@@ -209,8 +209,8 @@ impl IOBuilder {
         pos: u64,
         buffers: Vec<Arc<Buffer>>,
         completion: Completion,
-    ) -> CompletionBuilder {
-        let mut builder = CompletionBuilder::default();
+    ) -> CompletionFuture {
+        let mut builder = CompletionFuture::default();
         let op = Operation::WriteV {
             file,
             buffers,
@@ -220,23 +220,23 @@ impl IOBuilder {
         builder
     }
 
-    pub fn sync(file: Arc<dyn File>, completion: Completion) -> CompletionBuilder {
-        let mut builder = CompletionBuilder::default();
+    pub fn sync(file: Arc<dyn File>, completion: Completion) -> CompletionFuture {
+        let mut builder = CompletionFuture::default();
         let op = Operation::Sync { file };
         builder.add(op, completion);
         builder
     }
 
-    pub fn truncate(file: Arc<dyn File>, len: u64, completion: Completion) -> CompletionBuilder {
-        let mut builder = CompletionBuilder::default();
+    pub fn truncate(file: Arc<dyn File>, len: u64, completion: Completion) -> CompletionFuture {
+        let mut builder = CompletionFuture::default();
         let op = Operation::Truncate { file, len };
         builder.add(op, completion);
         builder
     }
 
     /// Creates a completion that is always ready
-    pub fn ready() -> CompletionBuilder {
-        let mut builder = CompletionBuilder::default();
+    pub fn ready() -> CompletionFuture {
+        let mut builder = CompletionFuture::default();
         let operation = Operation::Ready;
         let completion = Completion::new_ready();
         builder.add(operation, completion);
@@ -246,12 +246,12 @@ impl IOBuilder {
 
 #[must_use]
 #[derive(Debug, Default)]
-pub struct CompletionBuilder {
+pub struct CompletionFuture {
     op_list: LinkedList<CompletionBuilderAdapter>,
     completion_list: LinkedList<CompletionChainAdapter>,
 }
 
-impl CompletionBuilder {
+impl CompletionFuture {
     pub fn is_empty(&self) -> bool {
         self.completion_list.is_empty()
     }

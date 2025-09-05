@@ -1,7 +1,7 @@
 use tracing::{instrument, Level};
 
 use crate::{
-    io::{CompletionBuilder, IOBuilder},
+    io::{CompletionFuture, IOBuilder},
     io_yield,
     schema::Index,
     storage::{
@@ -1311,7 +1311,7 @@ impl BTreeCursor {
 
     /// Move the cursor to the root page of the btree.
     #[instrument(skip_all, level = Level::DEBUG)]
-    fn move_to_root(&mut self) -> Result<Option<CompletionBuilder>> {
+    fn move_to_root(&mut self) -> Result<Option<CompletionFuture>> {
         self.seek_state = CursorSeekState::Start;
         self.going_upwards = false;
         tracing::trace!(root_page = self.root_page);
@@ -2546,7 +2546,7 @@ impl BTreeCursor {
                     // start loading right page first
                     let mut pgno: u32 = unsafe { right_pointer.cast::<u32>().read().swap_bytes() };
                     let current_sibling = sibling_pointer;
-                    let mut completions = CompletionBuilder::default();
+                    let mut completions = CompletionFuture::default();
                     for i in (0..=current_sibling).rev() {
                         // No need to abort completion on error as completions were not scheduled yet
                         let (page, c) = btree_read_page(&self.pager, pgno as usize)?;
@@ -5327,7 +5327,7 @@ impl BTreeCursor {
         }
     }
 
-    pub fn read_page(&self, page_idx: usize) -> Result<(PageRef, Option<CompletionBuilder>)> {
+    pub fn read_page(&self, page_idx: usize) -> Result<(PageRef, Option<CompletionFuture>)> {
         btree_read_page(&self.pager, page_idx)
     }
 
@@ -5775,7 +5775,7 @@ pub fn integrity_check(
 pub fn btree_read_page(
     pager: &Rc<Pager>,
     page_idx: usize,
-) -> Result<(Arc<Page>, Option<CompletionBuilder>)> {
+) -> Result<(Arc<Page>, Option<CompletionFuture>)> {
     pager.read_page(page_idx)
 }
 
