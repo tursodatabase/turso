@@ -1514,10 +1514,10 @@ impl Wal for WalFile {
                 let io_ctx = self.io_ctx.borrow();
                 match &io_ctx.encryption_or_checksum() {
                     EncryptionOrChecksum::Encryption(ctx) => {
-                        Cow::Owned(ctx.encrypt_page(plain, page_id as usize)?)
+                        Cow::Owned(ctx.encrypt_page(plain, page_id)?)
                     }
                     EncryptionOrChecksum::Checksum(ctx) => {
-                        ctx.add_checksum_to_page(plain, page_id as usize)?;
+                        ctx.add_checksum_to_page(plain, page_id)?;
                         Cow::Borrowed(plain)
                     }
                     EncryptionOrChecksum::None => Cow::Borrowed(plain),
