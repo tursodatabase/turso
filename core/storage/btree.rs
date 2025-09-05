@@ -595,9 +595,9 @@ impl BTreeCursor {
             },
             overflow_state: OverflowState::Start,
             stack: PageStack {
-                current_page: Cell::new(-1),
-                node_states: RefCell::new([BTreeNodeState::default(); BTCURSOR_MAX_DEPTH + 1]),
-                stack: RefCell::new([const { None }; BTCURSOR_MAX_DEPTH + 1]),
+                current_page: -1,
+                node_states: [BTreeNodeState::default(); BTCURSOR_MAX_DEPTH + 1],
+                stack: [const { None }; BTCURSOR_MAX_DEPTH + 1],
             },
             reusable_immutable_record: RefCell::new(None),
             index_info: None,
@@ -721,6 +721,7 @@ impl BTreeCursor {
                     continue;
                 }
             }
+
             if cell_idx >= cell_count as i32 {
                 self.stack.set_cell_index(cell_count as i32 - 1);
             } else if !self.stack.current_cell_index_less_than_min() {
@@ -1182,7 +1183,7 @@ impl BTreeCursor {
     /// Check if any ancestor pages still have cells to iterate.
     /// If not, traversing back up to parent is of no use because we are at the end of the tree.
     fn ancestor_pages_have_more_children(&self) -> bool {
-        let node_states = self.stack.node_states.borrow();
+        let node_states = self.stack.node_states;
         (0..self.stack.current())
             .rev()
             .any(|idx| !node_states[idx].is_at_end())
@@ -1204,9 +1205,18 @@ impl BTreeCursor {
             }
         }
         loop {
-            let mem_page = self.stack.top();
+            let mem_page = self.stack.top_ref();
             let contents = mem_page.get_contents();
+            let cell_idx = self.stack.current_cell_index();
             let cell_count = contents.cell_count();
+            let is_leaf = contents.is_leaf();
+            if cell_idx != -1 && is_leaf && cell_idx as usize + 1 < cell_count {
+                self.stack.advance();
+                return Ok(IOResult::Done(true));
+            }
+
+            let mem_page = mem_page.clone();
+            let contents = mem_page.get_contents();
             tracing::debug!(
                 id = mem_page.get().id,
                 cell = self.stack.current_cell_index(),
@@ -1264,15 +1274,15 @@ impl BTreeCursor {
             }
 
             turso_assert!(
-                cell_idx < contents.cell_count(),
+                cell_idx < cell_count,
                 "cell index out of bounds: cell_idx={}, cell_count={}, page_type={:?} page_id={}",
                 cell_idx,
-                contents.cell_count(),
+                cell_count,
                 contents.page_type(),
                 mem_page.get().id
             );
 
-            if contents.is_leaf() {
+            if is_leaf {
                 return Ok(IOResult::Done(true));
             }
             if is_index && self.going_upwards {
@@ -4203,7 +4213,6 @@ impl BTreeCursor {
                     let cursor_has_record = return_if_io!(self.get_next_record());
                     self.has_record.replace(cursor_has_record);
                     self.invalidate_record();
-                    self.advance_state = AdvanceState::Start;
                     return Ok(IOResult::Done(cursor_has_record));
                 }
             }
@@ -4231,7 +4240,6 @@ impl BTreeCursor {
                     let cursor_has_record = return_if_io!(self.get_prev_record());
                     self.has_record.replace(cursor_has_record);
                     self.invalidate_record();
-                    self.advance_state = AdvanceState::Start;
                     return Ok(IOResult::Done(cursor_has_record));
                 }
             }
@@ -4586,7 +4594,6 @@ impl BTreeCursor {
                     // Ensure we keep the parent page at the same position as before the replacement.
                     self.stack
                         .node_states
-                        .borrow_mut()
                         .get_mut(btree_depth)
                         .expect("parent page should be on the stack")
                         .cell_idx = cell_idx as i32;
@@ -5149,7 +5156,8 @@ impl BTreeCursor {
     }
 
     fn get_immutable_record_or_create(&self) -> std::cell::RefMut<'_, Option<ImmutableRecord>> {
-        if self.reusable_immutable_record.borrow().is_none() {
+        let mut reusable_immutable_record = self.reusable_immutable_record.borrow_mut();
+        if reusable_immutable_record.is_none() {
             let page_size = self
                 .pager
                 .page_size
@@ -5157,9 +5165,9 @@ impl BTreeCursor {
                 .expect("page size is not set")
                 .get();
             let record = ImmutableRecord::new(page_size as usize);
-            self.reusable_immutable_record.replace(Some(record));
+            reusable_immutable_record.replace(record);
         }
-        self.reusable_immutable_record.borrow_mut()
+        reusable_immutable_record
     }
 
     fn get_immutable_record(&self) -> std::cell::RefMut<'_, Option<ImmutableRecord>> {
@@ -5884,9 +5892,9 @@ impl CoverageChecker {
 /// the parent. Using current_page + 1 or higher is undefined behaviour.
 struct PageStack {
     /// Pointer to the current page being consumed
-    current_page: Cell<i32>,
+    current_page: i32,
     /// List of pages in the stack. Root page will be in index 0
-    pub stack: RefCell<[Option<PageRef>; BTCURSOR_MAX_DEPTH + 1]>,
+    pub stack: [Option<PageRef>; BTCURSOR_MAX_DEPTH + 1],
     /// List of cell indices in the stack.
     /// node_states[current_page] is the current cell index being consumed. Similarly
     /// node_states[current_page-1] is the cell index of the parent of the current page
@@ -5894,32 +5902,21 @@ struct PageStack {
     /// There are two points that need special attention:
     ///  If node_states[current_page] = -1, it indicates that the current iteration has reached the start of the current_page
     ///  If node_states[current_page] = `cell_count`, it means that the current iteration has reached the end of the current_page
-    node_states: RefCell<[BTreeNodeState; BTCURSOR_MAX_DEPTH + 1]>,
+    node_states: [BTreeNodeState; BTCURSOR_MAX_DEPTH + 1],
 }
 
 impl PageStack {
-    fn increment_current(&self) {
-        self.current_page.set(self.current_page.get() + 1);
-    }
-    fn decrement_current(&self) {
-        assert!(self.current_page.get() > 0);
-        self.current_page.set(self.current_page.get() - 1);
-    }
     /// Push a new page onto the stack.
     /// This effectively means traversing to a child page.
     #[instrument(skip_all, level = Level::DEBUG, name = "pagestack::push")]
-    fn _push(&self, page: PageRef, starting_cell_idx: i32) {
-        tracing::trace!(
-            current = self.current_page.get(),
-            new_page_id = page.get().id,
-        );
+    fn _push(&mut self, page: PageRef, starting_cell_idx: i32) {
+        tracing::trace!(current = self.current_page, new_page_id = page.get().id,);
         'validate: {
-            let current = self.current_page.get();
+            let current = self.current_page;
             if current == -1 {
                 break 'validate;
             }
-            let stack = self.stack.borrow();
-            let current_top = stack[current as usize].as_ref();
+            let current_top = self.stack[current as usize].as_ref();
             if let Some(current_top) = current_top {
                 turso_assert!(
                     current_top.get().id != page.get().id,
@@ -5929,19 +5926,19 @@ impl PageStack {
             }
         }
         self.populate_parent_cell_count();
-        self.increment_current();
-        let current = self.current_page.get();
+        self.current_page += 1;
+        assert!(self.current_page >= 0);
+        let current = self.current_page as usize;
         assert!(
-            current < BTCURSOR_MAX_DEPTH as i32,
+            current < BTCURSOR_MAX_DEPTH,
             "corrupted database, stack is bigger than expected"
         );
-        assert!(current >= 0);
 
         // Pin the page to prevent it from being evicted while on the stack
         page.pin();
 
-        self.stack.borrow_mut()[current as usize] = Some(page);
-        self.node_states.borrow_mut()[current as usize] = BTreeNodeState {
+        self.stack[current] = Some(page);
+        self.node_states[current] = BTreeNodeState {
             cell_idx: starting_cell_idx,
             cell_count: None, // we don't know the cell count yet, so we set it to None. any code pushing a child page onto the stack MUST set the parent page's cell_count.
         };
@@ -5953,14 +5950,13 @@ impl PageStack {
     ///
     /// This rests on the assumption that the parent page is already in memory whenever a child is pushed onto the stack.
     /// We currently ensure this by pinning all the pages on [PageStack] to the page cache so that they cannot be evicted.
-    fn populate_parent_cell_count(&self) {
-        let stack_empty = self.current_page.get() == -1;
+    fn populate_parent_cell_count(&mut self) {
+        let stack_empty = self.current_page == -1;
         if stack_empty {
             return;
         }
         let current = self.current();
-        let stack = self.stack.borrow();
-        let page = stack[current].as_ref().unwrap();
+        let page = self.stack[current].as_ref().unwrap();
         turso_assert!(
             page.is_pinned(),
             "parent page {} is not pinned",
@@ -5973,59 +5969,64 @@ impl PageStack {
         );
         let contents = page.get_contents();
         let cell_count = contents.cell_count() as i32;
-        self.node_states.borrow_mut()[current].cell_count = Some(cell_count);
+        self.node_states[current].cell_count = Some(cell_count);
     }
 
-    fn push(&self, page: PageRef) {
+    fn push(&mut self, page: PageRef) {
         self._push(page, -1);
     }
 
-    fn push_backwards(&self, page: PageRef) {
+    fn push_backwards(&mut self, page: PageRef) {
         self._push(page, i32::MAX);
     }
 
     /// Pop a page off the stack.
     /// This effectively means traversing back up to a parent page.
     #[instrument(skip_all, level = Level::DEBUG, name = "pagestack::pop")]
-    fn pop(&self) {
-        let current = self.current_page.get();
+    fn pop(&mut self) {
+        let current = self.current_page;
         assert!(current >= 0);
         tracing::trace!(current);
+        let current = current as usize;
 
         // Unpin the page before removing it from the stack
-        if let Some(page) = &self.stack.borrow()[current as usize] {
+        if let Some(page) = &self.stack[current] {
             page.unpin();
         }
 
-        self.node_states.borrow_mut()[current as usize] = BTreeNodeState::default();
-        self.stack.borrow_mut()[current as usize] = None;
-        self.decrement_current();
+        assert!(current > 0);
+        self.node_states[current] = BTreeNodeState::default();
+        self.stack[current] = None;
+        self.current_page -= 1;
     }
 
     /// Get the top page on the stack.
     /// This is the page that is currently being traversed.
-    #[instrument(skip(self), level = Level::DEBUG, name = "pagestack::top", )]
     fn top(&self) -> Arc<Page> {
-        let page = self.stack.borrow()[self.current()]
-            .as_ref()
-            .unwrap()
-            .clone();
-        tracing::trace!(current = self.current(), page_id = page.get().id);
+        let current = self.current();
+        let page = self.stack[current].clone().unwrap();
+        turso_assert!(page.is_loaded(), "page should be loaded");
+        page
+    }
+
+    fn top_ref(&self) -> &Arc<Page> {
+        let current = self.current();
+        let page = self.stack[current].as_ref().unwrap();
         turso_assert!(page.is_loaded(), "page should be loaded");
         page
     }
 
     /// Current page pointer being used
+    #[inline(always)]
     fn current(&self) -> usize {
-        let current = self.current_page.get() as usize;
-        assert!(self.current_page.get() >= 0);
-        current
+        assert!(self.current_page >= 0);
+        self.current_page as usize
     }
 
     /// Cell index of the current page
     fn current_cell_index(&self) -> i32 {
         let current = self.current();
-        self.node_states.borrow()[current].cell_idx
+        self.node_states[current].cell_idx
     }
 
     /// Check if the current cell index is less than 0.
@@ -6037,59 +6038,50 @@ impl PageStack {
 
     /// Advance the current cell index of the current page to the next cell.
     /// We usually advance after going traversing a new page
-    #[instrument(skip(self), level = Level::DEBUG, name = "pagestack::advance",)]
-    fn advance(&self) {
+    #[inline(always)]
+    fn advance(&mut self) {
         let current = self.current();
-        tracing::trace!(
-            curr_cell_index = self.node_states.borrow()[current].cell_idx,
-            node_states = ?self.node_states.borrow().iter().map(|state| state.cell_idx).collect::<Vec<_>>(),
-        );
-        self.node_states.borrow_mut()[current].cell_idx += 1;
+        self.node_states[current].cell_idx += 1;
     }
 
     #[instrument(skip(self), level = Level::DEBUG, name = "pagestack::retreat")]
-    fn retreat(&self) {
+    fn retreat(&mut self) {
         let current = self.current();
         tracing::trace!(
-            curr_cell_index = self.node_states.borrow()[current].cell_idx,
-            node_states = ?self.node_states.borrow().iter().map(|state| state.cell_idx).collect::<Vec<_>>(),
+            curr_cell_index = self.node_states[current].cell_idx,
+            node_states = ?self.node_states.iter().map(|state| state.cell_idx).collect::<Vec<_>>(),
         );
-        self.node_states.borrow_mut()[current].cell_idx -= 1;
+        self.node_states[current].cell_idx -= 1;
     }
 
-    fn set_cell_index(&self, idx: i32) {
+    fn set_cell_index(&mut self, idx: i32) {
         let current = self.current();
-        self.node_states.borrow_mut()[current].cell_idx = idx;
+        self.node_states[current].cell_idx = idx;
     }
 
     fn has_parent(&self) -> bool {
-        self.current_page.get() > 0
+        self.current_page > 0
     }
 
     /// Get a page at a specific level in the stack (0 = root, 1 = first child, etc.)
     fn get_page_at_level(&self, level: usize) -> Option<PageRef> {
-        let stack = self.stack.borrow();
-        if level < stack.len() {
-            stack[level].clone()
+        if level < self.stack.len() {
+            self.stack[level].clone()
         } else {
             None
         }
     }
 
-    fn unpin_all_if_pinned(&self) {
-        self.stack
-            .borrow_mut()
-            .iter_mut()
-            .flatten()
-            .for_each(|page| {
-                let _ = page.try_unpin();
-            });
+    fn unpin_all_if_pinned(&mut self) {
+        self.stack.iter_mut().flatten().for_each(|page| {
+            let _ = page.try_unpin();
+        });
     }
 
-    fn clear(&self) {
+    fn clear(&mut self) {
         self.unpin_all_if_pinned();
 
-        self.current_page.set(-1);
+        self.current_page = -1;
     }
 }
 

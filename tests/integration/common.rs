@@ -64,9 +64,6 @@ impl TempDatabase {
     }
 
     pub fn new_with_rusqlite(table_sql: &str, enable_indexes: bool) -> Self {
-        let _ = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::TRACE)
-            .finish();
         let mut path = TempDir::new().unwrap().keep();
         path.push("test.db");
         {

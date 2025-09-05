@@ -410,14 +410,14 @@ impl Register {
 macro_rules! must_be_btree_cursor {
     ($cursor_id:expr, $cursor_ref:expr, $state:expr, $insn_name:expr) => {{
         let (_, cursor_type) = $cursor_ref.get($cursor_id).unwrap();
-        let cursor = match cursor_type {
-            CursorType::BTreeTable(_) => $state.get_cursor($cursor_id),
-            CursorType::BTreeIndex(_) => $state.get_cursor($cursor_id),
-            CursorType::Pseudo(_) => panic!("{} on pseudo cursor", $insn_name),
-            CursorType::Sorter => panic!("{} on sorter cursor", $insn_name),
-            CursorType::VirtualTable(_) => panic!("{} on virtual table cursor", $insn_name),
-        };
-        cursor
+        if matches!(
+            cursor_type,
+            CursorType::BTreeTable(_) | CursorType::BTreeIndex(_)
+        ) {
+            $state.get_cursor($cursor_id)
+        } else {
+            panic!("{} on unexpected cursor", $insn_name)
+        }
     }};
 }
 
@@ -451,6 +451,7 @@ impl Program {
         mv_store: Option<Arc<MvStore>>,
         pager: Rc<Pager>,
     ) -> Result<StepResult> {
+        let enable_tracing = tracing::enabled!(tracing::Level::TRACE);
         loop {
             if self.connection.closed.get() {
                 // Connection is closed for whatever reason, rollback the transaction.
@@ -477,7 +478,9 @@ impl Program {
             // invalidate row
             let _ = state.result_row.take();
             let (insn, insn_function) = &self.insns[state.pc as usize];
-            trace_insn(self, state.pc as InsnReference, insn);
+            if enable_tracing {
+                trace_insn(self, state.pc as InsnReference, insn);
+            }
             // Always increment VM steps for every loop iteration
             state.metrics.vm_steps = state.metrics.vm_steps.saturating_add(1);
 
@@ -728,9 +731,6 @@ pub fn registers_to_ref_values(registers: &[Register]) -> Vec<RefValue> {
 
 #[instrument(skip(program), level = Level::DEBUG)]
 fn trace_insn(program: &Program, addr: InsnReference, insn: &Insn) {
-    if !tracing::enabled!(tracing::Level::TRACE) {
-        return;
-    }
     tracing::trace!(
         "\n{}",
         explain::insn_to_str(
