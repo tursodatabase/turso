@@ -16,7 +16,7 @@ use crate::{
     Result, TransactionState,
 };
 use parking_lot::RwLock;
-use std::cell::{Cell, OnceCell, RefCell, UnsafeCell};
+use std::cell::{Cell, RefCell, UnsafeCell};
 use std::collections::HashSet;
 use std::hash;
 use std::rc::Rc;
@@ -489,7 +489,7 @@ pub struct Pager {
     /// `usable_space` calls. TODO: Invalidate reserved_space when we add the functionality
     /// to change it.
     pub(crate) page_size: Cell<Option<PageSize>>,
-    reserved_space: OnceCell<u8>,
+    reserved_space: Cell<Option<u8>>,
     free_page_state: RefCell<FreePageState>,
     /// Maximum number of pages allowed in the database. Default is 1073741823 (SQLite default).
     max_page_count: Cell<u32>,
@@ -595,7 +595,7 @@ impl Pager {
             init_lock,
             allocate_page1_state,
             page_size: Cell::new(None),
-            reserved_space: OnceCell::new(),
+            reserved_space: Cell::new(None),
             free_page_state: RefCell::new(FreePageState::Start),
             allocate_page_state: RefCell::new(AllocatePageState::Start),
             max_page_count: Cell::new(DEFAULT_MAX_PAGE_COUNT),
@@ -967,21 +967,24 @@ impl Pager {
                 .unwrap_or_default()
         });
 
-        let reserved_space = *self.reserved_space.get_or_init(|| {
-            self.io
-                .block(|| self.with_header(|header| header.reserved_space))
-                .unwrap_or_default()
-        });
+        let reserved_space = self.reserved_space();
 
         (page_size.get() as usize) - (reserved_space as usize)
     }
 
     pub fn reserved_space(&self) -> u8 {
-        *self.reserved_space.get_or_init(|| {
-            self.io
-                .block(|| self.with_header(|header| header.reserved_space))
-                .unwrap_or_default()
-        })
+        tracing::debug!("fetching reserved_space from header",);
+        match self.reserved_space.get() {
+            Some(value) => value,
+            None => {
+                let value = self
+                    .io
+                    .block(|| self.with_header(|header| header.reserved_space))
+                    .unwrap_or_default();
+                self.reserved_space.set(Some(value));
+                value
+            }
+        }
     }
 
     /// Set the initial page size for the database. Should only be called before the database is initialized
@@ -1817,7 +1820,7 @@ impl Pager {
                         "no encryption context, using default reserved space of 16 bytes"
                     );
                     default_header.reserved_space = 16;
-                    self.reserved_space.set(16).unwrap();
+                    self.reserved_space.set(Some(16));
                 }
 
                 if let Some(size) = self.page_size.get() {
