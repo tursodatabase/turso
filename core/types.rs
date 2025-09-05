@@ -633,8 +633,6 @@ pub enum AggContext {
     External(ExternalAggState),
 }
 
-const NULL: Value = Value::Null;
-
 impl AggContext {
     pub fn compute_external(&mut self) -> Result<()> {
         if let Self::External(ext_state) = self {
@@ -644,18 +642,6 @@ impl AggContext {
             }
         }
         Ok(())
-    }
-
-    pub fn final_value(&self) -> &Value {
-        match self {
-            Self::Avg(acc, _count) => acc,
-            Self::Sum(acc, _) => acc,
-            Self::Count(count) => count,
-            Self::Max(max) => max.as_ref().unwrap_or(&NULL),
-            Self::Min(min) => min.as_ref().unwrap_or(&NULL),
-            Self::GroupConcat(s) => s,
-            Self::External(ext_state) => ext_state.finalized_value.as_ref().unwrap_or(&NULL),
-        }
     }
 }
 
