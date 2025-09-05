@@ -3734,15 +3734,23 @@ pub fn op_agg_final(
     pager: &Rc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
-    load_insn!(AggFinal { register, func }, insn);
-    match &state.registers[*register] {
+    let (acc_reg, dest_reg, func) = match insn {
+        Insn::AggFinal { register, func } => (*register, *register, func),
+        Insn::AggValue {
+            acc_reg,
+            dest_reg,
+            func,
+        } => (*acc_reg, *dest_reg, func),
+        _ => unreachable!("unexpected Insn {:?}", insn),
+    };
+    match &state.registers[acc_reg] {
         Register::Aggregate(agg) => match func {
             AggFunc::Avg => {
                 let AggContext::Avg(acc, count) = agg else {
                     unreachable!();
                 };
                 let acc = acc.clone() / count.clone();
-                state.registers[*register] = Register::Value(acc);
+                state.registers[dest_reg] = Register::Value(acc);
             }
             AggFunc::Sum => {
                 let AggContext::Sum(acc, sum_state) = agg else {
@@ -3758,7 +3766,7 @@ pub fn op_agg_final(
                     }
                     _ => Value::Float(acc.as_float() + sum_state.r_err),
                 };
-                state.registers[*register] = Register::Value(value);
+                state.registers[dest_reg] = Register::Value(value);
             }
             AggFunc::Total => {
                 let AggContext::Sum(acc, _) = agg else {
@@ -3770,21 +3778,21 @@ pub fn op_agg_final(
                     Value::Float(f) => Value::Float(*f),
                     _ => unreachable!(),
                 };
-                state.registers[*register] = Register::Value(value);
+                state.registers[dest_reg] = Register::Value(value);
             }
             AggFunc::Count | AggFunc::Count0 => {
                 let AggContext::Count(count) = agg else {
                     unreachable!();
                 };
-                state.registers[*register] = Register::Value(count.clone());
+                state.registers[dest_reg] = Register::Value(count.clone());
             }
             AggFunc::Max => {
                 let AggContext::Max(acc) = agg else {
                     unreachable!();
                 };
                 match acc {
-                    Some(value) => state.registers[*register] = Register::Value(value.clone()),
-                    None => state.registers[*register] = Register::Value(Value::Null),
+                    Some(value) => state.registers[dest_reg] = Register::Value(value.clone()),
+                    None => state.registers[dest_reg] = Register::Value(Value::Null),
                 }
             }
             AggFunc::Min => {
@@ -3792,15 +3800,15 @@ pub fn op_agg_final(
                     unreachable!();
                 };
                 match acc {
-                    Some(value) => state.registers[*register] = Register::Value(value.clone()),
-                    None => state.registers[*register] = Register::Value(Value::Null),
+                    Some(value) => state.registers[dest_reg] = Register::Value(value.clone()),
+                    None => state.registers[dest_reg] = Register::Value(Value::Null),
                 }
             }
             AggFunc::GroupConcat | AggFunc::StringAgg => {
                 let AggContext::GroupConcat(acc) = agg else {
                     unreachable!();
                 };
-                state.registers[*register] = Register::Value(acc.clone());
+                state.registers[dest_reg] = Register::Value(acc.clone());
             }
             #[cfg(feature = "json")]
             AggFunc::JsonGroupObject => {
@@ -3808,7 +3816,7 @@ pub fn op_agg_final(
                     unreachable!();
                 };
                 let data = acc.to_blob().expect("Should be blob");
-                state.registers[*register] = Register::Value(json_from_raw_bytes_agg(data, false)?);
+                state.registers[dest_reg] = Register::Value(json_from_raw_bytes_agg(data, false)?);
             }
             #[cfg(feature = "json")]
             AggFunc::JsonbGroupObject => {
@@ -3816,7 +3824,7 @@ pub fn op_agg_final(
                     unreachable!();
                 };
                 let data = acc.to_blob().expect("Should be blob");
-                state.registers[*register] = Register::Value(json_from_raw_bytes_agg(data, true)?);
+                state.registers[dest_reg] = Register::Value(json_from_raw_bytes_agg(data, true)?);
             }
             #[cfg(feature = "json")]
             AggFunc::JsonGroupArray => {
@@ -3824,7 +3832,7 @@ pub fn op_agg_final(
                     unreachable!();
                 };
                 let data = acc.to_blob().expect("Should be blob");
-                state.registers[*register] = Register::Value(json_from_raw_bytes_agg(data, false)?);
+                state.registers[dest_reg] = Register::Value(json_from_raw_bytes_agg(data, false)?);
             }
             #[cfg(feature = "json")]
             AggFunc::JsonbGroupArray => {
@@ -3832,24 +3840,24 @@ pub fn op_agg_final(
                     unreachable!();
                 };
                 let data = acc.to_blob().expect("Should be blob");
-                state.registers[*register] = Register::Value(json_from_raw_bytes_agg(data, true)?);
+                state.registers[dest_reg] = Register::Value(json_from_raw_bytes_agg(data, true)?);
             }
             AggFunc::External(_) => {
                 let AggContext::External(agg_state) = agg else {
                     unreachable!();
                 };
                 let value = agg.compute_external()?;
-                state.registers[*register] = Register::Value(value)
+                state.registers[dest_reg] = Register::Value(value)
             }
         },
         Register::Value(Value::Null) => {
             // when the set is empty
             match func {
                 AggFunc::Total => {
-                    state.registers[*register] = Register::Value(Value::Float(0.0));
+                    state.registers[dest_reg] = Register::Value(Value::Float(0.0));
                 }
                 AggFunc::Count | AggFunc::Count0 => {
-                    state.registers[*register] = Register::Value(Value::Integer(0));
+                    state.registers[dest_reg] = Register::Value(Value::Integer(0));
                 }
                 _ => {}
             }

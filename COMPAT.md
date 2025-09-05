@@ -418,7 +418,7 @@ Modifiers:
 | Affinity       | Yes    |         |
 | AggFinal       | Yes    |         |
 | AggStep        | Yes    |         |
-| AggStep        | Yes    |         |
+| AggValue       | Yes    |         |
 | And            | Yes    |         |
 | AutoCommit     | Yes    |         |
 | BitAnd         | Yes    |         |

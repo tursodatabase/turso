@@ -672,6 +672,15 @@ pub enum Insn {
         func: AggFunc,
     },
 
+    /// Similar to AggFinal, but instead of writing the result back into the
+    /// accumulator register, it stores the result in a separate destination
+    /// register.
+    AggValue {
+        acc_reg: usize,
+        dest_reg: usize,
+        func: AggFunc,
+    },
+
     /// Open a sorter.
     SorterOpen {
         cursor_id: CursorID,                   // P1
@@ -1194,7 +1203,7 @@ impl Insn {
             Insn::IdxLT { .. } => execute::op_idx_lt,
             Insn::DecrJumpZero { .. } => execute::op_decr_jump_zero,
             Insn::AggStep { .. } => execute::op_agg_step,
-            Insn::AggFinal { .. } => execute::op_agg_final,
+            Insn::AggFinal { .. } | Insn::AggValue { .. } => execute::op_agg_final,
             Insn::SorterOpen { .. } => execute::op_sorter_open,
             Insn::SorterInsert { .. } => execute::op_sorter_insert,
             Insn::SorterSort { .. } => execute::op_sorter_sort,
