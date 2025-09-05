@@ -1728,8 +1728,7 @@ impl WalFile {
         let file = shared.file.as_ref().unwrap();
         sqlite3_ondisk::begin_write_wal_header(file, &shared.wal_header.lock())?
             .wait(self.io.as_ref())?;
-        IOBuilder::sync(file.clone(), Completion::new_sync(|_| {}))
-            .wait(self.io.as_ref())?;
+        IOBuilder::sync(file.clone(), Completion::new_sync(|_| {})).wait(self.io.as_ref())?;
         shared.initialized.store(true, Ordering::Release);
         Ok(())
     }
