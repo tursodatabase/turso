@@ -1,0 +1,20 @@
+{
+  "name": "wasm",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "devDependencies": {
+    "vite": "^7.1.4"
+  },
+  "dependencies": {
+    "@tursodatabase/database-browser": "../../browser",
+    "threads": "^1.7.0"
+  }
+}
