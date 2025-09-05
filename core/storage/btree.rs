@@ -6225,7 +6225,12 @@ fn find_free_slot(
 pub fn btree_init_page(page: &PageRef, page_type: PageType, offset: usize, usable_space: usize) {
     // setup btree page
     let contents = page.get_contents();
-    tracing::debug!("btree_init_page(id={}, offset={})", page.get().id, offset);
+    tracing::debug!(
+        "btree_init_page(id={}, offset={}, usable_space={})",
+        page.get().id,
+        offset,
+        usable_space
+    );
     contents.offset = offset;
     let id = page_type as u8;
     contents.write_page_type(id);

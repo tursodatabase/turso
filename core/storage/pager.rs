@@ -1128,7 +1128,11 @@ impl Pager {
     /// Reads a page from the database.
     #[tracing::instrument(skip_all, level = Level::DEBUG)]
     pub fn read_page(&self, page_idx: usize) -> Result<(PageRef, Option<Completion>)> {
-        tracing::trace!("read_page(page_idx = {})", page_idx);
+        tracing::trace!(
+            "read_page(page_idx = {}) (usable: {})",
+            page_idx,
+            self.usable_space()
+        );
         let mut page_cache = self.page_cache.write();
         let page_key = PageCacheKey::new(page_idx);
         if let Some(page) = page_cache.get(&page_key)? {
@@ -1813,6 +1817,7 @@ impl Pager {
                         "no encryption context, using default reserved space of 16 bytes"
                     );
                     default_header.reserved_space = 16;
+                    self.reserved_space.set(16).unwrap();
                 }
 
                 if let Some(size) = self.page_size.get() {
@@ -1845,7 +1850,10 @@ impl Pager {
             }
             AllocatePage1State::Writing { page } => {
                 turso_assert!(page.is_loaded(), "page should be loaded");
-                tracing::trace!("allocate_page1(Writing done)");
+                tracing::trace!(
+                    "allocate_page1(Writing done) (usable_space={})",
+                    self.usable_space()
+                );
                 let page_key = PageCacheKey::new(page.get().id);
                 let mut cache = self.page_cache.write();
                 cache.insert(page_key, page.clone()).map_err(|e| {
