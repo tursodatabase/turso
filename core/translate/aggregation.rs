@@ -289,7 +289,19 @@ pub fn translate_aggregation_step(
             });
             target_register
         }
-        AggFunc::Count | AggFunc::Count0 => {
+        AggFunc::Count0 => {
+            let expr = ast::Expr::Literal(ast::Literal::Numeric("1".to_string()));
+            let expr_reg = translate_const_arg(program, referenced_tables, resolver, &expr)?;
+            handle_distinct(program, agg_arg_source.aggregate(), expr_reg);
+            program.emit_insn(Insn::AggStep {
+                acc_reg: target_register,
+                col: expr_reg,
+                delimiter: 0,
+                func: AggFunc::Count0,
+            });
+            target_register
+        }
+        AggFunc::Count => {
             if num_args != 1 {
                 crate::bail_parse_error!("count bad number of arguments");
             }
@@ -299,11 +311,7 @@ pub fn translate_aggregation_step(
                 acc_reg: target_register,
                 col: expr_reg,
                 delimiter: 0,
-                func: if matches!(func, AggFunc::Count0) {
-                    AggFunc::Count0
-                } else {
-                    AggFunc::Count
-                },
+                func: AggFunc::Count,
             });
             target_register
         }

@@ -1058,18 +1058,9 @@ pub struct Aggregate {
 
 impl Aggregate {
     pub fn new(func: AggFunc, args: &[Box<Expr>], expr: &Expr, distinctness: Distinctness) -> Self {
-        let agg_args = if args.is_empty() {
-            // The AggStep instruction requires at least one argument. For functions that accept
-            // zero arguments (e.g. COUNT()), we insert a dummy literal so that AggStep remains valid.
-            // This does not cause ambiguity: the resolver has already verified that the function
-            // takes zero arguments, so the dummy value will be ignored.
-            vec![Expr::Literal(ast::Literal::Numeric("1".to_string()))]
-        } else {
-            args.iter().map(|arg| *arg.clone()).collect()
-        };
         Aggregate {
             func,
-            args: agg_args,
+            args: args.iter().map(|arg| *arg.clone()).collect(),
             original_expr: expr.clone(),
             distinctness,
         }
