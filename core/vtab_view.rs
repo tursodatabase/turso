@@ -98,4 +98,8 @@ impl ViewVirtualTableCursor {
         self.current_pos = 0;
         Ok(!self.data.is_empty())
     }
+
+    pub fn eof(&self) -> bool {
+        self.current_pos >= self.data.len()
+    }
 }

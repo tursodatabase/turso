@@ -166,11 +166,33 @@ pub enum VirtualTableCursor {
 }
 
 impl VirtualTableCursor {
-    pub(crate) fn next(&mut self) -> crate::Result<bool> {
+    pub(crate) fn next(&mut self) -> crate::Result<()> {
         match self {
-            VirtualTableCursor::Pragma(cursor) => cursor.next(),
-            VirtualTableCursor::External(cursor) => cursor.next(),
-            VirtualTableCursor::View(cursor) => cursor.next(),
+            VirtualTableCursor::Pragma(cursor) => {
+                cursor.next()?;
+                Ok(())
+            }
+            VirtualTableCursor::External(cursor) => {
+                let rc = unsafe { (cursor.implementation.next)(cursor.cursor.as_ptr()) };
+                match rc {
+                    ResultCode::OK | ResultCode::EOF => Ok(()),
+                    _ => Err(LimboError::ExtensionError("Next failed".to_string())),
+                }
+            }
+            VirtualTableCursor::View(cursor) => {
+                cursor.next()?;
+                Ok(())
+            }
+        }
+    }
+
+    pub(crate) fn eof(&self) -> bool {
+        match self {
+            VirtualTableCursor::Pragma(cursor) => cursor.eof(),
+            VirtualTableCursor::External(cursor) => unsafe {
+                (cursor.implementation.eof)(cursor.cursor.as_ptr())
+            },
+            VirtualTableCursor::View(cursor) => cursor.eof(),
         }
     }
 
@@ -376,15 +398,6 @@ impl ExtVirtualTableCursor {
     fn column(&self, column: usize) -> crate::Result<Value> {
         let val = unsafe { (self.implementation.column)(self.cursor.as_ptr(), column as u32) };
         Value::from_ffi(val)
-    }
-
-    fn next(&self) -> crate::Result<bool> {
-        let rc = unsafe { (self.implementation.next)(self.cursor.as_ptr()) };
-        match rc {
-            ResultCode::OK => Ok(true),
-            ResultCode::EOF => Ok(false),
-            _ => Err(LimboError::ExtensionError("Next failed".to_string())),
-        }
     }
 }
 
