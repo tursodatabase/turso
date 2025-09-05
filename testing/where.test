@@ -52,11 +52,11 @@ do_execsql_test_small where-is-not-null-combined {
 
 do_execsql_test where-clause-eq {
     select last_name from users where id = 2000;
-} {Rodriguez}
+} {Boyd}
 
 do_execsql_test where-clause-eq-string {
     select count(1) from users where last_name = 'Rodriguez';
-} {61}
+} {120}
 
 do_execsql_test where-clause-isnull {
     select count(1) from users where last_name isnull;
@@ -64,27 +64,27 @@ do_execsql_test where-clause-isnull {
 
 do_execsql_test where-clause-isnull-or-false {
     select count(1) from users where null isnull or 1 != 1;
-} {10000}
+} {15000}
 
 do_execsql_test where-clause-notnull {
     select count(1) from users where last_name not null;
-} {10000}
+} {15000}
 
 do_execsql_test where-clause-notnull-or-false {
     select count(1) from users where last_name not null or 1 != 1;
-} {10000}
+} {15000}
 
 do_execsql_test where-clause-ne {
     select count(1) from users where id != 2000;
-} {9999}
+} {14999}
 
 do_execsql_test where-clause-gt {
     select count(1) from users where id > 2000;
-} {8000}
+} {13000}
 
 do_execsql_test where-clause-gte {
     select count(1) from users where id >= 2000;
-} {8001}
+} {13001}
 
 do_execsql_test where-clause-lt {
     select count(1) from users where id < 2000;
@@ -96,7 +96,7 @@ do_execsql_test where-clause-lte {
 
 do_execsql_test where-clause-unary-true {
     select count(1) from users where 1;
-} {10000}
+} {15000}
 
 # not correct? should be 0?
 do_execsql_test where-clause-unary-false {
@@ -166,52 +166,70 @@ do_execsql_test where-clause-no-table-constant-condition-false-7 {
 # this test functions as an assertion that the index on users.age is being used, since the results are ordered by age without an order by.
 do_execsql_test select-where-and {
     select first_name, age from users where first_name = 'Jamie' and age > 80
-} {Jamie|87
-Jamie|88
-Jamie|88
-Jamie|92
-Jamie|94
-Jamie|99
-}
+} {Jamie|83
+Jamie|83
+Jamie|83
+Jamie|83
+Jamie|84
+Jamie|85}
+
 do_execsql_test select-where-or {
     select first_name, age from users where first_name = 'Jamie' and age > 80
-} {Jamie|87
-Jamie|88
-Jamie|88
-Jamie|92
-Jamie|94
-Jamie|99
-}
+} {Jamie|83
+Jamie|83
+Jamie|83
+Jamie|83
+Jamie|84
+Jamie|85}
 
 
 do_execsql_test select-where-and-or {
     select first_name, age from users where first_name = 'Jamie' or age = 1 and age = 2
-} {Jamie|94
-Jamie|88
-Jamie|31
-Jamie|26
-Jamie|71
+} {Jamie|26
 Jamie|50
+Jamie|47
+Jamie|22
 Jamie|28
-Jamie|46
-Jamie|17
-Jamie|64
-Jamie|76
-Jamie|99
-Jamie|92
-Jamie|47
-Jamie|27
-Jamie|54
-Jamie|47
-Jamie|15
-Jamie|12
-Jamie|71
-Jamie|87
+Jamie|80
+Jamie|28
+Jamie|26
+Jamie|21
+Jamie|66
+Jamie|35
 Jamie|34
-Jamie|88
-Jamie|41
-Jamie|73
-}
+Jamie|24
+Jamie|78
+Jamie|25
+Jamie|45
+Jamie|72
+Jamie|64
+Jamie|77
+Jamie|40
+Jamie|21
+Jamie|85
+Jamie|67
+Jamie|79
+Jamie|40
+Jamie|60
+Jamie|44
+Jamie|57
+Jamie|83
+Jamie|83
+Jamie|57
+Jamie|83
+Jamie|33
+Jamie|71
+Jamie|55
+Jamie|83
+Jamie|57
+Jamie|19
+Jamie|57
+Jamie|32
+Jamie|69
+Jamie|33
+Jamie|84
+Jamie|18
+Jamie|77}
 
 do_execsql_test where-float-int {
     select * from products where price > 50 and name != 'hat';
@@ -320,11 +338,11 @@ do_execsql_test where_name_not_in_list_or_name_eq_shirt {
 
 do_execsql_test where_multiple {
     select id, first_name, age from users where id = 5 and age < 50;
-} {5|Edward|15}
+} {5|Jennifer|21}
 
 do_execsql_test where_multiple_flipped {
     select id, first_name, age from users where age < 50 and id = 5;
-} {5|Edward|15}
+} {5|Jennifer|21}
 
 do_execsql_test where-parentheses-and {
     select id, name from products where (id = 5 and name = 'sweatshirt') and (id = 5 and name = 'sweatshirt') ORDER BY id;
@@ -342,58 +360,58 @@ do_execsql_test where-complex-parentheses {
 
 # regression test for primary key index behavior
 do_execsql_test where-id-index-seek-regression-test {
-    select id from users where id > 9995;
-} {9996
-9997
-9998
-9999
-10000}
+    select id from users where id > 14995;
+} {14996
+14997
+14998
+14999
+15000}
 
 do_execsql_test where-id-index-seek-regression-test-opposite {
-    select id from users where 9999 < id;
-    select id from users where 10000 <= id;
+    select id from users where 14999 < id;
+    select id from users where 15000 <= id;
     select id from users where 2 > id;
     select id from users where 1 >= id;
-} {10000
-10000
+} {15000
+15000
 1
 1}
 
 do_execsql_test where-id-index-seek-regression-test-2 {
     select count(1) from users where id > 0;
-} {10000}
+} {15000}
 
 # regression test for secondary index (users.age) behavior
 do_execsql_test where-age-index-seek-regression-test {
-    select age from users where age >= 100 limit 20;
-} {100
-100
-100
-100
-100
-100
-100
-100
-100
-100
-100
-100
-100
-100
-100
-100
-100
-100
-100
-100}
+    select age from users where age >= 84 limit 20;
+} {84
+84
+84
+84
+84
+84
+84
+84
+84
+84
+84
+84
+84
+84
+84
+84
+84
+84
+84
+84}
 
 do_execsql_test where-age-index-seek-regression-test-2 {
     select count(1) from users where age > 0;
-} {10000}
+} {15000}
 
 do_execsql_test where-age-index-seek-regression-test-3 {
-    select age from users where age > 90 limit 1;
-} {91}
+    select age from users where age > 83 limit 1;
+} {84}
 
 do_execsql_test where-simple-between {
     SELECT * FROM products WHERE price BETWEEN 70 AND 100;
@@ -418,26 +436,27 @@ do_execsql_test where-between-true-and-2 {
 2}
 
 do_execsql_test nested-parens-conditionals-or-and-or {
-    SELECT count(*) FROM users WHERE ((age > 25 OR age < 18) AND (city = 'Boston' OR state = 'MA'));
-} {146}
+    SELECT count(*) FROM users WHERE ((age > 25 OR age < 18) AND (city = 'Jonsstad' OR state = 'MA'));
+} {206}
 
 do_execsql_test nested-parens-conditionals-and-or-and {
     SELECT * FROM users WHERE (((age > 18 AND city = 'New Mario') OR age = 92) AND city = 'Lake Paul');
-} {{9989|Timothy|Harrison|woodsmichael@example.net|+1-447-830-5123|782 Wright Harbors|Lake Paul|ID|52330|92}}
+} {{}}
 
 
 do_execsql_test nested-parens-conditionals-and-double-or {
   SELECT * FROM users WHERE ((age > 30 OR age < 20) AND (state = 'NY' OR state = 'CA')) AND first_name glob 'An*' order by id;
-} {{1738|Angelica|Pena|jacksonjonathan@example.net|(867)536-1578x039|663 Jacqueline Estate Apt. 652|Clairehaven|NY|64172|74
-1811|Andrew|Mckee|jchen@example.net|359.939.9548|19809 Blair Junction Apt. 438|New Lawrencefort|NY|26240|42
-3773|Andrew|Peterson|cscott@example.com|(405)410-4972x90408|90513 Munoz Radial Apt. 786|Travisfurt|CA|52951|43
-3875|Anthony|Cordova|ocross@example.org|+1-356-999-4070x557|77081 Aguilar Turnpike|Michaelfurt|CA|73353|37
-4909|Andrew|Carson|michelle31@example.net|823.423.1516|78514 Luke Springs|Lake Crystal|CA|49481|74
-5498|Anna|Hall|elizabethheath@example.org|9778473725|5803 Taylor Tunnel|New Nicholaston|NY|21825|14
-6340|Angela|Freeman|juankelly@example.net|501.372.4720|3912 Ricardo Mission|West Nancyville|NY|60823|34
-8171|Andrea|Lee|dgarrison@example.com|001-594-430-0646|452 Anthony Stravenue|Sandraville|CA|28572|12
-9110|Anthony|Barrett|steven05@example.net|(562)928-9177x8454|86166 Foster Inlet Apt. 284|North Jeffreyburgh|CA|80147|97
-9279|Annette|Lynn|joanne37@example.com|(272)700-7181|2676 Laura Points Apt. 683|Tristanville|NY|48646|91}}
+} {{2347|Anita|Richardson|woodsmichael@example.com|001-864-361-7908|54481 Middleton Camp Apt. 773|Jamesburgh|CA|58147|82|2022-12-25 10:18:07.754283|2023-10-01 12:27:38.443200
+2890|Ana|Love|kaitlynwright@example.net|(377)831-9899|466 Katherine Village Suite 846|New Johnborough|NY|37649|81|2024-09-24 23:49:36.070616|2025-02-13 14:15:35.195050
+4062|Andre|Hines|tylerhahn@example.com|(841)468-3723x246|392 Garcia View|South Catherineburgh|CA|66877|85|2023-08-22 10:01:20.270168|2024-02-19 03:45:24.096195
+5086|Angela|Jones|xevans@example.com|+1-792-876-6509|465 Sanchez Parkways Apt. 524|Shawnshire|CA|02629|56|2024-07-17 20:48:12.227736|2025-06-03 11:07:00.060854
+6662|Andrew|Brown|brian90@example.com|889-262-1584|854 Mclaughlin Circle|Perezton|CA|20803|83|2022-09-20 21:06:54.006698|2023-12-20 22:11:10.393613
+9201|Angela|Baker|kelseywhite@example.com|830-888-0187x28203|3433 Poole Plain Apt. 378|Floydtown|NY|44783|76|2024-01-09 00:38:58.334340|2025-08-07 08:36:47.693296
+9492|Angela|Bishop|abigail51@example.net|314-610-5248|151 Andrew Lights Suite 478|Suzannefort|CA|35387|59|2023-06-02 20:49:19.192280|2024-10-28 15:32:02.339617
+9555|Andrew|Carr|walkeralicia@example.org|269-640-2098x61392|1825 Brooks Heights Suite 105|North Danielfurt|NY|92658|78|2025-07-27 17:41:33.413264|2025-08-31 07:06:17.717229
+13068|Andrew|Roberts|christy24@example.org|+1-216-929-7544x967|7063 Wong Overpass Apt. 519|East Michelleport|NY|97758|57|2025-07-09 00:49:22.294271|2025-08-31 12:32:29.435016
+13128|Anthony|Orr|reynoldsstanley@example.net|+1-522-396-6312x506|884 Rachel Parkways Suite 606|Brianshire|CA|00733|70|2023-05-18 17:22:31.016583|2023-10-08 15:10:38.970972
+14798|Anne|May|marcuscrawford@example.org|(854)933-3461x143|880 Cristian Mountains Suite 194|Webbfort|CA|05126|74|2024-12-13 15:38:46.038145|2025-02-21 21:29:22.268957}}
 
 # Regression test for nested parens + OR + AND. This returned 0 rows before the fix.
 # It should always return 1 row because it is true for id = 6.
@@ -461,7 +480,7 @@ do_execsql_test nested-parens-and-inside-or-regression-test {
 # Test behavior of binary comparisons (=,>,<,>=,<=,!=) when one operand is NULL
 # Each test has 3 variants:
 # 1. Simple comparison with NULL (should return empty)
-# 2. Comparison with NULL OR id=1 (should return Jamie)
+# 2. Comparison with NULL OR id=1 (should return Dawn)
 # 3. Comparison with NULL AND id=1 (should return empty)
 foreach {operator} {
     =
@@ -475,7 +494,7 @@ foreach {operator} {
     do_execsql_test where-binary-one-operand-null-$operator "select * from users where first_name $operator NULL" {}
 
     # NULL comparison OR id=1 
-    do_execsql_test where-binary-one-operand-null-or-$operator "select first_name from users where first_name $operator NULL OR id = 1" {Jamie}
+    do_execsql_test where-binary-one-operand-null-or-$operator "select first_name from users where first_name $operator NULL OR id = 1" {Dawn}
 
     # NULL comparison AND id=1
     do_execsql_test where-binary-one-operand-null-and-$operator "select first_name from users where first_name $operator NULL AND id = 1" {}
@@ -494,7 +513,7 @@ do_execsql_test where-literal-string {
 # Test CAST in WHERE clause
 do_execsql_test where-cast-string-to-int {
     select count(*) from users where cast('1' as integer);
-} {10000}
+} {15000}
 
 do_execsql_test where-cast-float-to-int {
     select count(*) from users where cast('0' as integer);
@@ -503,13 +522,13 @@ do_execsql_test where-cast-float-to-int {
 # Test FunctionCall in WHERE clause
 do_execsql_test where-function-length {
     select count(*) from users where length(first_name);
-} {10000}
+} {15000}
 
 # Test CASE in WHERE clause
 do_execsql_test where-case-simple {
     select count(*) from users where 
     case when age > 0 then 1 else 0 end;
-} {10000}
+} {15000}
 
 do_execsql_test where-case-searched {
     select count(*) from users where 
@@ -517,61 +536,61 @@ do_execsql_test where-case-searched {
         when 0 then 0
         else 1
     end;
-} {10000}
+} {15000}
 
 # Test unary operators in WHERE clause
 do_execsql_test where-unary-not {
     select count(*) from users where not (id = 1);
-} {9999}
+} {14999}
 
 do_execsql_test where-unary-plus {
     select count(*) from users where +1;
-} {10000}
+} {15000}
 
 do_execsql_test where-unary-minus {
     select count(*) from users where -1;
-} {10000}
+} {15000}
 
 do_execsql_test where-unary-bitnot {
     select count(*) from users where ~1;
-} {10000}
+} {15000}
 
 # Test binary math operators in WHERE clause
 do_execsql_test where-binary-add {
     select count(*) from users where 1 + 1;
-} {10000}
+} {15000}
 
 do_execsql_test where-binary-subtract {
     select count(*) from users where 2 - 1;
-} {10000}
+} {15000}
 
 do_execsql_test where-binary-multiply {
     select count(*) from users where 2 * 1;
-} {10000}
+} {15000}
 
 do_execsql_test where-binary-divide {
     select count(*) from users where 2 / 2;
-} {10000}
+} {15000}
 
 do_execsql_test where-binary-modulo {
     select count(*) from users where 3 % 2;
-} {10000}
+} {15000}
 
 do_execsql_test where-binary-shift-left {
     select count(*) from users where 1 << 1;
-} {10000}
+} {15000}
 
 do_execsql_test where-binary-shift-right {
     select count(*) from users where 2 >> 1;
-} {10000}
+} {15000}
 
 do_execsql_test where-binary-bitwise-and {
     select count(*) from users where 3 & 1;
-} {10000}
+} {15000}
 
 do_execsql_test where-binary-bitwise-or {
     select count(*) from users where 2 | 1;
-} {10000}
+} {15000}
 
 do_execsql_test where-constant-condition-no-tables {
     select 1 where 1 IS NULL;
@@ -589,4 +608,4 @@ do_execsql_test where-null-comparison-index-seek-regression-test {
 # We had a bug where Limbo tried to use an index when there was a WHERE term like 't.x = t.x'
 do_execsql_test where-self-referential-regression {
   select count(1) from users where id = id;
-} {10000}
+} {15000}
