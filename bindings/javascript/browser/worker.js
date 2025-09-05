@@ -1,4 +1,4 @@
-import { expose } from "threads/worker"
+import { getAllJSDocTagsOfKind } from "typescript";
 import { bindParams } from "./bind";
 import { SqliteError } from "./sqlite-error";
 
@@ -10,6 +10,7 @@ import {
 } from '@napi-rs/wasm-runtime'
 
 
+var sab = null;
 const __wasi = new __WASI({
     version: 'preview1',
 })
@@ -18,7 +19,7 @@ const __wasmUrl = new URL('./turso-browser.wasm32-wasi.wasm', import.meta.url).h
 const __emnapiContext = __emnapiGetDefaultContext()
 
 const __sharedMemory = new WebAssembly.Memory({
-    initial: 4000,
+    initial: 1024,
     maximum: 65536,
     shared: true,
 })
@@ -559,52 +560,149 @@ async function init() {
             }
         },
     })
+
     module = __napiModule;
 }
 
-expose({
-    async connect(path) {
-        await init();
-        let [dbPath, dbId] = await registerFile(path);
-        let [walPath, walId] = await registerFile(`${path}-wal`);
-        db = new Database({ path: path, files: { [dbPath]: { handle: dbId }, [walPath]: { handle: walId } } });
-    },
-    prepare(sql) {
-        stmtId += 1;
-        stmts.set(stmtId, db.prepare(sql));
-        return stmtId;
-    },
-    pragma(source, options) {
-        return db.pragma(source, options);
-    },
-    exec(sql) {
-        db.exec(sql);
-    },
-    defaultSafeIntegers(toggle) {
-        db.defaultSafeIntegers(toggle);
-    },
-    close() {
-        db.close();
-    },
-    async run(stmtId, bindParameters) {
-        return stmts.get(stmtId).run(...bindParameters);
-    },
-    async all(stmtId, bindParameters) {
-        return stmts.get(stmtId).all(...bindParameters);
-    },
-    pluck(stmtId, pluckMode) {
-        stmts.get(stmtId).pluck(pluckMode);
-    },
-    safeIntegers(stmtId, toggle) {
-        stmts.get(stmtId).safeIntegers(toggle);
-    },
-    columns(stmtId) {
-        return stmts.get(stmtId).stmt.columns();
-    },
-    async get(stmtId, bindParameters) {
-        return stmts.get(stmtId).get(...bindParameters);
-    },
-    bind(bindParameters) {
-        stmts.get(stmtId).bind(...bindParameters);
+self.onmessage = async (ev) => {
+    if (ev.data.sab) {
+        sab = new Int32Array(ev.data.sab);
+        console.info(ev);
+        (async function () {
+            let id = 0;
+            while (true) {
+                while (true) {
+                    const { async, value } = Atomics.waitAsync(sab, 0, id, 1);
+                    if (async) {
+                        await value;
+                    } else {
+                        break;
+                    }
+                }
+                id += 1;
+                Atomics.store(sab, 1, id);
+                Atomics.notify(sab, 1, 1);
+            }
+        })();
+        return;
     }
-})
+    const { id, action, args = [] } = ev.data || {};
+    const respond = (ok, result) => {
+        if (id !== undefined) self.postMessage({ id, ok, result }, []);
+    };
+
+    try {
+        switch (action) {
+            case 'pingAsync': {
+                respond(true, undefined);
+                break;
+            }
+            case 'pingSync': {
+                // Fire-and-forget, no response needed (but we still respond if id is present)
+                respond(true, undefined);
+                break;
+            }
+            case 'connect': {
+                console.info('connect')
+                const [path] = args;
+                await init();
+                if (path === ':memory:') {
+                    db = new Database(':memory:');
+                } else {
+                    const [dbPath, dbId] = await registerFile(path);
+                    const [walPath, walId] = await registerFile(`${path}-wal`);
+                    db = new Database({
+                        path,
+                        files: {
+                            [dbPath]: { handle: dbId },
+                            [walPath]: { handle: walId },
+                        },
+                    });
+                }
+                respond(true, undefined);
+                break;
+            }
+            case 'prepare': {
+                const [sql] = args;
+                // const start = performance.now();
+                stmtId += 1;
+                stmts.set(stmtId, db.prepare(sql));
+                // console.info('prepare', performance.now() - start);
+                respond(true, stmtId);
+                break;
+            }
+            case 'pragma': {
+                const [source, options] = args;
+                respond(true, db.pragma(source, options));
+                break;
+            }
+            case 'exec': {
+                const [sql] = args;
+                db.exec(sql);
+                respond(true, undefined);
+                break;
+            }
+            case 'defaultSafeIntegers': {
+                const [toggle] = args;
+                db.defaultSafeIntegers(toggle);
+                respond(true, undefined);
+                break;
+            }
+            case 'close': {
+                db.close();
+                respond(true, undefined);
+                break;
+            }
+            case 'run': {
+                const [id, bindParameters = []] = args;
+                respond(true, await stmts.get(id).run(...bindParameters));
+                break;
+            }
+            case 'all': {
+                const [id, bindParameters = []] = args;
+                // const start = performance.now();
+                const result = await stmts.get(id).all(...bindParameters);
+                // console.info('all', performance.now() - start);
+                respond(true, result);
+                break;
+            }
+            case 'pluck': {
+                const [id, pluckMode] = args;
+                stmts.get(id).pluck(pluckMode);
+                respond(true, undefined);
+                break;
+            }
+            case 'safeIntegers': {
+                const [id, toggle] = args;
+                stmts.get(id).safeIntegers(toggle);
+                respond(true, undefined);
+                break;
+            }
+            case 'columns': {
+                const [id] = args;
+                const start = performance.now();
+                const result = stmts.get(id).stmt.columns();
+                // console.info('columns', performance.now() - start);
+                respond(true, result);
+                break;
+            }
+            case 'get': {
+                const [id, bindParameters = []] = args;
+                respond(true, await stmts.get(id).get(...bindParameters));
+                break;
+            }
+            case 'bind': {
+                const [id, bindParameters = []] = args;
+                stmts.get(id).bind(...bindParameters);
+                respond(true, undefined);
+                break;
+            }
+            default: {
+                throw new Error(`Unknown action: ${action}`);
+            }
+        }
+    } catch (err) {
+        console.error(err);
+        respond(false, { message: String(err && err.message || err) });
+    }
+};
