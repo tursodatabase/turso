@@ -18,7 +18,7 @@ use crate::{
     schema::{Schema, Table},
     translate::expr::walk_expr_mut,
     util::{exprs_are_equivalent, normalize_ident},
-    vdbe::{builder::TableRefIdCounter, BranchOffset},
+    vdbe::builder::TableRefIdCounter,
     Result,
 };
 use turso_macros::match_ignore_ascii_case;
@@ -403,10 +403,7 @@ fn parse_from_clause_table(
                 syms,
                 table_references.outer_query_refs(),
                 table_ref_counter,
-                QueryDestination::CoroutineYield {
-                    yield_reg: usize::MAX, // will be set later in bytecode emission
-                    coroutine_implementation_start: BranchOffset::Placeholder, // will be set later in bytecode emission
-                },
+                QueryDestination::placeholder_for_subquery(),
                 connection,
             )?
             else {
@@ -722,10 +719,7 @@ pub fn parse_from(
                 syms,
                 &outer_query_refs_for_cte,
                 table_ref_counter,
-                QueryDestination::CoroutineYield {
-                    yield_reg: usize::MAX, // will be set later in bytecode emission
-                    coroutine_implementation_start: BranchOffset::Placeholder, // will be set later in bytecode emission
-                },
+                QueryDestination::placeholder_for_subquery(),
                 connection,
             )?;
             let Plan::Select(cte_plan) = cte_plan else {

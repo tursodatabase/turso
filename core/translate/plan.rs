@@ -198,6 +198,15 @@ pub enum QueryDestination {
     },
 }
 
+impl QueryDestination {
+    pub fn placeholder_for_subquery() -> Self {
+        QueryDestination::CoroutineYield {
+            yield_reg: usize::MAX, // will be set later in bytecode emission
+            coroutine_implementation_start: BranchOffset::Placeholder, // will be set later in bytecode emission
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct JoinOrderMember {
     /// The internal ID of the[TableReference]
