@@ -1,4 +1,5 @@
 use crate::json::error::{Error as PError, Result as PResult};
+use crate::json::Conv;
 use crate::{bail_parse_error, LimboError, Result};
 use std::{
     borrow::Cow,
@@ -742,7 +743,15 @@ impl JsonbHeader {
         Self(ElementType::OBJECT, 0)
     }
 
-    fn from_slice(cursor: usize, slice: &[u8]) -> Result<(Self, usize)> {
+    pub(super) fn element_type(&self) -> ElementType {
+        self.0
+    }
+
+    pub(super) fn payload_size(&self) -> PayloadSize {
+        self.1
+    }
+
+    pub(super) fn from_slice(cursor: usize, slice: &[u8]) -> Result<(Self, usize)> {
         match slice.get(cursor) {
             Some(header_byte) => {
                 // Extract first 4 bits (values 0-15)
@@ -906,6 +915,96 @@ impl Jsonb {
                 }
             }
             Err(_) => bail_parse_error!("malformed JSON"),
+        }
+    }
+
+    pub fn is_valid(&self) -> bool {
+        self.validate_element(0, self.data.len(), 0).is_ok()
+    }
+
+    fn validate_element(&self, start: usize, end: usize, depth: usize) -> Result<()> {
+        if depth > MAX_JSON_DEPTH {
+            bail_parse_error!("Too deep");
+        }
+
+        if start >= end {
+            bail_parse_error!("Empty element");
+        }
+
+        let (header, header_offset) = self.read_header(start)?;
+        let payload_start = start + header_offset;
+        let payload_size = header.payload_size();
+        let payload_end = payload_start + payload_size;
+
+        if payload_end != end {
+            bail_parse_error!("Size mismatch");
+        }
+
+        match header.element_type() {
+            ElementType::NULL | ElementType::TRUE | ElementType::FALSE => {
+                if payload_size == 0 {
+                    Ok(())
+                } else {
+                    bail_parse_error!("Invalid payload for primitive")
+                }
+            }
+            ElementType::INT | ElementType::INT5 | ElementType::FLOAT | ElementType::FLOAT5 => {
+                if payload_size > 0 {
+                    Ok(())
+                } else {
+                    bail_parse_error!("Empty number payload")
+                }
+            }
+            ElementType::TEXT | ElementType::TEXTJ | ElementType::TEXT5 | ElementType::TEXTRAW => {
+                let payload = &self.data[payload_start..payload_end];
+                std::str::from_utf8(payload).map_err(|_| {
+                    LimboError::ParseError("Invalid UTF-8 in text payload".to_string())
+                })?;
+                Ok(())
+            }
+            ElementType::ARRAY => {
+                let mut pos = payload_start;
+                while pos < payload_end {
+                    if pos >= self.data.len() {
+                        bail_parse_error!("Array element out of bounds");
+                    }
+                    let (elem_header, elem_header_size) = self.read_header(pos)?;
+                    let elem_end = pos + elem_header_size + elem_header.payload_size();
+                    if elem_end > payload_end {
+                        bail_parse_error!("Array element exceeds bounds");
+                    }
+                    self.validate_element(pos, elem_end, depth + 1)?;
+                    pos = elem_end;
+                }
+                Ok(())
+            }
+            ElementType::OBJECT => {
+                let mut pos = payload_start;
+                let mut count = 0;
+                while pos < payload_end {
+                    if pos >= self.data.len() {
+                        bail_parse_error!("Object element out of bounds");
+                    }
+                    let (elem_header, elem_header_size) = self.read_header(pos)?;
+                    if count % 2 == 0 && !elem_header.element_type().is_valid_key() {
+                        bail_parse_error!("Object key must be text");
+                    }
+
+                    let elem_end = pos + elem_header_size + elem_header.payload_size();
+                    if elem_end > payload_end {
+                        bail_parse_error!("Object element exceeds bounds");
+                    }
+                    self.validate_element(pos, elem_end, depth + 1)?;
+                    pos = elem_end;
+                    count += 1;
+                }
+
+                if count % 2 != 0 {
+                    bail_parse_error!("Object must have even number of elements");
+                }
+                Ok(())
+            }
+            _ => bail_parse_error!("Invalid element type"),
         }
     }
 
@@ -2156,6 +2255,18 @@ impl Jsonb {
         }
 
         Ok(result)
+    }
+
+    pub fn from_str_with_mode(input: &str, mode: Conv) -> PResult<Self> {
+        // Parse directly as JSON if it's already JSON subtype or strict mode is on
+        if matches!(mode, Conv::ToString) {
+            let mut str = input.replace('"', "\\\"");
+            str.insert(0, '"');
+            str.push('"');
+            Jsonb::from_str(&str)
+        } else {
+            Jsonb::from_str(input)
+        }
     }
 
     pub fn from_raw_data(data: &[u8]) -> Self {
