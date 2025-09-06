@@ -280,8 +280,8 @@ do_execsql_test subquery-inner-grouping {
         select first_name = 'Jennifer' as is_jennifer, count(1) as person_count from users
         group by first_name = 'Jennifer'
     ) order by person_count asc
-} {1|151
-0|9849}
+} {1|197
+0|14803}
 
 do_execsql_test subquery-inner-grouping-cte {
     with cte as (
@@ -290,16 +290,16 @@ do_execsql_test subquery-inner-grouping-cte {
     )
     select is_jennifer, person_count
     from cte order by person_count asc
-} {1|151
-0|9849}
+} {1|197
+0|14803}
 
 do_execsql_test subquery-outer-grouping {
     select is_jennifer, count(1) as person_count
     from (
         select first_name = 'Jennifer' as is_jennifer from users
     ) group by is_jennifer order by count(1) asc
-} {1|151
-0|9849}
+} {1|197
+0|14803}
 
 do_execsql_test subquery-outer-grouping-cte {
     with cte as (
@@ -307,8 +307,8 @@ do_execsql_test subquery-outer-grouping-cte {
     )
     select is_jennifer, count(1) as person_count
     from cte group by is_jennifer order by count(1) asc
-} {1|151
-0|9849}
+} {1|197
+0|14803}
 
 do_execsql_test subquery-join-using-with-outer-limit {
     SELECT p.name, sub.funny_name 
@@ -391,9 +391,9 @@ do_execsql_test subquery-containing-join {
         select p.name as foo, u.first_name as bar 
         from products p join users u using (id)
     ) limit 3;
-} {hat|Jamie
-cap|Cindy
-shirt|Tommy}
+} {hat|Dawn
+cap|Elizabeth
+shirt|Matthew}
 
 do_execsql_test subquery-containing-join-cte {
     with cte as (
@@ -402,9 +402,9 @@ do_execsql_test subquery-containing-join-cte {
     )
     select foo, bar 
     from cte limit 3;
-} {hat|Jamie
-cap|Cindy
-shirt|Tommy}
+} {hat|Dawn
+cap|Elizabeth
+shirt|Matthew}
 
 do_execsql_test subquery-ignore-unused-cte {
     with unused as (select last_name from users), 
@@ -415,7 +415,7 @@ do_execsql_test subquery-ignore-unused-cte {
 # Test verifying that select distinct works (distinct ages are 1-100)
 do_execsql_test subquery-count-distinct-age {
     select count(1) from (select distinct age from users);
-} {100}
+} {68}
 
 # Test verifying that select distinct works for multiple columns, and across joins
 do_execsql_test subquery-count-distinct {
@@ -424,7 +424,7 @@ do_execsql_test subquery-count-distinct {
         from users u join products p 
         where u.id < 100
     );
-} {902}
+} {913}
 
 do_execsql_test subquery-count-all {
     select count(1) from (

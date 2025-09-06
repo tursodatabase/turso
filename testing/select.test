@@ -79,16 +79,16 @@ do_execsql_test realify {
 } {79.0}
 
 do_execsql_test select-add {
-    select u.age + 1 from users u where u.age = 91 limit 1;
-} {92}
+    select u.age + 1 from users u where u.age = 84 limit 1;
+} {85}
 
 do_execsql_test select-subtract {
-    select u.age - 1 from users u where u.age = 91 limit 1;
-} {90}
+    select u.age - 1 from users u where u.age = 69 limit 1;
+} {68}
 
 do_execsql_test case-insensitive-columns {
-    select u.aGe + 1 from USERS u where U.AGe = 91 limit 1;
-} {92}
+    select u.aGe + 1 from USERS u where U.AGe = 69 limit 1;
+} {70}
 
 do_execsql_test table-star {
     select p.*, p.name from products p limit 1;
@@ -96,7 +96,7 @@ do_execsql_test table-star {
 
 do_execsql_test table-star-2 {
     select p.*, u.first_name from users u join products p on u.id = p.id limit 1;
-} {1|hat|79.0|Jamie}
+} {1|hat|79.0|Dawn}
 
 do_execsql_test select_with_quoting {
   select `users`.id from [users] where users.[id] = 5;
@@ -108,15 +108,15 @@ do_execsql_test select_with_quoting_2 {
 
 do_execsql_test select-rowid {
     select rowid, first_name from users u where rowid = 5;
-} {5|Edward}
+} {5|Jennifer}
 
 do_execsql_test select-rowid-2 {
     select u.rowid, first_name from users u where rowid = 5;
-} {5|Edward}
+} {5|Jennifer}
 
 do_execsql_test seekrowid {
     select * from users u where u.id = 5;
-} {"5|Edward|Miller|christiankramer@example.com|725-281-1033|08522 English Plain|Lake Keith|ID|23283|15"}
+} {"5|Jennifer|Zavala|michael53@example.com|371-529-4313x6105|84954 Nathaniel Lakes Apt. 191|Chandlerfurt|OH|06138|21|2023-11-17 06:54:27.921948|2024-10-16 05:58:54.267613"}
 
 do_execsql_test select_parenthesized {
   select (price + 100) from products limit 1;
