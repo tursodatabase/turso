@@ -145,6 +145,18 @@ do_execsql_test group_by_count_star {
   select u.first_name, count(*) from users u group by u.first_name limit 1;
 } {Aaron|41}
 
+do_execsql_test group_by_count_star_in_expression {
+  select u.first_name, count(*) % 3 from users u group by u.first_name order by u.first_name limit 3;
+} {Aaron|2
+Abigail|1
+Adam|0}
+
+do_execsql_test group_by_count_no_args_in_expression {
+  select u.first_name, count() % 3 from users u group by u.first_name order by u.first_name limit 3;
+} {Aaron|2
+Abigail|1
+Adam|0}
+
 do_execsql_test having {
   select u.first_name, round(avg(u.age)) from users u group by u.first_name having avg(u.age) > 97 order by avg(u.age) desc limit 5;
 } {Nina|100.0

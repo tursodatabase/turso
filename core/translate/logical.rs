@@ -14,6 +14,7 @@ use crate::{LimboError, Result};
 use std::collections::HashMap;
 use std::fmt::{self, Display, Formatter};
 use std::sync::Arc;
+use turso_macros::match_ignore_ascii_case;
 use turso_parser::ast;
 
 /// Result type for preprocessing aggregate expressions
@@ -1367,9 +1368,14 @@ impl<'a> LogicalPlanBuilder<'a> {
     fn build_literal(lit: &ast::Literal) -> Result<Value> {
         match lit {
             ast::Literal::Null => Ok(Value::Null),
-            ast::Literal::Keyword(k) if k.eq_ignore_ascii_case("true") => Ok(Value::Integer(1)), // SQLite uses int for bool
-            ast::Literal::Keyword(k) if k.eq_ignore_ascii_case("false") => Ok(Value::Integer(0)), // SQLite uses int for bool
-            ast::Literal::Keyword(k) => Ok(Value::Text(k.clone().into())),
+            ast::Literal::Keyword(k) => {
+                let k_bytes = k.as_bytes();
+                match_ignore_ascii_case!(match k_bytes {
+                    b"true" => Ok(Value::Integer(1)),  // SQLite uses int for bool
+                    b"false" => Ok(Value::Integer(0)), // SQLite uses int for bool
+                    _ => Ok(Value::Text(k.clone().into())),
+                })
+            }
             ast::Literal::Numeric(s) => {
                 if let Ok(i) = s.parse::<i64>() {
                     Ok(Value::Integer(i))
@@ -1400,19 +1406,20 @@ impl<'a> LogicalPlanBuilder<'a> {
 
     /// Parse aggregate function name (considering argument count for min/max)
     fn parse_aggregate_function(name: &str, arg_count: usize) -> Option<AggregateFunction> {
-        match name.to_uppercase().as_str() {
-            "COUNT" => Some(AggFunc::Count),
-            "SUM" => Some(AggFunc::Sum),
-            "AVG" => Some(AggFunc::Avg),
+        let name_bytes = name.as_bytes();
+        match_ignore_ascii_case!(match name_bytes {
+            b"COUNT" => Some(AggFunc::Count),
+            b"SUM" => Some(AggFunc::Sum),
+            b"AVG" => Some(AggFunc::Avg),
             // MIN and MAX are only aggregates with 1 argument
             // With 2+ arguments, they're scalar functions
-            "MIN" if arg_count == 1 => Some(AggFunc::Min),
-            "MAX" if arg_count == 1 => Some(AggFunc::Max),
-            "GROUP_CONCAT" => Some(AggFunc::GroupConcat),
-            "STRING_AGG" => Some(AggFunc::StringAgg),
-            "TOTAL" => Some(AggFunc::Total),
+            b"MIN" if arg_count == 1 => Some(AggFunc::Min),
+            b"MAX" if arg_count == 1 => Some(AggFunc::Max),
+            b"GROUP_CONCAT" => Some(AggFunc::GroupConcat),
+            b"STRING_AGG" => Some(AggFunc::StringAgg),
+            b"TOTAL" => Some(AggFunc::Total),
             _ => None,
-        }
+        })
     }
 
     // Check if expression contains aggregates

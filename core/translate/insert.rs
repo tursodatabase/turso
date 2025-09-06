@@ -63,6 +63,7 @@ pub fn translate_insert(
     if with.is_some() {
         crate::bail_parse_error!("WITH clause is not supported");
     }
+
     if on_conflict.is_some() {
         crate::bail_parse_error!("ON CONFLICT clause is not supported");
     }
@@ -75,10 +76,21 @@ pub fn translate_insert(
         );
     }
     let table_name = &tbl_name.name;
+
+    // Check if this is a system table that should be protected from direct writes
+    if crate::schema::is_system_table(table_name.as_str()) {
+        crate::bail_parse_error!("table {} may not be modified", table_name);
+    }
+
     let table = match schema.get_table(table_name.as_str()) {
         Some(table) => table,
         None => crate::bail_parse_error!("no such table: {}", table_name),
     };
+
+    // Check if this is a materialized view
+    if schema.is_materialized_view(table_name.as_str()) {
+        crate::bail_parse_error!("cannot modify materialized view {}", table_name);
+    }
 
     let resolver = Resolver::new(schema, syms);
 

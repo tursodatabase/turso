@@ -65,7 +65,8 @@ use crate::types::{RawSlice, RefValue, SerialType, SerialTypeKind, TextRef, Text
 use crate::{
     bail_corrupt_error, turso_assert, CompletionError, File, IOContext, Result, WalFileShared,
 };
-use std::cell::{Cell, UnsafeCell};
+use parking_lot::RwLock;
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap};
 use std::mem::MaybeUninit;
 use std::pin::Pin;
@@ -995,17 +996,14 @@ pub fn write_pages_vectored(
     pager: &Pager,
     batch: BTreeMap<usize, Arc<Buffer>>,
     done_flag: Arc<AtomicBool>,
+    final_write: bool,
 ) -> Result<Vec<Completion>> {
     if batch.is_empty() {
         done_flag.store(true, Ordering::Relaxed);
         return Ok(Vec::new());
     }
 
-    // batch item array is already sorted by id, so we just need to find contiguous ranges of page_id's
-    // to submit as `writev`/write_pages calls.
-
     let page_sz = pager.page_size.get().expect("page size is not set").get() as usize;
-
     // Count expected number of runs to create the atomic counter we need to track each batch
     let mut run_count = 0;
     let mut prev_id = None;
@@ -1023,26 +1021,21 @@ pub fn write_pages_vectored(
     // Create the atomic counters
     let runs_left = Arc::new(AtomicUsize::new(run_count));
     let done = done_flag.clone();
-    // we know how many runs, but we don't know how many buffers per run, so we can only give an
-    // estimate of the capacity
     const EST_BUFF_CAPACITY: usize = 32;
 
-    // Iterate through the batch, submitting each run as soon as it ends
-    // We can reuse this across runs without reallocating
     let mut run_bufs = Vec::with_capacity(EST_BUFF_CAPACITY);
     let mut run_start_id: Option<usize> = None;
 
-    // Iterate through the batch
+    // Track which run we're on to identify the last one
+    let mut current_run = 0;
     let mut iter = batch.iter().peekable();
-
     let mut completions = Vec::new();
+
     while let Some((id, item)) = iter.next() {
         // Track the start of the run
         if run_start_id.is_none() {
             run_start_id = Some(*id);
         }
-
-        // Add this page to the current run
         run_bufs.push(item.clone());
 
         // Check if this is the end of a run
@@ -1052,24 +1045,32 @@ pub fn write_pages_vectored(
         };
 
         if is_end_of_run {
+            current_run += 1;
             let start_id = run_start_id.expect("should have a start id");
             let runs_left_cl = runs_left.clone();
             let done_cl = done.clone();
 
+            // This is the last chunk if it's the last run AND final_write is true
+            let is_last_chunk = current_run == run_count && final_write;
+
             let total_sz = (page_sz * run_bufs.len()) as i32;
-            let c = Completion::new_write(move |res| {
+            let cmp = move |res| {
                 let Ok(res) = res else {
                     return;
                 };
-                // writev calls can sometimes return partial writes, but our `pwritev`
-                // implementation aggregates any partial writes and calls completion with total
                 turso_assert!(total_sz == res, "failed to write expected size");
                 if runs_left_cl.fetch_sub(1, Ordering::AcqRel) == 1 {
                     done_cl.store(true, Ordering::Release);
                 }
-            });
+            };
 
-            // Submit write operation for this run, decrementing the counter if we error
+            let c = if is_last_chunk {
+                Completion::new_write_linked(cmp)
+            } else {
+                Completion::new_write(cmp)
+            };
+
+            // Submit write operation for this run
             let io_ctx = &pager.io_ctx.borrow();
             match pager.db_file.write_pages(
                 start_id,
@@ -1546,8 +1547,22 @@ pub fn read_varint(buf: &[u8]) -> Result<(u64, usize)> {
             }
         }
     }
-    v = (v << 8) + buf[8] as u64;
-    Ok((v, 9))
+    match buf.get(8) {
+        Some(&c) => {
+            // Values requiring 9 bytes must have non-zero in the top 8 bits (value >= 1<<56).
+            // Since the final value is `(v<<8) + c`, the top 8 bits (v >> 48) must not be 0.
+            // If those are zero, this should be treated as corrupt.
+            // Perf? the comparison + branching happens only in parsing 9-byte varint which is rare.
+            if (v >> 48) == 0 {
+                bail_corrupt_error!("Invalid varint");
+            }
+            v = (v << 8) + c as u64;
+            Ok((v, 9))
+        }
+        None => {
+            bail_corrupt_error!("Invalid varint");
+        }
+    }
 }
 
 pub fn varint_len(value: u64) -> usize {
@@ -1616,7 +1631,7 @@ pub fn write_varint_to_vec(value: u64, payload: &mut Vec<u8>) {
 }
 
 /// We need to read the WAL file on open to reconstruct the WAL frame cache.
-pub fn read_entire_wal_dumb(file: &Arc<dyn File>) -> Result<Arc<UnsafeCell<WalFileShared>>> {
+pub fn read_entire_wal_dumb(file: &Arc<dyn File>) -> Result<Arc<RwLock<WalFileShared>>> {
     let size = file.size()?;
     #[allow(clippy::arc_with_non_send_sync)]
     let buf_for_pread = Arc::new(Buffer::new_temporary(size as usize));
@@ -1628,14 +1643,15 @@ pub fn read_entire_wal_dumb(file: &Arc<dyn File>) -> Result<Arc<UnsafeCell<WalFi
         l.unlock();
     }
     #[allow(clippy::arc_with_non_send_sync)]
-    let wal_file_shared_ret = Arc::new(UnsafeCell::new(WalFileShared {
+    let wal_file_shared_ret = Arc::new(RwLock::new(WalFileShared {
+        enabled: AtomicBool::new(true),
         wal_header: header.clone(),
         min_frame: AtomicU64::new(0),
         max_frame: AtomicU64::new(0),
         nbackfills: AtomicU64::new(0),
         frame_cache: Arc::new(SpinLock::new(HashMap::new())),
         last_checksum: (0, 0),
-        file: file.clone(),
+        file: Some(file.clone()),
         read_locks,
         write_lock: TursoRwLock::new(),
         loaded: AtomicBool::new(false),
@@ -1716,7 +1732,7 @@ pub fn read_entire_wal_dumb(file: &Arc<dyn File>) -> Result<Arc<UnsafeCell<WalFi
         let mut current_offset = WAL_HEADER_SIZE;
         let mut frame_idx = 1_u64;
 
-        let wfs_data = unsafe { &mut *wal_file_shared_for_completion.get() };
+        let mut wfs_data = wal_file_shared_for_completion.write();
 
         if !checksum_header_failed {
             while current_offset + WAL_FRAME_HEADER_SIZE + page_size <= buf_slice.len() {
@@ -1846,7 +1862,7 @@ pub fn read_entire_wal_dumb(file: &Arc<dyn File>) -> Result<Arc<UnsafeCell<WalFi
 pub fn begin_read_wal_frame_raw(
     buffer_pool: &Arc<BufferPool>,
     io: &Arc<dyn File>,
-    offset: usize,
+    offset: u64,
     complete: Box<ReadComplete>,
 ) -> Result<Completion> {
     tracing::trace!("begin_read_wal_frame_raw(offset={})", offset);
@@ -1859,7 +1875,7 @@ pub fn begin_read_wal_frame_raw(
 
 pub fn begin_read_wal_frame(
     io: &Arc<dyn File>,
-    offset: usize,
+    offset: u64,
     buffer_pool: Arc<BufferPool>,
     complete: Box<ReadComplete>,
     page_idx: usize,
@@ -2215,5 +2231,15 @@ mod tests {
         });
 
         assert_eq!(small_vec.get(8), None);
+    }
+
+    #[rstest]
+    #[case(&[])] // empty buffer
+    #[case(&[0x80])] // truncated 1-byte with continuation
+    #[case(&[0x80, 0x80])] // truncated 2-byte
+    #[case(&[0x81, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80])] // 9-byte truncated to 8
+    #[case(&[0x80; 9])] // bits set without end
+    fn test_read_varint_malformed_inputs(#[case] buf: &[u8]) {
+        assert!(read_varint(buf).is_err());
     }
 }

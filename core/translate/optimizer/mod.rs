@@ -8,7 +8,8 @@ use join::{compute_best_join_order, BestJoinOrderResult};
 use lift_common_subexpressions::lift_common_subexpressions_from_binary_or_terms;
 use order::{compute_order_target, plan_satisfies_order_target, EliminatesSortBy};
 use turso_ext::{ConstraintInfo, ConstraintUsage};
-use turso_parser::ast::{self, fmt::ToTokens as _, Expr, SortOrder};
+use turso_macros::match_ignore_ascii_case;
+use turso_parser::ast::{self, Expr, SortOrder};
 
 use crate::{
     parameters::PARAM_PREFIX,
@@ -52,11 +53,7 @@ pub fn optimize_plan(plan: &mut Plan, schema: &Schema) -> Result<()> {
         }
     }
     // When debug tracing is enabled, print the optimized plan as a SQL string for debugging
-    tracing::debug!(
-        plan_sql = plan
-            .format_with_context(&crate::translate::display::PlanContext(&[]))
-            .unwrap()
-    );
+    tracing::debug!(plan_sql = plan.to_string());
     Ok(())
 }
 
@@ -1409,13 +1406,16 @@ pub fn rewrite_expr(top_level_expr: &mut ast::Expr, param_idx: &mut usize) -> Re
         match expr {
             ast::Expr::Id(id) => {
                 // Convert "true" and "false" to 1 and 0
-                if id.as_str().eq_ignore_ascii_case("true") {
-                    *expr = ast::Expr::Literal(ast::Literal::Numeric(1.to_string()));
-                    return Ok(());
-                }
-                if id.as_str().eq_ignore_ascii_case("false") {
-                    *expr = ast::Expr::Literal(ast::Literal::Numeric(0.to_string()));
-                }
+                let id_bytes = id.as_str().as_bytes();
+                match_ignore_ascii_case!(match id_bytes {
+                    b"true" => {
+                        *expr = ast::Expr::Literal(ast::Literal::Numeric("1".to_owned()));
+                    }
+                    b"false" => {
+                        *expr = ast::Expr::Literal(ast::Literal::Numeric("0".to_owned()));
+                    }
+                    _ => {}
+                })
             }
             ast::Expr::Variable(var) => {
                 if var.is_empty() {

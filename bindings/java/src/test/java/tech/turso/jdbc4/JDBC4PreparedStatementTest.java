@@ -6,9 +6,12 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.math.BigDecimal;
+import java.sql.Date;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.sql.Time;
+import java.sql.Timestamp;
 import java.util.Properties;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -223,6 +226,84 @@ class JDBC4PreparedStatementTest {
     assertArrayEquals(new byte[] {4, 5, 6}, rs.getBytes(1));
     assertTrue(rs.next());
     assertArrayEquals(new byte[] {7, 8, 9}, rs.getBytes(1));
+  }
+
+  @Test
+  void testSetDate() throws SQLException {
+    connection.prepareStatement("CREATE TABLE test (col BLOB)").execute();
+    PreparedStatement stmt =
+        connection.prepareStatement("INSERT INTO test (col) VALUES (?), (?), (?)");
+
+    Date date1 = new Date(1000000000000L);
+    Date date2 = new Date(1500000000000L);
+    Date date3 = new Date(2000000000000L);
+
+    stmt.setDate(1, date1);
+    stmt.setDate(2, date2);
+    stmt.setDate(3, date3);
+    stmt.execute();
+
+    PreparedStatement stmt2 = connection.prepareStatement("SELECT * FROM test;");
+    JDBC4ResultSet rs = (JDBC4ResultSet) stmt2.executeQuery();
+
+    assertTrue(rs.next());
+    assertEquals(date1, rs.getDate(1));
+    assertTrue(rs.next());
+    assertEquals(date2, rs.getDate(1));
+    assertTrue(rs.next());
+    assertEquals(date3, rs.getDate(1));
+  }
+
+  @Test
+  void testSetTime() throws SQLException {
+    connection.prepareStatement("CREATE TABLE test (col BLOB)").execute();
+    PreparedStatement stmt =
+        connection.prepareStatement("INSERT INTO test (col) VALUES (?), (?), (?)");
+
+    Time time1 = new Time(1000000000000L);
+    Time time2 = new Time(1500000000000L);
+    Time time3 = new Time(2000000000000L);
+
+    stmt.setTime(1, time1);
+    stmt.setTime(2, time2);
+    stmt.setTime(3, time3);
+    stmt.execute();
+
+    PreparedStatement stmt2 = connection.prepareStatement("SELECT * FROM test;");
+    JDBC4ResultSet rs = (JDBC4ResultSet) stmt2.executeQuery();
+
+    assertTrue(rs.next());
+    assertEquals(time1, rs.getTime(1));
+    assertTrue(rs.next());
+    assertEquals(time2, rs.getTime(1));
+    assertTrue(rs.next());
+    assertEquals(time3, rs.getTime(1));
+  }
+
+  @Test
+  void testSetTimestamp() throws SQLException {
+    connection.prepareStatement("CREATE TABLE test (col BLOB)").execute();
+    PreparedStatement stmt =
+        connection.prepareStatement("INSERT INTO test (col) VALUES (?), (?), (?)");
+
+    Timestamp timestamp1 = new Timestamp(1000000000000L);
+    Timestamp timestamp2 = new Timestamp(1500000000000L);
+    Timestamp timestamp3 = new Timestamp(2000000000000L);
+
+    stmt.setTimestamp(1, timestamp1);
+    stmt.setTimestamp(2, timestamp2);
+    stmt.setTimestamp(3, timestamp3);
+    stmt.execute();
+
+    PreparedStatement stmt2 = connection.prepareStatement("SELECT * FROM test;");
+    JDBC4ResultSet rs = (JDBC4ResultSet) stmt2.executeQuery();
+
+    assertTrue(rs.next());
+    assertEquals(timestamp1, rs.getTimestamp(1));
+    assertTrue(rs.next());
+    assertEquals(timestamp2, rs.getTimestamp(1));
+    assertTrue(rs.next());
+    assertEquals(timestamp3, rs.getTimestamp(1));
   }
 
   @Test

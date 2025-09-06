@@ -583,6 +583,7 @@ impl Display for MathFunc {
 #[derive(Debug)]
 pub enum AlterTableFunc {
     RenameTable,
+    AlterColumn,
     RenameColumn,
 }
 
@@ -591,6 +592,7 @@ impl Display for AlterTableFunc {
         match self {
             AlterTableFunc::RenameTable => write!(f, "limbo_rename_table"),
             AlterTableFunc::RenameColumn => write!(f, "limbo_rename_column"),
+            AlterTableFunc::AlterColumn => write!(f, "limbo_alter_column"),
         }
     }
 }

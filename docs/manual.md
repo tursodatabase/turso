@@ -38,6 +38,7 @@ Welcome to Turso database manual!
     - [WAL manipulation](#wal-manipulation)
       - [`libsql_wal_frame_count`](#libsql_wal_frame_count)
   - [Encryption](#encryption)
+  - [CDC](#cdc-early-preview)
   - [Appendix A: Turso Internals](#appendix-a-turso-internals)
     - [Frontend](#frontend)
       - [Parser](#parser)
@@ -510,6 +511,114 @@ PRAGMA cipher = 'aegis256'; -- or 'aes256gcm'
 PRAGMA hexkey = '2d7a30108d3eb3e45c90a732041fe54778bdcf707c76749fab7da335d1b39c1d';
 ```
 
+
+## CDC (Early Preview)
+
+Turso supports [Change Data Capture](https://en.wikipedia.org/wiki/Change_data_capture), a powerful pattern for tracking and recording changes to your database in real-time. Instead of periodically scanning tables to find what changed, CDC automatically logs every insert, update, and delete as it happens per connection.
+
+### Enabling CDC
+
+```sql
+PRAGMA unstable_capture_data_changes_conn('<mode>[,custom_cdc_table]');
+```
+
+### Parameters
+- `<mode>` can be:
+    - `off`: Turn off CDC for the connection
+    - `id`: Logs only the `rowid` (most compact)
+    - `before`: Captures row state before updates and deletes
+    - `after`: Captures row state after inserts and updates
+    - `full`: Captures both before and after states (recommended for complete audit trail)
+
+- `custom_cdc` is optional, It lets you specify a custom table to capture changes.
+If no table is provided, Turso uses a default `turso_cdc` table.
+
+
+When **Change Data Capture (CDC)** is enabled for a connection, Turso automatically logs all modifications from that connection into a dedicated table (default: `turso_cdc`). This table records each change with details about the operation, the affected row or schema object, and its state **before** and **after** the modification.
+
+> **Note:** Currently, the CDC table is a regular table stored explicitly on disk. If you use full CDC mode and update rows frequently, each update of size N bytes will be written three times to disk (once for the before state, once for the after state, and once for the actual value in the WAL). Frequent updates in full mode can therefore significantly increase disk I/O.
+
+
+
+- **`change_id` (INTEGER)**  
+  A monotonically increasing integer uniquely identifying each change record.(guaranteed by turso-db) 
+  - Always strictly increasing.  
+  - Serves as the primary key.  
+
+- **`change_time` (INTEGER)**  
+> turso-db guarantee nothing about properties of the change_time sequence 
+  Local timestamp (Unix epoch, seconds) when the change was recorded.  
+  - Not guaranteed to be strictly increasing (can drift or repeat).  
+
+- **`change_type` (INTEGER)**  
+  Indicates the type of operation:  
+  - `1` → INSERT  
+  - `0` → UPDATE (also used for ALTER TABLE)  
+  - `-1` → DELETE (also covers DROP TABLE, DROP INDEX)  
+
+- **`table_name` (TEXT)**  
+  Name of the affected table.  
+  - For schema changes (DDL), this is always `"sqlite_schema"`.  
+
+- **`id` (INTEGER)**  
+  Rowid of the affected row in the source table.  
+  - For DDL operations: rowid of the `sqlite_schema` entry.  
+  - **Note:** `WITHOUT ROWID` tables are not supported in the tursodb and CDC
+
+- **`before` (BLOB)**  
+  Full state of the row/schema **before** an UPDATE or DELETE
+  - NULL for INSERT.  
+  - For DDL changes, may contain the definition of the object before modification.  
+
+- **`after` (BLOB)**  
+  Full state of the row/schema **after** an INSERT or UPDATE
+  - NULL for DELETE.  
+  - For DDL changes, may contain the definition of the object after modification.  
+
+- **`updates` (BLOB)**  
+  Granular details about the change.  
+  - For UPDATE: shows specific column modifications.  
+
+
+> CDC records are visible even before a transaction commits. 
+> Operations that fail (e.g., constraint violations) are not recorded in CDC.
+
+> Changes to the CDC table itself are also logged to CDC table. if CDC is enabled for that connection.
+
+```zsh
+Example:
+turso> PRAGMA unstable_capture_data_changes_conn('full');
+turso> .tables
+turso_cdc
+turso> CREATE TABLE users (
+    id INTEGER PRIMARY KEY,
+    name TEXT
+);
+turso> INSERT INTO users VALUES (1, 'John'), (2, 'Jane');
+
+UPDATE users SET name='John Doe' WHERE id=1;
+
+DELETE FROM users WHERE id=2;
+
+SELECT * FROM turso_cdc;
+┌───────────┬─────────────┬─────────────┬───────────────┬────┬──────────┬──────────────────────────────────────────────────────────────────────────────┬───────────────┐
+│ change_id │ change_time │ change_type │ table_name    │ id │ before   │ after                                                                        │ updates       │
+├───────────┼─────────────┼─────────────┼───────────────┼────┼──────────┼──────────────────────────────────────────────────────────────────────────────┼───────────────┤
+│         1 │  1756713161 │           1 │ sqlite_schema │  2 │          │ ytableusersusersCREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT) │               │
+├───────────┼─────────────┼─────────────┼───────────────┼────┼──────────┼──────────────────────────────────────────────────────────────────────────────┼───────────────┤
+│         2 │  1756713176 │           1 │ users         │  1 │          │       John                                                                      │               │
+├───────────┼─────────────┼─────────────┼───────────────┼────┼──────────┼──────────────────────────────────────────────────────────────────────────────┼───────────────┤
+│         3 │  1756713176 │           1 │ users         │  2 │          │ Jane                                                                     │               │
+├───────────┼─────────────┼─────────────┼───────────────┼────┼──────────┼──────────────────────────────────────────────────────────────────────────────┼───────────────┤
+│         4 │  1756713176 │           0 │ users         │  1 │  John  │         John Doe                                                                  │     John Doe │
+├───────────┼─────────────┼─────────────┼───────────────┼────┼──────────┼──────────────────────────────────────────────────────────────────────────────┼───────────────┤
+│         5 │  1756713176 │          -1 │ users         │  2 │ Jane │                                                                              │               │
+└───────────┴─────────────┴─────────────┴───────────────┴────┴──────────┴──────────────────────────────────────────────────────────────────────────────┴───────────────┘
+turso>
+
+```
+
+If you modify your table schema (adding/dropping columns), the `table_columns_json_array()` function returns the current schema, not the historical one. This can lead to incorrect results when decoding older CDC records. Manually track schema versions by storing the output of `table_columns_json_array()` before making schema changes.
 ## Appendix A: Turso Internals
 
 Turso's architecture resembles SQLite's but differs primarily in its

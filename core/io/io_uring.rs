@@ -4,15 +4,15 @@ use super::{common, Completion, CompletionInner, File, OpenFlags, IO};
 use crate::io::clock::{Clock, Instant};
 use crate::storage::wal::CKPT_BATCH_PAGES;
 use crate::{turso_assert, LimboError, Result};
+use parking_lot::Mutex;
 use rustix::fs::{self, FlockOperation, OFlags};
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
-    cell::RefCell,
     collections::{HashMap, VecDeque},
     io::ErrorKind,
     ops::Deref,
     os::{fd::AsFd, unix::io::AsRawFd},
-    rc::Rc,
     sync::Arc,
 };
 use tracing::{debug, trace};
@@ -44,8 +44,12 @@ const MAX_WAIT: usize = 4;
 /// One memory arena for DB pages and another for WAL frames
 const ARENA_COUNT: usize = 2;
 
+/// Arbitrary non-zero user_data for barrier operation when handling a partial writev
+/// writing a commit frame.
+const BARRIER_USER_DATA: u64 = 1;
+
 pub struct UringIO {
-    inner: Rc<RefCell<InnerUringIO>>,
+    inner: Arc<Mutex<InnerUringIO>>,
 }
 
 unsafe impl Send for UringIO {}
@@ -57,6 +61,7 @@ struct WrappedIOUring {
     writev_states: HashMap<u64, WritevState>,
     overflow: VecDeque<io_uring::squeue::Entry>,
     iov_pool: IovecPool,
+    pending_link: AtomicBool,
 }
 
 struct InnerUringIO {
@@ -123,13 +128,14 @@ impl UringIO {
                 pending_ops: 0,
                 writev_states: HashMap::new(),
                 iov_pool: IovecPool::new(),
+                pending_link: AtomicBool::new(false),
             },
             free_files: (0..FILES).collect(),
             free_arenas: [const { None }; ARENA_COUNT],
         };
         debug!("Using IO backend 'io-uring'");
         Ok(Self {
-            inner: Rc::new(RefCell::new(inner)),
+            inner: Arc::new(Mutex::new(inner)),
         })
     }
 }
@@ -154,6 +160,7 @@ macro_rules! with_fd {
 /// wrapper type to represent a possibly registered file descriptor,
 /// only used in WritevState, and piggy-backs on the available methods from
 /// `UringFile`, so we don't have to store the file on `WritevState`.
+#[derive(Clone)]
 enum Fd {
     Fixed(u32),
     RawFd(i32),
@@ -182,7 +189,7 @@ struct WritevState {
     /// File descriptor/id of the file we are writing to
     file_id: Fd,
     /// absolute file offset for next submit
-    file_pos: usize,
+    file_pos: u64,
     /// current buffer index in `bufs`
     current_buffer_idx: usize,
     /// intra-buffer offset
@@ -195,10 +202,12 @@ struct WritevState {
     bufs: Vec<Arc<crate::Buffer>>,
     /// we keep the last iovec allocation alive until final CQE
     last_iov_allocation: Option<Box<[libc::iovec; MAX_IOVEC_ENTRIES]>>,
+    had_partial: bool,
+    linked_op: bool,
 }
 
 impl WritevState {
-    fn new(file: &UringFile, pos: usize, bufs: Vec<Arc<crate::Buffer>>) -> Self {
+    fn new(file: &UringFile, pos: u64, linked: bool, bufs: Vec<Arc<crate::Buffer>>) -> Self {
         let file_id = file
             .id()
             .map(Fd::Fixed)
@@ -213,6 +222,8 @@ impl WritevState {
             bufs,
             last_iov_allocation: None,
             total_len,
+            had_partial: false,
+            linked_op: linked,
         }
     }
 
@@ -223,23 +234,23 @@ impl WritevState {
 
     /// Advance (idx, off, pos) after written bytes
     #[inline(always)]
-    fn advance(&mut self, written: usize) {
+    fn advance(&mut self, written: u64) {
         let mut remaining = written;
         while remaining > 0 {
             let current_buf_len = self.bufs[self.current_buffer_idx].len();
             let left = current_buf_len - self.current_buffer_offset;
-            if remaining < left {
-                self.current_buffer_offset += remaining;
+            if remaining < left as u64 {
+                self.current_buffer_offset += remaining as usize;
                 self.file_pos += remaining;
                 remaining = 0;
             } else {
-                remaining -= left;
-                self.file_pos += left;
+                remaining -= left as u64;
+                self.file_pos += left as u64;
                 self.current_buffer_idx += 1;
                 self.current_buffer_offset = 0;
             }
         }
-        self.total_written += written;
+        self.total_written += written as usize;
     }
 
     #[inline(always)]
@@ -354,7 +365,7 @@ impl WrappedIOUring {
     }
 
     /// Submit or resubmit a writev operation
-    fn submit_writev(&mut self, key: u64, mut st: WritevState) {
+    fn submit_writev(&mut self, key: u64, mut st: WritevState, continue_chain: bool) {
         st.free_last_iov(&mut self.iov_pool);
         let mut iov_allocation = self.iov_pool.acquire().unwrap_or_else(|| {
             // Fallback: allocate a new one if pool is exhausted
@@ -392,7 +403,7 @@ impl WrappedIOUring {
         }
         // If we have coalesced everything into a single iovec, submit as a single`pwrite`
         if iov_count == 1 {
-            let entry = with_fd!(st.file_id, |fd| {
+            let mut entry = with_fd!(st.file_id, |fd| {
                 if let Some(id) = st.bufs[st.current_buffer_idx].fixed_id() {
                     io_uring::opcode::WriteFixed::new(
                         fd,
@@ -400,7 +411,7 @@ impl WrappedIOUring {
                         iov_allocation[0].iov_len as u32,
                         id as u16,
                     )
-                    .offset(st.file_pos as u64)
+                    .offset(st.file_pos)
                     .build()
                     .user_data(key)
                 } else {
@@ -409,11 +420,21 @@ impl WrappedIOUring {
                         iov_allocation[0].iov_base as *const u8,
                         iov_allocation[0].iov_len as u32,
                     )
-                    .offset(st.file_pos as u64)
+                    .offset(st.file_pos)
                     .build()
                     .user_data(key)
                 }
             });
+
+            if st.linked_op && !st.had_partial {
+                // Starting a new link chain
+                entry = entry.flags(io_uring::squeue::Flags::IO_LINK);
+                self.pending_link.store(true, Ordering::Release);
+            } else if continue_chain && !st.had_partial {
+                // Continue existing chain
+                entry = entry.flags(io_uring::squeue::Flags::IO_LINK);
+            }
+
             self.submit_entry(&entry);
             return;
         }
@@ -423,12 +444,15 @@ impl WrappedIOUring {
         let ptr = iov_allocation.as_ptr() as *mut libc::iovec;
         st.last_iov_allocation = Some(iov_allocation);
 
-        let entry = with_fd!(st.file_id, |fd| {
+        let mut entry = with_fd!(st.file_id, |fd| {
             io_uring::opcode::Writev::new(fd, ptr, iov_count as u32)
-                .offset(st.file_pos as u64)
+                .offset(st.file_pos)
                 .build()
                 .user_data(key)
         });
+        if st.linked_op {
+            entry = entry.flags(io_uring::squeue::Flags::IO_LINK);
+        }
         // track the current state in case we get a partial write
         self.writev_states.insert(key, st);
         self.submit_entry(&entry);
@@ -443,8 +467,8 @@ impl WrappedIOUring {
             return;
         }
 
-        let written = result as usize;
-        state.advance(written);
+        let written = result;
+        state.advance(written as u64);
         match state.remaining() {
             0 => {
                 tracing::info!(
@@ -453,6 +477,19 @@ impl WrappedIOUring {
                 );
                 // write complete, return iovec to pool
                 state.free_last_iov(&mut self.iov_pool);
+                if state.linked_op && state.had_partial {
+                    // if it was a linked operation, we need to submit a fsync after this writev
+                    // to ensure data is on disk
+                    self.ring.submit().expect("submit after writev");
+                    let file_id = state.file_id;
+                    let sync = with_fd!(file_id, |fd| {
+                        io_uring::opcode::Fsync::new(fd)
+                            .build()
+                            .user_data(BARRIER_USER_DATA)
+                    })
+                    .flags(io_uring::squeue::Flags::IO_DRAIN);
+                    self.submit_entry(&sync);
+                }
                 completion_from_key(user_data).complete(state.total_written as i32);
             }
             remaining => {
@@ -462,8 +499,10 @@ impl WrappedIOUring {
                     written,
                     remaining
                 );
-                // partial write, submit next
-                self.submit_writev(user_data, state);
+                // make sure partial write is recorded, because fsync could happen after this
+                // and we are not finished writing to disk
+                state.had_partial = true;
+                self.submit_writev(user_data, state, false);
             }
         }
     }
@@ -490,7 +529,7 @@ impl IO for UringIO {
                 Err(error) => debug!("Error {error:?} returned when setting O_DIRECT flag to read file. The performance of the system may be affected"),
             }
         }
-        let id = self.inner.borrow_mut().register_file(file.as_raw_fd()).ok();
+        let id = self.inner.lock().register_file(file.as_raw_fd()).ok();
         let uring_file = Arc::new(UringFile {
             io: self.inner.clone(),
             file,
@@ -509,7 +548,7 @@ impl IO for UringIO {
 
     fn run_once(&self) -> Result<()> {
         trace!("run_once()");
-        let mut inner = self.inner.borrow_mut();
+        let mut inner = self.inner.lock();
         let ring = &mut inner.ring;
         ring.flush_overflow()?;
         if ring.empty() {
@@ -531,6 +570,14 @@ impl IO for UringIO {
                 // if we have ongoing writev state, handle it separately and don't call completion
                 ring.handle_writev_completion(state, user_data, result);
                 continue;
+            } else if user_data == BARRIER_USER_DATA {
+                // barrier operation, no completion to call
+                if result < 0 {
+                    let err = std::io::Error::from_raw_os_error(result);
+                    tracing::error!("barrier operation failed: {}", err);
+                    return Err(err.into());
+                }
+                continue;
             }
             completion_from_key(user_data).complete(result)
         }
@@ -541,7 +588,7 @@ impl IO for UringIO {
             len % 512 == 0,
             "fixed buffer length must be logical block aligned"
         );
-        let mut inner = self.inner.borrow_mut();
+        let mut inner = self.inner.lock();
         let slot = inner.free_arenas.iter().position(|e| e.is_none()).ok_or(
             crate::error::CompletionError::UringIOError("no free fixed buffer slots"),
         )?;
@@ -585,7 +632,7 @@ fn completion_from_key(key: u64) -> Completion {
 }
 
 pub struct UringFile {
-    io: Rc<RefCell<InnerUringIO>>,
+    io: Arc<Mutex<InnerUringIO>>,
     file: std::fs::File,
     id: Option<u32>,
 }
@@ -643,9 +690,8 @@ impl File for UringFile {
         Ok(())
     }
 
-    fn pread(&self, pos: usize, c: Completion) -> Result<Completion> {
+    fn pread(&self, pos: u64, c: Completion) -> Result<Completion> {
         let r = c.as_read();
-        let mut io = self.io.borrow_mut();
         let read_e = {
             let buf = r.buf();
             let ptr = buf.as_mut_ptr();
@@ -660,29 +706,29 @@ impl File for UringFile {
                     );
                     #[cfg(debug_assertions)]
                     {
-                        io.debug_check_fixed(idx, ptr, len);
+                        self.io.lock().debug_check_fixed(idx, ptr, len);
                     }
                     io_uring::opcode::ReadFixed::new(fd, ptr, len as u32, idx as u16)
-                        .offset(pos as u64)
+                        .offset(pos)
                         .build()
                         .user_data(get_key(c.clone()))
                 } else {
                     trace!("pread(pos = {}, length = {})", pos, len);
                     // Use Read opcode if fixed buffer is not available
                     io_uring::opcode::Read::new(fd, buf.as_mut_ptr(), len as u32)
-                        .offset(pos as u64)
+                        .offset(pos)
                         .build()
                         .user_data(get_key(c.clone()))
                 }
             })
         };
-        io.ring.submit_entry(&read_e);
+        self.io.lock().ring.submit_entry(&read_e);
         Ok(c)
     }
 
-    fn pwrite(&self, pos: usize, buffer: Arc<crate::Buffer>, c: Completion) -> Result<Completion> {
-        let mut io = self.io.borrow_mut();
-        let write = {
+    fn pwrite(&self, pos: u64, buffer: Arc<crate::Buffer>, c: Completion) -> Result<Completion> {
+        let mut io = self.io.lock();
+        let mut write = {
             let ptr = buffer.as_ptr();
             let len = buffer.len();
             with_fd!(self, |fd| {
@@ -698,37 +744,48 @@ impl File for UringFile {
                         io.debug_check_fixed(idx, ptr, len);
                     }
                     io_uring::opcode::WriteFixed::new(fd, ptr, len as u32, idx as u16)
-                        .offset(pos as u64)
+                        .offset(pos)
                         .build()
                         .user_data(get_key(c.clone()))
                 } else {
                     trace!("pwrite(pos = {}, length = {})", pos, buffer.len());
                     io_uring::opcode::Write::new(fd, ptr, len as u32)
-                        .offset(pos as u64)
+                        .offset(pos)
                         .build()
                         .user_data(get_key(c.clone()))
                 }
             })
         };
+        if c.needs_link() {
+            // Start a new link chain
+            write = write.flags(io_uring::squeue::Flags::IO_LINK);
+            io.ring.pending_link.store(true, Ordering::Release);
+        } else if io.ring.pending_link.load(Ordering::Acquire) {
+            // Continue existing link chain
+            write = write.flags(io_uring::squeue::Flags::IO_LINK);
+        }
+
         io.ring.submit_entry(&write);
         Ok(c)
     }
 
     fn sync(&self, c: Completion) -> Result<Completion> {
-        let mut io = self.io.borrow_mut();
+        let mut io = self.io.lock();
         trace!("sync()");
         let sync = with_fd!(self, |fd| {
             io_uring::opcode::Fsync::new(fd)
                 .build()
                 .user_data(get_key(c.clone()))
         });
+        // sync always ends the chain of linked operations
+        io.ring.pending_link.store(false, Ordering::Release);
         io.ring.submit_entry(&sync);
         Ok(c)
     }
 
     fn pwritev(
         &self,
-        pos: usize,
+        pos: u64,
         bufs: Vec<Arc<crate::Buffer>>,
         c: Completion,
     ) -> Result<Completion> {
@@ -736,11 +793,14 @@ impl File for UringFile {
         if bufs.len().eq(&1) {
             return self.pwrite(pos, bufs[0].clone(), c.clone());
         }
+        let linked = c.needs_link();
         tracing::trace!("pwritev(pos = {}, bufs.len() = {})", pos, bufs.len());
-        let mut io = self.io.borrow_mut();
         // create state to track ongoing writev operation
-        let state = WritevState::new(self, pos, bufs);
-        io.ring.submit_writev(get_key(c.clone()), state);
+        let state = WritevState::new(self, pos, linked, bufs);
+        let mut io = self.io.lock();
+        let continue_chain = !linked && io.ring.pending_link.load(Ordering::Acquire);
+        io.ring
+            .submit_writev(get_key(c.clone()), state, continue_chain);
         Ok(c)
     }
 
@@ -748,13 +808,16 @@ impl File for UringFile {
         Ok(self.file.metadata()?.len())
     }
 
-    fn truncate(&self, len: usize, c: Completion) -> Result<Completion> {
-        let mut io = self.io.borrow_mut();
-        let truncate = with_fd!(self, |fd| {
-            io_uring::opcode::Ftruncate::new(fd, len as u64)
+    fn truncate(&self, len: u64, c: Completion) -> Result<Completion> {
+        let mut truncate = with_fd!(self, |fd| {
+            io_uring::opcode::Ftruncate::new(fd, len)
                 .build()
                 .user_data(get_key(c.clone()))
         });
+        let mut io = self.io.lock();
+        if io.ring.pending_link.load(Ordering::Acquire) {
+            truncate = truncate.flags(io_uring::squeue::Flags::IO_LINK);
+        }
         io.ring.submit_entry(&truncate);
         Ok(c)
     }
@@ -765,7 +828,7 @@ impl Drop for UringFile {
         self.unlock_file().expect("Failed to unlock file");
         if let Some(id) = self.id {
             self.io
-                .borrow_mut()
+                .lock()
                 .unregister_file(id)
                 .inspect_err(|e| {
                     debug!("Failed to unregister file: {e}");

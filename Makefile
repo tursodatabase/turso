@@ -55,7 +55,7 @@ uv-sync-test:
 	uv sync --all-extras --dev --package turso_test
 .PHONE: uv-sync
 
-test: limbo uv-sync-test test-compat test-vector test-sqlite3 test-shell test-memory test-write test-update test-constraint test-collate test-extensions test-mvcc test-matviews
+test: limbo uv-sync-test test-compat test-alter-column test-vector test-sqlite3 test-shell test-memory test-write test-update test-constraint test-collate test-extensions test-mvcc test-matviews
 .PHONY: test
 
 test-extensions: limbo uv-sync-test
@@ -81,6 +81,10 @@ test-time:
 test-matviews:
 	RUST_LOG=$(RUST_LOG) SQLITE_EXEC=$(SQLITE_EXEC) ./testing/materialized_views.test
 .PHONY: test-matviews
+
+test-alter-column:
+	RUST_LOG=$(RUST_LOG) SQLITE_EXEC=$(SQLITE_EXEC) ./testing/alter_column.test
+.PHONY: test-alter-column
 
 reset-db:
 	./scripts/clone_test_db.sh
@@ -201,3 +205,8 @@ endif
 	fi
 
 .PHONY: merge-pr
+
+sim-schema: 
+	mkdir -p  simulator/configs/custom
+	cargo run -p limbo_sim -- print-schema > simulator/configs/custom/profile-schema.json
+

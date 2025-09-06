@@ -439,3 +439,17 @@ pub fn derive_vtab_module(input: TokenStream) -> TokenStream {
 pub fn derive_vfs_module(input: TokenStream) -> TokenStream {
     ext::derive_vfs_module(input)
 }
+
+/// match_ignore_ascii_case will generate trie-like tree matching from normal match expression.
+/// example:
+/// ```ignore
+///     match_ignore_ascii_case!(match input {
+///        b"AB" => TokenType::TK_ABORT,
+///        b"AC" => TokenType::TK_ACTION,
+///        _ => TokenType::TK_ID,
+///    })
+/// ```
+#[proc_macro]
+pub fn match_ignore_ascii_case(input: TokenStream) -> TokenStream {
+    ext::match_ignore_ascci_case(input)
+}

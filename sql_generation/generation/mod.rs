@@ -3,24 +3,13 @@ use std::{iter::Sum, ops::SubAssign};
 use anarchist_readable_name_generator_lib::readable_name_custom;
 use rand::{distr::uniform::SampleUniform, Rng};
 
-use crate::model::table::Table;
-
 pub mod expr;
+pub mod opts;
 pub mod predicate;
 pub mod query;
 pub mod table;
 
-#[derive(Debug, Clone, Copy)]
-pub struct Opts {
-    /// Indexes enabled
-    pub indexes: bool,
-}
-
-/// Trait used to provide context to generation functions
-pub trait GenerationContext {
-    fn tables(&self) -> &Vec<Table>;
-    fn opts(&self) -> Opts;
-}
+pub use opts::*;
 
 type ArbitraryFromFunc<'a, R, T> = Box<dyn Fn(&mut R) -> T + 'a>;
 type Choice<'a, R, T> = (usize, Box<dyn Fn(&mut R) -> Option<T> + 'a>);
@@ -30,7 +19,7 @@ type Choice<'a, R, T> = (usize, Box<dyn Fn(&mut R) -> Option<T> + 'a>);
 /// the possible values of the type, with a bias towards smaller values for
 /// practicality.
 pub trait Arbitrary {
-    fn arbitrary<R: Rng>(rng: &mut R) -> Self;
+    fn arbitrary<R: Rng, C: GenerationContext>(rng: &mut R, context: &C) -> Self;
 }
 
 /// ArbitrarySized trait for generating random values of a specific size
@@ -40,7 +29,8 @@ pub trait Arbitrary {
 /// must fit in the given size. This is useful for generating values that are
 /// constrained by a specific size, such as integers or strings.
 pub trait ArbitrarySized {
-    fn arbitrary_sized<R: Rng>(rng: &mut R, size: usize) -> Self;
+    fn arbitrary_sized<R: Rng, C: GenerationContext>(rng: &mut R, context: &C, size: usize)
+        -> Self;
 }
 
 /// ArbitraryFrom trait for generating random values from a given value
@@ -49,7 +39,7 @@ pub trait ArbitrarySized {
 /// such as generating an integer within an interval, or a value that fits in a table,
 /// or a predicate satisfying a given table row.
 pub trait ArbitraryFrom<T> {
-    fn arbitrary_from<R: Rng>(rng: &mut R, t: T) -> Self;
+    fn arbitrary_from<R: Rng, C: GenerationContext>(rng: &mut R, context: &C, t: T) -> Self;
 }
 
 /// ArbitrarySizedFrom trait for generating random values from a given value
@@ -61,12 +51,21 @@ pub trait ArbitraryFrom<T> {
 /// This is useful for generating values that are constrained by a specific size,
 /// such as integers or strings, while still being dependent on the given value.
 pub trait ArbitrarySizedFrom<T> {
-    fn arbitrary_sized_from<R: Rng>(rng: &mut R, t: T, size: usize) -> Self;
+    fn arbitrary_sized_from<R: Rng, C: GenerationContext>(
+        rng: &mut R,
+        context: &C,
+        t: T,
+        size: usize,
+    ) -> Self;
 }
 
 /// ArbitraryFromMaybe trait for fallibally generating random values from a given value
 pub trait ArbitraryFromMaybe<T> {
-    fn arbitrary_from_maybe<R: Rng>(rng: &mut R, t: T) -> Option<Self>
+    fn arbitrary_from_maybe<R: Rng, C: GenerationContext>(
+        rng: &mut R,
+        context: &C,
+        t: T,
+    ) -> Option<Self>
     where
         Self: Sized;
 }
@@ -143,11 +142,15 @@ pub fn pick_index<R: Rng>(choices: usize, rng: &mut R) -> usize {
 
 /// pick_n_unique is a helper function for uniformly picking N unique elements from a range.
 /// The elements themselves are usize, typically representing indices.
-pub fn pick_n_unique<R: Rng>(range: std::ops::Range<usize>, n: usize, rng: &mut R) -> Vec<usize> {
+pub fn pick_n_unique<R: Rng>(
+    range: std::ops::Range<usize>,
+    n: usize,
+    rng: &mut R,
+) -> impl Iterator<Item = usize> {
     use rand::seq::SliceRandom;
     let mut items: Vec<usize> = range.collect();
     items.shuffle(rng);
-    items.into_iter().take(n).collect()
+    items.into_iter().take(n)
 }
 
 /// gen_random_text uses `anarchist_readable_name_generator_lib` to generate random
@@ -169,20 +172,41 @@ pub fn gen_random_text<T: Rng>(rng: &mut T) -> String {
     }
 }
 
-pub fn pick_unique<T: ToOwned + PartialEq>(
-    items: &[T],
+pub fn pick_unique<'a, T: PartialEq>(
+    items: &'a [T],
     count: usize,
     rng: &mut impl rand::Rng,
-) -> Vec<T::Owned>
-where
-    <T as ToOwned>::Owned: PartialEq,
-{
-    let mut picked: Vec<T::Owned> = Vec::new();
+) -> impl Iterator<Item = &'a T> {
+    let mut picked: Vec<&T> = Vec::new();
     while picked.len() < count {
         let item = pick(items, rng);
-        if !picked.contains(&item.to_owned()) {
-            picked.push(item.to_owned());
+        if !picked.contains(&item) {
+            picked.push(item);
         }
     }
-    picked
+    picked.into_iter()
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        generation::{GenerationContext, Opts},
+        model::table::Table,
+    };
+
+    #[derive(Debug, Default, Clone)]
+    pub struct TestContext {
+        pub opts: Opts,
+        pub tables: Vec<Table>,
+    }
+
+    impl GenerationContext for TestContext {
+        fn tables(&self) -> &Vec<Table> {
+            &self.tables
+        }
+
+        fn opts(&self) -> &Opts {
+            &self.opts
+        }
+    }
 }

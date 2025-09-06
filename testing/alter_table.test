@@ -10,12 +10,12 @@ do_execsql_test_on_specific_db {:memory:} alter-table-rename-table {
 } { "t2" }
 
 do_execsql_test_on_specific_db {:memory:} alter-table-rename-column {
-    CREATE TABLE t (a);
+    CREATE TABLE t (a INTEGER);
     CREATE INDEX i ON t (a);
     ALTER TABLE t RENAME a TO b;
     SELECT sql FROM sqlite_schema;
 } {
-    "CREATE TABLE t (b)"
+    "CREATE TABLE t (b INTEGER)"
     "CREATE INDEX i ON t (b)"
 }
 

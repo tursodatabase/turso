@@ -74,3 +74,31 @@ do_execsql_test_on_specific_db {:memory:} collate_aggregation_explicit_nocase {
     insert into fruits(name) values ('Apple') ,('banana') ,('CHERRY');
     select max(name collate nocase) from fruits;
 } {CHERRY}
+
+do_execsql_test_on_specific_db {:memory:} collate_grouped_aggregation_default_binary {
+    create table fruits(name collate binary, category text);
+    insert into fruits(name, category) values ('Apple', 'A'), ('banana', 'A'), ('CHERRY', 'B'), ('blueberry', 'B');
+    select max(name) from fruits group by category;
+} {banana
+blueberry}
+
+do_execsql_test_on_specific_db {:memory:} collate_grouped_aggregation_default_nocase {
+    create table fruits(name collate nocase, category text);
+    insert into fruits(name, category) values ('Apple', 'A'), ('banana', 'A'), ('CHERRY', 'B'), ('blueberry', 'B');
+    select max(name) from fruits group by category;
+} {banana
+CHERRY}
+
+do_execsql_test_on_specific_db {:memory:} collate_grouped_aggregation_explicit_binary {
+    create table fruits(name collate nocase, category text);
+    insert into fruits(name, category) values ('Apple', 'A'), ('banana', 'A'), ('CHERRY', 'B'), ('blueberry', 'B');
+    select max(name collate binary) from fruits group by category;
+} {banana
+blueberry}
+
+do_execsql_test_on_specific_db {:memory:} collate_groupped_aggregation_explicit_nocase {
+    create table fruits(name collate binary, category text);
+    insert into fruits(name, category) values ('Apple', 'A'), ('banana', 'A'), ('CHERRY', 'B'), ('blueberry', 'B');
+    select max(name collate nocase) from fruits group by category;
+} {banana
+CHERRY}

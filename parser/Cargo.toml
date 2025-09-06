@@ -21,11 +21,11 @@ strum = { workspace = true }
 strum_macros = {workspace = true }
 serde = { workspace = true , optional = true, features = ["derive"] }
 thiserror = "1.0.61"
+turso_macros = { workspace = true }
 
 [dev-dependencies]
 fallible-iterator = "0.3"
 criterion = { version = "0.5", features = ["html_reports" ] }
-turso_sqlite3_parser = { workspace = true }
 
 [target.'cfg(not(target_family = "windows"))'.dev-dependencies]
 pprof = { version = "0.14.0", features = ["criterion", "flamegraph"] }

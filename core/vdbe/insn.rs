@@ -52,7 +52,7 @@ impl CmpInsFlags {
 
     pub fn get_affinity(&self) -> Affinity {
         let aff_code = (self.0 & Self::AFFINITY_MASK) as u8;
-        Affinity::from_char_code(aff_code).unwrap_or(Affinity::Blob)
+        Affinity::from_char_code(aff_code)
     }
 }
 
@@ -903,7 +903,12 @@ pub enum Insn {
     },
 
     /// Populate all materialized views after schema parsing
-    PopulateMaterializedViews,
+    /// The cursors parameter contains a mapping of view names to cursor IDs that have been
+    /// opened to the view's btree for writing the materialized data
+    PopulateMaterializedViews {
+        /// Mapping of view name to cursor_id for writing to the view's btree
+        cursors: Vec<(String, usize)>,
+    },
 
     /// Place the result of lhs >> rhs in dest register.
     ShiftRight {
@@ -1058,10 +1063,11 @@ pub enum Insn {
         table: String,
         column: Column,
     },
-    RenameColumn {
+    AlterColumn {
         table: String,
         column_index: usize,
-        name: String,
+        definition: turso_parser::ast::ColumnDefinition,
+        rename: bool,
     },
     /// Try to set the maximum page count for database P1 to the value in P3.
     /// Do not let the maximum page count fall below the current page count and
@@ -1079,6 +1085,10 @@ pub enum Insn {
         db: usize,                // P1: database index
         dest: usize,              // P2: output register for result
         new_mode: Option<String>, // P3: new journal mode (if setting)
+    },
+    IfNeg {
+        reg: usize,
+        target_pc: BranchOffset,
     },
 }
 
@@ -1192,7 +1202,7 @@ impl Insn {
             Insn::IsNull { .. } => execute::op_is_null,
             Insn::CollSeq { .. } => execute::op_coll_seq,
             Insn::ParseSchema { .. } => execute::op_parse_schema,
-            Insn::PopulateMaterializedViews => execute::op_populate_materialized_views,
+            Insn::PopulateMaterializedViews { .. } => execute::op_populate_materialized_views,
             Insn::ShiftRight { .. } => execute::op_shift_right,
             Insn::ShiftLeft { .. } => execute::op_shift_left,
             Insn::AddImm { .. } => execute::op_add_imm,
@@ -1216,9 +1226,10 @@ impl Insn {
             Insn::RenameTable { .. } => execute::op_rename_table,
             Insn::DropColumn { .. } => execute::op_drop_column,
             Insn::AddColumn { .. } => execute::op_add_column,
-            Insn::RenameColumn { .. } => execute::op_rename_column,
+            Insn::AlterColumn { .. } => execute::op_alter_column,
             Insn::MaxPgcnt { .. } => execute::op_max_pgcnt,
             Insn::JournalMode { .. } => execute::op_journal_mode,
+            Insn::IfNeg { .. } => execute::op_if_neg,
         }
     }
 }

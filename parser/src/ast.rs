@@ -3,8 +3,6 @@ pub mod fmt;
 
 use strum_macros::{EnumIter, EnumString};
 
-use crate::ast::fmt::ToTokens;
-
 /// `?` or `$` Prepared statement arg placeholder(s)
 #[derive(Default)]
 pub struct ParameterInfo {
@@ -931,13 +929,6 @@ pub struct QualifiedName {
     pub alias: Option<Name>, // FIXME restrict alias usage (fullname vs xfullname)
 }
 
-impl std::fmt::Display for QualifiedName {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        use fmt::ToTokens as _;
-        self.to_fmt(f)
-    }
-}
-
 impl QualifiedName {
     /// Constructor
     pub fn single(name: Name) -> Self {
@@ -982,6 +973,8 @@ pub enum AlterTableBody {
     RenameTo(Name),
     /// `ADD COLUMN`
     AddColumn(ColumnDefinition), // TODO distinction between ADD and ADD COLUMN
+    /// `ALTER COLUMN`
+    AlterColumn { old: Name, new: ColumnDefinition },
     /// `RENAME COLUMN`
     RenameColumn {
         /// old name
@@ -1151,12 +1144,6 @@ pub enum SortOrder {
     Asc,
     /// `DESC`
     Desc,
-}
-
-impl core::fmt::Display for SortOrder {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.to_fmt(f)
-    }
 }
 
 /// `NULLS FIRST` or `NULLS LAST`

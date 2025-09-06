@@ -189,6 +189,7 @@ pub fn translate_inner(
             if_not_exists,
             schema,
             syms,
+            connection,
             program,
         )?,
         ast::Stmt::CreateTrigger { .. } => bail_parse_error!("CREATE TRIGGER not supported yet"),

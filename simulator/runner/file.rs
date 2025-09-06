@@ -6,10 +6,10 @@ use std::{
 
 use rand::Rng as _;
 use rand_chacha::ChaCha8Rng;
-use tracing::{instrument, Level};
+use tracing::{Level, instrument};
 use turso_core::{File, Result};
 
-use crate::runner::{clock::SimulatorClock, FAULT_ERROR_MSG};
+use crate::runner::{FAULT_ERROR_MSG, clock::SimulatorClock};
 pub(crate) struct SimulatorFile {
     pub path: String,
     pub(crate) inner: Arc<dyn File>,
@@ -150,7 +150,7 @@ impl File for SimulatorFile {
         self.inner.unlock_file()
     }
 
-    fn pread(&self, pos: usize, c: turso_core::Completion) -> Result<turso_core::Completion> {
+    fn pread(&self, pos: u64, c: turso_core::Completion) -> Result<turso_core::Completion> {
         self.nr_pread_calls.set(self.nr_pread_calls.get() + 1);
         if self.fault.get() {
             tracing::debug!("pread fault");
@@ -173,7 +173,7 @@ impl File for SimulatorFile {
 
     fn pwrite(
         &self,
-        pos: usize,
+        pos: u64,
         buffer: Arc<turso_core::Buffer>,
         c: turso_core::Completion,
     ) -> Result<turso_core::Completion> {
@@ -201,7 +201,9 @@ impl File for SimulatorFile {
         self.nr_sync_calls.set(self.nr_sync_calls.get() + 1);
         if self.fault.get() {
             // TODO: Enable this when https://github.com/tursodatabase/turso/issues/2091 is fixed.
-            tracing::debug!("ignoring sync fault because it causes false positives with current simulator design");
+            tracing::debug!(
+                "ignoring sync fault because it causes false positives with current simulator design"
+            );
             self.fault.set(false);
         }
         let c = if let Some(latency) = self.generate_latency_duration() {
@@ -225,7 +227,7 @@ impl File for SimulatorFile {
 
     fn pwritev(
         &self,
-        pos: usize,
+        pos: u64,
         buffers: Vec<Arc<turso_core::Buffer>>,
         c: turso_core::Completion,
     ) -> Result<turso_core::Completion> {
@@ -255,7 +257,7 @@ impl File for SimulatorFile {
         self.inner.size()
     }
 
-    fn truncate(&self, len: usize, c: turso_core::Completion) -> Result<turso_core::Completion> {
+    fn truncate(&self, len: u64, c: turso_core::Completion) -> Result<turso_core::Completion> {
         if self.fault.get() {
             return Err(turso_core::LimboError::InternalError(
                 FAULT_ERROR_MSG.into(),

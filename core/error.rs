@@ -1,5 +1,7 @@
 use thiserror::Error;
 
+use crate::storage::page_cache::CacheError;
+
 #[derive(Debug, Clone, Error, miette::Diagnostic)]
 pub enum LimboError {
     #[error("Corrupt database: {0}")]
@@ -8,8 +10,8 @@ pub enum LimboError {
     NotADB,
     #[error("Internal error: {0}")]
     InternalError(String),
-    #[error("Page cache is full")]
-    CacheFull,
+    #[error(transparent)]
+    CacheError(#[from] CacheError),
     #[error("Database is full: {0}")]
     DatabaseFull(String),
     #[error("Parse error: {0}")]

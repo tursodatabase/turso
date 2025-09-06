@@ -1,5 +1,6 @@
 use crate::error::LimboError;
 use crate::ext::{ExtValue, ExtValueType};
+use crate::numeric::format_float;
 use crate::pseudo::PseudoCursor;
 use crate::schema::Index;
 use crate::storage::btree::BTreeCursor;
@@ -9,13 +10,14 @@ use crate::translate::plan::IterationDirection;
 use crate::vdbe::sorter::Sorter;
 use crate::vdbe::Register;
 use crate::vtab::VirtualTableCursor;
-use crate::{turso_assert, Completion, Result, IO};
 #[cfg(feature = "serde")]
 use serde::Deserialize;
-use std::fmt::{Debug, Display};
 use turso_ext::{AggCtx, FinalizeFunction, StepFunction};
 use turso_parser::ast::SortOrder;
 const MAX_REAL_SIZE: u8 = 15;
+use crate::{turso_assert, Completion, CompletionError, Result, IO};
+use std::fmt::{Debug, Display};
+
 /// SQLite by default uses 2000 as maximum numbers in a row.
 /// It controlld by the constant called SQLITE_MAX_COLUMN
 /// But the hard limit of number of columns is 32,767 columns i16::MAX
@@ -359,6 +361,13 @@ impl Value {
         }
     }
 
+    pub fn as_uint(&self) -> u64 {
+        match self {
+            Value::Integer(i) => (*i).cast_unsigned(),
+            _ => 0,
+        }
+    }
+
     pub fn from_text(text: &str) -> Self {
         Value::Text(Text::new(text))
     }
@@ -396,6 +405,13 @@ impl Value {
             #[cfg(feature = "u128-support")]
             Value::U128(i) => out.extend_from_slice(&i.to_be_bytes()),
         };
+    }
+
+    pub fn cast_text(&self) -> Option<String> {
+        Some(match self {
+            Value::Null => return None,
+            v => v.to_string(),
+        })
     }
 }
 
@@ -523,6 +539,9 @@ impl Display for Value {
                 }
                 write!(f, "{fl}")
             }
+
+            Self::Float(fl) => f.write_str(&format_float(*fl)),
+
             Self::Text(s) => {
                 write!(f, "{}", s.as_str())
             }
@@ -781,11 +800,8 @@ impl PartialEq<Value> for Value {
     fn eq(&self, other: &Value) -> bool {
         match (self, other) {
             (Self::Integer(int_left), Self::Integer(int_right)) => int_left == int_right,
-            (Self::Integer(int_left), Self::Float(float_right)) => {
-                (*int_left as f64) == (*float_right)
-            }
-            (Self::Float(float_left), Self::Integer(int_right)) => {
-                float_left == (&(*int_right as f64))
+            (Self::Integer(int), Self::Float(float)) | (Self::Float(float), Self::Integer(int)) => {
+                int_float_cmp(*int, *float).is_eq()
             }
             (Self::Float(float_left), Self::Float(float_right)) => float_left == float_right,
             #[cfg(feature = "u128-support")]
@@ -818,17 +834,32 @@ impl PartialEq<Value> for Value {
     }
 }
 
+fn int_float_cmp(int: i64, float: f64) -> std::cmp::Ordering {
+    if float.is_nan() {
+        return std::cmp::Ordering::Greater;
+    }
+
+    if float < -9223372036854775808.0 {
+        return std::cmp::Ordering::Greater;
+    }
+
+    if float >= 9223372036854775808.0 {
+        return std::cmp::Ordering::Less;
+    }
+
+    match int.cmp(&(float as i64)) {
+        std::cmp::Ordering::Equal => (int as f64).total_cmp(&float),
+        cmp => cmp,
+    }
+}
+
 #[allow(clippy::non_canonical_partial_ord_impl)]
 impl PartialOrd<Value> for Value {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         match (self, other) {
             (Self::Integer(int_left), Self::Integer(int_right)) => int_left.partial_cmp(int_right),
-            (Self::Integer(int_left), Self::Float(float_right)) => {
-                (*int_left as f64).partial_cmp(float_right)
-            }
-            (Self::Float(float_left), Self::Integer(int_right)) => {
-                float_left.partial_cmp(&(*int_right as f64))
-            }
+            (Self::Float(float), Self::Integer(int)) => Some(int_float_cmp(*int, *float).reverse()),
+            (Self::Integer(int), Self::Float(float)) => Some(int_float_cmp(*int, *float)),
             (Self::Float(float_left), Self::Float(float_right)) => {
                 float_left.partial_cmp(float_right)
             }
@@ -1336,7 +1367,7 @@ impl ImmutableRecord {
     pub fn column_count(&self) -> usize {
         let mut cursor = RecordCursor::new();
         cursor.parse_full_header(self).unwrap();
-        cursor.offsets.len()
+        cursor.serial_types.len()
     }
 }
 
@@ -2459,6 +2490,7 @@ pub enum Cursor {
     Pseudo(PseudoCursor),
     Sorter(Sorter),
     Virtual(VirtualTableCursor),
+    MaterializedView(Box<crate::incremental::cursor::MaterializedViewCursor>),
 }
 
 impl Cursor {
@@ -2472,6 +2504,12 @@ impl Cursor {
 
     pub fn new_sorter(cursor: Sorter) -> Self {
         Self::Sorter(cursor)
+    }
+
+    pub fn new_materialized_view(
+        cursor: crate::incremental::cursor::MaterializedViewCursor,
+    ) -> Self {
+        Self::MaterializedView(Box::new(cursor))
     }
 
     pub fn as_btree_mut(&mut self) -> &mut BTreeCursor {
@@ -2501,6 +2539,15 @@ impl Cursor {
             _ => panic!("Cursor is not a virtual cursor"),
         }
     }
+
+    pub fn as_materialized_view_mut(
+        &mut self,
+    ) -> &mut crate::incremental::cursor::MaterializedViewCursor {
+        match self {
+            Self::MaterializedView(cursor) => cursor,
+            _ => panic!("Cursor is not a materialized view cursor"),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -2516,8 +2563,15 @@ impl IOCompletions {
         match self {
             IOCompletions::Single(c) => io.wait_for_completion(c),
             IOCompletions::Many(completions) => {
-                for c in completions {
-                    io.wait_for_completion(c)?;
+                let mut completions = completions.into_iter();
+                while let Some(c) = completions.next() {
+                    let res = io.wait_for_completion(c);
+                    if res.is_err() {
+                        for c in completions {
+                            c.abort();
+                        }
+                        return res;
+                    }
                 }
                 Ok(())
             }
@@ -2536,6 +2590,13 @@ impl IOCompletions {
         match self {
             IOCompletions::Single(c) => c.abort(),
             IOCompletions::Many(completions) => completions.iter().for_each(|c| c.abort()),
+        }
+    }
+
+    pub fn get_error(&self) -> Option<CompletionError> {
+        match self {
+            IOCompletions::Single(c) => c.get_error(),
+            IOCompletions::Many(completions) => completions.iter().find_map(|c| c.get_error()),
         }
     }
 }
@@ -2560,6 +2621,23 @@ macro_rules! return_if_io {
         match $expr? {
             IOResult::Done(v) => v,
             IOResult::IO(io) => return Ok(IOResult::IO(io)),
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! return_and_restore_if_io {
+    ($field:expr, $saved_state:expr, $e:expr) => {
+        match $e {
+            Ok(IOResult::Done(v)) => v,
+            Ok(IOResult::IO(io)) => {
+                let _ = std::mem::replace($field, $saved_state);
+                return Ok(IOResult::IO(io));
+            }
+            Err(e) => {
+                let _ = std::mem::replace($field, $saved_state);
+                return Err(e);
+            }
         }
     };
 }
@@ -3523,5 +3601,20 @@ mod tests {
             buf.len(),
             header_length + size_of::<i8>() + size_of::<f64>() + text.len()
         );
+    }
+
+    #[test]
+    fn test_column_count_matches_values_written() {
+        // Test with different numbers of values
+        for num_values in 1..=10 {
+            let values: Vec<Value> = (0..num_values).map(|i| Value::Integer(i as i64)).collect();
+
+            let record = ImmutableRecord::from_values(&values, values.len());
+            let cnt = record.column_count();
+            assert_eq!(
+                cnt, num_values,
+                "column_count should be {num_values}, not {cnt}"
+            );
+        }
     }
 }

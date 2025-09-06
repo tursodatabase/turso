@@ -196,3 +196,5 @@ Cargo.lock
 
 *.node
 *.wasm
+
+package.native.json

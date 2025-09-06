@@ -15,7 +15,7 @@ cur_init = con_init.cursor()
 
 # Connect to the main database
 try:
-    con = turso.connect("stress_composer.db", experimental_indexes=True)
+    con = turso.connect("stress_composer.db")
 except Exception as e:
     print(f"Failed to open stress_composer.db. Exiting... {e}")
     exit(0)

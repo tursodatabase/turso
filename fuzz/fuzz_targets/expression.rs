@@ -4,7 +4,6 @@ use std::{error::Error, num::NonZero, sync::Arc};
 
 use arbitrary::Arbitrary;
 use libfuzzer_sys::{fuzz_target, Corpus};
-use turso_core::IO as _;
 
 macro_rules! str_enum {
     ($vis:vis enum $name:ident { $($variant:ident => $value:literal),*, }) => {
@@ -31,15 +30,14 @@ macro_rules! str_enum {
 
 str_enum! {
     enum Binary {
-        // TODO: Not compatible yet
-        // Equal => "=",
-        // Is => "IS",
-        // Concat => "||",
-        // NotEqual => "<>",
-        // GreaterThan => ">",
-        // GreaterThanOrEqual => ">=",
-        // LessThan => "<",
-        // LessThanOrEqual => "<=",
+        Equal => "=",
+        Is => "IS",
+        Concat => "||",
+        NotEqual => "<>",
+        GreaterThan => ">",
+        GreaterThanOrEqual => ">=",
+        LessThan => "<",
+        LessThanOrEqual => "<=",
         RightShift => ">>",
         LeftShift => "<<",
         BitwiseAnd => "&",
@@ -169,7 +167,7 @@ fn do_fuzz(expr: Expr) -> Result<Corpus, Box<dyn Error>> {
     let sql = format!("SELECT {}", expr.query);
 
     // FIX: `turso_core::translate::expr::translate_expr` causes a overflow if this is any higher.
-    if expr.depth > 140 {
+    if expr.depth > 100 {
         return Ok(Corpus::Reject);
     }
 

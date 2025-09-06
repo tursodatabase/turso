@@ -123,6 +123,10 @@ pub enum CursorType {
     Pseudo(PseudoCursorType),
     Sorter,
     VirtualTable(Arc<VirtualTable>),
+    MaterializedView(
+        Arc<BTreeTable>,
+        Arc<std::sync::Mutex<crate::incremental::view::IncrementalView>>,
+    ),
 }
 
 impl CursorType {
@@ -865,6 +869,7 @@ impl ProgramBuilder {
             let default = match cursor_type {
                 CursorType::BTreeTable(btree) => &btree.columns[column].default,
                 CursorType::BTreeIndex(index) => &index.columns[column].default,
+                CursorType::MaterializedView(btree, _) => &btree.columns[column].default,
                 _ => break 'value None,
             };
 

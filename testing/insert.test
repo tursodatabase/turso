@@ -613,3 +613,23 @@ do_execsql_test_in_memory_error_content  null-insert-in-nulltype-column-notnull-
     CREATE TABLE test (id INTEGER,name NULL NOT NULL);
     INSERT INTO test (id, name) VALUES (1, NULL);
 } {NOT NULL constraint failed}
+
+do_execsql_test_on_specific_db {:memory:} returning-true-literal {
+    CREATE TABLE test (id INTEGER, value TEXT);
+    INSERT INTO test (id, value) VALUES (1, true) RETURNING id, value;
+} {1|1}
+
+do_execsql_test_on_specific_db {:memory:} returning-false-literal {
+    CREATE TABLE test (id INTEGER, value TEXT);
+    INSERT INTO test (id, value) VALUES (1, false) RETURNING id, value;
+} {1|0}
+
+do_execsql_test_on_specific_db {:memory:} boolean-literal-edgecase {
+    CREATE TABLE true (id INTEGER, value TEXT);
+    INSERT INTO true (id, value) VALUES (1, true) RETURNING id, value;
+} {1|1}
+
+do_execsql_test_on_specific_db {:memory:} boolean-literal-edgecase-false {
+    CREATE TABLE false (id INTEGER, true TEXT);
+    INSERT INTO false (id, true) VALUES (1, false) RETURNING id, false;
+} {1|0}

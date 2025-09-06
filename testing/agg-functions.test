@@ -144,3 +144,58 @@ do_execsql_test select-agg-json-array-object {
 do_execsql_test select-distinct-agg-functions {
 SELECT sum(distinct age), count(distinct age), avg(distinct age) FROM users;
 } {5050|100|50.5}
+
+do_execsql_test select-json-group-object {
+  select price,
+         json_group_object(cast (id as text), name)
+  from products
+  group by price
+  order by price;
+} {1.0|{"9":"boots"}
+18.0|{"3":"shirt"}
+25.0|{"4":"sweater"}
+33.0|{"10":"coat"}
+70.0|{"6":"shorts"}
+74.0|{"5":"sweatshirt"}
+78.0|{"7":"jeans"}
+79.0|{"1":"hat"}
+81.0|{"11":"accessories"}
+82.0|{"2":"cap","8":"sneakers"}}
+
+do_execsql_test select-json-group-object-no-sorting-required {
+  select age,
+         json_group_object(cast (id as text), first_name)
+  from users
+  where first_name like 'Am%'
+  group by age
+  order by age
+  limit 5;
+} {1|{"6737":"Amy"}
+2|{"2297":"Amy","3580":"Amanda"}
+3|{"3437":"Amanda"}
+5|{"2378":"Amy","3227":"Amy","5605":"Amanda"}
+7|{"2454":"Amber"}}
+
+do_execsql_test_error_content select-max-star {
+  SELECT max(*) FROM users;
+} {"wrong number of arguments to function"}
+
+do_execsql_test_error_content select-max-star-in-expression {
+  SELECT CASE WHEN max(*) > 0 THEN 1 ELSE 0 END FROM users;
+} {"wrong number of arguments to function"}
+
+do_execsql_test_error select-scalar-func-star {
+  SELECT abs(*) FROM users;
+} {.*(Invalid aggregate function|wrong number of arguments to function).*}
+
+do_execsql_test_error select-scalar-func-star-in-expression {
+  SELECT CASE WHEN abs(*) > 0 THEN 1 ELSE 0 END FROM users;
+} {.*(Invalid aggregate function|wrong number of arguments to function).*}
+
+do_execsql_test_error_content select-nested-agg-func {
+  SELECT max(abs(sum(age))), sum(age) FROM users;
+} {"misuse of aggregate function"}
+
+do_execsql_test_error_content select-nested-agg-func-in-expression {
+  SELECT CASE WHEN max(abs(sum(age))) > 0 THEN 1 ELSE 0 END, sum(age) FROM users;
+} {"misuse of aggregate function"}

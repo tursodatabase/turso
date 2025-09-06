@@ -1,18 +1,21 @@
 #![allow(unused)]
+use crate::incremental::view::IncrementalView;
 use crate::translate::expr::WalkControl;
 use crate::types::IOResult;
 use crate::{
-    schema::{self, Column, MaterializedViewsMap, Schema, Type},
+    schema::{self, BTreeTable, Column, Schema, Table, Type, DBSP_TABLE_PREFIX},
     translate::{collate::CollationSeq, expr::walk_expr, plan::JoinOrderMember},
     types::{Value, ValueType},
     LimboError, OpenFlags, Result, Statement, StepResult, SymbolTable,
 };
 use crate::{Connection, IO};
 use std::{
+    collections::HashMap,
     rc::Rc,
     sync::{Arc, Mutex},
 };
 use tracing::{instrument, Level};
+use turso_macros::match_ignore_ascii_case;
 use turso_parser::ast::{
     self, fmt::ToTokens, Cmd, CreateTableBody, Expr, FunctionTail, Literal, Stmt, UnaryOperator,
 };
@@ -29,6 +32,58 @@ macro_rules! io_yield_many {
     ($v:expr) => {
         return Ok(IOResult::IO(IOCompletions::Many($v)));
     };
+}
+
+#[macro_export]
+macro_rules! eq_ignore_ascii_case {
+    ( $var:expr, $value:literal ) => {{
+        match_ignore_ascii_case!(match $var {
+            $value => true,
+            _ => false,
+        })
+    }};
+}
+
+#[macro_export]
+macro_rules! contains_ignore_ascii_case {
+    ( $var:expr, $value:literal ) => {{
+        let compare_to_idx = $var.len().saturating_sub($value.len());
+        if $var.len() < $value.len() {
+            false
+        } else {
+            let mut result = false;
+            for i in 0..=compare_to_idx {
+                if eq_ignore_ascii_case!(&$var[i..i + $value.len()], $value) {
+                    result = true;
+                    break;
+                }
+            }
+
+            result
+        }
+    }};
+}
+
+#[macro_export]
+macro_rules! starts_with_ignore_ascii_case {
+    ( $var:expr, $value:literal ) => {{
+        if $var.len() < $value.len() {
+            false
+        } else {
+            eq_ignore_ascii_case!(&$var[..$value.len()], $value)
+        }
+    }};
+}
+
+#[macro_export]
+macro_rules! ends_with_ignore_ascii_case {
+    ( $var:expr, $value:literal ) => {{
+        if $var.len() < $value.len() {
+            false
+        } else {
+            eq_ignore_ascii_case!(&$var[$var.len() - $value.len()..], $value)
+        }
+    }};
 }
 
 pub trait IOExt {
@@ -58,7 +113,12 @@ impl RoundToPrecision for f64 {
 }
 
 // https://sqlite.org/lang_keywords.html
-const QUOTE_PAIRS: &[(char, char)] = &[('"', '"'), ('[', ']'), ('`', '`')];
+const QUOTE_PAIRS: &[(char, char)] = &[
+    ('"', '"'),
+    ('[', ']'),
+    ('`', '`'),
+    ('\'', '\''), // string sometimes used as identifier quoting
+];
 
 pub fn normalize_ident(identifier: &str) -> String {
     let quote_pair = QUOTE_PAIRS
@@ -90,7 +150,7 @@ pub fn parse_schema_rows(
     schema: &mut Schema,
     syms: &SymbolTable,
     mv_tx_id: Option<u64>,
-    mut existing_views: MaterializedViewsMap,
+    mut existing_views: HashMap<String, Arc<Mutex<IncrementalView>>>,
 ) -> Result<()> {
     rows.set_mv_tx_id(mv_tx_id);
     // TODO: if we IO, this unparsed indexes is lost. Will probably need some state between
@@ -98,21 +158,25 @@ pub fn parse_schema_rows(
     let mut from_sql_indexes = Vec::with_capacity(10);
     let mut automatic_indices = std::collections::HashMap::with_capacity(10);
 
-    // Collect views for second pass to populate table_to_views mapping
-    let mut views_to_process: Vec<(String, Vec<String>)> = Vec::new();
+    // Store DBSP state table root pages: view_name -> dbsp_state_root_page
+    let mut dbsp_state_roots: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    // Store materialized view info (SQL and root page) for later creation
+    let mut materialized_view_info: std::collections::HashMap<String, (String, usize)> =
+        std::collections::HashMap::new();
     loop {
         match rows.step()? {
             StepResult::Row => {
                 let row = rows.row().unwrap();
                 let ty = row.get::<&str>(0)?;
-                if !["table", "index", "view"].contains(&ty) {
-                    continue;
-                }
                 match ty {
                     "table" => {
                         let root_page: i64 = row.get::<i64>(3)?;
                         let sql: &str = row.get::<&str>(4)?;
-                        if root_page == 0 && sql.to_lowercase().contains("create virtual") {
+                        let sql_bytes = sql.as_bytes();
+                        if root_page == 0
+                            && contains_ignore_ascii_case!(sql_bytes, b"create virtual")
+                        {
                             let name: &str = row.get::<&str>(1)?;
                             // a virtual table is found in the sqlite_schema, but it's no
                             // longer in the in-memory schema. We need to recreate it if
@@ -131,6 +195,18 @@ pub fn parse_schema_rows(
                             schema.add_virtual_table(vtab);
                         } else {
                             let table = schema::BTreeTable::from_sql(sql, root_page as usize)?;
+
+                            // Check if this is a DBSP state table
+                            if table.name.starts_with(DBSP_TABLE_PREFIX) {
+                                // Extract the view name from __turso_internal_dbsp_state_<viewname>
+                                let view_name = table
+                                    .name
+                                    .strip_prefix(DBSP_TABLE_PREFIX)
+                                    .unwrap()
+                                    .to_string();
+                                dbsp_state_roots.insert(view_name, root_page as usize);
+                            }
+
                             schema.add_btree_table(Arc::new(table));
                         }
                     }
@@ -170,6 +246,7 @@ pub fn parse_schema_rows(
                         use turso_parser::parser::Parser;
 
                         let name: &str = row.get::<&str>(1)?;
+                        let root_page = row.get::<i64>(3)?;
                         let sql: &str = row.get::<&str>(4)?;
                         let view_name = name.to_string();
 
@@ -178,52 +255,17 @@ pub fn parse_schema_rows(
                         if let Ok(Some(Cmd::Stmt(stmt))) = parser.next_cmd() {
                             match stmt {
                                 Stmt::CreateMaterializedView { .. } => {
-                                    // Handle materialized view with potential reuse
-                                    let should_create_new = if let Some(existing_view) =
-                                        existing_views.remove(&view_name)
-                                    {
-                                        // Check if we can reuse this view (same SQL definition)
-                                        let can_reuse = if let Ok(view_guard) = existing_view.lock()
-                                        {
-                                            view_guard.has_same_sql(sql)
-                                        } else {
-                                            false
-                                        };
+                                    // Store materialized view info for later creation
+                                    // We'll handle reuse logic and create the actual IncrementalView
+                                    // in a later pass when we have both the main root page and DBSP state root
+                                    materialized_view_info.insert(
+                                        view_name.clone(),
+                                        (sql.to_string(), root_page as usize),
+                                    );
 
-                                        if can_reuse {
-                                            // Reuse the existing view - it's already populated!
-                                            let referenced_tables =
-                                                if let Ok(view_guard) = existing_view.lock() {
-                                                    view_guard.get_referenced_table_names()
-                                                } else {
-                                                    vec![]
-                                                };
-
-                                            // Add the existing view to the new schema
-                                            schema
-                                                .materialized_views
-                                                .insert(view_name.clone(), existing_view);
-
-                                            // Store for second pass processing
-                                            views_to_process
-                                                .push((view_name.clone(), referenced_tables));
-                                            false // Don't create new
-                                        } else {
-                                            true // SQL changed, need to create new
-                                        }
-                                    } else {
-                                        true // No existing view, need to create new
-                                    };
-
-                                    if should_create_new {
-                                        // Create a new IncrementalView
-                                        // If this fails, we should propagate the error so the transaction rolls back
-                                        let incremental_view =
-                                            IncrementalView::from_sql(sql, schema)?;
-                                        let referenced_tables =
-                                            incremental_view.get_referenced_table_names();
-                                        schema.add_materialized_view(incremental_view);
-                                        views_to_process.push((view_name, referenced_tables));
+                                    // Mark the existing view for potential reuse
+                                    if existing_views.contains_key(&view_name) {
+                                        // We'll check for reuse in the third pass
                                     }
                                 }
                                 Stmt::CreateView {
@@ -301,11 +343,56 @@ pub fn parse_schema_rows(
         }
     }
 
-    // Second pass: populate table_to_views mapping
-    for (view_name, referenced_tables) in views_to_process {
-        // Register this view as dependent on each referenced table
-        for table_name in referenced_tables {
-            schema.add_materialized_view_dependency(&table_name, &view_name);
+    // Third pass: Create materialized views now that we have both root pages
+    for (view_name, (sql, main_root)) in materialized_view_info {
+        // Look up the DBSP state root for this view - must exist for materialized views
+        let dbsp_state_root = dbsp_state_roots.get(&view_name).ok_or_else(|| {
+            LimboError::InternalError(format!(
+                "Materialized view {view_name} is missing its DBSP state table"
+            ))
+        })?;
+
+        // Check if we can reuse the existing view
+        let mut reuse_view = false;
+        if let Some(existing_view_mutex) = schema.get_materialized_view(&view_name) {
+            let existing_view = existing_view_mutex.lock().unwrap();
+            if let Some(existing_sql) = schema.materialized_view_sql.get(&view_name) {
+                if existing_sql == &sql {
+                    reuse_view = true;
+                }
+            }
+        }
+
+        if reuse_view {
+            // View already exists with same SQL, just update dependencies
+            let existing_view_mutex = schema.get_materialized_view(&view_name).unwrap();
+            let existing_view = existing_view_mutex.lock().unwrap();
+            let referenced_tables = existing_view.get_referenced_table_names();
+            drop(existing_view); // Release lock before modifying schema
+            for table_name in referenced_tables {
+                schema.add_materialized_view_dependency(&table_name, &view_name);
+            }
+        } else {
+            // Create new IncrementalView with both root pages
+            let incremental_view =
+                IncrementalView::from_sql(&sql, schema, main_root, *dbsp_state_root)?;
+            let referenced_tables = incremental_view.get_referenced_table_names();
+
+            // Create a Table for the materialized view
+            let table = Arc::new(schema::Table::BTree(Arc::new(schema::BTreeTable {
+                root_page: main_root,
+                name: view_name.clone(),
+                columns: incremental_view.columns.clone(), // Use the view's columns, not the base table's
+                primary_key_columns: vec![],
+                has_rowid: true,
+                is_strict: false,
+                unique_sets: None,
+            })));
+
+            schema.add_materialized_view(incremental_view, table, sql.clone());
+            for table_name in referenced_tables {
+                schema.add_materialized_view_dependency(&table_name, &view_name);
+            }
         }
     }
 
@@ -609,6 +696,36 @@ pub fn exprs_are_equivalent(expr1: &Expr, expr2: &Expr) -> bool {
     }
 }
 
+// this function returns the affinity type and whether the type name was exactly "INTEGER"
+// https://www.sqlite.org/datatype3.html
+pub(crate) fn type_from_name(type_name: &str) -> (Type, bool) {
+    let type_name = type_name.as_bytes();
+    if type_name.is_empty() {
+        return (Type::Blob, false);
+    }
+
+    if eq_ignore_ascii_case!(type_name, b"INTEGER") {
+        return (Type::Integer, true);
+    }
+
+    if contains_ignore_ascii_case!(type_name, b"INT") {
+        return (Type::Integer, false);
+    }
+
+    if let Some(ty) = type_name.windows(4).find_map(|s| {
+        match_ignore_ascii_case!(match s {
+            b"CHAR" | b"CLOB" | b"TEXT" => Some(Type::Text),
+            b"BLOB" => Some(Type::Blob),
+            b"REAL" | b"FLOA" | b"DOUB" => Some(Type::Real),
+            _ => None,
+        })
+    }) {
+        return (ty, false);
+    }
+
+    (Type::Numeric, false)
+}
+
 pub fn columns_from_create_table_body(
     body: &turso_parser::ast::CreateTableBody,
 ) -> crate::Result<Vec<Column>> {
@@ -620,78 +737,7 @@ pub fn columns_from_create_table_body(
 
     use turso_parser::ast;
 
-    Ok(columns
-        .iter()
-        .map(
-            |ast::ColumnDefinition {
-                 col_name: name,
-                 col_type,
-                 constraints,
-             }| {
-                Column {
-                    name: Some(normalize_ident(name.as_str())),
-                    ty: match col_type {
-                        Some(ref data_type) => {
-                            // https://www.sqlite.org/datatype3.html
-                            let type_name = data_type.name.as_str().to_uppercase();
-                            if type_name.contains("INT") {
-                                Type::Integer
-                            } else if type_name.contains("CHAR")
-                                || type_name.contains("CLOB")
-                                || type_name.contains("TEXT")
-                            {
-                                Type::Text
-                            } else if type_name.contains("BLOB") || type_name.is_empty() {
-                                Type::Blob
-                            } else if type_name.contains("REAL")
-                                || type_name.contains("FLOA")
-                                || type_name.contains("DOUB")
-                            {
-                                Type::Real
-                            } else {
-                                Type::Numeric
-                            }
-                        }
-                        None => Type::Null,
-                    },
-                    default: constraints.iter().find_map(|c| match &c.constraint {
-                        ast::ColumnConstraint::Default(val) => Some(val.clone()),
-                        _ => None,
-                    }),
-                    notnull: constraints
-                        .iter()
-                        .any(|c| matches!(c.constraint, ast::ColumnConstraint::NotNull { .. })),
-                    ty_str: col_type
-                        .clone()
-                        .map(|t| t.name.to_string())
-                        .unwrap_or_default(),
-                    primary_key: constraints
-                        .iter()
-                        .any(|c| matches!(c.constraint, ast::ColumnConstraint::PrimaryKey { .. })),
-                    is_rowid_alias: false,
-                    unique: constraints
-                        .iter()
-                        .any(|c| matches!(c.constraint, ast::ColumnConstraint::Unique(..))),
-                    collation: constraints.iter().find_map(|c| match &c.constraint {
-                        // TODO: see if this should be the correct behavior
-                        // currently there cannot be any user defined collation sequences.
-                        // But in the future, when a user defines a collation sequence, creates a table with it,
-                        // then closes the db and opens it again. This may panic here if the collation seq is not registered
-                        // before reading the columns
-                        ast::ColumnConstraint::Collate { collation_name } => Some(
-                            CollationSeq::new(collation_name.as_str())
-                                .expect("collation should have been set correctly in create table"),
-                        ),
-                        _ => None,
-                    }),
-                    hidden: col_type
-                        .as_ref()
-                        .map(|data_type| data_type.name.as_str().contains("HIDDEN"))
-                        .unwrap_or(false),
-                }
-            },
-        )
-        .collect::<Vec<_>>())
+    Ok(columns.iter().map(Into::into).collect())
 }
 
 /// This function checks if a given expression is a constant value that can be pushed down to the database engine.
@@ -740,6 +786,10 @@ pub struct OpenOptions<'a> {
     pub cache: CacheMode,
     /// immutable=1|0 specifies that the database is stored on read-only media
     pub immutable: bool,
+    // The encryption cipher
+    pub cipher: Option<String>,
+    // The encryption key in hex format
+    pub hexkey: Option<String>,
 }
 
 pub const MEMORY_PATH: &str = ":memory:";
@@ -772,15 +822,16 @@ impl From<&str> for CacheMode {
 
 impl OpenMode {
     pub fn from_str(s: &str) -> Result<Self> {
-        match s.trim().to_lowercase().as_str() {
-            "ro" => Ok(OpenMode::ReadOnly),
-            "rw" => Ok(OpenMode::ReadWrite),
-            "memory" => Ok(OpenMode::Memory),
-            "rwc" => Ok(OpenMode::ReadWriteCreate),
+        let s_bytes = s.trim().as_bytes();
+        match_ignore_ascii_case!(match s_bytes {
+            b"ro" => Ok(OpenMode::ReadOnly),
+            b"rw" => Ok(OpenMode::ReadWrite),
+            b"memory" => Ok(OpenMode::Memory),
+            b"rwc" => Ok(OpenMode::ReadWriteCreate),
             _ => Err(LimboError::InvalidArgument(format!(
                 "Invalid mode: '{s}'. Expected one of 'ro', 'rw', 'memory', 'rwc'"
             ))),
-        }
+        })
     }
 }
 
@@ -890,6 +941,8 @@ fn parse_query_params(query: &str, opts: &mut OpenOptions) -> Result<()> {
                 "cache" => opts.cache = decoded_value.as_str().into(),
                 "immutable" => opts.immutable = decoded_value == "1",
                 "vfs" => opts.vfs = Some(decoded_value),
+                "cipher" => opts.cipher = Some(decoded_value),
+                "hexkey" => opts.hexkey = Some(decoded_value),
                 _ => {}
             }
         }
@@ -1242,7 +1295,7 @@ pub fn extract_view_columns(select_stmt: &ast::Select, schema: &Schema) -> Vec<C
                         .or_else(|| extract_column_name_from_expr(expr))
                         .unwrap_or_else(|| {
                             // If we can't extract a simple column name, use the expression itself
-                            expr.format().unwrap_or_else(|_| format!("column_{i}"))
+                            expr.to_string()
                         });
                     columns.push(Column {
                         name: Some(name),
@@ -1351,6 +1404,7 @@ pub fn extract_view_columns(select_stmt: &ast::Select, schema: &Schema) -> Vec<C
 #[cfg(test)]
 pub mod tests {
     use super::*;
+    use crate::schema::Type as SchemaValueType;
     use turso_parser::ast::{self, Expr, Literal, Name, Operator::*, Type};
 
     #[test]
@@ -2339,5 +2393,27 @@ pub mod tests {
         assert!(parse_pragma_bool(&Expr::Name(Name::Ident("nono".into()))).is_err());
         assert!(parse_pragma_bool(&Expr::Name(Name::Ident("10".into()))).is_err());
         assert!(parse_pragma_bool(&Expr::Name(Name::Ident("-1".into()))).is_err());
+    }
+
+    #[test]
+    fn test_type_from_name() {
+        let tc = vec![
+            ("", (SchemaValueType::Blob, false)),
+            ("INTEGER", (SchemaValueType::Integer, true)),
+            ("INT", (SchemaValueType::Integer, false)),
+            ("CHAR", (SchemaValueType::Text, false)),
+            ("CLOB", (SchemaValueType::Text, false)),
+            ("TEXT", (SchemaValueType::Text, false)),
+            ("BLOB", (SchemaValueType::Blob, false)),
+            ("REAL", (SchemaValueType::Real, false)),
+            ("FLOAT", (SchemaValueType::Real, false)),
+            ("DOUBLE", (SchemaValueType::Real, false)),
+            ("U128", (SchemaValueType::Numeric, false)),
+        ];
+
+        for (input, expected) in tc {
+            let result = type_from_name(input);
+            assert_eq!(result, expected, "Failed for input: {input}");
+        }
     }
 }

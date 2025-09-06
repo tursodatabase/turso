@@ -870,9 +870,7 @@ fn test_db_share_same_file() {
         path.to_str().unwrap(),
         db_file.clone(),
         turso_core::OpenFlags::Create,
-        false,
-        true,
-        false,
+        turso_core::DatabaseOpts::new().with_indexes(true),
     )
     .unwrap();
     let conn1 = db1.connect().unwrap();
@@ -898,9 +896,7 @@ fn test_db_share_same_file() {
         &format!("{}-wal-copy", path.to_str().unwrap()),
         db_file.clone(),
         turso_core::OpenFlags::empty(),
-        false,
-        true,
-        false,
+        turso_core::DatabaseOpts::new().with_indexes(true),
     )
     .unwrap();
     let conn2 = db2.connect().unwrap();

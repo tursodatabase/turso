@@ -133,9 +133,7 @@ impl<P: ProtocolIO, Ctx> DatabaseSyncEngine<P, Ctx> {
             main_db_path,
             db_file.clone(),
             OpenFlags::Create,
-            false,
-            true,
-            false,
+            turso_core::DatabaseOpts::new().with_indexes(true),
         )
         .unwrap();
         let tape_opts = DatabaseTapeOpts {
@@ -179,9 +177,7 @@ impl<P: ProtocolIO, Ctx> DatabaseSyncEngine<P, Ctx> {
             &self.revert_db_wal_path,
             self.db_file.clone(),
             OpenFlags::Create,
-            false,
-            true,
-            false,
+            turso_core::DatabaseOpts::new().with_indexes(true),
         )?;
         let conn = db.connect()?;
         conn.wal_auto_checkpoint_disable();

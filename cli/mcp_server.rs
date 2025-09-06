@@ -8,7 +8,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
-use turso_core::{Connection, Database, OpenFlags, StepResult, Value as DbValue};
+use turso_core::{Connection, Database, DatabaseOpts, OpenFlags, StepResult, Value as DbValue};
 
 #[derive(Debug, Serialize, Deserialize)]
 struct JsonRpcRequest {
@@ -408,7 +408,7 @@ impl TursoMcpServer {
 
         // Open the new database connection
         let conn = if path == ":memory:" || path.contains([':', '?', '&', '#']) {
-            match Connection::from_uri(&path, true, false, false) {
+            match Connection::from_uri(&path, true, false, false, false) {
                 Ok((_io, c)) => c,
                 Err(e) => return format!("Failed to open database '{path}': {e}"),
             }
@@ -417,9 +417,7 @@ impl TursoMcpServer {
                 &path,
                 None::<&str>,
                 OpenFlags::default(),
-                true,
-                false,
-                false,
+                DatabaseOpts::new().with_indexes(true),
             ) {
                 Ok((_io, db)) => match db.connect() {
                     Ok(c) => c,

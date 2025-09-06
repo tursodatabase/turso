@@ -58,7 +58,7 @@ Turso aims to be fully compatible with SQLite, with opt-in features not supporte
 | COMMIT TRANSACTION        | Partial | Transaction names are not supported.                                              |
 | CREATE INDEX              | Partial | Only for columns (not arbitrary expressions)                                      |
 | CREATE TABLE              | Partial |                                                                                   |
-| CREATE TABLE ... STRICT   | Yes     |                                                                                   |
+| CREATE TABLE ... STRICT   | Partial | Strict schema mode is experimental.                                               |
 | CREATE TRIGGER            | No      |                                                                                   |
 | CREATE VIEW               | Yes     |                                                                                   |
 | CREATE VIRTUAL TABLE      | Yes     |                                                                                   |

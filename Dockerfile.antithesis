@@ -13,7 +13,6 @@ FROM chef AS planner
 COPY ./Cargo.lock ./Cargo.lock
 COPY ./Cargo.toml ./Cargo.toml
 COPY ./bindings/dart ./bindings/dart/
-COPY ./bindings/go ./bindings/go/
 COPY ./bindings/java ./bindings/java/
 COPY ./bindings/javascript ./bindings/javascript/
 COPY ./bindings/python ./bindings/python/
@@ -25,13 +24,14 @@ COPY ./macros ./macros/
 COPY ./packages ./packages/
 COPY ./parser ./parser/
 COPY ./simulator ./simulator/
+COPY ./sql_generation ./sql_generation
 COPY ./sqlite3 ./sqlite3/
-COPY ./tests ./tests/
 COPY ./stress ./stress/
 COPY ./sync ./sync/
-COPY ./vendored ./vendored/
 COPY ./testing/sqlite_test_ext ./testing/sqlite_test_ext/
 COPY ./testing/unreliable-libc ./testing/unreliable-libc/
+COPY ./tests ./tests/
+COPY ./vendored ./vendored/
 RUN cargo chef prepare --bin turso_stress --recipe-path recipe.json
 
 #
@@ -51,30 +51,26 @@ COPY stress/libvoidstar.so /opt/antithesis/libvoidstar.so
 COPY --from=planner /app/recipe.json recipe.json
 RUN cargo chef cook --bin turso_stress --release --recipe-path recipe.json
 COPY --from=planner /app/Cargo.toml ./Cargo.toml
+COPY --from=planner /app/bindings/dart ./bindings/dart/
+COPY --from=planner /app/bindings/java ./bindings/java/
+COPY --from=planner /app/bindings/javascript ./bindings/javascript/
+COPY --from=planner /app/bindings/python ./bindings/python/
+COPY --from=planner /app/bindings/rust ./bindings/rust/
 COPY --from=planner /app/cli ./cli/
 COPY --from=planner /app/core ./core/
 COPY --from=planner /app/extensions ./extensions/
 COPY --from=planner /app/macros ./macros/
-COPY --from=planner /app/simulator ./simulator/
-COPY --from=planner /app/sqlite3 ./sqlite3/
-COPY --from=planner /app/tests ./tests/
-COPY --from=planner /app/stress ./stress/
-COPY --from=planner /app/bindings/rust ./bindings/rust/
-COPY --from=planner /app/bindings/dart ./bindings/dart/
-COPY --from=planner /app/bindings/go ./bindings/go/
-COPY --from=planner /app/bindings/javascript ./bindings/javascript/
-COPY --from=planner /app/bindings/java ./bindings/java/
-COPY --from=planner /app/bindings/python ./bindings/python/
 COPY --from=planner /app/packages ./packages/
-COPY --from=planner /app/core ./core/
-COPY --from=planner /app/extensions ./extensions/
-COPY --from=planner /app/macros ./macros/
+COPY --from=planner /app/parser ./parser/
+COPY --from=planner /app/simulator ./simulator/
+COPY --from=planner /app/sql_generation ./sql_generation
+COPY --from=planner /app/sqlite3 ./sqlite3/
 COPY --from=planner /app/stress ./stress/
 COPY --from=planner /app/sync ./sync/
-COPY --from=planner /app/parser ./parser/
-COPY --from=planner /app/vendored ./vendored/
 COPY --from=planner /app/testing/sqlite_test_ext ./testing/sqlite_test_ext/
 COPY --from=planner /app/testing/unreliable-libc ./testing/unreliable-libc/
+COPY --from=planner /app/tests ./tests/
+COPY --from=planner /app/vendored ./vendored/
 
 RUN if [ "$antithesis" = "true" ]; then \
         cp /opt/antithesis/libvoidstar.so /usr/lib/libvoidstar.so && \
@@ -114,6 +110,7 @@ WORKDIR /app
 COPY ./antithesis-tests/bank-test/*.py /opt/antithesis/test/v1/bank-test/
 COPY ./antithesis-tests/stress-composer/*.py /opt/antithesis/test/v1/stress-composer/
 COPY ./antithesis-tests/stress /opt/antithesis/test/v1/stress
+COPY ./antithesis-tests/stress-io_uring /opt/antithesis/test/v1/stress-io_uring
 COPY ./antithesis-tests/stress-unreliable /opt/antithesis/test/v1/stress-unreliable
 RUN chmod 777 -R /opt/antithesis/test/v1
 

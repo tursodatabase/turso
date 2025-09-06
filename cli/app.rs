@@ -66,6 +66,8 @@ pub struct Opts {
     pub experimental_views: bool,
     #[clap(long, help = "Enable experimental indexing feature")]
     pub experimental_indexes: Option<bool>,
+    #[clap(long, help = "Enable experimental strict schema mode")]
+    pub experimental_strict: bool,
     #[clap(short = 't', long, help = "specify output file for log traces")]
     pub tracing_output: Option<String>,
     #[clap(long, help = "Start MCP server instead of interactive shell")]
@@ -107,6 +109,7 @@ impl Limbo {
                 indexes_enabled,
                 opts.experimental_mvcc,
                 opts.experimental_views,
+                opts.experimental_strict,
             )?
         } else {
             let flags = if opts.readonly {
@@ -118,9 +121,11 @@ impl Limbo {
                 &db_file,
                 opts.vfs.as_ref(),
                 flags,
-                indexes_enabled,
-                opts.experimental_mvcc,
-                opts.experimental_views,
+                turso_core::DatabaseOpts::new()
+                    .with_mvcc(opts.experimental_mvcc)
+                    .with_indexes(indexes_enabled)
+                    .with_views(opts.experimental_views)
+                    .with_strict(opts.experimental_strict),
             )?;
             let conn = db.connect()?;
             (io, conn)
@@ -494,33 +499,7 @@ impl Limbo {
                 return Ok(());
             }
         }
-        if line.trim_start().starts_with("--") {
-            if let Some(remaining) = line.split_once('\n') {
-                let after_comment = remaining.1.trim();
-                if !after_comment.is_empty() {
-                    if after_comment.ends_with(';') {
-                        self.run_query(after_comment);
-                        if self.opts.echo {
-                            let _ = self.writeln(after_comment);
-                        }
-                        let conn = self.conn.clone();
-                        let runner = conn.query_runner(after_comment.as_bytes());
-                        for output in runner {
-                            if let Err(e) = self.print_query_result(after_comment, output, None) {
-                                let _ = self.writeln(e.to_string());
-                            }
-                        }
-                        self.reset_input();
-                        return self.handle_input_line(after_comment);
-                    } else {
-                        self.set_multiline_prompt();
-                        let _ = self.reset_line(line);
-                        return Ok(());
-                    }
-                }
-            }
-            return Ok(());
-        }
+
         self.reset_line(line)?;
         if line.ends_with(';') {
             self.buffer_input(line);

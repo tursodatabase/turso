@@ -7376,7 +7376,7 @@ mod tests {
         schema::IndexColumn,
         storage::{
             database::DatabaseFile,
-            page_cache::DumbLruPageCache,
+            page_cache::PageCache,
             pager::{AtomicDbState, DbState},
             sqlite3_ondisk::PageSize,
         },
@@ -8631,7 +8631,7 @@ mod tests {
                 db_file,
                 Some(wal),
                 io,
-                Arc::new(parking_lot::RwLock::new(DumbLruPageCache::new(10))),
+                Arc::new(parking_lot::RwLock::new(PageCache::new(10))),
                 buffer_pool,
                 Arc::new(AtomicDbState::new(DbState::Uninitialized)),
                 Arc::new(Mutex::new(())),

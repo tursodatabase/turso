@@ -21,3 +21,10 @@ do_execsql_test_on_specific_db {:memory:} create_table_rowid_unique_regression_t
   insert into u values (1),(2),(3);
   select * from u where x > 2;
 } {3}
+
+# https://github.com/tursodatabase/turso/issues/2886#issuecomment-3244885481
+do_execsql_test_on_specific_db {:memory:} create_table_with_empty_string_name {
+  create table ''('' INTEGER) strict;
+  insert into '' values(9);
+  select * from '';
+} {9}

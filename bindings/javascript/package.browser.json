@@ -1,0 +1,59 @@
+{
+  "name": "@tursodatabase/database-browser",
+  "version": "0.1.5-pre.2",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/tursodatabase/turso"
+  },
+  "description": "The Turso database library specifically for browser/web environment",
+  "module": "./dist/promise.js",
+  "main": "./dist/promise.js",
+  "type": "module",
+  "exports": {
+    ".": "./dist/promise.js",
+    "./compat": "./dist/compat.js"
+  },
+  "files": [
+    "browser.js",
+    "index.js",
+    "index.d.ts",
+    "dist/**"
+  ],
+  "types": "index.d.ts",
+  "napi": {
+    "binaryName": "turso",
+    "targets": [
+      "wasm32-wasip1-threads"
+    ]
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "@napi-rs/cli": "^3.0.4",
+    "@napi-rs/wasm-runtime": "^1.0.1",
+    "ava": "^6.0.1",
+    "better-sqlite3": "^11.9.1",
+    "typescript": "^5.9.2"
+  },
+  "ava": {
+    "timeout": "3m"
+  },
+  "engines": {
+    "node": ">= 10"
+  },
+  "scripts": {
+    "artifacts": "napi artifacts",
+    "build": "npm exec tsc && napi build --platform --release --esm",
+    "build:debug": "npm exec tsc && napi build --platform",
+    "prepublishOnly": "npm exec tsc && napi prepublish -t npm --skip-optional-publish",
+    "test": "true",
+    "universal": "napi universalize",
+    "version": "napi version"
+  },
+  "packageManager": "yarn@4.9.2",
+  "imports": {
+    "#entry-point": {
+      "types": "./index.d.ts",
+      "browser": "./browser.js"
+    }
+  }
+}

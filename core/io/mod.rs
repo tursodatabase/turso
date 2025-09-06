@@ -12,10 +12,10 @@ use std::{fmt::Debug, pin::Pin};
 pub trait File: Send + Sync {
     fn lock_file(&self, exclusive: bool) -> Result<()>;
     fn unlock_file(&self) -> Result<()>;
-    fn pread(&self, pos: usize, c: Completion) -> Result<Completion>;
-    fn pwrite(&self, pos: usize, buffer: Arc<Buffer>, c: Completion) -> Result<Completion>;
+    fn pread(&self, pos: u64, c: Completion) -> Result<Completion>;
+    fn pwrite(&self, pos: u64, buffer: Arc<Buffer>, c: Completion) -> Result<Completion>;
     fn sync(&self, c: Completion) -> Result<Completion>;
-    fn pwritev(&self, pos: usize, buffers: Vec<Arc<Buffer>>, c: Completion) -> Result<Completion> {
+    fn pwritev(&self, pos: u64, buffers: Vec<Arc<Buffer>>, c: Completion) -> Result<Completion> {
         use std::sync::atomic::{AtomicUsize, Ordering};
         if buffers.is_empty() {
             c.complete(0);
@@ -56,12 +56,12 @@ pub trait File: Send + Sync {
                 c.abort();
                 return Err(e);
             }
-            pos += len;
+            pos += len as u64;
         }
         Ok(c)
     }
     fn size(&self) -> Result<u64>;
-    fn truncate(&self, len: usize, c: Completion) -> Result<Completion>;
+    fn truncate(&self, len: u64, c: Completion) -> Result<Completion>;
 }
 
 #[derive(Debug, Copy, Clone, PartialEq)]
@@ -87,7 +87,9 @@ pub trait IO: Clock + Send + Sync {
     // remove_file is used in the sync-engine
     fn remove_file(&self, path: &str) -> Result<()>;
 
-    fn run_once(&self) -> Result<()>;
+    fn run_once(&self) -> Result<()> {
+        Ok(())
+    }
 
     fn wait_for_completion(&self, c: Completion) -> Result<()> {
         while !c.finished() {
@@ -133,6 +135,7 @@ struct CompletionInner {
     /// None means we completed successfully
     // Thread safe with OnceLock
     result: std::sync::OnceLock<Option<CompletionError>>,
+    needs_link: bool,
 }
 
 impl Debug for CompletionType {
@@ -159,8 +162,32 @@ impl Completion {
             inner: Arc::new(CompletionInner {
                 completion_type,
                 result: OnceLock::new(),
+                needs_link: false,
             }),
         }
+    }
+
+    pub fn new_linked(completion_type: CompletionType) -> Self {
+        Self {
+            inner: Arc::new(CompletionInner {
+                completion_type,
+                result: OnceLock::new(),
+                needs_link: true,
+            }),
+        }
+    }
+
+    pub fn needs_link(&self) -> bool {
+        self.inner.needs_link
+    }
+
+    pub fn new_write_linked<F>(complete: F) -> Self
+    where
+        F: Fn(Result<i32, CompletionError>) + 'static,
+    {
+        Self::new_linked(CompletionType::Write(WriteCompletion::new(Box::new(
+            complete,
+        ))))
     }
 
     pub fn new_write<F>(complete: F) -> Self
@@ -214,33 +241,41 @@ impl Completion {
         self.inner.result.get().is_some_and(|val| val.is_some())
     }
 
+    pub fn get_error(&self) -> Option<CompletionError> {
+        self.inner.result.get().and_then(|res| *res)
+    }
+
     /// Checks if the Completion completed or errored
     pub fn finished(&self) -> bool {
         self.inner.result.get().is_some()
     }
 
     pub fn complete(&self, result: i32) {
-        if self.inner.result.set(None).is_ok() {
-            let result = Ok(result);
-            match &self.inner.completion_type {
-                CompletionType::Read(r) => r.callback(result),
-                CompletionType::Write(w) => w.callback(result),
-                CompletionType::Sync(s) => s.callback(result), // fix
-                CompletionType::Truncate(t) => t.callback(result),
-            };
-        }
+        let result = Ok(result);
+        match &self.inner.completion_type {
+            CompletionType::Read(r) => r.callback(result),
+            CompletionType::Write(w) => w.callback(result),
+            CompletionType::Sync(s) => s.callback(result), // fix
+            CompletionType::Truncate(t) => t.callback(result),
+        };
+        self.inner
+            .result
+            .set(None)
+            .expect("result must be set only once");
     }
 
     pub fn error(&self, err: CompletionError) {
-        if self.inner.result.set(Some(err)).is_ok() {
-            let result = Err(err);
-            match &self.inner.completion_type {
-                CompletionType::Read(r) => r.callback(result),
-                CompletionType::Write(w) => w.callback(result),
-                CompletionType::Sync(s) => s.callback(result), // fix
-                CompletionType::Truncate(t) => t.callback(result),
-            };
-        }
+        let result = Err(err);
+        match &self.inner.completion_type {
+            CompletionType::Read(r) => r.callback(result),
+            CompletionType::Write(w) => w.callback(result),
+            CompletionType::Sync(s) => s.callback(result), // fix
+            CompletionType::Truncate(t) => t.callback(result),
+        };
+        self.inner
+            .result
+            .set(Some(err))
+            .expect("result must be set only once");
     }
 
     pub fn abort(&self) {

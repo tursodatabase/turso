@@ -1,6 +1,8 @@
 use crate::schema::{Index, IndexColumn, Schema};
 use crate::translate::emitter::{emit_query, LimitCtx, TranslateCtx};
+use crate::translate::expr::translate_expr;
 use crate::translate::plan::{Plan, QueryDestination, SelectPlan};
+use crate::translate::result_row::try_fold_expr_to_i64;
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::Insn;
 use crate::vdbe::BranchOffset;
@@ -31,36 +33,55 @@ pub fn emit_program_for_compound_select(
 
     let right_plan = right_most.clone();
     // Trivial exit on LIMIT 0
-    if let Some(limit) = limit {
-        if *limit == 0 {
-            program.result_columns = right_plan.result_columns;
-            program.table_references.extend(right_plan.table_references);
-            return Ok(());
-        }
+    if matches!(limit.as_ref().and_then(try_fold_expr_to_i64), Some(v) if v == 0) {
+        program.result_columns = right_plan.result_columns;
+        program.table_references.extend(right_plan.table_references);
+        return Ok(());
     }
+
+    let right_most_ctx = TranslateCtx::new(
+        program,
+        schema,
+        syms,
+        right_most.table_references.joined_tables().len(),
+    );
 
     // Each subselect shares the same limit_ctx and offset, because the LIMIT, OFFSET applies to
     // the entire compound select, not just a single subselect.
-    let limit_ctx = limit.map(|limit| {
+    let limit_ctx = limit.as_ref().map(|limit| {
         let reg = program.alloc_register();
-        program.emit_insn(Insn::Integer {
-            value: limit as i64,
-            dest: reg,
-        });
+        if let Some(val) = try_fold_expr_to_i64(limit) {
+            program.emit_insn(Insn::Integer {
+                value: val,
+                dest: reg,
+            });
+        } else {
+            program.add_comment(program.offset(), "OFFSET expr");
+            _ = translate_expr(program, None, limit, reg, &right_most_ctx.resolver);
+            program.emit_insn(Insn::MustBeInt { reg });
+        }
         LimitCtx::new_shared(reg)
     });
-    let offset_reg = offset.map(|offset| {
+    let offset_reg = offset.as_ref().map(|offset_expr| {
         let reg = program.alloc_register();
-        program.emit_insn(Insn::Integer {
-            value: offset as i64,
-            dest: reg,
-        });
+
+        if let Some(val) = try_fold_expr_to_i64(offset_expr) {
+            // Compile-time constant offset
+            program.emit_insn(Insn::Integer {
+                value: val,
+                dest: reg,
+            });
+        } else {
+            program.add_comment(program.offset(), "OFFSET expr");
+            _ = translate_expr(program, None, offset_expr, reg, &right_most_ctx.resolver);
+            program.emit_insn(Insn::MustBeInt { reg });
+        }
 
         let combined_reg = program.alloc_register();
         program.emit_insn(Insn::OffsetLimit {
             offset_reg: reg,
             combined_reg,
-            limit_reg: limit_ctx.unwrap().reg_limit,
+            limit_reg: limit_ctx.as_ref().unwrap().reg_limit,
         });
 
         reg
@@ -137,8 +158,8 @@ fn emit_compound_select(
                 let compound_select = Plan::CompoundSelect {
                     left,
                     right_most: plan,
-                    limit,
-                    offset,
+                    limit: limit.clone(),
+                    offset: offset.clone(),
                     order_by,
                 };
                 emit_compound_select(

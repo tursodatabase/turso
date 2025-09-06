@@ -7,22 +7,22 @@ from cli_tests.test_turso_cli import TestTursoShell
 sqlite_exec = "./scripts/limbo-sqlite3"
 sqlite_flags = os.getenv("SQLITE_FLAGS", "-q").split(" ")
 
-test_data = """CREATE TABLE numbers ( id INTEGER PRIMARY KEY, value FLOAT NOT NULL);
-INSERT INTO numbers (value) VALUES (1.0);
-INSERT INTO numbers (value) VALUES (2.0);
-INSERT INTO numbers (value) VALUES (3.0);
-INSERT INTO numbers (value) VALUES (4.0);
-INSERT INTO numbers (value) VALUES (5.0);
-INSERT INTO numbers (value) VALUES (6.0);
-INSERT INTO numbers (value) VALUES (7.0);
-CREATE TABLE test (value REAL, percent REAL);
-INSERT INTO test values (10, 25);
-INSERT INTO test values (20, 25);
-INSERT INTO test values (30, 25);
-INSERT INTO test values (40, 25);
-INSERT INTO test values (50, 25);
-INSERT INTO test values (60, 25);
-INSERT INTO test values (70, 25);
+test_data = """CREATE TABLE numbers ( id INTEGER PRIMARY KEY, value FLOAT NOT NULL, category TEXT DEFAULT 'A');
+INSERT INTO numbers (value, category) VALUES (1.0, 'A');
+INSERT INTO numbers (value, category) VALUES (2.0, 'A');
+INSERT INTO numbers (value, category) VALUES (3.0, 'A');
+INSERT INTO numbers (value, category) VALUES (4.0, 'B');
+INSERT INTO numbers (value, category) VALUES (5.0, 'B');
+INSERT INTO numbers (value, category) VALUES (6.0, 'B');
+INSERT INTO numbers (value, category) VALUES (7.0, 'B');
+CREATE TABLE test (value REAL, percent REAL, category TEXT);
+INSERT INTO test values (10, 25, 'A');
+INSERT INTO test values (20, 25, 'A');
+INSERT INTO test values (30, 25, 'B');
+INSERT INTO test values (40, 25, 'C');
+INSERT INTO test values (50, 25, 'C');
+INSERT INTO test values (60, 25, 'C');
+INSERT INTO test values (70, 25, 'D');
 """
 
 
@@ -153,6 +153,11 @@ def test_aggregates():
         validate_median,
         "median agg function works",
     )
+    limbo.run_test_fn(
+        "select CASE WHEN median(value) > 0 THEN median(value) ELSE 0 END from numbers;",
+        validate_median,
+        "median agg function wrapped in expression works",
+    )
     limbo.execute_dot("INSERT INTO numbers (value) VALUES (8.0);\n")
     limbo.run_test_fn(
         "select median(value) from numbers;",
@@ -171,6 +176,44 @@ def test_aggregates():
     )
     limbo.run_test_fn("SELECT percentile_cont(value, 0.25) from test;", validate_percentile1)
     limbo.run_test_fn("SELECT percentile_disc(value, 0.55) from test;", validate_percentile_disc)
+    limbo.quit()
+
+
+def test_grouped_aggregates():
+    limbo = TestTursoShell(init_commands=test_data)
+    extension_path = "./target/debug/liblimbo_percentile"
+    limbo.execute_dot(f".load {extension_path}")
+
+    limbo.run_test_fn(
+        "SELECT median(value) FROM numbers GROUP BY category;",
+        lambda res: "2.0\n5.5" == res,
+        "median aggregate function works",
+    )
+    limbo.run_test_fn(
+        "select CASE WHEN median(value) > 0 THEN median(value) ELSE 0 END from numbers GROUP BY category;",
+        lambda res: "2.0\n5.5" == res,
+        "median aggregate function wrapped in expression works",
+    )
+    limbo.run_test_fn(
+        "SELECT percentile(value, percent) FROM test GROUP BY category;",
+        lambda res: "12.5\n30.0\n45.0\n70.0" == res,
+        "grouped aggregate percentile function with 2 arguments works",
+    )
+    limbo.run_test_fn(
+        "SELECT percentile(value, 55) FROM test GROUP BY category;",
+        lambda res: "15.5\n30.0\n51.0\n70.0" == res,
+        "grouped aggregate percentile function with 1 argument works",
+    )
+    limbo.run_test_fn(
+        "SELECT percentile_cont(value, 0.25) FROM test GROUP BY category;",
+        lambda res: "12.5\n30.0\n45.0\n70.0" == res,
+        "grouped aggregate percentile_cont function works",
+    )
+    limbo.run_test_fn(
+        "SELECT percentile_disc(value, 0.55) FROM test GROUP BY category;",
+        lambda res: "10.0\n30.0\n50.0\n70.0" == res,
+        "grouped aggregate percentile_disc function works",
+    )
     limbo.quit()
 
 
@@ -770,6 +813,7 @@ def main():
         test_regexp()
         test_uuid()
         test_aggregates()
+        test_grouped_aggregates()
         test_crypto()
         test_series()
         test_ipaddr()

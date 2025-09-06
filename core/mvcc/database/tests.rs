@@ -654,10 +654,10 @@ fn test_future_row() {
 use crate::mvcc::cursor::MvccLazyCursor;
 use crate::mvcc::database::{MvStore, Row, RowID};
 use crate::types::Text;
-use crate::MemoryIO;
 use crate::RefValue;
 use crate::Value;
 use crate::{Database, StepResult};
+use crate::{MemoryIO, Statement};
 
 // Simple atomic clock implementation for testing
 
@@ -1242,4 +1242,77 @@ fn get_rows(conn: &Arc<Connection>, query: &str) -> Vec<Vec<Value>> {
         rows.push(values);
     }
     rows
+}
+
+#[test]
+#[ignore]
+fn test_concurrent_writes() {
+    struct ConnectionState {
+        conn: Arc<Connection>,
+        inserts: Vec<i64>,
+        current_statement: Option<Statement>,
+    }
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let mut connecitons = Vec::new();
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE test (x)").unwrap();
+        conn.close().unwrap();
+    }
+    for i in 0..2 {
+        let conn = db.connect();
+        let mut inserts = ((100 * i)..(100 * (i + 1))).collect::<Vec<_>>();
+        inserts.reverse();
+        connecitons.push(ConnectionState {
+            conn,
+            inserts,
+            current_statement: None,
+        });
+    }
+
+    loop {
+        let mut all_finished = true;
+        for conn in &mut connecitons {
+            if !conn.inserts.is_empty() && conn.current_statement.is_none() {
+                all_finished = false;
+                break;
+            }
+        }
+        for (conn_id, conn) in connecitons.iter_mut().enumerate() {
+            println!("connection {conn_id} inserts: {:?}", conn.inserts);
+            if conn.current_statement.is_none() && !conn.inserts.is_empty() {
+                let write = conn.inserts.pop().unwrap();
+                println!("inserting row {write} from connection {conn_id}");
+                conn.current_statement = Some(
+                    conn.conn
+                        .prepare(format!("INSERT INTO test (x) VALUES ({write})"))
+                        .unwrap(),
+                );
+            }
+            if conn.current_statement.is_none() {
+                continue;
+            }
+            let stmt = conn.current_statement.as_mut().unwrap();
+            match stmt.step().unwrap() {
+                // These you be only possible cases in write concurrency.
+                // No rows because insert doesn't return
+                // No interrupt because insert doesn't interrupt
+                // No busy because insert in mvcc should be multi concurrent write
+                StepResult::Done => {
+                    conn.current_statement = None;
+                }
+                StepResult::IO => {
+                    // let's skip doing I/O here, we want to perform io only after all the statements are stepped
+                }
+                _ => {
+                    unreachable!()
+                }
+            }
+        }
+        db.get_db().io.run_once().unwrap();
+
+        if all_finished {
+            break;
+        }
+    }
 }

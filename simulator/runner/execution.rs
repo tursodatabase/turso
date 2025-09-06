@@ -5,8 +5,8 @@ use tracing::instrument;
 use turso_core::{Connection, LimboError, Result, StepResult};
 
 use crate::generation::{
-    plan::{Interaction, InteractionPlan, InteractionPlanState, ResultSet},
     Shadow as _,
+    plan::{Interaction, InteractionPlan, InteractionPlanState, ResultSet},
 };
 
 use super::env::{SimConnection, SimulatorEnv};
@@ -191,7 +191,7 @@ pub(crate) fn execute_interaction(
                 SimConnection::Disconnected => unreachable!(),
             };
             tracing::debug!(?interaction);
-            let results = interaction.execute_query(conn, &env.io);
+            let results = interaction.execute_query(conn);
             if results.is_err() {
                 tracing::error!(?results);
             }

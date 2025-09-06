@@ -3,10 +3,9 @@ use super::plan::{
     select_star, Distinctness, JoinOrderMember, Operation, OuterQueryReference, QueryDestination,
     Search, TableReferences, WhereTerm,
 };
-use crate::function::{AggFunc, ExtFunc, Func};
 use crate::schema::Table;
 use crate::translate::optimizer::optimize_plan;
-use crate::translate::plan::{Aggregate, GroupBy, Plan, ResultSetColumn, SelectPlan};
+use crate::translate::plan::{GroupBy, Plan, ResultSetColumn, SelectPlan};
 use crate::translate::planner::{
     bind_column_references, break_predicate_at_and_boundaries, parse_from, parse_limit,
     parse_where, resolve_aggregates,
@@ -151,8 +150,7 @@ pub fn prepare_select_plan(
             }
             let (limit, offset) = select
                 .limit
-                .as_ref()
-                .map_or(Ok((None, None)), parse_limit)?;
+                .map_or(Ok((None, None)), |mut l| parse_limit(&mut l, connection))?;
 
             // FIXME: handle ORDER BY for compound selects
             if !select.order_by.is_empty() {
@@ -340,206 +338,16 @@ fn prepare_one_select_plan(
                             Some(&plan.result_columns),
                             connection,
                         )?;
-                        match expr.as_ref() {
-                            ast::Expr::FunctionCall {
-                                name,
-                                distinctness,
-                                args,
-                                filter_over,
-                                order_by,
-                            } => {
-                                if filter_over.filter_clause.is_some()
-                                    || filter_over.over_clause.is_some()
-                                {
-                                    crate::bail_parse_error!(
-                                        "FILTER clause is not supported yet in aggregate functions"
-                                    );
-                                }
-                                if !order_by.is_empty() {
-                                    crate::bail_parse_error!("ORDER BY clause is not supported yet in aggregate functions");
-                                }
-                                let args_count = args.len();
-                                let distinctness = Distinctness::from_ast(distinctness.as_ref());
-
-                                if !schema.indexes_enabled() && distinctness.is_distinct() {
-                                    crate::bail_parse_error!(
-                                       "SELECT with DISTINCT is not allowed without indexes enabled"
-                                   );
-                                }
-                                if distinctness.is_distinct() && args_count != 1 {
-                                    crate::bail_parse_error!("DISTINCT aggregate functions must have exactly one argument");
-                                }
-                                match Func::resolve_function(name.as_str(), args_count) {
-                                    Ok(Func::Agg(f)) => {
-                                        let agg_args = match (args.is_empty(), &f) {
-                                            (true, crate::function::AggFunc::Count0) => {
-                                                // COUNT() case
-                                                vec![ast::Expr::Literal(ast::Literal::Numeric(
-                                                    "1".to_string(),
-                                                ))
-                                                .into()]
-                                            }
-                                            (true, _) => crate::bail_parse_error!(
-                                                "Aggregate function {} requires arguments",
-                                                name.as_str()
-                                            ),
-                                            (false, _) => args.clone(),
-                                        };
-
-                                        let agg = Aggregate {
-                                            func: f,
-                                            args: agg_args.iter().map(|arg| *arg.clone()).collect(),
-                                            original_expr: *expr.clone(),
-                                            distinctness,
-                                        };
-                                        aggregate_expressions.push(agg);
-                                        plan.result_columns.push(ResultSetColumn {
-                                            alias: maybe_alias.as_ref().map(|alias| match alias {
-                                                ast::As::Elided(alias) => {
-                                                    alias.as_str().to_string()
-                                                }
-                                                ast::As::As(alias) => alias.as_str().to_string(),
-                                            }),
-                                            expr: *expr.clone(),
-                                            contains_aggregates: true,
-                                        });
-                                    }
-                                    Ok(_) => {
-                                        let contains_aggregates = resolve_aggregates(
-                                            schema,
-                                            expr,
-                                            &mut aggregate_expressions,
-                                        )?;
-                                        plan.result_columns.push(ResultSetColumn {
-                                            alias: maybe_alias.as_ref().map(|alias| match alias {
-                                                ast::As::Elided(alias) => {
-                                                    alias.as_str().to_string()
-                                                }
-                                                ast::As::As(alias) => alias.as_str().to_string(),
-                                            }),
-                                            expr: *expr.clone(),
-                                            contains_aggregates,
-                                        });
-                                    }
-                                    Err(e) => {
-                                        if let Some(f) =
-                                            syms.resolve_function(name.as_str(), args_count)
-                                        {
-                                            if let ExtFunc::Scalar(_) = f.as_ref().func {
-                                                let contains_aggregates = resolve_aggregates(
-                                                    schema,
-                                                    expr,
-                                                    &mut aggregate_expressions,
-                                                )?;
-                                                plan.result_columns.push(ResultSetColumn {
-                                                    alias: maybe_alias.as_ref().map(|alias| {
-                                                        match alias {
-                                                            ast::As::Elided(alias) => {
-                                                                alias.as_str().to_string()
-                                                            }
-                                                            ast::As::As(alias) => {
-                                                                alias.as_str().to_string()
-                                                            }
-                                                        }
-                                                    }),
-                                                    expr: *expr.clone(),
-                                                    contains_aggregates,
-                                                });
-                                            } else {
-                                                let agg = Aggregate {
-                                                    func: AggFunc::External(f.func.clone().into()),
-                                                    args: args
-                                                        .iter()
-                                                        .map(|arg| *arg.clone())
-                                                        .collect(),
-                                                    original_expr: *expr.clone(),
-                                                    distinctness,
-                                                };
-                                                aggregate_expressions.push(agg);
-                                                plan.result_columns.push(ResultSetColumn {
-                                                    alias: maybe_alias.as_ref().map(|alias| {
-                                                        match alias {
-                                                            ast::As::Elided(alias) => {
-                                                                alias.as_str().to_string()
-                                                            }
-                                                            ast::As::As(alias) => {
-                                                                alias.as_str().to_string()
-                                                            }
-                                                        }
-                                                    }),
-                                                    expr: *expr.clone(),
-                                                    contains_aggregates: true,
-                                                });
-                                            }
-                                            continue; // Continue with the normal flow instead of returning
-                                        } else {
-                                            return Err(e);
-                                        }
-                                    }
-                                }
-                            }
-                            ast::Expr::FunctionCallStar { name, filter_over } => {
-                                if filter_over.filter_clause.is_some()
-                                    || filter_over.over_clause.is_some()
-                                {
-                                    crate::bail_parse_error!(
-                                        "FILTER clause is not supported yet in aggregate functions"
-                                    );
-                                }
-                                match Func::resolve_function(name.as_str(), 0) {
-                                    Ok(Func::Agg(f)) => {
-                                        let agg = Aggregate {
-                                            func: f,
-                                            args: vec![ast::Expr::Literal(ast::Literal::Numeric(
-                                                "1".to_string(),
-                                            ))],
-                                            original_expr: *expr.clone(),
-                                            distinctness: Distinctness::NonDistinct,
-                                        };
-                                        aggregate_expressions.push(agg);
-                                        plan.result_columns.push(ResultSetColumn {
-                                            alias: maybe_alias.as_ref().map(|alias| match alias {
-                                                ast::As::Elided(alias) => {
-                                                    alias.as_str().to_string()
-                                                }
-                                                ast::As::As(alias) => alias.as_str().to_string(),
-                                            }),
-                                            expr: *expr.clone(),
-                                            contains_aggregates: true,
-                                        });
-                                    }
-                                    Ok(_) => {
-                                        crate::bail_parse_error!(
-                                            "Invalid aggregate function: {}",
-                                            name.as_str()
-                                        );
-                                    }
-                                    Err(e) => match e {
-                                        crate::LimboError::ParseError(e) => {
-                                            crate::bail_parse_error!("{}", e);
-                                        }
-                                        _ => {
-                                            crate::bail_parse_error!(
-                                                "Invalid aggregate function: {}",
-                                                name.as_str()
-                                            );
-                                        }
-                                    },
-                                }
-                            }
-                            expr => {
-                                let contains_aggregates =
-                                    resolve_aggregates(schema, expr, &mut aggregate_expressions)?;
-                                plan.result_columns.push(ResultSetColumn {
-                                    alias: maybe_alias.as_ref().map(|alias| match alias {
-                                        ast::As::Elided(alias) => alias.as_str().to_string(),
-                                        ast::As::As(alias) => alias.as_str().to_string(),
-                                    }),
-                                    expr: expr.clone(),
-                                    contains_aggregates,
-                                });
-                            }
-                        }
+                        let contains_aggregates =
+                            resolve_aggregates(schema, syms, expr, &mut aggregate_expressions)?;
+                        plan.result_columns.push(ResultSetColumn {
+                            alias: maybe_alias.as_ref().map(|alias| match alias {
+                                ast::As::Elided(alias) => alias.as_str().to_string(),
+                                ast::As::As(alias) => alias.as_str().to_string(),
+                            }),
+                            expr: expr.as_ref().clone(),
+                            contains_aggregates,
+                        });
                     }
                 }
             }
@@ -583,7 +391,7 @@ fn prepare_one_select_plan(
                                 connection,
                             )?;
                             let contains_aggregates =
-                                resolve_aggregates(schema, expr, &mut aggregate_expressions)?;
+                                resolve_aggregates(schema, syms, expr, &mut aggregate_expressions)?;
                             if !contains_aggregates {
                                 // TODO: sqlite allows HAVING clauses with non aggregate expressions like
                                 // HAVING id = 5. We should support this too eventually (I guess).
@@ -615,15 +423,15 @@ fn prepare_one_select_plan(
                     Some(&plan.result_columns),
                     connection,
                 )?;
-                resolve_aggregates(schema, &o.expr, &mut plan.aggregates)?;
+                resolve_aggregates(schema, syms, &o.expr, &mut plan.aggregates)?;
 
                 key.push((o.expr, o.order.unwrap_or(ast::SortOrder::Asc)));
             }
             plan.order_by = key;
 
             // Parse the LIMIT/OFFSET clause
-            (plan.limit, plan.offset) = limit.as_ref().map_or(Ok((None, None)), parse_limit)?;
-
+            (plan.limit, plan.offset) =
+                limit.map_or(Ok((None, None)), |mut l| parse_limit(&mut l, connection))?;
             // Return the unoptimized query plan
             Ok(plan)
         }

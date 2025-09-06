@@ -6,7 +6,7 @@ use crate::{Connection, LimboError, SymbolTable, Value};
 use std::ffi::c_void;
 use std::ptr::NonNull;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind, VTabModuleImpl};
 use turso_parser::{ast, parser::Parser};
 
@@ -14,7 +14,6 @@ use turso_parser::{ast, parser::Parser};
 pub(crate) enum VirtualTableType {
     Pragma(PragmaVirtualTable),
     External(ExtVirtualTable),
-    View(crate::vtab_view::ViewVirtualTable),
 }
 
 #[derive(Clone, Debug)]
@@ -30,7 +29,6 @@ impl VirtualTable {
         match &self.vtab_type {
             VirtualTableType::Pragma(_) => true,
             VirtualTableType::External(table) => table.readonly(),
-            VirtualTableType::View(_) => true,
         }
     }
 
@@ -88,21 +86,6 @@ impl VirtualTable {
         Ok(Arc::new(vtab))
     }
 
-    /// Create a virtual table for a view
-    pub(crate) fn view(
-        view_name: &str,
-        columns: Vec<Column>,
-        view: Arc<Mutex<crate::incremental::view::IncrementalView>>,
-    ) -> crate::Result<Arc<VirtualTable>> {
-        let vtab = VirtualTable {
-            name: view_name.to_owned(),
-            columns,
-            kind: VTabKind::VirtualTable,
-            vtab_type: VirtualTableType::View(crate::vtab_view::ViewVirtualTable { view }),
-        };
-        Ok(Arc::new(vtab))
-    }
-
     fn resolve_columns(schema: String) -> crate::Result<Vec<Column>> {
         let mut parser = Parser::new(schema.as_bytes());
         if let ast::Cmd::Stmt(ast::Stmt::CreateTable { body, .. }) = parser.next_cmd()?.ok_or(
@@ -124,9 +107,6 @@ impl VirtualTable {
             VirtualTableType::External(table) => {
                 Ok(VirtualTableCursor::External(table.open(conn.clone())?))
             }
-            VirtualTableType::View(table) => {
-                Ok(VirtualTableCursor::View(Box::new(table.open(conn)?)))
-            }
         }
     }
 
@@ -134,7 +114,6 @@ impl VirtualTable {
         match &self.vtab_type {
             VirtualTableType::Pragma(_) => Err(LimboError::ReadOnly),
             VirtualTableType::External(table) => table.update(args),
-            VirtualTableType::View(_) => Err(LimboError::ReadOnly),
         }
     }
 
@@ -142,7 +121,6 @@ impl VirtualTable {
         match &self.vtab_type {
             VirtualTableType::Pragma(_) => Ok(()),
             VirtualTableType::External(table) => table.destroy(),
-            VirtualTableType::View(_) => Ok(()),
         }
     }
 
@@ -154,7 +132,6 @@ impl VirtualTable {
         match &self.vtab_type {
             VirtualTableType::Pragma(table) => table.best_index(constraints),
             VirtualTableType::External(table) => table.best_index(constraints, order_by),
-            VirtualTableType::View(view) => view.best_index(),
         }
     }
 }
@@ -162,7 +139,6 @@ impl VirtualTable {
 pub enum VirtualTableCursor {
     Pragma(Box<PragmaVirtualTableCursor>),
     External(ExtVirtualTableCursor),
-    View(Box<crate::vtab_view::ViewVirtualTableCursor>),
 }
 
 impl VirtualTableCursor {
@@ -170,7 +146,6 @@ impl VirtualTableCursor {
         match self {
             VirtualTableCursor::Pragma(cursor) => cursor.next(),
             VirtualTableCursor::External(cursor) => cursor.next(),
-            VirtualTableCursor::View(cursor) => cursor.next(),
         }
     }
 
@@ -178,7 +153,6 @@ impl VirtualTableCursor {
         match self {
             VirtualTableCursor::Pragma(cursor) => cursor.rowid(),
             VirtualTableCursor::External(cursor) => cursor.rowid(),
-            VirtualTableCursor::View(cursor) => cursor.rowid(),
         }
     }
 
@@ -186,7 +160,6 @@ impl VirtualTableCursor {
         match self {
             VirtualTableCursor::Pragma(cursor) => cursor.column(column),
             VirtualTableCursor::External(cursor) => cursor.column(column),
-            VirtualTableCursor::View(cursor) => cursor.column(column),
         }
     }
 
@@ -202,7 +175,6 @@ impl VirtualTableCursor {
             VirtualTableCursor::External(cursor) => {
                 cursor.filter(idx_num, idx_str, arg_count, args)
             }
-            VirtualTableCursor::View(cursor) => cursor.filter(args),
         }
     }
 }

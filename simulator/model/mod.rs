@@ -1,18 +1,19 @@
-use std::{collections::HashSet, fmt::Display};
+use std::fmt::Display;
 
 use anyhow::Context;
+use indexmap::IndexSet;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use sql_generation::model::{
     query::{
+        Create, CreateIndex, Delete, Drop, Insert, Select,
         select::{CompoundOperator, FromClause, ResultColumn, SelectInner},
         transaction::{Begin, Commit, Rollback},
         update::Update,
-        Create, CreateIndex, Delete, Drop, EmptyContext, Insert, Select,
     },
     table::{JoinTable, JoinType, SimValue, Table, TableContext},
 };
-use turso_parser::ast::{fmt::ToTokens, Distinctness};
+use turso_parser::ast::Distinctness;
 
 use crate::{generation::Shadow, runner::env::SimulatorTables};
 
@@ -32,19 +33,19 @@ pub enum Query {
 }
 
 impl Query {
-    pub fn dependencies(&self) -> HashSet<String> {
+    pub fn dependencies(&self) -> IndexSet<String> {
         match self {
             Query::Select(select) => select.dependencies(),
-            Query::Create(_) => HashSet::new(),
+            Query::Create(_) => IndexSet::new(),
             Query::Insert(Insert::Select { table, .. })
             | Query::Insert(Insert::Values { table, .. })
             | Query::Delete(Delete { table, .. })
             | Query::Update(Update { table, .. })
-            | Query::Drop(Drop { table, .. }) => HashSet::from_iter([table.clone()]),
+            | Query::Drop(Drop { table, .. }) => IndexSet::from_iter([table.clone()]),
             Query::CreateIndex(CreateIndex { table_name, .. }) => {
-                HashSet::from_iter([table_name.clone()])
+                IndexSet::from_iter([table_name.clone()])
             }
-            Query::Begin(_) | Query::Commit(_) | Query::Rollback(_) => HashSet::new(),
+            Query::Begin(_) | Query::Commit(_) | Query::Rollback(_) => IndexSet::new(),
         }
     }
     pub fn uses(&self) -> Vec<String> {
@@ -282,10 +283,11 @@ impl Shadow for SelectInner {
 
             Ok(join_table)
         } else {
-            assert!(self
-                .columns
-                .iter()
-                .all(|col| matches!(col, ResultColumn::Expr(_))));
+            assert!(
+                self.columns
+                    .iter()
+                    .all(|col| matches!(col, ResultColumn::Expr(_)))
+            );
 
             // If `WHERE` is false, just return an empty table
             if !self.where_clause.test(&[], &Table::anonymous(vec![])) {
@@ -306,7 +308,7 @@ impl Shadow for SelectInner {
                         } else {
                             return Err(anyhow::anyhow!(
                                 "Failed to evaluate expression in free select ({})",
-                                expr.0.format_with_context(&EmptyContext {}).unwrap()
+                                expr.0
                             ));
                         }
                     }

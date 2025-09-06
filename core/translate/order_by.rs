@@ -117,7 +117,13 @@ pub fn emit_order_by(
     });
     program.preassign_label_to_next_insn(sort_loop_start_label);
 
-    emit_offset(program, plan, sort_loop_next_label, t_ctx.reg_offset);
+    emit_offset(
+        program,
+        plan,
+        sort_loop_next_label,
+        t_ctx.reg_offset,
+        &t_ctx.resolver,
+    );
 
     program.emit_insn(Insn::SorterData {
         cursor_id: sort_cursor,

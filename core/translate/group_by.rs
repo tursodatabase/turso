@@ -1,9 +1,16 @@
 use turso_parser::ast;
 
+use super::{
+    emitter::TranslateCtx,
+    expr::{translate_condition_expr, translate_expr, ConditionMetadata},
+    order_by::order_by_sorter_insert,
+    plan::{Distinctness, GroupBy, SelectPlan},
+    result_row::emit_select_result,
+};
+use crate::translate::aggregation::{translate_aggregation_step, AggArgumentSource};
 use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::plan::ResultSetColumn;
 use crate::{
-    function::AggFunc,
     schema::PseudoCursorType,
     translate::collate::CollationSeq,
     util::exprs_are_equivalent,
@@ -13,15 +20,6 @@ use crate::{
         BranchOffset,
     },
     Result,
-};
-
-use super::{
-    aggregation::handle_distinct,
-    emitter::{Resolver, TranslateCtx},
-    expr::{translate_condition_expr, translate_expr, ConditionMetadata},
-    order_by::order_by_sorter_insert,
-    plan::{Aggregate, Distinctness, GroupBy, SelectPlan, TableReferences},
-    result_row::emit_select_result,
 };
 
 /// Labels needed for various jumps in GROUP BY handling.
@@ -394,102 +392,6 @@ pub enum GroupByRowSource {
     },
 }
 
-/// Enum representing the source of the aggregate function arguments
-/// emitted for a group by aggregation.
-/// In the common case, the aggregate function arguments are first inserted
-/// into a sorter in the main loop, and in the group by aggregation phase
-/// we read the data from the sorter.
-///
-/// In the alternative case, no sorting is required for group by,
-/// and the aggregate function arguments are retrieved directly from
-/// registers allocated in the main loop.
-pub enum GroupByAggArgumentSource<'a> {
-    /// The aggregate function arguments are retrieved from a pseudo cursor
-    /// which reads from the GROUP BY sorter.
-    PseudoCursor {
-        cursor_id: usize,
-        col_start: usize,
-        dest_reg_start: usize,
-        aggregate: &'a Aggregate,
-    },
-    /// The aggregate function arguments are retrieved from a contiguous block of registers
-    /// allocated in the main loop for that given aggregate function.
-    Register {
-        src_reg_start: usize,
-        aggregate: &'a Aggregate,
-    },
-}
-
-impl<'a> GroupByAggArgumentSource<'a> {
-    /// Create a new [GroupByAggArgumentSource] that retrieves the values from a GROUP BY sorter.
-    pub fn new_from_cursor(
-        program: &mut ProgramBuilder,
-        cursor_id: usize,
-        col_start: usize,
-        aggregate: &'a Aggregate,
-    ) -> Self {
-        let dest_reg_start = program.alloc_registers(aggregate.args.len());
-        Self::PseudoCursor {
-            cursor_id,
-            col_start,
-            dest_reg_start,
-            aggregate,
-        }
-    }
-    /// Create a new [GroupByAggArgumentSource] that retrieves the values directly from an already
-    /// populated register or registers.
-    pub fn new_from_registers(src_reg_start: usize, aggregate: &'a Aggregate) -> Self {
-        Self::Register {
-            src_reg_start,
-            aggregate,
-        }
-    }
-
-    pub fn aggregate(&self) -> &Aggregate {
-        match self {
-            GroupByAggArgumentSource::PseudoCursor { aggregate, .. } => aggregate,
-            GroupByAggArgumentSource::Register { aggregate, .. } => aggregate,
-        }
-    }
-
-    pub fn agg_func(&self) -> &AggFunc {
-        match self {
-            GroupByAggArgumentSource::PseudoCursor { aggregate, .. } => &aggregate.func,
-            GroupByAggArgumentSource::Register { aggregate, .. } => &aggregate.func,
-        }
-    }
-    pub fn args(&self) -> &[ast::Expr] {
-        match self {
-            GroupByAggArgumentSource::PseudoCursor { aggregate, .. } => &aggregate.args,
-            GroupByAggArgumentSource::Register { aggregate, .. } => &aggregate.args,
-        }
-    }
-    pub fn num_args(&self) -> usize {
-        match self {
-            GroupByAggArgumentSource::PseudoCursor { aggregate, .. } => aggregate.args.len(),
-            GroupByAggArgumentSource::Register { aggregate, .. } => aggregate.args.len(),
-        }
-    }
-    /// Read the value of an aggregate function argument either from sorter data or directly from a register.
-    pub fn translate(&self, program: &mut ProgramBuilder, arg_idx: usize) -> Result<usize> {
-        match self {
-            GroupByAggArgumentSource::PseudoCursor {
-                cursor_id,
-                col_start,
-                dest_reg_start,
-                ..
-            } => {
-                program.emit_column_or_rowid(*cursor_id, *col_start, dest_reg_start + arg_idx);
-                Ok(dest_reg_start + arg_idx)
-            }
-            GroupByAggArgumentSource::Register {
-                src_reg_start: start_reg,
-                ..
-            } => Ok(*start_reg + arg_idx),
-        }
-    }
-}
-
 /// Emits bytecode for processing a single GROUP BY group.
 pub fn group_by_process_single_group(
     program: &mut ProgramBuilder,
@@ -593,21 +495,19 @@ pub fn group_by_process_single_group(
             .expect("aggregate registers must be initialized");
         let agg_result_reg = start_reg + i;
         let agg_arg_source = match &row_source {
-            GroupByRowSource::Sorter { pseudo_cursor, .. } => {
-                GroupByAggArgumentSource::new_from_cursor(
-                    program,
-                    *pseudo_cursor,
-                    cursor_index + offset,
-                    agg,
-                )
-            }
+            GroupByRowSource::Sorter { pseudo_cursor, .. } => AggArgumentSource::new_from_cursor(
+                program,
+                *pseudo_cursor,
+                cursor_index + offset,
+                agg,
+            ),
             GroupByRowSource::MainLoop { start_reg_src, .. } => {
                 // Aggregation arguments are always placed in the registers that follow any scalars.
                 let start_reg_aggs = start_reg_src + t_ctx.non_aggregate_expressions.len();
-                GroupByAggArgumentSource::new_from_registers(start_reg_aggs + offset, agg)
+                AggArgumentSource::new_from_registers(start_reg_aggs + offset, agg)
             }
         };
-        translate_aggregation_step_groupby(
+        translate_aggregation_step(
             program,
             &plan.table_references,
             agg_arg_source,
@@ -896,221 +796,4 @@ pub fn group_by_emit_row_phase<'a>(
     });
     program.preassign_label_to_next_insn(labels.label_group_by_end);
     Ok(())
-}
-
-/// Emits the bytecode for processing an aggregate step within a GROUP BY clause.
-/// Eg. in `SELECT product_category, SUM(price) FROM t GROUP BY line_item`, 'price' is evaluated for every row
-/// where the 'product_category' is the same, and the result is added to the accumulator for that category.
-///
-/// This is distinct from the final step, which is called after a single group has been entirely accumulated,
-/// and the actual result value of the aggregation is materialized.
-pub fn translate_aggregation_step_groupby(
-    program: &mut ProgramBuilder,
-    referenced_tables: &TableReferences,
-    agg_arg_source: GroupByAggArgumentSource,
-    target_register: usize,
-    resolver: &Resolver,
-) -> Result<usize> {
-    let num_args = agg_arg_source.num_args();
-    let dest = match agg_arg_source.agg_func() {
-        AggFunc::Avg => {
-            if num_args != 1 {
-                crate::bail_parse_error!("avg bad number of arguments");
-            }
-            let expr_reg = agg_arg_source.translate(program, 0)?;
-            handle_distinct(program, agg_arg_source.aggregate(), expr_reg);
-            program.emit_insn(Insn::AggStep {
-                acc_reg: target_register,
-                col: expr_reg,
-                delimiter: 0,
-                func: AggFunc::Avg,
-            });
-            target_register
-        }
-        AggFunc::Count | AggFunc::Count0 => {
-            let expr_reg = agg_arg_source.translate(program, 0)?;
-            handle_distinct(program, agg_arg_source.aggregate(), expr_reg);
-            program.emit_insn(Insn::AggStep {
-                acc_reg: target_register,
-                col: expr_reg,
-                delimiter: 0,
-                func: if matches!(agg_arg_source.agg_func(), AggFunc::Count0) {
-                    AggFunc::Count0
-                } else {
-                    AggFunc::Count
-                },
-            });
-            target_register
-        }
-        AggFunc::GroupConcat => {
-            let num_args = agg_arg_source.num_args();
-            if num_args != 1 && num_args != 2 {
-                crate::bail_parse_error!("group_concat bad number of arguments");
-            }
-
-            let delimiter_reg = program.alloc_register();
-
-            let delimiter_expr: ast::Expr;
-
-            if num_args == 2 {
-                match &agg_arg_source.args()[1] {
-                    arg @ ast::Expr::Column { .. } => {
-                        delimiter_expr = arg.clone();
-                    }
-                    ast::Expr::Literal(ast::Literal::String(s)) => {
-                        delimiter_expr = ast::Expr::Literal(ast::Literal::String(s.to_string()));
-                    }
-                    _ => crate::bail_parse_error!("Incorrect delimiter parameter"),
-                };
-            } else {
-                delimiter_expr = ast::Expr::Literal(ast::Literal::String(String::from("\",\"")));
-            }
-
-            let expr_reg = agg_arg_source.translate(program, 0)?;
-            handle_distinct(program, agg_arg_source.aggregate(), expr_reg);
-            translate_expr(
-                program,
-                Some(referenced_tables),
-                &delimiter_expr,
-                delimiter_reg,
-                resolver,
-            )?;
-
-            program.emit_insn(Insn::AggStep {
-                acc_reg: target_register,
-                col: expr_reg,
-                delimiter: delimiter_reg,
-                func: AggFunc::GroupConcat,
-            });
-
-            target_register
-        }
-        AggFunc::Max => {
-            if num_args != 1 {
-                crate::bail_parse_error!("max bad number of arguments");
-            }
-            let expr_reg = agg_arg_source.translate(program, 0)?;
-            handle_distinct(program, agg_arg_source.aggregate(), expr_reg);
-            program.emit_insn(Insn::AggStep {
-                acc_reg: target_register,
-                col: expr_reg,
-                delimiter: 0,
-                func: AggFunc::Max,
-            });
-            target_register
-        }
-        AggFunc::Min => {
-            if num_args != 1 {
-                crate::bail_parse_error!("min bad number of arguments");
-            }
-            let expr_reg = agg_arg_source.translate(program, 0)?;
-            handle_distinct(program, agg_arg_source.aggregate(), expr_reg);
-            program.emit_insn(Insn::AggStep {
-                acc_reg: target_register,
-                col: expr_reg,
-                delimiter: 0,
-                func: AggFunc::Min,
-            });
-            target_register
-        }
-        #[cfg(feature = "json")]
-        AggFunc::JsonGroupArray | AggFunc::JsonbGroupArray => {
-            if num_args != 1 {
-                crate::bail_parse_error!("min bad number of arguments");
-            }
-            let expr_reg = agg_arg_source.translate(program, 0)?;
-            handle_distinct(program, agg_arg_source.aggregate(), expr_reg);
-            program.emit_insn(Insn::AggStep {
-                acc_reg: target_register,
-                col: expr_reg,
-                delimiter: 0,
-                func: AggFunc::JsonGroupArray,
-            });
-            target_register
-        }
-        #[cfg(feature = "json")]
-        AggFunc::JsonGroupObject | AggFunc::JsonbGroupObject => {
-            if num_args != 2 {
-                crate::bail_parse_error!("max bad number of arguments");
-            }
-
-            let expr_reg = agg_arg_source.translate(program, 0)?;
-            handle_distinct(program, agg_arg_source.aggregate(), expr_reg);
-            let value_reg = agg_arg_source.translate(program, 1)?;
-
-            program.emit_insn(Insn::AggStep {
-                acc_reg: target_register,
-                col: expr_reg,
-                delimiter: value_reg,
-                func: AggFunc::JsonGroupObject,
-            });
-            target_register
-        }
-        AggFunc::StringAgg => {
-            if num_args != 2 {
-                crate::bail_parse_error!("string_agg bad number of arguments");
-            }
-
-            let delimiter_reg = program.alloc_register();
-
-            let delimiter_expr = match &agg_arg_source.args()[1] {
-                arg @ ast::Expr::Column { .. } => arg.clone(),
-                ast::Expr::Literal(ast::Literal::String(s)) => {
-                    ast::Expr::Literal(ast::Literal::String(s.to_string()))
-                }
-                _ => crate::bail_parse_error!("Incorrect delimiter parameter"),
-            };
-
-            let expr_reg = agg_arg_source.translate(program, 0)?;
-            handle_distinct(program, agg_arg_source.aggregate(), expr_reg);
-            translate_expr(
-                program,
-                Some(referenced_tables),
-                &delimiter_expr,
-                delimiter_reg,
-                resolver,
-            )?;
-
-            program.emit_insn(Insn::AggStep {
-                acc_reg: target_register,
-                col: expr_reg,
-                delimiter: delimiter_reg,
-                func: AggFunc::StringAgg,
-            });
-
-            target_register
-        }
-        AggFunc::Sum => {
-            if num_args != 1 {
-                crate::bail_parse_error!("sum bad number of arguments");
-            }
-            let expr_reg = agg_arg_source.translate(program, 0)?;
-            handle_distinct(program, agg_arg_source.aggregate(), expr_reg);
-            program.emit_insn(Insn::AggStep {
-                acc_reg: target_register,
-                col: expr_reg,
-                delimiter: 0,
-                func: AggFunc::Sum,
-            });
-            target_register
-        }
-        AggFunc::Total => {
-            if num_args != 1 {
-                crate::bail_parse_error!("total bad number of arguments");
-            }
-            let expr_reg = agg_arg_source.translate(program, 0)?;
-            handle_distinct(program, agg_arg_source.aggregate(), expr_reg);
-            program.emit_insn(Insn::AggStep {
-                acc_reg: target_register,
-                col: expr_reg,
-                delimiter: 0,
-                func: AggFunc::Total,
-            });
-            target_register
-        }
-        AggFunc::External(_) => {
-            todo!("External aggregate functions are not yet supported in GROUP BY");
-        }
-    };
-    Ok(dest)
 }

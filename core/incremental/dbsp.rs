@@ -1,19 +1,86 @@
 // Simplified DBSP integration for incremental view maintenance
 // For now, we'll use a basic approach and can expand to full DBSP later
 
-use std::collections::HashMap;
+use super::hashable_row::HashableRow;
+use crate::Value;
+use std::collections::{BTreeMap, HashMap};
+
+type DeltaEntry = (HashableRow, isize);
+/// A delta represents ordered changes to data
+#[derive(Debug, Clone, Default)]
+pub struct Delta {
+    /// Ordered list of changes: (row, weight) where weight is +1 for insert, -1 for delete
+    /// It is crucial that this is ordered. Imagine the case of an update, which becomes a delete +
+    /// insert. If this is not ordered, it would be applied in arbitrary order and break the view.
+    pub changes: Vec<DeltaEntry>,
+}
+
+impl Delta {
+    pub fn new() -> Self {
+        Self {
+            changes: Vec::new(),
+        }
+    }
+
+    pub fn insert(&mut self, row_key: i64, values: Vec<Value>) {
+        let row = HashableRow::new(row_key, values);
+        self.changes.push((row, 1));
+    }
+
+    pub fn delete(&mut self, row_key: i64, values: Vec<Value>) {
+        let row = HashableRow::new(row_key, values);
+        self.changes.push((row, -1));
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.changes.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.changes.len()
+    }
+
+    /// Merge another delta into this one
+    /// This preserves the order of operations - no consolidation is done
+    /// to maintain the full history of changes
+    pub fn merge(&mut self, other: &Delta) {
+        // Simply append all changes from other, preserving order
+        self.changes.extend(other.changes.iter().cloned());
+    }
+
+    /// Consolidate changes by combining entries with the same HashableRow
+    pub fn consolidate(&mut self) {
+        if self.changes.is_empty() {
+            return;
+        }
+
+        // Use a HashMap to accumulate weights
+        let mut consolidated: HashMap<HashableRow, isize> = HashMap::new();
+
+        for (row, weight) in self.changes.drain(..) {
+            *consolidated.entry(row).or_insert(0) += weight;
+        }
+
+        // Convert back to vec, filtering out zero weights
+        self.changes = consolidated
+            .into_iter()
+            .filter(|(_, weight)| *weight != 0)
+            .collect();
+    }
+}
 
 /// A simplified ZSet for incremental computation
 /// Each element has a weight: positive for additions, negative for deletions
 #[derive(Clone, Debug, Default)]
 pub struct SimpleZSet<T> {
-    data: HashMap<T, isize>,
+    data: BTreeMap<T, isize>,
 }
 
-impl<T: std::hash::Hash + Eq + Clone> SimpleZSet<T> {
+#[allow(dead_code)]
+impl<T: std::hash::Hash + Eq + Ord + Clone> SimpleZSet<T> {
     pub fn new() -> Self {
         Self {
-            data: HashMap::new(),
+            data: BTreeMap::new(),
         }
     }
 
@@ -45,36 +112,121 @@ impl<T: std::hash::Hash + Eq + Clone> SimpleZSet<T> {
             self.insert(item.clone(), weight);
         }
     }
-}
 
-/// A simplified stream for incremental computation
-#[derive(Clone, Debug)]
-pub struct SimpleStream<T> {
-    current: SimpleZSet<T>,
-}
-
-impl<T: std::hash::Hash + Eq + Clone> SimpleStream<T> {
-    pub fn from_zset(zset: SimpleZSet<T>) -> Self {
-        Self { current: zset }
+    /// Get the weight for a specific item (0 if not present)
+    pub fn get(&self, item: &T) -> isize {
+        self.data.get(item).copied().unwrap_or(0)
     }
 
-    /// Apply a delta (change) to the stream
-    pub fn apply_delta(&mut self, delta: &SimpleZSet<T>) {
-        self.current.merge(delta);
+    /// Get the first element (smallest key) in the Z-set
+    pub fn first(&self) -> Option<(&T, isize)> {
+        self.data.iter().next().map(|(k, &v)| (k, v))
     }
 
-    /// Get the current state as a vector of items (only positive weights)
-    pub fn to_vec(&self) -> Vec<T> {
-        self.current.to_vec()
+    /// Get the last element (largest key) in the Z-set
+    pub fn last(&self) -> Option<(&T, isize)> {
+        self.data.iter().next_back().map(|(k, &v)| (k, v))
+    }
+
+    /// Get a range of elements
+    pub fn range<R>(&self, range: R) -> impl Iterator<Item = (&T, isize)> + '_
+    where
+        R: std::ops::RangeBounds<T>,
+    {
+        self.data.range(range).map(|(k, &v)| (k, v))
+    }
+
+    /// Check if empty
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+
+    /// Get the number of elements
+    pub fn len(&self) -> usize {
+        self.data.len()
     }
 }
 
 // Type aliases for convenience
-use super::hashable_row::HashableRow;
-
 pub type RowKey = HashableRow;
 pub type RowKeyZSet = SimpleZSet<RowKey>;
-pub type RowKeyStream = SimpleStream<RowKey>;
+
+impl RowKeyZSet {
+    /// Create a Z-set from a Delta by consolidating all changes
+    pub fn from_delta(delta: &Delta) -> Self {
+        let mut zset = Self::new();
+
+        // Add all changes from the delta, consolidating as we go
+        for (row, weight) in &delta.changes {
+            zset.insert(row.clone(), *weight);
+        }
+
+        zset
+    }
+
+    /// Seek to find ALL entries for the best matching rowid
+    /// For GT/GE: returns all entries for the smallest rowid that satisfies the condition
+    /// For LT/LE: returns all entries for the largest rowid that satisfies the condition
+    /// Returns empty vec if no match found
+    pub fn seek(&self, target: i64, op: crate::types::SeekOp) -> Vec<(HashableRow, isize)> {
+        use crate::types::SeekOp;
+
+        // First find the best matching rowid
+        let best_rowid = match op {
+            SeekOp::GT => {
+                // Find smallest rowid > target
+                self.data
+                    .iter()
+                    .filter(|(row, _)| row.rowid > target)
+                    .map(|(row, _)| row.rowid)
+                    .min()
+            }
+            SeekOp::GE { eq_only: false } => {
+                // Find smallest rowid >= target
+                self.data
+                    .iter()
+                    .filter(|(row, _)| row.rowid >= target)
+                    .map(|(row, _)| row.rowid)
+                    .min()
+            }
+            SeekOp::GE { eq_only: true } | SeekOp::LE { eq_only: true } => {
+                // Need exact match
+                if self.data.iter().any(|(row, _)| row.rowid == target) {
+                    Some(target)
+                } else {
+                    None
+                }
+            }
+            SeekOp::LT => {
+                // Find largest rowid < target
+                self.data
+                    .iter()
+                    .filter(|(row, _)| row.rowid < target)
+                    .map(|(row, _)| row.rowid)
+                    .max()
+            }
+            SeekOp::LE { eq_only: false } => {
+                // Find largest rowid <= target
+                self.data
+                    .iter()
+                    .filter(|(row, _)| row.rowid <= target)
+                    .map(|(row, _)| row.rowid)
+                    .max()
+            }
+        };
+
+        // Now get ALL entries with that rowid
+        match best_rowid {
+            Some(rowid) => self
+                .data
+                .iter()
+                .filter(|(row, _)| row.rowid == rowid)
+                .map(|(k, &v)| (k.clone(), v))
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

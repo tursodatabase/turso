@@ -25,9 +25,17 @@ impl GenerationContext for SimulatorEnv {
         &self.tables.tables
     }
 
-    fn opts(&self) -> sql_generation::generation::Opts {
-        sql_generation::generation::Opts {
-            indexes: self.opts.experimental_indexes,
-        }
+    fn opts(&self) -> &sql_generation::generation::Opts {
+        &self.profile.query.gen_opts
+    }
+}
+
+impl GenerationContext for &mut SimulatorEnv {
+    fn tables(&self) -> &Vec<sql_generation::model::table::Table> {
+        &self.tables.tables
+    }
+
+    fn opts(&self) -> &sql_generation::generation::Opts {
+        &self.profile.query.gen_opts
     }
 }

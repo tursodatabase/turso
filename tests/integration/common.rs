@@ -29,9 +29,7 @@ impl TempDatabase {
             io.clone(),
             path.to_str().unwrap(),
             turso_core::OpenFlags::default(),
-            false,
-            enable_indexes,
-            false,
+            turso_core::DatabaseOpts::new().with_indexes(enable_indexes),
         )
         .unwrap();
         Self { path, io, db }
@@ -55,9 +53,7 @@ impl TempDatabase {
             io.clone(),
             db_path.to_str().unwrap(),
             flags,
-            false,
-            enable_indexes,
-            false,
+            turso_core::DatabaseOpts::new().with_indexes(enable_indexes),
         )
         .unwrap();
         Self {
@@ -85,9 +81,7 @@ impl TempDatabase {
             io.clone(),
             path.to_str().unwrap(),
             turso_core::OpenFlags::default(),
-            false,
-            enable_indexes,
-            false,
+            turso_core::DatabaseOpts::new().with_indexes(enable_indexes),
         )
         .unwrap();
 

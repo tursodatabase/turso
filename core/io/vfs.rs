@@ -81,8 +81,6 @@ impl VfsMod {
     }
 }
 
-// #Safety:
-// the callback wrapper in the extension library is FnOnce, so we know
 /// # Safety
 /// the callback wrapper in the extension library is FnOnce, so we know
 /// that the into_raw/from_raw contract will hold
@@ -121,7 +119,7 @@ impl File for VfsFileImpl {
         Ok(())
     }
 
-    fn pread(&self, pos: usize, c: Completion) -> Result<Completion> {
+    fn pread(&self, pos: u64, c: Completion) -> Result<Completion> {
         if self.vfs.is_null() {
             c.complete(-1);
             return Err(LimboError::ExtensionError("VFS is null".to_string()));
@@ -145,7 +143,7 @@ impl File for VfsFileImpl {
         Ok(c)
     }
 
-    fn pwrite(&self, pos: usize, buffer: Arc<Buffer>, c: Completion) -> Result<Completion> {
+    fn pwrite(&self, pos: u64, buffer: Arc<Buffer>, c: Completion) -> Result<Completion> {
         if self.vfs.is_null() {
             c.complete(-1);
             return Err(LimboError::ExtensionError("VFS is null".to_string()));
@@ -192,7 +190,7 @@ impl File for VfsFileImpl {
         }
     }
 
-    fn truncate(&self, len: usize, c: Completion) -> Result<Completion> {
+    fn truncate(&self, len: u64, c: Completion) -> Result<Completion> {
         if self.vfs.is_null() {
             c.complete(-1);
             return Err(LimboError::ExtensionError("VFS is null".to_string()));

@@ -5,12 +5,16 @@ use std::panic::UnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use garde::Validate;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use sql_generation::model::table::Table;
 use turso_core::Database;
 
+use crate::profiles::Profile;
+use crate::runner::SimIO;
 use crate::runner::io::SimulatorIO;
+use crate::runner::memory::io::MemorySimIO;
 
 use super::cli::SimulatorCLI;
 
@@ -59,14 +63,16 @@ impl Deref for SimulatorTables {
 
 pub(crate) struct SimulatorEnv {
     pub(crate) opts: SimulatorOpts,
+    pub profile: Profile,
     pub(crate) connections: Vec<SimConnection>,
-    pub(crate) io: Arc<SimulatorIO>,
+    pub(crate) io: Arc<dyn SimIO>,
     pub(crate) db: Option<Arc<Database>>,
     pub(crate) rng: ChaCha8Rng,
     pub(crate) paths: Paths,
     pub(crate) type_: SimulationType,
     pub(crate) phase: SimulationPhase,
     pub(crate) tables: SimulatorTables,
+    pub memory_io: bool,
 }
 
 impl UnwindSafe for SimulatorEnv {}
@@ -85,6 +91,8 @@ impl SimulatorEnv {
             paths: self.paths.clone(),
             type_: self.type_,
             phase: self.phase,
+            memory_io: self.memory_io,
+            profile: self.profile.clone(),
         }
     }
 
@@ -93,16 +101,28 @@ impl SimulatorEnv {
         self.connections.iter_mut().for_each(|c| c.disconnect());
         self.rng = ChaCha8Rng::seed_from_u64(self.opts.seed);
 
-        let io = Arc::new(
-            SimulatorIO::new(
+        let latency_prof = &self.profile.io.latency;
+
+        let io: Arc<dyn SimIO> = if self.memory_io {
+            Arc::new(MemorySimIO::new(
                 self.opts.seed,
                 self.opts.page_size,
-                self.opts.latency_probability,
-                self.opts.min_tick,
-                self.opts.max_tick,
+                latency_prof.latency_probability,
+                latency_prof.min_tick,
+                latency_prof.max_tick,
+            ))
+        } else {
+            Arc::new(
+                SimulatorIO::new(
+                    self.opts.seed,
+                    self.opts.page_size,
+                    latency_prof.latency_probability,
+                    latency_prof.min_tick,
+                    latency_prof.max_tick,
+                )
+                .unwrap(),
             )
-            .unwrap(),
-        );
+        };
 
         // Remove existing database file
         let db_path = self.get_db_path();
@@ -119,8 +139,8 @@ impl SimulatorEnv {
         let db = match Database::open_file(
             io.clone(),
             db_path.to_str().unwrap(),
-            self.opts.experimental_mvcc,
-            self.opts.experimental_indexes,
+            self.profile.experimental_mvcc,
+            self.profile.query.gen_opts.indexes,
         ) {
             Ok(db) => db,
             Err(e) => {
@@ -161,61 +181,9 @@ impl SimulatorEnv {
         cli_opts: &SimulatorCLI,
         paths: Paths,
         simulation_type: SimulationType,
+        profile: &Profile,
     ) -> Self {
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
-
-        let total = 100.0;
-
-        let mut create_percent = 0.0;
-        let mut create_index_percent = 0.0;
-        let mut drop_percent = 0.0;
-        let mut delete_percent = 0.0;
-        let mut update_percent = 0.0;
-
-        let read_percent = rng.random_range(0.0..=total);
-        let write_percent = total - read_percent;
-
-        if !cli_opts.disable_create {
-            // Create percent should be 5-15% of the write percent
-            create_percent = rng.random_range(0.05..=0.15) * write_percent;
-        }
-        if !cli_opts.disable_create_index {
-            // Create indexpercent should be 2-5% of the write percent
-            create_index_percent = rng.random_range(0.02..=0.05) * write_percent;
-        }
-        if !cli_opts.disable_drop {
-            // Drop percent should be 2-5% of the write percent
-            drop_percent = rng.random_range(0.02..=0.05) * write_percent;
-        }
-        if !cli_opts.disable_delete {
-            // Delete percent should be 10-20% of the write percent
-            delete_percent = rng.random_range(0.1..=0.2) * write_percent;
-        }
-        if !cli_opts.disable_update {
-            // Update percent should be 10-20% of the write percent
-            // TODO: freestyling the percentage
-            update_percent = rng.random_range(0.1..=0.2) * write_percent;
-        }
-
-        let write_percent = write_percent
-            - create_percent
-            - create_index_percent
-            - delete_percent
-            - drop_percent
-            - update_percent;
-
-        let summed_total: f64 = read_percent
-            + write_percent
-            + create_percent
-            + create_index_percent
-            + drop_percent
-            + update_percent
-            + delete_percent;
-
-        let abs_diff = (summed_total - total).abs();
-        if abs_diff > 0.0001 {
-            panic!("Summed total {summed_total} is not equal to total {total}");
-        }
 
         let opts = SimulatorOpts {
             seed,
@@ -223,13 +191,6 @@ impl SimulatorEnv {
             max_connections: 1, // TODO: for now let's use one connection as we didn't implement
             // correct transactions processing
             max_tables: rng.random_range(0..128),
-            create_percent,
-            create_index_percent,
-            read_percent,
-            write_percent,
-            delete_percent,
-            drop_percent,
-            update_percent,
             disable_select_optimizer: cli_opts.disable_select_optimizer,
             disable_insert_values_select: cli_opts.disable_insert_values_select,
             disable_double_create_failure: cli_opts.disable_double_create_failure,
@@ -242,26 +203,11 @@ impl SimulatorEnv {
             disable_fsync_no_wait: cli_opts.disable_fsync_no_wait,
             disable_faulty_query: cli_opts.disable_faulty_query,
             page_size: 4096, // TODO: randomize this too
-            max_interactions: rng.random_range(cli_opts.minimum_tests..=cli_opts.maximum_tests),
+            max_interactions: rng.random_range(cli_opts.minimum_tests..=cli_opts.maximum_tests)
+                as u32,
             max_time_simulation: cli_opts.maximum_time,
             disable_reopen_database: cli_opts.disable_reopen_database,
-            latency_probability: cli_opts.latency_probability,
-            experimental_mvcc: cli_opts.experimental_mvcc,
-            experimental_indexes: !cli_opts.disable_experimental_indexes,
-            min_tick: cli_opts.min_tick,
-            max_tick: cli_opts.max_tick,
         };
-
-        let io = Arc::new(
-            SimulatorIO::new(
-                seed,
-                opts.page_size,
-                cli_opts.latency_probability,
-                cli_opts.min_tick,
-                cli_opts.max_tick,
-            )
-            .unwrap(),
-        );
 
         // Remove existing database file if it exists
         let db_path = paths.db(&simulation_type, &SimulationPhase::Test);
@@ -275,11 +221,54 @@ impl SimulatorEnv {
             std::fs::remove_file(&wal_path).unwrap();
         }
 
+        let mut profile = profile.clone();
+        // Conditionals here so that we can override some profile options from the CLI
+        if let Some(mvcc) = cli_opts.experimental_mvcc {
+            profile.experimental_mvcc = mvcc;
+        }
+        if let Some(indexes) = cli_opts.disable_experimental_indexes {
+            profile.query.gen_opts.indexes = indexes;
+        }
+        if let Some(latency_prob) = cli_opts.latency_probability {
+            profile.io.latency.latency_probability = latency_prob;
+        }
+        if let Some(max_tick) = cli_opts.max_tick {
+            profile.io.latency.max_tick = max_tick;
+        }
+        if let Some(min_tick) = cli_opts.min_tick {
+            profile.io.latency.min_tick = min_tick;
+        }
+
+        profile.validate().unwrap();
+
+        let latency_prof = &profile.io.latency;
+
+        let io: Arc<dyn SimIO> = if cli_opts.memory_io {
+            Arc::new(MemorySimIO::new(
+                seed,
+                opts.page_size,
+                latency_prof.latency_probability,
+                latency_prof.min_tick,
+                latency_prof.max_tick,
+            ))
+        } else {
+            Arc::new(
+                SimulatorIO::new(
+                    seed,
+                    opts.page_size,
+                    latency_prof.latency_probability,
+                    latency_prof.min_tick,
+                    latency_prof.max_tick,
+                )
+                .unwrap(),
+            )
+        };
+
         let db = match Database::open_file(
             io.clone(),
             db_path.to_str().unwrap(),
-            opts.experimental_mvcc,
-            opts.experimental_indexes,
+            profile.experimental_mvcc,
+            profile.query.gen_opts.indexes,
         ) {
             Ok(db) => db,
             Err(e) => {
@@ -301,6 +290,8 @@ impl SimulatorEnv {
             db: Some(db),
             type_: simulation_type,
             phase: SimulationPhase::Test,
+            memory_io: cli_opts.memory_io,
+            profile: profile.clone(),
         }
     }
 
@@ -394,15 +385,6 @@ pub(crate) struct SimulatorOpts {
     pub(crate) ticks: usize,
     pub(crate) max_connections: usize,
     pub(crate) max_tables: usize,
-    // this next options are the distribution of workload where read_percent + write_percent +
-    // delete_percent == 100%
-    pub(crate) create_percent: f64,
-    pub(crate) create_index_percent: f64,
-    pub(crate) read_percent: f64,
-    pub(crate) write_percent: f64,
-    pub(crate) delete_percent: f64,
-    pub(crate) update_percent: f64,
-    pub(crate) drop_percent: f64,
 
     pub(crate) disable_select_optimizer: bool,
     pub(crate) disable_insert_values_select: bool,
@@ -416,14 +398,9 @@ pub(crate) struct SimulatorOpts {
     pub(crate) disable_faulty_query: bool,
     pub(crate) disable_reopen_database: bool,
 
-    pub(crate) max_interactions: usize,
+    pub(crate) max_interactions: u32,
     pub(crate) page_size: usize,
     pub(crate) max_time_simulation: usize,
-    pub(crate) latency_probability: usize,
-    pub(crate) experimental_mvcc: bool,
-    pub(crate) experimental_indexes: bool,
-    pub min_tick: u64,
-    pub max_tick: u64,
 }
 
 #[derive(Debug, Clone)]
