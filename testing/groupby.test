@@ -31,42 +31,42 @@ Alec}
 
 do_execsql_test group_by_two_joined_columns {
   select u.first_name, p.name, sum(u.age) from users u join products p on u.id = p.id group by u.first_name, p.name limit 10;
-} {Anne|sweater|56
-Carrie|sneakers|63
-Dawn|hat|41
-Elizabeth|cap|85
-Jacqueline|accessories|62
-Jennifer|sweatshirt|21
-Lisa|boots|32
-Matthew|shirt|67
-Nancy|jeans|61
-Robert|shorts|47}
+} {Aaron|As|64
+Aaron|Available|62
+Aaron|Bag|46
+Aaron|Become|70
+Aaron|Bit|34
+Aaron|By|92
+Aaron|Dog|76
+Aaron|Far|26
+Aaron|Fly|67
+Aaron|Free|20}
 
 do_execsql_test group_by_order_by {
   select u.first_name, p.name, sum(u.age) from users u join products p on u.id = p.id group by u.first_name, p.name order by p.name limit 10;
-} {Jacqueline|accessories|62
-Lisa|boots|32
-Elizabeth|cap|85
-Tracy|coat|54
-Dawn|hat|41
-Nancy|jeans|61
-Matthew|shirt|67
-Robert|shorts|47
-Carrie|sneakers|63
-Anne|sweater|56}
+} {David|A|77
+Eric|A|25
+Heather|A|24
+James|A|84
+Jeanne|A|26
+John|A|50
+Juan|A|68
+Michael|A|68
+Paul|A|26
+Ryan|A|85}
 
 do_execsql_test group_by_order_by_aggregate {
   select u.first_name, p.name, sum(u.age) from users u join products p on u.id = p.id group by u.first_name, p.name order by sum(u.age) limit 10;
-} {Jennifer|sweatshirt|21
-Lisa|boots|32
-Dawn|hat|41
-Robert|shorts|47
-Tracy|coat|54
-Anne|sweater|56
-Nancy|jeans|61
-Jacqueline|accessories|62
-Carrie|sneakers|63
-Matthew|shirt|67}
+} {Alexis|World|18
+Alicia|Father|18
+Alicia|Stop|18
+Allison|Side|18
+Amber|Price|18
+Andrew|Onto|18
+Andrew|Surface|18
+Angela|Again|18
+Angela|Control|18
+Anthony|Generation|18}
 
 do_execsql_test group_by_multiple_aggregates {
   select u.first_name, sum(u.age), count(u.age) from users u group by u.first_name order by sum(u.age) limit 10;
@@ -257,7 +257,7 @@ Sarah|1|65.0}
 do_execsql_test complex_result_expression_containing_aggregate {
   select
     case when price > 70 then group_concat(name, ',') else '<undisclosed>' end names
-  from products
+  from products where id < 12
   group by price
   order by price;
 } {<undisclosed>
@@ -274,7 +274,7 @@ cap,sneakers}
 do_execsql_test complex_result_expression_containing_aggregate_and_rowid {
   select
     case when rowid >= 5 then group_concat(name, ',') else '<undisclosed>' end names
-  from products
+  from products where id < 12
   group by rowid
   order by rowid;
 } {<undisclosed>
@@ -290,11 +290,11 @@ coat
 accessories}
 
 do_execsql_test complex_having_expression_containing_aggregate {
-  select group_concat(name, ',') from products group by price having (group_concat(name, ',') || price) like 'ca%';
+  select group_concat(name, ',') from products where id < 12 group by price having (group_concat(name, ',') || price) like 'ca%';
 } {cap,sneakers}
 
 do_execsql_test complex_order_by_expression_containing_aggregate {
-  select group_concat(name, ',') from products group by price order by (group_concat(name, ',') || price);
+  select group_concat(name, ',') from products where id < 12 group by price order by (group_concat(name, ',') || price);
 } {accessories
 boots
 cap,sneakers

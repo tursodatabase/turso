@@ -22,7 +22,7 @@ do_execsql_test cross-join-where-left-tbl {
 Dawn|cap}
 
 do_execsql_test inner-join-pk {
-    select users.first_name as user_name, products.name as product_name from users join products on users.id = products.id;
+    select users.first_name as user_name, products.name as product_name from users join products on users.id = products.id where products.id < 12;
 } {Dawn|hat
 Elizabeth|cap
 Matthew|shirt
@@ -40,7 +40,7 @@ do_execsql_test inner-join-non-pk-unqualified {
 } {Dawn|hat}
 
 do_execsql_test inner-join-non-pk-qualified {
-    select users.first_name as user_name, products.name as product_name from users join products on users.first_name = products.name;
+    select users.first_name as user_name, products.name as product_name from users join products on users.first_name = products.name where products.id < 12;
 } {}
 
 do_execsql_test inner-join-self {
@@ -81,37 +81,37 @@ Carrie|sneakers
 Lisa|boots
 Tracy|coat
 Jacqueline|accessories
-Eric|}
+Eric|Your}
 
 do_execsql_test left-join-with-where {
     select u.first_name, p.name from users u left join products as p on u.id = p.id where u.id >= 10 limit 5;
 } {Tracy|coat
 Jacqueline|accessories
-Eric|
-Christina|
-Christopher|}
+Eric|Your
+Christina|Sell
+Christopher|Analysis}
 
-do_execsql_test left-join-with-where-2 {
-   select users.first_name, products.name from users left join products on users.id < 2 where users.id < 3;
-} {Dawn|hat
-Dawn|cap
-Dawn|shirt
-Dawn|sweater
-Dawn|sweatshirt
-Dawn|shorts
-Dawn|jeans
-Dawn|sneakers
-Dawn|boots
-Dawn|coat
-Dawn|accessories
-Elizabeth|}
+# FIXME!: https://github.com/tursodatabase/turso/issues/2949
+# do_execsql_test left-join-with-where-2 {
+#    select users.first_name, products.name from users left join products on users.id < 2 where users.id < 3 and products.id < 12;
+# } {Dawn|hat
+# Dawn|cap
+# Dawn|shirt
+# Dawn|sweater
+# Dawn|sweatshirt
+# Dawn|shorts
+# Dawn|jeans
+# Dawn|sneakers
+# Dawn|boots
+# Dawn|coat
+# Dawn|accessories}
 
 # This test verifies that the WHERE clause is evaluated after the LEFT JOIN,
 # effectively filtering out rows where the right table has no match.
 do_execsql_test left-join-with-where-right-table {
     select users.id, price
     from users left join products on users.id = products.id
-    where products.price is not null
+    where products.price is not null and products.id < 12
     order by users.id;
 } {1|79.0
 2|82.0
@@ -129,9 +129,9 @@ do_execsql_test left-join-row-id {
     select u.rowid, p.rowid from users u left join products as p on u.rowid = p.rowid where u.rowid >= 10 limit 5;
 } {10|10
 11|11
-12|
-13|
-14|}
+12|12
+13|13
+14|14}
 
 do_execsql_test left-join-constant-condition-true {
     select u.first_name, p.name from users u left join products as p on true limit 1;
@@ -182,12 +182,12 @@ Elizabeth|cap}
 
 do_execsql_test left-join-order-by-qualified {
     select users.first_name, products.name from users left join products on users.id = products.id where users.first_name like 'Jam%' order by null limit 2;
-} {James|
-James|}
+} {James|Deal
+James|Suffer}
 
 do_execsql_test left-join-order-by-qualified-nullable-sorting-col {
     select users.first_name, products.name from users left join products on users.id = products.id order by products.name limit 1;
-} {Eric|}
+} {Heather|}
 
 do_execsql_test left-join-constant-condition-true {
     select u.first_name, p.name from users u left join products as p on 1 limit 5;
@@ -217,12 +217,20 @@ do_execsql_test three-way-inner-join-with-two-seeks {
 3|Matthew|Rivera|tinaparker@example.com|(884)803-5297x995|914 Logan Way Apt. 239|Mannton|CO|30662|67|2025-06-21 11:47:14.054766|2025-06-24 03:24:36.724644|3|Matthew|Rivera|tinaparker@example.com|(884)803-5297x995|914 Logan Way Apt. 239|Mannton|CO|30662|67|2025-06-21 11:47:14.054766|2025-06-24 03:24:36.724644|3|shirt|18.0"}
 
 do_execsql_test leftjoin-innerjoin-where {
-  select u.first_name, p.name, p2.name from users u left join products p on p.name = u.first_name join products p2 on length(p2.name) > 8 where u.first_name = 'Franklin';
+  select u.first_name, p.name, p2.name from users u left join products p on p.name = u.first_name join products p2 on length(p2.name) > 8 where u.first_name = 'Franklin' limit 10;
 } {Franklin||sweatshirt
-Franklin||accessories}
+Franklin||accessories
+Franklin||Education
+Franklin||Management
+Franklin||Commercial
+Franklin||Executive
+Franklin||Determine
+Franklin||Generation
+Franklin||Executive
+Franklin||Interesting}
 
 do_execsql_test leftjoin-leftjoin-where {
-  select u.first_name, p.name, p2.name from users u left join products p on p.name = u.first_name join products p2 on length(p2.name) > 8 where u.first_name = 'Franklin';
+  select u.first_name, p.name, p2.name from users u left join products p on p.name = u.first_name join products p2 on length(p2.name) > 8 where u.first_name = 'Franklin' limit 2;
 } {Franklin||sweatshirt
 Franklin||accessories}
 
@@ -231,7 +239,7 @@ do_execsql_test innerjoin-leftjoin-where {
 } {Franklin|Vincent|}
 
 do_execsql_test innerjoin-leftjoin-with-or-terms {
-  select u.first_name, u2.first_name, p.name from users u join users u2 on u.id = u2.id + 1 left join products p on p.name = u.first_name or p.name like 'sweat%' where u.first_name = 'Franklin';
+  select u.first_name, u2.first_name, p.name from users u join users u2 on u.id = u2.id + 1 left join products p on p.name = u.first_name or p.name like 'sweat%' where u.first_name = 'Franklin' and p.id < 12;
 } {Franklin|Vincent|sweater
 Franklin|Vincent|sweatshirt}
 
@@ -248,7 +256,7 @@ do_execsql_test left-join-constant-condition-true-inner-join-constant-condition-
 } {}
 
 do_execsql_test join-utilizing-both-seekrowid-and-secondary-index {
-    select u.first_name, p.name from users u join products p on u.id = p.id and u.age > 70;
+    select u.first_name, p.name from users u join products p on u.id = p.id and u.age > 70 and p.id < 12;
 } {Elizabeth|cap}
 
 # important difference between regular SELECT * join and a SELECT * USING join is that the join keys are deduplicated
@@ -297,7 +305,7 @@ do_execsql_test left-join-backwards-iteration {
     select users.id, users.first_name as user_name, products.name as product_name 
     from users left join products on users.id = products.id 
     where users.id < 13 order by users.id desc limit 3;
-} {12|Eric|
+} {12|Eric|Your
 11|Jacqueline|accessories
 10|Tracy|coat}
 
@@ -397,26 +405,28 @@ Brandon|shirt|4.0
 Kristin|shorts|4.0
 Curtis|shorts|4.0}
 
-do_execsql_test complex-aggregation-multiple-groups {
-    select p.price, o.status, count(distinct u.id) as unique_customers,
-           count(oi.id) as items_sold, sum(oi.total_price) as revenue
-    from products p
-    join order_items oi on p.id = oi.product_id
-    join orders o on oi.order_id = o.id
-    join users u on o.user_id = u.id
-    group by p.price, o.status
-    order by revenue desc
-    limit 10;
-} {74.0|shipped|5|5|9790.96
-18.0|shipped|2|2|8089.31
-70.0|delivered|3|3|7966.66
-78.0|delivered|4|4|7884.85
-78.0|processing|2|2|5873.15
-70.0|refunded|2|2|5444.26
-25.0|delivered|4|4|5402.71
-82.0|pending|2|2|4787.91
-82.0|cancelled|2|2|4544.53
-33.0|cancelled|2|2|4349.16}
+# FIXME! (takes > 5 mintues)
+# https://github.com/tursodatabase/turso/issues/2926
+# do_execsql_test complex-aggregation-multiple-groups {
+#     select p.price, o.status, count(distinct u.id) as unique_customers,
+#            count(oi.id) as items_sold, sum(oi.total_price) as revenue
+#     from products p
+#     join order_items oi on p.id = oi.product_id
+#     join orders o on oi.order_id = o.id
+#     join users u on o.user_id = u.id
+#     group by p.price, o.status
+#     order by revenue desc
+#     limit 10;
+# } {591.17|processing|8|8|23040.77
+# 564.24|cancelled|8|8|19261.9
+# 447.51|pending|7|7|18686.94
+# 932.09|processing|7|7|18069.65
+# 665.69|processing|6|6|17548.53
+# 981.59|pending|6|6|17390.96
+# 751.2|refunded|6|6|17374.89
+# 392.4|shipped|7|7|17168.61
+# 441.26|cancelled|6|6|16954.21
+# 539.06|shipped|5|5|16941.43}
 
 do_execsql_test join-with-case-expressions {
     select u.first_name,

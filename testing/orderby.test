@@ -4,7 +4,7 @@ set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 
 do_execsql_test basic-order-by {
-    select * from products order by price;
+    select * from products where id < 12 order by price;
 } {9|boots|1.0
 3|shirt|18.0
 4|sweater|25.0
@@ -18,7 +18,7 @@ do_execsql_test basic-order-by {
 8|sneakers|82.0}
 
 do_execsql_test basic-order-by {
-    select * from products order by price desc;
+    select * from products where id < 12 order by price desc;
 } {2|cap|82.0
 8|sneakers|82.0
 11|accessories|81.0
@@ -32,7 +32,7 @@ do_execsql_test basic-order-by {
 9|boots|1.0}
 
 do_execsql_test basic-order-by-and-limit {
-    select * from products order by name limit 5;
+    select * from products where id < 12 order by name limit 5;
 } {11|accessories|81.0
 9|boots|1.0
 2|cap|82.0
@@ -40,7 +40,7 @@ do_execsql_test basic-order-by-and-limit {
 1|hat|79.0}
 
 do_execsql_test basic-order-by-and-limit {
-    select * from products order by name desc limit 5;
+    select * from products where id < 12 order by name desc limit 5;
 } {5|sweatshirt|74.0
 4|sweater|25.0
 8|sneakers|82.0
@@ -48,7 +48,7 @@ do_execsql_test basic-order-by-and-limit {
 3|shirt|18.0}
 
 do_execsql_test basic-order-by-and-limit-2 {
-    select id, name from products order by name limit 5;
+    select id, name from products where id < 12 order by name limit 5;
 } {11|accessories
 9|boots
 2|cap
@@ -56,7 +56,7 @@ do_execsql_test basic-order-by-and-limit-2 {
 1|hat}
 
 do_execsql_test basic-order-by-and-limit-2 {
-    select id, name from products order by name desc limit 5;
+    select id, name from products where id < 12 order by name desc limit 5;
 } {5|sweatshirt
 4|sweater
 8|sneakers
@@ -64,7 +64,7 @@ do_execsql_test basic-order-by-and-limit-2 {
 3|shirt}
 
 do_execsql_test basic-order-by-and-limit-3 {
-    select price, name from products where price > 70 order by name;
+    select price, name from products where price > 70 and id < 12 order by name;
 } {81.0|accessories
 82.0|cap
 79.0|hat
@@ -73,7 +73,7 @@ do_execsql_test basic-order-by-and-limit-3 {
 74.0|sweatshirt}
 
 do_execsql_test basic-order-by-and-limit-3 {
-    select price, name from products where price > 70 order by name desc;
+    select price, name from products where price > 70 and id < 12 order by name desc;
 } {74.0|sweatshirt
 82.0|sneakers
 78.0|jeans
@@ -222,7 +222,7 @@ do_execsql_test_on_specific_db {:memory:} distinct_orderby_regression {
 4|3}
 
 do_execsql_test order_by_column_deduplication {
-    select name, name, price from products order by name;
+    select name, name, price from products where id < 12 order by name;
 } {accessories|accessories|81.0
 boots|boots|1.0
 cap|cap|82.0

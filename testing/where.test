@@ -232,7 +232,7 @@ Jamie|18
 Jamie|77}
 
 do_execsql_test where-float-int {
-    select * from products where price > 50 and name != 'hat';
+    select * from products where price > 50 and name != 'hat' and id < 12;
 } {2|cap|82.0
 5|sweatshirt|74.0
 6|shorts|70.0
@@ -241,11 +241,11 @@ do_execsql_test where-float-int {
 11|accessories|81.0}
 
 do_execsql_test where-multiple-and {
-    select * from products where price > 50 and name != 'sweatshirt' and price < 75;
+    select * from products where price > 50 and name != 'sweatshirt' and price < 75 and id < 12;
 } {6|shorts|70.0}
 
 do_execsql_test where-multiple-or {
-    select * from products where price > 75 or name = 'shirt' or name = 'coat';
+    select * from products where price > 75 or name = 'shirt' or name = 'coat' and id < 12 limit 7;
 } {1|hat|79.0
 2|cap|82.0
 3|shirt|18.0
@@ -255,13 +255,13 @@ do_execsql_test where-multiple-or {
 11|accessories|81.0}
 
 do_execsql_test where_in_list {
-    select * from products where name in ('hat', 'sweatshirt', 'shorts');
+    select * from products where name in ('hat', 'sweatshirt', 'shorts') and id < 12;
 } {1|hat|79.0
 5|sweatshirt|74.0
 6|shorts|70.0}
 
 do_execsql_test where_not_in_list {
-    select * from products where name not in ('hat', 'sweatshirt', 'shorts');
+    select * from products where name not in ('hat', 'sweatshirt', 'shorts') and id < 12;
 } {2|cap|82.0
 3|shirt|18.0
 4|sweater|25.0
@@ -269,10 +269,10 @@ do_execsql_test where_not_in_list {
 8|sneakers|82.0
 9|boots|1.0
 10|coat|33.0
-11|accessories|81.0}
+11|accessories|81.0 }
 
 do_execsql_test where_in_list_or_another_list {
-    select * from products where name in ('hat', 'sweatshirt', 'shorts') or price in (81.0, 82.0);
+    select * from products where name in ('hat', 'sweatshirt', 'shorts') or price in (81.0, 82.0) and id < 12;
 } {1|hat|79.0
 2|cap|82.0
 5|sweatshirt|74.0
@@ -281,12 +281,12 @@ do_execsql_test where_in_list_or_another_list {
 11|accessories|81.0}
 
 do_execsql_test where_not_in_list_and_not_in_another_list {
-    select * from products where name not in ('hat', 'sweatshirt', 'shorts') and price not in (81.0, 82.0, 78.0, 1.0, 33.0);
+    select * from products where name not in ('hat', 'sweatshirt', 'shorts') and price not in (81.0, 82.0, 78.0, 1.0, 33.0) and id < 12;
 } {3|shirt|18.0
 4|sweater|25.0}
 
 do_execsql_test where_in_list_or_not_in_another_list {
-    select * from products where name in ('hat', 'sweatshirt', 'shorts') or price not in (82.0, 18.0, 78.0, 33.0, 81.0);
+    select * from products where name in ('hat', 'sweatshirt', 'shorts') or price not in (82.0, 18.0, 78.0, 33.0, 81.0) and id < 12;
 } {1|hat|79.0
 4|sweater|25.0
 5|sweatshirt|74.0
@@ -298,7 +298,7 @@ do_execsql_test where_in_empty_list {
 } {}
 
 do_execsql_test where_not_in_empty_list {
-    select * from products where name not in ();
+    select * from products where name not in () and id < 12;
 } {1|hat|79.0
 2|cap|82.0
 3|shirt|18.0
@@ -312,19 +312,19 @@ do_execsql_test where_not_in_empty_list {
 11|accessories|81.0}
 
 do_execsql_test where_name_in_list_and_price_gt_70_or_name_exactly_boots {
-    select * from products where name in ('hat', 'sweatshirt', 'shorts') and price > 70 or name = 'boots';
+    select * from products where name in ('hat', 'sweatshirt', 'shorts') and price > 70 or name = 'boots' and id < 12;
 } {1|hat|79.0
 5|sweatshirt|74.0
 9|boots|1.0}
 
 do_execsql_test where_name_in_list_or_price_gt_70_and_name_like_shirt {
-    select * from products where name in ('hat', 'shorts') or price > 70 and name like '%shirt%';
+    select * from products where name in ('hat', 'shorts') or price > 70 and name like '%shirt%' and id < 12;
 } {1|hat|79.0
 5|sweatshirt|74.0
 6|shorts|70.0}
 
 do_execsql_test where_name_not_in_list_or_name_eq_shirt {
-    select * from products where name not in ('shirt', 'boots') or name = 'shirt';
+    select * from products where (name not in ('shirt', 'boots') or name = 'shirt') and id < 12;
 } {1|hat|79.0
 2|cap|82.0
 3|shirt|18.0
@@ -345,16 +345,16 @@ do_execsql_test where_multiple_flipped {
 } {5|Jennifer|21}
 
 do_execsql_test where-parentheses-and {
-    select id, name from products where (id = 5 and name = 'sweatshirt') and (id = 5 and name = 'sweatshirt') ORDER BY id;
+    select id, name from products where (id = 5 and name = 'sweatshirt') and (id = 5 and name = 'sweatshirt') ORDER BY id and id < 12;
 } {5|sweatshirt}
 
 do_execsql_test where-nested-parentheses {
-    select id, name from products where ((id = 5 and name = 'sweatshirt') or (id = 1 and name = 'hat')) ORDER BY id;
+    select id, name from products where ((id = 5 and name = 'sweatshirt') or (id = 1 and name = 'hat')) and id < 12 ORDER BY id;
 } {1|hat
 5|sweatshirt}
 
 do_execsql_test where-complex-parentheses {
-    select id, name from products where ((id = 5 and name = 'sweatshirt') or (id = 1 and name = 'hat')) and (name = 'sweatshirt' or name = 'hat') ORDER BY id;
+    select id, name from products where ((id = 5 and name = 'sweatshirt') or (id = 1 and name = 'hat')) and (name = 'sweatshirt' or name = 'hat') and id < 12 ORDER BY id;
 } {1|hat
 5|sweatshirt}
 
@@ -414,7 +414,7 @@ do_execsql_test where-age-index-seek-regression-test-3 {
 } {84}
 
 do_execsql_test where-simple-between {
-    SELECT * FROM products WHERE price BETWEEN 70 AND 100;
+    SELECT * FROM products WHERE price BETWEEN 70 AND 100 and id < 12;
 } {1|hat|79.0
 2|cap|82.0
 5|sweatshirt|74.0
@@ -426,7 +426,7 @@ do_execsql_test where-simple-between {
 do_execsql_test between-price-range-with-names {
     SELECT * FROM products 
     WHERE (price BETWEEN 70 AND 100) 
-    AND (name = 'sweatshirt' OR name = 'sneakers');
+    AND (name = 'sweatshirt' OR name = 'sneakers') AND id < 12;
 } {5|sweatshirt|74.0
 8|sneakers|82.0}
 

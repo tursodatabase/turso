@@ -6,14 +6,14 @@ source $testdir/tester.tcl
 do_execsql_test subquery-inner-filter {
     select sub.loud_hat from (
         select concat(name, '!!!') as loud_hat 
-        from products where name = 'hat'
+        from products where name = 'hat' and id < 12
     ) sub;
 } {hat!!!}
 
 do_execsql_test subquery-inner-filter-cte {
     with sub as (
         select concat(name, '!!!') as loud_hat 
-        from products where name = 'hat'
+        from products where name = 'hat' and id < 12
     )
     select sub.loud_hat from sub;
 } {hat!!!}
@@ -21,14 +21,14 @@ do_execsql_test subquery-inner-filter-cte {
 do_execsql_test subquery-outer-filter {
     select sub.loud_hat from (
         select concat(name, '!!!') as loud_hat 
-        from products
+        from products where id < 12
     ) sub where sub.loud_hat = 'hat!!!'
 } {hat!!!}
 
 do_execsql_test subquery-outer-filter-cte {
     with sub as (
         select concat(name, '!!!') as loud_hat 
-        from products
+        from products where id < 12
     )
     select sub.loud_hat from sub where sub.loud_hat = 'hat!!!'
 } {hat!!!}
@@ -36,60 +36,60 @@ do_execsql_test subquery-outer-filter-cte {
 do_execsql_test subquery-without-alias {
     select loud_hat from (
         select concat(name, '!!!') as loud_hat 
-        from products where name = 'hat'
+        from products where name = 'hat' and id < 12
     );
 } {hat!!!}
 
 do_execsql_test subquery-without-alias-cte {
     with cte as (
         select concat(name, '!!!') as loud_hat 
-        from products where name = 'hat'
+        from products where name = 'hat' and id < 12
     )
     select loud_hat from cte;
 } {hat!!!}
 
 do_execsql_test subquery-no-alias-on-col {
     select price from (
-        select * from products where name = 'hat'
+        select * from products where name = 'hat' and id < 12
     )
 } {79.0}
 
 do_execsql_test subquery-no-alias-on-col-cte {
     with cte as (
-        select * from products where name = 'hat'
+        select * from products where name = 'hat' and id < 12
     )
     select price from cte
 } {79.0}
 
 do_execsql_test subquery-no-alias-on-col-named {
     select price from (
-        select price from products where name = 'hat'
+        select price from products where name = 'hat' and id < 12
     )
 } {79.0}
 
 do_execsql_test subquery-no-alias-on-col-named-cte {
     with cte as (
-        select price from products where name = 'hat'
+        select price from products where name = 'hat' and id < 12
     )
     select price from cte
 } {79.0}
 
 do_execsql_test subquery-select-star {
     select * from (
-        select price, price + 1.0, name from products where name = 'hat'
+        select price, price + 1.0, name from products where name = 'hat' and id < 12
     )
 } {79.0|80.0|hat}
 
 do_execsql_test subquery-select-star-cte {
     with cte as (
-        select price, price + 1.0, name from products where name = 'hat'
+        select price, price + 1.0, name from products where name = 'hat' and id < 12
     )
     select * from cte
 } {79.0|80.0|hat}
 
 do_execsql_test subquery-select-table-star {
     select sub.* from (
-        select price, price + 1.0, name from products where name = 'hat'
+        select price, price + 1.0, name from products where name = 'hat' and id < 12
     ) sub
 } {79.0|80.0|hat}
 
@@ -104,7 +104,7 @@ do_execsql_test nested-subquery {
     select sub.loudest_hat from (
         select upper(nested_sub.loud_hat) as loudest_hat from (
             select concat(name, '!!!') as loud_hat 
-            from products where name = 'hat'
+            from products where name = 'hat' and id < 12
         ) nested_sub 
     ) sub;
 } {HAT!!!}
@@ -128,9 +128,9 @@ do_execsql_test subquery-orderby-limit {
         order by name 
         limit 3
     ) sub;
-} {ACCESSORIES!!!
-BOOTS!!!
-CAP!!!}
+} {A!!!
+A!!!
+A!!!}
 
 do_execsql_test subquery-orderby-limit-cte {
     with sub as (
@@ -140,15 +140,16 @@ do_execsql_test subquery-orderby-limit-cte {
         limit 3
     )
     select upper(sub.loud_name) as loudest_name from sub;
-} {ACCESSORIES!!!
-BOOTS!!!
-CAP!!!}
+} {A!!!
+A!!!
+A!!!}
 
 do_execsql_test table-join-subquery {
     select sub.product_name, p.name 
     from products p join (
         select name as product_name 
         from products
+		where id < 12
     ) sub on p.name = sub.product_name where p.name = 'hat'
 } {hat|hat}
 
@@ -156,6 +157,7 @@ do_execsql_test table-join-subquery-cte {
     with sub as (
         select name as product_name 
         from products
+		where id < 12
     )
     select sub.product_name, p.name 
     from products p join sub on p.name = sub.product_name 
@@ -167,13 +169,14 @@ do_execsql_test subquery-join-table {
     from (
         select name as product_name 
         from products
+		where id < 12
     ) sub join products p on sub.product_name = p.name where sub.product_name = 'hat'
 } {hat|hat}
 
 do_execsql_test subquery-join-table-cte {
     with sub as (
         select name as product_name 
-        from products
+        from products where id < 12
     )
     select sub.product_name, p.name
     from sub join products p on sub.product_name = p.name 
@@ -186,10 +189,12 @@ do_execsql_test subquery-join-subquery {
         select name as sus_name
         from products
         where name = 'cap'
+		and id < 12
     ) sub1 join (
         select concat('no ', name) as truthful_name
         from products 
         where name = 'cap'
+		and id < 12
     ) sub2;
 } {"cap|no cap"}
 
@@ -197,12 +202,12 @@ do_execsql_test subquery-join-subquery-cte {
     with sub1 as (
         select name as sus_name
         from products
-        where name = 'cap'
+        where name = 'cap' and id < 12
     ),
     sub2 as (
         select concat('no ', name) as truthful_name
         from products 
-        where name = 'cap'
+        where name = 'cap' and id < 12
     )
     select sub1.sus_name, sub2.truthful_name
     from sub1 join sub2;
@@ -213,7 +218,7 @@ do_execsql_test select-star-table-subquery {
     from products p join (
         select name, price 
         from products
-        where name = 'hat'
+        where name = 'hat' and id < 12
     ) sub on p.name = sub.name;
 } {1|hat|79.0|hat|79.0}
 
@@ -221,7 +226,7 @@ do_execsql_test select-star-table-subquery-cte {
     with sub as (
         select name, price 
         from products
-        where name = 'hat'
+        where name = 'hat' and id < 12
     )
     select * 
     from products p join sub on p.name = sub.name;
@@ -232,7 +237,7 @@ do_execsql_test select-star-subquery-table {
     from (
         select name, price 
         from products
-        where name = 'hat'
+        where name = 'hat' and id < 12
     ) sub join products p on sub.name = p.name;
 } {hat|79.0|1|hat|79.0}
 
@@ -240,7 +245,7 @@ do_execsql_test select-star-subquery-table-cte {
     with sub as (
         select name, price 
         from products
-        where name = 'hat'
+        where name = 'hat' and id < 12
     )
     select * 
     from sub join products p on sub.name = p.name;
@@ -422,7 +427,7 @@ do_execsql_test subquery-count-distinct {
     select count(1) from (
         select distinct first_name, name 
         from users u join products p 
-        where u.id < 100
+        where u.id < 100 AND p.id < 12
     );
 } {913}
 
@@ -430,6 +435,6 @@ do_execsql_test subquery-count-all {
     select count(1) from (
         select first_name, name 
         from users u join products p 
-        where u.id < 100
+        where u.id < 100 and p.id < 12
     );
 } {1089}

@@ -4,7 +4,7 @@ import sqlite3
 
 from faker import Faker
 
-conn = sqlite3.connect("database.db")
+conn = sqlite3.connect("testing/testing.db")
 cursor = conn.cursor()
 
 fake = Faker()
@@ -36,6 +36,8 @@ CREATE TABLE products (
 """,
     [],
 )
+
+# specific products we already test for
 cursor.execute("INSERT INTO products VALUES(1,'hat',79.0);")
 cursor.execute("INSERT INTO products VALUES(2,'cap',82.0);")
 cursor.execute("INSERT INTO products VALUES(3,'shirt',18.0);")
@@ -47,6 +49,11 @@ cursor.execute("INSERT INTO products VALUES(8,'sneakers',82.0);")
 cursor.execute("INSERT INTO products VALUES(9,'boots',1.0);")
 cursor.execute("INSERT INTO products VALUES(10,'coat',33.0);")
 cursor.execute("INSERT INTO products VALUES(11,'accessories',81.0);")
+
+for i in range(12, 12001):
+    name = fake.word().title()
+    price = round(random.uniform(5.0, 999.99), 2)
+    cursor.execute("INSERT INTO products (id, name, price) VALUES (?, ?, ?)", [i, name, price])
 
 cursor.execute("""
     CREATE TABLE IF NOT EXISTS orders (

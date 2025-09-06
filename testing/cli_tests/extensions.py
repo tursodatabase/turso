@@ -740,7 +740,7 @@ def test_tablestats():
                 "order_items|90282",
                 "orders|20000",
                 "people|3",
-                "products|11",
+                "products|12000",
                 "reviews|25000",
                 "users|15000",
             ]
@@ -768,7 +768,7 @@ def test_tablestats():
     # we need to add 3 for the 3 queries we did above.
     limbo.run_test_fn(
         "SELECT * FROM stats WHERE name='products';",
-        lambda x: x == "products|14",
+        lambda x: x == "products|12003",
         "products table reflects changes",
     )
     # an insert to products with (name,price) ('xConnect', 42)

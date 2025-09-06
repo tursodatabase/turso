@@ -4,7 +4,7 @@ set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 
 do_execsql_test glob-fn {
-    select name, glob('sweat*', name) from products;
+    select name, glob('sweat*', name) from products where id < 12;
 } {hat|0
 cap|0
 shirt|0
@@ -18,21 +18,21 @@ coat|0
 accessories|0}
 
 do_execsql_test where-glob {
-    select * from products where name glob 'sweat*';
+    select * from products where name glob 'sweat*' and id < 12;
 } {4|sweater|25.0
 5|sweatshirt|74.0}
 
 do_execsql_test where-glob-question-mark {
-    select * from products where name glob 'sweat?r';
+    select * from products where name glob 'sweat?r' and id < 12;
 } {4|sweater|25.0}
 
 do_execsql_test where-glob-fn {
-    select * from products where glob('sweat*', name)=1
+    select * from products where glob('sweat*', name)=1  and id < 12;
 } {4|sweater|25.0
 5|sweatshirt|74.0}
 
 do_execsql_test where-not-glob-and {
-    select * from products where name not glob 'sweat*' and price >= 70.0;
+    select * from products where name not glob 'sweat*' and price >= 70.0  and id < 12;
 } {1|hat|79.0
 2|cap|82.0
 6|shorts|70.0
@@ -41,7 +41,7 @@ do_execsql_test where-not-glob-and {
 11|accessories|81.0}
 
 do_execsql_test where-glob-or {
-    select * from products where name glob 'sweat*' or price >= 80.0;
+    select * from products where name glob 'sweat*' or price >= 80.0  and id < 12;
 } {2|cap|82.0
 4|sweater|25.0
 5|sweatshirt|74.0
@@ -72,7 +72,7 @@ Thomas|Thomas
 William|Williams}
 
 do_execsql_test where-glob-impossible {
-    select * from products where 'foobar' glob 'fooba';
+    select * from products where 'foobar' glob 'fooba' and id < 12;
 } {}
 
 do_execsql_test_on_specific_db {:memory:} glob-null-other-types {

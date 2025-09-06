@@ -77,23 +77,23 @@ do_execsql_test select-min-text {
 } {Aaron}
 
 do_execsql_test select-group-concat {
-  SELECT group_concat(name) FROM products;
+  SELECT group_concat(name) FROM products where id < 12;
 } {hat,cap,shirt,sweater,sweatshirt,shorts,jeans,sneakers,boots,coat,accessories}
 
 do_execsql_test select-group-concat-with-delimiter {
-  SELECT group_concat(name, ';') FROM products;
+  SELECT group_concat(name, ';') FROM products where id < 12;
 } {hat;cap;shirt;sweater;sweatshirt;shorts;jeans;sneakers;boots;coat;accessories}
 
 do_execsql_test select-group-concat-with-column-delimiter {
-  SELECT group_concat(name, id) FROM products;
+  SELECT group_concat(name, id) FROM products where id < 12;
 } {hat2cap3shirt4sweater5sweatshirt6shorts7jeans8sneakers9boots10coat11accessories}
 
 do_execsql_test select-string-agg-with-delimiter {
-  SELECT string_agg(name, ',') FROM products;
+  SELECT string_agg(name, ',') FROM products where id < 12;
 } {hat,cap,shirt,sweater,sweatshirt,shorts,jeans,sneakers,boots,coat,accessories}
 
 do_execsql_test select-string-agg-with-column-delimiter {
-  SELECT string_agg(name, id) FROM products;
+  SELECT string_agg(name, id) FROM products where id < 12;
 } {hat2cap3shirt4sweater5sweatshirt6shorts7jeans8sneakers9boots10coat11accessories}
 
 do_execsql_test select-agg-unary-negative {
@@ -134,11 +134,11 @@ Anna|Ayers
 Joshua|Baker}
 
 do_execsql_test select-agg-json-array {
-  SELECT json_group_array(name) FROM products;
+  SELECT json_group_array(name) FROM products where id < 12;
 } {["hat","cap","shirt","sweater","sweatshirt","shorts","jeans","sneakers","boots","coat","accessories"]}
 
 do_execsql_test select-agg-json-array-object {
-  SELECT json_group_array(json_object('name', name)) FROM products;
+  SELECT json_group_array(json_object('name', name)) FROM products where id < 12;
 } {[{"name":"hat"},{"name":"cap"},{"name":"shirt"},{"name":"sweater"},{"name":"sweatshirt"},{"name":"shorts"},{"name":"jeans"},{"name":"sneakers"},{"name":"boots"},{"name":"coat"},{"name":"accessories"}]}
 
 do_execsql_test select-distinct-agg-functions {
@@ -148,7 +148,7 @@ SELECT sum(distinct age), count(distinct age), avg(distinct age) FROM users;
 do_execsql_test select-json-group-object {
   select price,
          json_group_object(cast (id as text), name)
-  from products
+  from products where id < 12
   group by price
   order by price;
 } {1.0|{"9":"boots"}
