@@ -2060,6 +2060,11 @@ impl Connection {
         };
         tracing::trace!("setting encryption ctx for connection");
         let pager = self.pager.borrow();
+        if pager.is_encryption_ctx_set() {
+            return Err(LimboError::InvalidArgument(
+                "cannot reset encryption attributes if already set in the session".to_string(),
+            ));
+        }
         pager.set_encryption_context(cipher_mode, key)
     }
 }

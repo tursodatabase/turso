@@ -2163,6 +2163,10 @@ impl Pager {
         Ok(IOResult::Done(f(header)))
     }
 
+    pub fn is_encryption_ctx_set(&self) -> bool {
+        self.io_ctx.borrow_mut().encryption_context().is_some()
+    }
+
     pub fn set_encryption_context(
         &self,
         cipher_mode: CipherMode,
