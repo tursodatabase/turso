@@ -19,6 +19,14 @@ do_execsql_test_on_specific_db {:memory:} alter-table-rename-column {
     "CREATE INDEX i ON t (b)"
 }
 
+do_execsql_test_on_specific_db {:memory:} alter-table-rename-quoted-column {
+    CREATE TABLE t (a INTEGER);
+    ALTER TABLE t RENAME a TO "ab cd";
+    SELECT sql FROM sqlite_schema;
+} {
+    "CREATE TABLE t (\"ab cd\" INTEGER)"
+}
+
 do_execsql_test_on_specific_db {:memory:} alter-table-add-column {
     CREATE TABLE t (a);
     INSERT INTO t VALUES (1);
@@ -72,6 +80,14 @@ do_execsql_test_on_specific_db {:memory:} alter-table-add-column-default {
 "0.1|hello"
 "0.1|hello"
 "0.1|hello"
+}
+
+do_execsql_test_on_specific_db {:memory:} alter-table-add-quoted-column {
+    CREATE TABLE test (a);
+    ALTER TABLE test ADD COLUMN [b c];
+    SELECT sql FROM sqlite_schema;
+} {
+    "CREATE TABLE test (a, [b c])"
 }
 
 do_execsql_test_on_specific_db {:memory:} alter-table-drop-column {
