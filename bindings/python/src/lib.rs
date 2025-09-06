@@ -332,6 +332,8 @@ fn row_to_py(py: Python, row: &turso_core::Row) -> Result<PyObject> {
         match value {
             turso_core::Value::Null => py_values.push(py.None()),
             turso_core::Value::Integer(i) => py_values.push(i.into_pyobject(py)?.into()),
+            #[cfg(feature = "u128-support")]
+            turso_core::Value::U128(i) => py_values.push(i.into_pyobject(py)?.into()),
             turso_core::Value::Float(f) => py_values.push(f.into_pyobject(py)?.into()),
             turso_core::Value::Text(s) => py_values.push(s.as_str().into_pyobject(py)?.into()),
             turso_core::Value::Blob(b) => py_values.push(PyBytes::new(py, b.as_slice()).into()),

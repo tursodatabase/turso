@@ -183,19 +183,43 @@ pub fn op_init(
     Ok(InsnFunctionStepResult::Step)
 }
 
+// maybe i can change this back - todo
 pub fn op_add(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
-    mv_store: Option<&Arc<MvStore>>,
+    _pager: &Rc<Pager>,
+    _mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Add { lhs, rhs, dest }, insn);
-    state.registers[*dest] = Register::Value(
-        state.registers[*lhs]
-            .get_value()
-            .exec_add(state.registers[*rhs].get_value()),
-    );
+
+    let lhs_val = state.registers[*lhs].get_value();
+    let rhs_val = state.registers[*rhs].get_value();
+
+    let result = {
+        #[cfg(feature = "u128-support")]
+        match (lhs_val, rhs_val) {
+            (Value::U128(u1), Value::U128(u2)) => {
+                // Use saturating_add to prevent overflow instead of panicking
+                Value::U128(u1.saturating_add(*u2))
+            }
+            (Value::U128(u), Value::Integer(i)) | (Value::Integer(i), Value::U128(u)) => {
+                let result_val = if *i >= 0 {
+                    u.saturating_add(*i as u128)
+                } else {
+                    u.saturating_sub(i.abs() as u128)
+                };
+                Value::U128(result_val)
+            }
+            // Fallback for all other combinations, including U128 + Float (which becomes Null)
+            _ => (Numeric::from(lhs_val) + Numeric::from(rhs_val)).into(),
+        }
+
+        #[cfg(not(feature = "u128-support"))]
+        (Numeric::from(lhs_val) + Numeric::from(rhs_val)).into()
+    };
+
+    state.registers[*dest] = Register::Value(result);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -1576,6 +1600,8 @@ pub fn op_column(
                                     8 => 0,
                                     // CONST_INT1
                                     9 => 0,
+                                    #[cfg(feature = "u128-support")]
+                                    10 => 16,
                                     // BLOB
                                     n if n >= 12 && n & 1 == 0 => (n - 12) >> 1,
                                     // TEXT
@@ -1686,6 +1712,14 @@ pub fn op_column(
                                 // CONST_INT1
                                 9 => {
                                     state.registers[*dest] = Register::Value(Value::Integer(1));
+                                }
+                                #[cfg(feature = "u128-support")]
+                                10 => {
+                                    let bytes: [u8; 16] = buf
+                                        .try_into()
+                                        .expect("Slice with incorrect length for u128");
+                                    state.registers[*dest] =
+                                        Register::Value(Value::U128(u128::from_be_bytes(bytes)));
                                 }
                                 // BLOB
                                 n if n >= 12 && n & 1 == 0 => {
@@ -3483,6 +3517,31 @@ pub fn op_agg_step(
                             _ => unreachable!(),
                         },
 
+                        #[cfg(feature = "u128-support")]
+                        Value::U128(u) => match acc {
+                            Value::Null => {
+                                *acc = Value::U128(u);
+                            }
+                            Value::U128(acc_u) => {
+                                *acc = Value::U128(acc_u.saturating_add(u));
+                            }
+                            Value::Integer(acc_i) => {
+                                if *acc_i < 0 {
+                                    let new_acc = (*acc_i as f64) + (u as f64);
+                                    *acc = Value::Float(new_acc);
+                                    sum_state.approx = true;
+                                } else {
+                                    let new_acc = (*acc_i as u128).saturating_add(u);
+                                    *acc = Value::U128(new_acc);
+                                }
+                            }
+                            Value::Float(_) => {
+                                sum_state.approx = true;
+                                apply_kbn_step(acc, u as f64, sum_state);
+                            }
+                            _ => unreachable!(),
+                        },
+
                         _ => {
                             //  If any input to sum() is neither an integer nor a NULL, then sum() returns a float
                             // https://sqlite.org/lang_aggfunc.html
@@ -3692,6 +3751,10 @@ pub fn op_agg_final(
                     Value::Integer(i) if !sum_state.approx && !sum_state.ovrfl => {
                         Value::Integer(*i)
                     }
+
+                    #[cfg(feature = "u128-support")]
+                    Value::U128(u) if !sum_state.approx && !sum_state.ovrfl => Value::U128(*u),
+
                     _ => Value::Float(acc.as_float() + sum_state.r_err),
                 };
                 state.registers[*register] = Register::Value(value);
@@ -3974,6 +4037,23 @@ pub fn op_sorter_next(
         state.pc += 1;
     }
     Ok(InsnFunctionStepResult::Step)
+}
+
+#[cfg(feature = "u128-support")]
+pub fn op_u128(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Rc<Pager>,
+    _mv_store: Option<&Arc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    if let Insn::U128 { value, dest } = insn {
+        state.registers[*dest] = Register::Value(Value::U128(*value));
+        state.pc += 1;
+        Ok(InsnFunctionStepResult::Step)
+    } else {
+        unreachable!()
+    }
 }
 
 pub fn op_function(
@@ -6822,6 +6902,8 @@ pub fn op_add_imm(
         Value::Text(s) => s.as_str().parse::<i64>().unwrap_or(0) + value,
         Value::Blob(_) => *value, // BLOB becomes the added value
         Value::Null => *value,    // NULL becomes the added value
+        #[cfg(feature = "u128-support")]
+        Value::U128(_) => panic!("Cannot perform this aggregation on a U128 value"),
     };
 
     state.registers[*register] = Register::Value(Value::Integer(int_val));
@@ -7780,6 +7862,8 @@ impl Value {
             Value::Integer(i) => *i,
             Value::Float(f) => *f as i64,
             Value::Text(t) => t.as_str().parse().unwrap_or(1),
+            #[cfg(feature = "u128-support")]
+            Value::U128(i) => usize::try_from(*i).unwrap_or(1) as i64,
             _ => 1,
         }
         .max(1) as usize;
@@ -7793,6 +7877,9 @@ impl Value {
         match self {
             Value::Null => Value::build_text("NULL"),
             Value::Integer(_) | Value::Float(_) => self.to_owned(),
+            #[cfg(feature = "u128-support")]
+            Value::U128(val) => self.to_owned(),
+
             Value::Blob(_) => todo!(),
             Value::Text(s) => {
                 let mut quoted = String::with_capacity(s.as_str().len() + 2);
@@ -7898,6 +7985,9 @@ impl Value {
             Value::Float(_) => Value::build_text("real"),
             Value::Text(_) => Value::build_text("text"),
             Value::Blob(_) => Value::build_text("blob"),
+            #[cfg(feature = "u128-support")]
+            Value::U128(_) => Value::build_text("u128"),
+            // Value::U128(_) => Value::build_text("integer"),
         }
     }
 
@@ -7908,6 +7998,11 @@ impl Value {
                 Value::build_text(hex::encode_upper(text))
             }
             Value::Blob(blob_bytes) => Value::build_text(hex::encode_upper(blob_bytes)),
+            #[cfg(feature = "u128-support")]
+            Value::U128(_) => {
+                let text = self.to_string();
+                Value::build_text(hex::encode_upper(text))
+            }
             _ => Value::Null,
         }
     }
@@ -7942,6 +8037,15 @@ impl Value {
     pub fn exec_unicode(&self) -> Value {
         match self {
             Value::Text(_) | Value::Integer(_) | Value::Float(_) | Value::Blob(_) => {
+                let text = self.to_string();
+                if let Some(first_char) = text.chars().next() {
+                    Value::Integer(first_char as u32 as i64)
+                } else {
+                    Value::Null
+                }
+            }
+            #[cfg(feature = "u128-support")]
+            Value::U128(_) => {
                 let text = self.to_string();
                 if let Some(first_char) = text.chars().next() {
                     Value::Integer(first_char as u32 as i64)
@@ -8034,6 +8138,14 @@ impl Value {
             Value::Integer(i) => *i,
             Value::Float(f) => *f as i64,
             Value::Text(s) => s.as_str().parse().unwrap_or(0),
+            #[cfg(feature = "u128-support")]
+            Value::U128(u) => {
+                if *u > i64::MAX as u128 {
+                    i64::MAX
+                } else {
+                    *u as i64
+                }
+            }
             _ => 0,
         };
         Value::Blob(vec![0; length.max(0) as usize])
@@ -8318,6 +8430,8 @@ impl Value {
         }
     }
 
+
+
     pub fn exec_concat(&self, rhs: &Value) -> Value {
         if let (Value::Blob(lhs), Value::Blob(rhs)) = (self, rhs) {
             return Value::build_text(String::from_utf8_lossy(dbg!(&[
@@ -8337,6 +8451,7 @@ impl Value {
 
         Value::build_text(lhs + &rhs)
     }
+
 
     pub fn exec_and(&self, rhs: &Value) -> Value {
         match (
@@ -8470,6 +8585,12 @@ fn construct_like_regex(pattern: &str) -> Regex {
 
 fn apply_affinity_char(target: &mut Register, affinity: Affinity) -> bool {
     if let Register::Value(value) = target {
+        // just leave it alone if it has u128
+        #[cfg(feature = "u128-support")]
+        if matches!(value, Value::U128(_)) {
+            return true;
+        }
+
         if matches!(value, Value::Blob(_)) {
             return true;
         }
@@ -8487,6 +8608,11 @@ fn apply_affinity_char(target: &mut Register, affinity: Affinity) -> bool {
             }
 
             Affinity::Integer | Affinity::Numeric => {
+                #[cfg(feature = "u128-support")]
+                if matches!(value, Value::U128(_)) {
+                    return true;
+                }
+
                 if matches!(value, Value::Integer(_)) {
                     return true;
                 }
@@ -8613,6 +8739,15 @@ pub fn extract_int_value(value: &Value) -> i64 {
             }
         }
         Value::Null => 0,
+
+        #[cfg(feature = "u128-support")]
+        Value::U128(u) => {
+            if *u > i64::MAX as u128 {
+                i64::MAX
+            } else {
+                *u as i64
+            }
+        }
     }
 }
 
@@ -8959,6 +9094,11 @@ fn stringify_register(reg: &mut Register) -> bool {
         }
         Value::Float(f) => {
             *reg = Register::Value(Value::build_text(f.to_string()));
+            true
+        }
+        #[cfg(feature = "u128-support")]
+        Value::U128(u) => {
+            *reg = Register::Value(Value::build_text(u.to_string()));
             true
         }
         Value::Text(_) | Value::Null | Value::Blob(_) => false,

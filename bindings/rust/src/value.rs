@@ -9,6 +9,8 @@ pub enum Value {
     Real(f64),
     Text(String),
     Blob(Vec<u8>),
+    #[cfg(feature = "u128-support")]
+    U128(u128),
 }
 
 /// The possible types a column can be in libsql.
@@ -19,6 +21,8 @@ pub enum ValueType {
     Text,
     Blob,
     Null,
+    #[cfg(feature = "u128-support")]
+    U128,
 }
 
 impl FromStr for ValueType {
@@ -31,6 +35,9 @@ impl FromStr for ValueType {
             "BLOB" => Ok(ValueType::Blob),
             "NULL" => Ok(ValueType::Null),
             "REAL" => Ok(ValueType::Real),
+            #[cfg(feature = "u128-support")]
+            "U128" => Ok(ValueType::U128),
+
             _ => Err(()),
         }
     }
@@ -108,6 +115,20 @@ impl Value {
             None
         }
     }
+    #[cfg(feature = "u128-support")]
+    #[must_use]
+    pub fn is_u128(&self) -> bool {
+        matches!(self, Self::U128(..))
+    }
+
+    #[cfg(feature = "u128-support")]
+    pub fn as_u128(&self) -> Option<&u128> {
+        if let Self::U128(v) = self {
+            Some(v)
+        } else {
+            None
+        }
+    }
 }
 
 impl From<turso_core::Value> for Value {
@@ -118,6 +139,8 @@ impl From<turso_core::Value> for Value {
             turso_core::Value::Float(n) => Value::Real(n),
             turso_core::Value::Text(t) => Value::Text(t.into()),
             turso_core::Value::Blob(items) => Value::Blob(items),
+            #[cfg(feature = "u128-support")]
+            turso_core::Value::U128(i) => Value::U128(i),
         }
     }
 }
@@ -130,6 +153,8 @@ impl From<Value> for turso_core::Value {
             Value::Real(n) => turso_core::Value::Float(n),
             Value::Text(t) => turso_core::Value::from_text(&t),
             Value::Blob(items) => turso_core::Value::from_blob(items),
+            #[cfg(feature = "u128-support")]
+            Value::U128(i) => turso_core::Value::U128(i),
         }
     }
 }
@@ -252,6 +277,8 @@ pub enum ValueRef<'a> {
     Real(f64),
     Text(&'a [u8]),
     Blob(&'a [u8]),
+    #[cfg(feature = "u128-support")]
+    U128(&'a u128),
 }
 
 impl ValueRef<'_> {
@@ -262,6 +289,8 @@ impl ValueRef<'_> {
             ValueRef::Real(_) => ValueType::Real,
             ValueRef::Text(_) => ValueType::Text,
             ValueRef::Blob(_) => ValueType::Blob,
+            #[cfg(feature = "u128-support")]
+            ValueRef::U128(_) => ValueType::U128,
         }
     }
 
@@ -346,6 +375,8 @@ impl From<ValueRef<'_>> for Value {
             ValueRef::Real(r) => Value::Real(r),
             ValueRef::Text(s) => Value::Text(String::from_utf8_lossy(s).to_string()),
             ValueRef::Blob(b) => Value::Blob(b.to_vec()),
+            #[cfg(feature = "u128-support")]
+            ValueRef::U128(i) => Value::U128(*i),
         }
     }
 }
@@ -370,6 +401,8 @@ impl<'a> From<&'a Value> for ValueRef<'a> {
             Value::Real(r) => ValueRef::Real(r),
             Value::Text(ref s) => ValueRef::Text(s.as_bytes()),
             Value::Blob(ref b) => ValueRef::Blob(b),
+            #[cfg(feature = "u128-support")]
+            Value::U128(ref i) => ValueRef::U128(i),
         }
     }
 }

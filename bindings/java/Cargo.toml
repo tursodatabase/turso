@@ -16,3 +16,6 @@ path = "rs_src/lib.rs"
 turso_core = { path = "../../core", features = ["io_uring"] }
 jni = "0.21.1"
 thiserror = "2.0.9"
+
+[features]
+u128-support = ["turso_core/u128-support"]

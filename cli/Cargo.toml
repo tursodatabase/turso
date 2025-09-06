@@ -28,7 +28,7 @@ ctrlc = "3.4.4"
 dirs = "5.0.1"
 env_logger = "0.10.1"
 libc = "0.2.172"
-turso_core = { path = "../core", default-features = true, features = [] }
+turso_core = { path = "../core", default-features = true, features = []}
 limbo_completion = { path = "../extensions/completion", features = ["static"] }
 miette = { version = "7.4.0", features = ["fancy"] }
 nu-ansi-term = {version = "0.50.1", features = ["serde", "derive_serde_style"]}
@@ -51,6 +51,7 @@ mimalloc = { workspace = true }
 [features]
 default = ["io_uring"]
 io_uring = ["turso_core/io_uring"]
+u128-support = ["turso_core/u128-support"]
 
 [build-dependencies]
 syntect = { git = "https://github.com/trishume/syntect.git", rev = "64644ffe064457265cbcee12a0c1baf9485ba6ee" }

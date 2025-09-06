@@ -44,3 +44,6 @@ json5 = { version = "0.4.1" }
 strum = { workspace = true }
 parking_lot = { workspace = true }
 indexmap = "2.10.0"
+
+[features]
+u128-support = ["turso_core/u128-support"]
