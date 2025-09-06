@@ -995,7 +995,7 @@ fn create_table(
                         }
 
                         Type::Numeric
-                    },
+                    }
                     None => Type::Null,
                 };
 

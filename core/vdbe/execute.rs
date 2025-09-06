@@ -8430,8 +8430,6 @@ impl Value {
         }
     }
 
-
-
     pub fn exec_concat(&self, rhs: &Value) -> Value {
         if let (Value::Blob(lhs), Value::Blob(rhs)) = (self, rhs) {
             return Value::build_text(String::from_utf8_lossy(dbg!(&[
@@ -8451,7 +8449,6 @@ impl Value {
 
         Value::build_text(lhs + &rhs)
     }
-
 
     pub fn exec_and(&self, rhs: &Value) -> Value {
         match (

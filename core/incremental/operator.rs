@@ -1357,10 +1357,10 @@ impl AggregateState {
                 }
                 // look into this later but for now this
                 #[cfg(feature = "u128-support")]
-                    Value::U128(i) => {
-                    blob.push(5u8); 
+                Value::U128(i) => {
+                    blob.push(5u8);
                     blob.extend_from_slice(&i.to_le_bytes());
-}
+                }
             }
         }
 
@@ -1443,7 +1443,7 @@ impl AggregateState {
                 #[cfg(feature = "u128-support")]
                 5 => {
                     let i = u128::from_le_bytes(blob.get(cursor..cursor + 16)?.try_into().ok()?);
-                    cursor += 16; 
+                    cursor += 16;
                     Value::U128(i)
                 }
                 _ => return None,
