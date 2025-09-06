@@ -1355,6 +1355,12 @@ impl AggregateState {
                     blob.extend_from_slice(&(b.len() as u32).to_le_bytes());
                     blob.extend_from_slice(b);
                 }
+                // look into this later but for now this
+                #[cfg(feature = "u128-support")]
+                    Value::U128(i) => {
+                    blob.push(5u8); 
+                    blob.extend_from_slice(&i.to_le_bytes());
+}
             }
         }
 
@@ -1432,6 +1438,13 @@ impl AggregateState {
                     let bytes = blob.get(cursor..cursor + len)?;
                     cursor += len;
                     Value::Blob(bytes.to_vec())
+                }
+                // todo look later after emrg conflicts
+                #[cfg(feature = "u128-support")]
+                5 => {
+                    let i = u128::from_le_bytes(blob.get(cursor..cursor + 16)?.try_into().ok()?);
+                    cursor += 16; 
+                    Value::U128(i)
                 }
                 _ => return None,
             };

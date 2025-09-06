@@ -960,7 +960,6 @@ fn create_table(
 
                 let mut typename_exactly_integer = false;
                 let ty = match col_type {
-
                     Some(data_type) => 'ty: {
                         // https://www.sqlite.org/datatype3.html
                         let mut type_name = data_type.name.clone();
@@ -996,13 +995,7 @@ fn create_table(
                         }
 
                         Type::Numeric
-
-                    Some(data_type) => {
-                        let (ty, ei) = type_from_name(&data_type.name);
-                        typename_exactly_integer = ei;
-                        ty
-
-                    }
+                    },
                     None => Type::Null,
                 };
 

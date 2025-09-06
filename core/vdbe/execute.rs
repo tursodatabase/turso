@@ -1722,30 +1722,37 @@ pub fn op_column(
                                         Register::Value(Value::U128(u128::from_be_bytes(bytes)));
                                 }
                                 // BLOB
-                                n if n >= 12 && n & 1 == 0 => match state.registers[*dest] {
-                                    Register::Value(Value::Blob(ref mut existing_blob)) => {
-                                        existing_blob.do_extend(&buf);
-                                    }
-                                    _ => {
-                                        state.registers[*dest] =
-                                            Register::Value(Value::Blob(buf.to_vec()));
-                                    }
-                                },
-                                // TEXT
-                                n if n >= 13 && n & 1 == 1 => match state.registers[*dest] {
+                                n if n >= 12 && n & 1 == 0 => {
                                     // Try to reuse the registers when allocation is not needed.
-                                    Register::Value(Value::Text(ref mut existing_text)) => {
-                                        // SAFETY: We know the text is valid UTF-8 because we only accept valid UTF-8 and the serial type is TEXT.
-                                        let text = unsafe { std::str::from_utf8_unchecked(buf) };
-                                        existing_text.do_extend(&text);
+                                    match state.registers[*dest] {
+                                        Register::Value(Value::Blob(ref mut existing_blob)) => {
+                                            existing_blob.do_extend(&buf);
+                                        }
+                                        _ => {
+                                            state.registers[*dest] =
+                                                Register::Value(Value::Blob(buf.to_vec()));
+                                        }
                                     }
-                                    _ => {
-                                        // SAFETY: We know the text is valid UTF-8 because we only accept valid UTF-8 and the serial type is TEXT.
-                                        let text = unsafe { std::str::from_utf8_unchecked(buf) };
-                                        state.registers[*dest] =
-                                            Register::Value(Value::Text(Text::new(text)));
+                                }
+                                // TEXT
+                                n if n >= 13 && n & 1 == 1 => {
+                                    // Try to reuse the registers when allocation is not needed.
+                                    match state.registers[*dest] {
+                                        Register::Value(Value::Text(ref mut existing_text)) => {
+                                            // SAFETY: We know the text is valid UTF-8 because we only accept valid UTF-8 and the serial type is TEXT.
+                                            let text =
+                                                unsafe { std::str::from_utf8_unchecked(buf) };
+                                            existing_text.do_extend(&text);
+                                        }
+                                        _ => {
+                                            // SAFETY: We know the text is valid UTF-8 because we only accept valid UTF-8 and the serial type is TEXT.
+                                            let text =
+                                                unsafe { std::str::from_utf8_unchecked(buf) };
+                                            state.registers[*dest] =
+                                                Register::Value(Value::Text(Text::new(text)));
+                                        }
                                     }
-                                },
+                                }
                                 _ => panic!("Invalid serial type: {serial_type}"),
                             }
 
@@ -1753,7 +1760,6 @@ pub fn op_column(
                         };
 
                         // DEFAULT handling. Try to reuse the registers when allocation is not needed.
-
                         let Some(ref default) = default else {
                             state.registers[*dest] = Register::Value(Value::Null);
                             break;
@@ -8424,77 +8430,15 @@ impl Value {
         }
     }
 
+
+
     pub fn exec_concat(&self, rhs: &Value) -> Value {
-
-        match (self, rhs) {
-            (Value::Text(lhs_text), Value::Text(rhs_text)) => {
-                Value::build_text(lhs_text.as_str().to_string() + rhs_text.as_str())
-            }
-            (Value::Text(lhs_text), Value::Integer(rhs_int)) => {
-                Value::build_text(lhs_text.as_str().to_string() + &rhs_int.to_string())
-            }
-            (Value::Text(lhs_text), Value::Float(rhs_float)) => {
-                Value::build_text(lhs_text.as_str().to_string() + &rhs_float.to_string())
-            }
-            (Value::Integer(lhs_int), Value::Text(rhs_text)) => {
-                Value::build_text(lhs_int.to_string() + rhs_text.as_str())
-            }
-            (Value::Integer(lhs_int), Value::Integer(rhs_int)) => {
-                Value::build_text(lhs_int.to_string() + &rhs_int.to_string())
-            }
-            (Value::Integer(lhs_int), Value::Float(rhs_float)) => {
-                Value::build_text(lhs_int.to_string() + &rhs_float.to_string())
-            }
-            (Value::Float(lhs_float), Value::Text(rhs_text)) => {
-                Value::build_text(lhs_float.to_string() + rhs_text.as_str())
-            }
-            (Value::Float(lhs_float), Value::Integer(rhs_int)) => {
-                Value::build_text(lhs_float.to_string() + &rhs_int.to_string())
-            }
-            (Value::Float(lhs_float), Value::Float(rhs_float)) => {
-                Value::build_text(lhs_float.to_string() + &rhs_float.to_string())
-            }
-
-            #[cfg(feature = "u128-support")]
-            (Value::U128(lhs_u128), Value::Text(rhs_text)) => {
-                Value::build_text(lhs_u128.to_string() + rhs_text.as_str())
-            }
-            #[cfg(feature = "u128-support")]
-            (Value::U128(lhs_u128), Value::Integer(rhs_int)) => {
-                Value::build_text(lhs_u128.to_string() + &rhs_int.to_string())
-            }
-            #[cfg(feature = "u128-support")]
-            (Value::U128(lhs_u128), Value::Float(rhs_float)) => {
-                Value::build_text(lhs_u128.to_string() + &rhs_float.to_string())
-            }
-            #[cfg(feature = "u128-support")]
-            (Value::U128(lhs_u128), Value::U128(rhs_u128)) => {
-                Value::build_text(lhs_u128.to_string() + &rhs_u128.to_string())
-            }
-            #[cfg(feature = "u128-support")]
-            (Value::Text(lhs_text), Value::U128(rhs_u128)) => {
-                Value::build_text(lhs_text.as_str().to_string() + &rhs_u128.to_string())
-            }
-            #[cfg(feature = "u128-support")]
-            (Value::Integer(lhs_int), Value::U128(rhs_u128)) => {
-                Value::build_text(lhs_int.to_string() + &rhs_u128.to_string())
-            }
-            #[cfg(feature = "u128-support")]
-            (Value::Float(lhs_float), Value::U128(rhs_u128)) => {
-                Value::build_text(lhs_float.to_string() + &rhs_u128.to_string())
-            }
-            (Value::Null, _) | (_, Value::Null) => Value::Null,
-            (Value::Blob(_), _) | (_, Value::Blob(_)) => {
-                todo!("TODO: Handle Blob conversion to String")
-            }
-
         if let (Value::Blob(lhs), Value::Blob(rhs)) = (self, rhs) {
             return Value::build_text(String::from_utf8_lossy(dbg!(&[
                 lhs.as_slice(),
                 rhs.as_slice()
             ]
             .concat())));
-
         }
 
         let Some(lhs) = self.cast_text() else {
@@ -8507,6 +8451,7 @@ impl Value {
 
         Value::build_text(lhs + &rhs)
     }
+
 
     pub fn exec_and(&self, rhs: &Value) -> Value {
         match (
