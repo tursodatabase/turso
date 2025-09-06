@@ -1,7 +1,7 @@
-use crate::{types::IOCompletions, Result};
+use crate::{io::CompletionFuture, Result};
 
 pub enum TransitionResult<Result> {
-    Io(IOCompletions),
+    Io(CompletionFuture),
     Continue,
     Done(Result),
 }

@@ -434,8 +434,9 @@ fn write_at(io: &impl IO, file: Arc<dyn File>, offset: usize, data: &[u8]) {
         // reference the buffer to keep alive for async io
         let _buf = _buf.clone();
     });
-    let result = file.pwrite(offset as u64, buffer, completion).unwrap();
-    while !result.is_completed() {
+    file.pwrite(offset as u64, buffer, completion.clone())
+        .unwrap();
+    while !completion.is_completed() {
         io.run_once().unwrap();
     }
 }

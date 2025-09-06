@@ -1,6 +1,7 @@
 use super::compiler::{DbspCircuit, DbspCompiler, DeltaSet};
 use super::dbsp::Delta;
 use super::operator::{ComputationTracker, FilterPredicate};
+use crate::io::IOBuilder;
 use crate::schema::{BTreeTable, Column, Schema};
 use crate::storage::btree::BTreeCursor;
 use crate::translate::logical::LogicalPlanBuilder;
@@ -683,10 +684,7 @@ impl IncrementalView {
                             pending_row: None, // No pending row when interrupted between rows
                         };
                         // TODO: Get the actual I/O completion from the statement
-                        let completion = crate::io::Completion::new_dummy();
-                        return Ok(IOResult::IO(crate::types::IOCompletions::Single(
-                            completion,
-                        )));
+                        return Ok(IOResult::IO(IOBuilder::ready()));
                     }
                 }
             }

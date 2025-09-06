@@ -51,7 +51,7 @@ use super::pager::PageRef;
 use super::wal::TursoRwLock;
 use crate::error::LimboError;
 use crate::fast_lock::SpinLock;
-use crate::io::{Buffer, Completion, ReadComplete};
+use crate::io::{Buffer, Completion, CompletionFuture, IOBuilder, ReadComplete};
 use crate::storage::btree::offset::{
     BTREE_CELL_CONTENT_AREA, BTREE_CELL_COUNT, BTREE_FIRST_FREEBLOCK, BTREE_FRAGMENTED_BYTES_COUNT,
     BTREE_PAGE_TYPE, BTREE_RIGHTMOST_PTR,
@@ -902,7 +902,7 @@ pub fn begin_read_page(
     page_idx: usize,
     allow_empty_read: bool,
     io_ctx: &IOContext,
-) -> Result<Completion> {
+) -> Result<CompletionFuture> {
     tracing::trace!("begin_read_btree_page(page_idx = {})", page_idx);
     let buf = buffer_pool.get_page();
     #[allow(clippy::arc_with_non_send_sync)]
@@ -947,7 +947,7 @@ pub fn finish_read_page(page_idx: usize, buffer_ref: Arc<Buffer>, page: PageRef)
 }
 
 #[instrument(skip_all, level = Level::DEBUG)]
-pub fn begin_write_btree_page(pager: &Pager, page: &PageRef) -> Result<Completion> {
+pub fn begin_write_btree_page(pager: &Pager, page: &PageRef) -> Result<CompletionFuture> {
     tracing::trace!("begin_write_btree_page(page={})", page.get().id);
     let page_source = &pager.db_file;
     let page_finish = page.clone();
@@ -997,10 +997,10 @@ pub fn write_pages_vectored(
     batch: BTreeMap<usize, Arc<Buffer>>,
     done_flag: Arc<AtomicBool>,
     final_write: bool,
-) -> Result<Vec<Completion>> {
+) -> Result<CompletionFuture> {
     if batch.is_empty() {
         done_flag.store(true, Ordering::Relaxed);
-        return Ok(Vec::new());
+        return Ok(CompletionFuture::default());
     }
 
     let page_sz = pager.page_size.get().expect("page size is not set").get() as usize;
@@ -1029,7 +1029,7 @@ pub fn write_pages_vectored(
     // Track which run we're on to identify the last one
     let mut current_run = 0;
     let mut iter = batch.iter().peekable();
-    let mut completions = Vec::new();
+    let mut completions = CompletionFuture::default();
 
     while let Some((id, item)) = iter.next() {
         // Track the start of the run
@@ -1080,15 +1080,14 @@ pub fn write_pages_vectored(
                 c,
             ) {
                 Ok(c) => {
-                    completions.push(c);
+                    completions.append(c);
                 }
                 Err(e) => {
                     if runs_left.fetch_sub(1, Ordering::AcqRel) == 1 {
                         done.store(true, Ordering::Release);
                     }
-                    for c in completions {
-                        c.abort();
-                    }
+                    // No need to abort the completions here as we did not schedule the IO yet
+                    // Also Drop of CompletionChain will abort competions
                     return Err(e);
                 }
             }
@@ -1104,7 +1103,7 @@ pub fn write_pages_vectored(
 pub fn begin_sync(
     db_file: Arc<dyn DatabaseStorage>,
     syncing: Rc<Cell<bool>>,
-) -> Result<Completion> {
+) -> Result<CompletionFuture> {
     assert!(!syncing.get());
     syncing.set(true);
     let completion = Completion::new_sync(move |_| {
@@ -1623,7 +1622,9 @@ pub fn write_varint_to_vec(value: u64, payload: &mut Vec<u8>) {
 }
 
 /// We need to read the WAL file on open to reconstruct the WAL frame cache.
-pub fn read_entire_wal_dumb(file: &Arc<dyn File>) -> Result<Arc<RwLock<WalFileShared>>> {
+pub fn read_entire_wal_dumb(
+    file: &Arc<dyn File>,
+) -> Result<(Arc<RwLock<WalFileShared>>, CompletionFuture)> {
     let size = file.size()?;
     #[allow(clippy::arc_with_non_send_sync)]
     let buf_for_pread = Arc::new(Buffer::new_temporary(size as usize));
@@ -1846,9 +1847,9 @@ pub fn read_entire_wal_dumb(file: &Arc<dyn File>) -> Result<Arc<RwLock<WalFileSh
         }
     });
     let c = Completion::new_read(buf_for_pread, complete);
-    let _c = file.pread(0, c)?;
+    let c = IOBuilder::pread(file.clone(), 0, c);
 
-    Ok(wal_file_shared_ret)
+    Ok((wal_file_shared_ret, c))
 }
 
 pub fn begin_read_wal_frame_raw(
@@ -1856,12 +1857,12 @@ pub fn begin_read_wal_frame_raw(
     io: &Arc<dyn File>,
     offset: u64,
     complete: Box<ReadComplete>,
-) -> Result<Completion> {
+) -> Result<CompletionFuture> {
     tracing::trace!("begin_read_wal_frame_raw(offset={})", offset);
     let buf = Arc::new(buffer_pool.get_wal_frame());
     #[allow(clippy::arc_with_non_send_sync)]
     let c = Completion::new_read(buf, complete);
-    let c = io.pread(offset, c)?;
+    let c = IOBuilder::pread(io.clone(), offset, c);
     Ok(c)
 }
 
@@ -1872,7 +1873,7 @@ pub fn begin_read_wal_frame(
     complete: Box<ReadComplete>,
     page_idx: usize,
     io_ctx: &IOContext,
-) -> Result<Completion> {
+) -> Result<CompletionFuture> {
     tracing::trace!(
         "begin_read_wal_frame(offset={}, page_idx={})",
         offset,
@@ -1881,7 +1882,7 @@ pub fn begin_read_wal_frame(
     let buf = buffer_pool.get_page();
     let buf = Arc::new(buf);
 
-    if let Some(ctx) = io_ctx.encryption_context() {
+    let builder = if let Some(ctx) = io_ctx.encryption_context() {
         let encryption_ctx = ctx.clone();
         let original_complete = complete;
 
@@ -1911,11 +1912,12 @@ pub fn begin_read_wal_frame(
         });
 
         let new_completion = Completion::new_read(buf, decrypt_complete);
-        io.pread(offset, new_completion)
+        IOBuilder::pread(io.clone(), offset, new_completion)
     } else {
         let c = Completion::new_read(buf, complete);
-        io.pread(offset, c)
-    }
+        IOBuilder::pread(io.clone(), offset, c)
+    };
+    Ok(builder)
 }
 
 pub fn parse_wal_frame_header(frame: &[u8]) -> (WalFrameHeader, &[u8]) {
@@ -1972,7 +1974,7 @@ pub fn prepare_wal_frame(
     (final_checksum, Arc::new(buffer))
 }
 
-pub fn begin_write_wal_header(io: &Arc<dyn File>, header: &WalHeader) -> Result<Completion> {
+pub fn begin_write_wal_header(io: &Arc<dyn File>, header: &WalHeader) -> Result<CompletionFuture> {
     tracing::trace!("begin_write_wal_header");
     let buffer = {
         let buffer = Buffer::new_temporary(WAL_HEADER_SIZE);
@@ -2005,7 +2007,7 @@ pub fn begin_write_wal_header(io: &Arc<dyn File>, header: &WalHeader) -> Result<
     };
     #[allow(clippy::arc_with_non_send_sync)]
     let c = Completion::new_write(write_complete);
-    let c = io.pwrite(0, buffer.clone(), c.clone())?;
+    let c = IOBuilder::pwrite(io.clone(), 0, buffer.clone(), c.clone());
     Ok(c)
 }
 

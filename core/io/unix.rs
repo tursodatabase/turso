@@ -172,7 +172,7 @@ impl File for UnixFile {
     }
 
     #[instrument(err, skip_all, level = Level::TRACE)]
-    fn pread(&self, pos: u64, c: Completion) -> Result<Completion> {
+    fn pread(&self, pos: u64, c: Completion) -> Result<()> {
         let file = self.file.lock();
         let result = unsafe {
             let r = c.as_read();
@@ -192,12 +192,12 @@ impl File for UnixFile {
             trace!("pread n: {}", result);
             // Read succeeded immediately
             c.complete(result as i32);
-            Ok(c)
+            Ok(())
         }
     }
 
     #[instrument(err, skip_all, level = Level::TRACE)]
-    fn pwrite(&self, pos: u64, buffer: Arc<crate::Buffer>, c: Completion) -> Result<Completion> {
+    fn pwrite(&self, pos: u64, buffer: Arc<crate::Buffer>, c: Completion) -> Result<()> {
         let file = self.file.lock();
         let result = unsafe {
             libc::pwrite(
@@ -214,17 +214,12 @@ impl File for UnixFile {
             trace!("pwrite n: {}", result);
             // Write succeeded immediately
             c.complete(result as i32);
-            Ok(c)
+            Ok(())
         }
     }
 
     #[instrument(err, skip_all, level = Level::TRACE)]
-    fn pwritev(
-        &self,
-        pos: u64,
-        buffers: Vec<Arc<crate::Buffer>>,
-        c: Completion,
-    ) -> Result<Completion> {
+    fn pwritev(&self, pos: u64, buffers: Vec<Arc<crate::Buffer>>, c: Completion) -> Result<()> {
         if buffers.len().eq(&1) {
             // use `pwrite` for single buffer
             return self.pwrite(pos, buffers[0].clone(), c);
@@ -235,7 +230,7 @@ impl File for UnixFile {
             Ok(written) => {
                 trace!("pwritev wrote {written}");
                 c.complete(written as i32);
-                Ok(c)
+                Ok(())
             }
             Err(e) => {
                 return Err(e.into());
@@ -244,7 +239,7 @@ impl File for UnixFile {
     }
 
     #[instrument(err, skip_all, level = Level::TRACE)]
-    fn sync(&self, c: Completion) -> Result<Completion> {
+    fn sync(&self, c: Completion) -> Result<()> {
         let file = self.file.lock();
 
         let result = unsafe {
@@ -270,7 +265,7 @@ impl File for UnixFile {
             trace!("fcntl(F_FULLSYNC)");
 
             c.complete(0);
-            Ok(c)
+            Ok(())
         }
     }
 
@@ -281,14 +276,14 @@ impl File for UnixFile {
     }
 
     #[instrument(err, skip_all, level = Level::INFO)]
-    fn truncate(&self, len: u64, c: Completion) -> Result<Completion> {
+    fn truncate(&self, len: u64, c: Completion) -> Result<()> {
         let file = self.file.lock();
         let result = file.set_len(len);
         match result {
             Ok(()) => {
                 trace!("file truncated to len=({})", len);
                 c.complete(0);
-                Ok(c)
+                Ok(())
             }
             Err(e) => Err(e.into()),
         }

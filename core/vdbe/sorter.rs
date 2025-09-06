@@ -7,7 +7,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use tempfile;
 
-use crate::types::IOCompletions;
+use crate::io::{CompletionFuture, IOBuilder};
 use crate::util::IOExt;
 use crate::{
     error::LimboError,
@@ -18,7 +18,7 @@ use crate::{
     types::{IOResult, ImmutableRecord, KeyInfo, RecordCursor, RefValue},
     Result,
 };
-use crate::{io_yield_many, io_yield_one, return_if_io, CompletionError};
+use crate::{io_yield, return_if_io, CompletionError};
 
 #[derive(Debug, Clone, Copy)]
 enum SortState {
@@ -152,7 +152,7 @@ impl Sorter {
                 SortState::Flush => {
                     self.sort_state = SortState::InitHeap;
                     if let Some(c) = self.flush()? {
-                        io_yield_one!(c);
+                        io_yield!(c);
                     }
                 }
                 SortState::InitHeap => {
@@ -207,7 +207,7 @@ impl Sorter {
                     self.insert_state = InsertState::Insert;
                     if self.current_buffer_size + payload_size > self.max_buffer_size {
                         if let Some(c) = self.flush()? {
-                            io_yield_one!(c);
+                            io_yield!(c);
                         }
                     }
                 }
@@ -236,17 +236,13 @@ impl Sorter {
     fn init_chunk_heap(&mut self) -> Result<IOResult<()>> {
         match self.init_chunk_heap_state {
             InitChunkHeapState::Start => {
-                let mut completions: Vec<Completion> = Vec::with_capacity(self.chunks.len());
+                let mut completions = CompletionFuture::default();
                 for chunk in self.chunks.iter_mut() {
-                    let c = chunk.read().inspect_err(|_| {
-                        for c in completions.iter() {
-                            c.abort();
-                        }
-                    })?;
-                    completions.push(c);
+                    let c = chunk.read()?;
+                    completions.append(c)
                 }
                 self.init_chunk_heap_state = InitChunkHeapState::PushChunk;
-                io_yield_many!(completions);
+                io_yield!(completions);
             }
             InitChunkHeapState::PushChunk => {
                 // Make sure all chunks read at least one record into their buffer.
@@ -306,7 +302,7 @@ impl Sorter {
         Ok(IOResult::Done(()))
     }
 
-    fn flush(&mut self) -> Result<Option<Completion>> {
+    fn flush(&mut self) -> Result<Option<CompletionFuture>> {
         if self.records.is_empty() {
             // Dummy completion to not complicate logic handling
             return Ok(None);
@@ -468,7 +464,7 @@ impl SortedChunk {
                             self.io_state.set(SortedChunkIOState::ReadEOF);
                         } else {
                             let c = self.read()?;
-                            io_yield_one!(c);
+                            io_yield!(c);
                         }
                     }
                 }
@@ -480,7 +476,7 @@ impl SortedChunk {
         }
     }
 
-    fn read(&mut self) -> Result<Completion> {
+    fn read(&mut self) -> Result<CompletionFuture> {
         self.io_state.set(SortedChunkIOState::WaitingForRead);
 
         let read_buffer_size = self.buffer.borrow().len() - self.buffer_len.get();
@@ -520,9 +516,11 @@ impl SortedChunk {
         });
 
         let c = Completion::new_read(read_buffer_ref, read_complete);
-        let c = self
-            .file
-            .pread(self.start_offset + self.total_bytes_read.get() as u64, c)?;
+        let c = IOBuilder::pread(
+            self.file.clone(),
+            self.start_offset + self.total_bytes_read.get() as u64,
+            c,
+        );
         Ok(c)
     }
 
@@ -531,7 +529,7 @@ impl SortedChunk {
         records: &mut Vec<SortableImmutableRecord>,
         record_size_lengths: Vec<usize>,
         chunk_size: usize,
-    ) -> Result<Completion> {
+    ) -> Result<CompletionFuture> {
         assert!(self.io_state.get() == SortedChunkIOState::None);
         self.io_state.set(SortedChunkIOState::WaitingForWrite);
         self.chunk_size = chunk_size;
@@ -566,7 +564,7 @@ impl SortedChunk {
         });
 
         let c = Completion::new_write(write_complete);
-        let c = self.file.pwrite(self.start_offset, buffer_ref, c)?;
+        let c = IOBuilder::pwrite(self.file.clone(), self.start_offset, buffer_ref, c);
         Ok(c)
     }
 }
