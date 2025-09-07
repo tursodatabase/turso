@@ -33,6 +33,7 @@ dist/
 
 # testing
 testing/limbo_output.txt
+testing/tmp_db/testing_norowidalias.dump
 **/limbo_output.txt
 testing/*.log
 .bugbase
