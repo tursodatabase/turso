@@ -5,7 +5,7 @@ source $testdir/tester.tcl
 
 do_execsql_test select-avg {
   SELECT avg(age) FROM users;
-} {50.396}
+} {51.2701333333333}
 
 do_execsql_test select-avg-text {
   SELECT avg(first_name) FROM users;
@@ -13,7 +13,7 @@ do_execsql_test select-avg-text {
 
 do_execsql_test select-sum {
   SELECT sum(age) FROM users;
-} {503960}
+} {769052}
 
 do_execsql_test select-sum-text {
   SELECT sum(first_name) FROM users;
@@ -21,7 +21,7 @@ do_execsql_test select-sum-text {
 
 do_execsql_test select-total {
   SELECT total(age) FROM users;
-} {503960.0}
+} {769052.0}
 
 do_execsql_test select-total-text {
   SELECT total(first_name) FROM users WHERE id < 3;
@@ -33,15 +33,15 @@ do_execsql_test select-limit {
 
 do_execsql_test select-count {
   SELECT count(id) FROM users;
-} {10000}
+} {15000}
 
 do_execsql_test select-count {
   SELECT count(*) FROM users;
-} {10000}
+} {15000}
 
 do_execsql_test select-count-constant-true {
   SELECT count(*) FROM users WHERE true;
-} {10000}
+} {15000}
 
 do_execsql_test select-count-constant-false {
   SELECT count(*) FROM users WHERE false;
@@ -49,11 +49,11 @@ do_execsql_test select-count-constant-false {
 
 do_execsql_test select-max {
   SELECT max(age) FROM users;
-} {100}
+} {85}
 
 do_execsql_test select-min {
   SELECT min(age) FROM users;
-} {1}
+} {18}
 
 do_execsql_test_on_specific_db {:memory:} min-null-regression-test {
   CREATE TABLE t (a);
@@ -77,78 +77,78 @@ do_execsql_test select-min-text {
 } {Aaron}
 
 do_execsql_test select-group-concat {
-  SELECT group_concat(name) FROM products;
+  SELECT group_concat(name) FROM products where id < 12;
 } {hat,cap,shirt,sweater,sweatshirt,shorts,jeans,sneakers,boots,coat,accessories}
 
 do_execsql_test select-group-concat-with-delimiter {
-  SELECT group_concat(name, ';') FROM products;
+  SELECT group_concat(name, ';') FROM products where id < 12;
 } {hat;cap;shirt;sweater;sweatshirt;shorts;jeans;sneakers;boots;coat;accessories}
 
 do_execsql_test select-group-concat-with-column-delimiter {
-  SELECT group_concat(name, id) FROM products;
+  SELECT group_concat(name, id) FROM products where id < 12;
 } {hat2cap3shirt4sweater5sweatshirt6shorts7jeans8sneakers9boots10coat11accessories}
 
 do_execsql_test select-string-agg-with-delimiter {
-  SELECT string_agg(name, ',') FROM products;
+  SELECT string_agg(name, ',') FROM products where id < 12;
 } {hat,cap,shirt,sweater,sweatshirt,shorts,jeans,sneakers,boots,coat,accessories}
 
 do_execsql_test select-string-agg-with-column-delimiter {
-  SELECT string_agg(name, id) FROM products;
+  SELECT string_agg(name, id) FROM products where id < 12;
 } {hat2cap3shirt4sweater5sweatshirt6shorts7jeans8sneakers9boots10coat11accessories}
 
 do_execsql_test select-agg-unary-negative {
   SELECT -max(age) FROM users;
-} {-100}
+} {-85}
 
 do_execsql_test select-agg-unary-positive {
   SELECT +max(age) FROM users;
-} {100}
+} {85}
 
 do_execsql_test select-agg-binary-unary-negative {
   SELECT min(age) + -max(age) FROM users;
-} {-99}
+} {-67}
 
 do_execsql_test select-agg-binary-unary-positive {
   SELECT min(age) + +max(age) FROM users;
-} {101}
+} {103}
 
 do_execsql_test select-non-agg-cols-should-be-not-null {
   SELECT id, first_name, sum(age) FROM users LIMIT 1;
-} {1|Jamie|503960}
+} {1|Dawn|769052}
 
 do_execsql_test select-with-group-by-and-agg-1 {
   SELECT id, first_name, avg(age) FROM users group by last_name limit 1;
-} {274|Debra|66.25}
+} {8469|Melissa|52.5}
 
 do_execsql_test select-with-group-by-and-agg-2 {
   select first_name, last_name from users where state = 'AL' group by last_name limit 10;
-} {Jay|Acosta
-Daniel|Adams
-Aaron|Baker
-Sharon|Becker
-Kim|Berg
-Donald|Bishop
-Brian|Bradford
-Jesus|Bradley
-John|Brown
-Hunter|Burke}
+} {Crystal|Acevedo
+Amy|Adams
+Seth|Alexander
+Nancy|Alvarez
+Kelsey|Anderson
+Kimberly|Arnold
+Tracy|Atkinson
+Crystal|Avila
+Anna|Ayers
+Joshua|Baker}
 
 do_execsql_test select-agg-json-array {
-  SELECT json_group_array(name) FROM products;
+  SELECT json_group_array(name) FROM products where id < 12;
 } {["hat","cap","shirt","sweater","sweatshirt","shorts","jeans","sneakers","boots","coat","accessories"]}
 
 do_execsql_test select-agg-json-array-object {
-  SELECT json_group_array(json_object('name', name)) FROM products;
+  SELECT json_group_array(json_object('name', name)) FROM products where id < 12;
 } {[{"name":"hat"},{"name":"cap"},{"name":"shirt"},{"name":"sweater"},{"name":"sweatshirt"},{"name":"shorts"},{"name":"jeans"},{"name":"sneakers"},{"name":"boots"},{"name":"coat"},{"name":"accessories"}]}
 
 do_execsql_test select-distinct-agg-functions {
 SELECT sum(distinct age), count(distinct age), avg(distinct age) FROM users;
-} {5050|100|50.5}
+} {3502|68|51.5}
 
 do_execsql_test select-json-group-object {
   select price,
          json_group_object(cast (id as text), name)
-  from products
+  from products where id < 12
   group by price
   order by price;
 } {1.0|{"9":"boots"}
@@ -170,11 +170,11 @@ do_execsql_test select-json-group-object-no-sorting-required {
   group by age
   order by age
   limit 5;
-} {1|{"6737":"Amy"}
-2|{"2297":"Amy","3580":"Amanda"}
-3|{"3437":"Amanda"}
-5|{"2378":"Amy","3227":"Amy","5605":"Amanda"}
-7|{"2454":"Amber"}}
+} {18|{"4420":"Amy","8893":"Amber"}
+19|{"40":"Amanda","453":"Amber","10965":"Amanda"}
+20|{"2562":"Amy","3735":"Amber","7092":"Amy","12510":"Amber","13117":"Amanda","13371":"Amy"}
+21|{"330":"Amanda","1168":"Amanda","1564":"Amy","3535":"Amy","4638":"Amy","10265":"Amanda","10379":"Amy"}
+22|{"677":"Amy","7481":"Amy","8052":"Amanda","10683":"Amber"}}
 
 do_execsql_test_error_content select-max-star {
   SELECT max(*) FROM users;

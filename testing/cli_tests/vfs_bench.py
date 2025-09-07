@@ -51,7 +51,7 @@ def setup_temp_db() -> None:
     # make sure we start fresh, otherwise we could end up with
     # one having to checkpoint the others from the previous run
     cleanup_temp_db()
-    cmd = ["sqlite3", "testing/testing.db", ".clone testing/temp.db"]
+    cmd = ["sqlite3", "testing/tmp_db/testing.db", ".clone testing/tmp_db/temp.db"]
     proc = subprocess.run(cmd, check=True)
     proc.check_returncode()
     sleep(0.3)  # make sure it's finished

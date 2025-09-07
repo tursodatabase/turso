@@ -9,7 +9,7 @@ use turso_core::{Database, PlatformIO};
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn rusqlite_open() -> rusqlite::Connection {
-    let sqlite_conn = rusqlite::Connection::open("../testing/testing.db").unwrap();
+    let sqlite_conn = rusqlite::Connection::open("../testing/tmp_db/testing.db").unwrap();
     sqlite_conn
         .pragma_update(None, "locking_mode", "EXCLUSIVE")
         .unwrap();
@@ -266,7 +266,7 @@ fn bench_prepare_query(criterion: &mut Criterion) {
 
     #[allow(clippy::arc_with_non_send_sync)]
     let io = Arc::new(PlatformIO::new().unwrap());
-    let db = Database::open_file(io.clone(), "../testing/testing.db", false, false).unwrap();
+    let db = Database::open_file(io.clone(), "../testing/tmp_db/testing.db", false, false).unwrap();
     let limbo_conn = db.connect().unwrap();
 
     let queries = [
@@ -345,7 +345,7 @@ fn bench_execute_select_rows(criterion: &mut Criterion) {
 
     #[allow(clippy::arc_with_non_send_sync)]
     let io = Arc::new(PlatformIO::new().unwrap());
-    let db = Database::open_file(io.clone(), "../testing/testing.db", false, false).unwrap();
+    let db = Database::open_file(io.clone(), "../testing/tmp_db/testing.db", false, false).unwrap();
     let limbo_conn = db.connect().unwrap();
 
     let mut group = criterion.benchmark_group("Execute `SELECT * FROM users LIMIT ?`");
@@ -413,7 +413,7 @@ fn bench_execute_select_1(criterion: &mut Criterion) {
 
     #[allow(clippy::arc_with_non_send_sync)]
     let io = Arc::new(PlatformIO::new().unwrap());
-    let db = Database::open_file(io.clone(), "../testing/testing.db", false, false).unwrap();
+    let db = Database::open_file(io.clone(), "../testing/tmp_db/testing.db", false, false).unwrap();
     let limbo_conn = db.connect().unwrap();
 
     let mut group = criterion.benchmark_group("Execute `SELECT 1`");
@@ -465,7 +465,7 @@ fn bench_execute_select_count(criterion: &mut Criterion) {
 
     #[allow(clippy::arc_with_non_send_sync)]
     let io = Arc::new(PlatformIO::new().unwrap());
-    let db = Database::open_file(io.clone(), "../testing/testing.db", false, false).unwrap();
+    let db = Database::open_file(io.clone(), "../testing/tmp_db/testing.db", false, false).unwrap();
     let limbo_conn = db.connect().unwrap();
 
     let mut group = criterion.benchmark_group("Execute `SELECT count() FROM users`");

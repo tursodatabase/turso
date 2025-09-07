@@ -731,7 +731,20 @@ def test_tablestats():
 
     limbo.run_test_fn(
         "SELECT * FROM stats ORDER BY name;",
-        lambda res: sorted(_split(res)) == sorted(["logs|1", "people|3", "products|11", "users|10000"]),
+        lambda res: sorted(_split(res))
+        == sorted(
+            [
+                "customer_support_tickets|10000",
+                "inventory_transactions|18000",
+                "logs|1",
+                "order_items|90282",
+                "orders|20000",
+                "people|3",
+                "products|12000",
+                "reviews|25000",
+                "users|15000",
+            ]
+        ),
         "stats shows correct initial counts (and skips itself)",
     )
 
@@ -755,7 +768,7 @@ def test_tablestats():
     # we need to add 3 for the 3 queries we did above.
     limbo.run_test_fn(
         "SELECT * FROM stats WHERE name='products';",
-        lambda x: x == "products|14",
+        lambda x: x == "products|12003",
         "products table reflects changes",
     )
     # an insert to products with (name,price) ('xConnect', 42)
@@ -769,7 +782,7 @@ def test_tablestats():
 
     limbo.run_test_fn(
         "SELECT * FROM stats WHERE name='users';",
-        lambda x: x == "users|10000",
+        lambda x: x == "users|15000",
         "users table unchanged",
     )
 

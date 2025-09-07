@@ -1,6 +1,14 @@
 set sqlite_exec [expr {[info exists env(SQLITE_EXEC)] ? $env(SQLITE_EXEC) : "sqlite3"}]
-set test_dbs [list "testing/testing.db" "testing/testing_norowidalias.db"]
-set test_small_dbs [list "testing/testing_small.db" ]
+
+# Check if running in parallel mode with a job ID
+if {[info exists env(TEST_JOB_ID)]} {
+    set job_id $env(TEST_JOB_ID)
+    set test_dbs [list "testing/tmp_db/$job_id/testing.db" "testing/tmp_db/$job_id/testing_norowidalias.db"]
+    set test_small_dbs [list "testing/tmp_db/$job_id/testing_small.db"]
+} else {
+	set test_dbs [list "testing/tmp_db/testing.db" "testing/tmp_db/testing_norowidalias.db"]
+	set test_small_dbs [list "testing/tmp_db/testing_small.db" ]
+}
 
 # Array storing loaded extensions
 array set extensions {}

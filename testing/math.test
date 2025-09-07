@@ -259,31 +259,31 @@ foreach {testnum lhs rhs ans} {
 
 do_execsql_test add-agg-int {
   SELECT sum(id) + 10 from products
-} {76}
+} {72006010}
 
 do_execsql_test add-int-agg {
   SELECT 10 + sum(id) from products
-} {76}
+} {72006010}
 
 do_execsql_test add-agg-float {
   SELECT sum(id) + 10.1 from products
-} {76.1}
+} {72006010.1}
 
 do_execsql_test add-float-agg {
   SELECT 10.1 + sum(id) from products
-} {76.1}
+} {72006010.1}
 
 do_execsql_test add-agg-int-agg-int {
   SELECT sum(id) + sum(id) from products
-} {132}
+} {144012000}
 
 do_execsql_test add-agg-float-agg-float {
   SELECT sum(price) + sum(price) from products
-} {1246.0}
+} {12109157.26}
 
 do_execsql_test add-agg-int-agg-float {
   SELECT sum(id) + sum(price) from products
-} {689.0}
+} {78060578.63}
 
 do_execsql_test add-float-text-edgecase {
   SELECT '-123.22342-24' + '232.3x32';
@@ -296,35 +296,35 @@ SELECT '-1+23.22342-24' + '2-32.3x32';
 
 
 do_execsql_test subtract-agg-int {
-  SELECT sum(id) - 10 from products
+  SELECT sum(id) - 10 from products where id < 12;
 } {56}
 
 do_execsql_test subtract-int-agg {
-  SELECT 10 - sum(id) from products
+  SELECT 10 - sum(id) from products where id < 12;
 } {-56}
 
 do_execsql_test subtract-agg-float {
-  SELECT sum(id) - 10.1 from products
+  SELECT sum(id) - 10.1 from products where id < 12;
 } {55.9}
 
 do_execsql_test subtract-float-agg {
-  SELECT 10.1 - sum(id) from products
+  SELECT 10.1 - sum(id) from products where id < 12;
 } {-55.9}
 
 do_execsql_test subtract-agg-int-agg-int {
-  SELECT sum(id) - sum(id) from products
+  SELECT sum(id) - sum(id) from products where id < 12;
 } {0}
 
 do_execsql_test subtract-agg-float-agg-float {
-  SELECT sum(price) - sum(price) from products
+  SELECT sum(price) - sum(price) from products where id < 12;
 } {0.0}
 
 do_execsql_test subtract-agg-int-agg-float {
-  SELECT sum(id) - sum(price) from products
+  SELECT sum(id) - sum(price) from products where id < 12;
 } {-557.0}
 
 do_execsql_test subtract-agg-float-agg-int {
-  SELECT sum(price) - sum(id) from products
+  SELECT sum(price) - sum(id) from products where id < 12;
 } {557.0}
 
 do_execsql_test subtract-str-float-edgecase {
@@ -333,35 +333,35 @@ do_execsql_test subtract-str-float-edgecase {
 
 
 do_execsql_test multiply-agg-int {
-  SELECT sum(id) * 10 from products
+  SELECT sum(id) * 10 from products where id < 12;
 } {660}
 
 do_execsql_test multiply-int-agg {
-  SELECT 10 * sum(id) from products
+  SELECT 10 * sum(id) from products where id < 12;
 } {660}
 
 do_execsql_test multiply-agg-float {
-  SELECT sum(id) * 10.1 from products
+  SELECT sum(id) * 10.1 from products where id < 12;
 } {666.6}
 
 do_execsql_test multiply-float-agg {
-  SELECT 10.1 * sum(id) from products
+  SELECT 10.1 * sum(id) from products where id < 12;
 } {666.6}
 
 do_execsql_test multiply-agg-int-agg-int {
-  SELECT sum(id) * sum(id) from products
+  SELECT sum(id) * sum(id) from products where id < 12;
 } {4356}
 
 do_execsql_test multiply-agg-float-agg-float {
-  SELECT sum(price) * sum(price) from products
+  SELECT sum(price) * sum(price) from products where id < 12;
 } {388129.0}
 
 do_execsql_test multiply-agg-int-agg-float {
-  SELECT sum(id) * sum(price) from products
+  SELECT sum(id) * sum(price) from products where id < 12;
 } {41118.0}
 
 do_execsql_test multiply-agg-float-agg-int {
-  SELECT sum(price) * sum(id) from products
+  SELECT sum(price) * sum(id) from products where id < 12;
 } {41118.0}
 
 do_execsql_test multiply-str-floats-edgecase {
@@ -370,32 +370,32 @@ do_execsql_test multiply-str-floats-edgecase {
 
 
 do_execsql_test divide-agg-int {
-  SELECT sum(id) / 10 from products
+  SELECT sum(id) / 10 from products where id < 12;
 } {6}
 
 do_execsql_test divide-int-agg {
-  SELECT 660 / sum(id) from products
+  SELECT 660 / sum(id) from products where id < 12;
 } {10}
 
 do_execsql_test divide-agg-float {
-  SELECT sum(id) / 1.5 from products
+  SELECT sum(id) / 1.5 from products where id < 12;
 } {44.0}
 
 do_execsql_test divide-float-agg {
-  SELECT 66.0 / sum(id) from products
+  SELECT 66.0 / sum(id) from products where id < 12;
 } {1.0}
 
 do_execsql_test divide-agg-int-agg-int {
-  SELECT sum(id) / sum(id) from products
+  SELECT sum(id) / sum(id) from products where id < 12;
 } {1}
 
 do_execsql_test divide-agg-float-agg-float {
-  SELECT sum(price) / sum(price) from products
+  SELECT sum(price) / sum(price) from products;
 } {1.0}
 
 do_execsql_test divide-agg-int-agg-float {
   SELECT sum(id) / min(price) from products
-} {66.0}
+} {72006000.0}
 
 do_execsql_test divide-agg-float-agg-int {
   SELECT min(price) / min(id) from products
@@ -424,7 +424,7 @@ do_execsql_test bitwise-and-float-int-rev {
 
 do_execsql_test bitwise-and-int-agg-int {
    SELECT 8261 & sum(id) from products
-} {64}
+} {8256}
 
 do_execsql_test bitwise-and-int-agg-float {
     SELECT 1036.6 & sum(id) from products
@@ -432,7 +432,7 @@ do_execsql_test bitwise-and-int-agg-float {
 
 do_execsql_test bitwise-and-int-agg-int-agg {
     SELECT sum(id) & sum(id) from products
-} {66}
+} {72006000}
 
 foreach {testnum lhs rhs ans} {
    1   'a'   'a'   0
@@ -468,7 +468,7 @@ do_execsql_test bitwise-or-int-float {
 
 do_execsql_test bitwise-or-int-agg {
     SELECT 18823 | sum(id) from products
-} {18887}
+} {72022519}
 
 do_execsql_test bitwise-or-float-float {
     SELECT 1234.6 | 5432.2
@@ -491,7 +491,7 @@ foreach {testnum lhs rhs ans} {
 
 do_execsql_test bitwise-and-int-agg-int-agg {
     SELECT sum(id) | sum(id) from products
-} {66}
+} {72006000}
 
 
 foreach {testname lhs rhs ans} {
@@ -1379,7 +1379,7 @@ do_execsql_test remainder-int-agg {
 
 do_execsql_test remainder-agg-int {
     SELECT count(*) % 17 from users
-} { 4 }
+} { 6 }
 
 do_execsql_test remainder-agg-float {
     SELECT count(*) % 2.43 from users

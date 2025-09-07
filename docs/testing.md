@@ -6,6 +6,9 @@ Limbo supports a comprehensive testing system to ensure correctness, performance
 
 The `make test` target is the main entry point.
 
+(`make test-parallel CORES?=N` is available on systems with `GNU parallel` installed)
+
+
 Most compatibility tests live in the testing/ directory and are written in SQLite’s TCL test format. These tests ensure that Limbo matches SQLite’s behavior exactly. The database used during these tests is located at testing/testing.db, which includes the following schema:
 
 ```sql

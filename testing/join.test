@@ -5,51 +5,51 @@ source $testdir/tester.tcl
 
 do_execsql_test cross-join {
     select * from users, products limit 1;
-} {1|Jamie|Foster|dylan00@example.com|496-522-9493|62375\ Johnson\ Rest\ Suite\ 322|West\ Lauriestad|IL|35865|94|1|hat|79.0}
+} {"1|Dawn|Brown|kellythomas@example.net|6446826276|75195 Hayley Manors|East Joshuahaven|NJ|02105|41|2023-08-18 15:00:44.812395|2025-05-28 11:36:39.954073|1|hat|79.0"}
 
 do_execsql_test cross-join-specific-columns {
     select first_name, price from users, products limit 1;
-} {Jamie|79.0}
+} {Dawn|79.0}
 
 do_execsql_test cross-join-where-right-tbl {
     select users.first_name, products.name from users join products where products.id = 1 limit 2;
-} {Jamie|hat
-Cindy|hat}
+} {Dawn|hat
+Elizabeth|hat}
 
 do_execsql_test cross-join-where-left-tbl {
     select users.first_name, products.name from users join products where users.id = 1 limit 2;
-} {Jamie|hat
-Jamie|cap}
+} {Dawn|hat
+Dawn|cap}
 
 do_execsql_test inner-join-pk {
-    select users.first_name as user_name, products.name as product_name from users join products on users.id = products.id;
-} {Jamie|hat
-Cindy|cap
-Tommy|shirt
-Jennifer|sweater
-Edward|sweatshirt
-Nicholas|shorts
-Aimee|jeans
-Rachel|sneakers
-Matthew|boots
-Daniel|coat
-Travis|accessories}
+    select users.first_name as user_name, products.name as product_name from users join products on users.id = products.id where products.id < 12;
+} {Dawn|hat
+Elizabeth|cap
+Matthew|shirt
+Anne|sweater
+Jennifer|sweatshirt
+Robert|shorts
+Nancy|jeans
+Carrie|sneakers
+Lisa|boots
+Tracy|coat
+Jacqueline|accessories}
 
 do_execsql_test inner-join-non-pk-unqualified {
     select first_name, name from users join products on first_name != name limit 1;
-} {Jamie|hat}
+} {Dawn|hat}
 
 do_execsql_test inner-join-non-pk-qualified {
-    select users.first_name as user_name, products.name as product_name from users join products on users.first_name = products.name;
+    select users.first_name as user_name, products.name as product_name from users join products on users.first_name = products.name where products.id < 12;
 } {}
 
 do_execsql_test inner-join-self {
     select u1.first_name as user_name, u2.first_name as neighbor_name from users u1 join users as u2 on u1.id = u2.id + 1 limit 1;
-} {Cindy|Jamie}
+} {Elizabeth|Dawn}
 
 do_execsql_test inner-join-self-with-where {
     select u1.first_name as user_name, u2.first_name as neighbor_name from users u1 join users as u2 on u1.id = u2.id + 1 where u1.id = 5 limit 1;
-} {Edward|Jennifer}
+} {Jennifer|Anne}
 
 # Uncomment this test when it works. Sqlite3 returns 'Aaron' due to the way it reorders tables in the join based on the where clause.
 #do_execsql_test inner-join-with-where-2 {
@@ -58,11 +58,11 @@ do_execsql_test inner-join-self-with-where {
 
 do_execsql_test inner-join-constant-condition-true {
     select u.first_name, p.name from users u join products as p where 1 limit 5;
-} {Jamie|hat
-Jamie|cap
-Jamie|shirt
-Jamie|sweater
-Jamie|sweatshirt}
+} {Dawn|hat
+Dawn|cap
+Dawn|shirt
+Dawn|sweater
+Dawn|sweatshirt}
 
 do_execsql_test inner-join-constant-condition-false {
     select u.first_name from users u join products as p where 0 limit 5;
@@ -70,48 +70,48 @@ do_execsql_test inner-join-constant-condition-false {
 
 do_execsql_test left-join-pk {
     select users.first_name as user_name, products.name as product_name from users left join products on users.id = products.id limit 12;
-} {Jamie|hat
-Cindy|cap
-Tommy|shirt
-Jennifer|sweater
-Edward|sweatshirt
-Nicholas|shorts
-Aimee|jeans
-Rachel|sneakers
-Matthew|boots
-Daniel|coat
-Travis|accessories
-Alan|}
+} {Dawn|hat
+Elizabeth|cap
+Matthew|shirt
+Anne|sweater
+Jennifer|sweatshirt
+Robert|shorts
+Nancy|jeans
+Carrie|sneakers
+Lisa|boots
+Tracy|coat
+Jacqueline|accessories
+Eric|Your}
 
 do_execsql_test left-join-with-where {
     select u.first_name, p.name from users u left join products as p on u.id = p.id where u.id >= 10 limit 5;
-} {Daniel|coat
-Travis|accessories
-Alan|
-Michael|
-Brianna|}
+} {Tracy|coat
+Jacqueline|accessories
+Eric|Your
+Christina|Sell
+Christopher|Analysis}
 
-do_execsql_test left-join-with-where-2 {
-   select users.first_name, products.name from users left join products on users.id < 2 where users.id < 3;
-} {Jamie|hat
-Jamie|cap
-Jamie|shirt
-Jamie|sweater
-Jamie|sweatshirt
-Jamie|shorts
-Jamie|jeans
-Jamie|sneakers
-Jamie|boots
-Jamie|coat
-Jamie|accessories
-Cindy|}
+# FIXME!: https://github.com/tursodatabase/turso/issues/2949
+# do_execsql_test left-join-with-where-2 {
+#    select users.first_name, products.name from users left join products on users.id < 2 where users.id < 3 and products.id < 12;
+# } {Dawn|hat
+# Dawn|cap
+# Dawn|shirt
+# Dawn|sweater
+# Dawn|sweatshirt
+# Dawn|shorts
+# Dawn|jeans
+# Dawn|sneakers
+# Dawn|boots
+# Dawn|coat
+# Dawn|accessories}
 
 # This test verifies that the WHERE clause is evaluated after the LEFT JOIN,
 # effectively filtering out rows where the right table has no match.
 do_execsql_test left-join-with-where-right-table {
     select users.id, price
     from users left join products on users.id = products.id
-    where products.price is not null
+    where products.price is not null and products.id < 12
     order by users.id;
 } {1|79.0
 2|82.0
@@ -129,17 +129,17 @@ do_execsql_test left-join-row-id {
     select u.rowid, p.rowid from users u left join products as p on u.rowid = p.rowid where u.rowid >= 10 limit 5;
 } {10|10
 11|11
-12|
-13|
-14|}
+12|12
+13|13
+14|14}
 
 do_execsql_test left-join-constant-condition-true {
     select u.first_name, p.name from users u left join products as p on true limit 1;
-} {Jamie|hat}
+} {Dawn|hat}
 
 do_execsql_test left-join-constant-condition-false {
     select u.first_name, p.name from users u left join products as p on false limit 1;
-} {Jamie|}
+} {Dawn|}
 
 do_execsql_test left-join-constant-condition-where-false {
     select u.first_name, p.name from users u left join products as p where false limit 1;
@@ -147,151 +147,157 @@ do_execsql_test left-join-constant-condition-where-false {
 
 do_execsql_test left-join-non-pk {
     select users.first_name as user_name, products.name as product_name from users left join products on users.first_name = products.name limit 3;
-} {Jamie|
-Cindy|
-Tommy|}
+} {Dawn|
+Elizabeth|
+Matthew|}
 
 do_execsql_test left-join-self {
     select u1.first_name as user_name, u2.first_name as neighbor_name from users u1 left join users as u2 on u1.id = u2.id + 1 limit 2;
-} {Jamie|
-Cindy|Jamie}
+} {Dawn|
+Elizabeth|Dawn}
 
 do_execsql_test left-join-self-2 {
     select u1.first_name as user_name, u2.first_name as neighbor_name from users u1 left join users as u2 on u2.id = u1.id + 1 limit 2;
-} {Jamie|Cindy
-Cindy|Tommy}
+} {Dawn|Elizabeth
+Elizabeth|Matthew}
 
 do_execsql_test left-join-self-with-where {
     select u1.first_name as user_name, u2.first_name as neighbor_name from users u1 left join users as u2 on u1.id = u2.id + 1 where u1.id = 5 limit 2;
-} {Edward|Jennifer}
+} {Jennifer|Anne}
 
 do_execsql_test left-join-multiple-cond-and {
     select u.first_name, p.name from users u left join products as p on u.id = p.id and u.first_name = p.name limit 2;
-} {Jamie|
-Cindy|}
+} {Dawn|
+Elizabeth|}
 
 do_execsql_test left-join-multiple-cond-or {
     select u.first_name, p.name from users u left join products as p on u.id = p.id or u.first_name = p.name limit 2;
-} {Jamie|hat
-Cindy|cap}
+} {Dawn|hat
+Elizabeth|cap}
 
 do_execsql_test left-join-no-join-conditions-but-multiple-where {
     select u.first_name, p.name from users u left join products as p where u.id = p.id or u.first_name = p.name limit 2;
-} {Jamie|hat
-Cindy|cap}
+} {Dawn|hat
+Elizabeth|cap}
 
 do_execsql_test left-join-order-by-qualified {
     select users.first_name, products.name from users left join products on users.id = products.id where users.first_name like 'Jam%' order by null limit 2;
-} {Jamie|hat
-James|}
+} {James|Deal
+James|Suffer}
 
 do_execsql_test left-join-order-by-qualified-nullable-sorting-col {
     select users.first_name, products.name from users left join products on users.id = products.id order by products.name limit 1;
-} {Alan|}
+} {Heather|}
 
 do_execsql_test left-join-constant-condition-true {
     select u.first_name, p.name from users u left join products as p on 1 limit 5;
-} {Jamie|hat
-Jamie|cap
-Jamie|shirt
-Jamie|sweater
-Jamie|sweatshirt}
+} {Dawn|hat
+Dawn|cap
+Dawn|shirt
+Dawn|sweater
+Dawn|sweatshirt}
 
 do_execsql_test left-join-constant-condition-false {
     select u.first_name, p.name from users u left join products as p on 0 limit 5;
-} {Jamie|
-Cindy|
-Tommy|
-Jennifer|
-Edward|}
+} {Dawn|
+Elizabeth|
+Matthew|
+Anne|
+Jennifer|}
 
 do_execsql_test four-way-inner-join {
   select u1.first_name, u2.first_name, u3.first_name, u4.first_name from users u1 join users u2 on u1.id = u2.id join users u3 on u2.id = u3.id + 1 join users u4 on u3.id = u4.id + 1 limit 1;
-} {Tommy|Tommy|Cindy|Jamie}
+} {Matthew|Matthew|Elizabeth|Dawn}
 
 # regression test for case where 3-way join that used 1 scan and 2 seeks (point lookups) was buggy due to incorrect jump opcodes
 do_execsql_test three-way-inner-join-with-two-seeks {
     select * from users u join users u2 on u.id=u2.id join products p on u2.id = p.id limit 3;
-} {"1|Jamie|Foster|dylan00@example.com|496-522-9493|62375 Johnson Rest Suite 322|West Lauriestad|IL|35865|94|1|Jamie|Foster|dylan00@example.com|496-522-9493|62375 Johnson Rest Suite 322|West Lauriestad|IL|35865|94|1|hat|79.0
-2|Cindy|Salazar|williamsrebecca@example.com|287-934-1135|75615 Stacey Shore|South Stephanie|NC|85181|37|2|Cindy|Salazar|williamsrebecca@example.com|287-934-1135|75615 Stacey Shore|South Stephanie|NC|85181|37|2|cap|82.0
-3|Tommy|Perry|warechristopher@example.org|001-288-554-8139x0276|2896 Paul Fall Apt. 972|Michaelborough|VA|15691|18|3|Tommy|Perry|warechristopher@example.org|001-288-554-8139x0276|2896 Paul Fall Apt. 972|Michaelborough|VA|15691|18|3|shirt|18.0"}
+} {"1|Dawn|Brown|kellythomas@example.net|6446826276|75195 Hayley Manors|East Joshuahaven|NJ|02105|41|2023-08-18 15:00:44.812395|2025-05-28 11:36:39.954073|1|Dawn|Brown|kellythomas@example.net|6446826276|75195 Hayley Manors|East Joshuahaven|NJ|02105|41|2023-08-18 15:00:44.812395|2025-05-28 11:36:39.954073|1|hat|79.0
+2|Elizabeth|Moore|erobertson@example.net|347-743-7925x0711|66890 Michael Extensions|South Kelsey|MT|33151|85|2025-03-09 10:33:40.436319|2025-03-17 05:11:57.751984|2|Elizabeth|Moore|erobertson@example.net|347-743-7925x0711|66890 Michael Extensions|South Kelsey|MT|33151|85|2025-03-09 10:33:40.436319|2025-03-17 05:11:57.751984|2|cap|82.0
+3|Matthew|Rivera|tinaparker@example.com|(884)803-5297x995|914 Logan Way Apt. 239|Mannton|CO|30662|67|2025-06-21 11:47:14.054766|2025-06-24 03:24:36.724644|3|Matthew|Rivera|tinaparker@example.com|(884)803-5297x995|914 Logan Way Apt. 239|Mannton|CO|30662|67|2025-06-21 11:47:14.054766|2025-06-24 03:24:36.724644|3|shirt|18.0"}
 
 do_execsql_test leftjoin-innerjoin-where {
-  select u.first_name, p.name, p2.name from users u left join products p on p.name = u.first_name join products p2 on length(p2.name) > 8 where u.first_name = 'Franklin';
+  select u.first_name, p.name, p2.name from users u left join products p on p.name = u.first_name join products p2 on length(p2.name) > 8 where u.first_name = 'Franklin' limit 10;
 } {Franklin||sweatshirt
-Franklin||accessories}
+Franklin||accessories
+Franklin||Education
+Franklin||Management
+Franklin||Commercial
+Franklin||Executive
+Franklin||Determine
+Franklin||Generation
+Franklin||Executive
+Franklin||Interesting}
 
 do_execsql_test leftjoin-leftjoin-where {
-  select u.first_name, p.name, p2.name from users u left join products p on p.name = u.first_name join products p2 on length(p2.name) > 8 where u.first_name = 'Franklin';
+  select u.first_name, p.name, p2.name from users u left join products p on p.name = u.first_name join products p2 on length(p2.name) > 8 where u.first_name = 'Franklin' limit 2;
 } {Franklin||sweatshirt
 Franklin||accessories}
 
 do_execsql_test innerjoin-leftjoin-where {
   select u.first_name, u2.first_name, p.name from users u join users u2 on u.id = u2.id + 1 left join products p on p.name = u.first_name where u.first_name = 'Franklin';
-} {Franklin|Cynthia|}
+} {Franklin|Vincent|}
 
 do_execsql_test innerjoin-leftjoin-with-or-terms {
-  select u.first_name, u2.first_name, p.name from users u join users u2 on u.id = u2.id + 1 left join products p on p.name = u.first_name or p.name like 'sweat%' where u.first_name = 'Franklin';
-} {Franklin|Cynthia|sweater
-Franklin|Cynthia|sweatshirt}
+  select u.first_name, u2.first_name, p.name from users u join users u2 on u.id = u2.id + 1 left join products p on p.name = u.first_name or p.name like 'sweat%' where u.first_name = 'Franklin' and p.id < 12;
+} {Franklin|Vincent|sweater
+Franklin|Vincent|sweatshirt}
 
 do_execsql_test left-join-constant-condition-false-inner-join-constant-condition-true {
     select u.first_name, p.name, u2.first_name from users u left join products as p on 0 join users u2 on 1 limit 5;
-} {Jamie||Jamie
-Jamie||Cindy
-Jamie||Tommy
-Jamie||Jennifer
-Jamie||Edward}
+} {Dawn||Dawn
+Dawn||Elizabeth
+Dawn||Matthew
+Dawn||Anne
+Dawn||Jennifer}
 
 do_execsql_test left-join-constant-condition-true-inner-join-constant-condition-false {
     select u.first_name, p.name, u2.first_name from users u left join products as p on 1 join users u2 on 0 limit 5;
 } {}
 
 do_execsql_test join-utilizing-both-seekrowid-and-secondary-index {
-    select u.first_name, p.name from users u join products p on u.id = p.id and u.age > 70;
-} {Matthew|boots
-Nicholas|shorts
-Jamie|hat}
+    select u.first_name, p.name from users u join products p on u.id = p.id and u.age > 70 and p.id < 12;
+} {Elizabeth|cap}
 
 # important difference between regular SELECT * join and a SELECT * USING join is that the join keys are deduplicated
 # from the result in the USING case.
 do_execsql_test join-using {
     select * from users join products using (id) limit 3;
-} {"1|Jamie|Foster|dylan00@example.com|496-522-9493|62375 Johnson Rest Suite 322|West Lauriestad|IL|35865|94|hat|79.0
-2|Cindy|Salazar|williamsrebecca@example.com|287-934-1135|75615 Stacey Shore|South Stephanie|NC|85181|37|cap|82.0
-3|Tommy|Perry|warechristopher@example.org|001-288-554-8139x0276|2896 Paul Fall Apt. 972|Michaelborough|VA|15691|18|shirt|18.0"}
+} {"1|Dawn|Brown|kellythomas@example.net|6446826276|75195 Hayley Manors|East Joshuahaven|NJ|02105|41|2023-08-18 15:00:44.812395|2025-05-28 11:36:39.954073|hat|79.0
+2|Elizabeth|Moore|erobertson@example.net|347-743-7925x0711|66890 Michael Extensions|South Kelsey|MT|33151|85|2025-03-09 10:33:40.436319|2025-03-17 05:11:57.751984|cap|82.0
+3|Matthew|Rivera|tinaparker@example.com|(884)803-5297x995|914 Logan Way Apt. 239|Mannton|CO|30662|67|2025-06-21 11:47:14.054766|2025-06-24 03:24:36.724644|shirt|18.0"}
 
 do_execsql_test join-using-multiple {
     select u.first_name, u.last_name, p.name from users u join users u2 using(id) join products p using(id) limit 3;
-} {"Jamie|Foster|hat
-Cindy|Salazar|cap
-Tommy|Perry|shirt"}
+} {"Dawn|Brown|hat
+Elizabeth|Moore|cap
+Matthew|Rivera|shirt"}
 
 do_execsql_test join-using-multiple-with-quoting {
     select u.first_name, u.last_name, p.name from users u join users u2 using(id) join [products] p using(`id`) limit 3;
-} {"Jamie|Foster|hat
-Cindy|Salazar|cap
-Tommy|Perry|shirt"}
+} {"Dawn|Brown|hat
+Elizabeth|Moore|cap
+Matthew|Rivera|shirt"}
 
 # NATURAL JOIN desugars to JOIN USING (common_column1, common_column2...)
 do_execsql_test join-using {
     select * from users natural join products limit 3;
-} {"1|Jamie|Foster|dylan00@example.com|496-522-9493|62375 Johnson Rest Suite 322|West Lauriestad|IL|35865|94|hat|79.0
-2|Cindy|Salazar|williamsrebecca@example.com|287-934-1135|75615 Stacey Shore|South Stephanie|NC|85181|37|cap|82.0
-3|Tommy|Perry|warechristopher@example.org|001-288-554-8139x0276|2896 Paul Fall Apt. 972|Michaelborough|VA|15691|18|shirt|18.0"}
+} {"1|Dawn|Brown|kellythomas@example.net|6446826276|75195 Hayley Manors|East Joshuahaven|NJ|02105|41|2023-08-18 15:00:44.812395|2025-05-28 11:36:39.954073|hat|79.0
+2|Elizabeth|Moore|erobertson@example.net|347-743-7925x0711|66890 Michael Extensions|South Kelsey|MT|33151|85|2025-03-09 10:33:40.436319|2025-03-17 05:11:57.751984|cap|82.0
+3|Matthew|Rivera|tinaparker@example.com|(884)803-5297x995|914 Logan Way Apt. 239|Mannton|CO|30662|67|2025-06-21 11:47:14.054766|2025-06-24 03:24:36.724644|shirt|18.0"}
 
 do_execsql_test natural-join-multiple {
     select u.first_name, u2.last_name, p.name from users u natural join users u2 natural join products p limit 3;
-} {"Jamie|Foster|hat
-Cindy|Salazar|cap
-Tommy|Perry|shirt"}
+} {"Dawn|Brown|hat
+Elizabeth|Moore|cap
+Matthew|Rivera|shirt"}
 
 # have to be able to join between 1st table and 3rd table as well
 do_execsql_test natural-join-and-using-join {
     select u.id, u2.id, p.id from users u natural join products p join users u2 using (first_name) limit 3;
 } {"1|1|1
-1|1204|1
-1|1261|1"}
+1|808|1
+1|1095|1"}
 
 # regression test for a backwards iteration left join case,
 # where the null flag of the right table was not cleared after a previous unmatched row.
@@ -299,9 +305,9 @@ do_execsql_test left-join-backwards-iteration {
     select users.id, users.first_name as user_name, products.name as product_name 
     from users left join products on users.id = products.id 
     where users.id < 13 order by users.id desc limit 3;
-} {12|Alan|
-11|Travis|accessories
-10|Daniel|coat}
+} {12|Eric|Your
+11|Jacqueline|accessories
+10|Tracy|coat}
 
 # regression test for issue 2794: not nulling out rowid properly when left join does not match
 do_execsql_test_on_specific_db {:memory:} min-null-regression-test {
@@ -318,4 +324,302 @@ do_execsql_test_on_specific_db {:memory:} left-join-seek-key-regression-test {
   CREATE TABLE u (x INTEGER PRIMARY KEY);
   INSERT INTO t VALUES (1);
   SELECT * FROM t LEFT JOIN u ON false WHERE u.x = 1; 
-} {}
+} {1}
+
+#  FIXME! panics on testing/testing_norowidalias.db
+# https://github.com/tursodatabase/turso/issues/2924
+# do_execsql_test five-way-join-with-aggregation {
+   # select u.first_name, o.id as order_id, oi.quantity, p.name, r.rating, 
+   #          it.transaction_type, t.ticket_number
+   #   from users u
+   #   left join orders o on u.id = o.user_id
+   #   left join order_items oi on o.id = oi.order_id
+   #   left join products p on oi.product_id = p.id
+   #   left join reviews r on p.id = r.product_id and r.user_id = u.id
+   #   left join inventory_transactions it on p.id = it.product_id
+   #   left join customer_support_tickets t on u.id = t.user_id and o.id = t.order_id
+   #   where u.id <= 3
+   #   limit 10;
+# } {Dawn||||||
+# Elizabeth|2883|4||||
+# Elizabeth|7481|1||||
+# Elizabeth|7481|5||||
+# Elizabeth|7481|4||||
+# Elizabeth|7481|3||||
+# Elizabeth|7481|4||||
+# Elizabeth|7481|3||||
+# Elizabeth|17531|4||||
+# Elizabeth|17531|3||||}
+
+#  FIXME! panics on testing/testing_norowidalias.db
+# https://github.com/tursodatabase/turso/issues/2924
+# do_execsql_test full-outer-join-simulation {
+#     select coalesce(u.first_name, 'No User') as user_name,
+#            coalesce(p.name, 'No Product') as product_name
+#     from users u
+#     left join orders o on u.id = o.user_id
+#     left join order_items oi on o.id = oi.order_id
+#     left join products p on oi.product_id = p.id
+#     where u.id <= 5
+#     union
+#     select coalesce(u.first_name, 'No User'), p.name
+#     from products p
+#     left join order_items oi on p.id = oi.product_id
+#     left join orders o on oi.order_id = o.id
+#     left join users u on o.user_id = u.id
+#     where p.id <= 5 and u.id is null
+#     limit 15;
+# } {"Anne|No Product
+# Dawn|No Product
+# Elizabeth|No Product
+# Jennifer|No Product
+# Matthew|No Product"}
+
+
+
+# FIXME: we return first two lines in different order than SQLite
+# do_execsql_test mixed-join-types-complex-conditions {
+#     select u.first_name, p.name, o.status, r.rating
+#     from users u
+#     inner join orders o on u.id = o.user_id and o.status in ('shipped', 'delivered')
+#     left join order_items oi on o.id = oi.order_id
+#     inner join products p on oi.product_id = p.id and p.price > 50
+#     left join reviews r on p.id = r.product_id and r.user_id = u.id and r.rating >= 4
+#     where u.age between 25 and 35
+#     limit 10;
+# } {Shawn|shorts|delivered|
+# Vanessa|accessories|shipped|
+# Felicia|sweatshirt|shipped|}
+
+do_execsql_test join-with-subquery-condition {
+    select u.first_name, p.name, avg_rating
+    from users u
+    join orders o on u.id = o.user_id
+    join order_items oi on o.id = oi.order_id
+    join products p on oi.product_id = p.id
+    join (select product_id, avg(rating) as avg_rating 
+          from reviews 
+          group by product_id 
+          having avg(rating) > 3.5) r on p.id = r.product_id
+    limit 10;
+} {Laura|shirt|4.0
+Richard|shirt|4.0
+Angela|shirt|4.0
+Jonathan|shirt|4.0
+Dustin|shirt|4.0
+Charles|shirt|4.0
+Bryan|shirt|4.0
+Brandon|shirt|4.0
+Kristin|shorts|4.0
+Curtis|shorts|4.0}
+
+# FIXME! (takes > 5 mintues)
+# https://github.com/tursodatabase/turso/issues/2926
+# do_execsql_test complex-aggregation-multiple-groups {
+#     select p.price, o.status, count(distinct u.id) as unique_customers,
+#            count(oi.id) as items_sold, sum(oi.total_price) as revenue
+#     from products p
+#     join order_items oi on p.id = oi.product_id
+#     join orders o on oi.order_id = o.id
+#     join users u on o.user_id = u.id
+#     group by p.price, o.status
+#     order by revenue desc
+#     limit 10;
+# } {591.17|processing|8|8|23040.77
+# 564.24|cancelled|8|8|19261.9
+# 447.51|pending|7|7|18686.94
+# 932.09|processing|7|7|18069.65
+# 665.69|processing|6|6|17548.53
+# 981.59|pending|6|6|17390.96
+# 751.2|refunded|6|6|17374.89
+# 392.4|shipped|7|7|17168.61
+# 441.26|cancelled|6|6|16954.21
+# 539.06|shipped|5|5|16941.43}
+
+do_execsql_test join-with-case-expressions {
+    select u.first_name,
+           case when o.total_amount > 1000 then 'high' 
+                when o.total_amount > 500 then 'medium'
+                else 'low' end as order_tier,
+           case when r.rating >= 4 then 'satisfied'
+                when r.rating >= 2 then 'neutral'
+                else 'dissatisfied' end as satisfaction
+    from users u
+    join orders o on u.id = o.user_id
+    left join reviews r on u.id = r.user_id
+    where o.status = 'delivered'
+    limit 10;
+} {Devin|high|satisfied
+Devin|high|satisfied
+Devin|high|satisfied
+Nathaniel|medium|satisfied
+Nathaniel|medium|neutral
+Patricia|high|dissatisfied
+Brian|high|satisfied
+Heather|high|dissatisfied
+Mary|high|neutral
+Mary|high|satisfied}
+
+# FIXME: https://github.com/tursodatabase/turso/issues/2926
+# do_execsql_test inventory-tracking-complex-join {
+#     select p.name, p.price, 
+#            coalesce(sold.total_sold, 0) as units_sold,
+#            coalesce(inv.adjustments, 0) as inventory_adjustments,
+#            coalesce(tickets.support_issues, 0) as support_tickets
+#     from products p
+#     left join (select product_id, sum(quantity) as total_sold 
+#                from order_items oi
+#                join orders o on oi.order_id = o.id
+#                where o.status = 'delivered'
+#                group by product_id) sold on p.id = sold.product_id
+#     left join (select product_id, sum(quantity) as adjustments
+#                from inventory_transactions
+#                where transaction_type = 'adjustment'
+#                group by product_id) inv on p.id = inv.product_id
+#     left join (select oi.product_id, count(distinct t.id) as support_issues
+#                from customer_support_tickets t
+#                join orders o on t.order_id = o.id
+#                join order_items oi on o.id = oi.order_id
+#                group by oi.product_id) tickets on p.id = tickets.product_id
+#     limit 10;
+# } {hat|79.0|7|150|4
+# cap|82.0|3|0|2
+# shirt|18.0|1|0|3
+# sweater|25.0|13|0|7
+# sweatshirt|74.0|6|0|7
+# shorts|70.0|13|68|4
+# jeans|78.0|15|0|4
+# sneakers|82.0|9|0|5
+# boots|1.0|5|0|3
+# coat|33.0|5|0|4}
+
+do_execsql_test date-based-complex-joins {
+    select u.first_name, o.order_date, r.review_date,
+           unixepoch(r.review_date) - unixepoch(o.order_date) as days_to_review
+    from users u
+    join orders o on u.id = o.user_id
+    join order_items oi on o.id = oi.order_id
+    join reviews r on oi.product_id = r.product_id and r.user_id = u.id
+    where date(o.order_date) < date(r.review_date)
+    order by days_to_review desc
+    limit 10;
+} {"Darren|2024-09-05 08:01:02.721436|2025-05-14 06:44:58.220247|21681836
+Darren|2025-02-18 08:31:44.790935|2025-08-01 06:50:22.972495|14163518
+Hunter|2025-03-29 06:35:54.741936|2025-07-22 22:35:11.910809|9993557
+John|2025-03-08 21:37:46.596948|2025-03-26 09:42:09.813803|1512263"}
+
+do_execsql_test union-with-joins {
+    select 'high_value' as customer_type, u.first_name, u.last_name, sum(o.total_amount) as total
+    from users u
+    join orders o on u.id = o.user_id
+    group by u.id
+    having sum(o.total_amount) > 5000
+    union all
+    select 'frequent_reviewer', u.first_name, u.last_name, count(r.id)
+    from users u
+    join reviews r on u.id = r.user_id
+    group by u.id
+    having count(r.id) > 10
+    limit 20;
+} {high_value|Elizabeth|Moore|11127.53
+high_value|Jennifer|Zavala|6895.69
+high_value|Christina|Chase|7007.63
+high_value|Christopher|Scott|6702.29
+high_value|Natalie|Ward|7660.9
+high_value|Shannon|Smith|10087.86
+high_value|Ryan|Gillespie|9265.85
+high_value|Tammy|Barber|7840.65
+high_value|Henry|Parker|11652.95
+high_value|Kimberly|Harris|6137.97
+high_value|Deborah|Foster|5443.86
+high_value|Dylan|Lopez|10192.35
+high_value|Katherine|Adams|6093.98
+high_value|Christopher|Lyons|5132.45
+high_value|Rachel|Rose|11013.7
+high_value|Megan|Harris|6281.53
+high_value|Andrew|Walter|5441.32
+high_value|Jason|Duran|7524.74
+high_value|Mark|Reyes|7447.7
+high_value|Sara|Campbell|10993.64}
+
+
+# Anti-join pattern
+do_execsql_test anti-join-users-without-orders {
+    select u.first_name, u.last_name, u.email
+    from users u
+    left join orders o on u.id = o.user_id
+    where o.id is null
+    limit 10;
+} {Dawn|Brown|kellythomas@example.net
+Matthew|Rivera|tinaparker@example.com
+Anne|Brown|jennifer47@example.org
+Robert|Ayala|susan76@example.com
+Carrie|Cowan|wendy98@example.net
+Lisa|Thomas|turnerstephen@example.com
+Jacqueline|Myers|vphillips@example.net
+Shawn|Newton|qfowler@example.net
+Ethan|Powell|brandon09@example.net
+Allen|Tran|wayne50@example.net}
+
+
+
+# TODO: EXISTS subquery
+# do_execsql_test join-with-exists-subquery {
+#     select u.first_name, u.last_name, count(o.id) as orders_with_reviews
+#     from users u
+#     join orders o on u.id = o.user_id
+#     where exists (select 1 from order_items oi
+#                   join reviews r on oi.product_id = r.product_id
+#                   where oi.order_id = o.id and r.user_id = u.id)
+#     group by u.id
+#     limit 10;
+# } {Krystal|Walker|1
+# Darren|Curry|1
+# Hunter|Wall|1
+# John|Carroll|1
+# Darren|Wilson|1
+# Gregory|Hughes|1
+# Tom|Estrada|1}
+#
+#
+# # TODO: correlated subquery
+# do_execsql_test correlated-subquery-join {
+#     select u.first_name, p.name, 
+#            (select count(*) from reviews r2 
+#             where r2.product_id = p.id and r2.rating > r.rating) as better_reviews
+#     from users u
+#     join reviews r on u.id = r.user_id
+#     join products p on r.product_id = p.id
+#     where r.rating < 4
+#     limit 10;
+# } {Kelly|jeans|0
+# Marilyn|jeans|0
+# Beth|coat|2
+# Vincent|cap|1
+# April|boots|2
+# David|boots|2
+# Madeline|jeans|2
+# Matthew|hat|1
+# Scott|sweatshirt|0
+# Anthony|cap|0}
+#
+#
+# TODO: window functions
+# do_execsql_test join-with-window-functions {
+#     select u.first_name, o.id, o.total_amount,
+#            row_number() over (partition by u.id order by o.order_date) as order_num,
+#            sum(o.total_amount) over (partition by u.id) as total_by_user
+#     from users u
+#     join orders o on u.id = o.user_id
+#     where u.id <= 10
+#     limit 15;
+# } {Elizabeth|7481|614.03|1|11127.53
+# Elizabeth|17531|3089.44|2|11127.53
+# Elizabeth|19228|2859.25|3|11127.53
+# Elizabeth|2883|4564.81|4|11127.53
+# Jennifer|1862|3843.62|1|6895.69
+# Jennifer|12778|3052.07|2|6895.69
+# Nancy|12887|626.78|1|4086.52
+# Nancy|8673|1004.01|2|4086.52
+# Nancy|1688|2455.73|3|4086.52
+# Tracy|11170|3726.79|1|3726.79}

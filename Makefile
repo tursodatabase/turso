@@ -55,7 +55,7 @@ uv-sync-test:
 	uv sync --all-extras --dev --package turso_test
 .PHONE: uv-sync
 
-test: limbo uv-sync-test test-compat test-alter-column test-vector test-sqlite3 test-shell test-memory test-write test-update test-constraint test-collate test-extensions test-mvcc test-matviews
+test: gen-db limbo uv-sync-test test-compat test-alter-column test-vector test-sqlite3 test-shell test-memory test-write test-update test-constraint test-collate test-extensions test-mvcc test-matviews
 .PHONY: test
 
 test-extensions: limbo uv-sync-test
@@ -87,6 +87,7 @@ test-alter-column:
 .PHONY: test-alter-column
 
 reset-db:
+	rm -f testing/tmp_db/*.db
 	./scripts/clone_test_db.sh
 .PHONY: reset-db
 
@@ -152,6 +153,25 @@ clickbench:
 	./perf/clickbench/benchmark.sh
 .PHONY: clickbench
 
+check-parallel:
+	@echo "Checking parallel build support..."
+	@if command -v parallel >/dev/null 2>&1; then \
+		echo "gnu parallel found"; \
+	else \
+		echo "gnu parallel not found. Please install it to run tests in parallel."; \
+		exit 1; \
+	fi
+
+
+CORES ?= $(shell nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
+test-parallel: check-tcl-version check-parallel
+	@echo "Running compatibility tests in parallel on $(CORES) cores"
+	RUST_LOG=$(RUST_LOG) SQLITE_EXEC=$(SQLITE_EXEC) ./scripts/test_parallel.sh $(CORES)
+.PHONY: test-parallel
+
+gen-db:
+	./scripts/generate_db.sh
+.PHONY: gen-db
 
 bench-exclude-tpc-h:
 	@benchmarks=$$(cargo bench --bench 2>&1 | grep -A 1000 '^Available bench targets:' | grep -v '^Available bench targets:' | grep -v '^ *$$' | grep -v 'tpc_h_benchmark' | xargs -I {} printf -- "--bench %s " {}); \

@@ -1,3 +1,4 @@
 #!/bin/bash
-rm -f testing/testing_clone.db*
-sqlite3 testing/testing/db '.clone testing/testing_clone.db' > /dev/null
+rm -f testing/tmp_db/testing_clone.db*
+scripts/generate_db.sh
+sqlite3 testing/tmp_db/testing.db '.clone testing/tmp_db/testing_clone.db' > /dev/null

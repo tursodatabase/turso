@@ -5,16 +5,16 @@ source $testdir/tester.tcl
 
 do_execsql_test group_by {
   select u.first_name, sum(u.age) from users u group by u.first_name limit 10;
-} {Aaron|2271
-Abigail|890
-Adam|1642
-Adrian|439
-Adriana|83
-Adrienne|318
-Aimee|33
-Alan|551
-Albert|369
-Alec|247}
+} {Aaron|2865
+Abigail|912
+Adam|1977
+Adrian|459
+Adriana|22
+Adrienne|354
+Aimee|81
+Alan|936
+Albert|909
+Alec|368}
 
 do_execsql_test group_by_without_aggs {
   select u.first_name from users u group by u.first_name limit 10;
@@ -31,149 +31,147 @@ Alec}
 
 do_execsql_test group_by_two_joined_columns {
   select u.first_name, p.name, sum(u.age) from users u join products p on u.id = p.id group by u.first_name, p.name limit 10;
-} {Aimee|jeans|24
-Cindy|cap|37
-Daniel|coat|13
-Edward|sweatshirt|15
-Jamie|hat|94
-Jennifer|sweater|33
-Matthew|boots|77
-Nicholas|shorts|89
-Rachel|sneakers|63
-Tommy|shirt|18}
+} {Aaron|As|64
+Aaron|Available|62
+Aaron|Bag|46
+Aaron|Become|70
+Aaron|Bit|34
+Aaron|By|92
+Aaron|Dog|76
+Aaron|Far|26
+Aaron|Fly|67
+Aaron|Free|20}
 
 do_execsql_test group_by_order_by {
   select u.first_name, p.name, sum(u.age) from users u join products p on u.id = p.id group by u.first_name, p.name order by p.name limit 10;
-} {Travis|accessories|22
-Matthew|boots|77
-Cindy|cap|37
-Daniel|coat|13
-Jamie|hat|94
-Aimee|jeans|24
-Tommy|shirt|18
-Nicholas|shorts|89
-Rachel|sneakers|63
-Jennifer|sweater|33}
+} {David|A|77
+Eric|A|25
+Heather|A|24
+James|A|84
+Jeanne|A|26
+John|A|50
+Juan|A|68
+Michael|A|68
+Paul|A|26
+Ryan|A|85}
 
 do_execsql_test group_by_order_by_aggregate {
   select u.first_name, p.name, sum(u.age) from users u join products p on u.id = p.id group by u.first_name, p.name order by sum(u.age) limit 10;
-} {Daniel|coat|13
-Edward|sweatshirt|15
-Tommy|shirt|18
-Travis|accessories|22
-Aimee|jeans|24
-Jennifer|sweater|33
-Cindy|cap|37
-Rachel|sneakers|63
-Matthew|boots|77
-Nicholas|shorts|89}
+} {Alexis|World|18
+Alicia|Father|18
+Alicia|Stop|18
+Allison|Side|18
+Amber|Price|18
+Andrew|Onto|18
+Andrew|Surface|18
+Angela|Again|18
+Angela|Control|18
+Anthony|Generation|18}
 
 do_execsql_test group_by_multiple_aggregates {
   select u.first_name, sum(u.age), count(u.age) from users u group by u.first_name order by sum(u.age) limit 10;
-} {Jaclyn|1|1
-Mia|1|1
-Kirsten|7|1
-Kellie|8|1
-Makayla|8|1
-Yvette|9|1
-Mckenzie|12|1
-Grant|14|1
-Mackenzie|15|1
-Cesar|17|1}
+} {Robyn|18|1
+Adriana|22|1
+Collin|23|1
+Ariana|25|1
+Ross|26|1
+Earl|34|1
+Mckenzie|35|1
+Sonia|35|1
+Karla|37|2
+Darius|39|1}
 
 do_execsql_test group_by_multiple_aggregates_2 {
   select u.first_name, sum(u.age), group_concat(u.age) from users u group by u.first_name order by u.first_name limit 10;
-} {Aaron|2271|52,46,17,69,71,91,34,30,97,81,47,98,45,69,97,18,38,26,98,60,33,97,42,43,43,22,18,75,56,67,83,58,82,28,22,72,5,58,96,32,55
-Abigail|890|17,82,62,57,55,5,9,83,93,22,23,57,56,100,74,95
-Adam|1642|34,23,10,11,46,40,2,57,51,80,65,24,15,84,59,6,34,100,32,79,57,5,77,34,30,19,54,74,89,98,72,91,90
-Adrian|439|37,28,94,76,69,60,34,41
-Adriana|83|83
-Adrienne|318|79,74,82,33,50
-Aimee|33|24,9
-Alan|551|18,52,30,62,96,13,85,97,98
-Albert|369|99,80,41,7,64,7,26,41,4
-Alec|247|55,48,53,91}
+} {Aaron|2865|77,46,22,62,20,63,55,67,36,40,76,78,44,64,73,70,74,54,50,29,26,67,51,26,58,34,31,43,63,32,81,22,52,55,85,56,43,66,67,45,45,26,64,65,78,41,59,44,29,77,61,80,55,38
+Abigail|912|78,34,52,83,67,33,43,19,82,74,27,52,74,66,22,32,74
+Adam|1977|61,60,30,36,41,45,41,47,57,46,29,77,72,56,63,55,66,19,68,39,34,26,84,19,70,33,63,65,21,74,72,39,50,74,23,40,63,74,21,24
+Adrian|459|33,80,72,44,70,55,53,52
+Adriana|22|22
+Adrienne|354|36,76,51,49,78,64
+Aimee|81|81
+Alan|936|39,79,58,44,57,82,56,77,41,29,25,84,46,62,33,25,19,80
+Albert|909|83,39,20,38,64,68,29,69,81,27,66,31,69,84,33,69,39
+Alec|368|85,56,72,73,31,51}
 
 do_execsql_test group_by_complex_order_by {
   select u.first_name, group_concat(u.last_name) from users u group by u.first_name order by -1 * length(group_concat(u.last_name)) limit 1;
-} {Michael|Love,Finley,Hurst,Molina,Williams,Brown,King,Whitehead,Ochoa,Davis,Rhodes,Mcknight,Reyes,Johnston,Smith,Young,Lopez,Roberts,Green,Cole,Lane,Wagner,Allen,Simpson,Schultz,Perry,Mendez,Gibson,Hale,Williams,Bradford,Johnson,Weber,Nunez,Walls,Gonzalez,Park,Blake,Vazquez,Garcia,Mathews,Pacheco,Johnson,Perez,Gibson,Sparks,Chapman,Tate,Dudley,Miller,Alvarado,Ward,Nguyen,Rosales,Flynn,Ball,Jones,Hoffman,Clarke,Rivera,Moore,Hardin,Dillon,Montgomery,Rodgers,Payne,Williams,Mueller,Hernandez,Ware,Yates,Grimes,Gilmore,Johnson,Clark,Rodriguez,Walters,Powell,Colon,Mccoy,Allen,Quinn,Dunn,Wilson,Thompson,Bradford,Hunter,Gilmore,Woods,Bennett,Collier,Ali,Herrera,Lawson,Garner,Perez,Brown,Pena,Allen,Davis,Washington,Jackson,Khan,Martinez,Blackwell,Lee,Parker,Lynn,Johnson,Benton,Leonard,Munoz,Alvarado,Mathews,Salazar,Nelson,Jones,Carpenter,Walter,Young,Coleman,Berry,Clark,Powers,Meyer,Lewis,Barton,Guzman,Schneider,Hernandez,Mclaughlin,Allen,Atkinson,Woods,Rivera,Jones,Gordon,Dennis,Yoder,Hunt,Vance,Nelson,Park,Barnes,Lang,Williams,Cervantes,Tran,Anderson,Todd,Gonzalez,Lowery,Sanders,Mccullough,Haley,Rogers,Perez,Watson,Weaver,Wise,Walter,Summers,Long,Chan,Williams,Mccoy,Duncan,Roy,West,Christensen,Cuevas,Garcia,Williams,Butler,Anderson,Armstrong,Villarreal,Boyer,Johnson,Dyer,Hurst,Wilkins,Mercer,Taylor,Montes,Mccarty,Gill,Rodriguez,Williams,Copeland,Hansen,Palmer,Alexander,White,Taylor,Bowers,Hughes,Gibbs,Myers,Kennedy,Sanchez,Bell,Wilson,Berry,Spears,Patton,Rose,Smith,Bowen,Nicholson,Stewart,Quinn,Powell,Delgado,Mills,Duncan,Phillips,Grant,Hatfield,Russell,Anderson,Reed,Mahoney,Mcguire,Ortega,Logan,Schmitt,Walker}
+} {Michael|Oneill,Flores,Barber,Robles,Peterson,Edwards,Barrera,Smith,Klein,Brewer,Crane,Garza,Williams,Wilson,Jenkins,Torres,Pugh,Decker,Stein,Walton,Williams,Escobar,Jimenez,Gallagher,Lane,Moore,Foster,Myers,Hawkins,Guerrero,Burns,Dixon,Horton,Walker,Arnold,Green,Acevedo,Vasquez,Mcdonald,Scott,Coleman,Baker,Barton,Mathis,Huerta,Schmidt,Peters,Myers,Smith,Hancock,Kim,Ward,Huynh,Hughes,Miller,Valentine,Johnson,Ortega,Potter,Smith,Cherry,Perkins,White,Gonzalez,Johnson,Nolan,Clark,Patel,Velasquez,Mckinney,Williams,Montgomery,Owens,Hayes,Dawson,Gomez,Ramos,Acosta,Hull,Rivas,Snyder,Petty,Norton,Davis,Ferguson,Gomez,Stanley,Marshall,Hansen,Paul,Smith,Johnson,Coleman,Nixon,Thomas,Martin,Harper,Bell,Jackson,Edwards,Stewart,Jones,Chavez,Johnston,Tucker,Morgan,Sanders,Jones,Mccarthy,Gallagher,Murray,Gill,Cruz,Ortega,Jordan,Ferguson,Harrison,Jones,Campbell,Deleon,Silva,Lee,Kemp,Mcdonald,Ramirez,Wade,Carter,Butler,Wright,Ellison,Davidson,Ochoa,Thompson,Adkins,Herrera,Bowers,Zimmerman,Durham,Meyer,Hicks,Macdonald,Morrison,Larson,Reese,Berry,Cochran,Williams,Washington,Rivera,Sanchez,Gibson,Hanson,Shannon,Robbins,Martinez,Jackson,Turner,Glover,Johnston,Flores,Blevins,Matthews,Schmidt,Foster,Lee,Sullivan,Gonzales,Woods,Greene,Clayton,Rodriguez,Williams,Rivers,Walls,Little,Diaz,Green,Cook,Evans,Hayes,Gomez,Finley,Durham,Spears,Kirby,Austin,Hayes,Lee,Hinton,York,Hernandez,Burke,Reeves,Manning,Dean,Mccarty,Contreras,Macias,Tapia,Malone,Brown,Pennington,Evans,Hamilton,Johnson,Burns,Sullivan,Rodriguez,Brown,Hodges,Anderson,Neal,Kemp,Hall,Camacho,Gutierrez,Keith,Fields,Williams,Hill,Acosta,Johnson,Ward,Frederick,Lewis,Sloan,Palmer,Crawford,Torres,Washington,Joyce,Morgan,Phillips,Carter,Robinson,Marshall,Clark,Gray,Gill,Coffey,Brown,Allen,Lee,Lara,Lawrence,Roberts,Chapman,Horton,Gonzalez,Kent,Henson,Doyle,Burgess,Lamb,Sanders,Chapman,Robinson,Daniels,Powell,Davidson,Taylor,Vazquez,Rivera,Jordan,Carrillo,Spencer,Henry,Davis,Greene,Gomez,Parker,Holloway,Ballard,Newton,Gonzalez,Moore,Henderson,Watkins,Hughes,Martinez,Rojas,Beck,Schwartz,Davis,Steele,Hunter,Ritter,Wright,Hickman,Rasmussen,Hampton,Griffin,Webster,Knight,Jackson,King,Snyder,Young,Arnold,Russell,Ellison,Norman,Martinez,Summers,Campbell,Padilla,Hernandez,Rogers,Hicks,Hill,Ford,House,Blake,Patel,Williams,Smith,Clark,Baker,Mcintyre,Sanchez,Martinez,Wilson,Adams,Parrish,Taylor,Graham,Powell,Gutierrez,Cordova,Page,Turner,Davis,Rose,Smith,Collier,Nelson,Rodriguez,Guzman,Richards,James,Jackson,Silva,Adams }
 
 do_execsql_test group_by_complex_order_by_2 {
   select u.first_name, sum(u.age) from users u group by u.first_name order by -1 * sum(u.age) limit 10;
-} {Michael|11204
-David|8758
-Robert|8109
-Jennifer|7700
-John|7299
-Christopher|6397
-James|5921
-Joseph|5711
-Brian|5059
-William|5047}
+} {Michael|17324
+David|12091
+John|11748
+Robert|11146
+James|10941
+Christopher|10807
+Jennifer|9815
+Matthew|8119
+William|7679
+Daniel|7498}
 
 do_execsql_test group_by_and_binary_expression_that_depends_on_two_aggregates {
   select u.first_name, sum(u.age) + count(1) from users u group by u.first_name limit 5;
-} {Aaron|2312
-Abigail|906
-Adam|1675
-Adrian|447
-Adriana|84}
+} {Aaron|2919
+Abigail|929
+Adam|2017
+Adrian|467
+Adriana|23}
 
 do_execsql_test group_by_function_expression {
   select length(phone_number), count(1) from users group by length(phone_number) order by count(1);
-} {15|392
-22|416
-13|762
-20|791
-10|793
-19|816
-21|821
-17|1184
-18|1211
-16|1231
-12|1583}
+} {22|609
+15|630
+21|1169
+13|1189
+20|1193
+19|1205
+10|1262
+16|1748
+18|1782
+17|1813
+12|2400}
 
 do_execsql_test group_by_function_expression_ridiculous {
   select upper(substr(phone_number, 1,3)), count(1) from users group by upper(substr(phone_number, 1,3)) order by -1 * count(1) limit 5;
-} {001|1677
-+1-|1606
-(97|36
-(20|35
-(31|35}
+} {001|2423
++1-|2371
+(84|52
+(70|49
+(41|48}
 
 do_execsql_test group_by_count_star {
   select u.first_name, count(*) from users u group by u.first_name limit 1;
-} {Aaron|41}
+} {Aaron|54}
 
 do_execsql_test group_by_count_star_in_expression {
   select u.first_name, count(*) % 3 from users u group by u.first_name order by u.first_name limit 3;
-} {Aaron|2
-Abigail|1
-Adam|0}
+} {Aaron|0
+Abigail|2
+Adam|1}
 
 do_execsql_test group_by_count_no_args_in_expression {
   select u.first_name, count() % 3 from users u group by u.first_name order by u.first_name limit 3;
-} {Aaron|2
-Abigail|1
-Adam|0}
+} {Aaron|0
+Abigail|2
+Adam|1}
 
 do_execsql_test having {
-  select u.first_name, round(avg(u.age)) from users u group by u.first_name having avg(u.age) > 97 order by avg(u.age) desc limit 5;
-} {Nina|100.0
-Kurt|99.0
-Selena|98.0}
+  select u.first_name, round(avg(u.age)) from users u group by u.first_name having avg(u.age) > 84 order by avg(u.age) desc limit 5;
+} {Zoe|85.0}
 
 do_execsql_test having_with_binary_cond {
-  select u.first_name, sum(u.age) from users u group by u.first_name having sum(u.age) + 1000 = 9109;
-} {Robert|8109}
+  select u.first_name, sum(u.age) from users u group by u.first_name having sum(u.age) + 1000 = 1023;
+} {Collin|23}
 
 do_execsql_test having_with_scalar_fn_over_aggregate {
   select u.first_name, concat(count(1), ' people with this name') from users u group by u.first_name having count(1) > 50 order by count(1) asc limit 5;
-} {"Angela|51 people with this name
-Justin|51 people with this name
-Rachel|52 people with this name
-Susan|52 people with this name
-Jeffrey|54 people with this name"}
+} {"Pamela|51 people with this name
+Sean|51 people with this name
+Patrick|52 people with this name
+Sandra|52 people with this name
+Jacob|53 people with this name"}
 
 do_execsql_test having_with_multiple_conditions {
   select u.first_name, count(*), round(avg(u.age)) as avg_age 
@@ -182,41 +180,40 @@ do_execsql_test having_with_multiple_conditions {
   having count(*) > 40 and avg(u.age) > 40
   order by count(*) desc, avg(u.age) desc
   limit 5;
-} {Michael|228|49.0
-David|165|53.0
-Robert|159|51.0
-Jennifer|151|51.0
-John|145|50.0}
+} {Michael|343|51.0
+David|235|51.0
+John|222|53.0
+Robert|216|52.0
+Christopher|212|51.0}
 
 # Wanda = 9, Whitney = 11, William = 111
 do_execsql_test column_alias_in_group_by_order_by_having {
   select first_name as fn, count(1) as fn_count from users where fn in ('Wanda', 'Whitney', 'William') group by fn having fn_count > 10 order by fn_count;
-} {Whitney|11
-William|111}
+} {William|150}
 
 do_execsql_test group_by_column_number {
   select u.first_name, count(1) from users u group by 1 limit 1;
-} {Aaron|41}
+} {Aaron|54}
 
 # There was a regression where we incorrectly removed SOME order by terms and left others in place, which is invalid and results in wrong rows being returned.
 do_execsql_test groupby_orderby_removal_regression_test {
   select id, last_name, count(1) from users GROUP BY 1,2 order by id, last_name desc limit 3;
-} {1|Foster|1
-2|Salazar|1
-3|Perry|1}
+} {1|Brown|1
+2|Moore|1
+3|Rivera|1}
 
 do_execsql_test group_by_no_sorting_required {
   select age, count(1) from users group by age limit 3;
-} {1|112
-2|113
-3|97}
+} {18|215
+19|256
+20|228}
 
 # Compile-time constants are moved to the end of the program.
 # Verify that the jump to AggStep works correctly even when the location of the ',' constant has changed.
 do_execsql_test group_by_no_sorting_required_and_const_agg_arg {
   select group_concat(state, ',') from users group by age limit 2;
-} {CA,PW,ME,AS,LA,OH,AL,UT,WA,MO,WA,SC,AR,CO,OK,ME,FM,AR,CT,MT,TN,FL,MA,ND,LA,NE,KS,IN,RI,NH,IL,FM,WA,MH,RI,SC,AS,IL,VA,MI,ID,ME,WY,TN,IN,IN,UT,WA,AZ,VA,NM,IA,MP,WY,RI,OR,OR,FM,WA,DC,RI,GU,TX,HI,IL,TX,WY,OH,TX,CT,KY,NE,MH,AR,MN,IL,NH,HI,NV,UT,FL,MS,NM,NJ,CA,MS,GA,MT,GA,AL,IN,SC,PA,FL,CT,PA,GA,RI,HI,WV,VT,IA,PR,FM,MA,TX,MS,LA,MD,PA,TX,WY
-OR,SD,KS,MP,WA,VI,SC,SD,SD,MP,WA,MT,FM,IN,ME,OH,KY,RI,DC,MS,OK,VI,KY,MD,SC,OK,NY,WY,AK,MN,UT,NE,VA,MD,AZ,VI,SC,NV,IN,VA,HI,VI,MS,NE,WY,NY,GU,MT,AL,IA,VA,ND,MN,FM,IA,ID,IL,FL,PR,WA,AS,HI,NH,WI,FL,HI,AL,ID,DC,CT,IL,VT,AZ,VI,AK,PW,NC,SD,NV,WA,MO,MS,WY,VA,FM,MN,NH,MN,MT,TX,MS,FM,OH,GU,IN,WA,IA,PA,ID,MI,LA,GU,ND,AR,ND,WV,DC,NY,CO,CT,FM,CT,ND}
+} {IA,DE,FL,NJ,VA,UT,VT,ND,MH,VT,NC,DE,WA,NY,OK,LA,MO,WV,SD,MS,IN,GA,NC,NM,FL,HI,HI,VA,NM,GA,MN,WY,ID,WY,WY,SC,MN,NH,MH,TX,TN,ID,MD,MA,MD,GA,PR,OH,PR,MP,GA,NE,AK,SD,PW,MN,UT,MD,IL,MI,IA,VT,MO,AS,RI,CT,NE,TN,HI,DC,WY,TN,KS,MO,WV,VA,NM,MP,MP,OH,IA,IL,ID,MA,MS,NH,PR,GA,VA,UT,AZ,ID,MP,TN,AL,SC,CT,AZ,PW,NJ,MT,MA,MP,CT,OK,MI,TX,AR,PR,HI,VI,KY,NJ,AZ,AZ,NV,UT,OK,CA,KS,MP,PA,WY,KY,MH,GA,WI,NV,ME,NJ,DC,SC,NV,IN,MD,AZ,UT,TX,WY,OH,OR,TX,CT,AR,MI,WA,OR,MT,VA,OK,WV,MO,MS,OH,MP,SC,VT,OH,IA,VA,MI,WY,OR,WV,IA,NY,IN,MP,FL,MO,VI,LA,CO,KS,HI,SD,AS,MA,SC,MO,KY,AK,MS,WV,MD,OR,PA,TX,DE,WY,KS,MN,IL,NC,UT,NY,ME,AZ,GA,VT,VI,SC,MO,MI,PA,VT,CA,AS,NC,SD,SC,DC,ND,CT,SC
+FM,PR,MI,NV,AK,KY,WI,WY,VI,VI,KY,CO,VA,MS,MS,DE,MD,MO,NJ,NV,MS,AR,IA,MI,VI,MS,DC,AR,ND,MS,NH,MI,AK,IL,MS,AR,OR,NJ,AS,NH,OK,FM,MT,CO,TX,KY,VI,PW,GA,NM,MS,WA,CO,NV,OH,NJ,AR,HI,VI,NH,NV,FL,RI,ND,DC,MD,AL,MS,CT,MT,MS,WA,NC,AK,MS,ME,OK,HI,ME,NJ,NH,NY,RI,KS,MP,CA,NV,WY,VA,IA,ME,AZ,PR,WI,NC,NH,MH,PA,OK,OR,ND,IA,OH,WA,FL,ID,OK,ID,MP,VI,AK,TX,UT,TN,AR,VT,UT,TX,PR,CO,IA,NJ,ID,PR,TX,VT,ME,DC,NY,UT,WY,PA,IN,IN,ME,NM,WY,NY,DC,GA,AS,NH,SC,PR,MN,IL,PR,TX,AS,NE,VT,RI,VI,VA,AR,RI,PA,VT,IN,CT,FL,MI,ID,MS,ID,IL,VT,MD,GU,ME,MA,NY,DE,MS,ND,UT,NE,DC,VT,OR,MN,MA,RI,IN,ME,CT,NV,LA,VI,DC,NV,NM,MA,MH,RI,AL,WA,PA,MO,KY,ME,WA,NJ,TX,MN,PA,WI,HI,DC,MT,PA,VT,MH,MN,FM,AR,GU,VA,DC,MT,VI,ND,ND,IL,NC,NV,OK,LA,MT,MH,UT,AZ,IA,IL,NV,NV,LA,TX,FL,VA,MH,IL,UT,AZ,KS,AL,MD,KY,VA,TX,NM,AK,MO,MH,MN,HI}
 
 do_execsql_test_on_specific_db {:memory:} group_by_no_sorting_required_reordered_columns {
   create table t0 (a INT, b INT, c INT);
@@ -238,9 +235,9 @@ select first_name, sum(distinct age), count(distinct age), avg(distinct age)
 from users
 group by 1
 limit 3;
-} {Aaron|1769|33|53.6060606060606
-Abigail|833|15|55.5333333333333
-Adam|1517|30|50.5666666666667}
+} {Aaron|2104|39|53.9487179487179
+Abigail|712|14|50.8571428571429
+Adam|1511|31|48.741935483871}
 
 do_execsql_test_on_specific_db {:memory:} having_or {
   CREATE TABLE users (first_name TEXT, age INTEGER);
@@ -260,7 +257,7 @@ Sarah|1|65.0}
 do_execsql_test complex_result_expression_containing_aggregate {
   select
     case when price > 70 then group_concat(name, ',') else '<undisclosed>' end names
-  from products
+  from products where id < 12
   group by price
   order by price;
 } {<undisclosed>
@@ -277,7 +274,7 @@ cap,sneakers}
 do_execsql_test complex_result_expression_containing_aggregate_and_rowid {
   select
     case when rowid >= 5 then group_concat(name, ',') else '<undisclosed>' end names
-  from products
+  from products where id < 12
   group by rowid
   order by rowid;
 } {<undisclosed>
@@ -293,11 +290,11 @@ coat
 accessories}
 
 do_execsql_test complex_having_expression_containing_aggregate {
-  select group_concat(name, ',') from products group by price having (group_concat(name, ',') || price) like 'ca%';
+  select group_concat(name, ',') from products where id < 12 group by price having (group_concat(name, ',') || price) like 'ca%';
 } {cap,sneakers}
 
 do_execsql_test complex_order_by_expression_containing_aggregate {
-  select group_concat(name, ',') from products group by price order by (group_concat(name, ',') || price);
+  select group_concat(name, ',') from products where id < 12 group by price order by (group_concat(name, ',') || price);
 } {accessories
 boots
 cap,sneakers

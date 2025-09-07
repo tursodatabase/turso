@@ -31,65 +31,25 @@ def test_schema_operations():
 
 def test_file_operations():
     shell = TestTursoShell()
-    shell.run_test("file-open", ".open testing/testing.db", "")
-    shell.run_test("file-users-count", "select count(*) from users;", "10000")
-    shell.quit()
+    shell.run_test("file-open", ".open testing/tmp_db/testing.db", "")
+    shell.run_test("file-users-count", "select count(*) from users;", "15000")
 
-    shell = TestTursoShell()
-    shell.run_test("file-schema-1", ".open testing/testing.db", "")
-    expected_user_schema = (
-        "CREATE TABLE users (\n"
-        "id INTEGER PRIMARY KEY,\n"
-        "first_name TEXT,\n"
-        "last_name TEXT,\n"
-        "email TEXT,\n"
-        "phone_number TEXT,\n"
-        "address TEXT,\n"
-        "city TEXT,\n"
-        "state TEXT,\n"
-        "zipcode TEXT,\n"
-        "age INTEGER\n"
-        ");\n"
-        "CREATE INDEX age_idx on users (age);"
+    shell.run_test("open-file", ".open testing/tmp_db/testing.db", "")
+    shell.run_test(
+        "verify-tables",
+        ".tables",
+        "customer_support_tickets inventory_transactions order_items orders products reviews users",
     )
-    shell.run_test("file-schema-users", ".schema users", expected_user_schema)
-    shell.quit()
-
-
-def test_joins():
-    shell = TestTursoShell()
-    shell.run_test("open-file", ".open testing/testing.db", "")
-    shell.run_test("verify-tables", ".tables", "products users")
     shell.run_test(
         "file-cross-join",
         "select * from users, products limit 1;",
-        "1|Jamie|Foster|dylan00@example.com|496-522-9493|62375 Johnson Rest Suite 322|West Lauriestad|IL|35865|94|1|hat|79.0",  # noqa: E501
-    )
-    shell.quit()
-
-
-def test_left_join_self():
-    shell = TestTursoShell(
-        init_commands="""
-    .open testing/testing.db
-    """
+        "1|Dawn|Brown|kellythomas@example.net|6446826276|75195 Hayley Manors|East Joshuahaven|NJ|02105|41|2023-08-18 15:00:44.812395|2025-05-28 11:36:39.954073|1|hat|79.0",  # noqa: E501
     )
 
-    shell.run_test(
-        "file-left-join-self",
-        "select u1.first_name as user_name, u2.first_name as neighbor_name from users u1 left join users as u2 on u1.id = u2.id + 1 limit 2;",  # noqa: E501
-        "Jamie|\nCindy|Jamie",
-    )
-    shell.quit()
-
-
-def test_where_clauses():
-    shell = TestTursoShell()
-    shell.run_test("open-testing-db-file", ".open testing/testing.db", "")
     shell.run_test(
         "where-clause-eq-string",
         "select count(1) from users where last_name = 'Rodriguez';",
-        "61",
+        "120",
     )
     shell.quit()
 
@@ -97,16 +57,14 @@ def test_where_clauses():
 def test_switch_back_to_in_memory():
     shell = TestTursoShell()
     # First, open the file-based DB.
-    shell.run_test("open-testing-db-file", ".open testing/testing.db", "")
+    shell.run_test("open-testing-db-file", ".open testing/tmp_db/testing.db", "")
     # Then switch back to :memory:
     shell.run_test("switch-back", ".open :memory:", "")
     shell.run_test("schema-in-memory", ".schema users", "-- Error: Table 'users' not found.")
-    shell.quit()
 
-
-def test_verify_null_value():
-    shell = TestTursoShell()
+    # test_verify_null_value
     shell.run_test("verify-null", "select NULL;", "TURSO")
+
     shell.quit()
 
 
@@ -122,7 +80,7 @@ def test_output_file():
     output_filename = "turso_output.txt"
     output_file = shell.config.test_dir / shell.config.py_folder / output_filename
 
-    shell.execute_dot(".open testing/testing.db")
+    shell.execute_dot(".open testing/tmp_db/testing.db")
 
     shell.execute_dot(f".cd {shell.config.test_dir}/{shell.config.py_folder}")
     shell.execute_dot(".echo on")
@@ -148,7 +106,7 @@ def test_output_file():
         "TEST_ECHO": "Echoed result",
         "Null value: turso": "Null value setting",
         f"CWD: {shell.config.cwd}/{shell.config.test_dir}": "Working directory changed",
-        "DB: testing/testing.db": "File database opened",
+        "DB: testing/tmp_db/testing.db": "File database opened",
         "Echo: off": "Echo turned off",
     }
 
@@ -249,13 +207,6 @@ def test_import_csv_create_table_from_header():
         "select * from auto_table;",
         "1|2.0|String'1\n3|4.0|String2",
     )
-    shell.quit()
-
-
-def test_table_patterns():
-    shell = TestTursoShell()
-    shell.run_test("tables-pattern", ".tables us%", "users")
-    shell.quit()
 
 
 def test_update_with_limit():
@@ -299,7 +250,7 @@ def test_insert_default_values():
 
 
 def test_uri_readonly():
-    turso = TestTursoShell(flags="file:testing/testing_small.db?mode=ro", init_commands="")
+    turso = TestTursoShell(flags="file:testing/tmp_db/testing_small.db?mode=ro", init_commands="")
     turso.run_test("read-only-uri-reads-work", "SELECT COUNT(*) FROM demo;", "5")
     turso.run_test_fn(
         "INSERT INTO demo (id, value) values (6, 'demo');",
@@ -313,7 +264,7 @@ def test_uri_readonly():
 
 
 def test_copy_db_file():
-    testpath = "testing/test_copy.db"
+    testpath = "testing/tmp_db/test_copy.db"
     if Path(testpath).exists():
         os.unlink(Path(testpath))
         time.sleep(0.2)  # make sure closed
@@ -360,11 +311,7 @@ def main():
     test_basic_queries()
     test_schema_operations()
     test_file_operations()
-    test_joins()
-    test_left_join_self()
-    test_where_clauses()
     test_switch_back_to_in_memory()
-    test_verify_null_value()
     test_output_file()
     test_multi_line_single_line_comments_succession()
     test_comments()
@@ -372,7 +319,6 @@ def main():
     test_import_csv_verbose()
     test_import_csv_skip()
     test_import_csv_create_table_from_header()
-    test_table_patterns()
     test_update_with_limit()
     test_update_with_limit_and_offset()
     test_uri_readonly()

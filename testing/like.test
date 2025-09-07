@@ -4,7 +4,7 @@ set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 
 do_execsql_test like-fn {
-    select name, like('sweat%', name) from products;
+    select name, like('sweat%', name) from products where id < 12;
 } {hat|0
 cap|0
 shirt|0
@@ -18,30 +18,30 @@ coat|0
 accessories|0}
 
 do_execsql_test where-like {
-    select * from products where name like 'sweat%';
+    select * from products where name like 'sweat%' and id < 12;
 } {4|sweater|25.0
 5|sweatshirt|74.0}
 
 do_execsql_test where-like-case-insensitive {
-    select * from products where name like 'SWEAT%';
+    select * from products where name like 'SWEAT%' and id < 12;
 } {4|sweater|25.0
 5|sweatshirt|74.0}
 
 do_execsql_test where-like-underscore {
-    select * from products where name like 'sweat_r';
+    select * from products where name like 'sweat_r' and id < 12;
 } {4|sweater|25.0}
 
 do_execsql_test where-like-underscore-case-insensitive {
-    select * from products where name like 'SwEaT_R';
+    select * from products where name like 'SwEaT_R' and id < 12;
 } {4|sweater|25.0}
 
 do_execsql_test where-like-fn {
-    select * from products where like('sweat%', name)=1
+    select * from products where like('sweat%', name)=1 and id < 12;
 } {4|sweater|25.0
 5|sweatshirt|74.0}
 
 do_execsql_test where-not-like-and {
-    select * from products where name not like 'sweat%' and price >= 70.0;
+    select * from products where name not like 'sweat%' and price >= 70.0 and id < 12;
 } {1|hat|79.0
 2|cap|82.0
 6|shorts|70.0
@@ -50,7 +50,7 @@ do_execsql_test where-not-like-and {
 11|accessories|81.0}
 
 do_execsql_test where-like-or {
-    select * from products where name like 'sweat%' or price >= 80.0;
+    select * from products where name like 'sweat%' or price >= 80.0 and id < 12;
 } {2|cap|82.0
 4|sweater|25.0
 5|sweatshirt|74.0
@@ -59,27 +59,33 @@ do_execsql_test where-like-or {
 
 do_execsql_test where-like-another-column {
     select first_name, last_name from users where last_name like first_name;
-} {James|James
-Daniel|Daniel
-Taylor|Taylor}
+} {Frank|Frank
+Taylor|Taylor
+Blake|Blake
+Thomas|Thomas}
 
 do_execsql_test where-like-another-column-prefix {
     select first_name, last_name from users where last_name like concat(first_name, '%');
-} {James|James
-Daniel|Daniel
+} {John|Johnson
+John|Johnson
+Frank|Frank
 William|Williams
-John|Johnson
 Taylor|Taylor
-John|Johnson
-Stephen|Stephens
-Robert|Roberts}
+Steven|Stevens
+William|Williams
+William|Williams
+Blake|Blake
+William|Williams
+Steven|Stevens
+Thomas|Thomas
+William|Williams}
 
 do_execsql_test where-like-another-column-prefix {
     select count(*) from users where last_name like 'Pe#rry' escape '#';
-} {19}
+} {25}
 
 do_execsql_test where-like-impossible {
-    select * from products where 'foobar' like 'fooba';
+    select * from products where 'foobar' like 'fooba'  and id < 12;
 } {}
 
 do_execsql_test like-with-backslash {
