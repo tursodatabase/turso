@@ -3,52 +3,58 @@
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 
-do_execsql_test_small where-is-null {
-    select count(*) from demo where value is null;
+do_execsql_test where-1.1-is-null {
+    create table t1 (x, y);
+    insert into t1 values (1, 'A'), (2, null), (3, 'B'), (4, null), (5, 'C');
+    select count(*) from t1 where y is null;
 } {2}
 
-do_execsql_test_small where-equals-null {
-    select count(*) from demo where value = null;
+do_execsql_test where-1.2-equals-null {
+    select count(*) from t1 where y = null;
 } {0}
 
-do_execsql_test_small where-is-not-null {
-    select count(*) from demo where value is not null;
+do_execsql_test where-1.3-is-not-null {
+    select count(*) from t1 where y is not null;
 } {3}
 
-do_execsql_test_small where-not-equal-null {
-    select count(*) from demo where value != null;
+do_execsql_test where-1.4-not-equal-null {
+    select count(*) from t1 where y != null;
 } {0}
 
-do_execsql_test_small where-is-a-with-nulls {
-    select count(*) from demo where value is 'A';
+do_execsql_test where-1.5-is-a-with-nulls {
+    select count(*) from t1 where y is 'A';
 } {1}
 
-do_execsql_test_small where-equals-a-with-nulls {
-    select count(*) from demo where value == 'A';
+do_execsql_test where-1.6-equals-a-with-nulls {
+    select count(*) from t1 where y == 'A';
 } {1}
 
-do_execsql_test_small where-is-not-a-with-nulls {
-    select count(*) from demo where value is not 'A';
+do_execsql_test where-1.7-is-not-a-with-nulls {
+    select count(*) from t1 where y is not 'A';
 } {4}
 
-do_execsql_test_small where-not-equals-a-with-nulls {
-    select count(*) from demo where value != 'A';
+do_execsql_test where-1.8-not-equals-a-with-nulls {
+    select count(*) from t1 where y != 'A';
 } {2}
 
-do_execsql_test_small where-is-null-combined {
-    select * from demo where value is null or id = 3;
+do_execsql_test where-1.9-is-null-combined {
+    select * from t1 where y is null or x = 3;
 } {2|
 3|B
 4|
 }
 
-do_execsql_test_small where-is-not-null-combined {
-    select * from demo where value is not null or id = 2;
+do_execsql_test where-1.19-is-not-null-combined {
+    select * from t1 where y is not null or x = 2;
 } {1|A
 2|
 3|B
 5|C
 }
+
+do_execsql_test where-1.1 {
+    drop table t1;
+} {}
 
 do_execsql_test where-clause-eq {
     select last_name from users where id = 2000;
