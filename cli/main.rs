@@ -6,10 +6,12 @@ mod helper;
 mod input;
 mod mcp_server;
 mod opcodes_dictionary;
+mod server;
 
 use config::CONFIG_DIR;
 use mcp_server::TursoMcpServer;
 use rustyline::{error::ReadlineError, Config, Editor};
+use server::SqlServer;
 use std::{
     path::PathBuf,
     sync::{atomic::Ordering, LazyLock},
@@ -39,11 +41,25 @@ fn run_mcp_server(app: app::Limbo) -> anyhow::Result<()> {
     mcp_server.run()
 }
 
+fn run_sql_server(app: app::Limbo) -> anyhow::Result<()> {
+    let address = app.get_server_address();
+    let connection = app.get_connection();
+    let interrupt_count = app.get_interrupt_count();
+    let db_file = app.get_database_file_display();
+
+    let sql_server = SqlServer::new(connection, interrupt_count);
+    sql_server.run(address, &db_file)
+}
+
 fn main() -> anyhow::Result<()> {
     let (mut app, _guard) = app::Limbo::new()?;
 
     if app.is_mcp_mode() {
         return run_mcp_server(app);
+    }
+
+    if app.is_server_mode() {
+        return run_sql_server(app);
     }
 
     if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
