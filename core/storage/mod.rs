@@ -15,6 +15,7 @@ pub(crate) mod buffer_pool;
 pub mod database;
 pub(crate) mod encryption;
 pub(crate) mod page_cache;
+pub(crate) mod page_error_check;
 #[allow(clippy::arc_with_non_send_sync)]
 pub(crate) mod pager;
 #[allow(dead_code)]
