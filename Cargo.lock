@@ -831,6 +831,7 @@ dependencies = [
  "rand 0.9.2",
  "rand_chacha 0.9.0",
  "rusqlite",
+ "sql_generation",
  "tempfile",
  "test-log",
  "tokio",
@@ -838,6 +839,7 @@ dependencies = [
  "tracing-subscriber",
  "turso",
  "turso_core",
+ "turso_parser",
  "twox-hash",
  "zerocopy 0.8.26",
 ]
