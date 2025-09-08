@@ -493,7 +493,7 @@ pub struct Pager {
     /// Source of the database pages.
     pub db_file: Arc<dyn DatabaseStorage>,
     /// The write-ahead log (WAL) for the database.
-    /// in-memory databases, ephemeral tables and ephemeral indexes do not have a WAL.
+    /// ephemeral tables and ephemeral indexes do not have a WAL.
     pub(crate) wal: Option<Rc<RefCell<dyn Wal>>>,
     /// A page cache for the database.
     page_cache: Arc<RwLock<PageCache>>,
@@ -1096,8 +1096,6 @@ impl Pager {
     #[inline(always)]
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn begin_write_tx(&self) -> Result<IOResult<()>> {
-        // TODO(Diego): The only possibly allocate page1 here is because OpenEphemeral needs a write transaction
-        // we should have a unique API to begin transactions, something like sqlite3BtreeBeginTrans
         return_if_io!(self.maybe_allocate_page1());
         let Some(wal) = self.wal.as_ref() else {
             return Ok(IOResult::Done(()));
@@ -1117,7 +1115,7 @@ impl Pager {
         }
         tracing::trace!("end_tx(rollback={})", rollback);
         let Some(wal) = self.wal.as_ref() else {
-            // TODO: Unsure what the semantics of "end_tx" is for in-memory databases, ephemeral tables and ephemeral indexes.
+            // TODO: Unsure what the semantics of "end_tx" is for ephemeral tables and ephemeral indexes.
             return Ok(IOResult::Done(PagerCommitResult::Rollback));
         };
         let (is_write, schema_did_change) = match connection.transaction_state.get() {
