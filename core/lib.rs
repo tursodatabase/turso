@@ -40,6 +40,8 @@ pub mod numeric;
 #[cfg(not(feature = "fuzz"))]
 mod numeric;
 
+use crate::storage::checksum::CHECKSUM_REQUIRED_RESERVED_BYTES;
+use crate::incremental::view::AllViewsTxState;
 use crate::savepoint::SavepointStack;
 use crate::storage::checksum::CHECKSUM_REQUIRED_RESERVED_BYTES;
 use crate::storage::encryption::CipherMode;

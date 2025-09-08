@@ -73,11 +73,11 @@ Turso aims to be fully compatible with SQLite, with opt-in features not supporte
 | INSERT                    | Yes     |                                                                                   |
 | ON CONFLICT clause        | Yes     |                                                                                   |
 | REINDEX                   | No      |                                                                                   |
-| RELEASE SAVEPOINT         | No      |                                                                                   |
+| RELEASE SAVEPOINT         | Yes      |                                                                                   |
 | REPLACE                   | No      |                                                                                   |
 | RETURNING clause          | Partial | DELETE is missing                                                                 |
 | ROLLBACK TRANSACTION      | Yes     |                                                                                   |
-| SAVEPOINT                 | No      |                                                                                   |
+| SAVEPOINT                 | Yes      |                                                                                   |
 | SELECT                    | Yes     |                                                                                   |
 | SELECT ... WHERE          | Yes     |                                                                                   |
 | SELECT ... WHERE ... LIKE | Yes     |                                                                                   |
@@ -530,7 +530,7 @@ Modifiers:
 | RowSetTest     | No     |         |
 | Rowid          | Yes    |         |
 | SCopy          | No     |         |
-| Savepoint      | No     |         |
+| Savepoint      | Partial | Doesn't work when autocommit is disabled       |
 | Seek           | No     |         |
 | SeekGe         | Yes    |         |
 | SeekGt         | Yes    |         |
