@@ -41,7 +41,6 @@ pub mod numeric;
 mod numeric;
 
 use crate::incremental::view::AllViewsTxState;
-use crate::incremental::view::ViewTransactionState;
 use crate::savepoint::SavepointStack;
 use crate::storage::encryption::CipherMode;
 use crate::translate::optimizer::optimize_plan;
