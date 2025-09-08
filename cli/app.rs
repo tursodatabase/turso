@@ -746,7 +746,7 @@ impl Limbo {
                         .set_content_arrangement(ContentArrangement::Dynamic)
                         .set_truncation_indicator("…")
                         .apply_modifier("││──├─┼┤│─┼├┤┬┴┌┐└┘");
-                    if self.opts.headers && rows.num_columns() > 0 {
+                    if rows.num_columns() > 0 {
                         let header = (0..rows.num_columns())
                             .map(|i| {
                                 let name = rows.get_column_name(i);
