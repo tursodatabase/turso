@@ -489,12 +489,19 @@ impl Program {
                 if !io.finished() {
                     return Ok(StepResult::IO);
                 }
-                if let Some(err) = io.get_error() {
-                    let err = err.into();
-                    handle_program_error(&pager, &self.connection, &err)?;
-                    return Err(err);
-                }
-                state.io_completions = None;
+            }
+            let completions = state.io_completions.take();
+            if let Some(err) = completions.as_ref().and_then(|c| c.get_error()) {
+                let err = err.into();
+                handle_program_error(&pager, &self.connection, &err)?;
+                return Err(err);
+            }
+            if let Some(IOCompletions::Many {
+                done_cb: Some(callback),
+                ..
+            }) = completions
+            {
+                callback()?;
             }
             // invalidate row
             let _ = state.result_row.take();

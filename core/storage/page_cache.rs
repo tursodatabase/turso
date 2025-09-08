@@ -7,9 +7,7 @@ use crate::turso_assert;
 
 use super::pager::PageRef;
 
-/// FIXME: https://github.com/tursodatabase/turso/issues/1661
-const DEFAULT_PAGE_CACHE_SIZE_IN_PAGES_MAKE_ME_SMALLER_ONCE_WAL_SPILL_IS_IMPLEMENTED: usize =
-    100000;
+const DEFAULT_PAGE_CACHE_SIZE_IN_PAGES: usize = 2000;
 
 #[derive(Debug, Copy, Eq, Hash, PartialEq, Clone)]
 #[repr(transparent)]
@@ -87,6 +85,10 @@ impl PageCacheEntry {
 pub struct PageCache {
     /// Capacity in pages
     capacity: usize,
+    // Note: if PRAGMA cache_size is a positive integer in sqlite (meaning the page cache size is in pages, rather than bytes),
+    // then the output of PRAGMA cache_spill is equal to the capacity. If OTOH PRAGMA cache_size is negative, meaning the page cache size is in kB,
+    // then the output of PRAGMA cache_spill is some kind of calculation. But to make things simple, let's use the capacity as the spill threshold.
+    spill_threshold: usize,
     /// Map of Key -> usize in entries array
     map: PageHashMap,
     clock_hand: usize,
@@ -117,8 +119,11 @@ pub enum CacheError {
     Pinned { pgno: usize },
     #[error("cache active refs")]
     ActiveRefs,
-    #[error("Page cache is full")]
-    Full,
+    #[error("Page cache is full: should_spill={should_spill}")]
+    /// The page cache is full.
+    /// The `should_spill` field is true if we should attempt to spill pages to disk
+    /// (either to WAL or to an ephemeral database file)
+    Full { should_spill: bool },
     #[error("key already exists")]
     KeyExists,
 }
@@ -127,6 +132,12 @@ pub enum CacheError {
 pub enum CacheResizeResult {
     Done,
     PendingEvictions,
+}
+
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum CacheInsertOnConflict {
+    Overwrite,
+    Error,
 }
 
 impl PageCacheKey {
@@ -141,6 +152,7 @@ impl PageCache {
         let freelist = (0..capacity).rev().collect::<Vec<usize>>();
         Self {
             capacity,
+            spill_threshold: capacity,
             map: PageHashMap::new(capacity),
             clock_hand: NULL,
             entries: vec![PageCacheEntry::empty(); capacity],
@@ -201,20 +213,25 @@ impl PageCache {
     }
 
     #[inline]
-    pub fn insert(&mut self, key: PageCacheKey, value: PageRef) -> Result<(), CacheError> {
-        self._insert(key, value, false)
+    pub fn insert(
+        &mut self,
+        key: PageCacheKey,
+        value: PageRef,
+        on_conflict: CacheInsertOnConflict,
+    ) -> Result<(), CacheError> {
+        self._insert(key, value, on_conflict)
     }
 
     #[inline]
     pub fn upsert_page(&mut self, key: PageCacheKey, value: PageRef) -> Result<(), CacheError> {
-        self._insert(key, value, true)
+        self._insert(key, value, CacheInsertOnConflict::Overwrite)
     }
 
     pub fn _insert(
         &mut self,
         key: PageCacheKey,
         value: PageRef,
-        update_in_place: bool,
+        on_conflict: CacheInsertOnConflict,
     ) -> Result<(), CacheError> {
         trace!("insert(key={:?})", key);
         let slot = self.map.get(&key);
@@ -239,7 +256,7 @@ impl PageCache {
 
             let existing = &mut self.entries[slot];
             existing.bump_ref();
-            if update_in_place {
+            if on_conflict == CacheInsertOnConflict::Overwrite {
                 existing.page = Some(value);
                 return Ok(());
             } else {
@@ -381,7 +398,7 @@ impl PageCache {
             while evicted < need {
                 match self.make_room_for(1) {
                     Ok(()) => evicted += 1,
-                    Err(CacheError::Full) => return CacheResizeResult::PendingEvictions,
+                    Err(CacheError::Full { .. }) => return CacheResizeResult::PendingEvictions,
                     Err(_) => return CacheResizeResult::PendingEvictions,
                 }
             }
@@ -462,7 +479,9 @@ impl PageCache {
     /// Returns `CacheError::Full` if not enough pages can be evicted
     pub fn make_room_for(&mut self, n: usize) -> Result<(), CacheError> {
         if n > self.capacity {
-            return Err(CacheError::Full);
+            return Err(CacheError::Full {
+                should_spill: false, // User is requesting more room than we can possibly hold, so spilling will not help
+            });
         }
         let available = self.capacity - self.len();
         if n <= available {
@@ -475,7 +494,9 @@ impl PageCache {
 
         let mut cur = self.clock_hand;
         if cur == NULL || cur >= self.capacity || self.entries[cur].page.is_none() {
-            return Err(CacheError::Full);
+            return Err(CacheError::Full {
+                should_spill: self.len() >= self.spill_threshold,
+            });
         }
 
         while need > 0 && examined < max_examinations {
@@ -513,7 +534,9 @@ impl PageCache {
                     if need == 0 {
                         break;
                     }
-                    return Err(CacheError::Full);
+                    return Err(CacheError::Full {
+                        should_spill: self.len() >= self.spill_threshold,
+                    });
                 }
             } else {
                 // keep sweeping
@@ -522,7 +545,9 @@ impl PageCache {
         }
         self.clock_hand = cur;
         if need > 0 {
-            return Err(CacheError::Full);
+            return Err(CacheError::Full {
+                should_spill: self.len() >= self.spill_threshold,
+            });
         }
         Ok(())
     }
@@ -742,9 +767,7 @@ impl PageCache {
 
 impl Default for PageCache {
     fn default() -> Self {
-        PageCache::new(
-            DEFAULT_PAGE_CACHE_SIZE_IN_PAGES_MAKE_ME_SMALLER_ONCE_WAL_SPILL_IS_IMPLEMENTED,
-        )
+        PageCache::new(DEFAULT_PAGE_CACHE_SIZE_IN_PAGES)
     }
 }
 
@@ -881,7 +904,9 @@ mod tests {
     fn insert_page(cache: &mut PageCache, id: usize) -> PageCacheKey {
         let key = create_key(id);
         let page = page_with_content(id);
-        assert!(cache.insert(key, page).is_ok());
+        assert!(cache
+            .insert(key, page, CacheInsertOnConflict::Error)
+            .is_ok());
         key
     }
 
@@ -932,11 +957,13 @@ mod tests {
         let page1_v1 = page_with_content(1);
         let page1_v2 = page1_v1.clone(); // Same Arc instance
 
-        assert!(cache.insert(key1, page1_v1.clone()).is_ok());
+        assert!(cache
+            .insert(key1, page1_v1.clone(), CacheInsertOnConflict::Error)
+            .is_ok());
         assert_eq!(cache.len(), 1);
 
         // Inserting same page instance should return KeyExists error
-        let result = cache.insert(key1, page1_v2.clone());
+        let result = cache.insert(key1, page1_v2.clone(), CacheInsertOnConflict::Error);
         assert_eq!(result, Err(CacheError::KeyExists));
         assert_eq!(cache.len(), 1);
 
@@ -953,12 +980,14 @@ mod tests {
         let page1_v1 = page_with_content(1);
         let page1_v2 = page_with_content(1); // Different Arc instance
 
-        assert!(cache.insert(key1, page1_v1.clone()).is_ok());
+        assert!(cache
+            .insert(key1, page1_v1.clone(), CacheInsertOnConflict::Error)
+            .is_ok());
         assert_eq!(cache.len(), 1);
         cache.verify_cache_integrity();
 
         // This should panic because it's a different page instance
-        let _ = cache.insert(key1, page1_v2.clone());
+        let _ = cache.insert(key1, page1_v2.clone(), CacheInsertOnConflict::Error);
     }
 
     #[test]
@@ -1096,9 +1125,9 @@ mod tests {
         // Try to insert a third page, should fail because can't evict dirty pages
         let key3 = create_key(3);
         let page3 = page_with_content(3);
-        let result = cache.insert(key3, page3);
+        let result = cache.insert(key3, page3, CacheInsertOnConflict::Error);
 
-        assert_eq!(result, Err(CacheError::Full));
+        assert_eq!(result, Err(CacheError::Full { should_spill: true }));
         assert_eq!(cache.len(), 2);
         cache.verify_cache_integrity();
     }
@@ -1172,7 +1201,13 @@ mod tests {
         assert_eq!(cache.capacity(), 3);
 
         // Should still be able to insert after resize
-        assert!(cache.insert(create_key(6), page_with_content(6)).is_ok());
+        assert!(cache
+            .insert(
+                create_key(6),
+                page_with_content(6),
+                CacheInsertOnConflict::Error
+            )
+            .is_ok());
         assert_eq!(cache.len(), 3); // One was evicted to make room
         cache.verify_cache_integrity();
     }
@@ -1326,8 +1361,8 @@ mod tests {
                     }
 
                     tracing::debug!("inserting page {:?}", key);
-                    match cache.insert(key, page.clone()) {
-                        Err(CacheError::Full | CacheError::ActiveRefs) => {} // Expected, ignore
+                    match cache.insert(key, page.clone(), CacheInsertOnConflict::Error) {
+                        Err(CacheError::Full { .. } | CacheError::ActiveRefs) => {} // Expected, ignore
                         Err(err) => {
                             panic!("Cache insertion failed unexpectedly: {err:?}");
                         }
@@ -1437,7 +1472,9 @@ mod tests {
             for i in 0..1000 {
                 let key = create_key(i);
                 let page = page_with_content(i);
-                cache.insert(key, page).unwrap();
+                cache
+                    .insert(key, page, CacheInsertOnConflict::Error)
+                    .unwrap();
             }
 
             cache.clear().unwrap();

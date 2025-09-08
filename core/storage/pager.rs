@@ -1,4 +1,5 @@
 use crate::result::LimboResult;
+use crate::storage::page_cache::CacheInsertOnConflict;
 use crate::storage::wal::IOV_MAX;
 use crate::storage::{
     buffer_pool::BufferPool,
@@ -10,7 +11,7 @@ use crate::storage::{
 };
 use crate::types::{IOCompletions, WalState};
 use crate::util::IOExt as _;
-use crate::{io_yield_many, io_yield_one, IOContext};
+use crate::{io_yield, io_yield_many, io_yield_one, IOContext};
 use crate::{
     return_if_io, turso_assert, types::WalFrameInfo, Completion, Connection, IOResult, LimboError,
     Result, TransactionState,
@@ -53,7 +54,7 @@ impl HeaderRef {
                     let (page, c) = pager.read_page(DatabaseHeader::PAGE_ID)?;
                     *pager.header_ref_state.borrow_mut() = HeaderRefState::CreateHeader { page };
                     if let Some(c) = c {
-                        io_yield_one!(c);
+                        io_yield!(c);
                     }
                 }
                 HeaderRefState::CreateHeader { page } => {
@@ -93,7 +94,7 @@ impl HeaderRefMut {
                     let (page, c) = pager.read_page(DatabaseHeader::PAGE_ID)?;
                     *pager.header_ref_state.borrow_mut() = HeaderRefState::CreateHeader { page };
                     if let Some(c) = c {
-                        io_yield_one!(c);
+                        io_yield!(c);
                     }
                 }
                 HeaderRefState::CreateHeader { page } => {
@@ -538,6 +539,11 @@ enum AllocatePageState {
     AllocateNewPage {
         current_db_size: u32,
     },
+    // Separate state in case insertion to page cache spilled and IO is needed to finish the operation
+    Finish {
+        new_db_size: u32,
+        page: PageRef,
+    },
 }
 
 #[derive(Clone)]
@@ -678,7 +684,7 @@ impl Pager {
                         offset_in_ptrmap_page,
                     });
                     if let Some(c) = c {
-                        io_yield_one!(c);
+                        io_yield!(c);
                     }
                 }
                 PtrMapGetState::Deserialize {
@@ -782,7 +788,7 @@ impl Pager {
                         offset_in_ptrmap_page,
                     });
                     if let Some(c) = c {
-                        io_yield_one!(c);
+                        io_yield!(c);
                     }
                 }
                 PtrMapPutState::Deserialize {
@@ -1019,6 +1025,95 @@ impl Pager {
         Ok(IOResult::Done(()))
     }
 
+    #[instrument(skip_all, level = Level::INFO)]
+    /// Spill dirty pages to disk.
+    /// Accepts a callback to be called after spilling is successful, due to spilling
+    /// being potentially asynchronous depending on the IO backend.
+    pub fn spill(
+        &self,
+        page_cache: &mut PageCache,
+        done_cb: impl FnOnce(&mut PageCache) -> Result<()>,
+    ) -> Result<Option<IOCompletions>> {
+        let page_ids: Vec<_> = self
+            .dirty_pages
+            .borrow()
+            .iter()
+            .filter(|&page_id| {
+                *page_id != 1 // never spill page 1. TODO: set page 1 as perma-pinned.
+                    && page_cache
+                        .get(&PageCacheKey::new(*page_id))
+                        .is_ok_and(|p| p.is_some_and(|p| !p.is_pinned()))
+            })
+            .copied()
+            .collect();
+        let mut dirty_pages = self.dirty_pages.borrow_mut();
+
+        tracing::debug!("Spilling {} pages", page_ids.len());
+
+        let mut completions = Vec::new();
+
+        for page_id in page_ids.iter().cloned() {
+            let cache_key = PageCacheKey::new(page_id);
+            if let Some(page) = page_cache.get(&cache_key)? {
+                turso_assert!(!page.is_pinned(), "attempt to spill pinned page {page_id}");
+                turso_assert!(page.is_dirty(), "attempt to spill clean page {page_id}");
+                let completion = match self.wal.as_ref().map(|wal| wal.borrow_mut()) {
+                    Some(mut wal) => wal.append_frame(
+                        page.clone(),
+                        self.page_size.get().expect("page size not set"),
+                        0,
+                    ),
+                    None => begin_write_btree_page(self, &page),
+                }?;
+
+                if completion.is_completed() {
+                    page.clear_dirty();
+                    page_cache
+                        .delete(cache_key)
+                        .expect("should be able to delete unpinned clean page");
+                    dirty_pages.remove(&page_id);
+                    continue;
+                }
+
+                completions.push(completion);
+            }
+        }
+
+        if completions.is_empty() {
+            // If we synchronously spilled everything, we can now finally insert the page into the cache
+            drop(dirty_pages);
+            done_cb(page_cache)?;
+            return Ok(None);
+        }
+
+        Ok(Some(IOCompletions::Many {
+            completions,
+            done_cb: Some(Box::new(unsafe {
+                // Safety: we know the pager will not be dropped before the callback is called,
+                // since it will be called by the VDBE which owns the pager.
+                std::mem::transmute::<
+                    Box<dyn FnOnce() -> Result<()>>,
+                    Box<dyn FnOnce() -> Result<()> + 'static>,
+                >(Box::new(move || {
+                    let dirty_pages = self.dirty_pages.clone();
+                    let mut page_cache = self.page_cache.write();
+                    for page_id in page_ids.iter() {
+                        let cache_key = PageCacheKey::new(*page_id);
+                        let Some(page) = page_cache.get(&cache_key)? else {
+                            panic!("attempt to spill page that is not in the cache: {page_id}");
+                        };
+                        page.clear_dirty();
+                        page_cache
+                            .delete(cache_key)
+                            .expect("should be able to delete unpinned clean page");
+                        dirty_pages.borrow_mut().remove(page_id);
+                    }
+                    done_cb(&mut page_cache)
+                }))
+            })),
+        }))
+    }
+
     #[inline(always)]
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn begin_write_tx(&self) -> Result<IOResult<LimboResult>> {
@@ -1119,7 +1214,7 @@ impl Pager {
 
     /// Reads a page from the database.
     #[tracing::instrument(skip_all, level = Level::DEBUG)]
-    pub fn read_page(&self, page_idx: usize) -> Result<(PageRef, Option<Completion>)> {
+    pub fn read_page(&self, page_idx: usize) -> Result<(PageRef, Option<IOCompletions>)> {
         tracing::trace!("read_page(page_idx = {})", page_idx);
         let mut page_cache = self.page_cache.write();
         let page_key = PageCacheKey::new(page_idx);
@@ -1133,13 +1228,24 @@ impl Pager {
             return Ok((page.clone(), None));
         }
         let (page, c) = self.read_page_no_cache(page_idx, None, false)?;
-        turso_assert!(
-            page_idx == page.get().id,
-            "attempted to read page {page_idx} but got page {}",
-            page.get().id
-        );
-        self.cache_insert(page_idx, page.clone(), &mut page_cache)?;
-        Ok((page, Some(c)))
+        if let Some(mut completions) = self.cache_insert(
+            page_idx,
+            page.clone(),
+            &mut page_cache,
+            CacheInsertOnConflict::Error,
+        )? {
+            let IOCompletions::Many {
+                completions: ref mut c_list,
+                ..
+            } = completions
+            else {
+                unreachable!("cache_insert should only return IOCompletions::Many");
+            };
+            c_list.push(c);
+            Ok((page, Some(completions)))
+        } else {
+            Ok((page, Some(IOCompletions::Single(c))))
+        }
     }
 
     fn begin_read_disk_page(
@@ -1159,21 +1265,75 @@ impl Pager {
         )
     }
 
+    /// Insert or overwrite a page in the cache.
+    pub fn upsert_page_in_cache(
+        &self,
+        page_idx: usize,
+        page: PageRef,
+    ) -> Result<Option<IOCompletions>> {
+        let mut cache = self.page_cache.write();
+        self.cache_insert(page_idx, page, &mut cache, CacheInsertOnConflict::Overwrite)
+    }
+
+    /// Insert a page into the cache.
+    /// Allow dirty pages to be spilled to disk if the cache is full.
     fn cache_insert(
         &self,
         page_idx: usize,
         page: PageRef,
         page_cache: &mut PageCache,
+        on_conflict: CacheInsertOnConflict,
+    ) -> Result<Option<IOCompletions>> {
+        self._cache_insert(page_idx, page, page_cache, on_conflict, true)
+    }
+
+    /// Insert a page into the cache.
+    /// Do not allow dirty pages to be spilled to disk if the cache is full.
+    fn cache_insert_disallow_spill(
+        &self,
+        page_idx: usize,
+        page: PageRef,
+        page_cache: &mut PageCache,
+        on_conflict: CacheInsertOnConflict,
     ) -> Result<()> {
-        let page_key = PageCacheKey::new(page_idx);
-        match page_cache.insert(page_key, page.clone()) {
-            Ok(_) => {}
-            Err(CacheError::KeyExists) => {
-                unreachable!("Page should not exist in cache after get() miss")
-            }
-            Err(e) => return Err(e.into()),
-        }
+        let res = self._cache_insert(page_idx, page, page_cache, on_conflict, false)?;
+        turso_assert!(
+            res.is_none(),
+            "cache_insert_disallow_spill should not spill and thus should not return IOCompletions"
+        );
         Ok(())
+    }
+
+    /// Insert a page into the cache. Internal variant called by [Pager::cache_insert] and [Pager::cache_insert_disallow_spill].
+    fn _cache_insert(
+        &self,
+        page_idx: usize,
+        page: PageRef,
+        page_cache: &mut PageCache,
+        on_conflict: CacheInsertOnConflict,
+        allow_spill: bool,
+    ) -> Result<Option<IOCompletions>> {
+        let page_key = PageCacheKey::new(page_idx);
+        page.pin();
+        let insert_result = page_cache.insert(page_key, page.clone(), on_conflict);
+        if let Err(CacheError::Full { should_spill: true }) = insert_result {
+            if !allow_spill {
+                page.unpin();
+                return Err(LimboError::CacheError(CacheError::Full {
+                    should_spill: true,
+                }));
+            }
+            self.spill(page_cache, |cache_mut| {
+                page.unpin();
+                self.cache_insert_disallow_spill(page_idx, page, cache_mut, on_conflict)
+            })
+        } else {
+            page.unpin();
+            insert_result.map_err(|e| {
+                LimboError::InternalError(format!("Failed to insert page into cache: {e:?}"))
+            })?;
+            Ok(None)
+        }
     }
 
     // Get a page from the cache, if it exists.
@@ -1200,7 +1360,6 @@ impl Pager {
                     page_idx,
                     target_frame
                 );
-                page.pin();
                 Some(page.clone())
             } else {
                 tracing::trace!(
@@ -1736,7 +1895,7 @@ impl Pager {
                         let (page, c) = self.read_page(trunk_page_id as usize)?;
                         trunk_page.replace(page);
                         if let Some(c) = c {
-                            io_yield_one!(c);
+                            io_yield!(c);
                         }
                     }
                     let trunk_page = trunk_page.as_ref().unwrap();
@@ -1843,11 +2002,18 @@ impl Pager {
             AllocatePage1State::Writing { page } => {
                 turso_assert!(page.is_loaded(), "page should be loaded");
                 tracing::trace!("allocate_page1(Writing done)");
-                let page_key = PageCacheKey::new(page.get().id);
                 let mut cache = self.page_cache.write();
-                cache.insert(page_key, page.clone()).map_err(|e| {
-                    LimboError::InternalError(format!("Failed to insert page 1 into cache: {e:?}"))
-                })?;
+                let Ok(cache_insert_result) = self.cache_insert(
+                    page.get().id,
+                    page.clone(),
+                    &mut cache,
+                    CacheInsertOnConflict::Error,
+                ) else {
+                    return Err(LimboError::InternalError(
+                        "Failed to insert page 1 into cache".into(),
+                    ));
+                };
+                turso_assert!(cache_insert_result.is_none(), "cache insert of page 1 should not spill and thus should not return IOCompletions");
                 self.db_state.set(DbState::Initialized);
                 self.allocate_page1_state.replace(AllocatePage1State::Done);
                 Ok(IOResult::Done(page.clone()))
@@ -1906,9 +2072,9 @@ impl Pager {
                             let page =
                                 allocate_new_page(new_db_size as usize, &self.buffer_pool, 0);
                             self.add_dirty(&page);
-                            let page_key = PageCacheKey::new(page.get().id);
                             let mut cache = self.page_cache.write();
-                            cache.insert(page_key, page.clone())?;
+                            // FIXME: this may return completions and is now incorrect, please fix this when AUTOVACUUM support is fully added
+                            turso_assert!(self.cache_insert(page.get().id, page.clone(), &mut cache, CacheInsertOnConflict::Error).unwrap().is_none(), "cache insert of ptrmap page returned completions, which is allowed, but we are not handling this case right now");
                         }
                     }
 
@@ -1925,7 +2091,7 @@ impl Pager {
                         current_db_size: new_db_size,
                     };
                     if let Some(c) = c {
-                        io_yield_one!(c);
+                        io_yield!(c);
                     }
                 }
                 AllocatePageState::SearchAvailableFreeListLeaf {
@@ -1949,6 +2115,8 @@ impl Pager {
                         let page_contents = trunk_page.get_contents();
                         let next_leaf_page_id =
                             page_contents.read_u32_no_offset(FREELIST_TRUNK_OFFSET_FIRST_LEAF);
+
+                        trunk_page.pin(); // Pin the page so that it cannot be evicted from the cache if the read_page() call spills cache pages to disk.
                         let (leaf_page, c) = self.read_page(next_leaf_page_id as usize)?;
 
                         turso_assert!(
@@ -1963,7 +2131,7 @@ impl Pager {
                             number_of_freelist_leaves,
                         };
                         if let Some(c) = c {
-                            io_yield_one!(c);
+                            io_yield!(c);
                         }
                         continue;
                     }
@@ -2012,6 +2180,12 @@ impl Pager {
                         "Leaf page {} is not loaded",
                         leaf_page.get().id
                     );
+                    turso_assert!(
+                        trunk_page.is_loaded(),
+                        "Trunk page {} is not loaded",
+                        trunk_page.get().id
+                    );
+                    trunk_page.unpin(); // Unpin the trunk page so that it can be evicted from the cache again, now that we don't need a guarantee it's in memory.
                     let page_contents = trunk_page.get_contents();
                     self.add_dirty(leaf_page);
                     // zero out the page
@@ -2075,38 +2249,33 @@ impl Pager {
                         // setup page and add to cache
                         self.add_dirty(&page);
 
-                        let page_key = PageCacheKey::new(page.get().id);
                         {
                             // Run in separate block to avoid deadlock on page cache write lock
                             let mut cache = self.page_cache.write();
-                            cache.insert(page_key, page.clone())?;
+                            if let Some(completions) = self.cache_insert(
+                                page.get().id,
+                                page.clone(),
+                                &mut cache,
+                                CacheInsertOnConflict::Error,
+                            )? {
+                                *state = AllocatePageState::Finish { new_db_size, page };
+                                return Ok(IOResult::IO(completions));
+                            }
                         }
                         header.database_size = new_db_size.into();
                         *state = AllocatePageState::Start;
                         return Ok(IOResult::Done(page));
                     }
                 }
+                AllocatePageState::Finish { new_db_size, page } => {
+                    let new_db_size = *new_db_size;
+                    let page = page.clone();
+                    header.database_size = new_db_size.into();
+                    *state = AllocatePageState::Start;
+                    return Ok(IOResult::Done(page));
+                }
             }
         }
-    }
-
-    pub fn update_dirty_loaded_page_in_cache(
-        &self,
-        id: usize,
-        page: PageRef,
-    ) -> Result<(), LimboError> {
-        let mut cache = self.page_cache.write();
-        let page_key = PageCacheKey::new(id);
-
-        // FIXME: use specific page key for writer instead of max frame, this will make readers not conflict
-        assert!(page.is_dirty());
-        cache.upsert_page(page_key, page.clone()).map_err(|e| {
-            LimboError::InternalError(format!(
-                "Failed to insert loaded page {id} into cache: {e:?}"
-            ))
-        })?;
-        page.set_loaded();
-        Ok(())
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
@@ -2414,7 +2583,7 @@ mod tests {
 
     use parking_lot::RwLock;
 
-    use crate::storage::page_cache::{PageCache, PageCacheKey};
+    use crate::storage::page_cache::{CacheInsertOnConflict, PageCache, PageCacheKey};
 
     use super::Page;
 
@@ -2428,10 +2597,13 @@ mod tests {
             std::thread::spawn(move || {
                 let mut cache = cache.write();
                 let page_key = PageCacheKey::new(1);
-                let page = Page::new(1);
-                // Set loaded so that we avoid eviction, as we evict the page from cache if it is not locked and not loaded
-                page.set_loaded();
-                cache.insert(page_key, Arc::new(page)).unwrap();
+                cache
+                    .insert(
+                        page_key,
+                        Arc::new(Page::new(1)),
+                        CacheInsertOnConflict::Error,
+                    )
+                    .unwrap();
             })
         };
         let _ = thread.join();
