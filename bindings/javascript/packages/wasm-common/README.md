@@ -4,5 +4,5 @@ This package is the Turso embedded database common JS library which is shared be
 
 Do not use this package directly - instead you must use `@tursodatabase/database` or `@tursodatabase/database-wasm`.
 
-> **⚠️ Warning:** This software is ALPHA, only use for development, testing, and experimentation. We are working to make it production ready, but do not use it for critical data right now.
+> **⚠️ Warning:** This software is in BETA. It may still contain bugs and unexpected behavior. Use caution with production data and ensure you have backups.
 
