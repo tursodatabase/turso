@@ -1127,12 +1127,7 @@ mod tests {
         let page3 = page_with_content(3);
         let result = cache.insert(key3, page3, CacheInsertOnConflict::Error);
 
-        assert_eq!(
-            result,
-            Err(CacheError::Full {
-                should_spill: false,
-            })
-        );
+        assert_eq!(result, Err(CacheError::Full { should_spill: true }));
         assert_eq!(cache.len(), 2);
         cache.verify_cache_integrity();
     }
