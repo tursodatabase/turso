@@ -2278,8 +2278,7 @@ pub fn op_transaction(
             if header_schema_cookie != *schema_cookie {
                 tracing::debug!(
                     "schema changed, force reprepare: {} != {}",
-                    header_schema_cookie,
-                    *schema_cookie
+                    header_schema_cookie, *schema_cookie
                 );
                 return Err(LimboError::SchemaUpdated);
             }
@@ -6850,6 +6849,7 @@ pub fn op_set_cookie(
                     TransactionState::None => unreachable!("invalid transaction state for SetCookie: TransactionState::None, should be write"),
                     TransactionState::PendingUpgrade => unreachable!("invalid transaction state for SetCookie: TransactionState::PendingUpgrade, should be write"),
                 }
+                println!("SetCookie: schema_version = {}", *value as u32);
                 program
                     .connection
                     .with_schema_mut(|schema| schema.schema_version = *value as u32);

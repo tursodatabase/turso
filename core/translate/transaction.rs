@@ -10,6 +10,7 @@ pub fn translate_tx_begin(
     schema: &Schema,
     mut program: ProgramBuilder,
 ) -> Result<ProgramBuilder> {
+    println!("translate_tx_begin cookie {}", schema.schema_version);
     program.extend(&ProgramBuilderOpts {
         num_cursors: 0,
         approx_num_insns: 0,

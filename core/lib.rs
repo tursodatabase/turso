@@ -2152,6 +2152,7 @@ impl Statement {
                     break;
                 }
                 tracing::debug!("reprepare: attempt={}", attempt);
+                // println!("reprepare: attempt={}", attempt);
                 self.reprepare()?;
                 res = self.program.step(
                     &mut self.state,

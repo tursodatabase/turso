@@ -1269,8 +1269,8 @@ fn test_concurrent_writes() {
         conn.execute("CREATE TABLE test (x)").unwrap();
         conn.close().unwrap();
     }
-    let num_connections = 2;
-    let num_inserts_per_connection = 10;
+    let num_connections = 20;
+    let num_inserts_per_connection = 10000;
     for i in 0..num_connections {
         let conn = db.connect();
         let mut inserts = ((num_inserts_per_connection * i)
@@ -1322,7 +1322,8 @@ fn test_concurrent_writes() {
                 }
                 StepResult::Busy => {
                     println!("connection {conn_id} busy");
-                    stmt.reprepare().unwrap();
+                    // stmt.reprepare().unwrap();
+                    assert!(false);
                 }
                 _ => {
                     unreachable!()
@@ -1348,4 +1349,38 @@ fn test_concurrent_writes() {
         assert_eq!(row[0].as_int().unwrap(), row_id as i64);
     }
     conn.close().unwrap();
+}
+
+fn generate_batched_insert(num_inserts: usize) -> String {
+    let mut inserts = String::from("INSERT INTO test (x) VALUES ");
+    for i in 0..num_inserts {
+        inserts.push_str(&format!("({i})"));
+        if i < num_inserts - 1 {
+            inserts.push_str(",");
+        }
+    }
+    inserts.push_str(";");
+    inserts
+}
+#[test]
+fn test_batch_writes() {
+    let mut start = 0;
+    let mut end = 5000;
+    while start < end {
+        let i = ((end - start) / 2) + start;
+        let db = MvccTestDbNoConn::new_with_random_db();
+        let conn = db.connect();
+        conn.execute("CREATE TABLE test (x)").unwrap();
+        let inserts = generate_batched_insert(i);
+        for i in 0..10 {
+            if conn.execute(inserts.clone()).is_err() {
+                end = i;
+                break;
+            } else {
+                start = i + 1;
+                break;
+            }
+        }
+    }
+    println!("start: {start} end: {end}");
 }

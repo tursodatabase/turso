@@ -248,15 +248,15 @@ impl File for UnixFile {
         let file = self.file.lock();
 
         let result = unsafe {
-            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
-            {
-                libc::fsync(file.as_raw_fd())
-            }
+            libc::fsync(file.as_raw_fd())
+            // #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+            // {
+            // }
 
-            #[cfg(any(target_os = "macos", target_os = "ios"))]
-            {
-                libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC)
-            }
+            // #[cfg(any(target_os = "macos", target_os = "ios"))]
+            // {
+            //     libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC)
+            // }
         };
 
         if result == -1 {

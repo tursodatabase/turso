@@ -2,7 +2,7 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 use pprof::criterion::{Output, PProfProfiler};
 use regex::Regex;
 use std::{sync::Arc, time::Instant};
-use turso_core::{Database, MemoryIO, PlatformIO, StepResult};
+use turso_core::{Database, LimboError, MemoryIO, PlatformIO, StepResult};
 
 #[cfg(not(target_family = "wasm"))]
 #[global_allocator]
@@ -632,10 +632,15 @@ fn bench_insert_rows(criterion: &mut Criterion) {
 }
 
 #[inline(never)]
-fn bench_limbo(mvcc: bool, num_connections: i64, num_inserts_per_connection: i64) {
+fn bench_limbo(
+    mvcc: bool,
+    num_connections: i64,
+    num_batch_inserts: i64,
+    num_inserts_per_batch: usize,
+) {
     struct ConnectionState {
         conn: Arc<turso_core::Connection>,
-        inserts: Vec<i64>,
+        inserts: Vec<String>,
         current_statement: Option<turso_core::Statement>,
     }
     #[allow(clippy::arc_with_non_send_sync)]
@@ -649,12 +654,11 @@ fn bench_limbo(mvcc: bool, num_connections: i64, num_inserts_per_connection: i64
         conn.execute("CREATE TABLE test (x)").unwrap();
         conn.close().unwrap();
     }
+    let inserts =
+        generate_inserts_per_connection(num_connections, num_batch_inserts, num_inserts_per_batch);
     for i in 0..num_connections {
         let conn = db.connect().unwrap();
-        let mut inserts = ((num_inserts_per_connection * i)
-            ..(num_inserts_per_connection * (i + 1)))
-            .collect::<Vec<i64>>();
-        inserts.reverse();
+        let inserts = inserts[i as usize].clone();
         connecitons.push(ConnectionState {
             conn,
             inserts,
@@ -672,11 +676,7 @@ fn bench_limbo(mvcc: bool, num_connections: i64, num_inserts_per_connection: i64
         for (_, conn) in connecitons.iter_mut().enumerate() {
             if conn.current_statement.is_none() && !conn.inserts.is_empty() {
                 let write = conn.inserts.pop().unwrap();
-                conn.current_statement = Some(
-                    conn.conn
-                        .prepare(&format!("INSERT INTO test (x) VALUES ({write})"))
-                        .unwrap(),
-                );
+                conn.current_statement = Some(conn.conn.prepare(&write).unwrap());
             }
             if conn.current_statement.is_none() {
                 continue;
@@ -714,11 +714,17 @@ fn bench_limbo(mvcc: bool, num_connections: i64, num_inserts_per_connection: i64
 }
 
 #[inline(never)]
-fn bench_limbo_mvcc(mvcc: bool, num_connections: i64, num_inserts_per_connection: i64) {
+fn bench_limbo_mvcc(
+    mvcc: bool,
+    num_connections: i64,
+    num_batch_inserts: i64,
+    num_inserts_per_batch: usize,
+) {
     struct ConnectionState {
         conn: Arc<turso_core::Connection>,
-        inserts: Vec<i64>,
+        inserts: Vec<String>,
         current_statement: Option<turso_core::Statement>,
+        current_insert: Option<String>,
     }
     #[allow(clippy::arc_with_non_send_sync)]
     let io = Arc::new(PlatformIO::new().unwrap());
@@ -726,21 +732,19 @@ fn bench_limbo_mvcc(mvcc: bool, num_connections: i64, num_inserts_per_connection
     let path = temp_dir.path().join("bench.db");
     let db = Database::open_file(io.clone(), path.to_str().unwrap(), mvcc, false).unwrap();
     let mut connecitons = Vec::new();
-    {
-        let conn = db.connect().unwrap();
-        conn.execute("CREATE TABLE test (x)").unwrap();
-        conn.close().unwrap();
-    }
+    let conn0 = db.connect().unwrap();
+    conn0.execute("CREATE TABLE test (x)").unwrap();
+
+    let inserts =
+        generate_inserts_per_connection(num_connections, num_batch_inserts, num_inserts_per_batch);
     for i in 0..num_connections {
         let conn = db.connect().unwrap();
-        let mut inserts = ((num_inserts_per_connection * i)
-            ..(num_inserts_per_connection * (i + 1)))
-            .collect::<Vec<i64>>();
-        inserts.reverse();
+        let inserts = inserts[i as usize].clone();
         connecitons.push(ConnectionState {
             conn,
             inserts,
             current_statement: None,
+            current_insert: None,
         });
     }
     loop {
@@ -754,35 +758,44 @@ fn bench_limbo_mvcc(mvcc: bool, num_connections: i64, num_inserts_per_connection
         for (_, conn) in connecitons.iter_mut().enumerate() {
             if conn.current_statement.is_none() && !conn.inserts.is_empty() {
                 let write = conn.inserts.pop().unwrap();
-                conn.current_statement = Some(
-                    conn.conn
-                        .prepare(&format!("INSERT INTO test (x) VALUES ({write})"))
-                        .unwrap(),
-                );
+                conn.current_statement = Some(conn.conn.prepare(&write).unwrap());
+                conn.current_insert = Some(write);
             }
             if conn.current_statement.is_none() {
                 continue;
             }
             let stmt = conn.current_statement.as_mut().unwrap();
-            match stmt.step().unwrap() {
+            match stmt.step() {
                 // These you be only possible cases in write concurrency.
                 // No rows because insert doesn't return
                 // No interrupt because insert doesn't interrupt
                 // No busy because insert in mvcc should be multi concurrent write
-                StepResult::Done => {
+                Ok(StepResult::Done) => {
                     conn.current_statement = None;
+                    conn.current_insert = None;
                 }
-                StepResult::IO => {
+                Ok(StepResult::IO) => {
                     stmt.run_once().unwrap();
                     // let's skip doing I/O here, we want to perform io only after all the statements are stepped
                 }
-                StepResult::Busy => {
+                Ok(StepResult::Busy) => {
                     // We need to restart statement
                     if mvcc {
                         unreachable!();
                     }
                     println!("resetting statement");
                     stmt.reset();
+                }
+                Err(err) => {
+                    if let LimboError::SchemaUpdated = err {
+                        conn.current_statement = Some(
+                            conn.conn
+                                .prepare(&conn.current_insert.clone().as_ref().unwrap())
+                                .unwrap(),
+                        );
+                        continue;
+                    }
+                    panic!("unexpected error: {err:?}");
                 }
                 _ => {
                     unreachable!()
@@ -797,23 +810,69 @@ fn bench_limbo_mvcc(mvcc: bool, num_connections: i64, num_inserts_per_connection
     }
 }
 
+fn generate_inserts_per_connection(
+    num_connections: i64,
+    num_batch_inserts: i64,
+    num_inserts_per_batch: usize,
+) -> Vec<Vec<String>> {
+    let mut inserts = vec![];
+    for i in 0..num_connections {
+        let mut inserts_per_connection = vec![];
+        for j in 0..num_batch_inserts {
+            inserts_per_connection.push(generate_batch_insert(
+                num_batch_inserts * (i + j),
+                num_inserts_per_batch,
+            ));
+        }
+        inserts.push(inserts_per_connection);
+    }
+    inserts
+}
+
+fn generate_batch_insert(start: i64, num: usize) -> String {
+    let mut inserts = String::from("INSERT INTO test (x) VALUES ");
+    for i in 0..num {
+        inserts.push_str(&format!("({})", start + i as i64));
+        if i < num - 1 {
+            inserts.push(',');
+        }
+    }
+    inserts
+}
+
 fn bench_concurrent_writes(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("Concurrent writes");
 
-    let num_connections = 2;
-    let num_inserts_per_connection = 100;
+    let num_connections = 10;
+    let num_batch_inserts = 100;
+    let num_inserts_per_batch = 200_usize;
 
     group.bench_function("limbo_wal_concurrent_writes", |b| {
         b.iter(|| {
-            bench_limbo(false, num_connections, num_inserts_per_connection);
+            bench_limbo(
+                false,
+                num_connections,
+                num_batch_inserts,
+                num_inserts_per_batch,
+            );
         });
     });
     group.bench_function("limbo_mvcc_concurrent_writes", |b| {
         b.iter(|| {
-            bench_limbo_mvcc(true, num_connections, num_inserts_per_connection);
+            bench_limbo_mvcc(
+                true,
+                num_connections,
+                num_batch_inserts,
+                num_inserts_per_batch,
+            );
         });
     });
     group.bench_function("sqlite_concurrent_writes", |b| {
+        let inserts = generate_inserts_per_connection(
+            num_connections,
+            num_batch_inserts,
+            num_inserts_per_batch,
+        );
         b.iter(|| {
             let temp_dir = tempfile::tempdir().unwrap();
             let path = temp_dir.path().join("bench.db");
@@ -828,10 +887,8 @@ fn bench_concurrent_writes(criterion: &mut Criterion) {
 
             for i in 0..num_connections {
                 let conn = rusqlite::Connection::open(path.to_str().unwrap()).unwrap();
-                for j in 0..num_inserts_per_connection {
-                    let value = (num_inserts_per_connection * i) + j;
-                    conn.execute("INSERT INTO test (x) VALUES (?1)", [value])
-                        .unwrap();
+                for j in 0..num_batch_inserts {
+                    conn.execute(&inserts[i as usize][j as usize], []).unwrap();
                 }
             }
         });
