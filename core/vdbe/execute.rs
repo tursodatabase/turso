@@ -1618,7 +1618,7 @@ pub fn op_column(
                                     // Reserved in both cases
                                     11 => {
                                         return Err(LimboError::Corrupt(format!(
-                                        "Reserved serial type: {serial_type}"
+                                            "Reserved serial type: {serial_type}"
                                         )))
                                     }
                                     _ => unreachable!("Invalid serial type: {serial_type}"),

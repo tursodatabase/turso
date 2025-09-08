@@ -16,7 +16,7 @@ register_extension! {
 #[cfg(feature = "u128-support")]
 #[scalar(name = "ipv6_to_u128")]
 fn ipv6_to_u128(args: &[Value]) -> Value {
-    let Some(ip_text) = args.get(0).and_then(|v| v.to_text()) else {
+    let Some(ip_text) = args.first().and_then(|v| v.to_text()) else {
         return Value::error(ResultCode::InvalidArgs);
     };
 
@@ -29,7 +29,7 @@ fn ipv6_to_u128(args: &[Value]) -> Value {
 #[cfg(feature = "u128-support")]
 #[scalar(name = "u128_to_ipv6")]
 fn u128_to_ipv6(args: &[Value]) -> Value {
-    let Some(value) = args.get(0) else {
+    let Some(value) = args.first() else {
         return Value::error(ResultCode::InvalidArgs);
     };
 
@@ -43,7 +43,7 @@ fn u128_to_ipv6(args: &[Value]) -> Value {
 
 #[scalar(name = "ipcontains")]
 fn ip_contains(args: &[Value]) -> Value {
-    let Some(cidr_arg) = args.get(0).and_then(|v| v.to_text()) else {
+    let Some(cidr_arg) = args.first().and_then(|v| v.to_text()) else {
         return Value::error(ResultCode::InvalidArgs);
     };
 
@@ -64,7 +64,7 @@ fn ip_contains(args: &[Value]) -> Value {
 
 #[scalar(name = "ipfamily")]
 fn ip_family(args: &[Value]) -> Value {
-    let Some(ip_addr) = args.get(0).and_then(|v| v.to_text()) else {
+    let Some(ip_addr) = args.first().and_then(|v| v.to_text()) else {
         return Value::error(ResultCode::InvalidArgs);
     };
 
@@ -77,7 +77,7 @@ fn ip_family(args: &[Value]) -> Value {
 
 #[scalar(name = "iphost")]
 fn ip_host(args: &[Value]) -> Value {
-    let Some(cidr_arg) = args.get(0).and_then(|v| v.to_text()) else {
+    let Some(cidr_arg) = args.first().and_then(|v| v.to_text()) else {
         return Value::error(ResultCode::InvalidArgs);
     };
 
@@ -90,7 +90,7 @@ fn ip_host(args: &[Value]) -> Value {
 
 #[scalar(name = "ipmasklen")]
 fn ip_masklen(args: &[Value]) -> Value {
-    let Some(cidr_arg) = args.get(0).and_then(|v| v.to_text()) else {
+    let Some(cidr_arg) = args.first().and_then(|v| v.to_text()) else {
         return Value::error(ResultCode::InvalidArgs);
     };
 
@@ -103,7 +103,7 @@ fn ip_masklen(args: &[Value]) -> Value {
 
 #[scalar(name = "ipnetwork")]
 fn ip_network(args: &[Value]) -> Value {
-    let Some(cidr_arg) = args.get(0).and_then(|v| v.to_text()) else {
+    let Some(cidr_arg) = args.first().and_then(|v| v.to_text()) else {
         return Value::error(ResultCode::InvalidArgs);
     };
 
