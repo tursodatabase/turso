@@ -18,6 +18,12 @@ impl Display for Create {
                 write!(f, ",")?;
             }
             write!(f, "{} {}", column.name, column.column_type)?;
+            if column.primary {
+                write!(f, " PRIMARY KEY")?;
+            }
+            if column.unique && !column.primary {
+                write!(f, " UNIQUE")?;
+            }
         }
 
         write!(f, ")")
