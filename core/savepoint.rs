@@ -15,16 +15,13 @@ use std::rc::Rc;
 #[derive(Debug, Clone)]
 pub struct Savepoint {
     pub name: String,
-    /// Whether this savepoint was created outside of an existing transaction
-    pub is_outermost: bool,
     pub wal_data: SavepointWalData,
 }
 
 impl Savepoint {
-    pub fn new(name: String, is_outermost: bool, wal: Rc<RefCell<dyn Wal>>) -> Self {
+    pub fn new(name: String, wal: Rc<RefCell<dyn Wal>>) -> Self {
         Self {
             name,
-            is_outermost,
             wal_data: wal.borrow().savepoint(),
         }
     }
@@ -59,8 +56,8 @@ impl SavepointStack {
         self.savepoints.len()
     }
 
-    pub fn push_savepoint(&mut self, name: String, is_outermost: bool, wal: Rc<RefCell<dyn Wal>>) {
-        let savepoint = Savepoint::new(name, is_outermost, wal);
+    pub fn push_savepoint(&mut self, name: String, wal: Rc<RefCell<dyn Wal>>) {
+        let savepoint = Savepoint::new(name, wal);
         self.savepoints.push_back(savepoint);
     }
 

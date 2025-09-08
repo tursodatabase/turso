@@ -1236,11 +1236,8 @@ impl Insn {
             Insn::AlterColumn { .. } => execute::op_alter_column,
             Insn::MaxPgcnt { .. } => execute::op_max_pgcnt,
             Insn::JournalMode { .. } => execute::op_journal_mode,
-<<<<<<< HEAD
             Insn::IfNeg { .. } => execute::op_if_neg,
-=======
             Insn::Savepoint { .. } => execute::op_savepoint,
->>>>>>> 90a49b9e (Basic implementation of savepoints)
         }
     }
 }

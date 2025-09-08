@@ -491,6 +491,7 @@ impl Database {
             encryption_cipher_mode: Cell::new(None),
             sync_mode: Cell::new(SyncMode::Full),
             savepoint_stack: RefCell::new(SavepointStack::new()),
+            is_txn_savepoint: Cell::new(false),
         });
         self.n_connections
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -932,6 +933,8 @@ pub struct Connection {
     encryption_cipher_mode: Cell<Option<CipherMode>>,
     sync_mode: Cell<SyncMode>,
     savepoint_stack: RefCell<SavepointStack>,
+    /// Mark if the outermost transaction is a savepoint
+    is_txn_savepoint: Cell<bool>,
 }
 
 impl Drop for Connection {
