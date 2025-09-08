@@ -366,7 +366,7 @@ impl From<&Value> for NullableInteger {
 
             #[cfg(feature = "u128-support")]
             Value::U128(u) => {
-                // This is a lossy conversion , nullable integer can only hold i64 maybe we have to change this, idk  for now.
+                // U128 values are clamped to i64::MAX on conversion to INTEGER
                 if *u > i64::MAX as u128 {
                     Self::Integer(i64::MAX)
                 } else {

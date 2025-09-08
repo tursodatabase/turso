@@ -218,7 +218,7 @@ impl Limbo {
             _ => acc,
         }) {
             n if n < 0 => String::from(")x!...>"),
-            0 => String::from(" ...> "),
+            0 => String::from("   ...> "),
             n if n < 10 => format!("(x{n}...> "),
             _ => String::from("(.....> "),
         };
@@ -671,6 +671,7 @@ impl Limbo {
                                 if let Some(ref mut stats) = statistics {
                                     stats.execute_time_elapsed_samples.push(start.elapsed());
                                 }
+                                
                                 // Print headers if enabled and not already printed
                                 if self.opts.headers && !headers_printed {
                                     for i in 0..rows.num_columns() {

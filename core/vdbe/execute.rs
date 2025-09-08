@@ -1600,16 +1600,25 @@ pub fn op_column(
                                     8 => 0,
                                     // CONST_INT1
                                     9 => 0,
-                                    #[cfg(feature = "u128-support")]
-                                    10 => 16,
+                                   
                                     // BLOB
                                     n if n >= 12 && n & 1 == 0 => (n - 12) >> 1,
                                     // TEXT
                                     n if n >= 13 && n & 1 == 1 => (n - 13) >> 1,
-                                    // Reserved
-                                    10 | 11 => {
+                                    // Reserved if u128 is NOT supported
+                                    10 => {
+                                        if cfg!(feature = "u128-support") {
+                                            16
+                                        } else {
+                                            return Err(LimboError::Corrupt(format!(
+                                                "Reserved serial type: {serial_type}"
+                                            )));
+                                        }
+                                    }
+                                    // Reserved in both cases
+                                    11 => {
                                         return Err(LimboError::Corrupt(format!(
-                                            "Reserved serial type: {serial_type}"
+                                        "Reserved serial type: {serial_type}"
                                         )))
                                     }
                                     _ => unreachable!("Invalid serial type: {serial_type}"),
@@ -6903,7 +6912,11 @@ pub fn op_add_imm(
         Value::Blob(_) => *value, // BLOB becomes the added value
         Value::Null => *value,    // NULL becomes the added value
         #[cfg(feature = "u128-support")]
-        Value::U128(_) => panic!("Cannot perform this aggregation on a U128 value"),
+        Value::U128(_) => {
+            return Err(LimboError::InvalidArgument(
+        "           Invalid operation: cannot apply AddImm to a U128 value".to_string(),
+            ));
+        }
     };
 
     state.registers[*register] = Register::Value(Value::Integer(int_val));

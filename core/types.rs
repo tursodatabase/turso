@@ -14,7 +14,6 @@ use crate::vtab::VirtualTableCursor;
 use serde::Deserialize;
 use turso_ext::{AggCtx, FinalizeFunction, StepFunction};
 use turso_parser::ast::SortOrder;
-const MAX_REAL_SIZE: u8 = 15;
 use crate::{turso_assert, Completion, CompletionError, Result, IO};
 use std::fmt::{Debug, Display};
 
@@ -566,6 +565,7 @@ macro_rules! impl_int_from_value {
                 }
             }
         }
+
         impl Sealed for $ty {}
     };
 }
@@ -574,6 +574,7 @@ impl_int_from_value!(i32, |i| i as i32);
 impl_int_from_value!(u32, |i| i as u32);
 impl_int_from_value!(i64, |i| i);
 impl_int_from_value!(u64, |i| i as u64);
+
 impl FromValue for f64 {
     fn from_sql(val: Value) -> Result<Self> {
         match val {
@@ -790,9 +791,17 @@ impl PartialOrd<Value> for Value {
                 }
             }
             #[cfg(feature = "u128-support")]
-            (Value::U128(_), Value::Float(_)) => None, // TODO this panics
+            (Self::U128(u), Self::Float(f)) => {
+            // coerce U128 to f64 for comparison.
+            // This may result in a loss of precision.
+            (*u as f64).partial_cmp(f)
+                }
+            // (Value::U128(_), Value::Float(_)) => None, // TODO this panics
             #[cfg(feature = "u128-support")]
-            (Value::Float(_), Value::U128(_)) => None, // TODO this panics due to unwrap?
+            (Self::Float(f), Self::U128(u)) => {
+                f.partial_cmp(&(*u as f64))
+            }
+            // (Value::Float(_), Value::U128(_)) => None, // TODO this panics due to unwrap?
             #[cfg(not(feature = "u128-support"))]
             (Self::Integer(_) | Self::Float(_), Self::Text(_) | Self::Blob(_)) => {
                 Some(std::cmp::Ordering::Less)
@@ -1123,29 +1132,37 @@ impl ImmutableRecord {
         let mut serials = Vec::with_capacity(len);
         let mut size_header = 0;
         let mut size_values = 0;
+
         let mut serial_type_buf = [0; 9];
         // write serial types
         for value in values.clone() {
             let serial_type = SerialType::from(value);
             let n = write_varint(&mut serial_type_buf[0..], serial_type.into());
             serials.push((serial_type_buf, n));
+
             let value_size = serial_type.size();
+
             size_header += n;
             size_values += value_size;
         }
+
         let header_size = Record::calc_header_size(size_header);
+
         // 1. write header size
         let mut buf = Vec::new();
         buf.reserve_exact(header_size + size_values);
         assert_eq!(buf.capacity(), header_size + size_values);
         let n = write_varint(&mut serial_type_buf, header_size as u64);
+
         buf.resize(buf.capacity(), 0);
         let mut writer = AppendWriter::new(&mut buf, 0);
         writer.extend_from_slice(&serial_type_buf[..n]);
+
         // 2. Write serial
         for (value, n) in serials {
             writer.extend_from_slice(&value[..n]);
         }
+
         // write content
         for value in values {
             let start_offset = writer.pos;
@@ -1198,6 +1215,7 @@ impl ImmutableRecord {
                 }
             };
         }
+        
         writer.assert_finish_capacity();
         Self {
             payload: Value::Blob(buf),
@@ -1260,7 +1278,9 @@ impl ImmutableRecord {
         if self.is_invalidated() {
             return None;
         }
+
         let mut cursor = RecordCursor::new();
+
         match cursor.ensure_parsed_upto(self, idx) {
             Ok(()) => {
                 if idx >= cursor.serial_types.len() {
@@ -1668,6 +1688,7 @@ impl PartialOrd<RefValue> for RefValue {
             // Text vs Blob
             (Self::Text(_), Self::Blob(_)) => Some(std::cmp::Ordering::Less),
             (Self::Blob(_), Self::Text(_)) => Some(std::cmp::Ordering::Greater),
+
             (Self::Blob(blob_left), Self::Blob(blob_right)) => {
                 blob_left.to_slice().partial_cmp(blob_right.to_slice())
             }
@@ -1682,12 +1703,14 @@ fn sqlite_int_float_compare(int_val: i64, float_val: f64) -> std::cmp::Ordering 
     if float_val.is_nan() {
         return std::cmp::Ordering::Greater;
     }
+
     if float_val < -9223372036854775808.0 {
         return std::cmp::Ordering::Greater;
     }
     if float_val >= 9223372036854775808.0 {
         return std::cmp::Ordering::Less;
     }
+
     let float_as_int = float_val as i64;
     match int_val.cmp(&float_as_int) {
         std::cmp::Ordering::Equal => {
@@ -1720,6 +1743,7 @@ pub struct IndexInfo {
     /// The total number of columns in the index, including the row ID column if present.
     pub num_cols: usize,
 }
+
 impl Default for IndexInfo {
     fn default() -> Self {
         Self {
@@ -3419,6 +3443,7 @@ mod tests {
         let record = Record::new(vec![Value::Float(3.15555)]);
         let mut buf = Vec::new();
         record.serialize(&mut buf);
+
         let header_length = record.values.len() + 1;
         let header = &buf[0..header_length];
         assert_eq!(header[0], header_length as u8);
@@ -3431,13 +3456,14 @@ mod tests {
         // Check that buffer length is correct
         assert_eq!(buf.len(), header_length + size_of::<f64>());
     }
-    #[test]
 
+    #[test]
     fn test_serialize_text() {
         let text = "hello";
         let record = Record::new(vec![Value::Text(Text::new(text))]);
         let mut buf = Vec::new();
         record.serialize(&mut buf);
+
         let header_length = record.values.len() + 1;
         let header = &buf[0..header_length];
         // First byte should be header size
@@ -3456,6 +3482,7 @@ mod tests {
         let record = Record::new(vec![Value::Blob(blob.clone())]);
         let mut buf = Vec::new();
         record.serialize(&mut buf);
+
         let header_length = record.values.len() + 1;
         let header = &buf[0..header_length];
         // First byte should be header size
@@ -3491,6 +3518,7 @@ mod tests {
         assert_eq!(header[3] as u64, u64::from(SerialType::f64()));
         // Fifth byte should be serial type for TEXT, which is (len * 2 + 13)
         assert_eq!(header[4] as u64, (4 * 2 + 13) as u64);
+
         // Check that the bytes after the header can be interpreted as the correct values
         let mut cur_offset = header_length;
         let i8_bytes = &buf[cur_offset..cur_offset + size_of::<i8>()];
@@ -3498,12 +3526,15 @@ mod tests {
         let f64_bytes = &buf[cur_offset..cur_offset + size_of::<f64>()];
         cur_offset += size_of::<f64>();
         let text_bytes = &buf[cur_offset..cur_offset + text.len()];
+
         let val_int8 = i8::from_be_bytes(i8_bytes.try_into().unwrap());
         let val_float = f64::from_be_bytes(f64_bytes.try_into().unwrap());
         let val_text = String::from_utf8(text_bytes.to_vec()).unwrap();
+
         assert_eq!(val_int8, 42);
         assert_eq!(val_float, 3.15);
         assert_eq!(val_text, "test");
+
         // Check that buffer length is correct
         assert_eq!(
             buf.len(),
