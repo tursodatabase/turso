@@ -124,12 +124,11 @@ impl SimplePredicate {
     pub fn true_unary<R: rand::Rng, C: GenerationContext, T: TableContext>(
         rng: &mut R,
         context: &C,
-        table: &T,
+        _table: &T,
         row: &[SimValue],
     ) -> Self {
-        let columns = table.columns().collect::<Vec<_>>();
         // Pick a random column
-        let column_index = rng.random_range(0..columns.len());
+        let column_index = rng.random_range(0..row.len());
         let column_value = &row[column_index];
         let num_retries = row.len();
         // Avoid creation of NULLs
@@ -191,18 +190,17 @@ impl SimplePredicate {
     pub fn false_unary<R: rand::Rng, C: GenerationContext, T: TableContext>(
         rng: &mut R,
         context: &C,
-        table: &T,
+        _table: &T,
         row: &[SimValue],
     ) -> Self {
-        let columns = table.columns().collect::<Vec<_>>();
-        // Pick a random column
-        let column_index = rng.random_range(0..columns.len());
-        let column_value = &row[column_index];
-        let num_retries = row.len();
         // Avoid creation of NULLs
         if row.is_empty() {
             return SimplePredicate(Predicate(Expr::Literal(SimValue::FALSE.into())));
         }
+        // Pick a random column
+        let column_index = rng.random_range(0..row.len());
+        let column_value = &row[column_index];
+        let num_retries = row.len();
         let expr = backtrack(
             vec![
                 // (

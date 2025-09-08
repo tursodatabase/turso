@@ -259,16 +259,16 @@ impl SimplePredicate {
         table: &T,
         row: &[SimValue],
     ) -> Self {
-        // Pick a random column
-        let columns = table.columns().collect::<Vec<_>>();
-        let column_index = rng.random_range(0..columns.len());
-        let column = columns[column_index];
-        let column_value = &row[column_index];
-        let table_name = column.table_name;
         // Avoid creation of NULLs
         if row.is_empty() {
             return SimplePredicate(Predicate(Expr::Literal(SimValue::TRUE.into())));
         }
+        // Pick a random column
+        let columns = table.columns().collect::<Vec<_>>();
+        let column_index = rng.random_range(0..row.len());
+        let column = columns[column_index];
+        let column_value = &row[column_index];
+        let table_name = column.table_name;
 
         let expr = one_of(
             vec![
@@ -317,16 +317,16 @@ impl SimplePredicate {
         table: &T,
         row: &[SimValue],
     ) -> Self {
-        let columns = table.columns().collect::<Vec<_>>();
-        // Pick a random column
-        let column_index = rng.random_range(0..columns.len());
-        let column = columns[column_index];
-        let column_value = &row[column_index];
-        let table_name = column.table_name;
         // Avoid creation of NULLs
         if row.is_empty() {
             return SimplePredicate(Predicate(Expr::Literal(SimValue::FALSE.into())));
         }
+        let columns = table.columns().collect::<Vec<_>>();
+        // Pick a random column
+        let column_index = rng.random_range(0..row.len());
+        let column = columns[column_index];
+        let column_value = &row[column_index];
+        let table_name = column.table_name;
 
         let expr = one_of(
             vec![
