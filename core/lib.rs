@@ -520,6 +520,7 @@ impl Database {
             data_sync_retry: Cell::new(false),
             busy_timeout: Cell::new(None),
             savepoint_stack: RefCell::new(SavepointStack::new()),
+            is_txn_savepoint: Cell::new(false),
         });
         self.n_connections
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -1014,6 +1015,8 @@ pub struct Connection {
     /// User defined max accumulated Busy timeout duration
     busy_timeout: Cell<Option<std::time::Duration>>,
     savepoint_stack: RefCell<SavepointStack>,
+    /// Mark if the outermost transaction is a savepoint
+    is_txn_savepoint: Cell<bool>,
 }
 
 impl Drop for Connection {
