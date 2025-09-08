@@ -671,7 +671,7 @@ impl Limbo {
                                 if let Some(ref mut stats) = statistics {
                                     stats.execute_time_elapsed_samples.push(start.elapsed());
                                 }
-                                
+
                                 // Print headers if enabled and not already printed
                                 if self.opts.headers && !headers_printed {
                                     for i in 0..rows.num_columns() {

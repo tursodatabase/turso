@@ -962,6 +962,19 @@ impl<'a> FromValueRow<'a> for String {
     }
 }
 
+#[cfg(feature = "u128-support")]
+impl<'a> FromValueRow<'a> for u128 {
+    fn from_value(value: &'a Value) -> Result<Self> {
+        match value {
+            Value::U128(val) => Ok(*val),
+            Value::Integer(val) => Ok(*val as u128),
+            _ => Err(LimboError::ConversionError(
+                "Expected u128 or integer value".into(),
+            )),
+        }
+    }
+}
+
 impl<'a> FromValueRow<'a> for &'a str {
     fn from_value(value: &'a Value) -> Result<Self> {
         match value {

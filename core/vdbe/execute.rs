@@ -1600,7 +1600,7 @@ pub fn op_column(
                                     8 => 0,
                                     // CONST_INT1
                                     9 => 0,
-                                   
+
                                     // BLOB
                                     n if n >= 12 && n & 1 == 0 => (n - 12) >> 1,
                                     // TEXT
@@ -6914,7 +6914,7 @@ pub fn op_add_imm(
         #[cfg(feature = "u128-support")]
         Value::U128(_) => {
             return Err(LimboError::InvalidArgument(
-        "           Invalid operation: cannot apply AddImm to a U128 value".to_string(),
+                "           Invalid operation: cannot apply AddImm to a U128 value".to_string(),
             ));
         }
     };

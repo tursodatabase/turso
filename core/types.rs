@@ -10,12 +10,12 @@ use crate::translate::plan::IterationDirection;
 use crate::vdbe::sorter::Sorter;
 use crate::vdbe::Register;
 use crate::vtab::VirtualTableCursor;
+use crate::{turso_assert, Completion, CompletionError, Result, IO};
 #[cfg(feature = "serde")]
 use serde::Deserialize;
+use std::fmt::{Debug, Display};
 use turso_ext::{AggCtx, FinalizeFunction, StepFunction};
 use turso_parser::ast::SortOrder;
-use crate::{turso_assert, Completion, CompletionError, Result, IO};
-use std::fmt::{Debug, Display};
 
 /// SQLite by default uses 2000 as maximum numbers in a row.
 /// It controlld by the constant called SQLITE_MAX_COLUMN
@@ -792,15 +792,13 @@ impl PartialOrd<Value> for Value {
             }
             #[cfg(feature = "u128-support")]
             (Self::U128(u), Self::Float(f)) => {
-            // coerce U128 to f64 for comparison.
-            // This may result in a loss of precision.
-            (*u as f64).partial_cmp(f)
-                }
+                // coerce U128 to f64 for comparison.
+                // This may result in a loss of precision.
+                (*u as f64).partial_cmp(f)
+            }
             // (Value::U128(_), Value::Float(_)) => None, // TODO this panics
             #[cfg(feature = "u128-support")]
-            (Self::Float(f), Self::U128(u)) => {
-                f.partial_cmp(&(*u as f64))
-            }
+            (Self::Float(f), Self::U128(u)) => f.partial_cmp(&(*u as f64)),
             // (Value::Float(_), Value::U128(_)) => None, // TODO this panics due to unwrap?
             #[cfg(not(feature = "u128-support"))]
             (Self::Integer(_) | Self::Float(_), Self::Text(_) | Self::Blob(_)) => {
@@ -1215,7 +1213,7 @@ impl ImmutableRecord {
                 }
             };
         }
-        
+
         writer.assert_finish_capacity();
         Self {
             payload: Value::Blob(buf),

@@ -183,6 +183,13 @@ impl From<i64> for Value {
     }
 }
 
+#[cfg(feature = "u128-support")]
+impl From<u128> for Value {
+    fn from(value: u128) -> Value {
+        Value::U128(value)
+    }
+}
+
 impl From<u8> for Value {
     fn from(value: u8) -> Value {
         Value::Integer(value as i64)
