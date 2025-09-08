@@ -66,7 +66,7 @@ test-shell: limbo uv-sync-test
 	RUST_LOG=$(RUST_LOG) SQLITE_EXEC=$(SQLITE_EXEC) uv run --project limbo_test test-shell
 .PHONY: test-shell
 
-test-compat: check-tcl-version
+test-compat: geb-db check-tcl-version
 	RUST_LOG=$(RUST_LOG) SQLITE_EXEC=$(SQLITE_EXEC) ./testing/all.test
 .PHONY: test-compat
 
