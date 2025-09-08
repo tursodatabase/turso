@@ -511,7 +511,6 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     wal.begin_read_tx()?;
                 }
                 // Force updated header?
-                self.pager.clear_page_cache();
                 self.pager
                     .io
                     .block(|| self.pager.with_header_mut(|header| {}))
