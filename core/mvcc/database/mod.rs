@@ -1477,6 +1477,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     }
 
     // Extracts the begin timestamp from a transaction
+    #[inline]
     fn get_begin_timestamp(&self, ts_or_id: &TxTimestampOrID) -> u64 {
         match ts_or_id {
             TxTimestampOrID::Timestamp(ts) => *ts,
@@ -1501,13 +1502,20 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         // another data structure, e.g. a BTreeSet. If it proves to be too quadratic empirically,
         // we can either switch to a tree-like structure, or at least use partition_point()
         // which performs a binary search for the insertion point.
-        let position = versions
-            .iter()
-            .rposition(|v| {
-                self.get_begin_timestamp(&v.begin) < self.get_begin_timestamp(&row_version.begin)
-            })
-            .map(|p| p + 1)
-            .unwrap_or(0);
+        let mut position = 0_usize;
+        // let position = versions
+        //     .iter()
+        //     .rposition(|v| {
+        //         self.get_begin_timestamp(&v.begin) < self.get_begin_timestamp(&row_version.begin)
+        //     })
+        //     .map(|p| p + 1)
+        //     .unwrap_or(0);
+        for (i, v) in versions.iter().enumerate() {
+            if self.get_begin_timestamp(&v.begin) < self.get_begin_timestamp(&row_version.begin) {
+                position = i + 1;
+                break;
+            }
+        }
         if versions.len() - position > 3 {
             tracing::debug!(
                 "Inserting a row version {} positions from the end",
