@@ -229,7 +229,7 @@ impl FromClause {
 
         let mut join_table = JoinTable {
             tables: vec![first_table.clone()],
-            rows: Vec::new(),
+            rows: first_table.rows.clone(),
         };
 
         for join in &self.joins {
