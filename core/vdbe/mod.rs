@@ -771,12 +771,16 @@ impl Program {
         // Reset state for next use
         program_state.view_delta_state = ViewDeltaCommitState::NotStarted;
 
-        if self.connection.transaction_state.get() == TransactionState::None && mv_store.is_none() {
+        if self.connection.transaction_state.get() == TransactionState::None {
             // No need to do any work here if not in tx. Current MVCC logic doesn't work with this assumption,
             // hence the mv_store.is_none() check.
             return Ok(IOResult::Done(()));
         }
         if let Some(mv_store) = mv_store {
+            if self.connection.is_nested_stmt.get() {
+                // We don't want to commit on nested statements. Let parent handle it.
+                return Ok(IOResult::Done(()));
+            }
             let conn = self.connection.clone();
             let auto_commit = conn.auto_commit.get();
             if auto_commit {
