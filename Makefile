@@ -55,7 +55,7 @@ uv-sync-test:
 	uv sync --all-extras --dev --package turso_test
 .PHONE: uv-sync
 
-test: limbo uv-sync-test test-compat test-alter-column test-vector test-sqlite3 test-shell test-memory test-write test-update test-constraint test-collate test-extensions test-mvcc test-matviews
+test: limbo uv-sync-test test-compat test-alter-column test-vector test-sqlite3 test-shell test-memory test-write test-update test-constraint test-collate test-extensions test-mvcc test-matviews test-format
 .PHONY: test
 
 test-extensions: limbo uv-sync-test
@@ -139,6 +139,10 @@ test-constraint: limbo uv-sync-test
 test-mvcc: limbo uv-sync-test
 	RUST_LOG=$(RUST_LOG) SQLITE_EXEC=$(SQLITE_EXEC) uv run --project limbo_test test-mvcc;
 .PHONY: test-mvcc
+
+test-format: limbo
+	cd testing/sqlite3-format && ./all
+.PHONY: test-format
 
 bench-vfs: uv-sync-test
 	cargo build --release
