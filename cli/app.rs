@@ -769,18 +769,17 @@ impl Limbo {
                                 let mut row = Row::new();
                                 row.max_height(1);
                                 for (idx, value) in record.get_values().enumerate() {
-                                    let (content, alignment) = match value {
-                                        Value::Null => {
-                                            (self.opts.null_value.clone(), CellAlignment::Left)
-                                        }
-                                        Value::Integer(_) => {
-                                            (format!("{value}"), CellAlignment::Right)
-                                        }
-                                        Value::Float(_) => {
-                                            (format!("{value}"), CellAlignment::Right)
-                                        }
-                                        Value::Text(_) => (format!("{value}"), CellAlignment::Left),
-                                        Value::Blob(_) => (format!("{value}"), CellAlignment::Left),
+                                    // dbg!(value);
+                                    let content = if matches!(value, Value::Null) {
+                                        self.opts.null_value.clone()
+                                    } else {
+                                        format!("{value}")
+                                    };
+                                    let alignment = match value {
+                                        Value::Integer(_) | Value::Float(_) => CellAlignment::Right,
+                                        #[cfg(feature = "u128-support")]
+                                        Value::U128(_) => CellAlignment::Right,
+                                        _ => CellAlignment::Left,
                                     };
                                     row.add_cell(
                                         Cell::new(content)
@@ -1201,7 +1200,7 @@ impl Limbo {
             None => String::from(
                 "SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY 1"
             ),
-        };
+    };
 
         let mut tables = String::new();
         let handler = |row: &turso_core::Row| -> anyhow::Result<()> {
@@ -1540,8 +1539,8 @@ impl Limbo {
         let sql = r#"
             SELECT name, sql FROM sqlite_schema
             WHERE sql NOT NULL
-              AND name NOT LIKE 'sqlite_%'
-              AND type IN ('index','trigger','view')
+            AND name NOT LIKE 'sqlite_%'
+            AND type IN ('index','trigger','view')
             ORDER BY CASE type WHEN 'view' THEN 1 WHEN 'index' THEN 2 WHEN 'trigger' THEN 3 END, rowid
         "#;
         if let Some(mut rows) = conn.query(sql)? {
@@ -1567,6 +1566,8 @@ impl Limbo {
         match v {
             Value::Null => out.write_all(b"NULL"),
             Value::Integer(i) => out.write_all(format!("{i}").as_bytes()),
+            #[cfg(feature = "u128-support")]
+            Value::U128(i) => out.write_all(format!("{i}").as_bytes()),
             Value::Float(f) => write!(out, "{f}").map(|_| ()),
             Value::Text(s) => {
                 out.write_all(b"'")?;

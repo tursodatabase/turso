@@ -11,7 +11,8 @@ description = "Limbo IPAddr extension"
 crate-type = ["cdylib", "lib"]
 
 [features]
-static= [ "turso_ext/static" ]
+static = ["turso_ext/static"]
+u128-support = ["turso_ext/u128-support"]
 
 [dependencies]
 turso_ext = { workspace = true, features = ["static"] }

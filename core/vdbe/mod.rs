@@ -825,6 +825,8 @@ pub fn registers_to_ref_values(registers: &[Register]) -> Vec<RefValue> {
                     subtype: t.subtype,
                 }),
                 Value::Blob(b) => RefValue::Blob(RawSlice::new(b.as_ptr(), b.len())),
+                #[cfg(feature = "u128-support")]
+                Value::U128(u) => RefValue::U128(*u),
             }
         })
         .collect()
@@ -956,6 +958,19 @@ impl<'a> FromValueRow<'a> for String {
         match value {
             Value::Text(s) => Ok(s.as_str().to_string()),
             _ => Err(LimboError::ConversionError("Expected text value".into())),
+        }
+    }
+}
+
+#[cfg(feature = "u128-support")]
+impl<'a> FromValueRow<'a> for u128 {
+    fn from_value(value: &'a Value) -> Result<Self> {
+        match value {
+            Value::U128(val) => Ok(*val),
+            Value::Integer(val) => Ok(*val as u128),
+            _ => Err(LimboError::ConversionError(
+                "Expected u128 or integer value".into(),
+            )),
         }
     }
 }

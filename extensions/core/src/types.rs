@@ -105,6 +105,8 @@ pub enum ValueType {
     Float,
     Text,
     Blob,
+    #[cfg(feature = "u128-support")]
+    U128,
     Error,
 }
 
@@ -125,6 +127,8 @@ union ValueData {
     float: f64,
     text: *const TextValue,
     blob: *const Blob,
+    #[cfg(feature = "u128-support")]
+    u128: *const u128, // wait till rust 1.89 update into project
     error: *const ErrValue,
 }
 
@@ -148,6 +152,13 @@ impl std::fmt::Debug for Value {
                 f,
                 "Value {{ Float: {} }}",
                 self.to_float().unwrap_or_default()
+            ),
+
+            #[cfg(feature = "u128-support")]
+            ValueType::U128 => write!(
+                f,
+                "Value {{ U128: {} }}",
+                self.to_u128().unwrap_or_default()
             ),
             ValueType::Text => write!(f, "Value {{ Text: {:?} }}", self.to_text()),
             ValueType::Blob => write!(f, "Value {{ Blob: {:?} }}", self.to_blob()),
@@ -351,6 +362,23 @@ impl Value {
         match self.value_type() {
             ValueType::Integer => Some(unsafe { self.value.int }),
             ValueType::Float => Some(unsafe { self.value.float } as i64),
+            #[cfg(feature = "u128-support")]
+            ValueType::U128 => {
+                // This entire block operates on the u128 field, so we can wrap it.
+                // The `unsafe` keyword acknowledges that we are responsible for
+                // ensuring the value_type is indeed U128.
+                unsafe {
+                    if self.value.u128.is_null() {
+                        return None;
+                    }
+                    let val = *self.value.u128;
+                    if val > i64::MAX as u128 {
+                        Some(i64::MAX)
+                    } else {
+                        Some(val as i64)
+                    }
+                }
+            }
             ValueType::Text => self
                 .to_text()
                 .map(|txt| txt.parse::<i64>().unwrap_or_default()),
@@ -394,6 +422,12 @@ impl Value {
             match self.value_type {
                 ValueType::Integer => bytes.extend_from_slice(&self.value.int.to_le_bytes()),
                 ValueType::Float => bytes.extend_from_slice(&self.value.float.to_le_bytes()),
+                #[cfg(feature = "u128-support")]
+                ValueType::U128 => {
+                    if !self.value.u128.is_null() {
+                        bytes.extend_from_slice(&(*self.value.u128).to_le_bytes());
+                    }
+                }
                 ValueType::Text => {
                     let text = self.value.text.as_ref().expect("Invalid text pointer");
                     bytes.extend_from_slice(text.as_str().as_bytes());
@@ -481,6 +515,31 @@ impl Value {
         }
     }
 
+    #[cfg(feature = "u128-support")]
+    pub fn from_u128(i: u128) -> Self {
+        let boxed_u128 = Box::new(i);
+        Self {
+            value_type: ValueType::U128,
+            value: ValueData {
+                u128: Box::into_raw(boxed_u128) as *const u128,
+            },
+        }
+    }
+
+    #[cfg(feature = "u128-support")]
+    pub fn to_u128(&self) -> Option<u128> {
+        match self.value_type() {
+            ValueType::U128 => {
+                if unsafe { self.value.u128.is_null() } {
+                    None
+                } else {
+                    Some(unsafe { *self.value.u128 })
+                }
+            }
+            _ => None,
+        }
+    }
+
     /// Extension authors should __not__ use this function, or enable the 'core_only' feature
     ///
     /// # Safety
@@ -497,6 +556,12 @@ impl Value {
             ValueType::Blob => {
                 let blob = Box::from_raw(self.value.blob as *mut Blob);
                 blob.free();
+            }
+            #[cfg(feature = "u128-support")]
+            ValueType::U128 => {
+                if !self.value.u128.is_null() {
+                    let _ = Box::from_raw(self.value.u128 as *mut u128);
+                }
             }
             ValueType::Error => {
                 let err_val = Box::from_raw(self.value.error as *mut ErrValue);

@@ -1,8 +1,3 @@
-#[cfg(feature = "serde")]
-use serde::Deserialize;
-use turso_ext::{AggCtx, FinalizeFunction, StepFunction};
-use turso_parser::ast::SortOrder;
-
 use crate::error::LimboError;
 use crate::ext::{ExtValue, ExtValueType};
 use crate::numeric::format_float;
@@ -16,7 +11,11 @@ use crate::vdbe::sorter::Sorter;
 use crate::vdbe::Register;
 use crate::vtab::VirtualTableCursor;
 use crate::{turso_assert, Completion, CompletionError, Result, IO};
+#[cfg(feature = "serde")]
+use serde::Deserialize;
 use std::fmt::{Debug, Display};
+use turso_ext::{AggCtx, FinalizeFunction, StepFunction};
+use turso_parser::ast::SortOrder;
 
 /// SQLite by default uses 2000 as maximum numbers in a row.
 /// It controlld by the constant called SQLITE_MAX_COLUMN
@@ -31,6 +30,8 @@ pub enum ValueType {
     Text,
     Blob,
     Error,
+    #[cfg(feature = "u128-support")]
+    U128,
 }
 
 impl Display for ValueType {
@@ -42,6 +43,8 @@ impl Display for ValueType {
             Self::Blob => "BLOB",
             Self::Text => "TEXT",
             Self::Error => "ERROR",
+            #[cfg(feature = "u128-support")]
+            Self::U128 => "U128",
         };
         write!(f, "{value}")
     }
@@ -81,6 +84,7 @@ impl Text {
             subtype: TextSubtype::Text,
         }
     }
+
     #[cfg(feature = "json")]
     pub fn json(value: String) -> Self {
         Self {
@@ -250,6 +254,8 @@ pub enum Value {
     Float(f64),
     Text(Text),
     Blob(Vec<u8>),
+    #[cfg(feature = "u128-support")]
+    U128(u128),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -265,6 +271,8 @@ pub enum RefValue {
     Float(f64),
     Text(TextRef),
     Blob(RawSlice),
+    #[cfg(feature = "u128-support")]
+    U128(u128),
 }
 
 impl Debug for RefValue {
@@ -293,6 +301,8 @@ impl Debug for RefValue {
                     .field("truncated", &(blob.len() > max_len))
                     .finish()
             }
+            #[cfg(feature = "u128-support")]
+            RefValue::U128(i) => f.debug_tuple("U128").field(i).finish(),
         }
     }
 }
@@ -334,6 +344,7 @@ impl Value {
             _ => panic!("as_blob must be called only for Value::Blob"),
         }
     }
+
     pub fn as_float(&self) -> f64 {
         match self {
             Value::Float(f) => *f,
@@ -367,8 +378,11 @@ impl Value {
             Value::Float(_) => ValueType::Float,
             Value::Text(_) => ValueType::Text,
             Value::Blob(_) => ValueType::Blob,
+            #[cfg(feature = "u128-support")]
+            Value::U128(_) => ValueType::U128,
         }
     }
+
     pub fn serialize_serial(&self, out: &mut Vec<u8>) {
         match self {
             Value::Null => {}
@@ -387,6 +401,8 @@ impl Value {
             Value::Float(f) => out.extend_from_slice(&f.to_be_bytes()),
             Value::Text(t) => out.extend_from_slice(&t.value),
             Value::Blob(b) => out.extend_from_slice(b),
+            #[cfg(feature = "u128-support")]
+            Value::U128(i) => out.extend_from_slice(&i.to_be_bytes()),
         };
     }
 
@@ -420,9 +436,9 @@ impl ExternalAggState {
 /// format!("{}", value);
 /// ---BAD---
 /// match value {
-///   Value::Integer(i) => *i.as_str(),
-///   Value::Float(f) => *f.as_str(),
-///   ....
+///  Value::Integer(i) => *i.as_str(),
+///  Value::Float(f) => *f.as_str(),
+///  ....
 /// }
 impl Display for Value {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -432,10 +448,13 @@ impl Display for Value {
                 write!(f, "{i}")
             }
             Self::Float(fl) => f.write_str(&format_float(*fl)),
+
             Self::Text(s) => {
                 write!(f, "{}", s.as_str())
             }
             Self::Blob(b) => write!(f, "{}", String::from_utf8_lossy(b)),
+            #[cfg(feature = "u128-support")]
+            Self::U128(i) => write!(f, "{i}"),
         }
     }
 }
@@ -448,6 +467,9 @@ impl Value {
             Self::Float(fl) => ExtValue::from_float(*fl),
             Self::Text(text) => ExtValue::from_text(text.as_str().to_string()),
             Self::Blob(blob) => ExtValue::from_blob(blob.to_vec()),
+            //TODO should probably implement this better.
+            #[cfg(feature = "u128-support")]
+            Self::U128(i) => ExtValue::from_u128(*i),
         }
     }
 
@@ -476,11 +498,32 @@ impl Value {
                 }
                 Ok(Value::build_text(text))
             }
+            #[cfg(feature = "u128-support")]
+            ExtValueType::U128 => {
+                let Some(num) = v.to_u128() else {
+                    return Ok(Value::Null);
+                };
+                Ok(Value::U128(num))
+            }
+
             ExtValueType::Blob => {
                 let Some(blob) = v.to_blob() else {
                     return Ok(Value::Null);
                 };
-                Ok(Value::Blob(blob))
+                #[cfg(feature = "u128-support")]
+                {
+                    if blob.len() == 16 {
+                        let mut bytes = [0u8; 16];
+                        bytes.copy_from_slice(&blob);
+                        Ok(Value::U128(u128::from_be_bytes(bytes)))
+                    } else {
+                        Ok(Value::Blob(blob))
+                    }
+                }
+                #[cfg(not(feature = "u128-support"))]
+                {
+                    Ok(Value::Blob(blob))
+                }
             }
             ExtValueType::Error => {
                 let Some(err) = v.to_error_details() else {
@@ -509,8 +552,8 @@ impl FromValue for Value {
         Ok(val)
     }
 }
-impl Sealed for crate::Value {}
 
+impl Sealed for crate::Value {}
 macro_rules! impl_int_from_value {
     ($ty:ty, $cast:expr) => {
         impl FromValue for $ty {
@@ -541,8 +584,8 @@ impl FromValue for f64 {
         }
     }
 }
-impl Sealed for f64 {}
 
+impl Sealed for f64 {}
 impl FromValue for Vec<u8> {
     fn from_sql(val: Value) -> Result<Self> {
         match val {
@@ -552,8 +595,8 @@ impl FromValue for Vec<u8> {
         }
     }
 }
-impl Sealed for Vec<u8> {}
 
+impl Sealed for Vec<u8> {}
 impl<const N: usize> FromValue for [u8; N] {
     fn from_sql(val: Value) -> Result<Self> {
         match val {
@@ -563,8 +606,8 @@ impl<const N: usize> FromValue for [u8; N] {
         }
     }
 }
-impl<const N: usize> Sealed for [u8; N] {}
 
+impl<const N: usize> Sealed for [u8; N] {}
 impl FromValue for String {
     fn from_sql(val: Value) -> Result<Self> {
         match val {
@@ -574,8 +617,8 @@ impl FromValue for String {
         }
     }
 }
-impl Sealed for String {}
 
+impl Sealed for String {}
 impl FromValue for bool {
     fn from_sql(val: Value) -> Result<Self> {
         match val {
@@ -589,8 +632,8 @@ impl FromValue for bool {
         }
     }
 }
-impl Sealed for bool {}
 
+impl Sealed for bool {}
 impl<T> FromValue for Option<T>
 where
     T: FromValue,
@@ -602,19 +645,20 @@ where
         }
     }
 }
-impl<T> Sealed for Option<T> {}
 
+impl<T> Sealed for Option<T> {}
 mod sealed {
     pub trait Sealed {}
 }
-use sealed::Sealed;
 
+use sealed::Sealed;
 #[derive(Debug, Clone, PartialEq)]
 pub struct SumAggState {
     pub r_err: f64,   // Error term for Kahan-Babushka-Neumaier summation
     pub approx: bool, // True if any non-integer value was input to the sum
     pub ovrfl: bool,  // Integer overflow seen
 }
+
 impl Default for SumAggState {
     fn default() -> Self {
         Self {
@@ -637,7 +681,6 @@ pub enum AggContext {
 }
 
 const NULL: Value = Value::Null;
-
 impl AggContext {
     pub fn compute_external(&mut self) -> Result<()> {
         if let Self::External(ext_state) = self {
@@ -670,8 +713,26 @@ impl PartialEq<Value> for Value {
                 int_float_cmp(*int, *float).is_eq()
             }
             (Self::Float(float_left), Self::Float(float_right)) => float_left == float_right,
+            #[cfg(feature = "u128-support")]
+            (Self::U128(u_left), Self::U128(u_right)) => u_left == u_right,
+            #[cfg(feature = "u128-support")]
+            (Self::U128(_), Self::Integer(_)) => false,
+            #[cfg(feature = "u128-support")]
+            (Self::Integer(_), Self::U128(_)) => false,
+            #[cfg(feature = "u128-support")]
+            (Self::U128(_), Self::Float(_)) => false,
+            #[cfg(feature = "u128-support")]
+            (Self::Float(_), Self::U128(_)) => false,
             (Self::Integer(_) | Self::Float(_), Self::Text(_) | Self::Blob(_)) => false,
             (Self::Text(_) | Self::Blob(_), Self::Integer(_) | Self::Float(_)) => false,
+            #[cfg(feature = "u128-support")]
+            (Self::U128(_), Self::Text(_)) => false,
+            #[cfg(feature = "u128-support")]
+            (Self::Text(_), Self::U128(_)) => false,
+            #[cfg(feature = "u128-support")]
+            (Self::U128(_), Self::Blob(_)) => false,
+            #[cfg(feature = "u128-support")]
+            (Self::Blob(_), Self::U128(_)) => false,
             (Self::Text(text_left), Self::Text(text_right)) => {
                 text_left.value.eq(&text_right.value)
             }
@@ -711,21 +772,56 @@ impl PartialOrd<Value> for Value {
             (Self::Float(float_left), Self::Float(float_right)) => {
                 float_left.partial_cmp(float_right)
             }
-            // Numeric vs Text/Blob
+            #[cfg(feature = "u128-support")]
+            (Self::U128(u_left), Self::U128(u_right)) => u_left.partial_cmp(u_right),
+            #[cfg(feature = "u128-support")]
+            (Self::U128(u), Self::Integer(i)) => {
+                if *i < 0 {
+                    Some(std::cmp::Ordering::Greater) // u128 is always greater than a negative i64
+                } else {
+                    u.partial_cmp(&(*i as u128))
+                }
+            }
+            #[cfg(feature = "u128-support")]
+            (Self::Integer(i), Self::U128(u)) => {
+                if *i < 0 {
+                    Some(std::cmp::Ordering::Less)
+                } else {
+                    (*i as u128).partial_cmp(u)
+                }
+            }
+            #[cfg(feature = "u128-support")]
+            (Self::U128(u), Self::Float(f)) => {
+                // coerce U128 to f64 for comparison.
+                // This may result in a loss of precision.
+                (*u as f64).partial_cmp(f)
+            }
+            // (Value::U128(_), Value::Float(_)) => None, // TODO this panics
+            #[cfg(feature = "u128-support")]
+            (Self::Float(f), Self::U128(u)) => f.partial_cmp(&(*u as f64)),
+            // (Value::Float(_), Value::U128(_)) => None, // TODO this panics due to unwrap?
+            #[cfg(not(feature = "u128-support"))]
             (Self::Integer(_) | Self::Float(_), Self::Text(_) | Self::Blob(_)) => {
                 Some(std::cmp::Ordering::Less)
             }
+            #[cfg(feature = "u128-support")]
+            (Self::Integer(_) | Self::Float(_) | Self::U128(_), Self::Text(_) | Self::Blob(_)) => {
+                Some(std::cmp::Ordering::Less)
+            }
+            #[cfg(not(feature = "u128-support"))]
             (Self::Text(_) | Self::Blob(_), Self::Integer(_) | Self::Float(_)) => {
                 Some(std::cmp::Ordering::Greater)
             }
-
+            #[cfg(feature = "u128-support")]
+            (Self::Text(_) | Self::Blob(_), Self::Integer(_) | Self::Float(_) | Self::U128(_)) => {
+                Some(std::cmp::Ordering::Greater)
+            }
             (Self::Text(text_left), Self::Text(text_right)) => {
                 text_left.value.partial_cmp(&text_right.value)
             }
             // Text vs Blob
             (Self::Text(_), Self::Blob(_)) => Some(std::cmp::Ordering::Less),
             (Self::Blob(_), Self::Text(_)) => Some(std::cmp::Ordering::Greater),
-
             (Self::Blob(blob_left), Self::Blob(blob_right)) => blob_left.partial_cmp(blob_right),
             (Self::Null, Self::Null) => Some(std::cmp::Ordering::Equal),
             (Self::Null, _) => Some(std::cmp::Ordering::Less),
@@ -749,7 +845,6 @@ impl PartialOrd<AggContext> for AggContext {
 }
 
 impl Eq for Value {}
-
 impl Ord for Value {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.partial_cmp(other).unwrap()
@@ -758,7 +853,6 @@ impl Ord for Value {
 
 impl std::ops::Add<Value> for Value {
     type Output = Value;
-
     fn add(self, rhs: Self) -> Self::Output {
         match (self, rhs) {
             (Self::Integer(int_left), Self::Integer(int_right)) => {
@@ -799,7 +893,6 @@ impl std::ops::Add<Value> for Value {
 
 impl std::ops::Add<f64> for Value {
     type Output = Value;
-
     fn add(self, rhs: f64) -> Self::Output {
         match self {
             Self::Integer(int_left) => Self::Float(int_left as f64 + rhs),
@@ -811,7 +904,6 @@ impl std::ops::Add<f64> for Value {
 
 impl std::ops::Add<i64> for Value {
     type Output = Value;
-
     fn add(self, rhs: i64) -> Self::Output {
         match self {
             Self::Integer(int_left) => Self::Integer(int_left + rhs),
@@ -841,7 +933,6 @@ impl std::ops::AddAssign<f64> for Value {
 
 impl std::ops::Div<Value> for Value {
     type Output = Value;
-
     fn div(self, rhs: Value) -> Self::Output {
         match (self, rhs) {
             (Self::Integer(int_left), Self::Integer(int_right)) => {
@@ -860,16 +951,13 @@ impl std::ops::Div<Value> for Value {
         }
     }
 }
-
 impl std::ops::DivAssign<Value> for Value {
     fn div_assign(&mut self, rhs: Value) {
         *self = self.clone() / rhs;
     }
 }
-
 impl<'a> TryFrom<&'a RefValue> for i64 {
     type Error = LimboError;
-
     fn try_from(value: &'a RefValue) -> Result<Self, Self::Error> {
         match value {
             RefValue::Integer(i) => Ok(*i),
@@ -880,7 +968,6 @@ impl<'a> TryFrom<&'a RefValue> for i64 {
 
 impl<'a> TryFrom<&'a RefValue> for String {
     type Error = LimboError;
-
     fn try_from(value: &'a RefValue) -> Result<Self, Self::Error> {
         match value {
             RefValue::Text(s) => Ok(s.as_str().to_string()),
@@ -891,7 +978,6 @@ impl<'a> TryFrom<&'a RefValue> for String {
 
 impl<'a> TryFrom<&'a RefValue> for &'a str {
     type Error = LimboError;
-
     fn try_from(value: &'a RefValue) -> Result<Self, Self::Error> {
         match value {
             RefValue::Text(s) => Ok(s.as_str()),
@@ -943,13 +1029,11 @@ impl std::fmt::Debug for ImmutableRecord {
 pub struct Record {
     values: Vec<Value>,
 }
-
 impl Record {
     // pub fn get<'a, T: FromValue<'a> + 'a>(&'a self, idx: usize) -> Result<T> {
-    //     let value = &self.values[idx];
-    //     T::from_value(value)
+    //   let value = &self.values[idx];
+    //   T::from_value(value)
     // }
-
     pub fn count(&self) -> usize {
         self.values.len()
     }
@@ -974,6 +1058,7 @@ impl Record {
         self.values.is_empty()
     }
 }
+
 struct AppendWriter<'a> {
     buf: &'a mut Vec<u8>,
     pos: usize,
@@ -1121,6 +1206,11 @@ impl ImmutableRecord {
                     let ptr = unsafe { writer.buf.as_ptr().add(start_offset) };
                     ref_values.push(RefValue::Blob(RawSlice::new(ptr, len)));
                 }
+                #[cfg(feature = "u128-support")]
+                Value::U128(i) => {
+                    ref_values.push(RefValue::U128(*i));
+                    writer.extend_from_slice(&i.to_be_bytes());
+                }
             };
         }
 
@@ -1194,7 +1284,6 @@ impl ImmutableRecord {
                 if idx >= cursor.serial_types.len() {
                     return None;
                 }
-
                 cursor.deserialize_column(self, idx).ok()
             }
             Err(_) => None,
@@ -1302,7 +1391,6 @@ impl RecordCursor {
         if payload.is_empty() {
             return Ok(());
         }
-
         // Parse header size and initialize parsing
         if self.serial_types.is_empty() && self.offsets.is_empty() {
             let (header_size, bytes_read) = read_varint(payload)?;
@@ -1310,7 +1398,6 @@ impl RecordCursor {
             self.header_offset = bytes_read;
             self.offsets.push(self.header_size); // First column starts after header
         }
-
         // Parse serial types incrementally
         while self.serial_types.len() <= target_idx
             && self.header_offset < self.header_size
@@ -1319,13 +1406,11 @@ impl RecordCursor {
             let (serial_type, read_bytes) = read_varint(&payload[self.header_offset..])?;
             self.serial_types.push(serial_type);
             self.header_offset += read_bytes;
-
             let serial_type_obj = SerialType::try_from(serial_type)?;
             let data_size = serial_type_obj.size();
             let prev_offset = *self.offsets.last().unwrap();
             self.offsets.push(prev_offset + data_size);
         }
-
         Ok(())
     }
 
@@ -1352,25 +1437,20 @@ impl RecordCursor {
         if idx >= self.serial_types.len() {
             return Ok(RefValue::Null);
         }
-
         let serial_type = self.serial_types[idx];
         let serial_type_obj = SerialType::try_from(serial_type)?;
-
         match serial_type_obj.kind() {
             SerialTypeKind::Null => return Ok(RefValue::Null),
             SerialTypeKind::ConstInt0 => return Ok(RefValue::Integer(0)),
             SerialTypeKind::ConstInt1 => return Ok(RefValue::Integer(1)),
             _ => {} // continue
         }
-
         if idx + 1 >= self.offsets.len() {
             return Ok(RefValue::Null);
         }
-
         let start = self.offsets[idx];
         let end = self.offsets[idx + 1];
         let payload = record.get_payload();
-
         let slice = &payload[start..end];
         let (value, _) = crate::storage::sqlite3_ondisk::read_value(slice, serial_type_obj)?;
         Ok(value)
@@ -1396,7 +1476,6 @@ impl RecordCursor {
         if record.is_invalidated() {
             return Err(LimboError::InternalError("Record not initialized".into()));
         }
-
         self.ensure_parsed_upto(record, idx)?;
         self.deserialize_column(record, idx)
     }
@@ -1414,6 +1493,7 @@ impl RecordCursor {
     /// * `Some(Err(LimboError))` - Parsing succeeded but deserialization failed
     /// * `None` - Record is invalid or index is out of bounds
     ///
+    ///
     pub fn get_value_opt(
         &mut self,
         record: &ImmutableRecord,
@@ -1422,11 +1502,9 @@ impl RecordCursor {
         if record.is_invalidated() {
             return None;
         }
-
         if let Err(e) = self.ensure_parsed_upto(record, idx) {
             return Some(Err(e));
         }
-
         Some(self.deserialize_column(record, idx))
     }
 
@@ -1445,7 +1523,6 @@ impl RecordCursor {
         if record.is_invalidated() {
             return 0;
         }
-
         let _ = self.parse_full_header(record);
         self.serial_types.len()
     }
@@ -1462,7 +1539,6 @@ impl RecordCursor {
     pub fn len(&mut self, record: &ImmutableRecord) -> usize {
         self.count(record)
     }
-
     /// Returns all values in the record as a vector.
     ///
     /// This method parses the complete header and deserializes all columns.
@@ -1481,14 +1557,11 @@ impl RecordCursor {
         if record.is_invalidated() {
             return Ok(Vec::new());
         }
-
         self.parse_full_header(record)?;
         let mut result = Vec::with_capacity(self.serial_types.len());
-
         for i in 0..self.serial_types.len() {
             result.push(self.deserialize_column(record, i)?);
         }
-
         Ok(result)
     }
 }
@@ -1505,6 +1578,8 @@ impl RefValue {
                     .to_string(),
             ),
             Self::Blob(blob) => ExtValue::from_blob(blob.to_slice().to_vec()),
+            #[cfg(feature = "u128-support")]
+            Self::U128(i) => ExtValue::from_u128(*i),
         }
     }
 
@@ -1518,8 +1593,11 @@ impl RefValue {
                 subtype: text_ref.subtype,
             }),
             RefValue::Blob(b) => Value::Blob(b.to_slice().to_vec()),
+            #[cfg(feature = "u128-support")]
+            RefValue::U128(i) => Value::U128(*i),
         }
     }
+
     pub fn to_blob(&self) -> Option<&[u8]> {
         match self {
             Self::Blob(blob) => Some(blob.to_slice()),
@@ -1536,11 +1614,13 @@ impl Display for RefValue {
             Self::Float(fl) => write!(f, "{fl:?}"),
             Self::Text(s) => write!(f, "{}", s.as_str()),
             Self::Blob(b) => write!(f, "{}", String::from_utf8_lossy(b.to_slice())),
+            #[cfg(feature = "u128-support")]
+            Self::U128(i) => write!(f, "{i}"),
         }
     }
 }
-impl Eq for RefValue {}
 
+impl Eq for RefValue {}
 impl Ord for RefValue {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.partial_cmp(other).unwrap()
@@ -1561,14 +1641,44 @@ impl PartialOrd<RefValue> for RefValue {
             (Self::Float(float_left), Self::Float(float_right)) => {
                 float_left.partial_cmp(float_right)
             }
-            // Numeric vs Text/Blob
+            #[cfg(feature = "u128-support")]
+            (Self::U128(u_left), Self::U128(u_right)) => u_left.partial_cmp(u_right),
+            #[cfg(feature = "u128-support")]
+            (Self::U128(u), Self::Integer(i)) => {
+                if *i < 0 {
+                    Some(std::cmp::Ordering::Greater) // u128 is always > negative i64
+                } else {
+                    u.partial_cmp(&(*i as u128))
+                }
+            }
+            #[cfg(feature = "u128-support")]
+            (Self::Integer(i), Self::U128(u)) => {
+                if *i < 0 {
+                    Some(std::cmp::Ordering::Less) // negative i64 is always < u128
+                } else {
+                    (*i as u128).partial_cmp(u)
+                }
+            }
+            #[cfg(feature = "u128-support")]
+            (Self::U128(_), Self::Float(_)) => None, // Not comparable for now and todo this panics
+            #[cfg(feature = "u128-support")]
+            (Self::Float(_), Self::U128(_)) => None, // Not comparable for now this panics too
+            #[cfg(not(feature = "u128-support"))]
             (Self::Integer(_) | Self::Float(_), Self::Text(_) | Self::Blob(_)) => {
                 Some(std::cmp::Ordering::Less)
             }
+            #[cfg(feature = "u128-support")]
+            (Self::Integer(_) | Self::Float(_) | Self::U128(_), Self::Text(_) | Self::Blob(_)) => {
+                Some(std::cmp::Ordering::Less)
+            }
+            #[cfg(not(feature = "u128-support"))]
             (Self::Text(_) | Self::Blob(_), Self::Integer(_) | Self::Float(_)) => {
                 Some(std::cmp::Ordering::Greater)
             }
-
+            #[cfg(feature = "u128-support")]
+            (Self::Text(_) | Self::Blob(_), Self::Integer(_) | Self::Float(_) | Self::U128(_)) => {
+                Some(std::cmp::Ordering::Greater)
+            }
             (Self::Text(text_left), Self::Text(text_right)) => text_left
                 .value
                 .to_slice()
@@ -1700,7 +1810,6 @@ pub enum RecordCompare {
     String,
     Generic,
 }
-
 impl RecordCompare {
     pub fn compare(
         &self,
@@ -1742,11 +1851,9 @@ pub fn get_tie_breaker_from_seek_op(seek_op: SeekOp) -> std::cmp::Ordering {
     match seek_op {
         // exact‐match “key == X” opcodes
         SeekOp::GE { eq_only: true } | SeekOp::LE { eq_only: true } => std::cmp::Ordering::Equal,
-
         // forward search – want the *first* ≥ / > key
         SeekOp::GE { eq_only: false } => std::cmp::Ordering::Greater,
         SeekOp::GT => std::cmp::Ordering::Less,
-
         // backward search – want the *last* ≤ / < key
         SeekOp::LE { eq_only: false } => std::cmp::Ordering::Less,
         SeekOp::LT => std::cmp::Ordering::Greater,
@@ -1791,7 +1898,8 @@ pub fn get_tie_breaker_from_seek_op(seek_op: SeekOp) -> std::cmp::Ordering {
 /// 3. **Native comparison**: Uses Rust's built-in `i64::cmp()` for speed
 /// 4. **Sort order**: Applies ascending/descending order to comparison result
 /// 5. **Remaining fields**: If first field is equal and more fields exist,
-///    delegates to `compare_records_generic()` with `skip=1`
+///
+///  delegates to `compare_records_generic()` with `skip=1`
 fn compare_records_int(
     serialized: &ImmutableRecord,
     unpacked: &[RefValue],
@@ -1806,10 +1914,8 @@ fn compare_records_int(
     if payload.len() < 2 {
         return compare_records_generic(serialized, unpacked, index_info, 0, tie_breaker);
     }
-
     let (header_size, offset_1st_serialtype) = read_varint(payload)?;
     let header_size = header_size as usize;
-
     if payload.len() < header_size {
         return Err(LimboError::Corrupt(format!(
             "Record payload too short: claimed header size {} but payload only {} bytes",
@@ -1817,16 +1923,12 @@ fn compare_records_int(
             payload.len()
         )));
     }
-
     let (first_serial_type, _) = read_varint(&payload[offset_1st_serialtype..])?;
-
     let serialtype_is_integer = matches!(first_serial_type, 1..=6 | 8 | 9);
     if !serialtype_is_integer {
         return compare_records_generic(serialized, unpacked, index_info, 0, tie_breaker);
     }
-
     let data_start = header_size;
-
     let lhs_int = read_integer(&payload[data_start..], first_serial_type as u8)?;
     let RefValue::Integer(rhs_int) = unpacked[0] else {
         return compare_records_generic(serialized, unpacked, index_info, 0, tie_breaker);
@@ -1884,7 +1986,8 @@ fn compare_records_int(
 /// 3. **Sort order**: Applies ascending/descending order to comparison result
 /// 4. **Length comparison**: If strings are equal, compares lengths
 /// 5. **Remaining fields**: If first field is equal and more fields exist,
-///    delegates to `compare_records_generic()` with `skip=1`
+///
+///  delegates to `compare_records_generic()` with `skip=1`
 fn compare_records_string(
     serialized: &ImmutableRecord,
     unpacked: &[RefValue],
@@ -1899,10 +2002,8 @@ fn compare_records_string(
     if payload.len() < 2 {
         return compare_records_generic(serialized, unpacked, index_info, 0, tie_breaker);
     }
-
     let (header_size, offset_1st_serialtype) = read_varint(payload)?;
     let header_size = header_size as usize;
-
     if payload.len() < header_size {
         return Err(LimboError::Corrupt(format!(
             "Record payload too short: claimed header size {} but payload only {} bytes",
@@ -1910,38 +2011,28 @@ fn compare_records_string(
             payload.len()
         )));
     }
-
     let (first_serial_type, _) = read_varint(&payload[offset_1st_serialtype..])?;
-
     let serialtype_is_string = first_serial_type >= 13 && (first_serial_type & 1) == 1;
     if !serialtype_is_string {
         return compare_records_generic(serialized, unpacked, index_info, 0, tie_breaker);
     }
-
     let RefValue::Text(rhs_text) = &unpacked[0] else {
         return compare_records_generic(serialized, unpacked, index_info, 0, tie_breaker);
     };
-
     let string_len = (first_serial_type as usize - 13) / 2;
     let data_start = header_size;
-
     debug_assert!(data_start + string_len <= payload.len());
-
     let serial_type = SerialType::try_from(first_serial_type)?;
     let (lhs_value, _) = read_value(&payload[data_start..], serial_type)?;
-
     let RefValue::Text(lhs_text) = lhs_value else {
         return compare_records_generic(serialized, unpacked, index_info, 0, tie_breaker);
     };
-
     let collation = index_info.key_info[0].collation;
     let comparison = collation.compare_strings(lhs_text.as_str(), rhs_text.as_str());
-
     let final_comparison = match index_info.key_info[0].sort_order {
         SortOrder::Asc => comparison,
         SortOrder::Desc => comparison.reverse(),
     };
-
     match final_comparison {
         std::cmp::Ordering::Equal => {
             let len_cmp = lhs_text.value.len.cmp(&rhs_text.value.len);
@@ -1952,7 +2043,6 @@ fn compare_records_string(
                 };
                 return Ok(adjusted);
             }
-
             if unpacked.len() > 1 {
                 return compare_records_generic(serialized, unpacked, index_info, 1, tie_breaker);
             }
@@ -2009,22 +2099,17 @@ pub fn compare_records_generic(
     if payload.is_empty() {
         return Ok(std::cmp::Ordering::Less);
     }
-
     let (header_size, mut header_pos) = read_varint(payload)?;
     let header_end = header_size as usize;
     debug_assert!(header_end <= payload.len());
-
     let mut data_pos = header_size as usize;
-
     // Skip over `skip` number of fields
     for _ in 0..skip {
         if header_pos >= header_end {
             break;
         }
-
         let (serial_type_raw, bytes_read) = read_varint(&payload[header_pos..])?;
         header_pos += bytes_read;
-
         let serial_type = SerialType::try_from(serial_type_raw)?;
         if !matches!(
             serial_type.kind(),
@@ -2033,15 +2118,12 @@ pub fn compare_records_generic(
             data_pos += serial_type.size();
         }
     }
-
     let mut field_idx = skip;
     while field_idx < unpacked.len() && header_pos < header_end {
         let (serial_type_raw, bytes_read) = read_varint(&payload[header_pos..])?;
         header_pos += bytes_read;
-
         let serial_type = SerialType::try_from(serial_type_raw)?;
         let rhs_value = &unpacked[field_idx];
-
         let lhs_value = match serial_type.kind() {
             SerialTypeKind::ConstInt0 => RefValue::Integer(0),
             SerialTypeKind::ConstInt1 => RefValue::Integer(1),
@@ -2052,35 +2134,27 @@ pub fn compare_records_generic(
                 value
             }
         };
-
         let comparison = match (&lhs_value, rhs_value) {
             (RefValue::Text(lhs_text), RefValue::Text(rhs_text)) => index_info.key_info[field_idx]
                 .collation
                 .compare_strings(lhs_text.as_str(), rhs_text.as_str()),
-
             (RefValue::Integer(lhs_int), RefValue::Float(rhs_float)) => {
                 sqlite_int_float_compare(*lhs_int, *rhs_float)
             }
-
             (RefValue::Float(lhs_float), RefValue::Integer(rhs_int)) => {
                 sqlite_int_float_compare(*rhs_int, *lhs_float).reverse()
             }
-
             _ => lhs_value.partial_cmp(rhs_value).unwrap(),
         };
-
         let final_comparison = match index_info.key_info[field_idx].sort_order {
             SortOrder::Asc => comparison,
             SortOrder::Desc => comparison.reverse(),
         };
-
         if final_comparison != std::cmp::Ordering::Equal {
             return Ok(final_comparison);
         }
-
         field_idx += 1;
     }
-
     Ok(tie_breaker)
 }
 
@@ -2094,13 +2168,11 @@ const I32_LOW: i64 = -2147483648;
 const I32_HIGH: i64 = 2147483647;
 const I48_LOW: i64 = -140737488355328;
 const I48_HIGH: i64 = 140737488355327;
-
 /// Sqlite Serial Types
 /// https://www.sqlite.org/fileformat.html#record_format
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(transparent)]
 pub struct SerialType(u64);
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SerialTypeKind {
     Null,
@@ -2115,6 +2187,8 @@ pub enum SerialTypeKind {
     ConstInt1,
     Text,
     Blob,
+    #[cfg(feature = "u128-support")]
+    U128,
 }
 
 impl SerialType {
@@ -2122,7 +2196,6 @@ impl SerialType {
     pub fn u64_is_valid_serial_type(n: u64) -> bool {
         n != 10 && n != 11
     }
-
     const NULL: Self = Self(0);
     const I8: Self = Self(1);
     const I16: Self = Self(2);
@@ -2133,7 +2206,8 @@ impl SerialType {
     const F64: Self = Self(7);
     const CONST_INT0: Self = Self(8);
     const CONST_INT1: Self = Self(9);
-
+    #[cfg(feature = "u128-support")]
+    const U128: Self = Self(10);
     pub fn null() -> Self {
         Self::NULL
     }
@@ -2149,23 +2223,18 @@ impl SerialType {
     pub fn i24() -> Self {
         Self::I24
     }
-
     pub fn i32() -> Self {
         Self::I32
     }
-
     pub fn i48() -> Self {
         Self::I48
     }
-
     pub fn i64() -> Self {
         Self::I64
     }
-
     pub fn f64() -> Self {
         Self::F64
     }
-
     pub fn const_int0() -> Self {
         Self::CONST_INT0
     }
@@ -2194,6 +2263,8 @@ impl SerialType {
             7 => SerialTypeKind::F64,
             8 => SerialTypeKind::ConstInt0,
             9 => SerialTypeKind::ConstInt1,
+            #[cfg(feature = "u128-support")]
+            10 => SerialTypeKind::U128,
             n if n >= 12 => match n % 2 {
                 0 => SerialTypeKind::Blob,
                 1 => SerialTypeKind::Text,
@@ -2215,6 +2286,8 @@ impl SerialType {
             SerialTypeKind::F64 => 8,
             SerialTypeKind::ConstInt0 => 0,
             SerialTypeKind::ConstInt1 => 0,
+            #[cfg(feature = "u128-support")]
+            SerialTypeKind::U128 => 16,
             SerialTypeKind::Text => (self.0 as usize - 13) / 2,
             SerialTypeKind::Blob => (self.0 as usize - 12) / 2,
         }
@@ -2238,6 +2311,8 @@ impl From<&Value> for SerialType {
             Value::Float(_) => SerialType::f64(),
             Value::Text(t) => SerialType::text(t.value.len() as u64),
             Value::Blob(b) => SerialType::blob(b.len() as u64),
+            #[cfg(feature = "u128-support")]
+            Value::U128(_) => SerialType::U128,
         }
     }
 }
@@ -2250,8 +2325,12 @@ impl From<SerialType> for u64 {
 
 impl TryFrom<u64> for SerialType {
     type Error = LimboError;
-
     fn try_from(uint: u64) -> Result<Self> {
+        #[cfg(feature = "u128-support")]
+        if uint == 11 {
+            return Err(LimboError::Corrupt(format!("Invalid serial type: {uint}")));
+        }
+        #[cfg(not(feature = "u128-support"))]
         if uint == 10 || uint == 11 {
             return Err(LimboError::Corrupt(format!("Invalid serial type: {uint}")));
         }
@@ -2263,7 +2342,6 @@ impl Record {
     pub fn new(values: Vec<Value>) -> Self {
         Self { values }
     }
-
     /// Calculates the total size needed for a SQLite record header.
     ///
     /// The record header consists of:
@@ -2276,28 +2354,23 @@ impl Record {
         if sizeof_serial_types < i8::MAX as usize {
             return sizeof_serial_types + 1;
         }
-
         let mut header_size = sizeof_serial_types;
         // For larger headers, calculate how many bytes we need for the header size varint
         let mut temp_buf = [0u8; 9];
         let mut prev_header_size;
-
         loop {
             prev_header_size = header_size;
             let varint_len = write_varint(&mut temp_buf, header_size as u64);
             header_size = sizeof_serial_types + varint_len;
-
             if header_size == prev_header_size {
                 break;
             }
         }
-
         header_size
     }
 
     pub fn serialize(&self, buf: &mut Vec<u8>) {
         let initial_i = buf.len();
-
         // write serial types
         for value in &self.values {
             let serial_type = SerialType::from(value);
@@ -2306,7 +2379,6 @@ impl Record {
             let n = write_varint(&mut buf[len - 9..], serial_type.into());
             buf.truncate(buf.len() - 9 + n); // Remove unused bytes
         }
-
         let mut header_size = buf.len() - initial_i;
         // write content
         for value in &self.values {
@@ -2330,9 +2402,10 @@ impl Record {
                 Value::Float(f) => buf.extend_from_slice(&f.to_be_bytes()),
                 Value::Text(t) => buf.extend_from_slice(&t.value),
                 Value::Blob(b) => buf.extend_from_slice(b),
+                #[cfg(feature = "u128-support")]
+                Value::U128(i) => buf.extend_from_slice(&i.to_be_bytes()),
             };
         }
-
         let mut header_bytes_buf: Vec<u8> = Vec::new();
         header_size = Record::calc_header_size(header_size);
         header_bytes_buf.extend(std::iter::repeat_n(0, 9));
@@ -2642,7 +2715,6 @@ impl WalFrameInfo {
 mod tests {
     use super::*;
     use crate::translate::collate::CollationSeq;
-
     pub fn compare_immutable_for_testing(
         l: &[RefValue],
         r: &[RefValue],
@@ -2650,18 +2722,15 @@ mod tests {
         tie_breaker: std::cmp::Ordering,
     ) -> std::cmp::Ordering {
         let min_len = l.len().min(r.len());
-
         for i in 0..min_len {
             let column_order = index_key_info[i].sort_order;
             let collation = index_key_info[i].collation;
-
             let cmp = match (&l[i], &r[i]) {
                 (RefValue::Text(left), RefValue::Text(right)) => {
                     collation.compare_strings(left.as_str(), right.as_str())
                 }
                 _ => l[i].partial_cmp(&r[i]).unwrap_or(std::cmp::Ordering::Equal),
             };
-
             if cmp != std::cmp::Ordering::Equal {
                 return match column_order {
                     SortOrder::Asc => cmp,
@@ -2669,7 +2738,6 @@ mod tests {
                 };
             }
         }
-
         tie_breaker
     }
 
@@ -2707,6 +2775,8 @@ mod tests {
                 subtype: text.subtype,
             }),
             Value::Blob(blob) => RefValue::Blob(RawSlice::from_slice(blob)),
+            #[cfg(feature = "u128-support")]
+            Value::U128(i) => RefValue::U128(*i),
         }
     }
 
@@ -2735,38 +2805,31 @@ mod tests {
         test_name: &str,
     ) {
         let serialized = create_record(serialized_values.clone());
-
         let serialized_ref_values: Vec<RefValue> =
             serialized_values.iter().map(value_to_ref_value).collect();
-
         let tie_breaker = std::cmp::Ordering::Equal;
-
         let gold_result = compare_immutable_for_testing(
             &serialized_ref_values,
             &unpacked_values,
             &index_info.key_info,
             tie_breaker,
         );
-
         let comparer = find_compare(&unpacked_values, index_info);
         let optimized_result = comparer
             .compare(&serialized, &unpacked_values, index_info, 0, tie_breaker)
             .unwrap();
-
         assert_eq!(
-            gold_result, optimized_result,
-            "Test '{test_name}' failed: Full Comparison: {gold_result:?}, Optimized: {optimized_result:?}, Strategy: {comparer:?}"
-        );
-
+      gold_result, optimized_result,
+      "Test '{test_name}' failed: Full Comparison: {gold_result:?}, Optimized: {optimized_result:?}, Strategy: {comparer:?}"
+    );
         let generic_result =
             compare_records_generic(&serialized, &unpacked_values, index_info, 0, tie_breaker)
                 .unwrap();
         assert_eq!(
-            gold_result, generic_result,
-            "Test '{test_name}' failed with generic: Full Comparison: {gold_result:?}, Generic: {generic_result:?}"
-        );
+      gold_result, generic_result,
+      "Test '{test_name}' failed with generic: Full Comparison: {gold_result:?}, Generic: {generic_result:?}"
+    );
     }
-
     #[test]
     fn test_calc_header_size() {
         // Test 1-byte header size (serial type sizes 0 to 126)
@@ -2781,7 +2844,6 @@ mod tests {
             Record::calc_header_size(MAX_SERIALTYPES_SIZE_FOR_1_BYTE_HEADER),
             MAX_SERIALTYPES_SIZE_FOR_1_BYTE_HEADER + 1
         );
-
         // Test 2-byte header size (serial type sizes 127 to 16381)
         const MIN_SERIALTYPES_SIZE_FOR_2_BYTE_HEADER: usize =
             MAX_SERIALTYPES_SIZE_FOR_1_BYTE_HEADER + 1;
@@ -2795,7 +2857,6 @@ mod tests {
             Record::calc_header_size(MAX_SERIALTYPES_SIZE_FOR_2_BYTE_HEADER),
             MAX_SERIALTYPES_SIZE_FOR_2_BYTE_HEADER + 2
         );
-
         // Test 3-byte header size (serial type sizes 16382 to 2097148)
         const MIN_SERIALTYPES_SIZE_FOR_3_BYTE_HEADER: usize =
             MAX_SERIALTYPES_SIZE_FOR_2_BYTE_HEADER + 1;
@@ -2809,7 +2870,6 @@ mod tests {
             Record::calc_header_size(MAX_SERIALTYPES_SIZE_FOR_3_BYTE_HEADER),
             MAX_SERIALTYPES_SIZE_FOR_3_BYTE_HEADER + 3
         );
-
         // Test 4-byte header size (serial type sizes 2097149 to 268435451)
         const MIN_SERIALTYPES_SIZE_FOR_4_BYTE_HEADER: usize =
             MAX_SERIALTYPES_SIZE_FOR_3_BYTE_HEADER + 1;
@@ -2832,7 +2892,6 @@ mod tests {
             vec![SortOrder::Asc, SortOrder::Asc],
             vec![CollationSeq::Binary; 2],
         );
-
         let test_cases = vec![
             (
                 vec![Value::Integer(42)],
@@ -2886,7 +2945,6 @@ mod tests {
                 "integer_equal_text_different",
             ),
         ];
-
         for (serialized_values, unpacked_values, test_name) in test_cases {
             assert_compare_matches_full_comparison(
                 serialized_values,
@@ -2904,7 +2962,6 @@ mod tests {
             vec![SortOrder::Asc, SortOrder::Asc],
             vec![CollationSeq::Binary; 2],
         );
-
         let test_cases = vec![
             (
                 vec![Value::Text(Text::new("hello"))],
@@ -2949,7 +3006,6 @@ mod tests {
                 "string_equal_integer_different",
             ),
         ];
-
         for (serialized_values, unpacked_values, test_name) in test_cases {
             assert_compare_matches_full_comparison(
                 serialized_values,
@@ -2963,7 +3019,6 @@ mod tests {
     #[test]
     fn test_type_precedence() {
         let index_info = create_index_info(1, vec![SortOrder::Asc], vec![CollationSeq::Binary]);
-
         // Test SQLite type precedence: NULL < Numbers < Text < Blob
         let test_cases = vec![
             // NULL vs others
@@ -3031,7 +3086,6 @@ mod tests {
                 "float_vs_integer",
             ),
         ];
-
         for (serialized_values, unpacked_values, test_name) in test_cases {
             assert_compare_matches_full_comparison(
                 serialized_values,
@@ -3049,7 +3103,6 @@ mod tests {
             vec![SortOrder::Desc, SortOrder::Asc],
             vec![CollationSeq::Binary; 2],
         );
-
         let test_cases = vec![
             // DESC order should reverse first field comparison
             (
@@ -3072,7 +3125,6 @@ mod tests {
                 "desc_first_asc_second",
             ),
         ];
-
         for (serialized_values, unpacked_values, test_name) in test_cases {
             assert_compare_matches_full_comparison(
                 serialized_values,
@@ -3087,7 +3139,6 @@ mod tests {
     fn test_edge_cases() {
         let index_info =
             create_index_info(15, vec![SortOrder::Asc; 15], vec![CollationSeq::Binary; 15]);
-
         let test_cases = vec![
             (
                 vec![Value::Integer(42)],
@@ -3128,7 +3179,6 @@ mod tests {
                 "equal_text_then_equal_int",
             ),
         ];
-
         for (serialized_values, unpacked_values, test_name) in test_cases {
             assert_compare_matches_full_comparison(
                 serialized_values,
@@ -3146,7 +3196,6 @@ mod tests {
             vec![SortOrder::Asc, SortOrder::Asc, SortOrder::Asc],
             vec![CollationSeq::Binary; 3],
         );
-
         let serialized = create_record(vec![
             Value::Integer(1),
             Value::Integer(2),
@@ -3157,19 +3206,16 @@ mod tests {
             RefValue::Integer(99),
             RefValue::Integer(3),
         ];
-
         let tie_breaker = std::cmp::Ordering::Equal;
         let result_skip_0 =
             compare_records_generic(&serialized, &unpacked, &index_info, 0, tie_breaker).unwrap();
         let result_skip_1 =
             compare_records_generic(&serialized, &unpacked, &index_info, 1, tie_breaker).unwrap();
-
         assert_eq!(result_skip_0, std::cmp::Ordering::Less);
-
         assert_eq!(result_skip_1, std::cmp::Ordering::Less);
     }
-
     #[test]
+
     fn test_strategy_selection() {
         let collations_small = vec![CollationSeq::Binary; 3];
         let collations_large = vec![CollationSeq::Binary; 15];
@@ -3179,7 +3225,6 @@ mod tests {
             collations_small,
         );
         let index_info_large = create_index_info(15, vec![SortOrder::Asc; 15], collations_large);
-
         let int_values = vec![
             RefValue::Integer(42),
             RefValue::Text(TextRef::from_str("hello")),
@@ -3188,7 +3233,6 @@ mod tests {
             find_compare(&int_values, &index_info_small),
             RecordCompare::Int
         ));
-
         let string_values = vec![
             RefValue::Text(TextRef::from_str("hello")),
             RefValue::Integer(42),
@@ -3197,13 +3241,11 @@ mod tests {
             find_compare(&string_values, &index_info_small),
             RecordCompare::String
         ));
-
         let large_values: Vec<RefValue> = (0..15).map(RefValue::Integer).collect();
         assert!(matches!(
             find_compare(&large_values, &index_info_large),
             RecordCompare::Generic
         ));
-
         let blob_values = vec![RefValue::Blob(RawSlice::from_slice(&[1, 2, 3]))];
         assert!(matches!(
             find_compare(&blob_values, &index_info_small),
@@ -3221,61 +3263,50 @@ mod tests {
             Value::Integer(1000000),
             Value::Blob(vec![1, 2, 3, 4, 5]),
         ];
-
         let registers: Vec<Register> = values.iter().cloned().map(Register::Value).collect();
         let record = ImmutableRecord::from_registers(&registers, registers.len());
-
         // Full Parsing
         let mut cursor1 = RecordCursor::new();
         cursor1
             .parse_full_header(&record)
             .expect("Failed to parse full header");
-
         assert_eq!(
             cursor1.offsets.len(),
             cursor1.serial_types.len() + 1,
             "offsets should be one longer than serial_types"
         );
-
         for i in 0..values.len() {
             cursor1
                 .deserialize_column(&record, i)
                 .expect("Failed to deserialize column");
         }
-
         // Incremental Parsing
         let mut cursor2 = RecordCursor::new();
         cursor2
             .ensure_parsed_upto(&record, 2)
             .expect("Failed to parse up to column 2");
-
         assert_eq!(
             cursor2.offsets.len(),
             cursor2.serial_types.len() + 1,
             "offsets should be one longer than serial_types"
         );
-
         cursor2.get_value(&record, 2).expect("Column 2 failed");
-
         // Access column 0 (already parsed)
         let before = cursor2.serial_types.len();
         cursor2.get_value(&record, 0).expect("Column 0 failed");
         let after = cursor2.serial_types.len();
         assert_eq!(before, after, "Should not parse more");
-
         // Access column 5 (forces full parse)
         cursor2
             .ensure_parsed_upto(&record, 5)
             .expect("Column 5 parse failed");
         cursor2.get_value(&record, 5).expect("Column 5 failed");
-
         // Compare both parsing strategies
         for i in 0..values.len() {
             let full = cursor1.get_value(&record, i).expect("full failed");
             let incr = cursor2.get_value(&record, i).expect("incr failed");
             assert_eq!(full, incr, "Mismatch at column {i}");
         }
-
         assert_eq!(
             cursor1.serial_types, cursor2.serial_types,
             "serial_types must match"
@@ -3288,7 +3319,6 @@ mod tests {
         let record = Record::new(vec![Value::Null]);
         let mut buf = Vec::new();
         record.serialize(&mut buf);
-
         let header_length = record.values.len() + 1;
         let header = &buf[0..header_length];
         // First byte should be header size
@@ -3313,13 +3343,11 @@ mod tests {
         ]);
         let mut buf = Vec::new();
         record.serialize(&mut buf);
-
         let header_length = record.values.len() + 1;
         let header = &buf[0..header_length];
         // First byte should be header size
         assert_eq!(header[0], header_length as u8); // Header should be larger than number of values
-
-        // Check that correct serial types were chosen
+                                                    // Check that correct serial types were chosen
         assert_eq!(header[1] as u64, u64::from(SerialType::const_int0())); // 8
         assert_eq!(header[2] as u64, u64::from(SerialType::const_int1())); // 9
         assert_eq!(header[3] as u64, u64::from(SerialType::i8())); // 1
@@ -3328,70 +3356,55 @@ mod tests {
         assert_eq!(header[6] as u64, u64::from(SerialType::i32())); // 4
         assert_eq!(header[7] as u64, u64::from(SerialType::i48())); // 5
         assert_eq!(header[8] as u64, u64::from(SerialType::i64())); // 6
-
-        // test that the bytes after the header can be interpreted as the correct values
+                                                                    // test that the bytes after the header can be interpreted as the correct values
         let mut cur_offset = header_length;
-
         // Value::Integer(0) - ConstInt0: NO PAYLOAD BYTES
         // Value::Integer(1) - ConstInt1: NO PAYLOAD BYTES
-
         // Value::Integer(42) - I8: 1 byte
         let i8_bytes = &buf[cur_offset..cur_offset + size_of::<i8>()];
         cur_offset += size_of::<i8>();
-
         // Value::Integer(1000) - I16: 2 bytes
         let i16_bytes = &buf[cur_offset..cur_offset + size_of::<i16>()];
         cur_offset += size_of::<i16>();
-
         // Value::Integer(1_000_000) - I24: 3 bytes
         let i24_bytes = &buf[cur_offset..cur_offset + 3];
         cur_offset += 3;
-
         // Value::Integer(1_000_000_000) - I32: 4 bytes
         let i32_bytes = &buf[cur_offset..cur_offset + size_of::<i32>()];
         cur_offset += size_of::<i32>();
-
         // Value::Integer(1_000_000_000_000) - I48: 6 bytes
         let i48_bytes = &buf[cur_offset..cur_offset + 6];
         cur_offset += 6;
-
         // Value::Integer(i64::MAX) - I64: 8 bytes
         let i64_bytes = &buf[cur_offset..cur_offset + size_of::<i64>()];
-
         // Verify the payload values
         let val_int8 = i8::from_be_bytes(i8_bytes.try_into().unwrap());
         let val_int16 = i16::from_be_bytes(i16_bytes.try_into().unwrap());
-
         let mut i24_with_padding = vec![0];
         i24_with_padding.extend(i24_bytes);
         let val_int24 = i32::from_be_bytes(i24_with_padding.try_into().unwrap());
-
         let val_int32 = i32::from_be_bytes(i32_bytes.try_into().unwrap());
-
         let mut i48_with_padding = vec![0, 0];
         i48_with_padding.extend(i48_bytes);
         let val_int48 = i64::from_be_bytes(i48_with_padding.try_into().unwrap());
-
         let val_int64 = i64::from_be_bytes(i64_bytes.try_into().unwrap());
-
         assert_eq!(val_int8, 42);
         assert_eq!(val_int16, 1000);
         assert_eq!(val_int24, 1_000_000);
         assert_eq!(val_int32, 1_000_000_000);
         assert_eq!(val_int48, 1_000_000_000_000);
         assert_eq!(val_int64, i64::MAX);
-
         //Size of buffer = header + payload bytes
         // ConstInt0 and ConstInt1 contribute 0 bytes to payload
         assert_eq!(
             buf.len(),
-            header_length  // 9 bytes (header size + 8 serial types)
-                + size_of::<i8>()        // I8: 1 byte
-                + size_of::<i16>()        // I16: 2 bytes
-                + (size_of::<i32>() - 1)        // I24: 3 bytes
-                + size_of::<i32>()        // I32: 4 bytes
-                + (size_of::<i64>() - 2)        // I48: 6 bytes
-                + size_of::<i64>() // I64: 8 bytes
+            header_length // 9 bytes (header size + 8 serial types)
+        + size_of::<i8>()    // I8: 1 byte
+        + size_of::<i16>()    // I16: 2 bytes
+        + (size_of::<i32>() - 1)    // I24: 3 bytes
+        + size_of::<i32>()    // I32: 4 bytes
+        + (size_of::<i64>() - 2)    // I48: 6 bytes
+        + size_of::<i64>() // I64: 8 bytes
         );
     }
 
@@ -3400,35 +3413,29 @@ mod tests {
         let record = Record::new(vec![Value::Integer(0), Value::Integer(1)]);
         let mut buf = Vec::new();
         record.serialize(&mut buf);
-
         // [header_size, serial_type_0, serial_type_1] + no payload bytes
         let expected_header_size = 3; // 1 byte for header size + 2 bytes for serial types
-
         assert_eq!(buf.len(), expected_header_size);
-
         // Check header size
         assert_eq!(buf[0], expected_header_size as u8);
-
         assert_eq!(buf[1] as u64, u64::from(SerialType::const_int0())); // Should be 8
         assert_eq!(buf[2] as u64, u64::from(SerialType::const_int1())); // Should be 9
-
         assert_eq!(buf[1], 8); // ConstInt0 serial type
         assert_eq!(buf[2], 9); // ConstInt1 serial type
     }
-
     #[test]
+
     fn test_serialize_single_const_int0() {
         let record = Record::new(vec![Value::Integer(0)]);
         let mut buf = Vec::new();
         record.serialize(&mut buf);
-
         // Expected: [header_size=2, serial_type=8]
         assert_eq!(buf.len(), 2);
         assert_eq!(buf[0], 2); // Header size
         assert_eq!(buf[1], 8); // ConstInt0 serial type
     }
-
     #[test]
+
     fn test_serialize_float() {
         #[warn(clippy::approx_constant)]
         let record = Record::new(vec![Value::Float(3.15555)]);
@@ -3497,7 +3504,6 @@ mod tests {
         ]);
         let mut buf = Vec::new();
         record.serialize(&mut buf);
-
         let header_length = record.values.len() + 1;
         let header = &buf[0..header_length];
         // First byte should be header size

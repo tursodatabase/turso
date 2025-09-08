@@ -18,6 +18,7 @@ tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
 
 [features]
 encryption = ["turso_core/encryption"]
+u128-support = ["turso_core/u128-support"]
 
 [build-dependencies]
 napi-build = "2.2.3"

@@ -16,3 +16,6 @@ turso_core = { workspace = true, features = ["fs"] }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(frb_expand)'] }
+
+[features]
+u128-support = ["turso_core/u128-support"]

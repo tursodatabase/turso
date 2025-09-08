@@ -76,6 +76,9 @@ impl Row {
             turso_core::Value::Float(f) => Ok(Value::Real(*f)),
             turso_core::Value::Text(text) => Ok(Value::Text(text.to_string())),
             turso_core::Value::Blob(items) => Ok(Value::Blob(items.to_vec())),
+            #[cfg(feature = "u128-support")]
+            // turso_core::Value::U128(i) => Ok(Value::Text(i.to_string())),
+            turso_core::Value::U128(i) => Ok(Value::U128(*i)),
         }
     }
 
@@ -102,6 +105,9 @@ impl<'a> FromIterator<&'a turso_core::Value> for Row {
                 turso_core::Value::Float(f) => turso_core::Value::Float(*f),
                 turso_core::Value::Text(s) => turso_core::Value::Text(s.clone()),
                 turso_core::Value::Blob(b) => turso_core::Value::Blob(b.clone()),
+
+                #[cfg(feature = "u128-support")]
+                turso_core::Value::U128(i) => turso_core::Value::U128(*i),
             })
             .collect();
 
