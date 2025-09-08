@@ -1,7 +1,7 @@
 use super::{Buffer, Completion, File, OpenFlags, IO};
 use crate::ext::VfsMod;
 use crate::io::clock::{Clock, Instant};
-use crate::io::CompletionInner;
+use crate::io::CompletionNodeChain;
 use crate::{LimboError, Result};
 use std::ffi::{c_void, CString};
 use std::ptr::NonNull;
@@ -86,7 +86,7 @@ impl VfsMod {
 /// that the into_raw/from_raw contract will hold
 unsafe extern "C" fn callback_fn(result: i32, ctx: SendPtr) {
     let completion = Completion {
-        inner: (Arc::from_raw(ctx.inner().as_ptr() as *mut CompletionInner)),
+        inner: (Arc::from_raw(ctx.inner().as_ptr() as *mut CompletionNodeChain)),
     };
     completion.complete(result);
 }
@@ -119,7 +119,7 @@ impl File for VfsFileImpl {
         Ok(())
     }
 
-    fn pread(&self, pos: u64, c: Completion) -> Result<Completion> {
+    fn pread(&self, pos: u64, c: Completion) -> Result<()> {
         if self.vfs.is_null() {
             c.complete(-1);
             return Err(LimboError::ExtensionError("VFS is null".to_string()));
@@ -140,10 +140,10 @@ impl File for VfsFileImpl {
         if res.is_error() {
             return Err(LimboError::ExtensionError("pread failed".to_string()));
         }
-        Ok(c)
+        Ok(())
     }
 
-    fn pwrite(&self, pos: u64, buffer: Arc<Buffer>, c: Completion) -> Result<Completion> {
+    fn pwrite(&self, pos: u64, buffer: Arc<Buffer>, c: Completion) -> Result<()> {
         if self.vfs.is_null() {
             c.complete(-1);
             return Err(LimboError::ExtensionError("VFS is null".to_string()));
@@ -163,10 +163,10 @@ impl File for VfsFileImpl {
         if res.is_error() {
             return Err(LimboError::ExtensionError("pwrite failed".to_string()));
         }
-        Ok(c)
+        Ok(())
     }
 
-    fn sync(&self, c: Completion) -> Result<Completion> {
+    fn sync(&self, c: Completion) -> Result<()> {
         if self.vfs.is_null() {
             c.complete(-1);
             return Err(LimboError::ExtensionError("VFS is null".to_string()));
@@ -177,7 +177,7 @@ impl File for VfsFileImpl {
         if res.is_error() {
             return Err(LimboError::ExtensionError("sync failed".to_string()));
         }
-        Ok(c)
+        Ok(())
     }
 
     fn size(&self) -> Result<u64> {
@@ -190,7 +190,7 @@ impl File for VfsFileImpl {
         }
     }
 
-    fn truncate(&self, len: u64, c: Completion) -> Result<Completion> {
+    fn truncate(&self, len: u64, c: Completion) -> Result<()> {
         if self.vfs.is_null() {
             c.complete(-1);
             return Err(LimboError::ExtensionError("VFS is null".to_string()));
@@ -201,7 +201,7 @@ impl File for VfsFileImpl {
         if res.is_error() {
             return Err(LimboError::ExtensionError("truncate failed".to_string()));
         }
-        Ok(c)
+        Ok(())
     }
 }
 

@@ -28,11 +28,12 @@ pub mod sorter;
 use crate::{
     error::LimboError,
     function::{AggFunc, FuncCtx},
+    io::CompletionChain,
     mvcc::{database::CommitStateMachine, LocalClock},
     state_machine::{StateMachine, StateTransition, TransitionResult},
     storage::sqlite3_ondisk::SmallVec,
     translate::{collate::CollationSeq, plan::TableReferences},
-    types::{IOCompletions, IOResult, RawSlice, TextRef},
+    types::{IOResult, RawSlice, TextRef},
     vdbe::{
         execute::{
             OpColumnState, OpDeleteState, OpDeleteSubState, OpIdxInsertState, OpInsertState,
@@ -258,7 +259,7 @@ pub struct Row {
 
 /// The program state describes the environment in which the program executes.
 pub struct ProgramState {
-    pub io_completions: Option<IOCompletions>,
+    pub io_completions: Option<CompletionChain>,
     pub pc: InsnReference,
     cursors: Vec<Option<Cursor>>,
     registers: Vec<Register>,
@@ -517,7 +518,11 @@ impl Program {
                 }
                 Ok(InsnFunctionStepResult::IO(io)) => {
                     // Instruction not complete - waiting for I/O, will resume at same PC
-                    state.io_completions = Some(io);
+
+                    // Schedule the I/O
+                    let chain = io.build()?;
+                    // Save the I/O completions for tracking
+                    state.io_completions = Some(chain);
                     return Ok(StepResult::IO);
                 }
                 Ok(InsnFunctionStepResult::Row) => {

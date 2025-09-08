@@ -16,16 +16,16 @@ use super::buffer_pool::BufferPool;
 use super::pager::{PageRef, Pager};
 use super::sqlite3_ondisk::{self, checksum_wal, WalHeader, WAL_MAGIC_BE, WAL_MAGIC_LE};
 use crate::fast_lock::SpinLock;
-use crate::io::{clock, File, IO};
+use crate::io::{clock, CompletionFuture, File, IOBuilder, IO};
 use crate::result::LimboResult;
 use crate::storage::sqlite3_ondisk::{
     begin_read_wal_frame, begin_read_wal_frame_raw, finish_read_page, prepare_wal_frame,
     write_pages_vectored, PageSize, WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE,
 };
-use crate::types::{IOCompletions, IOResult};
+use crate::types::IOResult;
 use crate::{
-    bail_corrupt_error, io_yield_many, turso_assert, Buffer, Completion, CompletionError,
-    IOContext, LimboError, Result,
+    bail_corrupt_error, io_yield, turso_assert, Buffer, Completion, CompletionError, IOContext,
+    LimboError, Result,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -248,10 +248,10 @@ pub trait Wal: Debug {
         frame_id: u64,
         page: PageRef,
         buffer_pool: Arc<BufferPool>,
-    ) -> Result<Completion>;
+    ) -> Result<CompletionFuture>;
 
     /// Read a raw frame (header included) from the WAL.
-    fn read_frame_raw(&self, frame_id: u64, frame: &mut [u8]) -> Result<Completion>;
+    fn read_frame_raw(&self, frame_id: u64, frame: &mut [u8]) -> Result<CompletionFuture>;
 
     /// Write a raw frame (header included) from the WAL.
     /// Note, that turso-db will use page_no and size_after fields from the header, but will overwrite checksum with proper value
@@ -274,14 +274,14 @@ pub trait Wal: Debug {
         page: PageRef,
         page_size: PageSize,
         db_size: u32,
-    ) -> Result<Completion>;
+    ) -> Result<CompletionFuture>;
 
     fn append_frames_vectored(
         &mut self,
         pages: Vec<PageRef>,
         page_sz: PageSize,
         db_size_on_commit: Option<u32>,
-    ) -> Result<Completion>;
+    ) -> Result<CompletionFuture>;
 
     /// Complete append of frames by updating shared wal state. Before this
     /// all changes were stored locally.
@@ -293,7 +293,7 @@ pub trait Wal: Debug {
         pager: &Pager,
         mode: CheckpointMode,
     ) -> Result<IOResult<CheckpointResult>>;
-    fn sync(&mut self) -> Result<Completion>;
+    fn sync(&mut self) -> Result<CompletionFuture>;
     fn is_syncing(&self) -> bool;
     fn get_max_frame_in_wal(&self) -> u64;
     fn get_checkpoint_seq(&self) -> u32;
@@ -1064,7 +1064,7 @@ impl Wal for WalFile {
         frame_id: u64,
         page: PageRef,
         buffer_pool: Arc<BufferPool>,
-    ) -> Result<Completion> {
+    ) -> Result<CompletionFuture> {
         tracing::debug!(
             "read_frame(page_idx = {}, frame_id = {})",
             page.get().id,
@@ -1106,7 +1106,7 @@ impl Wal for WalFile {
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
-    fn read_frame_raw(&self, frame_id: u64, frame: &mut [u8]) -> Result<Completion> {
+    fn read_frame_raw(&self, frame_id: u64, frame: &mut [u8]) -> Result<CompletionFuture> {
         tracing::debug!("read_frame({})", frame_id);
         let offset = self.frame_offset(frame_id);
         let (frame_ptr, frame_len) = (frame.as_mut_ptr(), frame.len());
@@ -1228,7 +1228,7 @@ impl Wal for WalFile {
                 page_id as usize,
                 &self.io_ctx.borrow(),
             )?;
-            self.io.wait_for_completion(c)?;
+            c.wait(self.io.as_ref())?;
             return if conflict.get() {
                 Err(LimboError::Conflict(format!(
                     "frame content differs from the WAL: frame_id={frame_id}"
@@ -1262,8 +1262,8 @@ impl Wal for WalFile {
             page,
         );
         let c = Completion::new_write(|_| {});
-        let c = file.pwrite(offset, frame_bytes, c)?;
-        self.io.wait_for_completion(c)?;
+        let c = IOBuilder::pwrite(file.clone(), offset, frame_bytes, c);
+        c.wait(self.io.as_ref())?;
         self.complete_append_frame(page_id, frame_id, checksums);
         if db_size > 0 {
             self.finish_append_frames_commit()?;
@@ -1278,7 +1278,7 @@ impl Wal for WalFile {
         page: PageRef,
         page_size: PageSize,
         db_size: u32,
-    ) -> Result<Completion> {
+    ) -> Result<CompletionFuture> {
         self.ensure_header_if_needed(page_size)?;
         let shared_page_size = {
             let shared = self.get_shared();
@@ -1349,7 +1349,7 @@ impl Wal for WalFile {
                 "WAL must be enabled"
             );
             let file = shared.file.as_ref().unwrap();
-            let result = file.pwrite(offset, frame_bytes.clone(), c)?;
+            let result = IOBuilder::pwrite(file.clone(), offset, frame_bytes.clone(), c);
             (result, frame_checksums)
         };
         self.complete_append_frame(page_id as u64, frame_id, checksums);
@@ -1377,7 +1377,7 @@ impl Wal for WalFile {
     }
 
     #[instrument(err, skip_all, level = Level::DEBUG)]
-    fn sync(&mut self) -> Result<Completion> {
+    fn sync(&mut self) -> Result<CompletionFuture> {
         tracing::debug!("wal_sync");
         let syncing = self.syncing.clone();
         let completion = Completion::new_sync(move |_| {
@@ -1390,8 +1390,7 @@ impl Wal for WalFile {
             shared.enabled.load(Ordering::Relaxed),
             "WAL must be enabled"
         );
-        let file = shared.file.as_ref().unwrap();
-        let c = file.sync(completion)?;
+        let c = IOBuilder::sync(shared.file.as_ref().unwrap().clone(), completion);
         Ok(c)
     }
 
@@ -1460,7 +1459,7 @@ impl Wal for WalFile {
         let mut pages = Vec::with_capacity((frame_count - frame_watermark) as usize);
         for frame_no in frame_watermark + 1..=frame_count {
             let c = self.read_frame_raw(frame_no, &mut frame)?;
-            self.io.wait_for_completion(c)?;
+            c.wait(self.io.as_ref())?;
             let (header, _) = sqlite3_ondisk::parse_wal_frame_header(&frame);
             if seen.insert(header.page_number) {
                 pages.push(header.page_number);
@@ -1475,7 +1474,7 @@ impl Wal for WalFile {
         pages: Vec<PageRef>,
         page_sz: PageSize,
         db_size_on_commit: Option<u32>,
-    ) -> Result<Completion> {
+    ) -> Result<CompletionFuture> {
         turso_assert!(
             pages.len() <= IOV_MAX,
             "we limit number of iovecs to IOV_MAX"
@@ -1584,7 +1583,7 @@ impl Wal for WalFile {
             "WAL must be enabled"
         );
         let file = shared.file.as_ref().unwrap();
-        let c = file.pwritev(start_off, iovecs, c)?;
+        let c = IOBuilder::pwritev(file.clone(), start_off, iovecs, c);
         Ok(c)
     }
 
@@ -1727,13 +1726,9 @@ impl WalFile {
             "WAL must be enabled"
         );
         let file = shared.file.as_ref().unwrap();
-        self.io
-            .wait_for_completion(sqlite3_ondisk::begin_write_wal_header(
-                file,
-                &shared.wal_header.lock(),
-            )?)?;
-        self.io
-            .wait_for_completion(file.sync(Completion::new_sync(|_| {}))?)?;
+        sqlite3_ondisk::begin_write_wal_header(file, &shared.wal_header.lock())?
+            .wait(self.io.as_ref())?;
+        IOBuilder::sync(file.clone(), Completion::new_sync(|_| {})).wait(self.io.as_ref())?;
         shared.initialized.store(true, Ordering::Release);
         Ok(())
     }
@@ -1832,7 +1827,7 @@ impl WalFile {
                 // if at all possible, at the cost of some batching potential.
                 CheckpointState::Processing => {
                     // Gather I/O completions, estimate with MAX_INFLIGHT_WRITES to prevent realloc
-                    let mut completions = Vec::with_capacity(MAX_INFLIGHT_WRITES);
+                    let mut completions = CompletionFuture::default();
 
                     // Check and clean any completed writes from pending flush
                     if self.ongoing_checkpoint.process_inflight_writes() {
@@ -1863,9 +1858,8 @@ impl WalFile {
                             {
                                 let mut raw =
                                     vec![0u8; self.page_size() as usize + WAL_FRAME_HEADER_SIZE];
-                                self.io.wait_for_completion(
-                                    self.read_frame_raw(target_frame, &mut raw)?,
-                                )?;
+                                self.read_frame_raw(target_frame, &mut raw)?
+                                    .wait(self.io.as_ref())?;
                                 let (_, wal_page) = sqlite3_ondisk::parse_wal_frame_header(&raw);
                                 let cached = cached_page.get_contents().buffer.as_slice();
                                 turso_assert!(wal_page == cached, "cache fast-path returned wrong content for page {page_id} frame {target_frame}");
@@ -1883,9 +1877,9 @@ impl WalFile {
                         }
                         // Issue read if page wasn't found in the page cache or doesnt meet
                         // the frame requirements
-                        let inflight =
+                        let (inflight, c) =
                             self.issue_wal_read_into_buffer(page_id as usize, target_frame)?;
-                        completions.push(inflight.completion.clone());
+                        completions.append(c);
                         self.ongoing_checkpoint.inflight_reads.push(inflight);
                         self.ongoing_checkpoint.current_page += 1;
                     }
@@ -1898,14 +1892,14 @@ impl WalFile {
                         if !batch_map.is_empty() {
                             let done_flag = self.ongoing_checkpoint.add_write();
                             let is_final = self.ongoing_checkpoint.is_final_write();
-                            completions.extend(write_pages_vectored(
+                            completions.append(write_pages_vectored(
                                 pager, batch_map, done_flag, is_final,
                             )?);
                         }
                     }
 
                     if !completions.is_empty() {
-                        io_yield_many!(completions);
+                        io_yield!(completions);
                     } else if self.ongoing_checkpoint.complete() {
                         // if we are completely done backfilling, we need to unpin any pages we used from the page cache.
                         for (page_id, _, cached) in
@@ -2147,20 +2141,18 @@ impl WalFile {
                 "WAL must be enabled"
             );
             let file = shared.file.as_ref().unwrap();
-            let c = file.truncate(0, c).inspect_err(|e| unlock(Some(e)))?;
+            let c = IOBuilder::truncate(file.clone(), 0, c);
             shared.initialized.store(false, Ordering::Release);
-            self.io
-                .wait_for_completion(c)
-                .inspect_err(|e| unlock(Some(e)))?;
+            c.wait(self.io.as_ref()).inspect_err(|e| unlock(Some(e)))?;
             // fsync after truncation
-            self.io
-                .wait_for_completion(
-                    file.sync(Completion::new_sync(|_| {
-                        tracing::trace!("WAL file synced after reset/truncation");
-                    }))
-                    .inspect_err(|e| unlock(Some(e)))?,
-                )
-                .inspect_err(|e| unlock(Some(e)))?;
+            IOBuilder::sync(
+                file.clone(),
+                Completion::new_sync(|_| {
+                    tracing::trace!("WAL file synced after reset/truncation");
+                }),
+            )
+            .wait(self.io.as_ref())
+            .inspect_err(|e| unlock(Some(e)))?;
         }
 
         // release read‑locks 1..4
@@ -2190,7 +2182,11 @@ impl WalFile {
         Ok(())
     }
 
-    fn issue_wal_read_into_buffer(&self, page_id: usize, frame_id: u64) -> Result<InflightRead> {
+    fn issue_wal_read_into_buffer(
+        &self,
+        page_id: usize,
+        frame_id: u64,
+    ) -> Result<(InflightRead, CompletionFuture)> {
         let offset = self.frame_offset(frame_id);
         let buf_slot = Arc::new(SpinLock::new(None));
 
@@ -2224,11 +2220,14 @@ impl WalFile {
             &self.io_ctx.borrow(),
         )?;
 
-        Ok(InflightRead {
-            completion: c,
-            page_id,
-            buf: buf_slot,
-        })
+        Ok((
+            InflightRead {
+                completion: c.get_single(),
+                page_id,
+                buf: buf_slot,
+            },
+            c,
+        ))
     }
 }
 
@@ -2239,7 +2238,9 @@ impl WalFileShared {
     ) -> Result<Arc<RwLock<WalFileShared>>> {
         let file = io.open_file(path, crate::io::OpenFlags::Create, false)?;
         if file.size()? > 0 {
-            let wal_file_shared = sqlite3_ondisk::read_entire_wal_dumb(&file)?;
+            let (wal_file_shared, completion) = sqlite3_ondisk::read_entire_wal_dumb(&file)?;
+            // TODO: use the chain to track the IO
+            let _chain = completion.build()?;
             // TODO: Return a completion instead.
             let mut max_loops = 100_000;
             while !wal_file_shared.read().loaded.load(Ordering::Acquire) {
@@ -2580,9 +2581,7 @@ pub mod test {
             .unwrap();
         bulk_inserts(&conn, 20, 3);
         let completions = conn.pager.borrow_mut().cacheflush().unwrap();
-        for c in completions {
-            db.io.wait_for_completion(c).unwrap();
-        }
+        completions.wait(db.io.as_ref()).unwrap();
 
         // Snapshot header & counters before the RESTART checkpoint.
         let wal_shared = db.shared_wal.clone();
@@ -2675,9 +2674,7 @@ pub mod test {
             .unwrap();
         bulk_inserts(&conn1.clone(), 15, 2);
         let completions = conn1.pager.borrow_mut().cacheflush().unwrap();
-        for c in completions {
-            db.io.wait_for_completion(c).unwrap();
-        }
+        completions.wait(db.io.as_ref()).unwrap();
 
         // Force a read transaction that will freeze a lower read mark
         let readmark = {
@@ -2690,9 +2687,7 @@ pub mod test {
         // generate more frames that the reader will not see.
         bulk_inserts(&conn1.clone(), 15, 2);
         let completions = conn1.pager.borrow_mut().cacheflush().unwrap();
-        for c in completions {
-            db.io.wait_for_completion(c).unwrap();
-        }
+        completions.wait(db.io.as_ref()).unwrap();
 
         // Run passive checkpoint, expect partial
         let (res1, max_before) = {
@@ -3408,9 +3403,7 @@ pub mod test {
 
         // Ensure frames are flushed to the WAL
         let completions = conn.pager.borrow_mut().cacheflush().unwrap();
-        for c in completions {
-            db.io.wait_for_completion(c).unwrap();
-        }
+        completions.wait(db.io.as_ref()).unwrap();
 
         // Snapshot the current mxFrame before running FULL
         let wal_shared = db.shared_wal.clone();
@@ -3441,9 +3434,7 @@ pub mod test {
         // First commit some data and flush (reader will snapshot here)
         bulk_inserts(&writer, 2, 3);
         let completions = writer.pager.borrow_mut().cacheflush().unwrap();
-        for c in completions {
-            db.io.wait_for_completion(c).unwrap();
-        }
+        completions.wait(db.io.as_ref()).unwrap();
 
         // Start a read transaction pinned at the current snapshot
         {
@@ -3461,9 +3452,8 @@ pub mod test {
         // Advance WAL beyond the reader's snapshot
         bulk_inserts(&writer, 3, 4);
         let completions = writer.pager.borrow_mut().cacheflush().unwrap();
-        for c in completions {
-            db.io.wait_for_completion(c).unwrap();
-        }
+        completions.wait(db.io.as_ref()).unwrap();
+
         let mx_now = db.shared_wal.read().max_frame.load(Ordering::SeqCst);
         assert!(mx_now > r_snapshot);
 

@@ -1,3 +1,4 @@
+use crate::io::{CompletionFuture, IOBuilder};
 use crate::result::LimboResult;
 use crate::storage::wal::IOV_MAX;
 use crate::storage::{
@@ -8,9 +9,9 @@ use crate::storage::{
     },
     wal::{CheckpointResult, Wal},
 };
-use crate::types::{IOCompletions, WalState};
+use crate::types::WalState;
 use crate::util::IOExt as _;
-use crate::{io_yield_many, io_yield_one, IOContext};
+use crate::{io_yield, IOContext};
 use crate::{
     return_if_io, turso_assert, types::WalFrameInfo, Completion, Connection, IOResult, LimboError,
     Result, TransactionState,
@@ -53,7 +54,7 @@ impl HeaderRef {
                     let (page, c) = pager.read_page(DatabaseHeader::PAGE_ID)?;
                     *pager.header_ref_state.borrow_mut() = HeaderRefState::CreateHeader { page };
                     if let Some(c) = c {
-                        io_yield_one!(c);
+                        io_yield!(c);
                     }
                 }
                 HeaderRefState::CreateHeader { page } => {
@@ -93,7 +94,7 @@ impl HeaderRefMut {
                     let (page, c) = pager.read_page(DatabaseHeader::PAGE_ID)?;
                     *pager.header_ref_state.borrow_mut() = HeaderRefState::CreateHeader { page };
                     if let Some(c) = c {
-                        io_yield_one!(c);
+                        io_yield!(c);
                     }
                 }
                 HeaderRefState::CreateHeader { page } => {
@@ -678,7 +679,7 @@ impl Pager {
                         offset_in_ptrmap_page,
                     });
                     if let Some(c) = c {
-                        io_yield_one!(c);
+                        io_yield!(c);
                     }
                 }
                 PtrMapGetState::Deserialize {
@@ -782,7 +783,7 @@ impl Pager {
                         offset_in_ptrmap_page,
                     });
                     if let Some(c) = c {
-                        io_yield_one!(c);
+                        io_yield!(c);
                     }
                 }
                 PtrMapPutState::Deserialize {
@@ -1014,7 +1015,7 @@ impl Pager {
                 }
             }
             // Give a chance for the allocation to happen elsewhere
-            io_yield_one!(Completion::new_dummy());
+            io_yield!(IOBuilder::ready());
         }
         Ok(IOResult::Done(()))
     }
@@ -1089,7 +1090,7 @@ impl Pager {
         page_idx: usize,
         frame_watermark: Option<u64>,
         allow_empty_read: bool,
-    ) -> Result<(PageRef, Completion)> {
+    ) -> Result<(PageRef, CompletionFuture)> {
         tracing::trace!("read_page_no_cache(page_idx = {})", page_idx);
         let page = Arc::new(Page::new(page_idx));
         let io_ctx = &self.io_ctx.borrow();
@@ -1119,7 +1120,7 @@ impl Pager {
 
     /// Reads a page from the database.
     #[tracing::instrument(skip_all, level = Level::DEBUG)]
-    pub fn read_page(&self, page_idx: usize) -> Result<(PageRef, Option<Completion>)> {
+    pub fn read_page(&self, page_idx: usize) -> Result<(PageRef, Option<CompletionFuture>)> {
         tracing::trace!("read_page(page_idx = {})", page_idx);
         let mut page_cache = self.page_cache.write();
         let page_key = PageCacheKey::new(page_idx);
@@ -1148,7 +1149,7 @@ impl Pager {
         page: PageRef,
         allow_empty_read: bool,
         io_ctx: &IOContext,
-    ) -> Result<Completion> {
+    ) -> Result<CompletionFuture> {
         sqlite3_ondisk::begin_read_page(
             self.db_file.clone(),
             self.buffer_pool.clone(),
@@ -1244,7 +1245,7 @@ impl Pager {
     /// Flush all dirty pages to disk.
     /// Unlike commit_dirty_pages, this function does not commit, checkpoint now sync the WAL/Database.
     #[instrument(skip_all, level = Level::INFO)]
-    pub fn cacheflush(&self) -> Result<Vec<Completion>> {
+    pub fn cacheflush(&self) -> Result<CompletionFuture> {
         let Some(wal) = self.wal.as_ref() else {
             // TODO: when ephemeral table spills to disk, it should cacheflush pages directly to the temporary database file.
             // This handling is not yet implemented, but it should be when spilling is implemented.
@@ -1259,7 +1260,7 @@ impl Pager {
             .copied()
             .collect::<Vec<usize>>();
         let len = dirty_pages.len().min(IOV_MAX);
-        let mut completions: Vec<Completion> = Vec::new();
+        let mut completions = CompletionFuture::default();
         let mut pages = Vec::with_capacity(len);
         let page_sz = self.page_size.get().unwrap_or_default();
         let commit_frame = None; // cacheflush only so we are not setting a commit frame here
@@ -1274,34 +1275,24 @@ impl Pager {
             };
             pages.push(page);
             if pages.len() == IOV_MAX {
-                let c = wal
-                    .borrow_mut()
-                    .append_frames_vectored(
-                        std::mem::replace(
-                            &mut pages,
-                            Vec::with_capacity(std::cmp::min(IOV_MAX, dirty_pages.len() - idx)),
-                        ),
-                        page_sz,
-                        commit_frame,
-                    )
-                    .inspect_err(|_| {
-                        for c in completions.iter() {
-                            c.abort();
-                        }
-                    })?;
-                completions.push(c);
+                let c = wal.borrow_mut().append_frames_vectored(
+                    std::mem::replace(
+                        &mut pages,
+                        Vec::with_capacity(std::cmp::min(IOV_MAX, dirty_pages.len() - idx)),
+                    ),
+                    page_sz,
+                    commit_frame,
+                )?;
+                // No need to abort completions on error as they were not scheduled yet
+                completions.append(c);
             }
         }
         if !pages.is_empty() {
             let c = wal
                 .borrow_mut()
-                .append_frames_vectored(pages, page_sz, commit_frame)
-                .inspect_err(|_| {
-                    for c in completions.iter() {
-                        c.abort();
-                    }
-                })?;
-            completions.push(c);
+                .append_frames_vectored(pages, page_sz, commit_frame)?;
+            // No need to abort completions on error as they were not scheduled yet
+            completions.append(c);
         }
         Ok(completions)
     }
@@ -1342,7 +1333,7 @@ impl Pager {
                     }
 
                     let page_sz = self.page_size.get().expect("page size not set");
-                    let mut completions: Vec<Completion> = Vec::new();
+                    let mut completions = CompletionFuture::default();
                     let mut pages: Vec<PageRef> = Vec::with_capacity(dirty_ids.len().min(IOV_MAX));
                     let total = dirty_ids.len();
 
@@ -1376,11 +1367,9 @@ impl Pager {
                                 commit_flag,
                             );
                             match r {
-                                Ok(c) => completions.push(c),
+                                Ok(c) => completions.append(c),
                                 Err(e) => {
-                                    for c in &completions {
-                                        c.abort();
-                                    }
+                                    // No need to abort completions here, as they were not scheduled yet
                                     return Err(e);
                                 }
                             }
@@ -1398,16 +1387,12 @@ impl Pager {
                             self.commit_info.state.set(CommitState::SyncWal);
                         }
                     }
-                    if !completions.iter().all(|c| c.is_completed()) {
-                        io_yield_many!(completions);
-                    }
+                    io_yield!(completions);
                 }
                 CommitState::SyncWal => {
                     self.commit_info.state.set(CommitState::AfterSyncWal);
                     let c = wal.borrow_mut().sync()?;
-                    if !c.is_completed() {
-                        io_yield_one!(c);
-                    }
+                    io_yield!(c);
                 }
                 CommitState::AfterSyncWal => {
                     turso_assert!(!wal.borrow().is_syncing(), "wal should have synced");
@@ -1429,9 +1414,7 @@ impl Pager {
                 CommitState::SyncDbFile => {
                     let c = sqlite3_ondisk::begin_sync(self.db_file.clone(), self.syncing.clone())?;
                     self.commit_info.state.set(CommitState::AfterSyncDbFile);
-                    if !c.is_completed() {
-                        io_yield_one!(c);
-                    }
+                    io_yield!(c);
                 }
                 CommitState::AfterSyncDbFile => {
                     turso_assert!(!self.syncing.get(), "should have finished syncing");
@@ -1460,7 +1443,7 @@ impl Pager {
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
-    pub fn wal_get_frame(&self, frame_no: u64, frame: &mut [u8]) -> Result<Completion> {
+    pub fn wal_get_frame(&self, frame_no: u64, frame: &mut [u8]) -> Result<CompletionFuture> {
         let Some(wal) = self.wal.as_ref() else {
             return Err(LimboError::InternalError(
                 "wal_get_frame() called on database without WAL".to_string(),
@@ -1547,7 +1530,7 @@ impl Pager {
                     let c = sqlite3_ondisk::begin_sync(self.db_file.clone(), self.syncing.clone())?;
                     self.checkpoint_state
                         .replace(CheckpointState::CheckpointDone { res });
-                    io_yield_one!(c);
+                    io_yield!(c);
                 }
                 CheckpointState::CheckpointDone { res } => {
                     turso_assert!(!self.syncing.get(), "syncing should be done");
@@ -1591,7 +1574,7 @@ impl Pager {
             let mut wal = wal.borrow_mut();
             // fsync the wal syncronously before beginning checkpoint
             let c = wal.sync()?;
-            self.io.wait_for_completion(c)?;
+            c.wait(self.io.as_ref())?;
         }
         if !wal_auto_checkpoint_disabled {
             while let Err(LimboError::Busy) = self.wal_checkpoint(CheckpointMode::Truncate {
@@ -1632,27 +1615,29 @@ impl Pager {
                     let page_size = self.page_size.get().unwrap_or_default();
                     let expected = (db_size * page_size.get()) as u64;
                     if expected < self.db_file.size()? {
-                        self.io.wait_for_completion(self.db_file.truncate(
-                            expected as usize,
-                            Completion::new_trunc(move |_| {
-                                tracing::trace!(
-                                    "Database file truncated to expected size: {} bytes",
-                                    expected
-                                );
-                            }),
-                        )?)?;
-                        self.io
-                            .wait_for_completion(self.db_file.sync(Completion::new_sync(
-                                move |_| {
-                                    tracing::trace!("Database file syncd after truncation");
-                                },
-                            ))?)?;
+                        self.db_file
+                            .truncate(
+                                expected,
+                                Completion::new_trunc(move |_| {
+                                    tracing::trace!(
+                                        "Database file truncated to expected size: {} bytes",
+                                        expected
+                                    );
+                                }),
+                            )?
+                            .wait(self.io.as_ref())?;
+                        self.db_file
+                            .sync(Completion::new_sync(move |_| {
+                                tracing::trace!("Database file syncd after truncation");
+                            }))?
+                            .wait(self.io.as_ref())?;
                         break 'ensure_sync;
                     }
                 }
                 // if we backfilled at all, we have to sync the db-file here
-                self.io
-                    .wait_for_completion(self.db_file.sync(Completion::new_sync(move |_| {}))?)?;
+                self.db_file
+                    .sync(Completion::new_sync(move |_| {}))?
+                    .wait(self.io.as_ref())?;
             }
         }
         checkpoint_result.release_guard();
@@ -1736,7 +1721,7 @@ impl Pager {
                         let (page, c) = self.read_page(trunk_page_id as usize)?;
                         trunk_page.replace(page);
                         if let Some(c) = c {
-                            io_yield_one!(c);
+                            io_yield!(c);
                         }
                     }
                     let trunk_page = trunk_page.as_ref().unwrap();
@@ -1838,7 +1823,7 @@ impl Pager {
 
                 self.allocate_page1_state
                     .replace(AllocatePage1State::Writing { page: page1 });
-                io_yield_one!(c);
+                io_yield!(c);
             }
             AllocatePage1State::Writing { page } => {
                 turso_assert!(page.is_loaded(), "page should be loaded");
@@ -1925,7 +1910,7 @@ impl Pager {
                         current_db_size: new_db_size,
                     };
                     if let Some(c) = c {
-                        io_yield_one!(c);
+                        io_yield!(c);
                     }
                 }
                 AllocatePageState::SearchAvailableFreeListLeaf {
@@ -1963,7 +1948,7 @@ impl Pager {
                             number_of_freelist_leaves,
                         };
                         if let Some(c) = c {
-                            io_yield_one!(c);
+                            io_yield!(c);
                         }
                         continue;
                     }

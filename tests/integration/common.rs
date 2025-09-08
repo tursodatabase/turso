@@ -107,9 +107,7 @@ impl TempDatabase {
 
 pub(crate) fn do_flush(conn: &Arc<Connection>, tmp_db: &TempDatabase) -> anyhow::Result<()> {
     let completions = conn.cacheflush()?;
-    for c in completions {
-        tmp_db.io.wait_for_completion(c)?;
-    }
+    completions.wait(tmp_db.io.as_ref())?;
     Ok(())
 }
 
