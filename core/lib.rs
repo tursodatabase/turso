@@ -2468,6 +2468,18 @@ impl Statement {
         }
     }
 
+    pub fn get_column_table_name(&self, idx: usize) -> Option<Cow<str>> {
+        let column = &self.program.result_columns.get(idx).expect("No column");
+        match &column.expr {
+            turso_parser::ast::Expr::Column { table, .. } => self
+                .program
+                .table_references
+                .find_table_by_internal_id(*table)
+                .map(|table_ref| Cow::Borrowed(table_ref.get_name())),
+            _ => None,
+        }
+    }
+
     pub fn get_column_type(&self, idx: usize) -> Option<String> {
         let column = &self.program.result_columns.get(idx).expect("No column");
         match &column.expr {
