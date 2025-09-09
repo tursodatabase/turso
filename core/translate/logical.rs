@@ -1368,9 +1368,14 @@ impl<'a> LogicalPlanBuilder<'a> {
     fn build_literal(lit: &ast::Literal) -> Result<Value> {
         match lit {
             ast::Literal::Null => Ok(Value::Null),
-            ast::Literal::Keyword(k) if k.eq_ignore_ascii_case("true") => Ok(Value::Integer(1)), // SQLite uses int for bool
-            ast::Literal::Keyword(k) if k.eq_ignore_ascii_case("false") => Ok(Value::Integer(0)), // SQLite uses int for bool
-            ast::Literal::Keyword(k) => Ok(Value::Text(k.clone().into())),
+            ast::Literal::Keyword(k) => {
+                let k_bytes = k.as_bytes();
+                match_ignore_ascii_case!(match k_bytes {
+                    b"true" => Ok(Value::Integer(1)),  // SQLite uses int for bool
+                    b"false" => Ok(Value::Integer(0)), // SQLite uses int for bool
+                    _ => Ok(Value::Text(k.clone().into())),
+                })
+            }
             ast::Literal::Numeric(s) => {
                 if let Ok(i) = s.parse::<i64>() {
                     Ok(Value::Integer(i))

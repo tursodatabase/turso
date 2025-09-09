@@ -52,7 +52,7 @@ impl CmpInsFlags {
 
     pub fn get_affinity(&self) -> Affinity {
         let aff_code = (self.0 & Self::AFFINITY_MASK) as u8;
-        Affinity::from_char_code(aff_code).unwrap_or(Affinity::Blob)
+        Affinity::from_char_code(aff_code)
     }
 }
 
@@ -430,6 +430,7 @@ pub enum Insn {
         count: usize,     // P2
         dest_reg: usize,  // P3
         index_name: Option<String>,
+        affinity_str: Option<String>,
     },
 
     /// Emit a row of results.
@@ -898,7 +899,12 @@ pub enum Insn {
     },
 
     /// Populate all materialized views after schema parsing
-    PopulateMaterializedViews,
+    /// The cursors parameter contains a mapping of view names to cursor IDs that have been
+    /// opened to the view's btree for writing the materialized data
+    PopulateMaterializedViews {
+        /// Mapping of view name to cursor_id for writing to the view's btree
+        cursors: Vec<(String, usize)>,
+    },
 
     /// Place the result of lhs >> rhs in dest register.
     ShiftRight {
@@ -1076,6 +1082,10 @@ pub enum Insn {
         dest: usize,              // P2: output register for result
         new_mode: Option<String>, // P3: new journal mode (if setting)
     },
+    IfNeg {
+        reg: usize,
+        target_pc: BranchOffset,
+    },
 }
 
 impl Insn {
@@ -1186,7 +1196,7 @@ impl Insn {
             Insn::IsNull { .. } => execute::op_is_null,
             Insn::CollSeq { .. } => execute::op_coll_seq,
             Insn::ParseSchema { .. } => execute::op_parse_schema,
-            Insn::PopulateMaterializedViews => execute::op_populate_materialized_views,
+            Insn::PopulateMaterializedViews { .. } => execute::op_populate_materialized_views,
             Insn::ShiftRight { .. } => execute::op_shift_right,
             Insn::ShiftLeft { .. } => execute::op_shift_left,
             Insn::AddImm { .. } => execute::op_add_imm,
@@ -1213,6 +1223,7 @@ impl Insn {
             Insn::AlterColumn { .. } => execute::op_alter_column,
             Insn::MaxPgcnt { .. } => execute::op_max_pgcnt,
             Insn::JournalMode { .. } => execute::op_journal_mode,
+            Insn::IfNeg { .. } => execute::op_if_neg,
         }
     }
 }

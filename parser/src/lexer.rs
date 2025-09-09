@@ -207,7 +207,7 @@ impl<'a> Iterator for Lexer<'a> {
                 b'&' => Some(Ok(self.eat_one_token(TokenType::TK_BITAND))),
                 b'~' => Some(Ok(self.eat_one_token(TokenType::TK_BITNOT))),
                 b'\'' | b'"' | b'`' => Some(self.mark(|l| l.eat_lit_or_id())),
-                b'.' => Some(self.mark(|l| l.eat_dot_or_frac())),
+                b'.' => Some(self.mark(|l| l.eat_dot_or_frac(false))),
                 b'0'..=b'9' => Some(self.mark(|l| l.eat_number())),
                 b'[' => Some(self.mark(|l| l.eat_bracket())),
                 b'?' | b'$' | b'@' | b'#' | b':' => Some(self.mark(|l| l.eat_var())),
@@ -585,12 +585,14 @@ impl<'a> Lexer<'a> {
         })
     }
 
-    fn eat_dot_or_frac(&mut self) -> Result<Token<'a>> {
+    fn eat_dot_or_frac(&mut self, has_digit_prefix: bool) -> Result<Token<'a>> {
         let start = self.offset;
         self.eat_and_assert(|b| b == b'.');
 
         match self.peek() {
-            Some(b) if b.is_ascii_digit() => {
+            Some(b)
+                if b.is_ascii_digit() || (has_digit_prefix && b.eq_ignore_ascii_case(&b'e')) =>
+            {
                 self.eat_while_number_digit()?;
                 match self.peek() {
                     Some(b'e') | Some(b'E') => {
@@ -677,7 +679,7 @@ impl<'a> Lexer<'a> {
         self.eat_while_number_digit()?;
         match self.peek() {
             Some(b'.') => {
-                self.eat_dot_or_frac()?;
+                self.eat_dot_or_frac(true)?;
                 Ok(Token {
                     value: &self.input[start..self.offset],
                     token_type: Some(TokenType::TK_FLOAT),
@@ -1239,6 +1241,14 @@ mod tests {
                     token_type: Some(TokenType::TK_ID),
                 },
             ),
+            // issue 2933
+            (
+                b"1.e5".as_slice(),
+                Token {
+                    value: b"1.e5".as_slice(),
+                    token_type: Some(TokenType::TK_FLOAT),
+                },
+            ),
         ];
 
         for (input, expected) in test_cases {
@@ -1510,6 +1520,24 @@ mod tests {
                     Token {
                         value: b")".as_slice(),
                         token_type: Some(TokenType::TK_RP),
+                    },
+                ],
+            ),
+            // issue 2933
+            (
+                b"u.email".as_slice(),
+                vec![
+                    Token {
+                        value: b"u".as_slice(),
+                        token_type: Some(TokenType::TK_ID),
+                    },
+                    Token {
+                        value: b".".as_slice(),
+                        token_type: Some(TokenType::TK_DOT),
+                    },
+                    Token {
+                        value: b"email".as_slice(),
+                        token_type: Some(TokenType::TK_ID),
                     },
                 ],
             ),

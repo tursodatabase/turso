@@ -5,16 +5,221 @@
 //!
 //! Based on the DBSP paper: "DBSP: Automatic Incremental View Maintenance for Rich Query Languages"
 
+use crate::incremental::dbsp::Delta;
 use crate::incremental::expr_compiler::CompiledExpression;
+use crate::incremental::hashable_row::HashableRow;
 use crate::incremental::operator::{
-    Delta, FilterOperator, FilterPredicate, IncrementalOperator, ProjectOperator,
+    EvalState, FilterOperator, FilterPredicate, IncrementalOperator, InputOperator, ProjectOperator,
 };
+use crate::storage::btree::{BTreeCursor, BTreeKey};
 // Note: logical module must be made pub(crate) in translate/mod.rs
-use crate::translate::logical::{BinaryOperator, LogicalExpr, LogicalPlan, SchemaRef};
-use crate::types::Value;
-use crate::{LimboError, Result};
+use crate::translate::logical::{
+    BinaryOperator, LogicalExpr, LogicalPlan, LogicalSchema, SchemaRef,
+};
+use crate::types::{IOResult, SeekKey, SeekOp, SeekResult, Value};
+use crate::Pager;
+use crate::{return_and_restore_if_io, return_if_io, LimboError, Result};
 use std::collections::HashMap;
 use std::fmt::{self, Display, Formatter};
+use std::rc::Rc;
+use std::sync::Arc;
+
+// The state table is always a key-value store with 3 columns: key, state, and weight.
+const OPERATOR_COLUMNS: usize = 3;
+
+/// State machine for writing a row to the materialized view
+#[derive(Debug)]
+pub enum WriteViewRow {
+    /// Initial empty state
+    Empty,
+
+    /// Reading existing record to get current weight
+    GetRecord,
+
+    /// Deleting the row (when final weight <= 0)
+    Delete,
+
+    /// Inserting/updating the row with new weight
+    Insert {
+        /// The final weight to write
+        final_weight: isize,
+    },
+
+    /// Completed processing this row
+    Done,
+}
+
+impl WriteViewRow {
+    fn new() -> Self {
+        Self::Empty
+    }
+    fn write_row(
+        &mut self,
+        cursor: &mut BTreeCursor,
+        row: HashableRow,
+        weight: isize,
+    ) -> Result<IOResult<()>> {
+        loop {
+            match self {
+                WriteViewRow::Empty => {
+                    let key = SeekKey::TableRowId(row.rowid);
+                    let res = return_if_io!(cursor.seek(key, SeekOp::GE { eq_only: true }));
+                    match res {
+                        SeekResult::Found => *self = WriteViewRow::GetRecord,
+                        _ => {
+                            *self = WriteViewRow::Insert {
+                                final_weight: weight,
+                            }
+                        }
+                    }
+                }
+                WriteViewRow::GetRecord => {
+                    let existing_record = return_if_io!(cursor.record());
+                    let r = existing_record.ok_or_else(|| {
+                        crate::LimboError::InternalError(format!(
+                            "Found rowid {} in storage but could not read record",
+                            row.rowid
+                        ))
+                    })?;
+                    let values = r.get_values();
+
+                    // last value should contain the weight
+                    let existing_weight = match values.last() {
+                        Some(ref_val) => match ref_val.to_owned() {
+                            Value::Integer(w) => w as isize,
+                            _ => {
+                                return Err(crate::LimboError::InternalError(format!(
+                                    "Invalid weight value in storage for rowid {}",
+                                    row.rowid
+                                )))
+                            }
+                        },
+                        None => {
+                            return Err(crate::LimboError::InternalError(format!(
+                                "No weight value found in storage for rowid {}",
+                                row.rowid
+                            )))
+                        }
+                    };
+                    let final_weight = existing_weight + weight;
+                    if final_weight <= 0 {
+                        *self = WriteViewRow::Delete
+                    } else {
+                        *self = WriteViewRow::Insert { final_weight }
+                    }
+                }
+                WriteViewRow::Delete => {
+                    // Delete the row. Important: when delete returns I/O, the btree operation
+                    // has already completed in memory, so mark as Done to avoid retry
+                    *self = WriteViewRow::Done;
+                    return_if_io!(cursor.delete());
+                }
+                WriteViewRow::Insert { final_weight } => {
+                    let key = SeekKey::TableRowId(row.rowid);
+                    return_if_io!(cursor.seek(key, SeekOp::GE { eq_only: true }));
+
+                    // Create the record values: row values + weight
+                    let mut values = row.values.clone();
+                    values.push(Value::Integer(*final_weight as i64));
+
+                    // Create an ImmutableRecord from the values
+                    let immutable_record =
+                        crate::types::ImmutableRecord::from_values(&values, values.len());
+                    let btree_key = BTreeKey::new_table_rowid(row.rowid, Some(&immutable_record));
+                    // Insert the row. Important: when insert returns I/O, the btree operation
+                    // has already completed in memory, so mark as Done to avoid retry
+                    *self = WriteViewRow::Done;
+                    return_if_io!(cursor.insert(&btree_key));
+                }
+                WriteViewRow::Done => {
+                    break;
+                }
+            }
+        }
+        Ok(IOResult::Done(()))
+    }
+}
+
+/// State machine for commit operations
+pub enum CommitState {
+    /// Initial state - ready to start commit
+    Init,
+
+    /// Running circuit with commit_operators flag set to true
+    CommitOperators {
+        /// Execute state for running the circuit
+        execute_state: Box<ExecuteState>,
+        /// Persistent cursor for operator state btree (internal_state_root)
+        state_cursor: Box<BTreeCursor>,
+    },
+
+    /// Updating the materialized view with the delta
+    UpdateView {
+        /// Delta to write to the view
+        delta: Delta,
+        /// Current index in delta.changes being processed
+        current_index: usize,
+        /// State for writing individual rows
+        write_row_state: WriteViewRow,
+        /// Cursor for view data btree - created fresh for each row
+        view_cursor: Box<BTreeCursor>,
+    },
+}
+
+impl std::fmt::Debug for CommitState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Init => write!(f, "Init"),
+            Self::CommitOperators { execute_state, .. } => f
+                .debug_struct("CommitOperators")
+                .field("execute_state", execute_state)
+                .field("has_state_cursor", &true)
+                .finish(),
+            Self::UpdateView {
+                delta,
+                current_index,
+                write_row_state,
+                ..
+            } => f
+                .debug_struct("UpdateView")
+                .field("delta", delta)
+                .field("current_index", current_index)
+                .field("write_row_state", write_row_state)
+                .field("has_view_cursor", &true)
+                .finish(),
+        }
+    }
+}
+
+/// State machine for circuit execution across I/O operations
+/// Similar to EvalState but for tracking execution state through the circuit
+#[derive(Debug)]
+pub enum ExecuteState {
+    /// Empty state so we can allocate the space without executing
+    Uninitialized,
+
+    /// Initial state - starting circuit execution
+    Init {
+        /// Input deltas to process
+        input_data: DeltaSet,
+    },
+
+    /// Processing multiple inputs (for recursive node processing)
+    ProcessingInputs {
+        /// Collection of (node_id, state) pairs to process
+        input_states: Vec<(usize, ExecuteState)>,
+        /// Current index being processed
+        current_index: usize,
+        /// Collected deltas from processed inputs
+        input_deltas: Vec<Delta>,
+    },
+
+    /// Processing a specific node in the circuit
+    ProcessingNode {
+        /// Node's evaluation state (includes the delta in its Init state)
+        eval_state: Box<EvalState>,
+    },
+}
 
 /// A set of deltas for multiple tables/operators
 /// This provides a cleaner API for passing deltas through circuit execution
@@ -37,6 +242,11 @@ impl DeltaSet {
         Self {
             deltas: HashMap::new(),
         }
+    }
+
+    /// Create a DeltaSet from a HashMap
+    pub fn from_map(deltas: HashMap<String, Delta>) -> Self {
+        Self { deltas }
     }
 
     /// Add a delta for a table
@@ -96,8 +306,8 @@ pub struct DbspNode {
     pub operator: DbspOperator,
     /// Input nodes (edges in the DAG)
     pub inputs: Vec<usize>,
-    /// The actual executable operator (if applicable)
-    pub executable: Option<Box<dyn IncrementalOperator>>,
+    /// The actual executable operator
+    pub executable: Box<dyn IncrementalOperator>,
 }
 
 impl std::fmt::Debug for DbspNode {
@@ -106,8 +316,48 @@ impl std::fmt::Debug for DbspNode {
             .field("id", &self.id)
             .field("operator", &self.operator)
             .field("inputs", &self.inputs)
-            .field("has_executable", &self.executable.is_some())
+            .field("has_executable", &true)
             .finish()
+    }
+}
+
+impl DbspNode {
+    fn process_node(
+        &mut self,
+        pager: Rc<Pager>,
+        eval_state: &mut EvalState,
+        root_page: usize,
+        commit_operators: bool,
+        state_cursor: Option<&mut Box<BTreeCursor>>,
+    ) -> Result<IOResult<Delta>> {
+        // Process delta using the executable operator
+        let op = &mut self.executable;
+
+        // Use provided cursor or create a local one
+        let mut local_cursor;
+        let cursor = if let Some(cursor) = state_cursor {
+            cursor.as_mut()
+        } else {
+            // Create a local cursor if none was provided
+            local_cursor = BTreeCursor::new_table(None, pager.clone(), root_page, OPERATOR_COLUMNS);
+            &mut local_cursor
+        };
+
+        let state = if commit_operators {
+            // Clone the delta from eval_state - don't extract it
+            // in case we need to re-execute due to I/O
+            let delta = match eval_state {
+                EvalState::Init { delta } => delta.clone(),
+                _ => panic!("commit can only be called when eval_state is in Init state"),
+            };
+            let result = return_if_io!(op.commit(delta, cursor));
+            // After successful commit, move state to Done
+            *eval_state = EvalState::Done;
+            result
+        } else {
+            return_if_io!(op.eval(eval_state, cursor))
+        };
+        Ok(IOResult::Done(state))
     }
 }
 
@@ -120,24 +370,48 @@ pub struct DbspCircuit {
     next_id: usize,
     /// Root node ID (the final output)
     pub(super) root: Option<usize>,
+    /// Output schema of the circuit (schema of the root node)
+    pub(super) output_schema: SchemaRef,
+
+    /// State machine for commit operation
+    commit_state: CommitState,
+
+    /// Root page for the main materialized view data
+    pub(super) main_data_root: usize,
+    /// Root page for internal DBSP state
+    pub(super) internal_state_root: usize,
 }
 
 impl DbspCircuit {
-    /// Create a new empty circuit
-    pub fn new() -> Self {
+    /// Create a new empty circuit with initial empty schema
+    /// The actual output schema will be set when the root node is established
+    pub fn new(main_data_root: usize, internal_state_root: usize) -> Self {
+        // Start with an empty schema - will be updated when root is set
+        let empty_schema = Arc::new(LogicalSchema::new(vec![]));
         Self {
             nodes: HashMap::new(),
             next_id: 0,
             root: None,
+            output_schema: empty_schema,
+            commit_state: CommitState::Init,
+            main_data_root,
+            internal_state_root,
         }
     }
 
+    /// Set the root node and update the output schema
+    fn set_root(&mut self, root_id: usize, schema: SchemaRef) {
+        self.root = Some(root_id);
+        self.output_schema = schema;
+    }
+
+    /// Get the current materialized state by reading from btree
     /// Add a node to the circuit
     fn add_node(
         &mut self,
         operator: DbspOperator,
         inputs: Vec<usize>,
-        executable: Option<Box<dyn IncrementalOperator>>,
+        executable: Box<dyn IncrementalOperator>,
     ) -> usize {
         let id = self.next_id;
         self.next_id += 1;
@@ -153,92 +427,41 @@ impl DbspCircuit {
         id
     }
 
-    /// Initialize the circuit with base data. Should be called once before processing deltas.
-    /// If the database is restarting with materialized views, this can be skipped.
-    pub fn initialize(&mut self, input_data: HashMap<String, Delta>) -> Result<Delta> {
+    pub fn run_circuit(
+        &mut self,
+        pager: Rc<Pager>,
+        execute_state: &mut ExecuteState,
+        commit_operators: bool,
+        state_cursor: &mut Box<BTreeCursor>,
+    ) -> Result<IOResult<Delta>> {
         if let Some(root_id) = self.root {
-            self.initialize_node(root_id, &input_data)
+            self.execute_node(
+                root_id,
+                pager,
+                execute_state,
+                commit_operators,
+                Some(state_cursor),
+            )
         } else {
             Err(LimboError::ParseError(
                 "Circuit has no root node".to_string(),
             ))
         }
-    }
-
-    /// Initialize a specific node and its dependencies
-    fn initialize_node(
-        &mut self,
-        node_id: usize,
-        input_data: &HashMap<String, Delta>,
-    ) -> Result<Delta> {
-        // Clone to avoid borrow checker issues
-        let inputs = self
-            .nodes
-            .get(&node_id)
-            .ok_or_else(|| LimboError::ParseError("Node not found".to_string()))?
-            .inputs
-            .clone();
-
-        // Initialize inputs first
-        let mut input_deltas = Vec::new();
-        for input_id in inputs {
-            let delta = self.initialize_node(input_id, input_data)?;
-            input_deltas.push(delta);
-        }
-
-        // Get mutable reference to node
-        let node = self
-            .nodes
-            .get_mut(&node_id)
-            .ok_or_else(|| LimboError::ParseError("Node not found".to_string()))?;
-
-        // Initialize based on operator type
-        let result = match &node.operator {
-            DbspOperator::Input { name, .. } => {
-                // Get data from input map
-                input_data.get(name).cloned().unwrap_or_else(Delta::new)
-            }
-            DbspOperator::Filter { .. }
-            | DbspOperator::Projection { .. }
-            | DbspOperator::Aggregate { .. } => {
-                // Initialize the executable operator
-                if let Some(ref mut op) = node.executable {
-                    if !input_deltas.is_empty() {
-                        let input_delta = input_deltas[0].clone();
-                        op.initialize(input_delta);
-                        op.get_current_state()
-                    } else {
-                        Delta::new()
-                    }
-                } else {
-                    // If no executable, pass through the input
-                    if !input_deltas.is_empty() {
-                        input_deltas[0].clone()
-                    } else {
-                        Delta::new()
-                    }
-                }
-            }
-        };
-
-        Ok(result)
     }
 
     /// Execute the circuit with incremental input data (deltas).
-    /// Call initialize() first for initial data, then use execute() for updates.
     ///
     /// # Arguments
-    /// * `input_data` - The committed deltas to process
-    /// * `uncommitted_data` - Uncommitted transaction deltas that should be visible
-    ///   during this execution but not stored in operators.
-    ///   Use DeltaSet::empty() for no uncommitted changes.
+    /// * `pager` - Pager for btree access
+    /// * `context` - Execution context for tracking operator states
+    /// * `execute_state` - State machine containing input deltas and tracking execution progress
     pub fn execute(
-        &self,
-        input_data: HashMap<String, Delta>,
-        uncommitted_data: DeltaSet,
-    ) -> Result<Delta> {
+        &mut self,
+        pager: Rc<Pager>,
+        execute_state: &mut ExecuteState,
+    ) -> Result<IOResult<Delta>> {
         if let Some(root_id) = self.root {
-            self.execute_node(root_id, &input_data, &uncommitted_data)
+            self.execute_node(root_id, pager, execute_state, false, None)
         } else {
             Err(LimboError::ParseError(
                 "Circuit has no root node".to_string(),
@@ -246,146 +469,243 @@ impl DbspCircuit {
         }
     }
 
-    /// Commit deltas to the circuit, updating internal operator state.
+    /// Commit deltas to the circuit, updating internal operator state and persisting to btree.
     /// This should be called after execute() when you want to make changes permanent.
     ///
     /// # Arguments
     /// * `input_data` - The deltas to commit (same as what was passed to execute)
-    pub fn commit(&mut self, input_data: HashMap<String, Delta>) -> Result<()> {
-        if let Some(root_id) = self.root {
-            self.commit_node(root_id, &input_data)?;
-        }
-        Ok(())
-    }
-
-    /// Commit a specific node in the circuit
-    fn commit_node(
+    /// * `pager` - Pager for creating cursors to the btrees
+    pub fn commit(
         &mut self,
-        node_id: usize,
-        input_data: &HashMap<String, Delta>,
-    ) -> Result<Delta> {
-        // Clone to avoid borrow checker issues
-        let inputs = self
-            .nodes
-            .get(&node_id)
-            .ok_or_else(|| LimboError::ParseError("Node not found".to_string()))?
-            .inputs
-            .clone();
-
-        // Process inputs first
-        let mut input_deltas = Vec::new();
-        for input_id in inputs {
-            let delta = self.commit_node(input_id, input_data)?;
-            input_deltas.push(delta);
+        input_data: HashMap<String, Delta>,
+        pager: Rc<Pager>,
+    ) -> Result<IOResult<Delta>> {
+        // No root means nothing to commit
+        if self.root.is_none() {
+            return Ok(IOResult::Done(Delta::new()));
         }
 
-        // Get mutable reference to node
-        let node = self
-            .nodes
-            .get_mut(&node_id)
-            .ok_or_else(|| LimboError::ParseError("Node not found".to_string()))?;
+        // Get btree root pages
+        let main_data_root = self.main_data_root;
 
-        // Commit based on operator type
-        let result = match &node.operator {
-            DbspOperator::Input { name, .. } => {
-                // For input nodes, just return the committed delta
-                input_data.get(name).cloned().unwrap_or_else(Delta::new)
-            }
-            DbspOperator::Filter { .. }
-            | DbspOperator::Projection { .. }
-            | DbspOperator::Aggregate { .. } => {
-                // Commit the delta to the executable operator
-                if let Some(ref mut op) = node.executable {
-                    if !input_deltas.is_empty() {
-                        let input_delta = input_deltas[0].clone();
-                        // Commit updates state and returns the output delta
-                        op.commit(input_delta)
+        // Add 1 for the weight column that we store in the btree
+        let num_columns = self.output_schema.columns.len() + 1;
+
+        // Convert input_data to DeltaSet once, outside the loop
+        let input_delta_set = DeltaSet::from_map(input_data);
+
+        loop {
+            // Take ownership of the state for processing, to avoid borrow checker issues (we have
+            // to call run_circuit, which takes &mut self. Because of that, cannot use
+            // return_if_io. We have to use the version that restores the state before returning.
+            let mut state = std::mem::replace(&mut self.commit_state, CommitState::Init);
+            match &mut state {
+                CommitState::Init => {
+                    // Create state cursor when entering CommitOperators state
+                    let state_cursor = Box::new(BTreeCursor::new_table(
+                        None,
+                        pager.clone(),
+                        self.internal_state_root,
+                        OPERATOR_COLUMNS,
+                    ));
+
+                    self.commit_state = CommitState::CommitOperators {
+                        execute_state: Box::new(ExecuteState::Init {
+                            input_data: input_delta_set.clone(),
+                        }),
+                        state_cursor,
+                    };
+                }
+                CommitState::CommitOperators {
+                    ref mut execute_state,
+                    ref mut state_cursor,
+                } => {
+                    let delta = return_and_restore_if_io!(
+                        &mut self.commit_state,
+                        state,
+                        self.run_circuit(pager.clone(), execute_state, true, state_cursor)
+                    );
+
+                    // Create view cursor when entering UpdateView state
+                    let view_cursor = Box::new(BTreeCursor::new_table(
+                        None,
+                        pager.clone(),
+                        main_data_root,
+                        num_columns,
+                    ));
+
+                    self.commit_state = CommitState::UpdateView {
+                        delta,
+                        current_index: 0,
+                        write_row_state: WriteViewRow::new(),
+                        view_cursor,
+                    };
+                }
+                CommitState::UpdateView {
+                    delta,
+                    current_index,
+                    write_row_state,
+                    view_cursor,
+                } => {
+                    if *current_index >= delta.changes.len() {
+                        self.commit_state = CommitState::Init;
+                        let delta = std::mem::take(delta);
+                        return Ok(IOResult::Done(delta));
                     } else {
-                        Delta::new()
-                    }
-                } else {
-                    // If no executable, pass through the input
-                    if !input_deltas.is_empty() {
-                        input_deltas[0].clone()
-                    } else {
-                        Delta::new()
+                        let (row, weight) = delta.changes[*current_index].clone();
+
+                        // If we're starting a new row (Empty state), we need a fresh cursor
+                        // due to btree cursor state machine limitations
+                        if matches!(write_row_state, WriteViewRow::Empty) {
+                            *view_cursor = Box::new(BTreeCursor::new_table(
+                                None,
+                                pager.clone(),
+                                main_data_root,
+                                num_columns,
+                            ));
+                        }
+
+                        return_and_restore_if_io!(
+                            &mut self.commit_state,
+                            state,
+                            write_row_state.write_row(view_cursor, row, weight)
+                        );
+
+                        // Move to next row
+                        let delta = std::mem::take(delta);
+                        // Take ownership of view_cursor - we'll create a new one for next row if needed
+                        let view_cursor = std::mem::replace(
+                            view_cursor,
+                            Box::new(BTreeCursor::new_table(
+                                None,
+                                pager.clone(),
+                                main_data_root,
+                                num_columns,
+                            )),
+                        );
+
+                        self.commit_state = CommitState::UpdateView {
+                            delta,
+                            current_index: *current_index + 1,
+                            write_row_state: WriteViewRow::new(),
+                            view_cursor,
+                        };
                     }
                 }
             }
-        };
-        Ok(result)
+        }
     }
 
     /// Execute a specific node in the circuit
     fn execute_node(
-        &self,
+        &mut self,
         node_id: usize,
-        input_data: &HashMap<String, Delta>,
-        uncommitted_data: &DeltaSet,
-    ) -> Result<Delta> {
-        // Clone to avoid borrow checker issues
-        let inputs = self
-            .nodes
-            .get(&node_id)
-            .ok_or_else(|| LimboError::ParseError("Node not found".to_string()))?
-            .inputs
-            .clone();
+        pager: Rc<Pager>,
+        execute_state: &mut ExecuteState,
+        commit_operators: bool,
+        state_cursor: Option<&mut Box<BTreeCursor>>,
+    ) -> Result<IOResult<Delta>> {
+        loop {
+            match execute_state {
+                ExecuteState::Uninitialized => {
+                    panic!("Trying to execute an uninitialized ExecuteState state machine");
+                }
+                ExecuteState::Init { input_data } => {
+                    let node = self
+                        .nodes
+                        .get(&node_id)
+                        .ok_or_else(|| LimboError::ParseError("Node not found".to_string()))?;
 
-        // Process inputs first
-        let mut input_deltas = Vec::new();
-        for input_id in inputs {
-            let delta = self.execute_node(input_id, input_data, uncommitted_data)?;
-            input_deltas.push(delta);
+                    // Check if this is an Input node
+                    match &node.operator {
+                        DbspOperator::Input { name, .. } => {
+                            // Input nodes get their delta directly from input_data
+                            let delta = input_data.get(name);
+                            *execute_state = ExecuteState::ProcessingNode {
+                                eval_state: Box::new(EvalState::Init { delta }),
+                            };
+                        }
+                        _ => {
+                            // Non-input nodes need to process their inputs
+                            let input_data = std::mem::take(input_data);
+                            let input_node_ids = node.inputs.clone();
+
+                            let input_states: Vec<(usize, ExecuteState)> = input_node_ids
+                                .iter()
+                                .map(|&input_id| {
+                                    (
+                                        input_id,
+                                        ExecuteState::Init {
+                                            input_data: input_data.clone(),
+                                        },
+                                    )
+                                })
+                                .collect();
+
+                            *execute_state = ExecuteState::ProcessingInputs {
+                                input_states,
+                                current_index: 0,
+                                input_deltas: Vec::new(),
+                            };
+                        }
+                    }
+                }
+                ExecuteState::ProcessingInputs {
+                    input_states,
+                    current_index,
+                    input_deltas,
+                } => {
+                    if *current_index >= input_states.len() {
+                        // All inputs processed, check we have exactly one delta
+                        // (Input nodes never reach here since they go straight to ProcessingNode)
+                        let delta = if input_deltas.is_empty() {
+                            return Err(LimboError::InternalError(
+                                "execute() cannot be called without a Delta".to_string(),
+                            ));
+                        } else if input_deltas.len() > 1 {
+                            return Err(LimboError::InternalError(
+                                format!("Until joins are supported, only one delta is expected. Got {} deltas", input_deltas.len()),
+                            ));
+                        } else {
+                            input_deltas[0].clone()
+                        };
+
+                        *execute_state = ExecuteState::ProcessingNode {
+                            eval_state: Box::new(EvalState::Init { delta }),
+                        };
+                    } else {
+                        // Get the (node_id, state) pair for the current index
+                        let (input_node_id, input_state) = &mut input_states[*current_index];
+
+                        let delta = return_if_io!(self.execute_node(
+                            *input_node_id,
+                            pager.clone(),
+                            input_state,
+                            commit_operators,
+                            None // Input nodes don't need state cursor
+                        ));
+                        input_deltas.push(delta);
+                        *current_index += 1;
+                    }
+                }
+                ExecuteState::ProcessingNode { eval_state } => {
+                    // Get mutable reference to node for eval
+                    let node = self
+                        .nodes
+                        .get_mut(&node_id)
+                        .ok_or_else(|| LimboError::ParseError("Node not found".to_string()))?;
+
+                    let output_delta = return_if_io!(node.process_node(
+                        pager.clone(),
+                        eval_state,
+                        self.internal_state_root,
+                        commit_operators,
+                        state_cursor,
+                    ));
+                    return Ok(IOResult::Done(output_delta));
+                }
+            }
         }
-
-        // Get reference to node (read-only since we're using eval, not commit)
-        let node = self
-            .nodes
-            .get(&node_id)
-            .ok_or_else(|| LimboError::ParseError("Node not found".to_string()))?;
-
-        // Execute based on operator type
-        let result = match &node.operator {
-            DbspOperator::Input { name, .. } => {
-                // Get committed data from input map and merge with uncommitted if present
-                let committed = input_data.get(name).cloned().unwrap_or_else(Delta::new);
-                let uncommitted = uncommitted_data.get(name);
-
-                // If there's uncommitted data for this table, merge it with committed
-                if !uncommitted.is_empty() {
-                    let mut combined = committed;
-                    combined.merge(&uncommitted);
-                    combined
-                } else {
-                    committed
-                }
-            }
-            DbspOperator::Filter { .. }
-            | DbspOperator::Projection { .. }
-            | DbspOperator::Aggregate { .. } => {
-                // Process delta using the executable operator
-                if let Some(ref op) = node.executable {
-                    if !input_deltas.is_empty() {
-                        // Process the delta through the operator
-                        let input_delta = input_deltas[0].clone();
-
-                        // Use eval to compute result without modifying state
-                        // The uncommitted data has already been merged into input_delta if needed
-                        op.eval(input_delta, None)
-                    } else {
-                        Delta::new()
-                    }
-                } else {
-                    // If no executable, pass through the input
-                    if !input_deltas.is_empty() {
-                        input_deltas[0].clone()
-                    } else {
-                        Delta::new()
-                    }
-                }
-            }
-        };
-        Ok(result)
     }
 }
 
@@ -440,16 +760,17 @@ pub struct DbspCompiler {
 
 impl DbspCompiler {
     /// Create a new DBSP compiler
-    pub fn new() -> Self {
+    pub fn new(main_data_root: usize, internal_state_root: usize) -> Self {
         Self {
-            circuit: DbspCircuit::new(),
+            circuit: DbspCircuit::new(main_data_root, internal_state_root),
         }
     }
 
     /// Compile a logical plan to a DBSP circuit
     pub fn compile(mut self, plan: &LogicalPlan) -> Result<DbspCircuit> {
         let root_id = self.compile_plan(plan)?;
-        self.circuit.root = Some(root_id);
+        let output_schema = plan.schema().clone();
+        self.circuit.set_root(root_id, output_schema);
         Ok(self.circuit)
     }
 
@@ -486,10 +807,8 @@ impl DbspCompiler {
                     .collect();
 
                 // Create the ProjectOperator
-                let executable: Option<Box<dyn IncrementalOperator>> =
-                    ProjectOperator::from_compiled(compiled_exprs, aliases, input_column_names, output_column_names)
-                        .ok()
-                        .map(|op| Box::new(op) as Box<dyn IncrementalOperator>);
+                let executable: Box<dyn IncrementalOperator> =
+                    Box::new(ProjectOperator::from_compiled(compiled_exprs, aliases, input_column_names, output_column_names)?);
 
                 // Create projection node
                 let node_id = self.circuit.add_node(
@@ -526,7 +845,7 @@ impl DbspCompiler {
                 let node_id = self.circuit.add_node(
                     DbspOperator::Filter { predicate: dbsp_predicate },
                     vec![input_id],
-                    Some(executable),
+                    executable,
                 );
                 Ok(node_id)
             }
@@ -621,15 +940,16 @@ impl DbspCompiler {
                     }
                 }
 
-                // Create the AggregateOperator
+                // Create the AggregateOperator with a unique operator_id
+                // Use the next_node_id as the operator_id to ensure uniqueness
+                let operator_id = self.circuit.next_id;
                 use crate::incremental::operator::AggregateOperator;
-                let executable: Option<Box<dyn IncrementalOperator>> = Some(
-                    Box::new(AggregateOperator::new(
-                        group_by_columns,
-                        aggregate_functions.clone(),
-                        input_column_names,
-                    ))
-                );
+                let executable: Box<dyn IncrementalOperator> = Box::new(AggregateOperator::new(
+                    operator_id,  // Use next_node_id as operator_id
+                    group_by_columns,
+                    aggregate_functions.clone(),
+                    input_column_names,
+                ));
 
                 // Create aggregate node
                 let node_id = self.circuit.add_node(
@@ -644,14 +964,17 @@ impl DbspCompiler {
                 Ok(node_id)
             }
             LogicalPlan::TableScan(scan) => {
-                // Create input node (no executable needed for input)
+                // Create input node with InputOperator for uniform handling
+                let executable: Box<dyn IncrementalOperator> =
+                    Box::new(InputOperator::new(scan.table_name.clone()));
+
                 let node_id = self.circuit.add_node(
                     DbspOperator::Input {
                         name: scan.table_name.clone(),
                         schema: scan.schema.clone(),
                     },
                     vec![],
-                    None,
+                    executable,
                 );
                 Ok(node_id)
             }
@@ -925,10 +1248,15 @@ impl DbspCompiler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::incremental::operator::{Delta, FilterOperator, FilterPredicate};
+    use crate::incremental::dbsp::Delta;
+    use crate::incremental::operator::{FilterOperator, FilterPredicate};
     use crate::schema::{BTreeTable, Column as SchemaColumn, Schema, Type};
+    use crate::storage::pager::CreateBTreeFlags;
     use crate::translate::logical::LogicalPlanBuilder;
     use crate::translate::logical::LogicalSchema;
+    use crate::util::IOExt;
+    use crate::{Database, MemoryIO, Pager, IO};
+    use std::rc::Rc;
     use std::sync::Arc;
     use turso_parser::ast;
     use turso_parser::parser::Parser;
@@ -984,13 +1312,71 @@ mod tests {
                 unique_sets: None,
             };
             schema.add_btree_table(Arc::new(users_table));
+            let sales_table = BTreeTable {
+                name: "sales".to_string(),
+                root_page: 2,
+                primary_key_columns: vec![],
+                columns: vec![
+                    SchemaColumn {
+                        name: Some("product_id".to_string()),
+                        ty: Type::Integer,
+                        ty_str: "INTEGER".to_string(),
+                        primary_key: false,
+                        is_rowid_alias: false,
+                        notnull: false,
+                        default: None,
+                        unique: false,
+                        collation: None,
+                        hidden: false,
+                    },
+                    SchemaColumn {
+                        name: Some("amount".to_string()),
+                        ty: Type::Integer,
+                        ty_str: "INTEGER".to_string(),
+                        primary_key: false,
+                        is_rowid_alias: false,
+                        notnull: false,
+                        default: None,
+                        unique: false,
+                        collation: None,
+                        hidden: false,
+                    },
+                ],
+                has_rowid: true,
+                is_strict: false,
+                unique_sets: None,
+            };
+            schema.add_btree_table(Arc::new(sales_table));
+
             schema
         }};
+    }
+
+    fn setup_btree_for_circuit() -> (Rc<Pager>, usize, usize) {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = Database::open_file(io.clone(), ":memory:", false, false).unwrap();
+        let conn = db.connect().unwrap();
+        let pager = conn.pager.borrow().clone();
+
+        let _ = pager.io.block(|| pager.allocate_page1()).unwrap();
+
+        let main_root_page = pager
+            .io
+            .block(|| pager.btree_create(&CreateBTreeFlags::new_table()))
+            .unwrap() as usize;
+
+        let dbsp_state_page = pager
+            .io
+            .block(|| pager.btree_create(&CreateBTreeFlags::new_table()))
+            .unwrap() as usize;
+
+        (pager, main_root_page, dbsp_state_page)
     }
 
     // Macro to compile SQL to DBSP circuit
     macro_rules! compile_sql {
         ($sql:expr) => {{
+            let (pager, main_root_page, dbsp_state_page) = setup_btree_for_circuit();
             let schema = test_schema!();
             let mut parser = Parser::new($sql.as_bytes());
             let cmd = parser
@@ -1002,7 +1388,12 @@ mod tests {
                 ast::Cmd::Stmt(stmt) => {
                     let mut builder = LogicalPlanBuilder::new(&schema);
                     let logical_plan = builder.build_statement(&stmt).unwrap();
-                    DbspCompiler::new().compile(&logical_plan).unwrap()
+                    (
+                        DbspCompiler::new(main_root_page, dbsp_state_page)
+                            .compile(&logical_plan)
+                            .unwrap(),
+                        pager,
+                    )
                 }
                 _ => panic!("Only SQL statements are supported"),
             }
@@ -1108,40 +1499,72 @@ mod tests {
         circuit.nodes.get(&current_id).expect("Node not found")
     }
 
-    // Helper to get the current accumulated state of the circuit (from the root operator)
-    // This returns the internal state including bookkeeping entries
-    fn get_current_state(circuit: &DbspCircuit) -> Result<Delta> {
-        if let Some(root_id) = circuit.root {
-            let node = circuit
-                .nodes
-                .get(&root_id)
-                .ok_or_else(|| LimboError::ParseError("Root node not found".to_string()))?;
-
-            if let Some(ref executable) = node.executable {
-                Ok(executable.get_current_state())
-            } else {
-                // Input nodes don't have executables but also don't have state
-                Ok(Delta::new())
-            }
-        } else {
-            Err(LimboError::ParseError(
-                "Circuit has no root node".to_string(),
-            ))
+    // Helper function for tests to execute circuit and extract the Delta result
+    #[cfg(test)]
+    fn test_execute(
+        circuit: &mut DbspCircuit,
+        inputs: HashMap<String, Delta>,
+        pager: Rc<Pager>,
+    ) -> Result<Delta> {
+        let mut execute_state = ExecuteState::Init {
+            input_data: DeltaSet::from_map(inputs),
+        };
+        match circuit.execute(pager, &mut execute_state)? {
+            IOResult::Done(delta) => Ok(delta),
+            IOResult::IO(_) => panic!("Unexpected I/O in test"),
         }
     }
 
-    // Helper to create a DeltaSet from a HashMap (for tests)
-    fn delta_set_from_map(map: HashMap<String, Delta>) -> DeltaSet {
-        let mut delta_set = DeltaSet::new();
-        for (key, value) in map {
-            delta_set.insert(key, value);
+    // Helper to get the committed BTree state from main_data_root
+    // This reads the actual persisted data from the BTree
+    #[cfg(test)]
+    fn get_current_state(pager: Rc<Pager>, circuit: &DbspCircuit) -> Result<Delta> {
+        let mut delta = Delta::new();
+
+        let main_data_root = circuit.main_data_root;
+        let num_columns = circuit.output_schema.columns.len() + 1;
+
+        // Create a cursor to read the btree
+        let mut btree_cursor =
+            BTreeCursor::new_table(None, pager.clone(), main_data_root, num_columns);
+
+        // Rewind to the beginning
+        pager.io.block(|| btree_cursor.rewind())?;
+
+        // Read all rows from the BTree
+        loop {
+            // Check if cursor is empty (no more rows)
+            if btree_cursor.is_empty() {
+                break;
+            }
+
+            // Get the rowid
+            let rowid = pager.io.block(|| btree_cursor.rowid()).unwrap().unwrap();
+
+            // Get the record at this position
+            let record = pager
+                .io
+                .block(|| btree_cursor.record())
+                .unwrap()
+                .unwrap()
+                .to_owned();
+
+            let values_ref = record.get_values();
+            let num_data_columns = values_ref.len() - 1; // Get length before consuming
+            let values: Vec<Value> = values_ref
+                .into_iter()
+                .take(num_data_columns) // Skip the weight column
+                .map(|x| x.to_owned())
+                .collect();
+            delta.insert(rowid, values);
+            pager.io.block(|| btree_cursor.next()).unwrap();
         }
-        delta_set
+        Ok(delta)
     }
 
     #[test]
     fn test_simple_projection() {
-        let circuit = compile_sql!("SELECT name FROM users");
+        let (circuit, _) = compile_sql!("SELECT name FROM users");
 
         // Circuit has 2 nodes with Projection at root
         assert_circuit!(circuit, depth: 2, root: Projection);
@@ -1153,7 +1576,7 @@ mod tests {
 
     #[test]
     fn test_filter_with_projection() {
-        let circuit = compile_sql!("SELECT name FROM users WHERE age > 18");
+        let (circuit, _) = compile_sql!("SELECT name FROM users WHERE age > 18");
 
         // Circuit has 3 nodes with Projection at root
         assert_circuit!(circuit, depth: 3, root: Projection);
@@ -1167,7 +1590,7 @@ mod tests {
 
     #[test]
     fn test_select_star() {
-        let mut circuit = compile_sql!("SELECT * FROM users");
+        let (mut circuit, pager) = compile_sql!("SELECT * FROM users");
 
         // Create test data
         let mut input_delta = Delta::new();
@@ -1192,8 +1615,11 @@ mod tests {
         let mut inputs = HashMap::new();
         inputs.insert("users".to_string(), input_delta);
 
-        // Initialize circuit with initial data
-        let result = circuit.initialize(inputs).unwrap();
+        let result = test_execute(&mut circuit, inputs.clone(), pager.clone()).unwrap();
+        pager
+            .io
+            .block(|| circuit.commit(inputs.clone(), pager.clone()))
+            .unwrap();
 
         // Should have all rows with all columns
         assert_eq!(result.changes.len(), 2);
@@ -1207,7 +1633,7 @@ mod tests {
 
     #[test]
     fn test_execute_filter() {
-        let mut circuit = compile_sql!("SELECT * FROM users WHERE age > 18");
+        let (mut circuit, pager) = compile_sql!("SELECT * FROM users WHERE age > 18");
 
         // Create test data
         let mut input_delta = Delta::new();
@@ -1240,8 +1666,11 @@ mod tests {
         let mut inputs = HashMap::new();
         inputs.insert("users".to_string(), input_delta);
 
-        // Initialize circuit with initial data
-        let result = circuit.initialize(inputs).unwrap();
+        let result = test_execute(&mut circuit, inputs.clone(), pager.clone()).unwrap();
+        pager
+            .io
+            .block(|| circuit.commit(inputs.clone(), pager.clone()))
+            .unwrap();
 
         // Should only have Alice and Charlie (age > 18)
         assert_eq!(
@@ -1284,7 +1713,7 @@ mod tests {
 
     #[test]
     fn test_simple_column_projection() {
-        let mut circuit = compile_sql!("SELECT name, age FROM users");
+        let (mut circuit, pager) = compile_sql!("SELECT name, age FROM users");
 
         // Create test data
         let mut input_delta = Delta::new();
@@ -1309,8 +1738,11 @@ mod tests {
         let mut inputs = HashMap::new();
         inputs.insert("users".to_string(), input_delta);
 
-        // Initialize circuit with initial data
-        let result = circuit.initialize(inputs).unwrap();
+        let result = test_execute(&mut circuit, inputs.clone(), pager.clone()).unwrap();
+        pager
+            .io
+            .block(|| circuit.commit(inputs.clone(), pager.clone()))
+            .unwrap();
 
         // Should have all rows but only 2 columns (name, age)
         assert_eq!(result.changes.len(), 2);
@@ -1327,7 +1759,7 @@ mod tests {
     #[test]
     fn test_simple_aggregation() {
         // Test COUNT(*) with GROUP BY
-        let mut circuit = compile_sql!("SELECT age, COUNT(*) FROM users GROUP BY age");
+        let (mut circuit, pager) = compile_sql!("SELECT age, COUNT(*) FROM users GROUP BY age");
 
         // Create test data
         let mut input_delta = Delta::new();
@@ -1360,8 +1792,11 @@ mod tests {
         let mut inputs = HashMap::new();
         inputs.insert("users".to_string(), input_delta);
 
-        // Initialize circuit with initial data
-        let result = circuit.initialize(inputs).unwrap();
+        let result = test_execute(&mut circuit, inputs.clone(), pager.clone()).unwrap();
+        pager
+            .io
+            .block(|| circuit.commit(inputs.clone(), pager.clone()))
+            .unwrap();
 
         // Should have 2 groups: age 25 with count 2, age 30 with count 1
         assert_eq!(result.changes.len(), 2);
@@ -1392,7 +1827,7 @@ mod tests {
     #[test]
     fn test_sum_aggregation() {
         // Test SUM with GROUP BY
-        let mut circuit = compile_sql!("SELECT name, SUM(age) FROM users GROUP BY name");
+        let (mut circuit, pager) = compile_sql!("SELECT name, SUM(age) FROM users GROUP BY name");
 
         // Create test data - some names appear multiple times
         let mut input_delta = Delta::new();
@@ -1425,8 +1860,11 @@ mod tests {
         let mut inputs = HashMap::new();
         inputs.insert("users".to_string(), input_delta);
 
-        // Initialize circuit with initial data
-        let result = circuit.initialize(inputs).unwrap();
+        let result = test_execute(&mut circuit, inputs.clone(), pager.clone()).unwrap();
+        pager
+            .io
+            .block(|| circuit.commit(inputs.clone(), pager.clone()))
+            .unwrap();
 
         // Should have 2 groups: Alice with sum 55, Bob with sum 20
         assert_eq!(result.changes.len(), 2);
@@ -1448,7 +1886,7 @@ mod tests {
     #[test]
     fn test_aggregation_without_group_by() {
         // Test aggregation without GROUP BY - should produce a single row
-        let mut circuit = compile_sql!("SELECT COUNT(*), SUM(age), AVG(age) FROM users");
+        let (mut circuit, pager) = compile_sql!("SELECT COUNT(*), SUM(age), AVG(age) FROM users");
 
         // Create test data
         let mut input_delta = Delta::new();
@@ -1481,8 +1919,11 @@ mod tests {
         let mut inputs = HashMap::new();
         inputs.insert("users".to_string(), input_delta);
 
-        // Initialize circuit with initial data
-        let result = circuit.initialize(inputs).unwrap();
+        let result = test_execute(&mut circuit, inputs.clone(), pager.clone()).unwrap();
+        pager
+            .io
+            .block(|| circuit.commit(inputs.clone(), pager.clone()))
+            .unwrap();
 
         // Should have exactly 1 row with all aggregates
         assert_eq!(
@@ -1521,7 +1962,7 @@ mod tests {
     #[test]
     fn test_expression_projection_execution() {
         // Test that complex expressions work through VDBE compilation
-        let mut circuit = compile_sql!("SELECT hex(id) FROM users");
+        let (mut circuit, pager) = compile_sql!("SELECT hex(id) FROM users");
 
         // Create test data
         let mut input_delta = Delta::new();
@@ -1546,8 +1987,11 @@ mod tests {
         let mut inputs = HashMap::new();
         inputs.insert("users".to_string(), input_delta);
 
-        // Initialize circuit with initial data
-        let result = circuit.initialize(inputs).unwrap();
+        let result = test_execute(&mut circuit, inputs.clone(), pager.clone()).unwrap();
+        pager
+            .io
+            .block(|| circuit.commit(inputs.clone(), pager.clone()))
+            .unwrap();
 
         assert_eq!(result.changes.len(), 2);
 
@@ -1586,7 +2030,7 @@ mod tests {
     fn test_projection_aggregation_projection_pattern() {
         // Test pattern: projection -> aggregation -> projection
         // Query: SELECT HEX(SUM(age + 2)) FROM users
-        let mut circuit = compile_sql!("SELECT HEX(SUM(age + 2)) FROM users");
+        let (mut circuit, pager) = compile_sql!("SELECT HEX(SUM(age + 2)) FROM users");
 
         // Initial input data
         let mut input_delta = Delta::new();
@@ -1618,8 +2062,11 @@ mod tests {
         let mut input_data = HashMap::new();
         input_data.insert("users".to_string(), input_delta);
 
-        // Initialize the circuit with the initial data
-        let result = circuit.initialize(input_data).unwrap();
+        let result = test_execute(&mut circuit, input_data.clone(), pager.clone()).unwrap();
+        pager
+            .io
+            .block(|| circuit.commit(input_data.clone(), pager.clone()))
+            .unwrap();
 
         // Expected: SUM(age + 2) = (25+2) + (30+2) + (35+2) = 27 + 32 + 37 = 96
         // HEX(96) should be the hex representation of the string "96" = "3936"
@@ -1649,7 +2096,7 @@ mod tests {
         let mut input_data = HashMap::new();
         input_data.insert("users".to_string(), input_delta);
 
-        let result = circuit.execute(input_data, DeltaSet::empty()).unwrap();
+        let result = test_execute(&mut circuit, input_data, pager.clone()).unwrap();
 
         // Expected: new SUM(age + 2) = 96 + (40+2) = 138
         // HEX(138) = hex of "138" = "313338"
@@ -1674,7 +2121,8 @@ mod tests {
     fn test_nested_projection_with_groupby() {
         // Test pattern: projection -> aggregation with GROUP BY -> projection
         // Query: SELECT name, HEX(SUM(age * 2)) FROM users GROUP BY name
-        let mut circuit = compile_sql!("SELECT name, HEX(SUM(age * 2)) FROM users GROUP BY name");
+        let (mut circuit, pager) =
+            compile_sql!("SELECT name, HEX(SUM(age * 2)) FROM users GROUP BY name");
 
         // Initial input data
         let mut input_delta = Delta::new();
@@ -1706,8 +2154,11 @@ mod tests {
         let mut input_data = HashMap::new();
         input_data.insert("users".to_string(), input_delta);
 
-        // Initialize circuit with initial data
-        let result = circuit.initialize(input_data).unwrap();
+        let result = test_execute(&mut circuit, input_data.clone(), pager.clone()).unwrap();
+        pager
+            .io
+            .block(|| circuit.commit(input_data.clone(), pager.clone()))
+            .unwrap();
 
         // Expected results:
         // Alice: SUM(25*2 + 35*2) = 50 + 70 = 120, HEX("120") = "313230"
@@ -1746,7 +2197,7 @@ mod tests {
     fn test_transaction_context() {
         // Test that uncommitted changes are visible within a transaction
         // but don't affect the operator's internal state
-        let mut circuit = compile_sql!("SELECT * FROM users WHERE age > 18");
+        let (mut circuit, pager) = compile_sql!("SELECT * FROM users WHERE age > 18");
 
         // Initialize with some data
         let mut init_data = HashMap::new();
@@ -1769,10 +2220,13 @@ mod tests {
         );
         init_data.insert("users".to_string(), delta);
 
-        circuit.initialize(init_data).unwrap();
+        let _ = test_execute(&mut circuit, init_data.clone(), pager.clone()).unwrap();
+        let state = pager
+            .io
+            .block(|| circuit.commit(init_data.clone(), pager.clone()))
+            .unwrap();
 
-        // Verify initial state: only Alice (age > 18)
-        let state = get_current_state(&circuit).unwrap();
+        // Verify initial delta : only Alice (age > 18)
         assert_eq!(state.changes.len(), 1);
         assert_eq!(state.changes[0].0.values[1], Value::Text("Alice".into()));
 
@@ -1801,9 +2255,7 @@ mod tests {
 
         // Execute with uncommitted data - this simulates processing the uncommitted changes
         // through the circuit to see what would be visible
-        let tx_result = circuit
-            .execute(HashMap::new(), delta_set_from_map(uncommitted.clone()))
-            .unwrap();
+        let tx_result = test_execute(&mut circuit, uncommitted.clone(), pager.clone()).unwrap();
 
         // The result should show Charlie being added (passes filter, age > 18)
         // David is filtered out (age 15 < 18)
@@ -1826,9 +2278,7 @@ mod tests {
         );
         commit_data.insert("users".to_string(), commit_delta);
 
-        let commit_result = circuit
-            .execute(commit_data.clone(), DeltaSet::empty())
-            .unwrap();
+        let commit_result = test_execute(&mut circuit, commit_data.clone(), pager.clone()).unwrap();
 
         // The commit result should show Charlie being added
         assert_eq!(commit_result.changes.len(), 1, "Should see Charlie added");
@@ -1838,17 +2288,20 @@ mod tests {
         );
 
         // Commit the change to make it permanent
-        circuit.commit(commit_data).unwrap();
+        pager
+            .io
+            .block(|| circuit.commit(commit_data.clone(), pager.clone()))
+            .unwrap();
 
         // Now if we execute again with no changes, we should see no delta
-        let empty_result = circuit.execute(HashMap::new(), DeltaSet::empty()).unwrap();
+        let empty_result = test_execute(&mut circuit, HashMap::new(), pager.clone()).unwrap();
         assert_eq!(empty_result.changes.len(), 0, "No changes when no new data");
     }
 
     #[test]
     fn test_uncommitted_delete() {
         // Test that uncommitted deletes are handled correctly without affecting operator state
-        let mut circuit = compile_sql!("SELECT * FROM users WHERE age > 18");
+        let (mut circuit, pager) = compile_sql!("SELECT * FROM users WHERE age > 18");
 
         // Initialize with some data
         let mut init_data = HashMap::new();
@@ -1879,10 +2332,13 @@ mod tests {
         );
         init_data.insert("users".to_string(), delta);
 
-        circuit.initialize(init_data).unwrap();
+        let _ = test_execute(&mut circuit, init_data.clone(), pager.clone()).unwrap();
+        let state = pager
+            .io
+            .block(|| circuit.commit(init_data.clone(), pager.clone()))
+            .unwrap();
 
-        // Verify initial state: Alice, Bob, Charlie (all age > 18)
-        let state = get_current_state(&circuit).unwrap();
+        // Verify initial delta: Alice, Bob, Charlie (all age > 18)
         assert_eq!(state.changes.len(), 3);
 
         // Create uncommitted delete for Bob
@@ -1899,9 +2355,7 @@ mod tests {
         uncommitted.insert("users".to_string(), uncommitted_delta);
 
         // Execute with uncommitted delete
-        let tx_result = circuit
-            .execute(HashMap::new(), delta_set_from_map(uncommitted.clone()))
-            .unwrap();
+        let tx_result = test_execute(&mut circuit, uncommitted.clone(), pager.clone()).unwrap();
 
         // Result should show the deleted row that passed the filter
         assert_eq!(
@@ -1911,7 +2365,7 @@ mod tests {
         );
 
         // Verify operator's internal state is unchanged (still has all 3 users)
-        let state_after = get_current_state(&circuit).unwrap();
+        let state_after = get_current_state(pager.clone(), &circuit).unwrap();
         assert_eq!(
             state_after.changes.len(),
             3,
@@ -1931,12 +2385,13 @@ mod tests {
         );
         commit_data.insert("users".to_string(), commit_delta);
 
-        let commit_result = circuit
-            .execute(commit_data.clone(), DeltaSet::empty())
-            .unwrap();
+        let commit_result = test_execute(&mut circuit, commit_data.clone(), pager.clone()).unwrap();
 
         // Actually commit the delete to update operator state
-        circuit.commit(commit_data).unwrap();
+        pager
+            .io
+            .block(|| circuit.commit(commit_data.clone(), pager.clone()))
+            .unwrap();
 
         // The commit result should show Bob being deleted
         assert_eq!(commit_result.changes.len(), 1, "Should see Bob deleted");
@@ -1950,7 +2405,7 @@ mod tests {
         );
 
         // After commit, internal state should have only Alice and Charlie
-        let final_state = get_current_state(&circuit).unwrap();
+        let final_state = get_current_state(pager.clone(), &circuit).unwrap();
         assert_eq!(
             final_state.changes.len(),
             2,
@@ -1976,7 +2431,7 @@ mod tests {
     #[test]
     fn test_uncommitted_update() {
         // Test that uncommitted updates (delete + insert) are handled correctly
-        let mut circuit = compile_sql!("SELECT * FROM users WHERE age > 18");
+        let (mut circuit, pager) = compile_sql!("SELECT * FROM users WHERE age > 18");
 
         // Initialize with some data
         let mut init_data = HashMap::new();
@@ -1999,7 +2454,11 @@ mod tests {
         ); // Bob is 17, filtered out
         init_data.insert("users".to_string(), delta);
 
-        circuit.initialize(init_data).unwrap();
+        let _ = test_execute(&mut circuit, init_data.clone(), pager.clone()).unwrap();
+        pager
+            .io
+            .block(|| circuit.commit(init_data.clone(), pager.clone()))
+            .unwrap();
 
         // Create uncommitted update: Bob turns 19 (update from 17 to 19)
         // This is modeled as delete + insert
@@ -2024,9 +2483,7 @@ mod tests {
         uncommitted.insert("users".to_string(), uncommitted_delta);
 
         // Execute with uncommitted update
-        let tx_result = circuit
-            .execute(HashMap::new(), delta_set_from_map(uncommitted.clone()))
-            .unwrap();
+        let tx_result = test_execute(&mut circuit, uncommitted.clone(), pager.clone()).unwrap();
 
         // Bob should now appear in the result (age 19 > 18)
         // Consolidate to see the final state
@@ -2062,10 +2519,13 @@ mod tests {
         commit_data.insert("users".to_string(), commit_delta);
 
         // Commit the update
-        circuit.commit(commit_data).unwrap();
+        pager
+            .io
+            .block(|| circuit.commit(commit_data.clone(), pager.clone()))
+            .unwrap();
 
         // After committing, Bob should be in the view's state
-        let state = get_current_state(&circuit).unwrap();
+        let state = get_current_state(pager.clone(), &circuit).unwrap();
         let mut consolidated_state = state;
         consolidated_state.consolidate();
 
@@ -2094,7 +2554,7 @@ mod tests {
     #[test]
     fn test_uncommitted_filtered_delete() {
         // Test deleting a row that doesn't pass the filter
-        let mut circuit = compile_sql!("SELECT * FROM users WHERE age > 18");
+        let (mut circuit, pager) = compile_sql!("SELECT * FROM users WHERE age > 18");
 
         // Initialize with mixed data
         let mut init_data = HashMap::new();
@@ -2117,7 +2577,11 @@ mod tests {
         ); // Bob doesn't pass filter
         init_data.insert("users".to_string(), delta);
 
-        circuit.initialize(init_data).unwrap();
+        let _ = test_execute(&mut circuit, init_data.clone(), pager.clone()).unwrap();
+        pager
+            .io
+            .block(|| circuit.commit(init_data.clone(), pager.clone()))
+            .unwrap();
 
         // Create uncommitted delete for Bob (who isn't in the view because age=15)
         let mut uncommitted = HashMap::new();
@@ -2133,9 +2597,7 @@ mod tests {
         uncommitted.insert("users".to_string(), uncommitted_delta);
 
         // Execute with uncommitted delete - should produce no output changes
-        let tx_result = circuit
-            .execute(HashMap::new(), delta_set_from_map(uncommitted))
-            .unwrap();
+        let tx_result = test_execute(&mut circuit, uncommitted, pager.clone()).unwrap();
 
         // Bob wasn't in the view, so deleting him produces no output
         assert_eq!(
@@ -2145,7 +2607,7 @@ mod tests {
         );
 
         // The view state should still only have Alice
-        let state = get_current_state(&circuit).unwrap();
+        let state = get_current_state(pager.clone(), &circuit).unwrap();
         assert_eq!(state.changes.len(), 1, "View still has only Alice");
         assert_eq!(state.changes[0].0.values[1], Value::Text("Alice".into()));
     }
@@ -2153,7 +2615,7 @@ mod tests {
     #[test]
     fn test_uncommitted_mixed_operations() {
         // Test multiple uncommitted operations together
-        let mut circuit = compile_sql!("SELECT * FROM users WHERE age > 18");
+        let (mut circuit, pager) = compile_sql!("SELECT * FROM users WHERE age > 18");
 
         // Initialize with some data
         let mut init_data = HashMap::new();
@@ -2176,10 +2638,14 @@ mod tests {
         );
         init_data.insert("users".to_string(), delta);
 
-        circuit.initialize(init_data).unwrap();
+        let _ = test_execute(&mut circuit, init_data.clone(), pager.clone()).unwrap();
+        pager
+            .io
+            .block(|| circuit.commit(init_data.clone(), pager.clone()))
+            .unwrap();
 
         // Verify initial state
-        let state = get_current_state(&circuit).unwrap();
+        let state = get_current_state(pager.clone(), &circuit).unwrap();
         assert_eq!(state.changes.len(), 2);
 
         // Create uncommitted changes:
@@ -2236,9 +2702,7 @@ mod tests {
         uncommitted.insert("users".to_string(), uncommitted_delta);
 
         // Execute with uncommitted changes
-        let tx_result = circuit
-            .execute(HashMap::new(), delta_set_from_map(uncommitted.clone()))
-            .unwrap();
+        let tx_result = test_execute(&mut circuit, uncommitted.clone(), pager.clone()).unwrap();
 
         // Result should show all changes: delete Alice, update Bob, insert Charlie and David
         assert_eq!(
@@ -2248,7 +2712,7 @@ mod tests {
         );
 
         // Verify operator's internal state is unchanged
-        let state_after = get_current_state(&circuit).unwrap();
+        let state_after = get_current_state(pager.clone(), &circuit).unwrap();
         assert_eq!(state_after.changes.len(), 2, "Still has Alice and Bob");
 
         // Commit all changes
@@ -2296,19 +2760,20 @@ mod tests {
         );
         commit_data.insert("users".to_string(), commit_delta);
 
-        let commit_result = circuit
-            .execute(commit_data.clone(), DeltaSet::empty())
-            .unwrap();
+        let commit_result = test_execute(&mut circuit, commit_data.clone(), pager.clone()).unwrap();
 
         // Should see: Alice deleted, Bob deleted, Bob inserted, Charlie inserted
         // (David filtered out)
         assert_eq!(commit_result.changes.len(), 4, "Should see 4 changes");
 
         // Actually commit the changes to update operator state
-        circuit.commit(commit_data).unwrap();
+        pager
+            .io
+            .block(|| circuit.commit(commit_data.clone(), pager.clone()))
+            .unwrap();
 
         // After all commits, execute with no changes should return empty delta
-        let empty_result = circuit.execute(HashMap::new(), DeltaSet::empty()).unwrap();
+        let empty_result = test_execute(&mut circuit, HashMap::new(), pager.clone()).unwrap();
         assert_eq!(empty_result.changes.len(), 0, "No changes when no new data");
     }
 
@@ -2319,56 +2784,9 @@ mod tests {
         // and we need to see correct aggregation results within the transaction
 
         // Create a sales table schema for testing
-        let mut schema = Schema::new(false);
-        let sales_table = BTreeTable {
-            name: "sales".to_string(),
-            root_page: 2,
-            primary_key_columns: vec![],
-            columns: vec![
-                SchemaColumn {
-                    name: Some("product_id".to_string()),
-                    ty: Type::Integer,
-                    ty_str: "INTEGER".to_string(),
-                    primary_key: false,
-                    is_rowid_alias: false,
-                    notnull: false,
-                    default: None,
-                    unique: false,
-                    collation: None,
-                    hidden: false,
-                },
-                SchemaColumn {
-                    name: Some("amount".to_string()),
-                    ty: Type::Integer,
-                    ty_str: "INTEGER".to_string(),
-                    primary_key: false,
-                    is_rowid_alias: false,
-                    notnull: false,
-                    default: None,
-                    unique: false,
-                    collation: None,
-                    hidden: false,
-                },
-            ],
-            has_rowid: true,
-            is_strict: false,
-            unique_sets: None,
-        };
-        schema.add_btree_table(Arc::new(sales_table));
+        let _ = test_schema!();
 
-        // Parse and compile the aggregation query
-        let sql = "SELECT product_id, SUM(amount) as total, COUNT(*) as cnt FROM sales GROUP BY product_id";
-        let mut parser = Parser::new(sql.as_bytes());
-        let cmd = parser.next().unwrap().unwrap();
-
-        let mut circuit = match cmd {
-            ast::Cmd::Stmt(stmt) => {
-                let mut builder = LogicalPlanBuilder::new(&schema);
-                let logical_plan = builder.build_statement(&stmt).unwrap();
-                DbspCompiler::new().compile(&logical_plan).unwrap()
-            }
-            _ => panic!("Expected SQL statement"),
-        };
+        let (mut circuit, pager) = compile_sql!("SELECT product_id, SUM(amount) as total, COUNT(*) as cnt FROM sales GROUP BY product_id");
 
         // Initialize with base data: (1, 100), (1, 200), (2, 150), (2, 250)
         let mut init_data = HashMap::new();
@@ -2379,10 +2797,14 @@ mod tests {
         delta.insert(4, vec![Value::Integer(2), Value::Integer(250)]);
         init_data.insert("sales".to_string(), delta);
 
-        circuit.initialize(init_data).unwrap();
+        let _ = test_execute(&mut circuit, init_data.clone(), pager.clone()).unwrap();
+        pager
+            .io
+            .block(|| circuit.commit(init_data.clone(), pager.clone()))
+            .unwrap();
 
         // Verify initial state: product 1 total=300, product 2 total=400
-        let state = get_current_state(&circuit).unwrap();
+        let state = get_current_state(pager.clone(), &circuit).unwrap();
         assert_eq!(state.changes.len(), 2, "Should have 2 product groups");
 
         // Build a map of product_id -> (total, count)
@@ -2430,9 +2852,7 @@ mod tests {
         uncommitted.insert("sales".to_string(), uncommitted_delta);
 
         // Execute with uncommitted data - simulating a read within transaction
-        let tx_result = circuit
-            .execute(HashMap::new(), delta_set_from_map(uncommitted.clone()))
-            .unwrap();
+        let tx_result = test_execute(&mut circuit, uncommitted.clone(), pager.clone()).unwrap();
 
         // Result should show the aggregate changes from uncommitted data
         // Product 1: retraction of (300, 2) and insertion of (350, 3)
@@ -2444,7 +2864,7 @@ mod tests {
         );
 
         // IMPORTANT: Verify operator's internal state is unchanged
-        let state_after = get_current_state(&circuit).unwrap();
+        let state_after = get_current_state(pager.clone(), &circuit).unwrap();
         assert_eq!(
             state_after.changes.len(),
             2,
@@ -2498,9 +2918,7 @@ mod tests {
         commit_delta.insert(6, vec![Value::Integer(3), Value::Integer(300)]);
         commit_data.insert("sales".to_string(), commit_delta);
 
-        let commit_result = circuit
-            .execute(commit_data.clone(), DeltaSet::empty())
-            .unwrap();
+        let commit_result = test_execute(&mut circuit, commit_data.clone(), pager.clone()).unwrap();
 
         // Should see changes for product 1 (updated) and product 3 (new)
         assert_eq!(
@@ -2510,10 +2928,13 @@ mod tests {
         );
 
         // Actually commit the changes to update operator state
-        circuit.commit(commit_data).unwrap();
+        pager
+            .io
+            .block(|| circuit.commit(commit_data.clone(), pager.clone()))
+            .unwrap();
 
         // After commit, verify final state
-        let final_state = get_current_state(&circuit).unwrap();
+        let final_state = get_current_state(pager.clone(), &circuit).unwrap();
         assert_eq!(
             final_state.changes.len(),
             3,
@@ -2566,7 +2987,7 @@ mod tests {
         // Test that uncommitted INSERTs are visible within the same transaction
         // This simulates: BEGIN; INSERT ...; SELECT * FROM view; COMMIT;
 
-        let mut circuit = compile_sql!("SELECT * FROM users WHERE age > 18");
+        let (mut circuit, pager) = compile_sql!("SELECT * FROM users WHERE age > 18");
 
         // Initialize with some data - need to match the schema (id, name, age)
         let mut init_data = HashMap::new();
@@ -2589,10 +3010,14 @@ mod tests {
         );
         init_data.insert("users".to_string(), delta);
 
-        circuit.initialize(init_data.clone()).unwrap();
+        let _ = test_execute(&mut circuit, init_data.clone(), pager.clone()).unwrap();
+        pager
+            .io
+            .block(|| circuit.commit(init_data.clone(), pager.clone()))
+            .unwrap();
 
         // Verify initial state
-        let state = get_current_state(&circuit).unwrap();
+        let state = get_current_state(pager.clone(), &circuit).unwrap();
         assert_eq!(
             state.len(),
             2,
@@ -2622,9 +3047,7 @@ mod tests {
 
         // Execute with uncommitted data - this should return the uncommitted changes
         // that passed through the filter (age > 18)
-        let tx_result = circuit
-            .execute(HashMap::new(), delta_set_from_map(uncommitted.clone()))
-            .unwrap();
+        let tx_result = test_execute(&mut circuit, uncommitted.clone(), pager.clone()).unwrap();
 
         // IMPORTANT: tx_result should contain the filtered uncommitted changes!
         // Both Charlie (35) and David (20) should pass the age > 18 filter
@@ -2648,7 +3071,7 @@ mod tests {
         );
 
         // CRITICAL: Verify the operator state wasn't modified by uncommitted execution
-        let state_after_uncommitted = get_current_state(&circuit).unwrap();
+        let state_after_uncommitted = get_current_state(pager.clone(), &circuit).unwrap();
         assert_eq!(
             state_after_uncommitted.len(),
             2,
@@ -2680,7 +3103,8 @@ mod tests {
         // Similar to test_uncommitted_aggregation but explicitly tests rollback semantics
 
         // Create a simple aggregation circuit
-        let mut circuit = compile_sql!("SELECT age, COUNT(*) as cnt FROM users GROUP BY age");
+        let (mut circuit, pager) =
+            compile_sql!("SELECT age, COUNT(*) as cnt FROM users GROUP BY age");
 
         // Initialize with some data
         let mut init_data = HashMap::new();
@@ -2719,10 +3143,14 @@ mod tests {
         );
         init_data.insert("users".to_string(), delta);
 
-        circuit.initialize(init_data).unwrap();
+        let _ = test_execute(&mut circuit, init_data.clone(), pager.clone()).unwrap();
+        pager
+            .io
+            .block(|| circuit.commit(init_data.clone(), pager.clone()))
+            .unwrap();
 
         // Verify initial state: age 25 count=2, age 30 count=2
-        let state = get_current_state(&circuit).unwrap();
+        let state = get_current_state(pager.clone(), &circuit).unwrap();
         assert_eq!(state.changes.len(), 2);
 
         let initial_counts: HashMap<i64, i64> = state
@@ -2783,9 +3211,7 @@ mod tests {
         uncommitted.insert("users".to_string(), uncommitted_delta);
 
         // Execute with uncommitted changes
-        let tx_result = circuit
-            .execute(HashMap::new(), delta_set_from_map(uncommitted.clone()))
-            .unwrap();
+        let tx_result = test_execute(&mut circuit, uncommitted.clone(), pager.clone()).unwrap();
 
         // Should see the aggregate changes from uncommitted data
         // Age 25: retraction of count 1 and insertion of count 2
@@ -2796,7 +3222,7 @@ mod tests {
         );
 
         // Verify internal state is unchanged (simulating rollback by not committing)
-        let state_after_rollback = get_current_state(&circuit).unwrap();
+        let state_after_rollback = get_current_state(pager.clone(), &circuit).unwrap();
         assert_eq!(
             state_after_rollback.changes.len(),
             2,
@@ -2836,8 +3262,10 @@ mod tests {
 
     #[test]
     fn test_circuit_rowid_update_consolidation() {
+        let (pager, p1, p2) = setup_btree_for_circuit();
+
         // Test that circuit properly consolidates state when rowid changes
-        let mut circuit = DbspCircuit::new();
+        let mut circuit = DbspCircuit::new(p1, p2);
 
         // Create a simple filter node
         let schema = Arc::new(LogicalSchema::new(vec![
@@ -2845,14 +3273,14 @@ mod tests {
             ("value".to_string(), Type::Integer),
         ]));
 
-        // First create an input node
+        // First create an input node with InputOperator
         let input_id = circuit.add_node(
             DbspOperator::Input {
                 name: "test".to_string(),
                 schema: schema.clone(),
             },
             vec![],
-            None, // Input nodes don't have executables
+            Box::new(InputOperator::new("test".to_string())),
         );
 
         let filter_op = FilterOperator::new(
@@ -2873,10 +3301,10 @@ mod tests {
         let filter_id = circuit.add_node(
             DbspOperator::Filter { predicate },
             vec![input_id], // Filter takes input from the input node
-            Some(Box::new(filter_op)),
+            Box::new(filter_op),
         );
 
-        circuit.root = Some(filter_id);
+        circuit.set_root(filter_id, schema.clone());
 
         // Initialize with a row
         let mut init_data = HashMap::new();
@@ -2884,10 +3312,14 @@ mod tests {
         delta.insert(5, vec![Value::Integer(5), Value::Integer(20)]);
         init_data.insert("test".to_string(), delta);
 
-        circuit.initialize(init_data).unwrap();
+        let _ = test_execute(&mut circuit, init_data.clone(), pager.clone()).unwrap();
+        pager
+            .io
+            .block(|| circuit.commit(init_data.clone(), pager.clone()))
+            .unwrap();
 
         // Verify initial state
-        let state = get_current_state(&circuit).unwrap();
+        let state = get_current_state(pager.clone(), &circuit).unwrap();
         assert_eq!(state.changes.len(), 1);
         assert_eq!(state.changes[0].0.rowid, 5);
 
@@ -2898,15 +3330,16 @@ mod tests {
         update_delta.insert(3, vec![Value::Integer(3), Value::Integer(20)]);
         update_data.insert("test".to_string(), update_delta);
 
-        circuit
-            .execute(update_data.clone(), DeltaSet::empty())
-            .unwrap();
+        test_execute(&mut circuit, update_data.clone(), pager.clone()).unwrap();
 
         // Commit the changes to update operator state
-        circuit.commit(update_data).unwrap();
+        pager
+            .io
+            .block(|| circuit.commit(update_data.clone(), pager.clone()))
+            .unwrap();
 
         // The circuit should consolidate the state properly
-        let final_state = get_current_state(&circuit).unwrap();
+        let final_state = get_current_state(pager.clone(), &circuit).unwrap();
         assert_eq!(
             final_state.changes.len(),
             1,
@@ -2918,5 +3351,66 @@ mod tests {
             vec![Value::Integer(3), Value::Integer(20)]
         );
         assert_eq!(final_state.changes[0].1, 1);
+    }
+
+    #[test]
+    fn test_circuit_respects_multiplicities() {
+        let (mut circuit, pager) = compile_sql!("SELECT * from users");
+
+        // Insert same row twice (multiplicity 2)
+        let mut delta = Delta::new();
+        delta.insert(
+            1,
+            vec![
+                Value::Integer(1),
+                Value::Text("Alice".into()),
+                Value::Integer(25),
+            ],
+        );
+        delta.insert(
+            1,
+            vec![
+                Value::Integer(1),
+                Value::Text("Alice".into()),
+                Value::Integer(25),
+            ],
+        );
+
+        let mut inputs = HashMap::new();
+        inputs.insert("users".to_string(), delta);
+        test_execute(&mut circuit, inputs.clone(), pager.clone()).unwrap();
+        pager
+            .io
+            .block(|| circuit.commit(inputs.clone(), pager.clone()))
+            .unwrap();
+
+        // Delete once (should leave multiplicity 1)
+        let mut delete_one = Delta::new();
+        delete_one.delete(
+            1,
+            vec![
+                Value::Integer(1),
+                Value::Text("Alice".into()),
+                Value::Integer(25),
+            ],
+        );
+
+        let mut inputs = HashMap::new();
+        inputs.insert("users".to_string(), delete_one);
+        test_execute(&mut circuit, inputs.clone(), pager.clone()).unwrap();
+        pager
+            .io
+            .block(|| circuit.commit(inputs.clone(), pager.clone()))
+            .unwrap();
+
+        // With proper DBSP: row still exists (weight 2 - 1 = 1)
+        let state = get_current_state(pager.clone(), &circuit).unwrap();
+        let mut consolidated = state;
+        consolidated.consolidate();
+        assert_eq!(
+            consolidated.len(),
+            1,
+            "Row should still exist with multiplicity 1"
+        );
     }
 }

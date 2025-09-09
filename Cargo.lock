@@ -667,7 +667,7 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
 name = "core_tester"
-version = "0.1.5-pre.2"
+version = "0.1.5-pre.4"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -1800,9 +1800,9 @@ dependencies = [
 
 [[package]]
 name = "indexmap"
-version = "2.10.0"
+version = "2.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fe4cd85333e22411419a0bcae1297d25e58c9443848b11dc6a86fefe8c78a661"
+checksum = "f2481980430f9f78649238835720ddccc57e52df14ffce1c6f37391d61b563e9"
 dependencies = [
  "equivalent",
  "hashbrown 0.15.2",
@@ -1822,7 +1822,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "232929e1d75fe899576a3d5c7416ad0d88dbfbb3c3d6aa00873a7408a50ddb88"
 dependencies = [
  "ahash",
- "indexmap 2.10.0",
+ "indexmap 2.11.0",
  "is-terminal",
  "itoa",
  "log",
@@ -2126,7 +2126,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_completion"
-version = "0.1.5-pre.2"
+version = "0.1.5-pre.4"
 dependencies = [
  "mimalloc",
  "turso_ext",
@@ -2134,7 +2134,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_crypto"
-version = "0.1.5-pre.2"
+version = "0.1.5-pre.4"
 dependencies = [
  "blake3",
  "data-encoding",
@@ -2147,7 +2147,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_csv"
-version = "0.1.5-pre.2"
+version = "0.1.5-pre.4"
 dependencies = [
  "csv",
  "mimalloc",
@@ -2157,7 +2157,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_ipaddr"
-version = "0.1.5-pre.2"
+version = "0.1.5-pre.4"
 dependencies = [
  "ipnetwork",
  "mimalloc",
@@ -2166,7 +2166,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_percentile"
-version = "0.1.5-pre.2"
+version = "0.1.5-pre.4"
 dependencies = [
  "mimalloc",
  "turso_ext",
@@ -2174,7 +2174,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_regexp"
-version = "0.1.5-pre.2"
+version = "0.1.5-pre.4"
 dependencies = [
  "mimalloc",
  "regex",
@@ -2183,7 +2183,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_sim"
-version = "0.1.5-pre.2"
+version = "0.1.5-pre.4"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2192,7 +2192,7 @@ dependencies = [
  "env_logger 0.10.2",
  "garde",
  "hex",
- "indexmap 2.10.0",
+ "indexmap 2.11.0",
  "itertools 0.14.0",
  "json5",
  "log",
@@ -2216,7 +2216,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_sqlite_test_ext"
-version = "0.1.5-pre.2"
+version = "0.1.5-pre.4"
 dependencies = [
  "cc",
 ]
@@ -2774,7 +2774,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eac26e981c03a6e53e0aee43c113e3202f5581d5360dae7bd2c70e800dd0451d"
 dependencies = [
  "base64",
- "indexmap 2.10.0",
+ "indexmap 2.11.0",
  "quick-xml 0.32.0",
  "serde",
  "time",
@@ -2971,7 +2971,7 @@ dependencies = [
 
 [[package]]
 name = "py-turso"
-version = "0.1.5-pre.2"
+version = "0.1.5-pre.4"
 dependencies = [
  "anyhow",
  "pyo3",
@@ -3666,12 +3666,13 @@ checksum = "d372029cb5195f9ab4e4b9aef550787dce78b124fcaee8d82519925defcd6f0d"
 
 [[package]]
 name = "sql_generation"
-version = "0.1.5-pre.2"
+version = "0.1.5-pre.4"
 dependencies = [
  "anarchist-readable-name-generator-lib 0.2.0",
  "anyhow",
  "garde",
  "hex",
+ "indexmap 2.11.0",
  "itertools 0.14.0",
  "rand 0.9.2",
  "rand_chacha 0.9.0",
@@ -4064,7 +4065,7 @@ version = "0.8.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "05ae329d1f08c4d17a59bed7ff5b5a769d062e64a62d34a3261b219e62cd5aae"
 dependencies = [
- "indexmap 2.10.0",
+ "indexmap 2.11.0",
  "serde",
  "serde_spanned",
  "toml_datetime",
@@ -4086,7 +4087,7 @@ version = "0.22.26"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "310068873db2c5b3e7659d2cc35d21855dbafa50d1ce336397c666e3cb08137e"
 dependencies = [
- "indexmap 2.10.0",
+ "indexmap 2.11.0",
  "serde",
  "serde_spanned",
  "toml_datetime",
@@ -4175,7 +4176,7 @@ dependencies = [
 
 [[package]]
 name = "turso"
-version = "0.1.5-pre.2"
+version = "0.1.5-pre.4"
 dependencies = [
  "rand 0.8.5",
  "rand_chacha 0.3.1",
@@ -4187,7 +4188,7 @@ dependencies = [
 
 [[package]]
 name = "turso-java"
-version = "0.1.5-pre.2"
+version = "0.1.5-pre.4"
 dependencies = [
  "jni",
  "thiserror 2.0.12",
@@ -4196,7 +4197,7 @@ dependencies = [
 
 [[package]]
 name = "turso_cli"
-version = "0.1.5-pre.2"
+version = "0.1.5-pre.4"
 dependencies = [
  "anyhow",
  "cfg-if",
@@ -4229,7 +4230,7 @@ dependencies = [
 
 [[package]]
 name = "turso_core"
-version = "0.1.5-pre.2"
+version = "0.1.5-pre.4"
 dependencies = [
  "aegis",
  "aes",
@@ -4288,7 +4289,7 @@ dependencies = [
 
 [[package]]
 name = "turso_dart"
-version = "0.1.5-pre.2"
+version = "0.1.5-pre.4"
 dependencies = [
  "flutter_rust_bridge",
  "turso_core",
@@ -4296,7 +4297,7 @@ dependencies = [
 
 [[package]]
 name = "turso_ext"
-version = "0.1.5-pre.2"
+version = "0.1.5-pre.4"
 dependencies = [
  "chrono",
  "getrandom 0.3.2",
@@ -4305,7 +4306,7 @@ dependencies = [
 
 [[package]]
 name = "turso_ext_tests"
-version = "0.1.5-pre.2"
+version = "0.1.5-pre.4"
 dependencies = [
  "env_logger 0.11.7",
  "lazy_static",
@@ -4316,7 +4317,7 @@ dependencies = [
 
 [[package]]
 name = "turso_macros"
-version = "0.1.5-pre.2"
+version = "0.1.5-pre.4"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4325,18 +4326,19 @@ dependencies = [
 
 [[package]]
 name = "turso_node"
-version = "0.1.5-pre.2"
+version = "0.1.5-pre.4"
 dependencies = [
  "napi",
  "napi-build",
  "napi-derive",
+ "tracing",
  "tracing-subscriber",
  "turso_core",
 ]
 
 [[package]]
 name = "turso_parser"
-version = "0.1.5-pre.2"
+version = "0.1.5-pre.4"
 dependencies = [
  "bitflags 2.9.0",
  "criterion",
@@ -4352,7 +4354,7 @@ dependencies = [
 
 [[package]]
 name = "turso_sqlite3"
-version = "0.1.5-pre.2"
+version = "0.1.5-pre.4"
 dependencies = [
  "env_logger 0.11.7",
  "libc",
@@ -4365,13 +4367,13 @@ dependencies = [
 
 [[package]]
 name = "turso_sqlite3_parser"
-version = "0.1.5-pre.2"
+version = "0.1.5-pre.4"
 dependencies = [
  "bitflags 2.9.0",
  "cc",
  "env_logger 0.11.7",
  "fallible-iterator",
- "indexmap 2.10.0",
+ "indexmap 2.11.0",
  "log",
  "memchr",
  "miette",
@@ -4383,7 +4385,7 @@ dependencies = [
 
 [[package]]
 name = "turso_stress"
-version = "0.1.5-pre.2"
+version = "0.1.5-pre.4"
 dependencies = [
  "anarchist-readable-name-generator-lib 0.1.2",
  "antithesis_sdk",
@@ -4399,7 +4401,7 @@ dependencies = [
 
 [[package]]
 name = "turso_sync_engine"
-version = "0.1.5-pre.2"
+version = "0.1.5-pre.4"
 dependencies = [
  "base64",
  "bytes",
@@ -4425,7 +4427,7 @@ dependencies = [
 
 [[package]]
 name = "turso_sync_js"
-version = "0.1.5-pre.2"
+version = "0.1.5-pre.4"
 dependencies = [
  "genawaiter",
  "http",

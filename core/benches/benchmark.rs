@@ -1,5 +1,6 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use pprof::criterion::{Output, PProfProfiler};
+use regex::Regex;
 use std::{sync::Arc, time::Instant};
 use turso_core::{Database, PlatformIO};
 
@@ -272,9 +273,41 @@ fn bench_prepare_query(criterion: &mut Criterion) {
         "SELECT 1",
         "SELECT * FROM users LIMIT 1",
         "SELECT first_name, count(1) FROM users GROUP BY first_name HAVING count(1) > 1 ORDER BY count(1)  LIMIT 1",
+        "SELECT
+            first_name,
+            last_name,
+            state,
+            city,
+            age + 10,
+            LENGTH(email),
+            UPPER(first_name),
+            LOWER(last_name),
+            SUBSTR(phone_number, 1, 3),
+            zipcode || '-' || state,
+            AVG(age) + 5,
+            MAX(age) - MIN(age),
+            ROUND(AVG(age), 1),
+            SUM(age) / COUNT(*),
+            COUNT(*),
+            COUNT(email),
+            SUM(age),
+            AVG(age),
+            MIN(age),
+            MAX(age),
+            SUM(CASE WHEN age >= 18 THEN 1 ELSE 0 END),
+            SUM(CASE WHEN age < 18 THEN 1 ELSE 0 END),
+            AVG(CASE WHEN age >= 18 THEN age ELSE NULL END),
+            MAX(CASE WHEN age >= 18 THEN age ELSE NULL END)
+        FROM users
+        GROUP BY state, city",
     ];
 
+    let whitespace_re = Regex::new(r"\s+").unwrap();
     for query in queries.iter() {
+        // Normalize whitespace in the query string by replacing all sequences of whitespace with a single space.
+        let query = whitespace_re.replace_all(query, " ").to_string();
+        let query = query.as_str();
+
         let mut group = criterion.benchmark_group(format!("Prepare `{query}`"));
 
         group.bench_with_input(

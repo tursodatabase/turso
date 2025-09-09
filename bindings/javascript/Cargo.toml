@@ -15,9 +15,11 @@ turso_core = { workspace = true }
 napi = { version = "3.1.3", default-features = false, features = ["napi6"] }
 napi-derive = { version = "3.1.1", default-features = true }
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
+tracing.workspace = true
 
 [features]
 encryption = ["turso_core/encryption"]
+browser = []
 
 [build-dependencies]
 napi-build = "2.2.3"

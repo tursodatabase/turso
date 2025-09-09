@@ -32,7 +32,6 @@ mod uuid;
 mod vdbe;
 mod vector;
 mod vtab;
-mod vtab_view;
 
 #[cfg(feature = "fuzz")]
 pub mod numeric;
@@ -40,7 +39,7 @@ pub mod numeric;
 #[cfg(not(feature = "fuzz"))]
 mod numeric;
 
-use crate::incremental::view::ViewTransactionState;
+use crate::incremental::view::AllViewsTxState;
 use crate::storage::encryption::CipherMode;
 use crate::translate::optimizer::optimize_plan;
 use crate::translate::pragma::TURSO_CDC_DEFAULT_TABLE_NAME;
@@ -65,20 +64,23 @@ use parking_lot::RwLock;
 use schema::Schema;
 use std::{
     borrow::Cow,
-    cell::{Cell, RefCell, UnsafeCell},
+    cell::{Cell, RefCell},
     collections::HashMap,
     fmt::{self, Display},
     io::Write,
     num::NonZero,
     ops::Deref,
     rc::Rc,
-    sync::{atomic::AtomicUsize, Arc, LazyLock, Mutex, Weak},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, LazyLock, Mutex, Weak,
+    },
 };
 #[cfg(feature = "fs")]
 use storage::database::DatabaseFile;
 pub use storage::database::IOContext;
 pub use storage::encryption::{EncryptionContext, EncryptionKey};
-use storage::page_cache::DumbLruPageCache;
+use storage::page_cache::PageCache;
 use storage::pager::{AtomicDbState, DbState};
 use storage::sqlite3_ondisk::PageSize;
 pub use storage::{
@@ -90,6 +92,7 @@ pub use storage::{
 };
 use tracing::{instrument, Level};
 use translate::select::prepare_select_plan;
+use turso_macros::match_ignore_ascii_case;
 use turso_parser::{ast, ast::Cmd, parser::Parser};
 use types::IOResult;
 pub use types::RefValue;
@@ -184,8 +187,8 @@ pub struct Database {
     buffer_pool: Arc<BufferPool>,
     // Shared structures of a Database are the parts that are common to multiple threads that might
     // create DB connections.
-    _shared_page_cache: Arc<RwLock<DumbLruPageCache>>,
-    maybe_shared_wal: RwLock<Option<Arc<UnsafeCell<WalFileShared>>>>,
+    _shared_page_cache: Arc<RwLock<PageCache>>,
+    shared_wal: Arc<RwLock<WalFileShared>>,
     db_state: Arc<AtomicDbState>,
     init_lock: Arc<Mutex<()>>,
     open_flags: OpenFlags,
@@ -226,9 +229,9 @@ impl fmt::Debug for Database {
         };
         debug_struct.field("init_lock", &init_lock_status);
 
-        let wal_status = match self.maybe_shared_wal.try_read().as_deref() {
-            Some(Some(_)) => "present",
-            Some(None) => "none",
+        let wal_status = match self.shared_wal.try_read() {
+            Some(wal) if wal.enabled.load(Ordering::Relaxed) => "enabled",
+            Some(_) => "disabled",
             None => "locked_for_write",
         };
         debug_struct.field("wal_state", &wal_status);
@@ -364,7 +367,7 @@ impl Database {
         flags: OpenFlags,
         opts: DatabaseOpts,
     ) -> Result<Arc<Database>> {
-        let maybe_shared_wal = WalFileShared::open_shared_if_exists(&io, wal_path)?;
+        let shared_wal = WalFileShared::open_shared_if_exists(&io, wal_path)?;
 
         let mv_store = if opts.enable_mvcc {
             Some(Arc::new(MvStore::new(
@@ -382,7 +385,7 @@ impl Database {
             DbState::Initialized
         };
 
-        let shared_page_cache = Arc::new(RwLock::new(DumbLruPageCache::default()));
+        let shared_page_cache = Arc::new(RwLock::new(PageCache::default()));
         let syms = SymbolTable::new();
         let arena_size = if std::env::var("TESTING").is_ok_and(|v| v.eq_ignore_ascii_case("true")) {
             BufferPool::TEST_ARENA_SIZE
@@ -396,7 +399,7 @@ impl Database {
             wal_path: wal_path.to_string(),
             schema: Mutex::new(Arc::new(Schema::new(opts.enable_indexes))),
             _shared_page_cache: shared_page_cache.clone(),
-            maybe_shared_wal: RwLock::new(maybe_shared_wal),
+            shared_wal,
             db_file,
             builtin_syms: syms.into(),
             io: io.clone(),
@@ -437,13 +440,6 @@ impl Database {
                 Ok(())
             })?;
         }
-        // FIXME: the correct way to do this is to just materialize the view.
-        // But this will allow us to keep going.
-        let conn = db.connect()?;
-        let pager = conn.pager.borrow().clone();
-        pager
-            .io
-            .block(|| conn.schema.borrow().populate_materialized_views(&conn))?;
         Ok(db)
     }
 
@@ -485,7 +481,7 @@ impl Database {
             attached_databases: RefCell::new(DatabaseCatalog::new()),
             query_only: Cell::new(false),
             mv_tx_id: Cell::new(None),
-            view_transaction_states: RefCell::new(HashMap::new()),
+            view_transaction_states: AllViewsTxState::new(),
             metrics: RefCell::new(ConnectionMetrics::new()),
             is_nested_stmt: Cell::new(false),
             encryption_key: RefCell::new(None),
@@ -533,10 +529,10 @@ impl Database {
     /// 2. PageSize::default(), i.e. 4096
     fn determine_actual_page_size(
         &self,
-        maybe_shared_wal: Option<&WalFileShared>,
+        shared_wal: &WalFileShared,
         requested_page_size: Option<usize>,
     ) -> Result<PageSize> {
-        if let Some(shared_wal) = maybe_shared_wal {
+        if shared_wal.enabled.load(Ordering::Relaxed) {
             let size_in_wal = shared_wal.page_size();
             if size_in_wal != 0 {
                 let Some(page_size) = PageSize::new(size_in_wal) else {
@@ -559,13 +555,12 @@ impl Database {
     }
 
     fn init_pager(&self, requested_page_size: Option<usize>) -> Result<Pager> {
-        // Open existing WAL file if present
-        let mut maybe_shared_wal = self.maybe_shared_wal.write();
-        if let Some(shared_wal) = maybe_shared_wal.clone() {
-            let page_size = self.determine_actual_page_size(
-                Some(unsafe { &*shared_wal.get() }),
-                requested_page_size,
-            )?;
+        // Check if WAL is enabled
+        let shared_wal = self.shared_wal.read();
+        if shared_wal.enabled.load(Ordering::Relaxed) {
+            let page_size = self.determine_actual_page_size(&shared_wal, requested_page_size)?;
+            drop(shared_wal);
+
             let buffer_pool = self.buffer_pool.clone();
             if self.db_state.is_initialized() {
                 buffer_pool.finalize_with_page_size(page_size.get() as usize)?;
@@ -574,14 +569,14 @@ impl Database {
             let db_state = self.db_state.clone();
             let wal = Rc::new(RefCell::new(WalFile::new(
                 self.io.clone(),
-                shared_wal,
+                self.shared_wal.clone(),
                 buffer_pool.clone(),
             )));
             let pager = Pager::new(
                 self.db_file.clone(),
                 Some(wal),
                 self.io.clone(),
-                Arc::new(RwLock::new(DumbLruPageCache::default())),
+                Arc::new(RwLock::new(PageCache::default())),
                 buffer_pool.clone(),
                 db_state,
                 self.init_lock.clone(),
@@ -589,9 +584,10 @@ impl Database {
             pager.page_size.set(Some(page_size));
             return Ok(pager);
         }
-        let buffer_pool = self.buffer_pool.clone();
+        let page_size = self.determine_actual_page_size(&shared_wal, requested_page_size)?;
+        drop(shared_wal);
 
-        let page_size = self.determine_actual_page_size(None, requested_page_size)?;
+        let buffer_pool = self.buffer_pool.clone();
 
         if self.db_state.is_initialized() {
             buffer_pool.finalize_with_page_size(page_size.get() as usize)?;
@@ -603,7 +599,7 @@ impl Database {
             self.db_file.clone(),
             None,
             self.io.clone(),
-            Arc::new(RwLock::new(DumbLruPageCache::default())),
+            Arc::new(RwLock::new(PageCache::default())),
             buffer_pool.clone(),
             db_state,
             Arc::new(Mutex::new(())),
@@ -613,18 +609,53 @@ impl Database {
         let file = self
             .io
             .open_file(&self.wal_path, OpenFlags::Create, false)?;
-        let real_shared_wal = WalFileShared::new_shared(file)?;
-        // Modify Database::maybe_shared_wal to point to the new WAL file so that other connections
-        // can open the existing WAL.
-        *maybe_shared_wal = Some(real_shared_wal.clone());
+
+        // Enable WAL in the existing shared instance
+        {
+            let mut shared_wal = self.shared_wal.write();
+            shared_wal.create(file)?;
+        }
+
         let wal = Rc::new(RefCell::new(WalFile::new(
             self.io.clone(),
-            real_shared_wal,
+            self.shared_wal.clone(),
             buffer_pool,
         )));
         pager.set_wal(wal);
 
         Ok(pager)
+    }
+
+    #[cfg(feature = "fs")]
+    pub fn io_for_path(path: &str) -> Result<Arc<dyn IO>> {
+        use crate::util::MEMORY_PATH;
+        let io: Arc<dyn IO> = match path.trim() {
+            MEMORY_PATH => Arc::new(MemoryIO::new()),
+            _ => Arc::new(PlatformIO::new()?),
+        };
+        Ok(io)
+    }
+
+    #[cfg(feature = "fs")]
+    pub fn io_for_vfs<S: AsRef<str> + std::fmt::Display>(vfs: S) -> Result<Arc<dyn IO>> {
+        let vfsmods = ext::add_builtin_vfs_extensions(None)?;
+        let io: Arc<dyn IO> = match vfsmods
+            .iter()
+            .find(|v| v.0 == vfs.as_ref())
+            .map(|v| v.1.clone())
+        {
+            Some(vfs) => vfs,
+            None => match vfs.as_ref() {
+                "memory" => Arc::new(MemoryIO::new()),
+                "syscall" => Arc::new(SyscallIO::new()?),
+                #[cfg(all(target_os = "linux", feature = "io_uring"))]
+                "io_uring" => Arc::new(UringIO::new()?),
+                other => {
+                    return Err(LimboError::InvalidArgument(format!("no such VFS: {other}")));
+                }
+            },
+        };
+        Ok(io)
     }
 
     /// Open a new database file with optionally specifying a VFS without an existing database
@@ -640,40 +671,13 @@ impl Database {
     where
         S: AsRef<str> + std::fmt::Display,
     {
-        use crate::util::MEMORY_PATH;
-        let vfsmods = ext::add_builtin_vfs_extensions(None)?;
-        match vfs {
-            Some(vfs) => {
-                let io: Arc<dyn IO> = match vfsmods
-                    .iter()
-                    .find(|v| v.0 == vfs.as_ref())
-                    .map(|v| v.1.clone())
-                {
-                    Some(vfs) => vfs,
-                    None => match vfs.as_ref() {
-                        "memory" => Arc::new(MemoryIO::new()),
-                        "syscall" => Arc::new(SyscallIO::new()?),
-                        #[cfg(all(target_os = "linux", feature = "io_uring"))]
-                        "io_uring" => Arc::new(UringIO::new()?),
-                        other => {
-                            return Err(LimboError::InvalidArgument(format!(
-                                "no such VFS: {other}"
-                            )));
-                        }
-                    },
-                };
-                let db = Self::open_file_with_flags(io.clone(), path, flags, opts)?;
-                Ok((io, db))
-            }
-            None => {
-                let io: Arc<dyn IO> = match path.trim() {
-                    MEMORY_PATH => Arc::new(MemoryIO::new()),
-                    _ => Arc::new(PlatformIO::new()?),
-                };
-                let db = Self::open_file_with_flags(io.clone(), path, flags, opts)?;
-                Ok((io, db))
-            }
-        }
+        let io = vfs
+            .map(|vfs| Self::io_for_vfs(vfs))
+            .or_else(|| Some(Self::io_for_path(path)))
+            .transpose()?
+            .unwrap();
+        let db = Self::open_file_with_flags(io.clone(), path, flags, opts)?;
+        Ok((io, db))
     }
 
     #[inline]
@@ -919,7 +923,7 @@ pub struct Connection {
 
     /// Per-connection view transaction states for uncommitted changes. This represents
     /// one entry per view that was touched in the transaction.
-    view_transaction_states: RefCell<HashMap<String, ViewTransactionState>>,
+    view_transaction_states: AllViewsTxState,
     /// Connection-level metrics aggregation
     pub metrics: RefCell<ConnectionMetrics>,
     /// Whether the connection is executing a statement initiated by another statement.
@@ -1065,7 +1069,7 @@ impl Connection {
 
         // Preserve existing views to avoid expensive repopulation.
         // TODO: We may not need to do this if we materialize our views.
-        let existing_views = self.schema.borrow().materialized_views.clone();
+        let existing_views = self.schema.borrow().incremental_views.clone();
 
         // TODO: this is hack to avoid a cyclical problem with schema reprepare
         // The problem here is that we prepare a statement here, but when the statement tries
@@ -1089,13 +1093,6 @@ impl Connection {
         self.with_schema_mut(|schema| {
             *schema = fresh;
         });
-
-        {
-            let schema = self.schema.borrow();
-            pager
-                .io
-                .block(|| schema.populate_materialized_views(self))?;
-        }
         Result::Ok(())
     }
 
@@ -1312,12 +1309,17 @@ impl Connection {
     }
 
     #[cfg(feature = "fs")]
-    fn from_uri_attached(uri: &str, db_opts: DatabaseOpts) -> Result<Arc<Database>> {
+    fn from_uri_attached(
+        uri: &str,
+        db_opts: DatabaseOpts,
+        io: Arc<dyn IO>,
+    ) -> Result<Arc<Database>> {
         let mut opts = OpenOptions::parse(uri)?;
         // FIXME: for now, only support read only attach
         opts.mode = OpenMode::ReadOnly;
         let flags = opts.get_flags()?;
-        let (_io, db) = Database::open_new(&opts.path, opts.vfs.as_ref(), flags, db_opts)?;
+        let io = opts.vfs.map(Database::io_for_vfs).unwrap_or(Ok(io))?;
+        let db = Database::open_file_with_flags(io.clone(), &opts.path, flags, db_opts)?;
         if let Some(modeof) = opts.modeof {
             let perms = std::fs::metadata(modeof)?;
             std::fs::set_permissions(&opts.path, perms.permissions())?;
@@ -1660,7 +1662,11 @@ impl Connection {
             return Ok(());
         }
 
-        *self._db.maybe_shared_wal.write() = None;
+        {
+            let mut shared_wal = self._db.shared_wal.write();
+            shared_wal.enabled.store(false, Ordering::Relaxed);
+            shared_wal.file = None;
+        }
         self.pager.borrow_mut().clear_page_cache();
         let pager = self._db.init_pager(Some(size.get() as usize))?;
         self.pager.replace(Rc::new(pager));
@@ -1705,7 +1711,7 @@ impl Connection {
             .expect("query must be parsed to statement");
         let syms = self.syms.borrow();
         self.with_schema_mut(|schema| {
-            let existing_views = schema.materialized_views.clone();
+            let existing_views = schema.incremental_views.clone();
             if let Err(LimboError::ExtensionError(e)) =
                 parse_schema_rows(rows, schema, &syms, None, existing_views)
             {
@@ -1856,7 +1862,7 @@ impl Connection {
             .with_indexes(use_indexes)
             .with_views(use_views)
             .with_strict(use_strict);
-        let db = Self::from_uri_attached(path, db_opts)?;
+        let db = Self::from_uri_attached(path, db_opts, self._db.io.clone())?;
         let pager = Rc::new(db.init_pager(None)?);
 
         self.attached_databases
@@ -1911,21 +1917,23 @@ impl Connection {
         // Check if this is a qualified name (database.table) or unqualified
         if let Some(db_name) = &qualified_name.db_name {
             let db_name_normalized = normalize_ident(db_name.as_str());
-
-            if db_name_normalized.eq_ignore_ascii_case("main") {
-                Ok(0)
-            } else if db_name_normalized.eq_ignore_ascii_case("temp") {
-                Ok(1)
-            } else {
-                // Look up attached database
-                if let Some((idx, _attached_db)) = self.get_attached_database(&db_name_normalized) {
-                    Ok(idx)
-                } else {
-                    Err(LimboError::InvalidArgument(format!(
-                        "no such database: {db_name_normalized}"
-                    )))
+            let name_bytes = db_name_normalized.as_bytes();
+            match_ignore_ascii_case!(match name_bytes {
+                b"main" => Ok(0),
+                b"temp" => Ok(1),
+                _ => {
+                    // Look up attached database
+                    if let Some((idx, _attached_db)) =
+                        self.get_attached_database(&db_name_normalized)
+                    {
+                        Ok(idx)
+                    } else {
+                        Err(LimboError::InvalidArgument(format!(
+                            "no such database: {db_name_normalized}"
+                        )))
+                    }
                 }
-            }
+            })
         } else {
             // Unqualified table name - use main database
             Ok(0)
@@ -2035,16 +2043,16 @@ impl Connection {
         self.syms.borrow().vtab_modules.keys().cloned().collect()
     }
 
-    pub fn set_encryption_key(&self, key: EncryptionKey) {
+    pub fn set_encryption_key(&self, key: EncryptionKey) -> Result<()> {
         tracing::trace!("setting encryption key for connection");
         *self.encryption_key.borrow_mut() = Some(key.clone());
-        self.set_encryption_context();
+        self.set_encryption_context()
     }
 
-    pub fn set_encryption_cipher(&self, cipher_mode: CipherMode) {
+    pub fn set_encryption_cipher(&self, cipher_mode: CipherMode) -> Result<()> {
         tracing::trace!("setting encryption cipher for connection");
         self.encryption_cipher_mode.replace(Some(cipher_mode));
-        self.set_encryption_context();
+        self.set_encryption_context()
     }
 
     pub fn get_encryption_cipher_mode(&self) -> Option<CipherMode> {
@@ -2052,17 +2060,22 @@ impl Connection {
     }
 
     // if both key and cipher are set, set encryption context on pager
-    fn set_encryption_context(&self) {
+    fn set_encryption_context(&self) -> Result<()> {
         let key_ref = self.encryption_key.borrow();
         let Some(key) = key_ref.as_ref() else {
-            return;
+            return Ok(());
         };
         let Some(cipher_mode) = self.encryption_cipher_mode.get() else {
-            return;
+            return Ok(());
         };
         tracing::trace!("setting encryption ctx for connection");
         let pager = self.pager.borrow();
-        pager.set_encryption_context(cipher_mode, key);
+        if pager.is_encryption_ctx_set() {
+            return Err(LimboError::InvalidArgument(
+                "cannot reset encryption attributes if already set in the session".to_string(),
+            ));
+        }
+        pager.set_encryption_context(cipher_mode, key)
     }
 }
 

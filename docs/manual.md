@@ -89,6 +89,7 @@ hello, world
 
 Turso aims towards full SQLite compatibility but has the following limitations:
 
+* Query result ordering is not guaranteed to be the same (see [#2964](https://github.com/tursodatabase/turso/issues/2964) for more discussion)
 * No multi-process access
 * No multi-threading
 * No savepoints

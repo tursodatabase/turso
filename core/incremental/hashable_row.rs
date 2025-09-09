@@ -78,3 +78,23 @@ impl Hash for HashableRow {
         self.cached_hash.hash(state);
     }
 }
+
+impl PartialOrd for HashableRow {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for HashableRow {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // First compare by rowid, then by values if rowids are equal
+        // This ensures Ord is consistent with Eq (which compares all fields)
+        match self.rowid.cmp(&other.rowid) {
+            std::cmp::Ordering::Equal => {
+                // If rowids are equal, compare values to maintain consistency with Eq
+                self.values.cmp(&other.values)
+            }
+            other => other,
+        }
+    }
+}

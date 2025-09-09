@@ -1,8 +1,4 @@
 use crate::incremental::view::IncrementalView;
-use crate::types::IOResult;
-
-/// Type alias for the materialized views collection
-pub type MaterializedViewsMap = HashMap<String, Arc<Mutex<IncrementalView>>>;
 
 /// Simple view structure for non-materialized views
 #[derive(Debug, Clone)]
@@ -23,12 +19,12 @@ use crate::translate::plan::SelectPlan;
 use crate::util::{
     module_args_from_sql, module_name_from_sql, type_from_name, IOExt, UnparsedFromSqlIndex,
 };
-use crate::{return_if_io, LimboError, MvCursor, Pager, RefValue, SymbolTable, VirtualTable};
 use crate::{util::normalize_ident, Result};
+use crate::{LimboError, MvCursor, Pager, RefValue, SymbolTable, VirtualTable};
 use core::fmt;
 use std::cell::RefCell;
 use std::collections::hash_map::Entry;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ops::Deref;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -42,11 +38,25 @@ use turso_parser::{
 
 const SCHEMA_TABLE_NAME: &str = "sqlite_schema";
 const SCHEMA_TABLE_NAME_ALT: &str = "sqlite_master";
+pub const DBSP_TABLE_PREFIX: &str = "__turso_internal_dbsp_state_";
+
+/// Check if a table name refers to a system table that should be protected from direct writes
+pub fn is_system_table(table_name: &str) -> bool {
+    let normalized = table_name.to_lowercase();
+    normalized == SCHEMA_TABLE_NAME || normalized == SCHEMA_TABLE_NAME_ALT
+}
 
 #[derive(Debug)]
 pub struct Schema {
     pub tables: HashMap<String, Arc<Table>>,
-    pub materialized_views: MaterializedViewsMap,
+
+    /// Track which tables are actually materialized views
+    pub materialized_view_names: HashSet<String>,
+    /// Store original SQL for materialized views (for .schema command)
+    pub materialized_view_sql: HashMap<String, String>,
+    /// The incremental view objects (DBSP circuits)
+    pub incremental_views: HashMap<String, Arc<Mutex<IncrementalView>>>,
+
     pub views: ViewsMap,
 
     /// table_name to list of indexes for the table
@@ -75,12 +85,16 @@ impl Schema {
                 Arc::new(Table::Virtual(Arc::new((*function).clone()))),
             );
         }
-        let materialized_views: MaterializedViewsMap = HashMap::new();
+        let materialized_view_names = HashSet::new();
+        let materialized_view_sql = HashMap::new();
+        let incremental_views = HashMap::new();
         let views: ViewsMap = HashMap::new();
         let table_to_materialized_views: HashMap<String, Vec<String>> = HashMap::new();
         Self {
             tables,
-            materialized_views,
+            materialized_view_names,
+            materialized_view_sql,
+            incremental_views,
             views,
             indexes,
             has_indexes,
@@ -96,41 +110,51 @@ impl Schema {
             .iter()
             .any(|idx| idx.1.iter().any(|i| i.name == name))
     }
-    pub fn add_materialized_view(&mut self, view: IncrementalView) {
+    pub fn add_materialized_view(&mut self, view: IncrementalView, table: Arc<Table>, sql: String) {
         let name = normalize_ident(view.name());
-        self.materialized_views
+
+        // Add to tables (so it appears as a regular table)
+        self.tables.insert(name.clone(), table);
+
+        // Track that this is a materialized view
+        self.materialized_view_names.insert(name.clone());
+        self.materialized_view_sql.insert(name.clone(), sql);
+
+        // Store the incremental view (DBSP circuit)
+        self.incremental_views
             .insert(name, Arc::new(Mutex::new(view)));
     }
 
     pub fn get_materialized_view(&self, name: &str) -> Option<Arc<Mutex<IncrementalView>>> {
         let name = normalize_ident(name);
-        self.materialized_views.get(&name).cloned()
+        self.incremental_views.get(&name).cloned()
+    }
+
+    pub fn is_materialized_view(&self, name: &str) -> bool {
+        let name = normalize_ident(name);
+        self.materialized_view_names.contains(&name)
     }
 
     pub fn remove_view(&mut self, name: &str) -> Result<()> {
         let name = normalize_ident(name);
 
-        // Check if we have both a regular view and a materialized view with the same name
-        // It should be impossible to have both
-        let has_regular_view = self.views.contains_key(&name);
-        let has_materialized_view = self.materialized_views.contains_key(&name);
-
-        assert!(
-            !(has_regular_view && has_materialized_view),
-            "Found both regular view and materialized view with name: {name}"
-        );
-
-        if has_regular_view {
+        if self.views.contains_key(&name) {
             self.views.remove(&name);
             Ok(())
-        } else if has_materialized_view {
+        } else if self.materialized_view_names.contains(&name) {
+            // Remove from tables
+            self.tables.remove(&name);
+
+            // Remove from materialized view tracking
+            self.materialized_view_names.remove(&name);
+            self.materialized_view_sql.remove(&name);
+            self.incremental_views.remove(&name);
+
             // Remove from table_to_materialized_views dependencies
             for views in self.table_to_materialized_views.values_mut() {
                 views.retain(|v| v != &name);
             }
 
-            // Remove the materialized view itself
-            self.materialized_views.remove(&name);
             Ok(())
         } else {
             Err(crate::LimboError::ParseError(format!(
@@ -157,30 +181,6 @@ impl Schema {
             .get(&table_name)
             .cloned()
             .unwrap_or_default()
-    }
-
-    /// Get all materialized views that depend on a given table, skip normalizing ident.
-    /// We are basically assuming we already normalized the ident.
-    pub fn get_dependent_materialized_views_unnormalized(
-        &self,
-        table_name: &str,
-    ) -> Option<&Vec<String>> {
-        self.table_to_materialized_views.get(table_name)
-    }
-
-    /// Populate all materialized views by scanning their source tables
-    /// Returns IOResult to support async execution
-    pub fn populate_materialized_views(
-        &self,
-        conn: &Arc<crate::Connection>,
-    ) -> Result<IOResult<()>> {
-        for view in self.materialized_views.values() {
-            let mut view = view
-                .lock()
-                .map_err(|_| LimboError::InternalError("Failed to lock view".to_string()))?;
-            return_if_io!(view.populate_from_table(conn));
-        }
-        Ok(IOResult::Done(()))
     }
 
     /// Add a regular (non-materialized) view
@@ -218,6 +218,12 @@ impl Schema {
     pub fn remove_table(&mut self, table_name: &str) {
         let name = normalize_ident(table_name);
         self.tables.remove(&name);
+
+        // If this was a materialized view, also clean up the metadata
+        if self.materialized_view_names.remove(&name) {
+            self.incremental_views.remove(&name);
+            self.materialized_view_sql.remove(&name);
+        }
     }
 
     pub fn get_btree_table(&self, name: &str) -> Option<Arc<BTreeTable>> {
@@ -291,8 +297,10 @@ impl Schema {
         let mut automatic_indices: HashMap<String, Vec<(String, usize)>> =
             HashMap::with_capacity(10);
 
-        // Collect materialized views for second pass to populate table_to_materialized_views mapping
-        let mut materialized_views_to_process: Vec<(String, Vec<String>)> = Vec::new();
+        // Store DBSP state table root pages: view_name -> dbsp_state_root_page
+        let mut dbsp_state_roots: HashMap<String, usize> = HashMap::new();
+        // Store materialized view info (SQL and root page) for later creation
+        let mut materialized_view_info: HashMap<String, (String, usize)> = HashMap::new();
 
         if matches!(pager.begin_read_tx()?, LimboResult::Busy) {
             return Err(LimboError::Busy);
@@ -351,6 +359,18 @@ impl Schema {
                     }
 
                     let table = BTreeTable::from_sql(sql, root_page as usize)?;
+
+                    // Check if this is a DBSP state table
+                    if table.name.starts_with(DBSP_TABLE_PREFIX) {
+                        // Extract the view name from _dbsp_state_<viewname>
+                        let view_name = table
+                            .name
+                            .strip_prefix(DBSP_TABLE_PREFIX)
+                            .unwrap()
+                            .to_string();
+                        dbsp_state_roots.insert(view_name, root_page as usize);
+                    }
+
                     self.add_btree_table(Arc::new(table));
                 }
                 "index" => {
@@ -412,6 +432,14 @@ impl Schema {
                     };
                     let name = name_text.as_str();
 
+                    // Get the root page (column 3) to determine if this is a materialized view
+                    // Regular views have rootpage = 0, materialized views have rootpage != 0
+                    let root_page_value = record_cursor.get_value(&row, 3)?;
+                    let RefValue::Integer(root_page_int) = root_page_value else {
+                        return Err(LimboError::ConversionError("Expected integer value".into()));
+                    };
+                    let root_page = root_page_int as usize;
+
                     let sql_value = record_cursor.get_value(&row, 4)?;
                     let RefValue::Text(sql_text) = sql_value else {
                         return Err(LimboError::ConversionError("Expected text value".into()));
@@ -423,15 +451,12 @@ impl Schema {
                     if let Ok(Some(Cmd::Stmt(stmt))) = parser.next_cmd() {
                         match stmt {
                             Stmt::CreateMaterializedView { .. } => {
-                                // Create IncrementalView for materialized views
-                                if let Ok(incremental_view) = IncrementalView::from_sql(sql, self) {
-                                    let referenced_tables =
-                                        incremental_view.get_referenced_table_names();
-                                    let view_name = name.to_string();
-                                    self.add_materialized_view(incremental_view);
-                                    materialized_views_to_process
-                                        .push((view_name, referenced_tables));
-                                }
+                                // Store materialized view info for later creation
+                                // We'll create the actual IncrementalView in a later pass
+                                // when we have both the main root page and DBSP state root
+                                let view_name = name.to_string();
+                                materialized_view_info
+                                    .insert(view_name, (sql.to_string(), root_page));
                             }
                             Stmt::CreateView {
                                 view_name: _,
@@ -475,14 +500,6 @@ impl Schema {
 
         pager.end_read_tx()?;
 
-        // Second pass: populate table_to_materialized_views mapping
-        for (view_name, referenced_tables) in materialized_views_to_process {
-            // Register this view as dependent on each referenced table
-            for table_name in referenced_tables {
-                self.add_materialized_view_dependency(&table_name, &view_name);
-            }
-        }
-
         for unparsed_sql_from_index in from_sql_indexes {
             if !self.indexes_enabled() {
                 self.table_set_has_index(&unparsed_sql_from_index.table_name);
@@ -511,6 +528,39 @@ impl Schema {
                 for index in ret_index {
                     self.add_index(Arc::new(index));
                 }
+            }
+        }
+
+        // Third pass: Create materialized views now that we have both root pages
+        for (view_name, (sql, main_root)) in materialized_view_info {
+            // Look up the DBSP state root for this view - must exist for materialized views
+            let dbsp_state_root = dbsp_state_roots.get(&view_name).ok_or_else(|| {
+                LimboError::InternalError(format!(
+                    "Materialized view {view_name} is missing its DBSP state table"
+                ))
+            })?;
+
+            // Create the IncrementalView with both root pages
+            let incremental_view =
+                IncrementalView::from_sql(&sql, self, main_root, *dbsp_state_root)?;
+            let referenced_tables = incremental_view.get_referenced_table_names();
+
+            // Create a BTreeTable for the materialized view
+            let table = Arc::new(Table::BTree(Arc::new(BTreeTable {
+                name: view_name.clone(),
+                root_page: main_root,
+                columns: incremental_view.columns.clone(),
+                primary_key_columns: Vec::new(),
+                has_rowid: true,
+                is_strict: false,
+                unique_sets: None,
+            })));
+
+            self.add_materialized_view(incremental_view, table, sql);
+
+            // Register dependencies
+            for table_name in referenced_tables {
+                self.add_materialized_view_dependency(&table_name, &view_name);
             }
         }
 
@@ -559,15 +609,19 @@ impl Clone for Schema {
                 (name.clone(), indexes)
             })
             .collect();
-        let materialized_views = self
-            .materialized_views
+        let materialized_view_names = self.materialized_view_names.clone();
+        let materialized_view_sql = self.materialized_view_sql.clone();
+        let incremental_views = self
+            .incremental_views
             .iter()
             .map(|(name, view)| (name.clone(), view.clone()))
             .collect();
         let views = self.views.clone();
         Self {
             tables,
-            materialized_views,
+            materialized_view_names,
+            materialized_view_sql,
+            incremental_views,
             views,
             indexes,
             has_indexes: self.has_indexes.clone(),
@@ -1252,16 +1306,14 @@ impl Affinity {
         }
     }
 
-    pub fn from_char(char: char) -> Result<Self> {
+    pub fn from_char(char: char) -> Self {
         match char {
-            SQLITE_AFF_INTEGER => Ok(Affinity::Integer),
-            SQLITE_AFF_TEXT => Ok(Affinity::Text),
-            SQLITE_AFF_NONE => Ok(Affinity::Blob),
-            SQLITE_AFF_REAL => Ok(Affinity::Real),
-            SQLITE_AFF_NUMERIC => Ok(Affinity::Numeric),
-            _ => Err(LimboError::InternalError(format!(
-                "Invalid affinity character: {char}"
-            ))),
+            SQLITE_AFF_INTEGER => Affinity::Integer,
+            SQLITE_AFF_TEXT => Affinity::Text,
+            SQLITE_AFF_NONE => Affinity::Blob,
+            SQLITE_AFF_REAL => Affinity::Real,
+            SQLITE_AFF_NUMERIC => Affinity::Numeric,
+            _ => Affinity::Blob,
         }
     }
 
@@ -1269,7 +1321,7 @@ impl Affinity {
         self.aff_mask() as u8
     }
 
-    pub fn from_char_code(code: u8) -> Result<Self, LimboError> {
+    pub fn from_char_code(code: u8) -> Self {
         Self::from_char(code as char)
     }
 

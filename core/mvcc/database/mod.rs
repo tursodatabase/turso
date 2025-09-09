@@ -271,6 +271,15 @@ pub struct CommitStateMachine<Clock: LogicalClock> {
     _phantom: PhantomData<Clock>,
 }
 
+impl<Clock: LogicalClock> Debug for CommitStateMachine<Clock> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CommitStateMachine")
+            .field("state", &self.state)
+            .field("is_finalized", &self.is_finalized)
+            .finish()
+    }
+}
+
 pub struct WriteRowStateMachine {
     state: WriteRowState,
     is_finalized: bool,

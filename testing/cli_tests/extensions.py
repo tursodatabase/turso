@@ -153,6 +153,11 @@ def test_aggregates():
         validate_median,
         "median agg function works",
     )
+    limbo.run_test_fn(
+        "select CASE WHEN median(value) > 0 THEN median(value) ELSE 0 END from numbers;",
+        validate_median,
+        "median agg function wrapped in expression works",
+    )
     limbo.execute_dot("INSERT INTO numbers (value) VALUES (8.0);\n")
     limbo.run_test_fn(
         "select median(value) from numbers;",
@@ -183,6 +188,11 @@ def test_grouped_aggregates():
         "SELECT median(value) FROM numbers GROUP BY category;",
         lambda res: "2.0\n5.5" == res,
         "median aggregate function works",
+    )
+    limbo.run_test_fn(
+        "select CASE WHEN median(value) > 0 THEN median(value) ELSE 0 END from numbers GROUP BY category;",
+        lambda res: "2.0\n5.5" == res,
+        "median aggregate function wrapped in expression works",
     )
     limbo.run_test_fn(
         "SELECT percentile(value, percent) FROM test GROUP BY category;",

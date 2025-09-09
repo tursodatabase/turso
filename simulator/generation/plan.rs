@@ -1,11 +1,11 @@
 use std::{
-    collections::HashSet,
     fmt::{Debug, Display},
     path::Path,
     sync::Arc,
     vec,
 };
 
+use indexmap::IndexSet;
 use serde::{Deserialize, Serialize};
 
 use sql_generation::{
@@ -166,13 +166,13 @@ impl Interactions {
 }
 
 impl Interactions {
-    pub(crate) fn dependencies(&self) -> HashSet<String> {
+    pub(crate) fn dependencies(&self) -> IndexSet<String> {
         match self {
             Interactions::Property(property) => {
                 property
                     .interactions()
                     .iter()
-                    .fold(HashSet::new(), |mut acc, i| match i {
+                    .fold(IndexSet::new(), |mut acc, i| match i {
                         Interaction::Query(q) => {
                             acc.extend(q.dependencies());
                             acc
@@ -181,7 +181,7 @@ impl Interactions {
                     })
             }
             Interactions::Query(query) => query.dependencies(),
-            Interactions::Fault(_) => HashSet::new(),
+            Interactions::Fault(_) => IndexSet::new(),
         }
     }
 

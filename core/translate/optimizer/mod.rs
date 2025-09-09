@@ -8,6 +8,7 @@ use join::{compute_best_join_order, BestJoinOrderResult};
 use lift_common_subexpressions::lift_common_subexpressions_from_binary_or_terms;
 use order::{compute_order_target, plan_satisfies_order_target, EliminatesSortBy};
 use turso_ext::{ConstraintInfo, ConstraintUsage};
+use turso_macros::match_ignore_ascii_case;
 use turso_parser::ast::{self, Expr, SortOrder};
 
 use crate::{
@@ -189,6 +190,34 @@ fn optimize_table_access(
     let maybe_order_target = compute_order_target(order_by, group_by.as_mut());
     let constraints_per_table =
         constraints_from_where_clause(where_clause, table_references, available_indexes)?;
+
+    // Currently the expressions we evaluate as constraints are binary expressions that will never be true for a NULL operand.
+    // If there are any constraints on the right hand side table of an outer join that are not part of the outer join condition,
+    // the outer join can be converted into an inner join.
+    // for example:
+    // - SELECT * FROM t1 LEFT JOIN t2 ON false WHERE t2.id = 5
+    // there can never be a situation where null columns are emitted for t2 because t2.id = 5 will never be true in that case.
+    // hence: we can convert the outer join into an inner join.
+    for (i, t) in table_references
+        .joined_tables_mut()
+        .iter_mut()
+        .enumerate()
+        .filter(|(_, t)| {
+            t.join_info
+                .as_ref()
+                .is_some_and(|join_info| join_info.outer)
+        })
+    {
+        if constraints_per_table[i]
+            .constraints
+            .iter()
+            .any(|c| where_clause[c.where_clause_pos.0].from_outer_join.is_none())
+        {
+            t.join_info.as_mut().unwrap().outer = false;
+            continue;
+        }
+    }
+
     let Some(best_join_order_result) = compute_best_join_order(
         table_references.joined_tables_mut(),
         maybe_order_target.as_ref(),
@@ -338,14 +367,29 @@ fn optimize_table_access(
                         )?,
                     });
                 } else {
+                    let is_outer_join = joined_tables[table_idx]
+                        .join_info
+                        .as_ref()
+                        .is_some_and(|join_info| join_info.outer);
                     for cref in constraint_refs.iter() {
                         let constraint =
                             &constraints_per_table[table_idx].constraints[cref.constraint_vec_pos];
+                        let where_term = &mut where_clause[constraint.where_clause_pos.0];
                         assert!(
-                            !where_clause[constraint.where_clause_pos.0].consumed,
-                            "trying to consume a where clause term twice: {:?}",
-                            where_clause[constraint.where_clause_pos.0]
+                            !where_term.consumed,
+                            "trying to consume a where clause term twice: {where_term:?}",
                         );
+                        if is_outer_join && where_term.from_outer_join.is_none() {
+                            // Don't consume WHERE terms from outer joins if the where term is not part of the outer join condition. Consider:
+                            // - SELECT * FROM t1 LEFT JOIN t2 ON false WHERE t2.id = 5
+                            // - there is no row in t2 where t2.id = 5
+                            // This should never produce any rows with null columns for t2 (because NULL != 5), but if we consume 't2.id = 5' to use it as a seek key,
+                            // this will cause a null row to be emitted for EVERY row of t1.
+                            // Note: in most cases like this, the LEFT JOIN could just be converted into an INNER JOIN (because e.g. t2.id=5 statically excludes any null rows),
+                            // but that optimization should not be done here - it should be done before the join order optimization happens.
+                            continue;
+                        }
+
                         where_clause[constraint.where_clause_pos.0].consumed = true;
                     }
                     if let Some(index) = &index {
@@ -1405,13 +1449,16 @@ pub fn rewrite_expr(top_level_expr: &mut ast::Expr, param_idx: &mut usize) -> Re
         match expr {
             ast::Expr::Id(id) => {
                 // Convert "true" and "false" to 1 and 0
-                if id.as_str().eq_ignore_ascii_case("true") {
-                    *expr = ast::Expr::Literal(ast::Literal::Numeric(1.to_string()));
-                    return Ok(());
-                }
-                if id.as_str().eq_ignore_ascii_case("false") {
-                    *expr = ast::Expr::Literal(ast::Literal::Numeric(0.to_string()));
-                }
+                let id_bytes = id.as_str().as_bytes();
+                match_ignore_ascii_case!(match id_bytes {
+                    b"true" => {
+                        *expr = ast::Expr::Literal(ast::Literal::Numeric("1".to_owned()));
+                    }
+                    b"false" => {
+                        *expr = ast::Expr::Literal(ast::Literal::Numeric("0".to_owned()));
+                    }
+                    _ => {}
+                })
             }
             ast::Expr::Variable(var) => {
                 if var.is_empty() {

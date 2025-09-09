@@ -1,6 +1,7 @@
-use std::{collections::HashSet, fmt::Display};
+use std::fmt::Display;
 
 pub use ast::Distinctness;
+use indexmap::IndexSet;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use turso_parser::ast::{
@@ -105,12 +106,12 @@ impl Select {
         }
     }
 
-    pub fn dependencies(&self) -> HashSet<String> {
+    pub fn dependencies(&self) -> IndexSet<String> {
         if self.body.select.from.is_none() {
-            return HashSet::new();
+            return IndexSet::new();
         }
         let from = self.body.select.from.as_ref().unwrap();
-        let mut tables = HashSet::new();
+        let mut tables = IndexSet::new();
         tables.insert(from.table.clone());
 
         tables.extend(from.dependencies());
@@ -228,7 +229,7 @@ impl FromClause {
 
         let mut join_table = JoinTable {
             tables: vec![first_table.clone()],
-            rows: Vec::new(),
+            rows: first_table.rows.clone(),
         };
 
         for join in &self.joins {

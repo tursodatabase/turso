@@ -3,7 +3,7 @@ use turso_parser::ast::{self, SortOrder};
 
 use crate::{
     function::AggFunc,
-    schema::{BTreeTable, Column, FromClauseSubquery, Index, Table},
+    schema::{BTreeTable, Column, FromClauseSubquery, Index, Schema, Table},
     vdbe::{
         builder::{CursorKey, CursorType, ProgramBuilder},
         insn::{IdxInsertFlags, Insn},
@@ -154,8 +154,8 @@ pub enum Plan {
     CompoundSelect {
         left: Vec<(SelectPlan, ast::CompoundOperator)>,
         right_most: SelectPlan,
-        limit: Option<isize>,
-        offset: Option<isize>,
+        limit: Option<Box<Expr>>,
+        offset: Option<Box<Expr>>,
         order_by: Option<Vec<(ast::Expr, SortOrder)>>,
     },
     Delete(DeletePlan),
@@ -264,6 +264,7 @@ impl DistinctCtx {
             count: num_regs,
             dest_reg: record_reg,
             index_name: Some(self.ephemeral_index_name.to_string()),
+            affinity_str: None,
         });
         program.emit_insn(Insn::IdxInsert {
             cursor_id: self.cursor_id,
@@ -292,9 +293,9 @@ pub struct SelectPlan {
     /// all the aggregates collected from the result columns, order by, and (TODO) having clauses
     pub aggregates: Vec<Aggregate>,
     /// limit clause
-    pub limit: Option<isize>,
+    pub limit: Option<Box<Expr>>,
     /// offset clause
-    pub offset: Option<isize>,
+    pub offset: Option<Box<Expr>>,
     /// query contains a constant condition that is always false
     pub contains_constant_false_condition: bool,
     /// the destination of the resulting rows from this plan.
@@ -378,9 +379,9 @@ pub struct DeletePlan {
     /// order by clause
     pub order_by: Vec<(Box<ast::Expr>, SortOrder)>,
     /// limit clause
-    pub limit: Option<isize>,
+    pub limit: Option<Box<Expr>>,
     /// offset clause
-    pub offset: Option<isize>,
+    pub offset: Option<Box<Expr>>,
     /// query contains a constant condition that is always false
     pub contains_constant_false_condition: bool,
     /// Indexes that must be updated by the delete operation.
@@ -394,8 +395,8 @@ pub struct UpdatePlan {
     pub set_clauses: Vec<(usize, Box<ast::Expr>)>,
     pub where_clause: Vec<WhereTerm>,
     pub order_by: Vec<(Box<ast::Expr>, SortOrder)>,
-    pub limit: Option<isize>,
-    pub offset: Option<isize>,
+    pub limit: Option<Box<Expr>>,
+    pub offset: Option<Box<Expr>>,
     // TODO: optional RETURNING clause
     pub returning: Option<Vec<ResultSetColumn>>,
     // whether the WHERE clause is always false
@@ -852,6 +853,7 @@ impl JoinedTable {
         &self,
         program: &mut ProgramBuilder,
         mode: OperationMode,
+        schema: &Schema,
     ) -> Result<(Option<CursorID>, Option<CursorID>)> {
         let index = self.op.index();
         match &self.table {
@@ -863,10 +865,17 @@ impl JoinedTable {
                 let table_cursor_id = if table_not_required {
                     None
                 } else {
-                    Some(program.alloc_cursor_id_keyed(
-                        CursorKey::table(self.internal_id),
-                        CursorType::BTreeTable(btree.clone()),
-                    ))
+                    // Check if this is a materialized view
+                    let cursor_type =
+                        if let Some(view_mutex) = schema.get_materialized_view(&btree.name) {
+                            CursorType::MaterializedView(btree.clone(), view_mutex)
+                        } else {
+                            CursorType::BTreeTable(btree.clone())
+                        };
+                    Some(
+                        program
+                            .alloc_cursor_id_keyed(CursorKey::table(self.internal_id), cursor_type),
+                    )
                 };
                 let index_cursor_id = index.map(|index| {
                     program.alloc_cursor_id_keyed(

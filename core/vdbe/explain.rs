@@ -19,6 +19,7 @@ pub fn insn_to_str(
             CursorType::BTreeIndex(index) => &index.name,
             CursorType::Pseudo(_) => "pseudo",
             CursorType::VirtualTable(virtual_table) => &virtual_table.name,
+            CursorType::MaterializedView(table, _) => &table.name,
             CursorType::Sorter => "sorter",
         }
     };
@@ -541,6 +542,10 @@ pub fn insn_to_str(
                         let name = &index.columns.get(*column).unwrap().name;
                         Some(name)
                     }
+                    CursorType::MaterializedView(table, _) => {
+                        let name = table.columns.get(*column).and_then(|v| v.name.as_ref());
+                        name
+                    }
                     CursorType::Pseudo(_) => None,
                     CursorType::Sorter => None,
                     CursorType::VirtualTable(v) => v.columns.get(*column).unwrap().name.as_ref(),
@@ -579,6 +584,7 @@ pub fn insn_to_str(
                 count,
                 dest_reg,
                 index_name,
+                affinity_str: _,
             } => {
                 let for_index = index_name.as_ref().map(|name| format!("; for {name}"));
                 (
@@ -1337,13 +1343,13 @@ pub fn insn_to_str(
                 0,
                 where_clause.clone().unwrap_or("NULL".to_string()),
             ),
-            Insn::PopulateMaterializedViews => (
+            Insn::PopulateMaterializedViews { cursors } => (
                 "PopulateMaterializedViews",
                 0,
                 0,
                 0,
                 Value::Null,
-                0,
+                cursors.len() as u16,
                 "".to_string(),
             ),
             Insn::Prev {
@@ -1708,6 +1714,15 @@ pub fn insn_to_str(
                 Value::build_text(collation.to_string().as_str()),
                 0,
                 format!("collation={collation}"),
+            ),
+            Insn::IfNeg { reg, target_pc } => (
+                "IfNeg",
+                *reg as i32,
+                target_pc.as_debug_int(),
+                0,
+                Value::build_text(""),
+                0,
+                format!("if (r[{}] < 0) goto {}", reg, target_pc.as_debug_int()),
             ),
         };
     format!(

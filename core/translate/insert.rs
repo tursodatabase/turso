@@ -63,6 +63,7 @@ pub fn translate_insert(
     if with.is_some() {
         crate::bail_parse_error!("WITH clause is not supported");
     }
+
     if on_conflict.is_some() {
         crate::bail_parse_error!("ON CONFLICT clause is not supported");
     }
@@ -75,10 +76,21 @@ pub fn translate_insert(
         );
     }
     let table_name = &tbl_name.name;
+
+    // Check if this is a system table that should be protected from direct writes
+    if crate::schema::is_system_table(table_name.as_str()) {
+        crate::bail_parse_error!("table {} may not be modified", table_name);
+    }
+
     let table = match schema.get_table(table_name.as_str()) {
         Some(table) => table,
         None => crate::bail_parse_error!("no such table: {}", table_name),
     };
+
+    // Check if this is a materialized view
+    if schema.is_materialized_view(table_name.as_str()) {
+        crate::bail_parse_error!("cannot modify materialized view {}", table_name);
+    }
 
     let resolver = Resolver::new(schema, syms);
 
@@ -241,11 +253,35 @@ pub fn translate_insert(
                         end_offset: yield_label,
                     });
                     let record_reg = program.alloc_register();
+
+                    let affinity_str = if columns.is_empty() {
+                        btree_table
+                            .columns
+                            .iter()
+                            .filter(|col| !col.hidden)
+                            .map(|col| col.affinity().aff_mask())
+                            .collect::<String>()
+                    } else {
+                        columns
+                            .iter()
+                            .map(|col_name| {
+                                let column_name = normalize_ident(col_name.as_str());
+                                table
+                                    .get_column_by_name(&column_name)
+                                    .unwrap()
+                                    .1
+                                    .affinity()
+                                    .aff_mask()
+                            })
+                            .collect::<String>()
+                    };
+
                     program.emit_insn(Insn::MakeRecord {
                         start_reg: yield_reg + 1,
                         count: result.num_result_cols,
                         dest_reg: record_reg,
                         index_name: None,
+                        affinity_str: Some(affinity_str),
                     });
 
                     let rowid_reg = program.alloc_register();
@@ -495,6 +531,7 @@ pub fn translate_insert(
             count: num_cols + 1,
             dest_reg: record_reg,
             index_name: Some(index.name.clone()),
+            affinity_str: None,
         });
 
         if index.unique {
@@ -615,11 +652,18 @@ pub fn translate_insert(
         });
     }
     // Create and insert the record
+    let affinity_str = insertion
+        .col_mappings
+        .iter()
+        .map(|col_mapping| col_mapping.column.affinity().aff_mask())
+        .collect::<String>();
+
     program.emit_insn(Insn::MakeRecord {
         start_reg: insertion.first_col_register(),
         count: insertion.col_mappings.len(),
         dest_reg: insertion.record_register(),
         index_name: None,
+        affinity_str: Some(affinity_str),
     });
     program.emit_insn(Insn::Insert {
         cursor: cursor_id,

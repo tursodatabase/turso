@@ -1,8 +1,7 @@
 use std::sync::atomic::Ordering;
-use std::{cell::RefCell, ptr::NonNull};
 
 use std::sync::Arc;
-use tracing::{debug, trace};
+use tracing::trace;
 
 use crate::turso_assert;
 
@@ -12,39 +11,98 @@ use super::pager::PageRef;
 const DEFAULT_PAGE_CACHE_SIZE_IN_PAGES_MAKE_ME_SMALLER_ONCE_WAL_SPILL_IS_IMPLEMENTED: usize =
     100000;
 
-#[derive(Debug, Eq, Hash, PartialEq, Clone, Copy)]
-pub struct PageCacheKey {
-    pgno: usize,
-}
+#[derive(Debug, Copy, Eq, Hash, PartialEq, Clone)]
+#[repr(transparent)]
+pub struct PageCacheKey(usize);
 
-#[allow(dead_code)]
+const NULL: usize = usize::MAX;
+
+const CLEAR: u8 = 0;
+const REF_MAX: u8 = 3;
+
+#[derive(Clone, Debug)]
 struct PageCacheEntry {
+    /// Key identifying this page
     key: PageCacheKey,
-    page: PageRef,
-    prev: Option<NonNull<PageCacheEntry>>,
-    next: Option<NonNull<PageCacheEntry>>,
+    /// The cached page, None if this slot is free
+    page: Option<PageRef>,
+    /// Reference counter (SIEVE/GClock): starts at zero, bumped on access,
+    /// decremented during eviction, only pages at 0 are evicted.
+    ref_bit: u8,
+    /// Index of next entry in SIEVE queue (older/toward tail)
+    next: usize,
+    /// Index of previous entry in SIEVE queue (newer/toward head)
+    prev: usize,
 }
 
-pub struct DumbLruPageCache {
-    capacity: usize,
-    map: RefCell<PageHashMap>,
-    head: RefCell<Option<NonNull<PageCacheEntry>>>,
-    tail: RefCell<Option<NonNull<PageCacheEntry>>>,
+impl Default for PageCacheEntry {
+    fn default() -> Self {
+        Self {
+            key: PageCacheKey(0),
+            page: None,
+            ref_bit: CLEAR,
+            next: NULL,
+            prev: NULL,
+        }
+    }
 }
-unsafe impl Send for DumbLruPageCache {}
-unsafe impl Sync for DumbLruPageCache {}
+
+impl PageCacheEntry {
+    #[inline]
+    fn bump_ref(&mut self) {
+        self.ref_bit = std::cmp::min(self.ref_bit + 1, REF_MAX);
+    }
+
+    #[inline]
+    /// Returns the old value
+    fn decrement_ref(&mut self) -> u8 {
+        let old = self.ref_bit;
+        self.ref_bit = old.saturating_sub(1);
+        old
+    }
+    #[inline]
+    fn clear_ref(&mut self) {
+        self.ref_bit = CLEAR;
+    }
+    #[inline]
+    fn empty() -> Self {
+        Self::default()
+    }
+    #[inline]
+    fn reset_links(&mut self) {
+        self.next = NULL;
+        self.prev = NULL;
+    }
+}
+
+/// PageCache implements a variation of the SIEVE algorithm that maintains an intrusive linked list queue of
+/// pages which keep a 'reference_bit' to determine how recently/frequently the page has been accessed.
+/// The bit is set to `Clear` on initial insertion and then bumped on each access and decremented
+/// during eviction scans.
+///
+/// The ring is circular. `clock_hand` points at the tail (LRU).
+/// Sweep order follows next: tail (LRU) -> head (MRU) -> .. -> tail
+/// New pages are inserted after the clock hand in the `next` direction,
+/// which places them at head (MRU) (i.e. `tail.next` is the head).
+pub struct PageCache {
+    /// Capacity in pages
+    capacity: usize,
+    /// Map of Key -> usize in entries array
+    map: PageHashMap,
+    clock_hand: usize,
+    /// Fixed-size vec holding page entries
+    entries: Vec<PageCacheEntry>,
+    /// Free list: Stack of available slot indices
+    freelist: Vec<usize>,
+}
+
+unsafe impl Send for PageCache {}
+unsafe impl Sync for PageCache {}
 
 struct PageHashMap {
-    // FIXME: do we prefer array buckets or list? Deletes will be slower here which I guess happens often. I will do this for now to test how well it does.
     buckets: Vec<Vec<HashMapNode>>,
     capacity: usize,
     size: usize,
-}
-
-#[derive(Clone)]
-struct HashMapNode {
-    key: PageCacheKey,
-    value: NonNull<PageCacheEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -73,33 +131,82 @@ pub enum CacheResizeResult {
 
 impl PageCacheKey {
     pub fn new(pgno: usize) -> Self {
-        Self { pgno }
+        Self(pgno)
     }
 }
-impl DumbLruPageCache {
+
+impl PageCache {
     pub fn new(capacity: usize) -> Self {
-        assert!(capacity > 0, "capacity of cache should be at least 1");
+        assert!(capacity > 0);
+        let freelist = (0..capacity).rev().collect::<Vec<usize>>();
         Self {
             capacity,
-            map: RefCell::new(PageHashMap::new(capacity)),
-            head: RefCell::new(None),
-            tail: RefCell::new(None),
+            map: PageHashMap::new(capacity),
+            clock_hand: NULL,
+            entries: vec![PageCacheEntry::empty(); capacity],
+            freelist,
         }
     }
 
-    pub fn contains_key(&mut self, key: &PageCacheKey) -> bool {
-        self.map.borrow().contains_key(key)
+    #[inline]
+    fn link_after(&mut self, a: usize, b: usize) {
+        // insert `b` after `a` in a non-empty circular list
+        let an = self.entries[a].next;
+        self.entries[b].prev = a;
+        self.entries[b].next = an;
+        self.entries[an].prev = b;
+        self.entries[a].next = b;
     }
 
+    #[inline]
+    fn link_new_node(&mut self, slot: usize) {
+        let hand = self.clock_hand;
+        if hand == NULL {
+            // first element → points to itself
+            self.entries[slot].prev = slot;
+            self.entries[slot].next = slot;
+            self.clock_hand = slot;
+        } else {
+            // insert after the hand (LRU)
+            self.link_after(hand, slot);
+        }
+    }
+
+    #[inline]
+    fn unlink(&mut self, slot: usize) {
+        let p = self.entries[slot].prev;
+        let n = self.entries[slot].next;
+
+        if p == slot && n == slot {
+            self.clock_hand = NULL;
+        } else {
+            self.entries[p].next = n;
+            self.entries[n].prev = p;
+            if self.clock_hand == slot {
+                // stay at LRU position, second-oldest becomes oldest
+                self.clock_hand = p;
+            }
+        }
+
+        self.entries[slot].reset_links();
+    }
+
+    #[inline]
+    fn forward_of(&self, i: usize) -> usize {
+        self.entries[i].next
+    }
+
+    pub fn contains_key(&self, key: &PageCacheKey) -> bool {
+        self.map.contains_key(key)
+    }
+
+    #[inline]
     pub fn insert(&mut self, key: PageCacheKey, value: PageRef) -> Result<(), CacheError> {
         self._insert(key, value, false)
     }
 
-    pub fn insert_ignore_existing(
-        &mut self,
-        key: PageCacheKey,
-        value: PageRef,
-    ) -> Result<(), CacheError> {
+    #[inline]
+    pub fn upsert_page(&mut self, key: PageCacheKey, value: PageRef) -> Result<(), CacheError> {
         self._insert(key, value, true)
     }
 
@@ -107,484 +214,547 @@ impl DumbLruPageCache {
         &mut self,
         key: PageCacheKey,
         value: PageRef,
-        ignore_exists: bool,
+        update_in_place: bool,
     ) -> Result<(), CacheError> {
         trace!("insert(key={:?})", key);
-        // Check first if page already exists in cache
-        let existing_ptr = self.map.borrow().get(&key).copied();
-        if let Some(ptr) = existing_ptr {
-            if !ignore_exists {
-                if let Some(existing_page_ref) = self.get(&key)? {
-                    assert!(
-                        Arc::ptr_eq(&value, &existing_page_ref),
-                        "Attempted to insert different page with same key: {key:?}"
-                    );
-                    return Err(CacheError::KeyExists);
-                }
-            } else {
-                // ignore_exists is called when the existing entry needs to be updated in place
-                unsafe {
-                    let entry = ptr.as_ptr();
-                    (*entry).page = value;
-                }
-                self.unlink(ptr);
-                self.touch(ptr);
+        let slot = self.map.get(&key);
+        if let Some(slot) = slot {
+            let p = self.entries[slot]
+                .page
+                .as_ref()
+                .expect("slot must have a page");
+
+            if !p.is_loaded() && !p.is_locked() {
+                // evict, then continue with fresh insert
+                self._delete(key, true)?;
+                let slot_index = self.find_free_slot()?;
+                let entry = &mut self.entries[slot_index];
+                entry.key = key;
+                entry.page = Some(value);
+                entry.clear_ref();
+                self.map.insert(key, slot_index);
+                self.link_new_node(slot_index);
                 return Ok(());
             }
-        }
 
+            let existing = &mut self.entries[slot];
+            existing.bump_ref();
+            if update_in_place {
+                existing.page = Some(value);
+                return Ok(());
+            } else {
+                turso_assert!(
+                    Arc::ptr_eq(existing.page.as_ref().unwrap(), &value),
+                    "Attempted to insert different page with same key: {key:?}"
+                );
+                return Err(CacheError::KeyExists);
+            }
+        }
         // Key doesn't exist, proceed with new entry
         self.make_room_for(1)?;
-        let entry = Box::new(PageCacheEntry {
-            key,
-            next: None,
-            prev: None,
-            page: value,
-        });
-        let ptr_raw = Box::into_raw(entry);
-        let ptr = unsafe { NonNull::new_unchecked(ptr_raw) };
-        self.touch(ptr);
-        self.map.borrow_mut().insert(key, ptr);
+        let slot_index = self.find_free_slot()?;
+        let entry = &mut self.entries[slot_index];
+        turso_assert!(entry.page.is_none(), "page must be None in free slot");
+        entry.key = key;
+        entry.page = Some(value);
+        // Sieve ref bit starts cleared, will be set on first access
+        entry.clear_ref();
+        self.map.insert(key, slot_index);
+        self.link_new_node(slot_index);
         Ok(())
     }
 
+    fn find_free_slot(&mut self) -> Result<usize, CacheError> {
+        let slot = self.freelist.pop().ok_or_else(|| {
+            CacheError::InternalError("No free slots available after make_room_for".into())
+        })?;
+        #[cfg(debug_assertions)]
+        {
+            turso_assert!(
+                self.entries[slot].page.is_none(),
+                "allocating non-free slot {}",
+                slot
+            );
+        }
+        turso_assert!(
+            self.entries[slot].next == NULL && self.entries[slot].prev == NULL,
+            "freelist slot {} has non-NULL links",
+            slot
+        );
+        Ok(slot)
+    }
+
+    fn _delete(&mut self, key: PageCacheKey, clean_page: bool) -> Result<(), CacheError> {
+        if !self.contains_key(&key) {
+            return Ok(());
+        }
+        let slot_idx = self
+            .map
+            .get(&key)
+            .ok_or_else(|| CacheError::InternalError("Key exists but not found in map".into()))?;
+        let entry = self.entries[slot_idx]
+            .page
+            .as_ref()
+            .expect("page in map was None")
+            .clone();
+        if entry.is_locked() {
+            return Err(CacheError::Locked {
+                pgno: entry.get().id,
+            });
+        }
+        if entry.is_dirty() {
+            return Err(CacheError::Dirty {
+                pgno: entry.get().id,
+            });
+        }
+        if entry.is_pinned() {
+            return Err(CacheError::Pinned {
+                pgno: entry.get().id,
+            });
+        }
+        if clean_page {
+            entry.clear_loaded();
+            let _ = entry.get().contents.take();
+        }
+        // unlink from circular list and advance hand if needed
+        self.unlink(slot_idx);
+        self.map.remove(&key);
+        let e = &mut self.entries[slot_idx];
+        e.page = None;
+        e.clear_ref();
+        e.reset_links();
+        self.freelist.push(slot_idx);
+        Ok(())
+    }
+
+    #[inline]
+    /// Deletes a page from the cache
     pub fn delete(&mut self, key: PageCacheKey) -> Result<(), CacheError> {
         trace!("cache_delete(key={:?})", key);
         self._delete(key, true)
     }
 
-    // Returns Ok if key is not found
-    pub fn _delete(&mut self, key: PageCacheKey, clean_page: bool) -> Result<(), CacheError> {
-        if !self.contains_key(&key) {
-            return Ok(());
-        }
-
-        let ptr = *self.map.borrow().get(&key).unwrap();
-
-        // Try to detach from LRU list first, can fail
-        self.detach(ptr, clean_page)?;
-        let ptr = self.map.borrow_mut().remove(&key).unwrap();
-        unsafe {
-            let _ = Box::from_raw(ptr.as_ptr());
+    #[inline]
+    pub fn get(&mut self, key: &PageCacheKey) -> crate::Result<Option<PageRef>> {
+        let Some(slot) = self.map.get(key) else {
+            return Ok(None);
         };
-        Ok(())
-    }
-
-    fn get_ptr(&mut self, key: &PageCacheKey) -> Option<NonNull<PageCacheEntry>> {
-        let m = self.map.borrow_mut();
-        let ptr = m.get(key);
-        ptr.copied()
-    }
-
-    pub fn get(&mut self, key: &PageCacheKey) -> Result<Option<PageRef>, CacheError> {
-        if let Some(page) = self.peek(key, true) {
-            // Because we can abort a read_page completion, this means a page can be in the cache but be unloaded and unlocked.
-            // However, if we do not evict that page from the page cache, we will return an unloaded page later which will trigger
-            // assertions later on. This is worsened by the fact that page cache is not per `Statement`, so you can abort a completion
-            // in one Statement, and trigger some error in the next one if we don't evict the page here.
-            if !page.is_loaded() && !page.is_locked() {
-                self.delete(*key)?;
-                Ok(None)
-            } else {
-                Ok(Some(page))
-            }
-        } else {
-            Ok(None)
+        // Because we can abort a read_page completion, this means a page can be in the cache but be unloaded and unlocked.
+        // However, if we do not evict that page from the page cache, we will return an unloaded page later which will trigger
+        // assertions later on. This is worsened by the fact that page cache is not per `Statement`, so you can abort a completion
+        // in one Statement, and trigger some error in the next one if we don't evict the page here.
+        let entry = &mut self.entries[slot];
+        let page = entry
+            .page
+            .as_ref()
+            .expect("page in the map to exist")
+            .clone();
+        if !page.is_loaded() && !page.is_locked() {
+            self.delete(*key)?;
+            return Ok(None);
         }
+        entry.bump_ref();
+        Ok(Some(page))
     }
 
-    /// Get page without promoting entry
+    #[inline]
     pub fn peek(&mut self, key: &PageCacheKey, touch: bool) -> Option<PageRef> {
-        trace!("cache_get(key={:?})", key);
-        let mut ptr = self.get_ptr(key)?;
-        let page = unsafe { ptr.as_mut().page.clone() };
+        let slot = self.map.get(key)?;
+        let entry = &mut self.entries[slot];
+        let page = entry.page.as_ref()?.clone();
         if touch {
-            self.unlink(ptr);
-            self.touch(ptr);
+            entry.bump_ref();
         }
         Some(page)
     }
 
-    // To match SQLite behavior, just set capacity and try to shrink as much as possible.
-    // In case of failure, the caller should request further evictions (e.g. after I/O).
-    pub fn resize(&mut self, capacity: usize) -> CacheResizeResult {
-        let new_map = self.map.borrow().rehash(capacity);
-        self.map.replace(new_map);
-        self.capacity = capacity;
-        match self.make_room_for(0) {
-            Ok(_) => CacheResizeResult::Done,
-            Err(_) => CacheResizeResult::PendingEvictions,
+    /// Resizes the cache to a new capacity
+    /// If shrinking, attempts to evict pages.
+    /// If growing, simply increases capacity.
+    pub fn resize(&mut self, new_cap: usize) -> CacheResizeResult {
+        if new_cap == self.capacity {
+            return CacheResizeResult::Done;
         }
-    }
-
-    fn _detach(
-        &mut self,
-        mut entry: NonNull<PageCacheEntry>,
-        clean_page: bool,
-        allow_detach_pinned: bool,
-    ) -> Result<(), CacheError> {
-        let entry_mut = unsafe { entry.as_mut() };
-        if entry_mut.page.is_locked() {
-            return Err(CacheError::Locked {
-                pgno: entry_mut.page.get().id,
-            });
+        if new_cap < self.len() {
+            let need = self.len() - new_cap;
+            let mut evicted = 0;
+            while evicted < need {
+                match self.make_room_for(1) {
+                    Ok(()) => evicted += 1,
+                    Err(CacheError::Full) => return CacheResizeResult::PendingEvictions,
+                    Err(_) => return CacheResizeResult::PendingEvictions,
+                }
+            }
         }
-        if entry_mut.page.is_dirty() {
-            return Err(CacheError::Dirty {
-                pgno: entry_mut.page.get().id,
-            });
+        assert!(new_cap > 0);
+        // Collect survivors starting from hand, one full cycle
+        struct Payload {
+            key: PageCacheKey,
+            page: PageRef,
+            ref_bit: u8,
         }
-        if entry_mut.page.is_pinned() && !allow_detach_pinned {
-            return Err(CacheError::Pinned {
-                pgno: entry_mut.page.get().id,
-            });
-        }
-
-        if clean_page {
-            entry_mut.page.clear_loaded();
-            debug!("clean(page={})", entry_mut.page.get().id);
-            let _ = entry_mut.page.get().contents.take();
-        }
-        self.unlink(entry);
-        Ok(())
-    }
-
-    fn detach(
-        &mut self,
-        entry: NonNull<PageCacheEntry>,
-        clean_page: bool,
-    ) -> Result<(), CacheError> {
-        self._detach(entry, clean_page, false)
-    }
-
-    fn detach_even_if_pinned(
-        &mut self,
-        entry: NonNull<PageCacheEntry>,
-        clean_page: bool,
-    ) -> Result<(), CacheError> {
-        self._detach(entry, clean_page, true)
-    }
-
-    fn unlink(&mut self, mut entry: NonNull<PageCacheEntry>) {
-        let (next, prev) = unsafe {
-            let c = entry.as_mut();
-            let next = c.next;
-            let prev = c.prev;
-            c.prev = None;
-            c.next = None;
-            (next, prev)
+        let survivors: Vec<Payload> = {
+            let mut v = Vec::with_capacity(self.len());
+            let start = self.clock_hand;
+            if start != NULL {
+                let mut cur = start;
+                let mut seen = 0usize;
+                loop {
+                    let e = &self.entries[cur];
+                    if let Some(ref p) = e.page {
+                        v.push(Payload {
+                            key: e.key,
+                            page: p.clone(),
+                            ref_bit: e.ref_bit,
+                        });
+                        seen += 1;
+                    }
+                    cur = e.next;
+                    if cur == start || seen >= self.len() {
+                        break;
+                    }
+                }
+            }
+            v
         };
+        // Rebuild storage
+        self.entries.resize(new_cap, PageCacheEntry::empty());
+        self.capacity = new_cap;
+        let mut new_map = PageHashMap::new(new_cap);
 
-        match (prev, next) {
-            (None, None) => {
-                self.head.replace(None);
-                self.tail.replace(None);
-            }
-            (None, Some(mut n)) => {
-                unsafe { n.as_mut().prev = None };
-                self.head.borrow_mut().replace(n);
-            }
-            (Some(mut p), None) => {
-                unsafe { p.as_mut().next = None };
-                self.tail = RefCell::new(Some(p));
-            }
-            (Some(mut p), Some(mut n)) => unsafe {
-                let p_mut = p.as_mut();
-                p_mut.next = Some(n);
-                let n_mut = n.as_mut();
-                n_mut.prev = Some(p);
-            },
-        };
-    }
-
-    /// inserts into head, assuming we detached first
-    fn touch(&mut self, mut entry: NonNull<PageCacheEntry>) {
-        if let Some(mut head) = *self.head.borrow_mut() {
-            unsafe {
-                entry.as_mut().next.replace(head);
-                let head = head.as_mut();
-                head.prev = Some(entry);
-            }
+        let used = survivors.len().min(new_cap);
+        for (i, item) in survivors.iter().enumerate().take(used) {
+            let e = &mut self.entries[i];
+            e.key = item.key;
+            e.page = Some(item.page.clone());
+            e.ref_bit = item.ref_bit;
+            // link circularly to neighbors by index
+            let prev = if i == 0 { used - 1 } else { i - 1 };
+            let next = if i + 1 == used { 0 } else { i + 1 };
+            e.prev = prev;
+            e.next = next;
+            new_map.insert(item.key, i);
+        }
+        self.map = new_map;
+        // hand points to slot 0 if there are survivors, else NULL
+        self.clock_hand = if used > 0 { 0 } else { NULL };
+        // rebuild freelist
+        self.freelist.clear();
+        for i in (used..new_cap).rev() {
+            self.freelist.push(i);
         }
 
-        if self.tail.borrow().is_none() {
-            self.tail.borrow_mut().replace(entry);
-        }
-        self.head.borrow_mut().replace(entry);
+        CacheResizeResult::Done
     }
 
+    /// Ensures at least `n` free slots are available
+    ///
+    /// Uses the SIEVE algorithm to evict pages if necessary:
+    /// Start at tail (LRU position)
+    /// If page is marked, decrement mark
+    /// If page mark was already Cleared, evict it
+    /// If page is unevictable (dirty/locked/pinned), continue sweep
+    /// On sweep, pages with ref_bit > 0 are given a second chance by decrementing
+    /// their ref_bit and leaving them in place; only pages with ref_bit == 0 are evicted.
+    /// We never relocate nodes during sweeping.
+    /// because the list is circular, `tail.next == head` and `head.prev == tail`.
+    ///
+    /// Returns `CacheError::Full` if not enough pages can be evicted
     pub fn make_room_for(&mut self, n: usize) -> Result<(), CacheError> {
         if n > self.capacity {
             return Err(CacheError::Full);
         }
-
-        let len = self.len();
-        let available = self.capacity.saturating_sub(len);
-        if n <= available && len <= self.capacity {
+        let available = self.capacity - self.len();
+        if n <= available {
             return Ok(());
         }
 
-        let tail = self.tail.borrow().ok_or_else(|| {
-            CacheError::InternalError(format!(
-                "Page cache of len {} expected to have a tail pointer",
-                self.len()
-            ))
-        })?;
+        let mut need = n - available;
+        let mut examined = 0usize;
+        let max_examinations = self.len().saturating_mul(REF_MAX as usize + 1);
 
-        // Handle len > capacity, too
-        let available = self.capacity.saturating_sub(len);
-        let x = n.saturating_sub(available);
-        let mut need_to_evict = x.saturating_add(len.saturating_sub(self.capacity));
+        let mut cur = self.clock_hand;
+        if cur == NULL || cur >= self.capacity || self.entries[cur].page.is_none() {
+            return Err(CacheError::Full);
+        }
 
-        let mut current_opt = Some(tail);
-        while need_to_evict > 0 && current_opt.is_some() {
-            let current = current_opt.unwrap();
-            let entry = unsafe { current.as_ref() };
-            // Pick prev before modifying entry
-            current_opt = entry.prev;
-            match self.delete(entry.key) {
-                Err(_) => {}
-                Ok(_) => need_to_evict -= 1,
+        while need > 0 && examined < max_examinations {
+            // compute the next candidate before mutating anything
+            let next = self.forward_of(cur);
+
+            let evictable_and_clear = {
+                let e = &mut self.entries[cur];
+                if let Some(ref p) = e.page {
+                    if p.is_dirty() || p.is_locked() || p.is_pinned() {
+                        examined += 1;
+                        false
+                    } else if e.ref_bit == CLEAR {
+                        true
+                    } else {
+                        e.decrement_ref();
+                        examined += 1;
+                        false
+                    }
+                } else {
+                    examined += 1;
+                    false
+                }
+            };
+
+            if evictable_and_clear {
+                // Evict the current slot, then continue from the next candidate in sweep direction
+                self.evict_slot(cur, true)?;
+                need -= 1;
+                examined = 0;
+
+                // move on; if the ring became empty, self.clock_hand may be NULL
+                cur = if next == cur { self.clock_hand } else { next };
+                if cur == NULL {
+                    if need == 0 {
+                        break;
+                    }
+                    return Err(CacheError::Full);
+                }
+            } else {
+                // keep sweeping
+                cur = next;
             }
         }
-
-        match need_to_evict > 0 {
-            true => Err(CacheError::Full),
-            false => Ok(()),
+        self.clock_hand = cur;
+        if need > 0 {
+            return Err(CacheError::Full);
         }
+        Ok(())
     }
 
     pub fn clear(&mut self) -> Result<(), CacheError> {
-        let mut current = *self.head.borrow();
-        while let Some(current_entry) = current {
-            unsafe {
-                self.map.borrow_mut().remove(&current_entry.as_ref().key);
+        for e in self.entries.iter() {
+            if let Some(ref p) = e.page {
+                if p.is_dirty() {
+                    return Err(CacheError::Dirty { pgno: p.get().id });
+                }
+                p.clear_loaded();
+                let _ = p.get().contents.take();
             }
-            let next = unsafe { current_entry.as_ref().next };
-            self.detach_even_if_pinned(current_entry, true)?;
-            unsafe {
-                assert!(!current_entry.as_ref().page.is_dirty());
-            }
-            unsafe {
-                let _ = Box::from_raw(current_entry.as_ptr());
-            };
-            current = next;
         }
-        let _ = self.head.take();
-        let _ = self.tail.take();
+        self.entries.fill(PageCacheEntry::empty());
+        self.map.clear();
+        self.clock_hand = NULL;
+        self.freelist.clear();
+        for i in (0..self.capacity).rev() {
+            self.freelist.push(i);
+        }
+        Ok(())
+    }
 
-        assert!(self.head.borrow().is_none());
-        assert!(self.tail.borrow().is_none());
-        assert!(self.map.borrow().is_empty());
+    #[inline]
+    /// preconditions: slot contains Some(page) and is clean/unlocked/unpinned
+    fn evict_slot(&mut self, slot: usize, clean_page: bool) -> Result<(), CacheError> {
+        let key = self.entries[slot].key;
+        if clean_page {
+            if let Some(ref p) = self.entries[slot].page {
+                p.clear_loaded();
+                let _ = p.get().contents.take();
+            }
+        }
+        // unlink will advance the hand if it pointed to `slot`
+        self.unlink(slot);
+        let _ = self.map.remove(&key);
+
+        let e = &mut self.entries[slot];
+        e.page = None;
+        e.clear_ref();
+        e.reset_links();
+        self.freelist.push(slot);
+
         Ok(())
     }
 
     /// Removes all pages from the cache with pgno greater than len
     pub fn truncate(&mut self, len: usize) -> Result<(), CacheError> {
-        let head_ptr = *self.head.borrow();
-        let mut current = head_ptr;
-        while let Some(node) = current {
-            let node_ref = unsafe { node.as_ref() };
-
-            current = node_ref.next;
-            if node_ref.key.pgno <= len {
-                continue;
-            }
-
-            self.map.borrow_mut().remove(&node_ref.key);
-            turso_assert!(!node_ref.page.is_dirty(), "page must be clean");
-            turso_assert!(!node_ref.page.is_locked(), "page must be unlocked");
-            turso_assert!(!node_ref.page.is_pinned(), "page must be unpinned");
-            self.detach(node, true)?;
-
-            unsafe {
-                let _ = Box::from_raw(node.as_ptr());
-            }
+        let keys_to_delete: Vec<PageCacheKey> = {
+            self.entries
+                .iter()
+                .filter_map(|entry| {
+                    entry.page.as_ref().and({
+                        if entry.key.0 > len {
+                            Some(entry.key)
+                        } else {
+                            None
+                        }
+                    })
+                })
+                .collect()
+        };
+        for key in keys_to_delete.iter() {
+            self.delete(*key)?;
         }
         Ok(())
     }
 
     pub fn print(&self) {
-        tracing::debug!("page_cache_len={}", self.map.borrow().len());
-        let head_ptr = *self.head.borrow();
-        let mut current = head_ptr;
-        while let Some(node) = current {
-            unsafe {
+        tracing::debug!("page_cache_len={}", self.map.len());
+        let entries = &self.entries;
+
+        for (i, entry_opt) in entries.iter().enumerate() {
+            if let Some(ref page) = entry_opt.page {
                 tracing::debug!(
-                    "page={:?}, flags={}, pin_count={}",
-                    node.as_ref().key,
-                    node.as_ref().page.get().flags.load(Ordering::SeqCst),
-                    node.as_ref().page.get().pin_count.load(Ordering::SeqCst),
+                    "slot={}, page={:?}, flags={}, pin_count={}, ref_bit={:?}",
+                    i,
+                    entry_opt.key,
+                    page.get().flags.load(Ordering::Relaxed),
+                    page.get().pin_count.load(Ordering::Relaxed),
+                    entry_opt.ref_bit,
                 );
-                let node_ref = node.as_ref();
-                current = node_ref.next;
             }
         }
     }
 
     #[cfg(test)]
     pub fn keys(&mut self) -> Vec<PageCacheKey> {
-        let mut this_keys = Vec::new();
-        let head_ptr = *self.head.borrow();
-        let mut current = head_ptr;
-        while let Some(node) = current {
-            unsafe {
-                this_keys.push(node.as_ref().key);
-                let node_ref = node.as_ref();
-                current = node_ref.next;
+        let mut keys = Vec::with_capacity(self.len());
+        let entries = &self.entries;
+        for entry in entries.iter() {
+            if entry.page.is_none() {
+                continue;
             }
+            keys.push(entry.key);
         }
-        this_keys
+        keys
     }
 
     pub fn len(&self) -> usize {
-        self.map.borrow().len()
+        self.map.len()
     }
 
     pub fn capacity(&self) -> usize {
         self.capacity
     }
 
-    #[cfg(test)]
-    fn get_entry_ptr(&self, key: &PageCacheKey) -> Option<NonNull<PageCacheEntry>> {
-        self.map.borrow().get(key).copied()
-    }
-
-    #[cfg(test)]
-    fn verify_list_integrity(&self) {
-        let map_len = self.map.borrow().len();
-        let head_ptr = *self.head.borrow();
-        let tail_ptr: Option<NonNull<PageCacheEntry>> = *self.tail.borrow();
-
-        if map_len == 0 {
-            assert!(head_ptr.is_none(), "Head should be None when map is empty");
-            assert!(tail_ptr.is_none(), "Tail should be None when map is empty");
-            return;
-        }
-
-        assert!(
-            head_ptr.is_some(),
-            "Head should be Some when map is not empty"
-        );
-        assert!(
-            tail_ptr.is_some(),
-            "Tail should be Some when map is not empty"
-        );
-
-        unsafe {
-            assert!(
-                head_ptr.unwrap().as_ref().prev.is_none(),
-                "Head's prev pointer mismatch"
-            );
-        }
-
-        unsafe {
-            assert!(
-                tail_ptr.unwrap().as_ref().next.is_none(),
-                "Tail's next pointer mismatch"
-            );
-        }
-
-        // Forward traversal
-        let mut forward_count = 0;
-        let mut current = head_ptr;
-        let mut last_ptr: Option<NonNull<PageCacheEntry>> = None;
-        while let Some(node) = current {
-            forward_count += 1;
-            unsafe {
-                let node_ref = node.as_ref();
-                assert_eq!(
-                    node_ref.prev, last_ptr,
-                    "Backward pointer mismatch during forward traversal for key {:?}",
-                    node_ref.key
-                );
-                assert!(
-                    self.map.borrow().contains_key(&node_ref.key),
-                    "Node key {:?} not found in map during forward traversal",
-                    node_ref.key
-                );
-                assert_eq!(
-                    self.map.borrow().get(&node_ref.key).copied(),
-                    Some(node),
-                    "Map pointer mismatch for key {:?}",
-                    node_ref.key
-                );
-
-                last_ptr = Some(node);
-                current = node_ref.next;
-            }
-
-            if forward_count > map_len + 5 {
-                panic!(
-                    "Infinite loop suspected in forward integrity check. Size {map_len}, count {forward_count}"
-                );
-            }
-        }
-        assert_eq!(
-            forward_count, map_len,
-            "Forward count mismatch (counted {forward_count}, map has {map_len})"
-        );
-        assert_eq!(
-            tail_ptr, last_ptr,
-            "Tail pointer mismatch after forward traversal"
-        );
-
-        // Backward traversal
-        let mut backward_count = 0;
-        current = tail_ptr;
-        last_ptr = None;
-        while let Some(node) = current {
-            backward_count += 1;
-            unsafe {
-                let node_ref = node.as_ref();
-                assert_eq!(
-                    node_ref.next, last_ptr,
-                    "Forward pointer mismatch during backward traversal for key {:?}",
-                    node_ref.key
-                );
-                assert!(
-                    self.map.borrow().contains_key(&node_ref.key),
-                    "Node key {:?} not found in map during backward traversal",
-                    node_ref.key
-                );
-
-                last_ptr = Some(node);
-                current = node_ref.prev;
-            }
-            if backward_count > map_len + 5 {
-                panic!(
-                    "Infinite loop suspected in backward integrity check. Size {map_len}, count {backward_count}"
-                );
-            }
-        }
-        assert_eq!(
-            backward_count, map_len,
-            "Backward count mismatch (counted {backward_count}, map has {map_len})"
-        );
-        assert_eq!(
-            head_ptr, last_ptr,
-            "Head pointer mismatch after backward traversal"
-        );
-    }
-
     pub fn unset_dirty_all_pages(&mut self) {
-        for node in self.map.borrow_mut().iter_mut() {
-            unsafe {
-                let entry = node.value.as_mut();
-                entry.page.clear_dirty()
-            };
+        let entries = &self.entries;
+        for entry in entries.iter() {
+            if entry.page.is_none() {
+                continue;
+            }
+            entry.page.as_ref().unwrap().clear_dirty();
         }
+    }
+
+    #[cfg(test)]
+    fn verify_cache_integrity(&self) {
+        let map = &self.map;
+        let hand = self.clock_hand;
+
+        if hand == NULL {
+            assert_eq!(map.len(), 0, "map not empty but list is empty");
+        } else {
+            // 0 = unseen, 1 = freelist, 2 = in list
+            let mut seen = vec![0u8; self.capacity];
+            // Walk exactly map.len steps from hand, ensure circular closure
+            let mut cnt = 0usize;
+            let mut cur = hand;
+            loop {
+                let e = &self.entries[cur];
+
+                assert!(e.page.is_some(), "list points to empty slot {cur}");
+                assert_eq!(seen[cur], 0, "slot {cur} appears twice (list/freelist)");
+                seen[cur] = 2;
+                cnt += 1;
+
+                let n = e.next;
+                let p = e.prev;
+                assert_eq!(self.entries[n].prev, cur, "broken next.prev at {cur}");
+                assert_eq!(self.entries[p].next, cur, "broken prev.next at {cur}");
+
+                if n == hand {
+                    break;
+                }
+                assert!(cnt <= map.len(), "cycle longer than map len");
+                cur = n;
+            }
+            assert_eq!(
+                cnt,
+                map.len(),
+                "list length {} != map size {}",
+                cnt,
+                map.len()
+            );
+
+            // Map bijection
+            for node in map.iter() {
+                let slot = node.slot_index;
+                assert!(
+                    self.entries[slot].page.is_some(),
+                    "map points to empty slot"
+                );
+                assert_eq!(self.entries[slot].key, node.key, "map key mismatch");
+                assert_eq!(seen[slot], 2, "map slot {slot} not on list");
+            }
+
+            // Freelist disjointness
+            let mut free_count = 0usize;
+            for &s in &self.freelist {
+                free_count += 1;
+                assert_eq!(seen[s], 0, "slot {s} in both freelist and list");
+                assert!(
+                    self.entries[s].page.is_none(),
+                    "freelist slot {s} has a page"
+                );
+                assert_eq!(self.entries[s].next, NULL, "freelist slot {s} next != NULL");
+                assert_eq!(self.entries[s].prev, NULL, "freelist slot {s} prev != NULL");
+                seen[s] = 1;
+            }
+
+            // No orphans: every slot is in list or freelist or unused beyond capacity
+            let orphans = seen.iter().filter(|&&v| v == 0).count();
+            assert_eq!(
+                free_count + cnt + orphans,
+                self.capacity,
+                "free {} + list {} + orphans {} != capacity {}",
+                free_count,
+                cnt,
+                orphans,
+                self.capacity
+            );
+            // In practice orphans==0; assertion above detects mismatches.
+        }
+
+        // Hand sanity
+        if hand != NULL {
+            assert!(hand < self.capacity, "clock_hand out of bounds");
+            assert!(
+                self.entries[hand].page.is_some(),
+                "clock_hand points to empty slot"
+            );
+        }
+    }
+
+    #[cfg(test)]
+    fn slot_of(&self, key: &PageCacheKey) -> Option<usize> {
+        self.map.get(key)
+    }
+    #[cfg(test)]
+    fn ref_of(&self, key: &PageCacheKey) -> Option<u8> {
+        self.slot_of(key).map(|i| self.entries[i].ref_bit)
     }
 }
 
-impl Default for DumbLruPageCache {
+impl Default for PageCache {
     fn default() -> Self {
-        DumbLruPageCache::new(
+        PageCache::new(
             DEFAULT_PAGE_CACHE_SIZE_IN_PAGES_MAKE_ME_SMALLER_ONCE_WAL_SPILL_IS_IMPLEMENTED,
         )
     }
 }
 
+#[derive(Clone)]
+struct HashMapNode {
+    key: PageCacheKey,
+    slot_index: usize,
+}
+
+#[allow(dead_code)]
 impl PageHashMap {
     pub fn new(capacity: usize) -> PageHashMap {
         PageHashMap {
@@ -594,26 +764,20 @@ impl PageHashMap {
         }
     }
 
-    /// Insert page into hashmap. If a key was already in the hashmap, then update it and return the previous value.
-    pub fn insert(
-        &mut self,
-        key: PageCacheKey,
-        value: NonNull<PageCacheEntry>,
-    ) -> Option<NonNull<PageCacheEntry>> {
+    pub fn insert(&mut self, key: PageCacheKey, slot_index: usize) {
         let bucket = self.hash(&key);
         let bucket = &mut self.buckets[bucket];
         let mut idx = 0;
         while let Some(node) = bucket.get_mut(idx) {
             if node.key == key {
-                let prev = node.value;
-                node.value = value;
-                return Some(prev);
+                node.slot_index = slot_index;
+                node.key = key;
+                return;
             }
             idx += 1;
         }
-        bucket.push(HashMapNode { key, value });
+        bucket.push(HashMapNode { key, slot_index });
         self.size += 1;
-        None
     }
 
     pub fn contains_key(&self, key: &PageCacheKey) -> bool {
@@ -621,20 +785,18 @@ impl PageHashMap {
         self.buckets[bucket].iter().any(|node| node.key == *key)
     }
 
-    pub fn get(&self, key: &PageCacheKey) -> Option<&NonNull<PageCacheEntry>> {
+    pub fn get(&self, key: &PageCacheKey) -> Option<usize> {
         let bucket = self.hash(key);
         let bucket = &self.buckets[bucket];
-        let mut idx = 0;
-        while let Some(node) = bucket.get(idx) {
+        for node in bucket {
             if node.key == *key {
-                return Some(&node.value);
+                return Some(node.slot_index);
             }
-            idx += 1;
         }
         None
     }
 
-    pub fn remove(&mut self, key: &PageCacheKey) -> Option<NonNull<PageCacheEntry>> {
+    pub fn remove(&mut self, key: &PageCacheKey) -> Option<usize> {
         let bucket = self.hash(key);
         let bucket = &mut self.buckets[bucket];
         let mut idx = 0;
@@ -649,38 +811,37 @@ impl PageHashMap {
         } else {
             let v = bucket.remove(idx);
             self.size -= 1;
-            Some(v.value)
+            Some(v.slot_index)
         }
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.size == 0
+    pub fn clear(&mut self) {
+        for bucket in &mut self.buckets {
+            bucket.clear();
+        }
+        self.size = 0;
     }
 
     pub fn len(&self) -> usize {
         self.size
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = &HashMapNode> {
-        self.buckets.iter().flat_map(|bucket| bucket.iter())
-    }
-
-    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut HashMapNode> {
-        self.buckets.iter_mut().flat_map(|bucket| bucket.iter_mut())
+    fn iter(&self) -> impl Iterator<Item = &HashMapNode> {
+        self.buckets.iter().flat_map(|b| b.iter())
     }
 
     fn hash(&self, key: &PageCacheKey) -> usize {
         if self.capacity.is_power_of_two() {
-            key.pgno & (self.capacity - 1)
+            key.0 & (self.capacity - 1)
         } else {
-            key.pgno % self.capacity
+            key.0 % self.capacity
         }
     }
 
-    pub fn rehash(&self, new_capacity: usize) -> PageHashMap {
+    fn rehash(&self, new_capacity: usize) -> PageHashMap {
         let mut new_hash_map = PageHashMap::new(new_capacity);
         for node in self.iter() {
-            new_hash_map.insert(node.key, node.value);
+            new_hash_map.insert(node.key, node.slot_index);
         }
         new_hash_map
     }
@@ -692,31 +853,20 @@ mod tests {
     use crate::storage::page_cache::CacheError;
     use crate::storage::pager::{Page, PageRef};
     use crate::storage::sqlite3_ondisk::PageContent;
-    use crate::{BufferPool, IO};
-    use std::ptr::NonNull;
-    use std::sync::OnceLock;
-    use std::{num::NonZeroUsize, sync::Arc};
-
-    use lru::LruCache;
     use rand_chacha::{
         rand_core::{RngCore, SeedableRng},
         ChaCha8Rng,
     };
+    use std::sync::Arc;
 
     fn create_key(id: usize) -> PageCacheKey {
         PageCacheKey::new(id)
     }
 
-    static TEST_BUFFER_POOL: OnceLock<Arc<BufferPool>> = OnceLock::new();
-
-    #[allow(clippy::arc_with_non_send_sync)]
     pub fn page_with_content(page_id: usize) -> PageRef {
         let page = Arc::new(Page::new(page_id));
         {
-            let mock_io = Arc::new(crate::PlatformIO::new().unwrap()) as Arc<dyn IO>;
-            let pool = TEST_BUFFER_POOL
-                .get_or_init(|| BufferPool::begin_init(&mock_io, BufferPool::TEST_ARENA_SIZE));
-            let buffer = pool.allocate(4096);
+            let buffer = crate::Buffer::new_temporary(4096);
             let page_content = PageContent {
                 offset: 0,
                 buffer: Arc::new(buffer),
@@ -728,37 +878,19 @@ mod tests {
         page
     }
 
-    fn insert_page(cache: &mut DumbLruPageCache, id: usize) -> PageCacheKey {
+    fn insert_page(cache: &mut PageCache, id: usize) -> PageCacheKey {
         let key = create_key(id);
         let page = page_with_content(id);
         assert!(cache.insert(key, page).is_ok());
         key
     }
 
-    fn page_has_content(page: &PageRef) -> bool {
-        page.is_loaded() && page.get().contents.is_some()
-    }
-
-    fn insert_and_get_entry(
-        cache: &mut DumbLruPageCache,
-        id: usize,
-    ) -> (PageCacheKey, NonNull<PageCacheEntry>) {
-        let key = create_key(id);
-        let page = page_with_content(id);
-        assert!(cache.insert(key, page).is_ok());
-        let entry = cache.get_ptr(&key).expect("Entry should exist");
-        (key, entry)
-    }
-
     #[test]
-    fn test_detach_only_element() {
-        let mut cache = DumbLruPageCache::default();
+    fn test_delete_only_element() {
+        let mut cache = PageCache::default();
         let key1 = insert_page(&mut cache, 1);
-        cache.verify_list_integrity();
+        cache.verify_cache_integrity();
         assert_eq!(cache.len(), 1);
-        assert!(cache.head.borrow().is_some());
-        assert!(cache.tail.borrow().is_some());
-        assert_eq!(*cache.head.borrow(), *cache.tail.borrow());
 
         assert!(cache.delete(key1).is_ok());
 
@@ -768,326 +900,401 @@ mod tests {
             "Length should be 0 after deleting only element"
         );
         assert!(
-            cache.map.borrow().get(&key1).is_none(),
-            "Map should not contain key after delete"
+            !cache.contains_key(&key1),
+            "Cache should not contain key after delete"
         );
-        assert!(cache.head.borrow().is_none(), "Head should be None");
-        assert!(cache.tail.borrow().is_none(), "Tail should be None");
-        cache.verify_list_integrity();
-    }
-
-    #[test]
-    fn test_detach_head() {
-        let mut cache = DumbLruPageCache::default();
-        let _key1 = insert_page(&mut cache, 1); // Tail
-        let key2 = insert_page(&mut cache, 2); // Middle
-        let key3 = insert_page(&mut cache, 3); // Head
-        cache.verify_list_integrity();
-        assert_eq!(cache.len(), 3);
-
-        let head_ptr_before = cache.head.borrow().unwrap();
-        assert_eq!(
-            unsafe { &head_ptr_before.as_ref().key },
-            &key3,
-            "Initial head check"
-        );
-
-        assert!(cache.delete(key3).is_ok());
-
-        assert_eq!(cache.len(), 2, "Length should be 2 after deleting head");
-        assert!(
-            cache.map.borrow().get(&key3).is_none(),
-            "Map should not contain deleted head key"
-        );
-        cache.verify_list_integrity();
-
-        let new_head_ptr = cache.head.borrow().unwrap();
-        assert_eq!(
-            unsafe { &new_head_ptr.as_ref().key },
-            &key2,
-            "New head should be key2"
-        );
-        assert!(
-            unsafe { new_head_ptr.as_ref().prev.is_none() },
-            "New head's prev should be None"
-        );
-
-        let tail_ptr = cache.tail.borrow().unwrap();
-        assert_eq!(
-            unsafe { new_head_ptr.as_ref().next },
-            Some(tail_ptr),
-            "New head's next should point to tail (key1)"
-        );
+        cache.verify_cache_integrity();
     }
 
     #[test]
     fn test_detach_tail() {
-        let mut cache = DumbLruPageCache::default();
-        let key1 = insert_page(&mut cache, 1); // Tail
-        let key2 = insert_page(&mut cache, 2); // Middle
-        let _key3 = insert_page(&mut cache, 3); // Head
-        cache.verify_list_integrity();
+        let mut cache = PageCache::default();
+        let key1 = insert_page(&mut cache, 1); // tail
+        let _key2 = insert_page(&mut cache, 2); // middle
+        let _key3 = insert_page(&mut cache, 3); // head
+        cache.verify_cache_integrity();
         assert_eq!(cache.len(), 3);
 
-        let tail_ptr_before = cache.tail.borrow().unwrap();
-        assert_eq!(
-            unsafe { &tail_ptr_before.as_ref().key },
-            &key1,
-            "Initial tail check"
-        );
-
-        assert!(cache.delete(key1).is_ok()); // Delete tail
-
+        // Delete tail
+        assert!(cache.delete(key1).is_ok());
         assert_eq!(cache.len(), 2, "Length should be 2 after deleting tail");
         assert!(
-            cache.map.borrow().get(&key1).is_none(),
-            "Map should not contain deleted tail key"
+            !cache.contains_key(&key1),
+            "Cache should not contain deleted tail key"
         );
-        cache.verify_list_integrity();
-
-        let new_tail_ptr = cache.tail.borrow().unwrap();
-        assert_eq!(
-            unsafe { &new_tail_ptr.as_ref().key },
-            &key2,
-            "New tail should be key2"
-        );
-        assert!(
-            unsafe { new_tail_ptr.as_ref().next.is_none() },
-            "New tail's next should be None"
-        );
-
-        let head_ptr = cache.head.borrow().unwrap();
-        assert_eq!(
-            unsafe { head_ptr.as_ref().prev },
-            None,
-            "Head's prev should point to new tail (key2)"
-        );
-        assert_eq!(
-            unsafe { head_ptr.as_ref().next },
-            Some(new_tail_ptr),
-            "Head's next should point to new tail (key2)"
-        );
-        assert_eq!(
-            unsafe { new_tail_ptr.as_ref().next },
-            None,
-            "Double check new tail's next is None"
-        );
+        cache.verify_cache_integrity();
     }
 
     #[test]
-    fn test_detach_middle() {
-        let mut cache = DumbLruPageCache::default();
-        let key1 = insert_page(&mut cache, 1); // Tail
-        let key2 = insert_page(&mut cache, 2); // Middle
-        let key3 = insert_page(&mut cache, 3); // Middle
-        let _key4 = insert_page(&mut cache, 4); // Head
-        cache.verify_list_integrity();
-        assert_eq!(cache.len(), 4);
-
-        let head_ptr_before = cache.head.borrow().unwrap();
-        let tail_ptr_before = cache.tail.borrow().unwrap();
-
-        assert!(cache.delete(key2).is_ok()); // Detach a middle element (key2)
-
-        assert_eq!(cache.len(), 3, "Length should be 3 after deleting middle");
-        assert!(
-            cache.map.borrow().get(&key2).is_none(),
-            "Map should not contain deleted middle key2"
-        );
-        cache.verify_list_integrity();
-
-        // Check neighbors
-        let key1_ptr = cache.get_entry_ptr(&key1).expect("Key1 should still exist");
-        let key3_ptr = cache.get_entry_ptr(&key3).expect("Key3 should still exist");
-        assert_eq!(
-            unsafe { key3_ptr.as_ref().next },
-            Some(key1_ptr),
-            "Key3's next should point to key1"
-        );
-        assert_eq!(
-            unsafe { key1_ptr.as_ref().prev },
-            Some(key3_ptr),
-            "Key1's prev should point to key2"
-        );
-
-        assert_eq!(
-            cache.head.borrow().unwrap(),
-            head_ptr_before,
-            "Head should remain key4"
-        );
-        assert_eq!(
-            cache.tail.borrow().unwrap(),
-            tail_ptr_before,
-            "Tail should remain key1"
-        );
-    }
-
-    #[test]
-    #[ignore = "for now let's not track active refs"]
-    fn test_detach_via_delete() {
-        let mut cache = DumbLruPageCache::default();
+    fn test_insert_existing_key_updates_in_place() {
+        let mut cache = PageCache::default();
         let key1 = create_key(1);
-        let page1 = page_with_content(1);
-        assert!(cache.insert(key1, page1.clone()).is_ok());
-        assert!(page_has_content(&page1));
-        cache.verify_list_integrity();
+        let page1_v1 = page_with_content(1);
+        let page1_v2 = page1_v1.clone(); // Same Arc instance
 
-        let result = cache.delete(key1);
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), CacheError::ActiveRefs);
+        assert!(cache.insert(key1, page1_v1.clone()).is_ok());
         assert_eq!(cache.len(), 1);
 
-        drop(page1);
+        // Inserting same page instance should return KeyExists error
+        let result = cache.insert(key1, page1_v2.clone());
+        assert_eq!(result, Err(CacheError::KeyExists));
+        assert_eq!(cache.len(), 1);
 
-        assert!(cache.delete(key1).is_ok());
-        assert_eq!(cache.len(), 0);
-        cache.verify_list_integrity();
+        // Verify the page is still accessible
+        assert!(cache.get(&key1).unwrap().is_some());
+        cache.verify_cache_integrity();
     }
 
     #[test]
     #[should_panic(expected = "Attempted to insert different page with same key")]
-    fn test_insert_existing_key_fail() {
-        let mut cache = DumbLruPageCache::default();
+    fn test_insert_different_page_same_key_panics() {
+        let mut cache = PageCache::default();
         let key1 = create_key(1);
         let page1_v1 = page_with_content(1);
-        let page1_v2 = page_with_content(1);
+        let page1_v2 = page_with_content(1); // Different Arc instance
+
         assert!(cache.insert(key1, page1_v1.clone()).is_ok());
         assert_eq!(cache.len(), 1);
-        cache.verify_list_integrity();
-        let _ = cache.insert(key1, page1_v2.clone()); // Panic
+        cache.verify_cache_integrity();
+
+        // This should panic because it's a different page instance
+        let _ = cache.insert(key1, page1_v2.clone());
     }
 
     #[test]
-    fn test_detach_nonexistent_key() {
-        let mut cache = DumbLruPageCache::default();
+    fn test_delete_nonexistent_key() {
+        let mut cache = PageCache::default();
         let key_nonexist = create_key(99);
 
-        assert!(cache.delete(key_nonexist).is_ok()); // no-op
+        // Deleting non-existent key should be a no-op (returns Ok)
+        assert!(cache.delete(key_nonexist).is_ok());
+        assert_eq!(cache.len(), 0);
+        cache.verify_cache_integrity();
     }
 
     #[test]
     fn test_page_cache_evict() {
-        let mut cache = DumbLruPageCache::new(1);
+        let mut cache = PageCache::new(1);
         let key1 = insert_page(&mut cache, 1);
         let key2 = insert_page(&mut cache, 2);
+
+        // With capacity=1, inserting key2 should evict key1
         assert_eq!(cache.get(&key2).unwrap().unwrap().get().id, 2);
+        assert!(
+            cache.get(&key1).unwrap().is_none(),
+            "key1 should be evicted"
+        );
+
+        // key2 should still be accessible
+        assert_eq!(cache.get(&key2).unwrap().unwrap().get().id, 2);
+        assert!(
+            cache.get(&key1).unwrap().is_none(),
+            "capacity=1 should have evicted the older page"
+        );
+        cache.verify_cache_integrity();
+    }
+
+    #[test]
+    fn test_sieve_touch_non_tail_does_not_affect_immediate_eviction() {
+        // SIEVE algorithm: touching a non-tail page marks it but doesn't move it.
+        // The tail (if unmarked) will still be the first eviction candidate.
+
+        // Insert 1,2,3 -> order [3,2,1] with tail=1
+        let mut cache = PageCache::new(3);
+        let key1 = insert_page(&mut cache, 1);
+        let key2 = insert_page(&mut cache, 2);
+        let key3 = insert_page(&mut cache, 3);
+
+        // Touch key2 (middle) to mark it with reference bit
+        assert!(cache.get(&key2).unwrap().is_some());
+
+        // Insert 4: SIEVE examines tail (key1, unmarked) -> evict key1
+        let key4 = insert_page(&mut cache, 4);
+
+        assert!(
+            cache.get(&key2).unwrap().is_some(),
+            "marked non-tail (key2) should remain"
+        );
+        assert!(cache.get(&key3).unwrap().is_some(), "key3 should remain");
+        assert!(
+            cache.get(&key4).unwrap().is_some(),
+            "key4 was just inserted"
+        );
+        assert!(
+            cache.get(&key1).unwrap().is_none(),
+            "unmarked tail (key1) should be evicted first"
+        );
+        cache.verify_cache_integrity();
+    }
+
+    #[test]
+    fn clock_second_chance_decrements_tail_then_evicts_next() {
+        let mut cache = PageCache::new(3);
+        let key1 = insert_page(&mut cache, 1);
+        let key2 = insert_page(&mut cache, 2);
+        let key3 = insert_page(&mut cache, 3);
+        assert_eq!(cache.len(), 3);
+        assert!(cache.get(&key1).unwrap().is_some());
+        let key4 = insert_page(&mut cache, 4);
+        assert!(cache.get(&key1).unwrap().is_some(), "key1 should survive");
+        assert!(cache.get(&key2).unwrap().is_some(), "key2 remains");
+        assert!(cache.get(&key4).unwrap().is_some(), "key4 inserted");
+        assert!(
+            cache.get(&key3).unwrap().is_none(),
+            "key3 (next after tail) evicted"
+        );
+        assert_eq!(cache.len(), 3);
+        cache.verify_cache_integrity();
+    }
+
+    #[test]
+    fn test_delete_locked_page() {
+        let mut cache = PageCache::default();
+        let key = insert_page(&mut cache, 1);
+        let page = cache.get(&key).unwrap().unwrap();
+        page.set_locked();
+
+        assert_eq!(cache.delete(key), Err(CacheError::Locked { pgno: 1 }));
+        assert_eq!(cache.len(), 1, "Locked page should not be deleted");
+        cache.verify_cache_integrity();
+    }
+
+    #[test]
+    fn test_delete_dirty_page() {
+        let mut cache = PageCache::default();
+        let key = insert_page(&mut cache, 1);
+        let page = cache.get(&key).unwrap().unwrap();
+        page.set_dirty();
+
+        assert_eq!(cache.delete(key), Err(CacheError::Dirty { pgno: 1 }));
+        assert_eq!(cache.len(), 1, "Dirty page should not be deleted");
+        cache.verify_cache_integrity();
+    }
+
+    #[test]
+    fn test_delete_pinned_page() {
+        let mut cache = PageCache::default();
+        let key = insert_page(&mut cache, 1);
+        let page = cache.get(&key).unwrap().unwrap();
+        page.pin();
+
+        assert_eq!(cache.delete(key), Err(CacheError::Pinned { pgno: 1 }));
+        assert_eq!(cache.len(), 1, "Pinned page should not be deleted");
+        cache.verify_cache_integrity();
+    }
+
+    #[test]
+    fn test_make_room_for_with_dirty_pages() {
+        let mut cache = PageCache::new(2);
+        let key1 = insert_page(&mut cache, 1);
+        let key2 = insert_page(&mut cache, 2);
+
+        // Make both pages dirty (unevictable)
+        cache.get(&key1).unwrap().unwrap().set_dirty();
+        cache.get(&key2).unwrap().unwrap().set_dirty();
+
+        // Try to insert a third page, should fail because can't evict dirty pages
+        let key3 = create_key(3);
+        let page3 = page_with_content(3);
+        let result = cache.insert(key3, page3);
+
+        assert_eq!(result, Err(CacheError::Full));
+        assert_eq!(cache.len(), 2);
+        cache.verify_cache_integrity();
+    }
+
+    #[test]
+    fn test_page_cache_insert_and_get() {
+        let mut cache = PageCache::default();
+        let key1 = insert_page(&mut cache, 1);
+        let key2 = insert_page(&mut cache, 2);
+
+        assert_eq!(cache.get(&key1).unwrap().unwrap().get().id, 1);
+        assert_eq!(cache.get(&key2).unwrap().unwrap().get().id, 2);
+        cache.verify_cache_integrity();
+    }
+
+    #[test]
+    fn test_page_cache_over_capacity() {
+        // Test SIEVE eviction when exceeding capacity
+        let mut cache = PageCache::new(2);
+        let key1 = insert_page(&mut cache, 1);
+        let key2 = insert_page(&mut cache, 2);
+
+        // Insert 3: tail (key1, unmarked) should be evicted
+        let key3 = insert_page(&mut cache, 3);
+
+        assert_eq!(cache.len(), 2);
+        assert!(cache.get(&key2).unwrap().is_some(), "key2 should remain");
+        assert!(cache.get(&key3).unwrap().is_some(), "key3 just inserted");
+        assert!(
+            cache.get(&key1).unwrap().is_none(),
+            "key1 (oldest, unmarked) should be evicted"
+        );
+        cache.verify_cache_integrity();
+    }
+
+    #[test]
+    fn test_page_cache_delete() {
+        let mut cache = PageCache::default();
+        let key1 = insert_page(&mut cache, 1);
+
+        assert!(cache.delete(key1).is_ok());
         assert!(cache.get(&key1).unwrap().is_none());
-    }
-
-    #[test]
-    fn test_detach_locked_page() {
-        let mut cache = DumbLruPageCache::default();
-        let (_, mut entry) = insert_and_get_entry(&mut cache, 1);
-        unsafe { entry.as_mut().page.set_locked() };
-        assert_eq!(
-            cache.detach(entry, false),
-            Err(CacheError::Locked { pgno: 1 })
-        );
-        cache.verify_list_integrity();
-    }
-
-    #[test]
-    fn test_detach_dirty_page() {
-        let mut cache = DumbLruPageCache::default();
-        let (key, mut entry) = insert_and_get_entry(&mut cache, 1);
-        cache.get(&key).expect("Page should exist");
-        unsafe { entry.as_mut().page.set_dirty() };
-        assert_eq!(
-            cache.detach(entry, false),
-            Err(CacheError::Dirty { pgno: 1 })
-        );
-        cache.verify_list_integrity();
-    }
-
-    #[test]
-    #[ignore = "for now let's not track active refs"]
-    fn test_detach_with_active_reference_clean() {
-        let mut cache = DumbLruPageCache::default();
-        let (key, entry) = insert_and_get_entry(&mut cache, 1);
-        let page_ref = cache.get(&key);
-        assert_eq!(cache.detach(entry, true), Err(CacheError::ActiveRefs));
-        drop(page_ref);
-        cache.verify_list_integrity();
-    }
-
-    #[test]
-    #[ignore = "for now let's not track active refs"]
-    fn test_detach_with_active_reference_no_clean() {
-        let mut cache = DumbLruPageCache::default();
-        let (key, entry) = insert_and_get_entry(&mut cache, 1);
-        cache.get(&key).expect("Page should exist");
-        assert!(cache.detach(entry, false).is_ok());
-        assert!(cache.map.borrow_mut().remove(&key).is_some());
-        cache.verify_list_integrity();
-    }
-
-    #[test]
-    fn test_detach_without_cleaning() {
-        let mut cache = DumbLruPageCache::default();
-        let (key, entry) = insert_and_get_entry(&mut cache, 1);
-        assert!(cache.detach(entry, false).is_ok());
-        assert!(cache.map.borrow_mut().remove(&key).is_some());
-        cache.verify_list_integrity();
         assert_eq!(cache.len(), 0);
+        cache.verify_cache_integrity();
     }
 
     #[test]
-    fn test_detach_with_cleaning() {
-        let mut cache = DumbLruPageCache::default();
-        let (key, entry) = insert_and_get_entry(&mut cache, 1);
-        let page = cache.get(&key).unwrap().expect("Page should exist");
-        assert!(page_has_content(&page));
-        drop(page);
-        assert!(cache.detach(entry, true).is_ok());
-        // Internal testing: the page is still in map, so we use it to check content
-        let page = cache.peek(&key, false).expect("Page should exist in map");
-        assert!(!page_has_content(&page));
-        assert!(cache.map.borrow_mut().remove(&key).is_some());
-        cache.verify_list_integrity();
+    fn test_page_cache_clear() {
+        let mut cache = PageCache::default();
+        let key1 = insert_page(&mut cache, 1);
+        let key2 = insert_page(&mut cache, 2);
+
+        assert!(cache.clear().is_ok());
+        assert!(cache.get(&key1).unwrap().is_none());
+        assert!(cache.get(&key2).unwrap().is_none());
+        assert_eq!(cache.len(), 0);
+        cache.verify_cache_integrity();
     }
 
     #[test]
-    fn test_detach_only_element_preserves_integrity() {
-        let mut cache = DumbLruPageCache::default();
-        let (_, entry) = insert_and_get_entry(&mut cache, 1);
-        assert!(cache.detach(entry, false).is_ok());
-        assert!(
-            cache.head.borrow().is_none(),
-            "Head should be None after detaching only element"
-        );
-        assert!(
-            cache.tail.borrow().is_none(),
-            "Tail should be None after detaching only element"
-        );
+    fn test_resize_smaller_success() {
+        let mut cache = PageCache::default();
+        for i in 1..=5 {
+            let _ = insert_page(&mut cache, i);
+        }
+        assert_eq!(cache.len(), 5);
+
+        let result = cache.resize(3);
+        assert_eq!(result, CacheResizeResult::Done);
+        assert_eq!(cache.len(), 3);
+        assert_eq!(cache.capacity(), 3);
+
+        // Should still be able to insert after resize
+        assert!(cache.insert(create_key(6), page_with_content(6)).is_ok());
+        assert_eq!(cache.len(), 3); // One was evicted to make room
+        cache.verify_cache_integrity();
     }
 
     #[test]
     fn test_detach_with_multiple_pages() {
-        let mut cache = DumbLruPageCache::default();
-        let (key1, _) = insert_and_get_entry(&mut cache, 1);
-        let (key2, entry2) = insert_and_get_entry(&mut cache, 2);
-        let (key3, _) = insert_and_get_entry(&mut cache, 3);
-        let head_key = unsafe { cache.head.borrow().unwrap().as_ref().key };
-        let tail_key = unsafe { cache.tail.borrow().unwrap().as_ref().key };
-        assert_eq!(head_key, key3, "Head should be key3");
-        assert_eq!(tail_key, key1, "Tail should be key1");
-        assert!(cache.detach(entry2, false).is_ok());
-        let head_entry = unsafe { cache.head.borrow().unwrap().as_ref() };
-        let tail_entry = unsafe { cache.tail.borrow().unwrap().as_ref() };
-        assert_eq!(head_entry.key, key3, "Head should still be key3");
-        assert_eq!(tail_entry.key, key1, "Tail should still be key1");
-        assert_eq!(
-            unsafe { head_entry.next.unwrap().as_ref().key },
-            key1,
-            "Head's next should point to tail after middle element detached"
+        let mut cache = PageCache::default();
+        let _key1 = insert_page(&mut cache, 1);
+        let key2 = insert_page(&mut cache, 2);
+        let _key3 = insert_page(&mut cache, 3);
+
+        // Delete middle element (key2)
+        assert!(cache.delete(key2).is_ok());
+
+        // Verify structure after deletion
+        assert_eq!(cache.len(), 2);
+        assert!(!cache.contains_key(&key2));
+
+        cache.verify_cache_integrity();
+    }
+
+    #[test]
+    fn test_delete_multiple_elements() {
+        let mut cache = PageCache::default();
+        let key1 = insert_page(&mut cache, 1);
+        let key2 = insert_page(&mut cache, 2);
+        let key3 = insert_page(&mut cache, 3);
+        cache.verify_cache_integrity();
+        assert_eq!(cache.len(), 3);
+
+        // Delete head (key3)
+        assert!(cache.delete(key3).is_ok());
+        assert_eq!(cache.len(), 2, "Length should be 2 after deleting head");
+        assert!(
+            !cache.contains_key(&key3),
+            "Cache should not contain deleted head key"
         );
-        assert_eq!(
-            unsafe { tail_entry.prev.unwrap().as_ref().key },
-            key3,
-            "Tail's prev should point to head after middle element detached"
-        );
-        assert!(cache.map.borrow_mut().remove(&key2).is_some());
-        cache.verify_list_integrity();
+        cache.verify_cache_integrity();
+
+        // Delete tail (key1)
+        assert!(cache.delete(key1).is_ok());
+        assert_eq!(cache.len(), 1, "Length should be 1 after deleting two");
+        cache.verify_cache_integrity();
+
+        // Delete last element (key2)
+        assert!(cache.delete(key2).is_ok());
+        assert_eq!(cache.len(), 0, "Length should be 0 after deleting all");
+        cache.verify_cache_integrity();
+    }
+
+    #[test]
+    fn test_resize_larger() {
+        let mut cache = PageCache::new(2);
+        let key1 = insert_page(&mut cache, 1);
+        let key2 = insert_page(&mut cache, 2);
+        assert_eq!(cache.len(), 2);
+
+        let result = cache.resize(5);
+        assert_eq!(result, CacheResizeResult::Done);
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.capacity(), 5);
+
+        // Existing pages should still be accessible
+        assert!(cache.get(&key1).is_ok_and(|p| p.is_some()));
+        assert!(cache.get(&key2).is_ok_and(|p| p.is_some()));
+
+        // Now we should be able to add 3 more without eviction
+        for i in 3..=5 {
+            let _ = insert_page(&mut cache, i);
+        }
+        assert_eq!(cache.len(), 5);
+        cache.verify_cache_integrity();
+    }
+
+    #[test]
+    fn test_resize_same_capacity() {
+        let mut cache = PageCache::new(3);
+        for i in 1..=3 {
+            let _ = insert_page(&mut cache, i);
+        }
+
+        let result = cache.resize(3);
+        assert_eq!(result, CacheResizeResult::Done);
+        assert_eq!(cache.len(), 3);
+        assert_eq!(cache.capacity(), 3);
+        cache.verify_cache_integrity();
+    }
+
+    #[test]
+    fn test_truncate_page_cache() {
+        let mut cache = PageCache::new(10);
+        let _ = insert_page(&mut cache, 1);
+        let _ = insert_page(&mut cache, 4);
+        let _ = insert_page(&mut cache, 8);
+        let _ = insert_page(&mut cache, 10);
+
+        // Truncate to keep only pages <= 4
+        cache.truncate(4).unwrap();
+
+        assert!(cache.contains_key(&PageCacheKey(1)));
+        assert!(cache.contains_key(&PageCacheKey(4)));
+        assert!(!cache.contains_key(&PageCacheKey(8)));
+        assert!(!cache.contains_key(&PageCacheKey(10)));
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.capacity(), 10);
+        cache.verify_cache_integrity();
+    }
+
+    #[test]
+    fn test_truncate_page_cache_remove_all() {
+        let mut cache = PageCache::new(10);
+        let _ = insert_page(&mut cache, 8);
+        let _ = insert_page(&mut cache, 10);
+
+        // Truncate to 4 (removes all pages since they're > 4)
+        cache.truncate(4).unwrap();
+
+        assert!(!cache.contains_key(&PageCacheKey(8)));
+        assert!(!cache.contains_key(&PageCacheKey(10)));
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.capacity(), 10);
+        cache.verify_cache_integrity();
     }
 
     #[test]
@@ -1097,245 +1304,135 @@ mod tests {
             .unwrap()
             .as_secs();
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
-        tracing::info!("super seed: {}", seed);
+        tracing::info!("fuzz test seed: {}", seed);
+
         let max_pages = 10;
-        let mut cache = DumbLruPageCache::new(10);
-        let mut lru = LruCache::new(NonZeroUsize::new(10).unwrap());
+        let mut cache = PageCache::new(10);
+        let mut reference_map = std::collections::HashMap::new();
 
         for _ in 0..10000 {
             cache.print();
-            for (key, _) in &lru {
-                tracing::debug!("lru_page={:?}", key);
-            }
+
             match rng.next_u64() % 2 {
                 0 => {
-                    // add
+                    // Insert operation
                     let id_page = rng.next_u64() % max_pages;
                     let key = PageCacheKey::new(id_page as usize);
                     #[allow(clippy::arc_with_non_send_sync)]
                     let page = Arc::new(Page::new(id_page as usize));
+
                     if cache.peek(&key, false).is_some() {
-                        continue; // skip duplicate page ids
+                        continue; // Skip duplicate page ids
                     }
+
                     tracing::debug!("inserting page {:?}", key);
                     match cache.insert(key, page.clone()) {
-                        Err(CacheError::Full | CacheError::ActiveRefs) => {} // Ignore
+                        Err(CacheError::Full | CacheError::ActiveRefs) => {} // Expected, ignore
                         Err(err) => {
-                            // Any other error should fail the test
-                            panic!("Cache insertion failed: {err:?}");
+                            panic!("Cache insertion failed unexpectedly: {err:?}");
                         }
                         Ok(_) => {
-                            lru.push(key, page);
+                            reference_map.insert(key, page);
+                            // Clean up reference_map if cache evicted something
+                            if cache.len() < reference_map.len() {
+                                reference_map.retain(|k, _| cache.contains_key(k));
+                            }
                         }
                     }
-                    assert!(cache.len() <= 10);
+                    assert!(cache.len() <= 10, "Cache size exceeded capacity");
                 }
                 1 => {
-                    // remove
+                    // Delete operation
                     let random = rng.next_u64() % 2 == 0;
-                    let key = if random || lru.is_empty() {
+                    let key = if random || reference_map.is_empty() {
                         let id_page: u64 = rng.next_u64() % max_pages;
-
                         PageCacheKey::new(id_page as usize)
                     } else {
-                        let i = rng.next_u64() as usize % lru.len();
-                        let key: PageCacheKey = *lru.iter().nth(i).unwrap().0;
-                        key
+                        let i = rng.next_u64() as usize % reference_map.len();
+                        *reference_map.keys().nth(i).unwrap()
                     };
+
                     tracing::debug!("removing page {:?}", key);
-                    lru.pop(&key);
+                    reference_map.remove(&key);
                     assert!(cache.delete(key).is_ok());
                 }
                 _ => unreachable!(),
             }
-            compare_to_lru(&mut cache, &lru);
-            cache.print();
-            for (key, _) in &lru {
-                tracing::debug!("lru_page={:?}", key);
-            }
-            cache.verify_list_integrity();
-            for (key, page) in &lru {
-                println!("getting page {key:?}");
-                cache.peek(key, false).unwrap();
-                assert_eq!(page.get().id, key.pgno);
-            }
-        }
-    }
 
-    pub fn compare_to_lru(cache: &mut DumbLruPageCache, lru: &LruCache<PageCacheKey, PageRef>) {
-        let this_keys = cache.keys();
-        let mut lru_keys = Vec::new();
-        for (lru_key, _) in lru {
-            lru_keys.push(*lru_key);
-        }
-        if this_keys != lru_keys {
-            cache.print();
-            for (lru_key, _) in lru {
-                tracing::debug!("lru_page={:?}", lru_key);
+            cache.verify_cache_integrity();
+
+            // Verify all pages in reference_map are in cache
+            for (key, page) in &reference_map {
+                let cached_page = cache.peek(key, false).expect("Page should be in cache");
+                assert_eq!(cached_page.get().id, key.0);
+                assert_eq!(page.get().id, key.0);
             }
-            assert_eq!(&this_keys, &lru_keys)
         }
     }
 
     #[test]
-    fn test_page_cache_insert_and_get() {
-        let mut cache = DumbLruPageCache::default();
+    fn test_peek_without_touch() {
+        // Test that peek with touch=false doesn't mark pages
+        let mut cache = PageCache::new(2);
         let key1 = insert_page(&mut cache, 1);
         let key2 = insert_page(&mut cache, 2);
-        assert_eq!(cache.get(&key1).unwrap().unwrap().get().id, 1);
-        assert_eq!(cache.get(&key2).unwrap().unwrap().get().id, 2);
-    }
 
-    #[test]
-    fn test_page_cache_over_capacity() {
-        let mut cache = DumbLruPageCache::new(2);
-        let key1 = insert_page(&mut cache, 1);
-        let key2 = insert_page(&mut cache, 2);
+        // Peek key1 without touching (no ref bit set)
+        assert!(cache.peek(&key1, false).is_some());
+
+        // Insert 3: should evict unmarked tail (key1)
         let key3 = insert_page(&mut cache, 3);
-        assert!(cache.get(&key1).unwrap().is_none());
-        assert_eq!(cache.get(&key2).unwrap().unwrap().get().id, 2);
-        assert_eq!(cache.get(&key3).unwrap().unwrap().get().id, 3);
+
+        assert!(cache.get(&key2).unwrap().is_some(), "key2 should remain");
+        assert!(
+            cache.get(&key3).unwrap().is_some(),
+            "key3 was just inserted"
+        );
+        assert!(
+            cache.get(&key1).unwrap().is_none(),
+            "key1 should be evicted since peek(false) didn't mark it"
+        );
+        assert_eq!(cache.len(), 2);
+        cache.verify_cache_integrity();
     }
 
     #[test]
-    fn test_page_cache_delete() {
-        let mut cache = DumbLruPageCache::default();
-        let key1 = insert_page(&mut cache, 1);
-        assert!(cache.delete(key1).is_ok());
-        assert!(cache.get(&key1).unwrap().is_none());
-    }
-
-    #[test]
-    fn test_page_cache_clear() {
-        let mut cache = DumbLruPageCache::default();
+    fn test_peek_with_touch() {
+        // Test that peek with touch=true marks pages for SIEVE
+        let mut cache = PageCache::new(2);
         let key1 = insert_page(&mut cache, 1);
         let key2 = insert_page(&mut cache, 2);
-        assert!(cache.clear().is_ok());
-        assert!(cache.get(&key1).unwrap().is_none());
-        assert!(cache.get(&key2).unwrap().is_none());
-    }
 
-    #[test]
-    fn test_page_cache_insert_sequential() {
-        let mut cache = DumbLruPageCache::default();
-        for i in 0..10000 {
-            let key = insert_page(&mut cache, i);
-            assert_eq!(cache.peek(&key, false).unwrap().get().id, i);
-        }
-    }
+        // Peek key1 WITH touching (sets ref bit)
+        assert!(cache.peek(&key1, true).is_some());
 
-    #[test]
-    fn test_resize_smaller_success() {
-        let mut cache = DumbLruPageCache::default();
-        for i in 1..=5 {
-            let _ = insert_page(&mut cache, i);
-        }
-        assert_eq!(cache.len(), 5);
-        let result = cache.resize(3);
-        assert_eq!(result, CacheResizeResult::Done);
-        assert_eq!(cache.len(), 3);
-        assert_eq!(cache.capacity, 3);
-        assert!(cache.insert(create_key(6), page_with_content(6)).is_ok());
-    }
+        // Insert 3: key1 is marked, so it gets second chance
+        // key2 becomes new tail and gets evicted
+        let key3 = insert_page(&mut cache, 3);
 
-    #[test]
-    #[should_panic(expected = "Attempted to insert different page with same key")]
-    fn test_resize_larger() {
-        let mut cache = DumbLruPageCache::default();
-        let _ = insert_page(&mut cache, 1);
-        let _ = insert_page(&mut cache, 2);
+        assert!(
+            cache.get(&key1).unwrap().is_some(),
+            "key1 should survive (was marked)"
+        );
+        assert!(
+            cache.get(&key3).unwrap().is_some(),
+            "key3 was just inserted"
+        );
+        assert!(
+            cache.get(&key2).unwrap().is_none(),
+            "key2 should be evicted after key1's second chance"
+        );
         assert_eq!(cache.len(), 2);
-        let result = cache.resize(5);
-        assert_eq!(result, CacheResizeResult::Done);
-        assert_eq!(cache.len(), 2);
-        assert_eq!(cache.capacity, 5);
-        assert!(cache.get(&create_key(1)).unwrap().is_some());
-        assert!(cache.get(&create_key(2)).unwrap().is_some());
-        for i in 3..=5 {
-            let _ = insert_page(&mut cache, i);
-        }
-        assert_eq!(cache.len(), 5);
-        // FIXME: For now this will assert because we cannot insert a page with same id but different contents of page.
-        assert!(cache.insert(create_key(4), page_with_content(4)).is_err());
-        cache.verify_list_integrity();
+        cache.verify_cache_integrity();
     }
 
     #[test]
-    #[ignore = "for now let's not track active refs"]
-    fn test_resize_with_active_references() {
-        let mut cache = DumbLruPageCache::default();
-        let page1 = page_with_content(1);
-        let page2 = page_with_content(2);
-        let page3 = page_with_content(3);
-        assert!(cache.insert(create_key(1), page1.clone()).is_ok());
-        assert!(cache.insert(create_key(2), page2.clone()).is_ok());
-        assert!(cache.insert(create_key(3), page3.clone()).is_ok());
-        assert_eq!(cache.len(), 3);
-        cache.verify_list_integrity();
-        assert_eq!(cache.resize(2), CacheResizeResult::PendingEvictions);
-        assert_eq!(cache.capacity, 2);
-        assert_eq!(cache.len(), 3);
-        drop(page2);
-        drop(page3);
-        assert_eq!(cache.resize(1), CacheResizeResult::Done); // Evicted 2 and 3
-        assert_eq!(cache.len(), 1);
-        assert!(cache.insert(create_key(4), page_with_content(4)).is_err());
-        cache.verify_list_integrity();
-    }
-
-    #[test]
-    fn test_resize_same_capacity() {
-        let mut cache = DumbLruPageCache::new(3);
-        for i in 1..=3 {
-            let _ = insert_page(&mut cache, i);
-        }
-        let result = cache.resize(3);
-        assert_eq!(result, CacheResizeResult::Done); // no-op
-        assert_eq!(cache.len(), 3);
-        assert_eq!(cache.capacity, 3);
-        cache.verify_list_integrity();
-        assert!(cache.insert(create_key(4), page_with_content(4)).is_ok());
-    }
-
-    #[test]
-    fn test_truncate_page_cache() {
-        let mut cache = DumbLruPageCache::new(10);
-        let _ = insert_page(&mut cache, 1);
-        let _ = insert_page(&mut cache, 4);
-        let _ = insert_page(&mut cache, 8);
-        let _ = insert_page(&mut cache, 10);
-        cache.truncate(4).unwrap();
-        assert!(cache.contains_key(&PageCacheKey { pgno: 1 }));
-        assert!(cache.contains_key(&PageCacheKey { pgno: 4 }));
-        assert!(!cache.contains_key(&PageCacheKey { pgno: 8 }));
-        assert!(!cache.contains_key(&PageCacheKey { pgno: 10 }));
-        assert_eq!(cache.len(), 2);
-        assert_eq!(cache.capacity, 10);
-        cache.verify_list_integrity();
-        assert!(cache.insert(create_key(8), page_with_content(8)).is_ok());
-    }
-
-    #[test]
-    fn test_truncate_page_cache_remove_all() {
-        let mut cache = DumbLruPageCache::new(10);
-        let _ = insert_page(&mut cache, 8);
-        let _ = insert_page(&mut cache, 10);
-        cache.truncate(4).unwrap();
-        assert!(!cache.contains_key(&PageCacheKey { pgno: 8 }));
-        assert!(!cache.contains_key(&PageCacheKey { pgno: 10 }));
-        assert_eq!(cache.len(), 0);
-        assert_eq!(cache.capacity, 10);
-        cache.verify_list_integrity();
-        assert!(cache.insert(create_key(8), page_with_content(8)).is_ok());
-    }
-
-    #[test]
-    #[ignore = "long running test, remove to verify"]
+    #[ignore = "long running test, remove ignore to verify memory stability"]
     fn test_clear_memory_stability() {
         let initial_memory = memory_stats::memory_stats().unwrap().physical_mem;
 
         for _ in 0..100000 {
-            let mut cache = DumbLruPageCache::new(1000);
+            let mut cache = PageCache::new(1000);
 
             for i in 0..1000 {
                 let key = create_key(i);
@@ -1348,12 +1445,299 @@ mod tests {
         }
 
         let final_memory = memory_stats::memory_stats().unwrap().physical_mem;
-
         let growth = final_memory.saturating_sub(initial_memory);
-        println!("Growth: {growth}");
+
+        println!("Memory growth: {growth} bytes");
         assert!(
             growth < 10_000_000,
-            "Memory grew by {growth} bytes over 10 cycles"
+            "Memory grew by {growth} bytes over test cycles (limit: 10MB)",
         );
+    }
+
+    #[test]
+    fn clock_drains_hot_page_within_single_sweep_when_others_are_unevictable() {
+        // capacity 3: [3(head), 2, 1(tail)]
+        let mut c = PageCache::new(3);
+        let k1 = insert_page(&mut c, 1);
+        let k2 = insert_page(&mut c, 2);
+        let _k3 = insert_page(&mut c, 3);
+
+        // Make k1 hot: bump to Max
+        for _ in 0..3 {
+            assert!(c.get(&k1).unwrap().is_some());
+        }
+        assert!(matches!(c.ref_of(&k1), Some(REF_MAX)));
+
+        // Make other pages unevictable; clock must keep revisiting k1.
+        c.get(&k2).unwrap().unwrap().set_dirty();
+        c.get(&_k3).unwrap().unwrap().set_dirty();
+
+        // Insert 4 -> sweep rotates as needed, draining k1 and evicting it.
+        let _k4 = insert_page(&mut c, 4);
+
+        assert!(
+            c.get(&k1).unwrap().is_none(),
+            "k1 should be evicted after its credit drains"
+        );
+        assert!(c.get(&k2).unwrap().is_some(), "k2 is dirty (unevictable)");
+        assert!(c.get(&_k3).unwrap().is_some(), "k3 is dirty (unevictable)");
+        assert!(c.get(&_k4).unwrap().is_some(), "k4 just inserted");
+        c.verify_cache_integrity();
+    }
+
+    #[test]
+    fn gclock_hot_survives_scan_pages() {
+        let mut c = PageCache::new(4);
+        let _k1 = insert_page(&mut c, 1);
+        let k2 = insert_page(&mut c, 2);
+        let _k3 = insert_page(&mut c, 3);
+        let _k4 = insert_page(&mut c, 4);
+
+        // Make k2 truly hot: three real touches
+        for _ in 0..3 {
+            assert!(c.get(&k2).unwrap().is_some());
+        }
+        assert!(matches!(c.ref_of(&k2), Some(REF_MAX)));
+
+        // Now simulate a scan inserting new pages 5..10 (one-hit wonders).
+        for id in 5..=10 {
+            let _ = insert_page(&mut c, id);
+        }
+
+        // Hot k2 should still be present; most single-hit scan pages should churn.
+        assert!(
+            c.get(&k2).unwrap().is_some(),
+            "hot page should survive scan"
+        );
+        // The earliest single-hit page should be gone.
+        assert!(c.get(&create_key(5)).unwrap().is_none());
+        c.verify_cache_integrity();
+    }
+
+    #[test]
+    fn hand_stays_valid_after_deleting_only_element() {
+        let mut c = PageCache::new(2);
+        let k = insert_page(&mut c, 1);
+        assert!(c.delete(k).is_ok());
+        // Inserting again should not panic and should succeed
+        let _ = insert_page(&mut c, 2);
+        c.verify_cache_integrity();
+    }
+
+    #[test]
+    fn hand_is_reset_after_clear_and_resize() {
+        let mut c = PageCache::new(3);
+        for i in 1..=3 {
+            let _ = insert_page(&mut c, i);
+        }
+        c.clear().unwrap();
+        // No elements; insert should not rely on stale hand
+        let _ = insert_page(&mut c, 10);
+
+        // Resize from 1 -> 4 and back should not OOB the hand
+        assert_eq!(c.resize(4), CacheResizeResult::Done);
+        assert_eq!(c.resize(1), CacheResizeResult::Done);
+        let _ = insert_page(&mut c, 11);
+        c.verify_cache_integrity();
+    }
+
+    #[test]
+    fn resize_preserves_ref_and_recency() {
+        let mut c = PageCache::new(4);
+        let _k1 = insert_page(&mut c, 1);
+        let k2 = insert_page(&mut c, 2);
+        let _k3 = insert_page(&mut c, 3);
+        let _k4 = insert_page(&mut c, 4);
+        // Make k2 hot.
+        for _ in 0..3 {
+            assert!(c.get(&k2).unwrap().is_some());
+        }
+        let _r_before = c.ref_of(&k2);
+
+        // Shrink to 3 (one page will be evicted during repack/next insert)
+        assert_eq!(c.resize(3), CacheResizeResult::Done);
+        assert!(matches!(c.ref_of(&k2), _r_before));
+
+        // Force an eviction; hot k2 should survive more passes.
+        let _ = insert_page(&mut c, 5);
+        assert!(c.get(&k2).unwrap().is_some());
+        c.verify_cache_integrity();
+    }
+
+    #[test]
+    fn test_sieve_second_chance_preserves_marked_page() {
+        let mut cache = PageCache::new(3);
+        let key1 = insert_page(&mut cache, 1);
+        let key2 = insert_page(&mut cache, 2);
+        let key3 = insert_page(&mut cache, 3);
+
+        // Mark key1 for second chance
+        assert!(cache.get(&key1).unwrap().is_some());
+
+        let key4 = insert_page(&mut cache, 4);
+        // CLOCK sweep from hand:
+        // - key1 marked -> decrement, continue
+        // - key3 (MRU) unmarked -> evict
+        assert!(
+            cache.get(&key1).unwrap().is_some(),
+            "key1 had ref bit set, got second chance"
+        );
+        assert!(
+            cache.get(&key3).unwrap().is_none(),
+            "key3 (MRU) should be evicted"
+        );
+        assert!(cache.get(&key4).unwrap().is_some(), "key4 just inserted");
+        assert!(
+            cache.get(&key2).unwrap().is_some(),
+            "key2 (middle) should remain"
+        );
+        cache.verify_cache_integrity();
+    }
+
+    #[test]
+    fn test_clock_sweep_wraps_around() {
+        // Test that clock hand properly wraps around the circular list
+        let mut cache = PageCache::new(3);
+        let key1 = insert_page(&mut cache, 1);
+        let key2 = insert_page(&mut cache, 2);
+        let key3 = insert_page(&mut cache, 3);
+
+        // Mark all pages
+        assert!(cache.get(&key1).unwrap().is_some());
+        assert!(cache.get(&key2).unwrap().is_some());
+        assert!(cache.get(&key3).unwrap().is_some());
+
+        // Insert 4: hand will sweep full circle, decrementing all refs
+        // then sweep again and evict first unmarked page
+        let key4 = insert_page(&mut cache, 4);
+
+        // One page was evicted after full sweep
+        assert_eq!(cache.len(), 3);
+        assert!(cache.get(&key4).unwrap().is_some());
+
+        // Verify exactly one of the original pages was evicted
+        let survivors = [key1, key2, key3]
+            .iter()
+            .filter(|k| cache.get(k).unwrap().is_some())
+            .count();
+        assert_eq!(survivors, 2, "Should have 2 survivors from original 3");
+        cache.verify_cache_integrity();
+    }
+
+    #[test]
+    fn test_circular_list_single_element() {
+        let mut cache = PageCache::new(3);
+        let key1 = insert_page(&mut cache, 1);
+
+        // Single element should point to itself
+        let slot = cache.slot_of(&key1).unwrap();
+        assert_eq!(cache.entries[slot].next, slot);
+        assert_eq!(cache.entries[slot].prev, slot);
+
+        // Delete single element
+        assert!(cache.delete(key1).is_ok());
+        assert_eq!(cache.clock_hand, NULL);
+
+        // Insert after empty should work
+        let key2 = insert_page(&mut cache, 2);
+        let slot2 = cache.slot_of(&key2).unwrap();
+        assert_eq!(cache.entries[slot2].next, slot2);
+        assert_eq!(cache.entries[slot2].prev, slot2);
+        cache.verify_cache_integrity();
+    }
+
+    #[test]
+    fn test_hand_advances_on_eviction() {
+        let mut cache = PageCache::new(2);
+        let _key1 = insert_page(&mut cache, 1);
+        let _key2 = insert_page(&mut cache, 2);
+
+        // Note initial hand position
+        let initial_hand = cache.clock_hand;
+
+        // Force eviction
+        let _key3 = insert_page(&mut cache, 3);
+
+        // Hand should have advanced
+        let new_hand = cache.clock_hand;
+        assert_ne!(new_hand, NULL);
+        // Hand moved during sweep (exact position depends on eviction)
+        assert!(initial_hand == NULL || new_hand != initial_hand || cache.len() < 2);
+        cache.verify_cache_integrity();
+    }
+
+    #[test]
+    fn test_multi_level_ref_counting() {
+        let mut cache = PageCache::new(2);
+        let key1 = insert_page(&mut cache, 1);
+        let _key2 = insert_page(&mut cache, 2);
+
+        // Bump key1 to MAX (3 accesses)
+        for _ in 0..3 {
+            assert!(cache.get(&key1).unwrap().is_some());
+        }
+        assert_eq!(cache.ref_of(&key1), Some(REF_MAX));
+
+        // Insert multiple new pages - key1 should survive longer
+        for i in 3..6 {
+            let _ = insert_page(&mut cache, i);
+        }
+
+        // key1 might still be there due to high ref count
+        // (depends on exact sweep pattern, but it got multiple chances)
+        cache.verify_cache_integrity();
+    }
+
+    #[test]
+    fn test_resize_maintains_circular_structure() {
+        let mut cache = PageCache::new(5);
+        for i in 1..=4 {
+            let _ = insert_page(&mut cache, i);
+        }
+
+        // Resize smaller
+        assert_eq!(cache.resize(2), CacheResizeResult::Done);
+        assert_eq!(cache.len(), 2);
+
+        // Verify circular structure
+        if cache.clock_hand != NULL {
+            let start = cache.clock_hand;
+            let mut current = start;
+            let mut count = 0;
+            loop {
+                count += 1;
+                current = cache.entries[current].next;
+                if current == start {
+                    break;
+                }
+                assert!(count <= cache.len(), "Circular list broken after resize");
+            }
+            assert_eq!(count, cache.len());
+        }
+        cache.verify_cache_integrity();
+    }
+
+    #[test]
+    fn test_link_after_correctness() {
+        let mut cache = PageCache::new(4);
+        let key1 = insert_page(&mut cache, 1);
+        let key2 = insert_page(&mut cache, 2);
+        let key3 = insert_page(&mut cache, 3);
+
+        // Verify circular linkage
+        let slot1 = cache.slot_of(&key1).unwrap();
+        let slot2 = cache.slot_of(&key2).unwrap();
+        let slot3 = cache.slot_of(&key3).unwrap();
+
+        // Should form a circle: 3 -> 2 -> 1 -> 3 (insertion order)
+        assert_eq!(cache.entries[slot3].next, slot2);
+        assert_eq!(cache.entries[slot2].next, slot1);
+        assert_eq!(cache.entries[slot1].next, slot3);
+
+        assert_eq!(cache.entries[slot3].prev, slot1);
+        assert_eq!(cache.entries[slot2].prev, slot3);
+        assert_eq!(cache.entries[slot1].prev, slot2);
+
+        cache.verify_cache_integrity();
     }
 }

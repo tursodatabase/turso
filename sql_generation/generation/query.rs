@@ -10,6 +10,7 @@ use crate::model::query::select::{
 use crate::model::query::update::Update;
 use crate::model::query::{Create, CreateIndex, Delete, Drop, Insert, Select};
 use crate::model::table::{JoinTable, JoinType, JoinedTable, SimValue, Table, TableContext};
+use indexmap::IndexSet;
 use itertools::Itertools;
 use rand::Rng;
 use turso_parser::ast::{Expr, SortOrder};
@@ -104,7 +105,7 @@ impl Arbitrary for SelectInner {
                 if order_by_col_count == 0 {
                     return None;
                 }
-                let mut col_names = std::collections::HashSet::new();
+                let mut col_names = IndexSet::new();
                 let mut order_by_cols = Vec::new();
                 while order_by_cols.len() < order_by_col_count {
                     let table = pick(&order_by_table_candidates, rng);

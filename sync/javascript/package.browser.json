@@ -1,0 +1,57 @@
+{
+  "name": "@tursodatabase/sync-browser",
+  "version": "0.1.5-pre.2",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/tursodatabase/turso"
+  },
+  "description": "Sync engine for the Turso database library specifically for browser/web environment",
+  "module": "./dist/sync_engine.js",
+  "main": "./dist/sync_engine.js",
+  "type": "module",
+  "exports": "./dist/sync_engine.js",
+  "files": [
+    "browser.js",
+    "dist/**"
+  ],
+  "types": "./dist/sync_engine.d.ts",
+  "napi": {
+    "binaryName": "turso-sync-js",
+    "targets": [
+      "wasm32-wasip1-threads"
+    ]
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "@napi-rs/cli": "^3.0.4",
+    "@napi-rs/wasm-runtime": "^1.0.1",
+    "@types/node": "^24.2.0",
+    "ava": "^6.0.1",
+    "typescript": "^5.9.2"
+  },
+  "ava": {
+    "timeout": "3m"
+  },
+  "engines": {
+    "node": ">= 10"
+  },
+  "scripts": {
+    "artifacts": "napi artifacts",
+    "build": "npm exec tsc && napi build --platform --release --esm",
+    "build:debug": "npm exec tsc && napi build --platform",
+    "prepublishOnly": "npm exec tsc && napi prepublish -t npm --skip-optional-publish",
+    "test": "true",
+    "universal": "napi universalize",
+    "version": "napi version"
+  },
+  "packageManager": "yarn@4.9.2",
+  "imports": {
+    "#entry-point": {
+      "types": "./index.d.ts",
+      "browser": "./browser.js"
+    }
+  },
+  "dependencies": {
+    "@tursodatabase/database": "~0.1.4-pre.5"
+  }
+}

@@ -317,13 +317,13 @@ fn update_pragma(
         PragmaName::EncryptionKey => {
             let value = parse_string(&value)?;
             let key = EncryptionKey::from_hex_string(&value)?;
-            connection.set_encryption_key(key);
+            connection.set_encryption_key(key)?;
             Ok((program, TransactionMode::None))
         }
         PragmaName::EncryptionCipher => {
             let value = parse_string(&value)?;
             let cipher = CipherMode::try_from(value.as_str())?;
-            connection.set_encryption_cipher(cipher);
+            connection.set_encryption_cipher(cipher)?;
             Ok((program, TransactionMode::None))
         }
         PragmaName::Synchronous => {

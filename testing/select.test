@@ -59,6 +59,12 @@ do_execsql_test_error select-doubly-qualified-wrong-column {
   SELECT main.users.wrong FROM users LIMIT 0;
 } {.*}
 
+do_execsql_test select-limit-expression {
+  select price from products limit 2 + 1 - 1;
+} {79.0
+82.0}
+
+
 # ORDER BY id here because sqlite uses age_idx here and we (yet) don't so force it to evaluate in ID order
 do_execsql_test select-limit-true {
   SELECT id FROM users ORDER BY id LIMIT true;
@@ -743,3 +749,21 @@ do_execsql_test_on_specific_db {:memory:} select-in-complex {
   SELECT * FROM test_table WHERE category IN ('A', 'B') AND value IN (10, 30, 40);
 } {1|A|10
 3|A|30}
+
+foreach {testname limit ans} {
+  limit-const-1             1                      {1}
+  limit-text-2              '2'                    {1 2}
+  limit-bool-true           true                   {1}
+  limit-expr-add            1+2+3                  {1 2 3 4 5 6}
+  limit-expr-sub            5-2-3                  {}
+  limit-expr-paren          (1+1)*2                {1 2 3 4}
+  limit-bool-add            true+2                 {1 2 3}
+  limit-text-math           '2'*2+1                {1 2 3 4 5}
+  limit-bool-false-add      false+4                {1 2 3 4}
+  limit-mixed-math          (1+'1')*(1+1)-(5/5)    {1 2 3}
+  limit-text-bool           ('false'+2)            {1 2}
+  limit-coalesce            COALESCE(NULL,0+1)     {1}
+} {
+  do_execsql_test limit-complex-exprs-$testname \
+    "SELECT id FROM users ORDER BY id LIMIT $limit" $ans
+}

@@ -23,7 +23,7 @@ This package is the Turso in-memory database library for JavaScript.
 - **SQLite compatible:** SQLite query language and file format support ([status](https://github.com/tursodatabase/turso/blob/main/COMPAT.md)).
 - **In-process**: No network overhead, runs directly in your Node.js process
 - **TypeScript support**: Full TypeScript definitions included
-- **Cross-platform**: Supports Linux, macOS, Windows and browsers (through WebAssembly)
+- **Cross-platform**: Supports Linux (x86 and arm64), macOS, Windows and browsers (through WebAssembly)
 
 ## Installation
 

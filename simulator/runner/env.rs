@@ -185,59 +185,6 @@ impl SimulatorEnv {
     ) -> Self {
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
 
-        let total = 100.0;
-
-        let mut create_percent = 0.0;
-        let mut create_index_percent = 0.0;
-        let mut drop_percent = 0.0;
-        let mut delete_percent = 0.0;
-        let mut update_percent = 0.0;
-
-        let read_percent = rng.random_range(0.0..=total);
-        let write_percent = total - read_percent;
-
-        if !cli_opts.disable_create {
-            // Create percent should be 5-15% of the write percent
-            create_percent = rng.random_range(0.05..=0.15) * write_percent;
-        }
-        if !cli_opts.disable_create_index {
-            // Create indexpercent should be 2-5% of the write percent
-            create_index_percent = rng.random_range(0.02..=0.05) * write_percent;
-        }
-        if !cli_opts.disable_drop {
-            // Drop percent should be 2-5% of the write percent
-            drop_percent = rng.random_range(0.02..=0.05) * write_percent;
-        }
-        if !cli_opts.disable_delete {
-            // Delete percent should be 10-20% of the write percent
-            delete_percent = rng.random_range(0.1..=0.2) * write_percent;
-        }
-        if !cli_opts.disable_update {
-            // Update percent should be 10-20% of the write percent
-            // TODO: freestyling the percentage
-            update_percent = rng.random_range(0.1..=0.2) * write_percent;
-        }
-
-        let write_percent = write_percent
-            - create_percent
-            - create_index_percent
-            - delete_percent
-            - drop_percent
-            - update_percent;
-
-        let summed_total: f64 = read_percent
-            + write_percent
-            + create_percent
-            + create_index_percent
-            + drop_percent
-            + update_percent
-            + delete_percent;
-
-        let abs_diff = (summed_total - total).abs();
-        if abs_diff > 0.0001 {
-            panic!("Summed total {summed_total} is not equal to total {total}");
-        }
-
         let opts = SimulatorOpts {
             seed,
             ticks: rng.random_range(cli_opts.minimum_tests..=cli_opts.maximum_tests),

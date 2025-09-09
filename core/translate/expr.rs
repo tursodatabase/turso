@@ -336,10 +336,19 @@ pub fn translate_condition_expr(
                 resolver,
             )?;
         }
-        ast::Expr::Binary(_, _, _) => {
+        ast::Expr::Binary(e1, op, e2) => {
             let result_reg = program.alloc_register();
-            translate_expr(program, Some(referenced_tables), expr, result_reg, resolver)?;
-            emit_cond_jump(program, condition_metadata, result_reg);
+            binary_expr_shared(
+                program,
+                Some(referenced_tables),
+                e1,
+                e2,
+                op,
+                result_reg,
+                resolver,
+                Some(condition_metadata),
+                emit_binary_condition_insn,
+            )?;
         }
         ast::Expr::Literal(_)
         | ast::Expr::Cast { .. }
@@ -508,80 +517,18 @@ pub fn translate_expr(
             unreachable!("expression should have been rewritten in optmizer")
         }
         ast::Expr::Binary(e1, op, e2) => {
-            // Check if both sides of the expression are equivalent and reuse the same register if so
-            if exprs_are_equivalent(e1, e2) {
-                let shared_reg = program.alloc_register();
-                translate_expr(program, referenced_tables, e1, shared_reg, resolver)?;
-
-                emit_binary_insn(
-                    program,
-                    op,
-                    shared_reg,
-                    shared_reg,
-                    target_register,
-                    e1,
-                    e2,
-                    referenced_tables,
-                )?;
-                program.reset_collation();
-                Ok(target_register)
-            } else {
-                let e1_reg = program.alloc_registers(2);
-                let e2_reg = e1_reg + 1;
-
-                translate_expr(program, referenced_tables, e1, e1_reg, resolver)?;
-                let left_collation_ctx = program.curr_collation_ctx();
-                program.reset_collation();
-
-                translate_expr(program, referenced_tables, e2, e2_reg, resolver)?;
-                let right_collation_ctx = program.curr_collation_ctx();
-                program.reset_collation();
-
-                /*
-                 * The rules for determining which collating function to use for a binary comparison
-                 * operator (=, <, >, <=, >=, !=, IS, and IS NOT) are as follows:
-                 *
-                 * 1. If either operand has an explicit collating function assignment using the postfix COLLATE operator,
-                 * then the explicit collating function is used for comparison,
-                 * with precedence to the collating function of the left operand.
-                 *
-                 * 2. If either operand is a column, then the collating function of that column is used
-                 * with precedence to the left operand. For the purposes of the previous sentence,
-                 * a column name preceded by one or more unary "+" operators and/or CAST operators is still considered a column name.
-                 *
-                 * 3. Otherwise, the BINARY collating function is used for comparison.
-                 */
-                let collation_ctx = {
-                    match (left_collation_ctx, right_collation_ctx) {
-                        (Some((c_left, true)), _) => Some((c_left, true)),
-                        (_, Some((c_right, true))) => Some((c_right, true)),
-                        (Some((c_left, from_collate_left)), None) => {
-                            Some((c_left, from_collate_left))
-                        }
-                        (None, Some((c_right, from_collate_right))) => {
-                            Some((c_right, from_collate_right))
-                        }
-                        (Some((c_left, from_collate_left)), Some((_, false))) => {
-                            Some((c_left, from_collate_left))
-                        }
-                        _ => None,
-                    }
-                };
-                program.set_collation(collation_ctx);
-
-                emit_binary_insn(
-                    program,
-                    op,
-                    e1_reg,
-                    e2_reg,
-                    target_register,
-                    e1,
-                    e2,
-                    referenced_tables,
-                )?;
-                program.reset_collation();
-                Ok(target_register)
-            }
+            binary_expr_shared(
+                program,
+                referenced_tables,
+                e1,
+                e2,
+                op,
+                target_register,
+                resolver,
+                None,
+                emit_binary_insn,
+            )?;
+            Ok(target_register)
         }
         ast::Expr::Case {
             base,
@@ -2225,6 +2172,102 @@ pub fn translate_expr(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn binary_expr_shared(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+    e1: &ast::Expr,
+    e2: &ast::Expr,
+    op: &ast::Operator,
+    target_register: usize,
+    resolver: &Resolver,
+    condition_metadata: Option<ConditionMetadata>,
+    emit_fn: impl Fn(
+        &mut ProgramBuilder,
+        &ast::Operator,
+        usize,      // left reg
+        usize,      // right reg
+        usize,      // target reg
+        &ast::Expr, // left expr
+        &ast::Expr, // right expr
+        Option<&TableReferences>,
+        Option<ConditionMetadata>,
+    ) -> Result<()>,
+) -> Result<usize> {
+    // Check if both sides of the expression are equivalent and reuse the same register if so
+    if exprs_are_equivalent(e1, e2) {
+        let shared_reg = program.alloc_register();
+        translate_expr(program, referenced_tables, e1, shared_reg, resolver)?;
+
+        emit_fn(
+            program,
+            op,
+            shared_reg,
+            shared_reg,
+            target_register,
+            e1,
+            e2,
+            referenced_tables,
+            condition_metadata,
+        )?;
+        program.reset_collation();
+        Ok(target_register)
+    } else {
+        let e1_reg = program.alloc_registers(2);
+        let e2_reg = e1_reg + 1;
+
+        translate_expr(program, referenced_tables, e1, e1_reg, resolver)?;
+        let left_collation_ctx = program.curr_collation_ctx();
+        program.reset_collation();
+
+        translate_expr(program, referenced_tables, e2, e2_reg, resolver)?;
+        let right_collation_ctx = program.curr_collation_ctx();
+        program.reset_collation();
+
+        /*
+         * The rules for determining which collating function to use for a binary comparison
+         * operator (=, <, >, <=, >=, !=, IS, and IS NOT) are as follows:
+         *
+         * 1. If either operand has an explicit collating function assignment using the postfix COLLATE operator,
+         * then the explicit collating function is used for comparison,
+         * with precedence to the collating function of the left operand.
+         *
+         * 2. If either operand is a column, then the collating function of that column is used
+         * with precedence to the left operand. For the purposes of the previous sentence,
+         * a column name preceded by one or more unary "+" operators and/or CAST operators is still considered a column name.
+         *
+         * 3. Otherwise, the BINARY collating function is used for comparison.
+         */
+        let collation_ctx = {
+            match (left_collation_ctx, right_collation_ctx) {
+                (Some((c_left, true)), _) => Some((c_left, true)),
+                (_, Some((c_right, true))) => Some((c_right, true)),
+                (Some((c_left, from_collate_left)), None) => Some((c_left, from_collate_left)),
+                (None, Some((c_right, from_collate_right))) => Some((c_right, from_collate_right)),
+                (Some((c_left, from_collate_left)), Some((_, false))) => {
+                    Some((c_left, from_collate_left))
+                }
+                _ => None,
+            }
+        };
+        program.set_collation(collation_ctx);
+
+        emit_fn(
+            program,
+            op,
+            e1_reg,
+            e2_reg,
+            target_register,
+            e1,
+            e2,
+            referenced_tables,
+            condition_metadata,
+        )?;
+        program.reset_collation();
+        Ok(target_register)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn emit_binary_insn(
     program: &mut ProgramBuilder,
     op: &ast::Operator,
@@ -2234,6 +2277,7 @@ fn emit_binary_insn(
     lhs_expr: &Expr,
     rhs_expr: &Expr,
     referenced_tables: Option<&TableReferences>,
+    _: Option<ConditionMetadata>,
 ) -> Result<()> {
     let mut affinity = Affinity::Blob;
     if op.is_comparison() {
@@ -2474,6 +2518,277 @@ fn emit_binary_insn(
                 rhs,
                 dest: target_register,
             });
+        }
+        other_unimplemented => todo!("{:?}", other_unimplemented),
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_binary_condition_insn(
+    program: &mut ProgramBuilder,
+    op: &ast::Operator,
+    lhs: usize,
+    rhs: usize,
+    target_register: usize,
+    lhs_expr: &Expr,
+    rhs_expr: &Expr,
+    referenced_tables: Option<&TableReferences>,
+    condition_metadata: Option<ConditionMetadata>,
+) -> Result<()> {
+    let condition_metadata = condition_metadata
+        .expect("condition metadata must be provided for emit_binary_insn_conditional");
+    let mut affinity = Affinity::Blob;
+    if op.is_comparison() {
+        affinity = comparison_affinity(lhs_expr, rhs_expr, referenced_tables);
+    }
+
+    let opposite_op = match op {
+        ast::Operator::NotEquals => ast::Operator::Equals,
+        ast::Operator::Equals => ast::Operator::NotEquals,
+        ast::Operator::Less => ast::Operator::GreaterEquals,
+        ast::Operator::LessEquals => ast::Operator::Greater,
+        ast::Operator::Greater => ast::Operator::LessEquals,
+        ast::Operator::GreaterEquals => ast::Operator::Less,
+        ast::Operator::Is => ast::Operator::IsNot,
+        ast::Operator::IsNot => ast::Operator::Is,
+        other => *other,
+    };
+
+    // For conditional jumps we need to use the opposite comparison operator
+    // when we intend to jump if the condition is false. Jumping when the condition is false
+    // is the common case, e.g.:
+    // WHERE x=1 turns into "jump if x != 1".
+    // However, in e.g. "WHERE x=1 OR y=2" we want to jump if the condition is true
+    // when evaluating "x=1", because we are jumping over the "y=2" condition, and if the condition
+    // is false we move on to the "y=2" condition without jumping.
+    let op_to_use = if condition_metadata.jump_if_condition_is_true {
+        *op
+    } else {
+        opposite_op
+    };
+
+    // Similarly, we "jump if NULL" only when we intend to jump if the condition is false.
+    let flags = if condition_metadata.jump_if_condition_is_true {
+        CmpInsFlags::default().with_affinity(affinity)
+    } else {
+        CmpInsFlags::default()
+            .with_affinity(affinity)
+            .jump_if_null()
+    };
+
+    let target_pc = if condition_metadata.jump_if_condition_is_true {
+        condition_metadata.jump_target_when_true
+    } else {
+        condition_metadata.jump_target_when_false
+    };
+
+    // For conditional jumps that don't have a clear "opposite op" (e.g. x+y), we check whether the result is nonzero/nonnull
+    // (or zero/null) depending on the condition metadata.
+    let eval_result = |program: &mut ProgramBuilder, result_reg: usize| {
+        if condition_metadata.jump_if_condition_is_true {
+            program.emit_insn(Insn::If {
+                reg: result_reg,
+                target_pc,
+                jump_if_null: false,
+            });
+        } else {
+            program.emit_insn(Insn::IfNot {
+                reg: result_reg,
+                target_pc,
+                jump_if_null: true,
+            });
+        }
+    };
+
+    match op_to_use {
+        ast::Operator::NotEquals => {
+            program.emit_insn(Insn::Ne {
+                lhs,
+                rhs,
+                target_pc,
+                flags,
+                collation: program.curr_collation(),
+            });
+        }
+        ast::Operator::Equals => {
+            program.emit_insn(Insn::Eq {
+                lhs,
+                rhs,
+                target_pc,
+                flags,
+                collation: program.curr_collation(),
+            });
+        }
+        ast::Operator::Less => {
+            program.emit_insn(Insn::Lt {
+                lhs,
+                rhs,
+                target_pc,
+                flags,
+                collation: program.curr_collation(),
+            });
+        }
+        ast::Operator::LessEquals => {
+            program.emit_insn(Insn::Le {
+                lhs,
+                rhs,
+                target_pc,
+                flags,
+                collation: program.curr_collation(),
+            });
+        }
+        ast::Operator::Greater => {
+            program.emit_insn(Insn::Gt {
+                lhs,
+                rhs,
+                target_pc,
+                flags,
+                collation: program.curr_collation(),
+            });
+        }
+        ast::Operator::GreaterEquals => {
+            program.emit_insn(Insn::Ge {
+                lhs,
+                rhs,
+                target_pc,
+                flags,
+                collation: program.curr_collation(),
+            });
+        }
+        ast::Operator::Is => {
+            program.emit_insn(Insn::Eq {
+                lhs,
+                rhs,
+                target_pc,
+                flags: flags.null_eq(),
+                collation: program.curr_collation(),
+            });
+        }
+        ast::Operator::IsNot => {
+            program.emit_insn(Insn::Ne {
+                lhs,
+                rhs,
+                target_pc,
+                flags: flags.null_eq(),
+                collation: program.curr_collation(),
+            });
+        }
+        ast::Operator::Add => {
+            program.emit_insn(Insn::Add {
+                lhs,
+                rhs,
+                dest: target_register,
+            });
+            eval_result(program, target_register);
+        }
+        ast::Operator::Subtract => {
+            program.emit_insn(Insn::Subtract {
+                lhs,
+                rhs,
+                dest: target_register,
+            });
+            eval_result(program, target_register);
+        }
+        ast::Operator::Multiply => {
+            program.emit_insn(Insn::Multiply {
+                lhs,
+                rhs,
+                dest: target_register,
+            });
+            eval_result(program, target_register);
+        }
+        ast::Operator::Divide => {
+            program.emit_insn(Insn::Divide {
+                lhs,
+                rhs,
+                dest: target_register,
+            });
+            eval_result(program, target_register);
+        }
+        ast::Operator::Modulus => {
+            program.emit_insn(Insn::Remainder {
+                lhs,
+                rhs,
+                dest: target_register,
+            });
+            eval_result(program, target_register);
+        }
+        ast::Operator::And => {
+            program.emit_insn(Insn::And {
+                lhs,
+                rhs,
+                dest: target_register,
+            });
+            eval_result(program, target_register);
+        }
+        ast::Operator::Or => {
+            program.emit_insn(Insn::Or {
+                lhs,
+                rhs,
+                dest: target_register,
+            });
+            eval_result(program, target_register);
+        }
+        ast::Operator::BitwiseAnd => {
+            program.emit_insn(Insn::BitAnd {
+                lhs,
+                rhs,
+                dest: target_register,
+            });
+            eval_result(program, target_register);
+        }
+        ast::Operator::BitwiseOr => {
+            program.emit_insn(Insn::BitOr {
+                lhs,
+                rhs,
+                dest: target_register,
+            });
+            eval_result(program, target_register);
+        }
+        ast::Operator::RightShift => {
+            program.emit_insn(Insn::ShiftRight {
+                lhs,
+                rhs,
+                dest: target_register,
+            });
+            eval_result(program, target_register);
+        }
+        ast::Operator::LeftShift => {
+            program.emit_insn(Insn::ShiftLeft {
+                lhs,
+                rhs,
+                dest: target_register,
+            });
+            eval_result(program, target_register);
+        }
+        #[cfg(feature = "json")]
+        op @ (ast::Operator::ArrowRight | ast::Operator::ArrowRightShift) => {
+            let json_func = match op {
+                ast::Operator::ArrowRight => JsonFunc::JsonArrowExtract,
+                ast::Operator::ArrowRightShift => JsonFunc::JsonArrowShiftExtract,
+                _ => unreachable!(),
+            };
+
+            program.emit_insn(Insn::Function {
+                constant_mask: 0,
+                start_reg: lhs,
+                dest: target_register,
+                func: FuncCtx {
+                    func: Func::Json(json_func),
+                    arg_count: 2,
+                },
+            });
+            eval_result(program, target_register);
+        }
+        ast::Operator::Concat => {
+            program.emit_insn(Insn::Concat {
+                lhs,
+                rhs,
+                dest: target_register,
+            });
+            eval_result(program, target_register);
         }
         other_unimplemented => todo!("{:?}", other_unimplemented),
     }
@@ -3185,6 +3500,7 @@ pub fn translate_expr_for_returning(
                 lhs,
                 rhs,
                 None, // No table references needed for RETURNING
+                None, // No condition metadata needed for RETURNING
             )?;
 
             Ok(target_register)

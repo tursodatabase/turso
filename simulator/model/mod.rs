@@ -1,6 +1,7 @@
-use std::{collections::HashSet, fmt::Display};
+use std::fmt::Display;
 
 use anyhow::Context;
+use indexmap::IndexSet;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use sql_generation::model::{
@@ -32,19 +33,19 @@ pub enum Query {
 }
 
 impl Query {
-    pub fn dependencies(&self) -> HashSet<String> {
+    pub fn dependencies(&self) -> IndexSet<String> {
         match self {
             Query::Select(select) => select.dependencies(),
-            Query::Create(_) => HashSet::new(),
+            Query::Create(_) => IndexSet::new(),
             Query::Insert(Insert::Select { table, .. })
             | Query::Insert(Insert::Values { table, .. })
             | Query::Delete(Delete { table, .. })
             | Query::Update(Update { table, .. })
-            | Query::Drop(Drop { table, .. }) => HashSet::from_iter([table.clone()]),
+            | Query::Drop(Drop { table, .. }) => IndexSet::from_iter([table.clone()]),
             Query::CreateIndex(CreateIndex { table_name, .. }) => {
-                HashSet::from_iter([table_name.clone()])
+                IndexSet::from_iter([table_name.clone()])
             }
-            Query::Begin(_) | Query::Commit(_) | Query::Rollback(_) => HashSet::new(),
+            Query::Begin(_) | Query::Commit(_) | Query::Rollback(_) => IndexSet::new(),
         }
     }
     pub fn uses(&self) -> Vec<String> {

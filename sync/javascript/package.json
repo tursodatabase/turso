@@ -1,6 +1,6 @@
 {
   "name": "@tursodatabase/sync",
-  "version": "0.1.5-pre.2",
+  "version": "0.1.5-pre.4",
   "repository": {
     "type": "git",
     "url": "https://github.com/tursodatabase/turso"
@@ -22,6 +22,7 @@
       "x86_64-unknown-linux-gnu",
       "x86_64-pc-windows-msvc",
       "universal-apple-darwin",
+      "aarch64-unknown-linux-gnu",
       "wasm32-wasip1-threads"
     ]
   },

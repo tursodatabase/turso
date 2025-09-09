@@ -257,6 +257,7 @@ pub fn emit_schema_entry(
         count: 5,
         dest_reg: record_reg,
         index_name: None,
+        affinity_str: None,
     });
 
     program.emit_insn(Insn::Insert {
@@ -614,6 +615,7 @@ pub fn translate_create_virtual_table(
             count: args_vec.len(),
             dest_reg: args_record_reg,
             index_name: None,
+            affinity_str: None,
         });
         Some(args_record_reg)
     } else {
@@ -690,6 +692,14 @@ pub fn translate_drop_table(
     }
 
     let table = table.unwrap(); // safe since we just checked for None
+
+    // Check if this is a materialized view - if so, refuse to drop it with DROP TABLE
+    if schema.is_materialized_view(tbl_name.name.as_str()) {
+        bail_parse_error!(
+            "Cannot DROP TABLE on materialized view {}. Use DROP VIEW instead.",
+            tbl_name.name.as_str()
+        );
+    }
     let cdc_table = prepare_cdc_if_necessary(&mut program, schema, SQLITE_TABLEID)?;
 
     let null_reg = program.alloc_register(); //  r1
@@ -990,6 +1000,7 @@ pub fn translate_drop_table(
             count: 5,
             dest_reg: new_record_register,
             index_name: None,
+            affinity_str: None,
         });
         program.emit_insn(Insn::Delete {
             cursor_id: sqlite_schema_cursor_id_1,

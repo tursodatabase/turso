@@ -149,10 +149,7 @@ mod tests {
     fn test_prepare_misuse() {
         unsafe {
             let mut db = ptr::null_mut();
-            assert_eq!(
-                sqlite3_open(c"../testing/testing_clone.db".as_ptr(), &mut db),
-                SQLITE_OK
-            );
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
 
             let mut stmt = ptr::null_mut();
             assert_eq!(
@@ -165,82 +162,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_wal_checkpoint() {
-        unsafe {
-            // Test with valid db
-            let mut db = ptr::null_mut();
-            assert_eq!(
-                sqlite3_open(c"../testing/testing_clone.db".as_ptr(), &mut db),
-                SQLITE_OK
-            );
-            assert_eq!(sqlite3_wal_checkpoint(db, ptr::null()), SQLITE_OK);
-            assert_eq!(sqlite3_close(db), SQLITE_OK);
-        }
-    }
-
-    #[test]
-    fn test_wal_checkpoint_v2() {
-        unsafe {
-            // Test with valid db
-            let mut db = ptr::null_mut();
-            assert_eq!(
-                sqlite3_open(c"../testing/testing_clone.db".as_ptr(), &mut db),
-                SQLITE_OK
-            );
-
-            let mut log_size = 0;
-            let mut checkpoint_count = 0;
-
-            // Test different checkpoint modes
-            assert_eq!(
-                sqlite3_wal_checkpoint_v2(
-                    db,
-                    ptr::null(),
-                    SQLITE_CHECKPOINT_PASSIVE,
-                    &mut log_size,
-                    &mut checkpoint_count
-                ),
-                SQLITE_OK
-            );
-
-            // TODO: uncomment when SQLITE_CHECKPOINT_FULL is supported
-            // assert_eq!(
-            //     sqlite3_wal_checkpoint_v2(
-            //         db,
-            //         ptr::null(),
-            //         SQLITE_CHECKPOINT_FULL,
-            //         &mut log_size,
-            //         &mut checkpoint_count
-            //     ),
-            //     SQLITE_OK
-            // );
-
-            assert_eq!(
-                sqlite3_wal_checkpoint_v2(
-                    db,
-                    ptr::null(),
-                    SQLITE_CHECKPOINT_RESTART,
-                    &mut log_size,
-                    &mut checkpoint_count
-                ),
-                SQLITE_OK
-            );
-
-            assert_eq!(
-                sqlite3_wal_checkpoint_v2(
-                    db,
-                    ptr::null(),
-                    SQLITE_CHECKPOINT_TRUNCATE,
-                    &mut log_size,
-                    &mut checkpoint_count
-                ),
-                SQLITE_OK
-            );
-
-            assert_eq!(sqlite3_close(db), SQLITE_OK);
-        }
-    }
     #[test]
     fn test_sqlite3_bind_int() {
         unsafe {

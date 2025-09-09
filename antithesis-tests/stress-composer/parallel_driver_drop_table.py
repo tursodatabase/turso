@@ -24,7 +24,7 @@ selected_idx = get_random() % len(existing_schemas)
 selected_tbl = existing_schemas[selected_idx][0]
 
 try:
-    con = turso.connect("stress_composer.db", experimental_indexes=True)
+    con = turso.connect("stress_composer.db")
 except Exception as e:
     print(f"Failed to open stress_composer.db. Exiting... {e}")
     exit(0)
