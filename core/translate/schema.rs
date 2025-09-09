@@ -194,6 +194,17 @@ pub fn translate_create_table(
             });
         }
     }
+ 
+    let table = schema.get_btree_table(SQLITE_TABLEID).unwrap();
+    let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
+    program.emit_insn(Insn::OpenWrite {
+        cursor_id: sqlite_schema_cursor_id,
+        root_page: 1usize.into(),
+        db: 0,
+    });
+
+    let cdc_table = prepare_cdc_if_necessary(&mut program, schema, SQLITE_TABLEID)?;
+    let resolver = Resolver::new(schema, syms);
 
     emit_schema_entry(
         &mut program,
