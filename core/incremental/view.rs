@@ -1,11 +1,11 @@
 use super::compiler::{DbspCircuit, DbspCompiler, DeltaSet};
 use super::dbsp::Delta;
 use super::operator::{ComputationTracker, FilterPredicate};
-use crate::schema::{BTreeTable, Column, Schema};
+use crate::schema::{BTreeTable, Schema};
 use crate::storage::btree::BTreeCursor;
 use crate::translate::logical::LogicalPlanBuilder;
 use crate::types::{IOResult, Value};
-use crate::util::extract_view_columns;
+use crate::util::{extract_view_columns, ViewColumnSchema};
 use crate::{return_if_io, LimboError, Pager, Result, Statement};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -173,8 +173,8 @@ pub struct IncrementalView {
 
     // All tables referenced by this view (from FROM clause and JOINs)
     referenced_tables: Vec<Arc<BTreeTable>>,
-    // The view's output columns with their types
-    pub columns: Vec<Column>,
+    // The view's column schema with table relationships
+    pub column_schema: ViewColumnSchema,
     // State machine for population
     populate_state: PopulateState,
     // Computation tracker for statistics
@@ -227,11 +227,16 @@ impl IncrementalView {
 
     /// Get an iterator over column names, using enumerated naming for unnamed columns
     pub fn column_names(&self) -> impl Iterator<Item = String> + '_ {
-        self.columns.iter().enumerate().map(|(i, col)| {
-            col.name
-                .clone()
-                .unwrap_or_else(|| format!("column{}", i + 1))
-        })
+        self.column_schema
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(i, vc)| {
+                vc.column
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| format!("column{}", i + 1))
+            })
     }
 
     /// Check if this view has the same SQL definition as the provided SQL string
@@ -251,24 +256,9 @@ impl IncrementalView {
     pub fn validate_and_extract_columns(
         select: &ast::Select,
         schema: &Schema,
-    ) -> Result<Vec<crate::schema::Column>> {
-        // For now, just extract columns from a simple select
-        // This will need to be expanded to handle joins, aggregates, etc.
-
-        // Get the base table name
-        let base_table_name = Self::extract_base_table(select).ok_or_else(|| {
-            LimboError::ParseError("Cannot extract base table from SELECT".to_string())
-        })?;
-
-        // Get the table from schema
-        let table = schema
-            .get_table(&base_table_name)
-            .and_then(|t| t.btree())
-            .ok_or_else(|| LimboError::ParseError(format!("Table {base_table_name} not found")))?;
-
-        // For now, return all columns from the base table
-        // In the future, this should parse the select list and handle projections
-        Ok(table.columns.clone())
+    ) -> Result<ViewColumnSchema> {
+        // Use the shared function to extract columns with full table context
+        extract_view_columns(select, schema)
     }
 
     pub fn from_sql(
@@ -314,7 +304,7 @@ impl IncrementalView {
         let where_predicate = FilterPredicate::from_select(&select)?;
 
         // Extract output columns using the shared function
-        let view_columns = extract_view_columns(&select, schema);
+        let column_schema = extract_view_columns(&select, schema)?;
 
         let (join_tables, join_condition) = Self::extract_join_info(&select);
         if join_tables.is_some() || join_condition.is_some() {
@@ -331,7 +321,7 @@ impl IncrementalView {
             where_predicate,
             select.clone(),
             referenced_tables,
-            view_columns,
+            column_schema,
             schema,
             main_data_root,
             internal_state_root,
@@ -345,7 +335,7 @@ impl IncrementalView {
         where_predicate: FilterPredicate,
         select_stmt: ast::Select,
         referenced_tables: Vec<Arc<BTreeTable>>,
-        columns: Vec<Column>,
+        column_schema: ViewColumnSchema,
         schema: &Schema,
         main_data_root: usize,
         internal_state_root: usize,
@@ -369,7 +359,7 @@ impl IncrementalView {
             select_stmt,
             circuit,
             referenced_tables,
-            columns,
+            column_schema,
             populate_state: PopulateState::Start,
             tracker,
             root_page: main_data_root,
@@ -455,20 +445,6 @@ impl IncrementalView {
         }
 
         Ok(tables)
-    }
-
-    /// Extract the base table name from a SELECT statement (for non-join cases)
-    fn extract_base_table(select: &ast::Select) -> Option<String> {
-        if let ast::OneSelect::Select {
-            from: Some(ref from),
-            ..
-        } = select.body.select
-        {
-            if let ast::SelectTable::Table(name, _, _) = from.select.as_ref() {
-                return Some(name.name.as_str().to_string());
-            }
-        }
-        None
     }
 
     /// Generate the SQL query for populating the view from its source table
