@@ -1503,14 +1503,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         // we can either switch to a tree-like structure, or at least use partition_point()
         // which performs a binary search for the insertion point.
         let mut position = 0_usize;
-        // let position = versions
-        //     .iter()
-        //     .rposition(|v| {
-        //         self.get_begin_timestamp(&v.begin) < self.get_begin_timestamp(&row_version.begin)
-        //     })
-        //     .map(|p| p + 1)
-        //     .unwrap_or(0);
-        for (i, v) in versions.iter().enumerate() {
+        for (i, v) in versions.iter().rev().enumerate() {
             if self.get_begin_timestamp(&v.begin) < self.get_begin_timestamp(&row_version.begin) {
                 position = i + 1;
                 break;
