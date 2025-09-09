@@ -393,10 +393,15 @@ pub unsafe extern "C" fn sqlite3_reset(stmt: *mut sqlite3_stmt) -> ffi::c_int {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn sqlite3_changes(db: *mut sqlite3) -> ffi::c_int {
+pub unsafe extern "C" fn sqlite3_changes64(db: *mut sqlite3) -> i64 {
     let db: &mut sqlite3 = &mut *db;
     let inner = db.inner.lock().unwrap();
-    inner.conn.changes() as ffi::c_int
+    inner.conn.changes()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn sqlite3_changes(db: *mut sqlite3) -> ffi::c_int {
+    sqlite3_changes64(db) as ffi::c_int
 }
 
 #[no_mangle]
@@ -879,6 +884,29 @@ pub unsafe extern "C" fn sqlite3_column_name(
     let stmt = &mut *stmt;
 
     let binding = stmt.stmt.get_column_name(idx).into_owned();
+    let val = binding.as_str();
+
+    if val.is_empty() {
+        return std::ptr::null();
+    }
+
+    let c_string = CString::new(val).expect("CString::new failed");
+    c_string.into_raw()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn sqlite3_column_table_name(
+    stmt: *mut sqlite3_stmt,
+    idx: ffi::c_int,
+) -> *const ffi::c_char {
+    let idx = idx.try_into().unwrap();
+    let stmt = &mut *stmt;
+
+    let binding = stmt
+        .stmt
+        .get_column_table_name(idx)
+        .map(|cow| cow.into_owned())
+        .unwrap_or_default();
     let val = binding.as_str();
 
     if val.is_empty() {
@@ -1645,4 +1673,146 @@ fn sqlite3_safety_check_sick_or_ok(db: &sqlite3Inner) -> bool {
             false
         }
     }
+}
+
+// https://sqlite.org/c3ref/table_column_metadata.html
+#[no_mangle]
+pub unsafe extern "C" fn sqlite3_table_column_metadata(
+    db: *mut sqlite3,
+    z_db_name: *const ffi::c_char,
+    z_table_name: *const ffi::c_char,
+    z_column_name: *const ffi::c_char,
+    pz_data_type: *mut *const ffi::c_char,
+    pz_coll_seq: *mut *const ffi::c_char,
+    p_not_null: *mut ffi::c_int,
+    p_primary_key: *mut ffi::c_int,
+    p_autoinc: *mut ffi::c_int,
+) -> ffi::c_int {
+    trace!("sqlite3_table_column_metadata");
+
+    let mut rc = SQLITE_OK;
+    let mut z_data_type: *const ffi::c_char = std::ptr::null();
+    let mut z_coll_seq: *const ffi::c_char = std::ptr::null();
+    let mut not_null = 0;
+    let mut primary_key = 0;
+    let mut autoinc = 0;
+
+    // Safety checks
+    if db.is_null() || z_table_name.is_null() {
+        return SQLITE_MISUSE;
+    }
+
+    let db_inner = &(*db).inner.lock().unwrap();
+
+    // Convert C strings to Rust strings
+    let table_name = match CStr::from_ptr(z_table_name).to_str() {
+        Ok(s) => s,
+        Err(_) => return SQLITE_MISUSE,
+    };
+
+    // Handle database name (can be NULL for main database)
+    let db_name = if z_db_name.is_null() {
+        "main"
+    } else {
+        match CStr::from_ptr(z_db_name).to_str() {
+            Ok(s) => s,
+            Err(_) => return SQLITE_MISUSE,
+        }
+    };
+
+    // For now, we only support the main database
+    if db_name != "main" {
+        rc = SQLITE_ERROR;
+    } else {
+        // Handle column name (can be NULL to just check table existence)
+        if !z_column_name.is_null() {
+            let column_name = match CStr::from_ptr(z_column_name).to_str() {
+                Ok(s) => s,
+                Err(_) => return SQLITE_MISUSE,
+            };
+
+            // Use pragma table_info to get column information
+            match db_inner
+                .conn
+                .pragma_query(&format!("table_info({table_name})"))
+            {
+                Ok(rows) => {
+                    let mut found_column = false;
+                    for row in rows {
+                        let col_name: &str = match &row[1] {
+                            turso_core::Value::Text(text) => text.as_str(),
+                            _ => return SQLITE_ERROR,
+                        }; // name column
+                        if col_name == column_name {
+                            // Found the column, extract metadata
+                            let col_type: String = match &row[2] {
+                                turso_core::Value::Text(text) => text.as_str().to_string(),
+                                _ => return SQLITE_ERROR,
+                            }; // type column
+                            let col_notnull: i64 = row[3].as_int().unwrap(); // notnull column
+                            let col_pk: i64 = row[5].as_int().unwrap(); // pk column
+
+                            z_data_type = CString::new(col_type)
+                                .expect("CString::new failed")
+                                .into_raw();
+                            z_coll_seq = CString::new("BINARY")
+                                .expect("CString::new failed")
+                                .into_raw();
+                            not_null = if col_notnull != 0 { 1 } else { 0 };
+                            primary_key = if col_pk != 0 { 1 } else { 0 };
+
+                            // For now, we don't support auto-increment detection
+                            autoinc = 0;
+
+                            found_column = true;
+                            break;
+                        }
+                    }
+
+                    if !found_column {
+                        // Check if it's a rowid reference
+                        if column_name == "rowid"
+                            || column_name == "oid"
+                            || column_name == "_rowid_"
+                        {
+                            // For rowid columns, return INTEGER type
+                            z_data_type = CString::new("INTEGER")
+                                .expect("CString::new failed")
+                                .into_raw();
+                            z_coll_seq = CString::new("BINARY")
+                                .expect("CString::new failed")
+                                .into_raw();
+                            not_null = 0;
+                            primary_key = 1;
+                            autoinc = 0;
+                        } else {
+                            rc = SQLITE_ERROR;
+                        }
+                    }
+                }
+                Err(_) => {
+                    rc = SQLITE_ERROR;
+                }
+            }
+        }
+    }
+
+    // Set output parameters
+    if !pz_data_type.is_null() {
+        *pz_data_type = z_data_type;
+    }
+    if !pz_coll_seq.is_null() {
+        *pz_coll_seq = z_coll_seq;
+    }
+    if !p_not_null.is_null() {
+        *p_not_null = not_null;
+    }
+    if !p_primary_key.is_null() {
+        *p_primary_key = primary_key;
+    }
+    if !p_autoinc.is_null() {
+        *p_autoinc = autoinc;
+    }
+
+    rc
 }

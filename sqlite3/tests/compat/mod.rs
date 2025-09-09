@@ -55,6 +55,7 @@ extern "C" {
     fn sqlite3_bind_parameter_index(stmt: *mut sqlite3_stmt, name: *const libc::c_char) -> i32;
     fn sqlite3_clear_bindings(stmt: *mut sqlite3_stmt) -> i32;
     fn sqlite3_column_name(stmt: *mut sqlite3_stmt, idx: i32) -> *const libc::c_char;
+    fn sqlite3_column_table_name(stmt: *mut sqlite3_stmt, idx: i32) -> *const libc::c_char;
     fn sqlite3_last_insert_rowid(db: *mut sqlite3) -> i32;
     fn sqlite3_column_count(stmt: *mut sqlite3_stmt) -> i32;
     fn sqlite3_bind_text(
@@ -77,9 +78,24 @@ extern "C" {
     fn sqlite3_column_type(stmt: *mut sqlite3_stmt, idx: i32) -> i32;
     fn sqlite3_column_decltype(stmt: *mut sqlite3_stmt, idx: i32) -> *const libc::c_char;
     fn sqlite3_get_autocommit(db: *mut sqlite3) -> i32;
+    fn sqlite3_changes(db: *mut sqlite3) -> i32;
+    fn sqlite3_changes64(db: *mut sqlite3) -> i64;
+    fn sqlite3_table_column_metadata(
+        db: *mut sqlite3,
+        z_db_name: *const libc::c_char,
+        z_table_name: *const libc::c_char,
+        z_column_name: *const libc::c_char,
+        pz_data_type: *mut *const libc::c_char,
+        pz_coll_seq: *mut *const libc::c_char,
+        p_not_null: *mut libc::c_int,
+        p_primary_key: *mut libc::c_int,
+        p_autoinc: *mut libc::c_int,
+    ) -> i32;
 }
 
 const SQLITE_OK: i32 = 0;
+const SQLITE_ERROR: i32 = 1;
+const SQLITE_MISUSE: i32 = 21;
 const SQLITE_CANTOPEN: i32 = 14;
 const SQLITE_ROW: i32 = 100;
 const SQLITE_DONE: i32 = 101;
@@ -376,6 +392,11 @@ mod tests {
             assert!(!name1.is_null());
             let name1_str = std::ffi::CStr::from_ptr(name1).to_str().unwrap();
             assert_eq!(name1_str, "id");
+
+            let table_name1 = sqlite3_column_table_name(stmt, 0);
+            assert!(!table_name1.is_null());
+            let table_name1_str = std::ffi::CStr::from_ptr(table_name1).to_str().unwrap();
+            assert_eq!(table_name1_str, "test_cols");
 
             let name2 = sqlite3_column_name(stmt, 1);
             assert!(!name2.is_null());
@@ -1314,6 +1335,235 @@ mod tests {
             // Should be no statements left
             let iter = sqlite3_next_stmt(db, ptr::null_mut());
             assert!(iter.is_null());
+
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    fn test_sqlite3_changes() {
+        unsafe {
+            let mut db: *mut sqlite3 = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+
+            // // Initially no changes
+            assert_eq!(sqlite3_changes(db), 0);
+            assert_eq!(sqlite3_changes64(db), 0);
+
+            // Create a table
+            let mut stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"CREATE TABLE test_changes (id INTEGER PRIMARY KEY, value TEXT)".as_ptr(),
+                    -1,
+                    &mut stmt,
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_step(stmt), SQLITE_DONE);
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+
+            // Still no changes after CREATE TABLE
+            assert_eq!(sqlite3_changes(db), 0);
+            assert_eq!(sqlite3_changes64(db), 0);
+
+            // Insert a single row
+            let mut stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"INSERT INTO test_changes (value) VALUES ('test1')".as_ptr(),
+                    -1,
+                    &mut stmt,
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_step(stmt), SQLITE_DONE);
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+
+            // Should have 1 change
+            assert_eq!(sqlite3_changes(db), 1);
+            assert_eq!(sqlite3_changes64(db), 1);
+
+            // Insert multiple rows
+            let mut stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"INSERT INTO test_changes (value) VALUES ('test2'), ('test3'), ('test4')"
+                        .as_ptr(),
+                    -1,
+                    &mut stmt,
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_step(stmt), SQLITE_DONE);
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+
+            // Should have 3 changes
+            assert_eq!(sqlite3_changes(db), 3);
+            assert_eq!(sqlite3_changes64(db), 3);
+
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    fn test_sqlite3_table_column_metadata() {
+        unsafe {
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+
+            // Create a test table
+            let mut stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"CREATE TABLE test_metadata (id INTEGER PRIMARY KEY, name TEXT NOT NULL, value REAL)"
+                        .as_ptr(),
+                    -1,
+                    &mut stmt,
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_step(stmt), SQLITE_DONE);
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+
+            // Test column metadata for 'id' column
+            let mut data_type: *const libc::c_char = ptr::null();
+            let mut coll_seq: *const libc::c_char = ptr::null();
+            let mut not_null: libc::c_int = 0;
+            let mut primary_key: libc::c_int = 0;
+            let mut autoinc: libc::c_int = 0;
+
+            assert_eq!(
+                sqlite3_table_column_metadata(
+                    db,
+                    ptr::null(), // main database
+                    c"test_metadata".as_ptr(),
+                    c"id".as_ptr(),
+                    &mut data_type,
+                    &mut coll_seq,
+                    &mut not_null,
+                    &mut primary_key,
+                    &mut autoinc,
+                ),
+                SQLITE_OK
+            );
+
+            // Verify the results
+            assert!(!data_type.is_null());
+            assert!(!coll_seq.is_null());
+            assert_eq!(primary_key, 1); // id is primary key
+            assert_eq!(not_null, 0); // INTEGER columns don't have NOT NULL by default
+            assert_eq!(autoinc, 0); // not auto-increment
+
+            // Test column metadata for 'name' column
+            let mut data_type2: *const libc::c_char = ptr::null();
+            let mut coll_seq2: *const libc::c_char = ptr::null();
+            let mut not_null2: libc::c_int = 0;
+            let mut primary_key2: libc::c_int = 0;
+            let mut autoinc2: libc::c_int = 0;
+
+            assert_eq!(
+                sqlite3_table_column_metadata(
+                    db,
+                    ptr::null(), // main database
+                    c"test_metadata".as_ptr(),
+                    c"name".as_ptr(),
+                    &mut data_type2,
+                    &mut coll_seq2,
+                    &mut not_null2,
+                    &mut primary_key2,
+                    &mut autoinc2,
+                ),
+                SQLITE_OK
+            );
+
+            // Verify the results
+            assert!(!data_type2.is_null());
+            assert!(!coll_seq2.is_null());
+            assert_eq!(primary_key2, 0); // name is not primary key
+            assert_eq!(not_null2, 1); // name has NOT NULL constraint
+            assert_eq!(autoinc2, 0); // not auto-increment
+
+            // Test non-existent column
+            let mut data_type3: *const libc::c_char = ptr::null();
+            let mut coll_seq3: *const libc::c_char = ptr::null();
+            let mut not_null3: libc::c_int = 0;
+            let mut primary_key3: libc::c_int = 0;
+            let mut autoinc3: libc::c_int = 0;
+
+            assert_eq!(
+                sqlite3_table_column_metadata(
+                    db,
+                    ptr::null(), // main database
+                    c"test_metadata".as_ptr(),
+                    c"nonexistent".as_ptr(),
+                    &mut data_type3,
+                    &mut coll_seq3,
+                    &mut not_null3,
+                    &mut primary_key3,
+                    &mut autoinc3,
+                ),
+                SQLITE_ERROR
+            );
+
+            // Test non-existent table
+            let mut data_type4: *const libc::c_char = ptr::null();
+            let mut coll_seq4: *const libc::c_char = ptr::null();
+            let mut not_null4: libc::c_int = 0;
+            let mut primary_key4: libc::c_int = 0;
+            let mut autoinc4: libc::c_int = 0;
+
+            assert_eq!(
+                sqlite3_table_column_metadata(
+                    db,
+                    ptr::null(), // main database
+                    c"nonexistent_table".as_ptr(),
+                    c"id".as_ptr(),
+                    &mut data_type4,
+                    &mut coll_seq4,
+                    &mut not_null4,
+                    &mut primary_key4,
+                    &mut autoinc4,
+                ),
+                SQLITE_ERROR
+            );
+
+            // Test rowid column
+            let mut data_type5: *const libc::c_char = ptr::null();
+            let mut coll_seq5: *const libc::c_char = ptr::null();
+            let mut not_null5: libc::c_int = 0;
+            let mut primary_key5: libc::c_int = 0;
+            let mut autoinc5: libc::c_int = 0;
+
+            assert_eq!(
+                sqlite3_table_column_metadata(
+                    db,
+                    ptr::null(), // main database
+                    c"test_metadata".as_ptr(),
+                    c"rowid".as_ptr(),
+                    &mut data_type5,
+                    &mut coll_seq5,
+                    &mut not_null5,
+                    &mut primary_key5,
+                    &mut autoinc5,
+                ),
+                SQLITE_OK
+            );
+
+            // Verify rowid results
+            assert!(!data_type5.is_null());
+            assert!(!coll_seq5.is_null());
+            assert_eq!(primary_key5, 1); // rowid is primary key
+            assert_eq!(not_null5, 0);
+            assert_eq!(autoinc5, 0);
 
             assert_eq!(sqlite3_close(db), SQLITE_OK);
         }
