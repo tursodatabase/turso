@@ -566,8 +566,13 @@ impl IncrementalView {
                 //    machinery (next step is which index is best to use, etc)
                 let query = self.sql_for_populate()?;
 
-                // Prepare the statement
-                let stmt = conn.prepare(&query)?;
+                // Create a new connection for reading to avoid transaction conflicts
+                // This allows us to read from tables while the parent transaction is writing the view
+                // The statement holds a reference to this connection, keeping it alive
+                let read_conn = conn.db.connect()?;
+
+                // Prepare the statement using the read connection
+                let stmt = read_conn.prepare(&query)?;
 
                 self.populate_state = PopulateState::Processing {
                     stmt: Box::new(stmt),
