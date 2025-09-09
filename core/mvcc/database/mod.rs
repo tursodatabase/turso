@@ -252,13 +252,31 @@ impl AtomicTransactionState {
 #[derive(Debug)]
 pub enum CommitState {
     Initial,
-    BeginPagerTxn { end_ts: u64 },
-    WriteRow { end_ts: u64, write_set_index: usize },
-    WriteRowStateMachine { end_ts: u64, write_set_index: usize },
-    DeleteRowStateMachine { end_ts: u64, write_set_index: usize },
-    CommitPagerTxn { end_ts: u64 },
-    SyncWal { end_ts: u64 },
-    Commit { end_ts: u64 },
+    BeginPagerTxn {
+        end_ts: u64,
+    },
+    WriteRow {
+        end_ts: u64,
+        write_set_index: usize,
+        requires_seek: bool,
+    },
+    WriteRowStateMachine {
+        end_ts: u64,
+        write_set_index: usize,
+    },
+    DeleteRowStateMachine {
+        end_ts: u64,
+        write_set_index: usize,
+    },
+    CommitPagerTxn {
+        end_ts: u64,
+    },
+    SyncWal {
+        end_ts: u64,
+    },
+    Commit {
+        end_ts: u64,
+    },
 }
 
 #[derive(Debug)]
@@ -266,6 +284,8 @@ pub enum WriteRowState {
     Initial,
     Seek,
     Insert,
+    /// Move to the next record in order to leave the cursor in the next position, this is used for inserting multiple rows for optimizations.
+    Next,
 }
 
 #[derive(Debug)]
@@ -288,6 +308,7 @@ pub struct CommitStateMachine<Clock: LogicalClock> {
     pager: Rc<Pager>,
     tx_id: TxID,
     connection: Arc<Connection>,
+    /// Write set sorted by table id and row id
     write_set: Vec<RowID>,
     write_row_state_machine: Option<StateMachine<WriteRowStateMachine>>,
     delete_row_state_machine: Option<StateMachine<DeleteRowStateMachine>>,
@@ -313,6 +334,7 @@ pub struct WriteRowStateMachine {
     row: Row,
     record: Option<ImmutableRecord>,
     cursor: Arc<RwLock<BTreeCursor>>,
+    requires_seek: bool,
 }
 
 #[derive(Debug)]
@@ -358,7 +380,12 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
 }
 
 impl WriteRowStateMachine {
-    fn new(pager: Rc<Pager>, row: Row, cursor: Arc<RwLock<BTreeCursor>>) -> Self {
+    fn new(
+        pager: Rc<Pager>,
+        row: Row,
+        cursor: Arc<RwLock<BTreeCursor>>,
+        requires_seek: bool,
+    ) -> Self {
         Self {
             state: WriteRowState::Initial,
             is_finalized: false,
@@ -366,6 +393,7 @@ impl WriteRowStateMachine {
             row,
             record: None,
             cursor,
+            requires_seek,
         }
     }
 }
@@ -474,6 +502,8 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 tracing::trace!("commit_tx(tx_id={})", self.tx_id);
                 self.write_set
                     .extend(tx.write_set.iter().map(|v| *v.value()));
+                self.write_set
+                    .sort_by(|a, b| a.table_id.cmp(&b.table_id).then(a.row_id.cmp(&b.row_id)));
                 self.state = CommitState::BeginPagerTxn { end_ts };
                 Ok(TransitionResult::Continue)
             }
@@ -531,12 +561,14 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 self.state = CommitState::WriteRow {
                     end_ts,
                     write_set_index: 0,
+                    requires_seek: true,
                 };
                 return Ok(TransitionResult::Continue);
             }
             CommitState::WriteRow {
                 end_ts,
                 write_set_index,
+                requires_seek,
             } => {
                 if write_set_index == self.write_set.len() {
                     self.state = CommitState::CommitPagerTxn { end_ts };
@@ -566,6 +598,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                                     self.pager.clone(),
                                     &row_version.row,
                                     cursor,
+                                    requires_seek,
                                 )?;
                                 self.write_row_state_machine = Some(state_machine);
 
@@ -622,9 +655,26 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                         return Ok(TransitionResult::Continue);
                     }
                     TransitionResult::Done(_) => {
+                        let requires_seek = {
+                            if let Some(next_id) = self.write_set.get(write_set_index + 1) {
+                                let current_id = &self.write_set[write_set_index];
+                                if current_id.table_id == next_id.table_id
+                                    && current_id.row_id + 1 == next_id.row_id
+                                {
+                                    // simple optimizaiton for sequential inserts with inceasing by 1 ids
+                                    // we should probably just check record in next row and see if it requires seek
+                                    false
+                                } else {
+                                    true
+                                }
+                            } else {
+                                false
+                            }
+                        };
                         self.state = CommitState::WriteRow {
                             end_ts,
                             write_set_index: write_set_index + 1,
+                            requires_seek,
                         };
                         return Ok(TransitionResult::Continue);
                     }
@@ -644,6 +694,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                         self.state = CommitState::WriteRow {
                             end_ts,
                             write_set_index: write_set_index + 1,
+                            requires_seek: true,
                         };
                         return Ok(TransitionResult::Continue);
                     }
@@ -798,7 +849,11 @@ impl StateTransition for WriteRowStateMachine {
                 record.start_serialization(&self.row.data);
                 self.record = Some(record);
 
-                self.state = WriteRowState::Seek;
+                if self.requires_seek {
+                    self.state = WriteRowState::Seek;
+                } else {
+                    self.state = WriteRowState::Insert;
+                }
                 Ok(TransitionResult::Continue)
             }
             WriteRowState::Seek => {
@@ -834,10 +889,21 @@ impl StateTransition for WriteRowStateMachine {
                         return Ok(TransitionResult::Io(io));
                     }
                 }
-                // println!(
-                //     "write_row_to_pager(table_id={}, row_id={})",
-                //     self.row.id.table_id, self.row.id.row_id
-                // );
+                self.state = WriteRowState::Next;
+                Ok(TransitionResult::Continue)
+            }
+            WriteRowState::Next => {
+                match self
+                    .cursor
+                    .write()
+                    .next()
+                    .map_err(|e: LimboError| LimboError::InternalError(e.to_string()))?
+                {
+                    IOResult::Done(_) => {}
+                    IOResult::IO(io) => {
+                        return Ok(TransitionResult::Io(io));
+                    }
+                }
                 self.finalize(&())?;
                 Ok(TransitionResult::Done(()))
             }
@@ -1523,12 +1589,14 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         pager: Rc<Pager>,
         row: &Row,
         cursor: Arc<RwLock<BTreeCursor>>,
+        requires_seek: bool,
     ) -> Result<StateMachine<WriteRowStateMachine>> {
         let state_machine: StateMachine<WriteRowStateMachine> =
             StateMachine::<WriteRowStateMachine>::new(WriteRowStateMachine::new(
                 pager,
                 row.clone(),
                 cursor,
+                requires_seek,
             ));
 
         Ok(state_machine)
