@@ -386,6 +386,8 @@ pub fn parse_schema_rows(
                 primary_key_columns: vec![],
                 has_rowid: true,
                 is_strict: false,
+                has_autoincrement:false,
+
                 unique_sets: None,
             })));
 

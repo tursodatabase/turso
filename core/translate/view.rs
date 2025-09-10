@@ -75,6 +75,8 @@ pub fn translate_create_materialized_view(
         primary_key_columns: vec![], // Materialized views use implicit rowid
         has_rowid: true,
         is_strict: false,
+        has_autoincrement:false,
+
         unique_sets: None,
     });
 
