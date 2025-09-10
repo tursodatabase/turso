@@ -1322,12 +1322,11 @@ fn emit_autoincrement_logic(
         extra_amount: 0,
     });
 
-      let affinity_str = seq_table
-    .columns
-    .iter()
-    .map(|col| col.affinity().aff_mask())
-    .collect::<String>();
-
+    let affinity_str = seq_table
+        .columns
+        .iter()
+        .map(|col| col.affinity().aff_mask())
+        .collect::<String>();
 
     program.emit_insn(Insn::MakeRecord {
         start_reg: record_start_reg,
