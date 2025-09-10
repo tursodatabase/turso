@@ -97,14 +97,46 @@ def wrap_text(text, width=72):
     return "\n".join(wrapped_lines)
 
 
+def check_pr_status(pr_number):
+    """Check the status of all checks for a PR
+
+    Returns a tuple of (has_failing, has_pending) indicating if there are
+    any failing or pending checks respectively.
+    """
+    output, error, returncode = run_command(f"gh pr checks {pr_number} --json state,name,startedAt,completedAt")
+    if returncode != 0:
+        print(f"Warning: Unable to get PR check status: {error}")
+        return False, False
+
+    checks_data = json.loads(output)
+    if not checks_data:
+        return False, False
+
+    has_failing = any(check.get("state") == "FAILURE" for check in checks_data)
+    has_pending = any(
+        check.get("startedAt") and not check.get("completedAt") or check.get("state") == "IN_PROGRESS"
+        for check in checks_data
+    )
+    return has_failing, has_pending
+
+
 def merge_remote(pr_number: int, commit_message: str, commit_title: str):
-    output, error, returncode = run_command(f"gh pr checks {pr_number} --json state")
-    if returncode == 0:
-        checks_data = json.loads(output)
-        if checks_data and any(check.get("state") == "FAILURE" for check in checks_data):
-            print("Warning: Some checks are failing")
-            if input("Do you want to proceed with the merge? (y/N): ").strip().lower() != "y":
-                exit(0)
+    has_failing, has_pending = check_pr_status(pr_number)
+
+    prompt_needed = False
+    warning_msg = ""
+
+    if has_failing:
+        prompt_needed = True
+        warning_msg = "Warning: Some checks are failing"
+    elif has_pending:
+        prompt_needed = True
+        warning_msg = "Warning: Some checks are still running"
+
+    if prompt_needed:
+        print(warning_msg)
+        if input("Do you want to proceed with the merge? (y/N): ").strip().lower() != "y":
+            exit(0)
 
     # Create a temporary file for the commit message
     with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as temp_file:
@@ -131,6 +163,23 @@ def merge_remote(pr_number: int, commit_message: str, commit_title: str):
 
 
 def merge_local(pr_number: int, commit_message: str):
+    has_failing, has_pending = check_pr_status(pr_number)
+
+    prompt_needed = False
+    warning_msg = ""
+
+    if has_failing:
+        prompt_needed = True
+        warning_msg = "Warning: Some checks are failing"
+    elif has_pending:
+        prompt_needed = True
+        warning_msg = "Warning: Some checks are still running"
+
+    if prompt_needed:
+        print(warning_msg)
+        if input("Do you want to proceed with the merge? (y/N): ").strip().lower() != "y":
+            exit(0)
+
     current_branch, _, _ = run_command("git branch --show-current")
 
     print(f"Fetching PR #{pr_number}...")

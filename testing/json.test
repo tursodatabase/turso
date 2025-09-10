@@ -1223,3 +1223,122 @@ do_execsql_test json_remove_with_arrow {
 #   WITH RECURSIVE c(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM c WHERE x<0x1f)
 #   SELECT sum(json_valid(json_quote('a'||char(x)||'z'))) FROM c ORDER BY x;
 # } {31}
+
+do_execsql_test json_each_arrays_heterogeneous_primitives {
+  SELECT key, atom, type, fullkey, path, typeof(key) AS ktype
+  FROM json_each('[1, 2.5, "x", true, false, null]')
+  ORDER BY key;
+} {
+0|1|integer|$[0]|$|integer
+1|2.5|real|$[1]|$|integer
+2|x|text|$[2]|$|integer
+3|1|true|$[3]|$|integer
+4|0|false|$[4]|$|integer
+5||null|$[5]|$|integer
+}
+
+do_execsql_test json_each_arrays_parent_is_always_null {
+  SELECT COUNT(*) FROM json_each('[0,1,2]') WHERE parent IS NOT NULL;
+} {0}
+
+do_execsql_test json_each_arrays_id_uniqueness {
+  SELECT COUNT(*), COUNT(DISTINCT id)
+  FROM json_each('[10,20,30,40]');
+} {4|4}
+
+do_execsql_test json_each_arrays_empty_container_yields_zero_rows {
+  SELECT COUNT(*) FROM json_each('[]');
+} {0}
+
+do_execsql_test json_each_objects_simple_integer_values {
+  SELECT key, atom, type, fullkey, path, typeof(key) AS ktype
+  FROM json_each('{"a":1,"b":2}')
+  ORDER BY key;
+} {
+  {a|1|integer|$.a|$|text}
+  {b|2|integer|$.b|$|text}
+}
+
+do_execsql_test json_each_objects_nested_containers_value_is_valid_json {
+  SELECT key, type, json_valid(value) AS is_json, fullkey, path
+  FROM json_each('{"o":{"x":5},"a":[7,8]}')
+  ORDER BY key;
+} {
+  {a|array|1|$.a|$}
+  {o|object|1|$.o|$}
+}
+
+do_execsql_test json_each_objects_empty_container_yields_zero_rows {
+  SELECT COUNT(*) FROM json_each('{}');
+} {0}
+
+do_execsql_test json_each_objects_keys_require_quoting_in_json_path {
+  SELECT key, fullkey
+  FROM json_each('{"a space":1,"a.b":2,"\"q\"":3}')
+  ORDER BY key DESC;
+} {
+{a.b|$."a.b"}
+{a space|$."a space"}
+{"q"|$."\"q\""}
+}
+
+do_execsql_test json_each_top_level_integer_single_row_key_null {
+  SELECT (key IS NULL), fullkey, path, atom, type
+  FROM json_each('42');
+} {1|$|$|42|integer}
+
+do_execsql_test json_each_top_level_true_single_row_key_null {
+  SELECT (key IS NULL), fullkey, path, atom, type
+  FROM json_each('true');
+} {1|$|$|1|true}
+
+do_execsql_test json_each_top_level_null_single_row_key_null {
+  SELECT (key IS NULL), fullkey, path, (atom IS NULL), type
+  FROM json_each('null');
+} {1|$|$|1|null}
+
+do_execsql_test json_each_atom_equals_value_for_primitives_containers_are_json_text {
+  WITH t AS (
+    SELECT * FROM json_each('[1,"x",{"y":2},[3]]')
+  )
+  SELECT 
+    SUM(type IN ('object','array') AND json_valid(value)=1),
+    SUM(type NOT IN ('object','array') AND value=atom)
+  FROM t;
+} {2|2}
+
+do_execsql_test json_each_typeof_key_array_indices_integer {
+  SELECT GROUP_CONCAT(ktype,'|') FROM (
+    SELECT typeof(key) AS ktype FROM json_each('[0,1]') ORDER BY key
+  );
+} {integer|integer}
+
+do_execsql_test json_each_typeof_key_object_keys_text {
+  SELECT GROUP_CONCAT(ktype,'|') FROM (
+    SELECT typeof(key) AS ktype FROM json_each('{"0":0,"1":1}') ORDER BY key
+  );
+} {text|text}
+
+do_execsql_test json_each_parent_column_always_null {
+  SELECT COUNT(*) FROM json_each('{"a":[1,2,3],"b":{}}') WHERE parent IS NOT NULL;
+} {0}
+
+do_execsql_test_error json_each_malformed_json_raises_error {
+  SELECT * FROM json_each('{not json}');
+} {(.*malformed JSON.*)}
+
+do_execsql_test json_each_object_member_order_preserved {
+  SELECT key FROM json_each('{"z":0,"a":1,"m":2}');
+} {z a m}
+
+do_execsql_test json_each_json_extract_on_value {
+  SELECT key, json_extract(value, '$.x')
+  FROM json_each('{"k1":{"x":11},"k2":{"x":22},"k3":{"x":[3]}}')
+  WHERE type!='array'
+  ORDER BY key;
+} {
+  {k1|11}
+  {k2|22}
+  {k3|[3]}
+}
+

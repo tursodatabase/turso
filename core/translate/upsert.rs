@@ -379,6 +379,7 @@ pub fn emit_upsert(
                 count: k + 1,
                 dest_reg: rec,
                 index_name: Some((*idx_name).clone()),
+                affinity_str: None,
             });
             program.emit_insn(Insn::IdxInsert {
                 cursor_id: *idx_cid,
@@ -392,11 +393,19 @@ pub fn emit_upsert(
 
     // Write table row (same rowid, new payload)
     let rec = program.alloc_register();
+
+    let affinity_str = table
+        .columns()
+        .iter()
+        .map(|col| col.affinity().aff_mask())
+        .collect::<String>();
+
     program.emit_insn(Insn::MakeRecord {
         start_reg: new_start,
         count: num_cols,
         dest_reg: rec,
         index_name: None,
+        affinity_str: Some(affinity_str),
     });
     program.emit_insn(Insn::Insert {
         cursor: tbl_cursor_id,

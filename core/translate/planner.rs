@@ -3,9 +3,9 @@ use std::sync::Arc;
 use super::{
     expr::walk_expr,
     plan::{
-        Aggregate, ColumnUsedMask, Distinctness, EvalAt, JoinInfo, JoinOrderMember, JoinedTable,
-        Operation, OuterQueryReference, Plan, QueryDestination, ResultSetColumn, Scan,
-        TableReferences, WhereTerm,
+        Aggregate, ColumnUsedMask, Distinctness, EvalAt, IterationDirection, JoinInfo,
+        JoinOrderMember, JoinedTable, Operation, OuterQueryReference, Plan, QueryDestination,
+        ResultSetColumn, Scan, TableReferences, WhereTerm,
     },
     select::prepare_select_plan,
     SymbolTable,
@@ -13,6 +13,7 @@ use super::{
 use crate::function::{AggFunc, ExtFunc};
 use crate::translate::expr::WalkControl;
 use crate::{
+    ast::Limit,
     function::Func,
     schema::{Schema, Table},
     translate::expr::walk_expr_mut,
@@ -23,8 +24,8 @@ use crate::{
 use turso_macros::match_ignore_ascii_case;
 use turso_parser::ast::Literal::Null;
 use turso_parser::ast::{
-    self, As, Expr, FromClause, JoinType, Limit, Literal, Materialized, QualifiedName,
-    TableInternalId, UnaryOperator, With,
+    self, As, Expr, FromClause, JoinType, Literal, Materialized, QualifiedName, TableInternalId,
+    With,
 };
 
 pub const ROWID: &str = "rowid";
@@ -528,12 +529,29 @@ fn parse_table(
         schema.get_materialized_view(table_name.as_str())
     });
     if let Some(view) = view {
-        // Create a virtual table wrapper for the view
-        // We'll use the view's columns from the schema
-        let vtab = crate::vtab_view::create_view_virtual_table(
-            normalize_ident(table_name.as_str()).as_str(),
-            view.clone(),
-        )?;
+        // Check if this materialized view has persistent storage
+        let view_guard = view.lock().unwrap();
+        let root_page = view_guard.get_root_page();
+
+        if root_page == 0 {
+            drop(view_guard);
+            return Err(crate::LimboError::InternalError(
+                "Materialized view has no storage allocated".to_string(),
+            ));
+        }
+
+        // This is a materialized view with storage - treat it as a regular BTree table
+        // Create a BTreeTable from the view's metadata
+        let btree_table = Arc::new(crate::schema::BTreeTable {
+            name: view_guard.name().to_string(),
+            root_page,
+            columns: view_guard.columns.clone(),
+            primary_key_columns: Vec::new(),
+            has_rowid: true,
+            is_strict: false,
+            unique_sets: None,
+        });
+        drop(view_guard);
 
         let alias = maybe_alias
             .map(|a| match a {
@@ -543,12 +561,11 @@ fn parse_table(
             .map(|a| normalize_ident(a.as_str()));
 
         table_references.add_joined_table(JoinedTable {
-            op: Operation::Scan(Scan::VirtualTable {
-                idx_num: -1,
-                idx_str: None,
-                constraints: Vec::new(),
+            op: Operation::Scan(Scan::BTreeTable {
+                iter_dir: IterationDirection::Forwards,
+                index: None,
             }),
-            table: Table::Virtual(vtab),
+            table: Table::BTree(btree_table),
             identifier: alias.unwrap_or(normalized_qualified_name),
             internal_id: table_ref_counter.next(),
             join_info: None,
@@ -1145,44 +1162,6 @@ fn parse_join(
     Ok(())
 }
 
-pub fn parse_limit(limit: &Limit) -> Result<(Option<isize>, Option<isize>)> {
-    let offset_val = match &limit.offset {
-        Some(offset_expr) => match offset_expr.as_ref() {
-            Expr::Literal(ast::Literal::Numeric(n)) => n.parse().ok(),
-            // If OFFSET is negative, the result is as if OFFSET is zero
-            Expr::Unary(UnaryOperator::Negative, expr) => {
-                if let Expr::Literal(ast::Literal::Numeric(ref n)) = &**expr {
-                    n.parse::<isize>().ok().map(|num| -num)
-                } else {
-                    crate::bail_parse_error!("Invalid OFFSET clause");
-                }
-            }
-            _ => crate::bail_parse_error!("Invalid OFFSET clause"),
-        },
-        None => Some(0),
-    };
-
-    if let Expr::Literal(ast::Literal::Numeric(n)) = limit.expr.as_ref() {
-        Ok((n.parse().ok(), offset_val))
-    } else if let Expr::Unary(UnaryOperator::Negative, expr) = limit.expr.as_ref() {
-        if let Expr::Literal(ast::Literal::Numeric(n)) = expr.as_ref() {
-            let limit_val = n.parse::<isize>().ok().map(|num| -num);
-            Ok((limit_val, offset_val))
-        } else {
-            crate::bail_parse_error!("Invalid LIMIT clause");
-        }
-    } else if let Expr::Id(id) = limit.expr.as_ref() {
-        let id_bytes = id.as_str().as_bytes();
-        match_ignore_ascii_case!(match id_bytes {
-            b"true" => Ok((Some(1), offset_val)),
-            b"false" => Ok((Some(0), offset_val)),
-            _ => crate::bail_parse_error!("Invalid LIMIT clause"),
-        })
-    } else {
-        crate::bail_parse_error!("Invalid LIMIT clause");
-    }
-}
-
 pub fn break_predicate_at_and_boundaries(predicate: &Expr, out_predicates: &mut Vec<Expr>) {
     match predicate {
         Expr::Binary(left, ast::Operator::And, right) => {
@@ -1214,4 +1193,17 @@ where
         }));
     }
     Ok(None)
+}
+
+#[allow(clippy::type_complexity)]
+pub fn parse_limit(
+    limit: &mut Limit,
+    connection: &std::sync::Arc<crate::Connection>,
+) -> Result<(Option<Box<Expr>>, Option<Box<Expr>>)> {
+    let mut empty_refs = TableReferences::new(Vec::new(), Vec::new());
+    bind_column_references(&mut limit.expr, &mut empty_refs, None, connection)?;
+    if let Some(ref mut off_expr) = limit.offset {
+        bind_column_references(off_expr, &mut empty_refs, None, connection)?;
+    }
+    Ok((Some(limit.expr.clone()), limit.offset.clone()))
 }

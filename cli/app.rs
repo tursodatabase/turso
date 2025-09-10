@@ -500,33 +500,7 @@ impl Limbo {
                 return Ok(());
             }
         }
-        if line.trim_start().starts_with("--") {
-            if let Some(remaining) = line.split_once('\n') {
-                let after_comment = remaining.1.trim();
-                if !after_comment.is_empty() {
-                    if after_comment.ends_with(';') {
-                        self.run_query(after_comment);
-                        if self.opts.echo {
-                            let _ = self.writeln(after_comment);
-                        }
-                        let conn = self.conn.clone();
-                        let runner = conn.query_runner(after_comment.as_bytes());
-                        for output in runner {
-                            if let Err(e) = self.print_query_result(after_comment, output, None) {
-                                let _ = self.writeln(e.to_string());
-                            }
-                        }
-                        self.reset_input();
-                        return self.handle_input_line(after_comment);
-                    } else {
-                        self.set_multiline_prompt();
-                        let _ = self.reset_line(line);
-                        return Ok(());
-                    }
-                }
-            }
-            return Ok(());
-        }
+
         self.reset_line(line)?;
         if line.ends_with(';') {
             self.buffer_input(line);
@@ -1400,7 +1374,7 @@ impl Limbo {
         // FIXME: we don't yet support PRAGMA foreign_keys=OFF internally,
         // so for now this hacky boolean that decides not to emit it when cloning
         if fk {
-            writeln!(out, "PRAGMA foreign_keys=OFF")?;
+            writeln!(out, "PRAGMA foreign_keys=OFF;")?;
         }
         writeln!(out, "BEGIN TRANSACTION;")?;
         // FIXME: At this point, SQLite executes the following:

@@ -29,7 +29,7 @@ tbl_schema = json.loads(schema_json)
 tbl_name = f"tbl_{selected_tbl}"
 
 try:
-    con = turso.connect("stress_composer.db", experimental_indexes=True)
+    con = turso.connect("stress_composer.db")
 except Exception as e:
     print(f"Failed to open stress_composer.db. Exiting... {e}")
     exit(0)

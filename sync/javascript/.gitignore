@@ -134,3 +134,5 @@ Cargo.lock
 *-draft
 *-synced
 *-info
+
+package.native.json

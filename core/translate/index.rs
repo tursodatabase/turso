@@ -174,6 +174,7 @@ pub fn translate_create_index(
         count: columns.len() + 1,
         dest_reg: record_reg,
         index_name: Some(idx_name.clone()),
+        affinity_str: None,
     });
     program.emit_insn(Insn::SorterInsert {
         cursor_id: sorter_cursor_id,

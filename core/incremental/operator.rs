@@ -2,15 +2,321 @@
 // Operator DAG for DBSP-style incremental computation
 // Based on Feldera DBSP design but adapted for Turso's architecture
 
+use crate::function::{AggFunc, Func};
+use crate::incremental::dbsp::Delta;
 use crate::incremental::expr_compiler::CompiledExpression;
 use crate::incremental::hashable_row::HashableRow;
-use crate::types::Text;
-use crate::{Connection, Database, SymbolTable, Value};
-use std::collections::{HashMap, HashSet};
+use crate::storage::btree::{BTreeCursor, BTreeKey};
+use crate::types::{IOResult, SeekKey, SeekOp, SeekResult, Text};
+use crate::{
+    return_and_restore_if_io, return_if_io, Connection, Database, Result, SymbolTable, Value,
+};
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::{self, Debug, Display};
-use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use turso_macros::match_ignore_ascii_case;
+use turso_parser::ast::{As, Expr, Literal, Name, OneSelect, Operator, ResultColumn};
+
+#[derive(Debug)]
+pub enum ReadRecord {
+    GetRecord,
+    Done { state: Option<AggregateState> },
+}
+
+impl ReadRecord {
+    fn new() -> Self {
+        ReadRecord::GetRecord
+    }
+
+    fn read_record(
+        &mut self,
+        key: SeekKey,
+        aggregates: &[AggregateFunction],
+        cursor: &mut BTreeCursor,
+    ) -> Result<IOResult<Option<AggregateState>>> {
+        loop {
+            match self {
+                ReadRecord::GetRecord => {
+                    let res = return_if_io!(cursor.seek(key.clone(), SeekOp::GE { eq_only: true }));
+                    if !matches!(res, SeekResult::Found) {
+                        *self = ReadRecord::Done { state: None };
+                    } else {
+                        let record = return_if_io!(cursor.record());
+                        let r = record.ok_or_else(|| {
+                            crate::LimboError::InternalError(format!(
+                                "Found key {key:?} in aggregate storage but could not read record"
+                            ))
+                        })?;
+                        let values = r.get_values();
+                        let blob = values[1].to_owned();
+
+                        let (state, _group_key) = match blob {
+                            Value::Blob(blob) => AggregateState::from_blob(&blob, aggregates)
+                                .ok_or_else(|| {
+                                    crate::LimboError::InternalError(format!(
+                                        "Cannot deserialize aggregate state {blob:?}",
+                                    ))
+                                }),
+                            _ => Err(crate::LimboError::ParseError(
+                                "Value in aggregator not blob".to_string(),
+                            )),
+                        }?;
+                        *self = ReadRecord::Done { state: Some(state) }
+                    }
+                }
+                ReadRecord::Done { state } => return Ok(IOResult::Done(state.clone())),
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum WriteRecord {
+    GetRecord,
+    Delete { final_weight: isize },
+    Insert { final_weight: isize },
+    Done,
+}
+impl WriteRecord {
+    fn new() -> Self {
+        WriteRecord::GetRecord
+    }
+
+    fn write_record(
+        &mut self,
+        key: SeekKey,
+        record: HashableRow,
+        weight: isize,
+        cursor: &mut BTreeCursor,
+    ) -> Result<IOResult<()>> {
+        loop {
+            match self {
+                WriteRecord::GetRecord => {
+                    let res = return_if_io!(cursor.seek(key.clone(), SeekOp::GE { eq_only: true }));
+                    if !matches!(res, SeekResult::Found) {
+                        *self = WriteRecord::Insert {
+                            final_weight: weight,
+                        };
+                    } else {
+                        let existing_record = return_if_io!(cursor.record());
+                        let r = existing_record.ok_or_else(|| {
+                            crate::LimboError::InternalError(format!(
+                                "Found key {key:?} in aggregate storage but could not read record"
+                            ))
+                        })?;
+                        let values = r.get_values();
+                        // values[2] should contain the weight
+                        let existing_weight = match values[2].to_owned() {
+                            Value::Integer(w) => w as isize,
+                            _ => {
+                                return Err(crate::LimboError::InternalError(format!(
+                                    "Invalid weight value in aggregate storage for key {key:?}"
+                                )))
+                            }
+                        };
+                        let final_weight = existing_weight + weight;
+                        if final_weight <= 0 {
+                            *self = WriteRecord::Delete { final_weight }
+                        } else {
+                            *self = WriteRecord::Insert { final_weight }
+                        }
+                    }
+                }
+                WriteRecord::Delete { final_weight: _ } => {
+                    let res = return_if_io!(cursor.seek(key.clone(), SeekOp::GE { eq_only: true }));
+                    if !matches!(res, SeekResult::Found) {
+                        return Err(crate::LimboError::InternalError(format!(
+                            "record not found for {key:?}, but we had just GetRecord! Should not be possible"
+                        )));
+                    }
+                    // Done - row was deleted and weights cancel out.
+                    // If we iniated the delete we will complete, so Done has to be set
+                    // before so we don't come back here.
+                    *self = WriteRecord::Done;
+                    return_if_io!(cursor.delete());
+                }
+                WriteRecord::Insert { final_weight } => {
+                    return_if_io!(cursor.seek(key.clone(), SeekOp::GE { eq_only: true }));
+                    // Build the key and insert the record
+                    let key_i64 = match key {
+                        SeekKey::TableRowId(id) => id,
+                        _ => {
+                            return Err(crate::LimboError::InternalError(
+                                "Expected TableRowId for aggregate storage".to_string(),
+                            ))
+                        }
+                    };
+                    // Create the record values: key, blob, weight
+                    let record_values = vec![
+                        Value::Integer(key_i64),
+                        record.values[0].clone(), // The blob with serialized state
+                        Value::Integer(*final_weight as i64),
+                    ];
+
+                    // Create an ImmutableRecord from the values
+                    let immutable_record = crate::types::ImmutableRecord::from_values(
+                        &record_values,
+                        record_values.len(),
+                    );
+                    let btree_key = BTreeKey::new_table_rowid(key_i64, Some(&immutable_record));
+
+                    *self = WriteRecord::Done;
+                    return_if_io!(cursor.insert(&btree_key));
+                }
+                WriteRecord::Done => {
+                    return Ok(IOResult::Done(()));
+                }
+            }
+        }
+    }
+}
+
+type ComputedStates = HashMap<String, (Vec<Value>, AggregateState)>; // group_key_str -> (group_key, state)
+#[derive(Debug)]
+enum AggregateCommitState {
+    Idle,
+    Eval {
+        eval_state: EvalState,
+    },
+    PersistDelta {
+        delta: Delta,
+        computed_states: ComputedStates,
+        current_idx: usize,
+        write_record: WriteRecord,
+    },
+    Done {
+        delta: Delta,
+    },
+    Invalid,
+}
+
+// eval() has uncommitted data, so it can't be a member attribute of the Operator.
+// The state has to be kept by the caller
+#[derive(Debug)]
+pub enum EvalState {
+    Uninitialized,
+    Init {
+        delta: Delta,
+    },
+    FetchData {
+        delta: Delta, // Keep original delta for merge operation
+        current_idx: usize,
+        groups_to_read: Vec<(String, Vec<Value>)>, // Changed to Vec for index-based access
+        existing_groups: HashMap<String, AggregateState>,
+        old_values: HashMap<String, Vec<Value>>,
+        read_record_state: Box<ReadRecord>,
+    },
+    Done,
+}
+
+impl From<Delta> for EvalState {
+    fn from(delta: Delta) -> Self {
+        EvalState::Init { delta }
+    }
+}
+
+impl EvalState {
+    fn from_delta(delta: Delta) -> Self {
+        Self::Init { delta }
+    }
+
+    fn delta_ref(&self) -> &Delta {
+        match self {
+            EvalState::Init { delta } => delta,
+            _ => panic!("delta_ref() can only be called when in Init state",),
+        }
+    }
+    pub fn extract_delta(&mut self) -> Delta {
+        match self {
+            EvalState::Init { delta } => {
+                let extracted = std::mem::take(delta);
+                *self = EvalState::Uninitialized;
+                extracted
+            }
+            _ => panic!("extract_delta() can only be called when in Init state"),
+        }
+    }
+
+    fn advance(&mut self, groups_to_read: BTreeMap<String, Vec<Value>>) {
+        let delta = match self {
+            EvalState::Init { delta } => std::mem::take(delta),
+            _ => panic!("advance() can only be called when in Init state, current state: {self:?}"),
+        };
+
+        let _ = std::mem::replace(
+            self,
+            EvalState::FetchData {
+                delta,
+                current_idx: 0,
+                groups_to_read: groups_to_read.into_iter().collect(), // Convert BTreeMap to Vec
+                existing_groups: HashMap::new(),
+                old_values: HashMap::new(),
+                read_record_state: Box::new(ReadRecord::new()),
+            },
+        );
+    }
+    fn process_delta(
+        &mut self,
+        operator: &mut AggregateOperator,
+        cursor: &mut BTreeCursor,
+    ) -> Result<IOResult<(Delta, ComputedStates)>> {
+        loop {
+            match self {
+                EvalState::Uninitialized => {
+                    panic!("Cannot process_delta with Uninitialized state");
+                }
+                EvalState::Init { .. } => {
+                    panic!("State machine not supposed to reach the init state! advance() should have been called");
+                }
+                EvalState::FetchData {
+                    delta,
+                    current_idx,
+                    groups_to_read,
+                    existing_groups,
+                    old_values,
+                    read_record_state,
+                } => {
+                    if *current_idx >= groups_to_read.len() {
+                        // All groups processed, compute final output
+                        let result =
+                            operator.merge_delta_with_existing(delta, existing_groups, old_values);
+                        *self = EvalState::Done;
+                        return Ok(IOResult::Done(result));
+                    } else {
+                        // Get the current group to read
+                        let (group_key_str, group_key) = &groups_to_read[*current_idx];
+
+                        let seek_key = operator.generate_storage_key(group_key_str);
+                        let key = SeekKey::TableRowId(seek_key);
+
+                        let state = return_if_io!(read_record_state.read_record(
+                            key,
+                            &operator.aggregates,
+                            cursor
+                        ));
+
+                        // Anything that mutates state has to happen after return_if_io!
+                        // Unfortunately there's no good way to enforce that without turning
+                        // this into a hot mess of mem::takes.
+                        if let Some(state) = state {
+                            let mut old_row = group_key.clone();
+                            old_row.extend(state.to_values(&operator.aggregates));
+                            old_values.insert(group_key_str.clone(), old_row);
+                            existing_groups.insert(group_key_str.clone(), state.clone());
+                        }
+
+                        // All attributes mutated in place.
+                        *current_idx += 1;
+                        *read_record_state = Box::new(ReadRecord::new());
+                    }
+                }
+                EvalState::Done => {
+                    return Ok(IOResult::Done((Delta::new(), HashMap::new())));
+                }
+            }
+        }
+    }
+}
 
 /// Tracks computation counts to verify incremental behavior (for tests now), and in the future
 /// should be used to provide statistics.
@@ -53,69 +359,6 @@ impl ComputationTracker {
             + self.project_operations
             + self.join_lookups
             + self.aggregation_updates
-    }
-}
-
-/// A delta represents ordered changes to data
-#[derive(Debug, Clone, Default)]
-pub struct Delta {
-    /// Ordered list of changes: (row, weight) where weight is +1 for insert, -1 for delete
-    /// It is crucial that this is ordered. Imagine the case of an update, which becomes a delete +
-    /// insert. If this is not ordered, it would be applied in arbitrary order and break the view.
-    pub changes: Vec<(HashableRow, isize)>,
-}
-
-impl Delta {
-    pub fn new() -> Self {
-        Self {
-            changes: Vec::new(),
-        }
-    }
-
-    pub fn insert(&mut self, row_key: i64, values: Vec<Value>) {
-        let row = HashableRow::new(row_key, values);
-        self.changes.push((row, 1));
-    }
-
-    pub fn delete(&mut self, row_key: i64, values: Vec<Value>) {
-        let row = HashableRow::new(row_key, values);
-        self.changes.push((row, -1));
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.changes.is_empty()
-    }
-
-    pub fn len(&self) -> usize {
-        self.changes.len()
-    }
-
-    /// Merge another delta into this one
-    /// This preserves the order of operations - no consolidation is done
-    /// to maintain the full history of changes
-    pub fn merge(&mut self, other: &Delta) {
-        // Simply append all changes from other, preserving order
-        self.changes.extend(other.changes.iter().cloned());
-    }
-
-    /// Consolidate changes by combining entries with the same HashableRow
-    pub fn consolidate(&mut self) {
-        if self.changes.is_empty() {
-            return;
-        }
-
-        // Use a HashMap to accumulate weights
-        let mut consolidated: HashMap<HashableRow, isize> = HashMap::new();
-
-        for (row, weight) in self.changes.drain(..) {
-            *consolidated.entry(row).or_insert(0) += weight;
-        }
-
-        // Convert back to vec, filtering out zero weights
-        self.changes = consolidated
-            .into_iter()
-            .filter(|(_, weight)| *weight != 0)
-            .collect();
     }
 }
 
@@ -240,8 +483,6 @@ impl FilterPredicate {
     /// Parse a SQL AST expression into a FilterPredicate
     /// This centralizes all SQL-to-predicate parsing logic
     pub fn from_sql_expr(expr: &turso_parser::ast::Expr) -> crate::Result<Self> {
-        use turso_parser::ast::*;
-
         let Expr::Binary(lhs, op, rhs) = expr else {
             return Err(crate::LimboError::ParseError(
                 "Unsupported WHERE clause for incremental views: not a binary expression"
@@ -323,8 +564,6 @@ impl FilterPredicate {
 
     /// Parse a WHERE clause from a SELECT statement
     pub fn from_select(select: &turso_parser::ast::Select) -> crate::Result<Self> {
-        use turso_parser::ast::*;
-
         if let OneSelect::Select {
             ref where_clause, ..
         } = select.body.select
@@ -391,8 +630,6 @@ impl AggregateFunction {
         func: &crate::function::Func,
         input_column: Option<String>,
     ) -> Option<Self> {
-        use crate::function::{AggFunc, Func};
-
         match func {
             Func::Agg(agg_func) => {
                 match agg_func {
@@ -412,34 +649,77 @@ impl AggregateFunction {
 /// Operator DAG (Directed Acyclic Graph)
 /// Base trait for incremental operators
 pub trait IncrementalOperator: Debug {
-    /// Initialize with base data
-    fn initialize(&mut self, data: Delta);
-
-    /// Evaluate the operator with a delta, without modifying internal state
-    /// This is used during query execution to compute results including uncommitted changes
+    /// Evaluate the operator with a state, without modifying internal state
+    /// This is used during query execution to compute results
+    /// May need to read from storage to get current state (e.g., for aggregates)
     ///
     /// # Arguments
-    /// * `delta` - The committed delta to process
-    /// * `uncommitted` - Optional uncommitted changes from the current transaction
-    fn eval(&self, delta: Delta, uncommitted: Option<Delta>) -> Delta;
+    /// * `state` - The evaluation state (may be in progress from a previous I/O operation)
+    /// * `cursor` - Cursor for reading operator state from storage
+    ///
+    /// # Returns
+    /// The output delta from the evaluation
+    fn eval(&mut self, state: &mut EvalState, cursor: &mut BTreeCursor) -> Result<IOResult<Delta>>;
 
     /// Commit a delta to the operator's internal state and return the output
     /// This is called when a transaction commits, making changes permanent
     /// Returns the output delta (what downstream operators should see)
-    fn commit(&mut self, delta: Delta) -> Delta;
-
-    /// Get current accumulated state
-    fn get_current_state(&self) -> Delta;
+    /// The cursor parameter is for operators that need to persist state
+    fn commit(&mut self, delta: Delta, cursor: &mut BTreeCursor) -> Result<IOResult<Delta>>;
 
     /// Set computation tracker
     fn set_tracker(&mut self, tracker: Arc<Mutex<ComputationTracker>>);
+}
+
+/// Input operator - passes through input data unchanged
+/// This operator is used for input nodes in the circuit to provide a uniform interface
+#[derive(Debug)]
+pub struct InputOperator {
+    name: String,
+}
+
+impl InputOperator {
+    pub fn new(name: String) -> Self {
+        Self { name }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+impl IncrementalOperator for InputOperator {
+    fn eval(
+        &mut self,
+        state: &mut EvalState,
+        _cursor: &mut BTreeCursor,
+    ) -> Result<IOResult<Delta>> {
+        match state {
+            EvalState::Init { delta } => {
+                let output = std::mem::take(delta);
+                *state = EvalState::Done;
+                Ok(IOResult::Done(output))
+            }
+            _ => unreachable!(
+                "InputOperator doesn't execute the state machine. Should be in Init state"
+            ),
+        }
+    }
+
+    fn commit(&mut self, delta: Delta, _cursor: &mut BTreeCursor) -> Result<IOResult<Delta>> {
+        // Input operator passes through the delta unchanged during commit
+        Ok(IOResult::Done(delta))
+    }
+
+    fn set_tracker(&mut self, _tracker: Arc<Mutex<ComputationTracker>>) {
+        // Input operator doesn't need tracking
+    }
 }
 
 /// Filter operator - filters rows based on predicate
 #[derive(Debug)]
 pub struct FilterOperator {
     predicate: FilterPredicate,
-    current_state: Delta,
     column_names: Vec<String>,
     tracker: Option<Arc<Mutex<ComputationTracker>>>,
 }
@@ -448,7 +728,6 @@ impl FilterOperator {
     pub fn new(predicate: FilterPredicate, column_names: Vec<String>) -> Self {
         Self {
             predicate,
-            current_state: Delta::new(),
             column_names,
             tracker: None,
         }
@@ -549,33 +828,22 @@ impl FilterOperator {
 }
 
 impl IncrementalOperator for FilterOperator {
-    fn initialize(&mut self, data: Delta) {
-        // Process initial data through filter
-        for (row, weight) in data.changes {
-            if let Some(tracker) = &self.tracker {
-                tracker.lock().unwrap().record_filter();
-            }
-
-            if self.evaluate_predicate(&row.values) {
-                self.current_state.changes.push((row, weight));
-            }
-        }
-    }
-
-    fn eval(&self, delta: Delta, uncommitted: Option<Delta>) -> Delta {
-        let mut output_delta = Delta::new();
-
-        // Merge delta with uncommitted if present
-        let combined_delta = if let Some(uncommitted) = uncommitted {
-            let mut combined = delta;
-            combined.merge(&uncommitted);
-            combined
-        } else {
-            delta
+    fn eval(
+        &mut self,
+        state: &mut EvalState,
+        _cursor: &mut BTreeCursor,
+    ) -> Result<IOResult<Delta>> {
+        let delta = match state {
+            EvalState::Init { delta } => std::mem::take(delta),
+            _ => unreachable!(
+                "FilterOperator doesn't execute the state machine. Should be in Init state"
+            ),
         };
 
-        // Process the combined delta through the filter
-        for (row, weight) in combined_delta.changes {
+        let mut output_delta = Delta::new();
+
+        // Process the delta through the filter
+        for (row, weight) in delta.changes {
             if let Some(tracker) = &self.tracker {
                 tracker.lock().unwrap().record_filter();
             }
@@ -588,10 +856,11 @@ impl IncrementalOperator for FilterOperator {
             }
         }
 
-        output_delta
+        *state = EvalState::Done;
+        Ok(IOResult::Done(output_delta))
     }
 
-    fn commit(&mut self, delta: Delta) -> Delta {
+    fn commit(&mut self, delta: Delta, _cursor: &mut BTreeCursor) -> Result<IOResult<Delta>> {
         let mut output_delta = Delta::new();
 
         // Commit the delta to our internal state
@@ -605,19 +874,11 @@ impl IncrementalOperator for FilterOperator {
             // For deletes, this means the row was in the view (its values pass the filter)
             // For inserts, this means the row should be in the view
             if self.evaluate_predicate(&row.values) {
-                self.current_state.changes.push((row.clone(), weight));
                 output_delta.changes.push((row, weight));
             }
         }
 
-        output_delta
-    }
-
-    fn get_current_state(&self) -> Delta {
-        // Return a consolidated view of the current state
-        let mut consolidated = self.current_state.clone();
-        consolidated.consolidate();
-        consolidated
+        Ok(IOResult::Done(output_delta))
     }
 
     fn set_tracker(&mut self, tracker: Arc<Mutex<ComputationTracker>>) {
@@ -631,7 +892,6 @@ pub struct ProjectOperator {
     columns: Vec<ProjectColumn>,
     input_column_names: Vec<String>,
     output_column_names: Vec<String>,
-    current_state: Delta,
     tracker: Option<Arc<Mutex<ComputationTracker>>>,
     // Internal in-memory connection for expression evaluation
     // Programs are very dependent on having a connection, so give it one.
@@ -652,7 +912,6 @@ impl std::fmt::Debug for ProjectOperator {
             .field("columns", &self.columns)
             .field("input_column_names", &self.input_column_names)
             .field("output_column_names", &self.output_column_names)
-            .field("current_state", &self.current_state)
             .field("tracker", &self.tracker)
             .finish_non_exhaustive()
     }
@@ -665,8 +924,6 @@ impl ProjectOperator {
         input_column_names: Vec<String>,
         schema: &crate::schema::Schema,
     ) -> crate::Result<Self> {
-        use turso_parser::ast::*;
-
         // Set up internal connection for expression evaluation
         let io = Arc::new(crate::MemoryIO::new());
         let db = Database::open_file(
@@ -769,7 +1026,6 @@ impl ProjectOperator {
             columns,
             input_column_names,
             output_column_names,
-            current_state: Delta::new(),
             tracker: None,
             internal_conn,
         })
@@ -809,7 +1065,6 @@ impl ProjectOperator {
             columns,
             input_column_names,
             output_column_names,
-            current_state: Delta::new(),
             tracker: None,
             internal_conn,
         })
@@ -839,7 +1094,6 @@ impl ProjectOperator {
     }
 
     fn evaluate_expression(&self, expr: &turso_parser::ast::Expr, values: &[Value]) -> Value {
-        use turso_parser::ast::*;
         match expr {
             Expr::Id(name) => {
                 if let Some(idx) = self
@@ -970,44 +1224,35 @@ impl ProjectOperator {
 }
 
 impl IncrementalOperator for ProjectOperator {
-    fn initialize(&mut self, data: Delta) {
-        for (row, weight) in &data.changes {
-            if let Some(tracker) = &self.tracker {
-                tracker.lock().unwrap().record_project();
-            }
-
-            let projected = self.project_values(&row.values);
-            let projected_row = HashableRow::new(row.rowid, projected);
-            self.current_state.changes.push((projected_row, *weight));
-        }
-    }
-
-    fn eval(&self, delta: Delta, uncommitted: Option<Delta>) -> Delta {
-        let mut output_delta = Delta::new();
-
-        // Merge delta with uncommitted if present
-        let combined_delta = if let Some(uncommitted) = uncommitted {
-            let mut combined = delta;
-            combined.merge(&uncommitted);
-            combined
-        } else {
-            delta
+    fn eval(
+        &mut self,
+        state: &mut EvalState,
+        _cursor: &mut BTreeCursor,
+    ) -> Result<IOResult<Delta>> {
+        let delta = match state {
+            EvalState::Init { delta } => std::mem::take(delta),
+            _ => unreachable!(
+                "ProjectOperator doesn't execute the state machine. Should be in Init state"
+            ),
         };
 
-        for (row, weight) in &combined_delta.changes {
+        let mut output_delta = Delta::new();
+
+        for (row, weight) in delta.changes {
             if let Some(tracker) = &self.tracker {
                 tracker.lock().unwrap().record_project();
             }
 
             let projected = self.project_values(&row.values);
             let projected_row = HashableRow::new(row.rowid, projected);
-            output_delta.changes.push((projected_row, *weight));
+            output_delta.changes.push((projected_row, weight));
         }
 
-        output_delta
+        *state = EvalState::Done;
+        Ok(IOResult::Done(output_delta))
     }
 
-    fn commit(&mut self, delta: Delta) -> Delta {
+    fn commit(&mut self, delta: Delta, _cursor: &mut BTreeCursor) -> Result<IOResult<Delta>> {
         let mut output_delta = Delta::new();
 
         // Commit the delta to our internal state and build output
@@ -1017,20 +1262,10 @@ impl IncrementalOperator for ProjectOperator {
             }
             let projected = self.project_values(&row.values);
             let projected_row = HashableRow::new(row.rowid, projected);
-            self.current_state
-                .changes
-                .push((projected_row.clone(), *weight));
             output_delta.changes.push((projected_row, *weight));
         }
 
-        output_delta
-    }
-
-    fn get_current_state(&self) -> Delta {
-        // Return a consolidated view of the current state
-        let mut consolidated = self.current_state.clone();
-        consolidated.consolidate();
-        consolidated
+        Ok(crate::types::IOResult::Done(output_delta))
     }
 
     fn set_tracker(&mut self, tracker: Arc<Mutex<ComputationTracker>>) {
@@ -1040,28 +1275,29 @@ impl IncrementalOperator for ProjectOperator {
 
 /// Aggregate operator - performs incremental aggregation with GROUP BY
 /// Maintains running totals/counts that are updated incrementally
-#[derive(Debug, Clone)]
+///
+/// Note that the AggregateOperator essentially implements a ZSet, even
+/// though the ZSet structure is never used explicitly. The on-disk btree
+/// plays the role of the set!
+#[derive(Debug)]
 pub struct AggregateOperator {
+    // Unique operator ID for indexing in persistent storage
+    operator_id: usize,
     // GROUP BY columns
     group_by: Vec<String>,
     // Aggregate functions to compute
     aggregates: Vec<AggregateFunction>,
     // Column names from input
     pub input_column_names: Vec<String>,
-    // Aggregation state: group_key_str -> aggregate values
-    // For each group, we store the aggregate results
-    // We use String representation of group keys since Value doesn't implement Hash
-    group_states: HashMap<String, AggregateState>,
-    // Map to keep track of actual group key values for output
-    group_key_values: HashMap<String, Vec<Value>>,
-    // Current output state as a Delta
-    current_state: Delta,
     tracker: Option<Arc<Mutex<ComputationTracker>>>,
+
+    // State machine for commit operation
+    commit_state: AggregateCommitState,
 }
 
 /// State for a single group's aggregates
 #[derive(Debug, Clone)]
-struct AggregateState {
+pub struct AggregateState {
     // For COUNT: just the count
     count: i64,
     // For SUM: column_name -> sum value
@@ -1079,6 +1315,158 @@ impl AggregateState {
             sums: HashMap::new(),
             avgs: HashMap::new(),
         }
+    }
+
+    // Serialize the aggregate state to a binary blob including group key values
+    // The reason we serialize it like this, instead of just writing the actual values, is that
+    // The same table may have different aggregators in the circuit. They will all have different
+    // columns.
+    fn to_blob(&self, aggregates: &[AggregateFunction], group_key: &[Value]) -> Vec<u8> {
+        let mut blob = Vec::new();
+
+        // Write version byte for future compatibility
+        blob.push(1u8);
+
+        // Write number of group key values
+        blob.extend_from_slice(&(group_key.len() as u32).to_le_bytes());
+
+        // Write each group key value
+        for value in group_key {
+            // Write value type tag
+            match value {
+                Value::Null => blob.push(0u8),
+                Value::Integer(i) => {
+                    blob.push(1u8);
+                    blob.extend_from_slice(&i.to_le_bytes());
+                }
+                Value::Float(f) => {
+                    blob.push(2u8);
+                    blob.extend_from_slice(&f.to_le_bytes());
+                }
+                Value::Text(s) => {
+                    blob.push(3u8);
+                    let text_str = s.as_str();
+                    let bytes = text_str.as_bytes();
+                    blob.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                    blob.extend_from_slice(bytes);
+                }
+                Value::Blob(b) => {
+                    blob.push(4u8);
+                    blob.extend_from_slice(&(b.len() as u32).to_le_bytes());
+                    blob.extend_from_slice(b);
+                }
+            }
+        }
+
+        // Write count as 8 bytes (little-endian)
+        blob.extend_from_slice(&self.count.to_le_bytes());
+
+        // Write each aggregate's state
+        for agg in aggregates {
+            match agg {
+                AggregateFunction::Sum(col_name) => {
+                    let sum = self.sums.get(col_name).copied().unwrap_or(0.0);
+                    blob.extend_from_slice(&sum.to_le_bytes());
+                }
+                AggregateFunction::Avg(col_name) => {
+                    let (sum, count) = self.avgs.get(col_name).copied().unwrap_or((0.0, 0));
+                    blob.extend_from_slice(&sum.to_le_bytes());
+                    blob.extend_from_slice(&count.to_le_bytes());
+                }
+                AggregateFunction::Count => {
+                    // Count is already written above
+                }
+            }
+        }
+
+        blob
+    }
+
+    /// Deserialize aggregate state from a binary blob
+    /// Returns the aggregate state and the group key values
+    fn from_blob(blob: &[u8], aggregates: &[AggregateFunction]) -> Option<(Self, Vec<Value>)> {
+        let mut cursor = 0;
+
+        // Check version byte
+        if blob.get(cursor) != Some(&1u8) {
+            return None;
+        }
+        cursor += 1;
+
+        // Read number of group key values
+        let num_group_keys =
+            u32::from_le_bytes(blob.get(cursor..cursor + 4)?.try_into().ok()?) as usize;
+        cursor += 4;
+
+        // Read group key values
+        let mut group_key = Vec::new();
+        for _ in 0..num_group_keys {
+            let value_type = *blob.get(cursor)?;
+            cursor += 1;
+
+            let value = match value_type {
+                0 => Value::Null,
+                1 => {
+                    let i = i64::from_le_bytes(blob.get(cursor..cursor + 8)?.try_into().ok()?);
+                    cursor += 8;
+                    Value::Integer(i)
+                }
+                2 => {
+                    let f = f64::from_le_bytes(blob.get(cursor..cursor + 8)?.try_into().ok()?);
+                    cursor += 8;
+                    Value::Float(f)
+                }
+                3 => {
+                    let len =
+                        u32::from_le_bytes(blob.get(cursor..cursor + 4)?.try_into().ok()?) as usize;
+                    cursor += 4;
+                    let bytes = blob.get(cursor..cursor + len)?;
+                    cursor += len;
+                    let text_str = std::str::from_utf8(bytes).ok()?;
+                    Value::Text(text_str.to_string().into())
+                }
+                4 => {
+                    let len =
+                        u32::from_le_bytes(blob.get(cursor..cursor + 4)?.try_into().ok()?) as usize;
+                    cursor += 4;
+                    let bytes = blob.get(cursor..cursor + len)?;
+                    cursor += len;
+                    Value::Blob(bytes.to_vec())
+                }
+                _ => return None,
+            };
+            group_key.push(value);
+        }
+
+        // Read count
+        let count = i64::from_le_bytes(blob.get(cursor..cursor + 8)?.try_into().ok()?);
+        cursor += 8;
+
+        let mut state = Self::new();
+        state.count = count;
+
+        // Read each aggregate's state
+        for agg in aggregates {
+            match agg {
+                AggregateFunction::Sum(col_name) => {
+                    let sum = f64::from_le_bytes(blob.get(cursor..cursor + 8)?.try_into().ok()?);
+                    cursor += 8;
+                    state.sums.insert(col_name.clone(), sum);
+                }
+                AggregateFunction::Avg(col_name) => {
+                    let sum = f64::from_le_bytes(blob.get(cursor..cursor + 8)?.try_into().ok()?);
+                    cursor += 8;
+                    let count = i64::from_le_bytes(blob.get(cursor..cursor + 8)?.try_into().ok()?);
+                    cursor += 8;
+                    state.avgs.insert(col_name.clone(), (sum, count));
+                }
+                AggregateFunction::Count => {
+                    // Count was already read above
+                }
+            }
+        }
+
+        Some((state, group_key))
     }
 
     /// Apply a delta to this aggregate state
@@ -1168,23 +1556,144 @@ impl AggregateState {
 
 impl AggregateOperator {
     pub fn new(
+        operator_id: usize,
         group_by: Vec<String>,
         aggregates: Vec<AggregateFunction>,
         input_column_names: Vec<String>,
     ) -> Self {
         Self {
+            operator_id,
             group_by,
             aggregates,
             input_column_names,
-            group_states: HashMap::new(),
-            group_key_values: HashMap::new(),
-            current_state: Delta::new(),
             tracker: None,
+            commit_state: AggregateCommitState::Idle,
         }
+    }
+
+    fn eval_internal(
+        &mut self,
+        state: &mut EvalState,
+        cursor: &mut BTreeCursor,
+    ) -> Result<IOResult<(Delta, ComputedStates)>> {
+        match state {
+            EvalState::Uninitialized => {
+                panic!("Cannot eval AggregateOperator with Uninitialized state");
+            }
+            EvalState::Init { delta } => {
+                if delta.changes.is_empty() {
+                    *state = EvalState::Done;
+                    return Ok(IOResult::Done((Delta::new(), HashMap::new())));
+                }
+
+                let mut groups_to_read = BTreeMap::new();
+                for (row, _weight) in &delta.changes {
+                    // Extract group key using cloned fields
+                    let group_key = self.extract_group_key(&row.values);
+                    let group_key_str = Self::group_key_to_string(&group_key);
+                    groups_to_read.insert(group_key_str, group_key);
+                }
+                state.advance(groups_to_read);
+            }
+            EvalState::FetchData { .. } => {
+                // Already in progress, continue processing on process_delta below.
+            }
+            EvalState::Done => {
+                panic!("unreachable state! should have returned");
+            }
+        }
+
+        // Process the delta through the state machine
+        let result = return_if_io!(state.process_delta(self, cursor));
+        Ok(IOResult::Done(result))
+    }
+
+    fn merge_delta_with_existing(
+        &mut self,
+        delta: &Delta,
+        existing_groups: &mut HashMap<String, AggregateState>,
+        old_values: &mut HashMap<String, Vec<Value>>,
+    ) -> (Delta, HashMap<String, (Vec<Value>, AggregateState)>) {
+        let mut output_delta = Delta::new();
+        let mut temp_keys: HashMap<String, Vec<Value>> = HashMap::new();
+
+        // Process each change in the delta
+        for (row, weight) in &delta.changes {
+            if let Some(tracker) = &self.tracker {
+                tracker.lock().unwrap().record_aggregation();
+            }
+
+            // Extract group key
+            let group_key = self.extract_group_key(&row.values);
+            let group_key_str = Self::group_key_to_string(&group_key);
+
+            let state = existing_groups
+                .entry(group_key_str.clone())
+                .or_insert_with(AggregateState::new);
+
+            temp_keys.insert(group_key_str.clone(), group_key.clone());
+
+            // Apply the delta to the temporary state
+            state.apply_delta(
+                &row.values,
+                *weight,
+                &self.aggregates,
+                &self.input_column_names,
+            );
+        }
+
+        // Generate output delta from temporary states and collect final states
+        let mut final_states = HashMap::new();
+
+        for (group_key_str, state) in existing_groups {
+            let group_key = temp_keys.get(group_key_str).cloned().unwrap_or_default();
+
+            // Generate a unique rowid for this group
+            let result_key = self.generate_group_rowid(group_key_str);
+
+            if let Some(old_row_values) = old_values.get(group_key_str) {
+                let old_row = HashableRow::new(result_key, old_row_values.clone());
+                output_delta.changes.push((old_row, -1));
+            }
+
+            // Always store the state for persistence (even if count=0, we need to delete it)
+            final_states.insert(group_key_str.clone(), (group_key.clone(), state.clone()));
+
+            // Only include groups with count > 0 in the output delta
+            if state.count > 0 {
+                // Build output row: group_by columns + aggregate values
+                let mut output_values = group_key.clone();
+                output_values.extend(state.to_values(&self.aggregates));
+
+                let output_row = HashableRow::new(result_key, output_values);
+                output_delta.changes.push((output_row, 1));
+            }
+        }
+        (output_delta, final_states)
     }
 
     pub fn set_tracker(&mut self, tracker: Arc<Mutex<ComputationTracker>>) {
         self.tracker = Some(tracker);
+    }
+
+    /// Generate a rowid for a group
+    /// For no GROUP BY: always returns 0
+    /// For GROUP BY: returns a hash of the group key string
+    fn generate_group_rowid(&self, group_key_str: &str) -> i64 {
+        if self.group_by.is_empty() {
+            0
+        } else {
+            group_key_str
+                .bytes()
+                .fold(0i64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as i64))
+        }
+    }
+
+    /// Generate the composite key for BTree storage
+    /// Combines operator_id and group hash
+    fn generate_storage_key(&self, group_key_str: &str) -> i64 {
+        let group_hash = self.generate_group_rowid(group_key_str);
+        (self.operator_id as i64) << 32 | (group_hash & 0xFFFFFFFF)
     }
 
     /// Extract group key values from a row
@@ -1214,215 +1723,102 @@ impl AggregateOperator {
             .join(",")
     }
 
-    /// Process a delta and update aggregate state incrementally
-    pub fn process_delta(&mut self, delta: Delta) -> Delta {
-        let mut output_delta = Delta::new();
-
-        // Track which groups were modified and their old values
-        let mut modified_groups = HashSet::new();
-        let mut old_values: HashMap<String, Vec<Value>> = HashMap::new();
-
-        // Process each change in the delta
-        for (row, weight) in &delta.changes {
-            if let Some(tracker) = &self.tracker {
-                tracker.lock().unwrap().record_aggregation();
-            }
-
-            // Extract group key
-            let group_key = self.extract_group_key(&row.values);
-            let group_key_str = Self::group_key_to_string(&group_key);
-
-            // Store old aggregate values BEFORE applying the delta
-            // (only for the first time we see this group in this batch)
-            if !modified_groups.contains(&group_key_str) {
-                if let Some(state) = self.group_states.get(&group_key_str) {
-                    let mut old_row = group_key.clone();
-                    old_row.extend(state.to_values(&self.aggregates));
-                    old_values.insert(group_key_str.clone(), old_row);
-                }
-            }
-
-            modified_groups.insert(group_key_str.clone());
-
-            // Store the actual group key values
-            self.group_key_values
-                .insert(group_key_str.clone(), group_key.clone());
-
-            // Get or create aggregate state for this group
-            let state = self
-                .group_states
-                .entry(group_key_str.clone())
-                .or_insert_with(AggregateState::new);
-
-            // Apply the delta to the aggregate state
-            state.apply_delta(
-                &row.values,
-                *weight,
-                &self.aggregates,
-                &self.input_column_names,
-            );
-        }
-
-        // Generate output delta for modified groups
-        for group_key_str in modified_groups {
-            // Get the actual group key values
-            let group_key = self
-                .group_key_values
-                .get(&group_key_str)
-                .cloned()
-                .unwrap_or_default();
-
-            // Generate a unique key for this group
-            // We use a hash of the group key to ensure consistency
-            let result_key = group_key_str
-                .bytes()
-                .fold(0i64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as i64));
-
-            // Emit retraction for old value if it existed
-            if let Some(old_row_values) = old_values.get(&group_key_str) {
-                let old_row = HashableRow::new(result_key, old_row_values.clone());
-                output_delta.changes.push((old_row.clone(), -1));
-                // Also remove from current state
-                self.current_state.changes.push((old_row, -1));
-            }
-
-            if let Some(state) = self.group_states.get(&group_key_str) {
-                // Build output row: group_by columns + aggregate values
-                let mut output_values = group_key.clone();
-                output_values.extend(state.to_values(&self.aggregates));
-
-                // Check if group should be removed (count is 0)
-                if state.count > 0 {
-                    // Add to output delta with positive weight
-                    let output_row = HashableRow::new(result_key, output_values.clone());
-                    output_delta.changes.push((output_row.clone(), 1));
-
-                    // Update current state
-                    self.current_state.changes.push((output_row, 1));
-                } else {
-                    // Group has count=0, remove from state
-                    // (we already emitted the retraction above if needed)
-                    self.group_states.remove(&group_key_str);
-                    self.group_key_values.remove(&group_key_str);
-                }
-            }
-        }
-
-        // Consolidate current state to handle removals
-        self.current_state.consolidate();
-
-        output_delta
+    fn seek_key_from_str(&self, group_key_str: &str) -> SeekKey {
+        // Calculate the composite key for seeking
+        let key_i64 = self.generate_storage_key(group_key_str);
+        SeekKey::TableRowId(key_i64)
     }
 
-    pub fn get_current_state(&self) -> &Delta {
-        &self.current_state
+    fn seek_key(&self, row: HashableRow) -> SeekKey {
+        // Extract group key for first row
+        let group_key = self.extract_group_key(&row.values);
+        let group_key_str = Self::group_key_to_string(&group_key);
+        self.seek_key_from_str(&group_key_str)
     }
 }
 
 impl IncrementalOperator for AggregateOperator {
-    fn initialize(&mut self, data: Delta) {
-        // Process all initial data - this modifies state during initialization
-        let _ = self.process_delta(data);
+    fn eval(&mut self, state: &mut EvalState, cursor: &mut BTreeCursor) -> Result<IOResult<Delta>> {
+        let (delta, _) = return_if_io!(self.eval_internal(state, cursor));
+        Ok(IOResult::Done(delta))
     }
 
-    fn eval(&self, delta: Delta, uncommitted: Option<Delta>) -> Delta {
-        // Clone the current state to work with temporarily
-        let mut temp_group_states = self.group_states.clone();
-        let mut temp_group_key_values = self.group_key_values.clone();
-
-        // Merge delta with uncommitted if present
-        let combined_delta = if let Some(uncommitted) = uncommitted {
-            let mut combined = delta;
-            combined.merge(&uncommitted);
-            combined
-        } else {
-            delta
-        };
-
-        let mut output_delta = Delta::new();
-        let mut modified_groups = HashSet::new();
-        let mut old_values: HashMap<String, Vec<Value>> = HashMap::new();
-
-        // Process each change in the combined delta using temporary state
-        for (row, weight) in &combined_delta.changes {
-            if let Some(tracker) = &self.tracker {
-                tracker.lock().unwrap().record_aggregation();
-            }
-
-            // Extract group key
-            let group_key = self.extract_group_key(&row.values);
-            let group_key_str = Self::group_key_to_string(&group_key);
-
-            // Store old aggregate values BEFORE applying the delta
-            if !modified_groups.contains(&group_key_str) {
-                if let Some(state) = temp_group_states.get(&group_key_str) {
-                    let mut old_row = group_key.clone();
-                    old_row.extend(state.to_values(&self.aggregates));
-                    old_values.insert(group_key_str.clone(), old_row);
+    fn commit(&mut self, delta: Delta, cursor: &mut BTreeCursor) -> Result<IOResult<Delta>> {
+        loop {
+            // Note: because we std::mem::replace here (without it, the borrow checker goes nuts,
+            // because we call self.eval_interval, which requires a mutable borrow), we have to
+            // restore the state if we return I/O. So we can't use return_if_io!
+            let mut state =
+                std::mem::replace(&mut self.commit_state, AggregateCommitState::Invalid);
+            match &mut state {
+                AggregateCommitState::Invalid => {
+                    panic!("Reached invalid state! State was replaced, and not replaced back");
                 }
-            }
+                AggregateCommitState::Idle => {
+                    let eval_state = EvalState::from_delta(delta.clone());
+                    self.commit_state = AggregateCommitState::Eval { eval_state };
+                }
+                AggregateCommitState::Eval { ref mut eval_state } => {
+                    let (output_delta, computed_states) = return_and_restore_if_io!(
+                        &mut self.commit_state,
+                        state,
+                        self.eval_internal(eval_state, cursor)
+                    );
+                    self.commit_state = AggregateCommitState::PersistDelta {
+                        delta: output_delta,
+                        computed_states,
+                        current_idx: 0,
+                        write_record: WriteRecord::new(),
+                    };
+                }
+                AggregateCommitState::PersistDelta {
+                    delta,
+                    computed_states,
+                    current_idx,
+                    write_record,
+                } => {
+                    let states_vec: Vec<_> = computed_states.iter().collect();
 
-            modified_groups.insert(group_key_str.clone());
-            temp_group_key_values.insert(group_key_str.clone(), group_key.clone());
+                    if *current_idx >= states_vec.len() {
+                        self.commit_state = AggregateCommitState::Done {
+                            delta: delta.clone(),
+                        };
+                    } else {
+                        let (group_key_str, (group_key, agg_state)) = states_vec[*current_idx];
 
-            // Get or create aggregate state for this group in temporary state
-            let state = temp_group_states
-                .entry(group_key_str.clone())
-                .or_insert_with(AggregateState::new);
+                        let seek_key = self.seek_key_from_str(group_key_str);
 
-            // Apply the delta to the temporary aggregate state
-            state.apply_delta(
-                &row.values,
-                *weight,
-                &self.aggregates,
-                &self.input_column_names,
-            );
-        }
+                        // Determine weight: -1 to delete (cancels existing weight=1), 1 to insert/update
+                        let weight = if agg_state.count == 0 { -1 } else { 1 };
 
-        // Generate output delta for modified groups using temporary state
-        for group_key_str in modified_groups {
-            let group_key = temp_group_key_values
-                .get(&group_key_str)
-                .cloned()
-                .unwrap_or_default();
+                        // Serialize the aggregate state with group key (even for deletion, we need a row)
+                        let state_blob = agg_state.to_blob(&self.aggregates, group_key);
+                        let blob_row = HashableRow::new(0, vec![Value::Blob(state_blob)]);
 
-            // Generate a unique key for this group
-            let result_key = group_key_str
-                .bytes()
-                .fold(0i64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as i64));
+                        return_and_restore_if_io!(
+                            &mut self.commit_state,
+                            state,
+                            write_record.write_record(seek_key, blob_row, weight, cursor)
+                        );
 
-            // Emit retraction for old value if it existed
-            if let Some(old_row_values) = old_values.get(&group_key_str) {
-                let old_row = HashableRow::new(result_key, old_row_values.clone());
-                output_delta.changes.push((old_row, -1));
-            }
+                        let delta = std::mem::take(delta);
+                        let computed_states = std::mem::take(computed_states);
 
-            if let Some(state) = temp_group_states.get(&group_key_str) {
-                // Build output row: group_by columns + aggregate values
-                let mut output_values = group_key.clone();
-                output_values.extend(state.to_values(&self.aggregates));
-
-                // Check if group should be included (count > 0)
-                if state.count > 0 {
-                    let output_row = HashableRow::new(result_key, output_values);
-                    output_delta.changes.push((output_row, 1));
+                        self.commit_state = AggregateCommitState::PersistDelta {
+                            delta,
+                            computed_states,
+                            current_idx: *current_idx + 1,
+                            write_record: WriteRecord::new(), // Reset for next write
+                        };
+                    }
+                }
+                AggregateCommitState::Done { delta } => {
+                    self.commit_state = AggregateCommitState::Idle;
+                    let delta = std::mem::take(delta);
+                    return Ok(IOResult::Done(delta));
                 }
             }
         }
-
-        output_delta
-    }
-
-    fn commit(&mut self, delta: Delta) -> Delta {
-        // Actually update the internal state when committing and return the output
-        self.process_delta(delta)
-    }
-
-    fn get_current_state(&self) -> Delta {
-        // Return a consolidated view of the current state
-        let mut consolidated = self.current_state.clone();
-        consolidated.consolidate();
-        consolidated
     }
 
     fn set_tracker(&mut self, tracker: Arc<Mutex<ComputationTracker>>) {
@@ -1433,9 +1829,100 @@ impl IncrementalOperator for AggregateOperator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::pager::CreateBTreeFlags;
     use crate::types::Text;
+    use crate::util::IOExt;
     use crate::Value;
+    use crate::{Database, MemoryIO, IO};
     use std::sync::{Arc, Mutex};
+
+    /// Create a test pager for operator tests
+    fn create_test_pager() -> (std::rc::Rc<crate::Pager>, usize) {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = Database::open_file(io.clone(), ":memory:", false, false).unwrap();
+        let conn = db.connect().unwrap();
+
+        let pager = conn.pager.borrow().clone();
+
+        // Allocate page 1 first (database header)
+        let _ = pager.io.block(|| pager.allocate_page1());
+
+        // Properly create a BTree for aggregate state using the pager API
+        let root_page_id = pager
+            .io
+            .block(|| pager.btree_create(&CreateBTreeFlags::new_table()))
+            .expect("Failed to create BTree for aggregate state")
+            as usize;
+
+        (pager, root_page_id)
+    }
+
+    /// Read the current state from the BTree (for testing)
+    /// Returns a Delta with all the current aggregate values
+    fn get_current_state_from_btree(
+        agg: &AggregateOperator,
+        pager: &std::rc::Rc<crate::Pager>,
+        cursor: &mut BTreeCursor,
+    ) -> Delta {
+        let mut result = Delta::new();
+
+        // Rewind to start of table
+        pager.io.block(|| cursor.rewind()).unwrap();
+
+        loop {
+            // Check if cursor is empty (no more rows)
+            if cursor.is_empty() {
+                break;
+            }
+
+            // Get the record at this position
+            let record = pager
+                .io
+                .block(|| cursor.record())
+                .unwrap()
+                .unwrap()
+                .to_owned();
+
+            let values_ref = record.get_values();
+            let values: Vec<Value> = values_ref.into_iter().map(|x| x.to_owned()).collect();
+
+            // Check if this record belongs to our operator
+            if let Some(Value::Integer(key)) = values.first() {
+                let operator_part = (key >> 32) as usize;
+
+                // Skip if not our operator
+                if operator_part != agg.operator_id {
+                    pager.io.block(|| cursor.next()).unwrap();
+                    continue;
+                }
+
+                // Get the blob data
+                if let Some(Value::Blob(blob)) = values.get(1) {
+                    // Deserialize the state
+                    if let Some((state, group_key)) =
+                        AggregateState::from_blob(blob, &agg.aggregates)
+                    {
+                        // Should not have made it this far.
+                        assert!(state.count != 0);
+                        // Build output row: group_by columns + aggregate values
+                        let mut output_values = group_key.clone();
+                        output_values.extend(state.to_values(&agg.aggregates));
+
+                        let group_key_str = AggregateOperator::group_key_to_string(&group_key);
+                        let rowid = agg.generate_group_rowid(&group_key_str);
+
+                        let output_row = HashableRow::new(rowid, output_values);
+                        result.changes.push((output_row, 1));
+                    }
+                }
+            }
+
+            pager.io.block(|| cursor.next()).unwrap();
+        }
+
+        result.consolidate();
+        result
+    }
 
     /// Assert that we're doing incremental work, not full recomputation
     fn assert_incremental(tracker: &ComputationTracker, expected_ops: usize, data_size: usize) {
@@ -1464,8 +1951,13 @@ mod tests {
         // the operator emits both a retraction (-1) of the old value
         // and an insertion (+1) of the new value.
 
+        // Create a persistent pager for the test
+        let (pager, root_page_id) = create_test_pager();
+        let mut cursor = BTreeCursor::new_table(None, pager.clone(), root_page_id, 10);
+
         // Create an aggregate operator for SUM(age) with no GROUP BY
         let mut agg = AggregateOperator::new(
+            1,      // operator_id for testing
             vec![], // No GROUP BY
             vec![AggregateFunction::Sum("age".to_string())],
             vec!["id".to_string(), "name".to_string(), "age".to_string()],
@@ -1499,10 +1991,13 @@ mod tests {
         );
 
         // Initialize with initial data
-        agg.initialize(initial_delta);
+        pager
+            .io
+            .block(|| agg.commit(initial_delta.clone(), &mut cursor))
+            .unwrap();
 
         // Verify initial state: SUM(age) = 25 + 30 + 35 = 90
-        let state = agg.get_current_state();
+        let state = get_current_state_from_btree(&agg, &pager, &mut cursor);
         assert_eq!(state.changes.len(), 1, "Should have one aggregate row");
         let (row, weight) = &state.changes[0];
         assert_eq!(*weight, 1, "Aggregate row should have weight 1");
@@ -1520,8 +2015,10 @@ mod tests {
         );
 
         // Process the incremental update
-        let output_delta = agg.eval(update_delta.clone(), None);
-        agg.commit(update_delta);
+        let output_delta = pager
+            .io
+            .block(|| agg.commit(update_delta.clone(), &mut cursor))
+            .unwrap();
 
         // CRITICAL: The output delta should contain TWO changes:
         // 1. Retraction of old aggregate value (90) with weight -1
@@ -1568,7 +2065,12 @@ mod tests {
         // the operator emits both retractions and insertions correctly for each group.
 
         // Create an aggregate operator for SUM(score) GROUP BY team
+        // Create a persistent pager for the test
+        let (pager, root_page_id) = create_test_pager();
+        let mut cursor = BTreeCursor::new_table(None, pager.clone(), root_page_id, 10);
+
         let mut agg = AggregateOperator::new(
+            1,                        // operator_id for testing
             vec!["team".to_string()], // GROUP BY team
             vec![AggregateFunction::Sum("score".to_string())],
             vec![
@@ -1610,10 +2112,13 @@ mod tests {
         );
 
         // Initialize with initial data
-        agg.initialize(initial_delta);
+        pager
+            .io
+            .block(|| agg.commit(initial_delta.clone(), &mut cursor))
+            .unwrap();
 
         // Verify initial state: red team = 30, blue team = 15
-        let state = agg.get_current_state();
+        let state = get_current_state_from_btree(&agg, &pager, &mut cursor);
         assert_eq!(state.changes.len(), 2, "Should have two groups");
 
         // Find the red and blue team aggregates
@@ -1653,8 +2158,10 @@ mod tests {
         );
 
         // Process the incremental update
-        let output_delta = agg.eval(update_delta.clone(), None);
-        agg.commit(update_delta);
+        let output_delta = pager
+            .io
+            .block(|| agg.commit(update_delta.clone(), &mut cursor))
+            .unwrap();
 
         // Should have 2 changes: retraction of old red team sum, insertion of new red team sum
         // Blue team should NOT be affected
@@ -1703,8 +2210,13 @@ mod tests {
     fn test_count_increments_not_recounts() {
         let tracker = Arc::new(Mutex::new(ComputationTracker::new()));
 
+        // Create a persistent pager for the test
+        let (pager, root_page_id) = create_test_pager();
+        let mut cursor = BTreeCursor::new_table(None, pager.clone(), root_page_id, 10);
+
         // Create COUNT(*) GROUP BY category
         let mut agg = AggregateOperator::new(
+            1, // operator_id for testing
             vec!["category".to_string()],
             vec![AggregateFunction::Count],
             vec![
@@ -1728,7 +2240,10 @@ mod tests {
                 ],
             );
         }
-        agg.initialize(initial);
+        pager
+            .io
+            .block(|| agg.commit(initial.clone(), &mut cursor))
+            .unwrap();
 
         // Reset tracker for delta processing
         tracker.lock().unwrap().aggregation_updates = 0;
@@ -1744,15 +2259,15 @@ mod tests {
             ],
         );
 
-        let _output = agg.eval(delta.clone(), None);
-        agg.commit(delta);
+        pager
+            .io
+            .block(|| agg.commit(delta.clone(), &mut cursor))
+            .unwrap();
 
-        // Should update one group (cat_0) twice - once in eval, once in commit
-        // This is still incremental - we're not recounting all groups
-        assert_eq!(tracker.lock().unwrap().aggregation_updates, 2);
+        assert_eq!(tracker.lock().unwrap().aggregation_updates, 1);
 
         // Check the final state - cat_0 should now have count 11
-        let final_state = agg.get_current_state();
+        let final_state = get_current_state_from_btree(&agg, &pager, &mut cursor);
         let cat_0 = final_state
             .changes
             .iter()
@@ -1770,7 +2285,12 @@ mod tests {
         let tracker = Arc::new(Mutex::new(ComputationTracker::new()));
 
         // Create SUM(amount) GROUP BY product
+        // Create a persistent pager for the test
+        let (pager, root_page_id) = create_test_pager();
+        let mut cursor = BTreeCursor::new_table(None, pager.clone(), root_page_id, 10);
+
         let mut agg = AggregateOperator::new(
+            1, // operator_id for testing
             vec!["product".to_string()],
             vec![AggregateFunction::Sum("amount".to_string())],
             vec![
@@ -1807,10 +2327,13 @@ mod tests {
                 Value::Integer(150),
             ],
         );
-        agg.initialize(initial);
+        pager
+            .io
+            .block(|| agg.commit(initial.clone(), &mut cursor))
+            .unwrap();
 
         // Check initial state: Widget=250, Gadget=200
-        let state = agg.get_current_state();
+        let state = get_current_state_from_btree(&agg, &pager, &mut cursor);
         let widget_sum = state
             .changes
             .iter()
@@ -1833,14 +2356,15 @@ mod tests {
             ],
         );
 
-        let _output = agg.eval(delta.clone(), None);
-        agg.commit(delta);
+        pager
+            .io
+            .block(|| agg.commit(delta.clone(), &mut cursor))
+            .unwrap();
 
-        // Should update Widget group twice (once in eval, once in commit)
-        assert_eq!(tracker.lock().unwrap().aggregation_updates, 2);
+        assert_eq!(tracker.lock().unwrap().aggregation_updates, 1);
 
         // Check final state - Widget should now be 300 (250 + 50)
-        let final_state = agg.get_current_state();
+        let final_state = get_current_state_from_btree(&agg, &pager, &mut cursor);
         let widget = final_state
             .changes
             .iter()
@@ -1852,7 +2376,12 @@ mod tests {
     #[test]
     fn test_count_and_sum_together() {
         // Test the example from DBSP_ROADMAP: COUNT(*) and SUM(amount) GROUP BY user_id
+        // Create a persistent pager for the test
+        let (pager, root_page_id) = create_test_pager();
+        let mut cursor = BTreeCursor::new_table(None, pager.clone(), root_page_id, 10);
+
         let mut agg = AggregateOperator::new(
+            1, // operator_id for testing
             vec!["user_id".to_string()],
             vec![
                 AggregateFunction::Count,
@@ -1879,12 +2408,15 @@ mod tests {
             3,
             vec![Value::Integer(3), Value::Integer(2), Value::Integer(150)],
         );
-        agg.initialize(initial);
+        pager
+            .io
+            .block(|| agg.commit(initial.clone(), &mut cursor))
+            .unwrap();
 
         // Check initial state
         // User 1: count=2, sum=300
         // User 2: count=1, sum=150
-        let state = agg.get_current_state();
+        let state = get_current_state_from_btree(&agg, &pager, &mut cursor);
         assert_eq!(state.changes.len(), 2);
 
         let user1 = state
@@ -1911,11 +2443,13 @@ mod tests {
             4,
             vec![Value::Integer(4), Value::Integer(1), Value::Integer(50)],
         );
-        let _output = agg.eval(delta.clone(), None);
-        agg.commit(delta);
+        pager
+            .io
+            .block(|| agg.commit(delta.clone(), &mut cursor))
+            .unwrap();
 
         // Check final state - user 1 should have updated count and sum
-        let final_state = agg.get_current_state();
+        let final_state = get_current_state_from_btree(&agg, &pager, &mut cursor);
         let user1 = final_state
             .changes
             .iter()
@@ -1928,7 +2462,12 @@ mod tests {
     #[test]
     fn test_avg_maintains_sum_and_count() {
         // Test AVG aggregation
+        // Create a persistent pager for the test
+        let (pager, root_page_id) = create_test_pager();
+        let mut cursor = BTreeCursor::new_table(None, pager.clone(), root_page_id, 10);
+
         let mut agg = AggregateOperator::new(
+            1, // operator_id for testing
             vec!["category".to_string()],
             vec![AggregateFunction::Avg("value".to_string())],
             vec![
@@ -1964,12 +2503,15 @@ mod tests {
                 Value::Integer(30),
             ],
         );
-        agg.initialize(initial);
+        pager
+            .io
+            .block(|| agg.commit(initial.clone(), &mut cursor))
+            .unwrap();
 
         // Check initial averages
         // Category A: avg = (10 + 20) / 2 = 15
         // Category B: avg = 30 / 1 = 30
-        let state = agg.get_current_state();
+        let state = get_current_state_from_btree(&agg, &pager, &mut cursor);
         let cat_a = state
             .changes
             .iter()
@@ -1996,11 +2538,13 @@ mod tests {
                 Value::Integer(30),
             ],
         );
-        let _output = agg.eval(delta.clone(), None);
-        agg.commit(delta);
+        pager
+            .io
+            .block(|| agg.commit(delta.clone(), &mut cursor))
+            .unwrap();
 
         // Check final state - Category A avg should now be (10 + 20 + 30) / 3 = 20
-        let final_state = agg.get_current_state();
+        let final_state = get_current_state_from_btree(&agg, &pager, &mut cursor);
         let cat_a = final_state
             .changes
             .iter()
@@ -2012,7 +2556,12 @@ mod tests {
     #[test]
     fn test_delete_updates_aggregates() {
         // Test that deletes (negative weights) properly update aggregates
+        // Create a persistent pager for the test
+        let (pager, root_page_id) = create_test_pager();
+        let mut cursor = BTreeCursor::new_table(None, pager.clone(), root_page_id, 10);
+
         let mut agg = AggregateOperator::new(
+            1, // operator_id for testing
             vec!["category".to_string()],
             vec![
                 AggregateFunction::Count,
@@ -2043,10 +2592,13 @@ mod tests {
                 Value::Integer(200),
             ],
         );
-        agg.initialize(initial);
+        pager
+            .io
+            .block(|| agg.commit(initial.clone(), &mut cursor))
+            .unwrap();
 
         // Check initial state: count=2, sum=300
-        let state = agg.get_current_state();
+        let state = get_current_state_from_btree(&agg, &pager, &mut cursor);
         assert!(!state.changes.is_empty());
         let (row, _weight) = &state.changes[0];
         assert_eq!(row.values[1], Value::Integer(2)); // count
@@ -2063,11 +2615,13 @@ mod tests {
             ],
         );
 
-        let _output = agg.eval(delta.clone(), None);
-        agg.commit(delta);
+        pager
+            .io
+            .block(|| agg.commit(delta.clone(), &mut cursor))
+            .unwrap();
 
         // Check final state - should update to count=1, sum=200
-        let final_state = agg.get_current_state();
+        let final_state = get_current_state_from_btree(&agg, &pager, &mut cursor);
         let cat_a = final_state
             .changes
             .iter()
@@ -2083,17 +2637,29 @@ mod tests {
         let group_by = vec!["category".to_string()];
         let input_columns = vec!["category".to_string(), "value".to_string()];
 
-        let mut agg = AggregateOperator::new(group_by, aggregates.clone(), input_columns);
+        // Create a persistent pager for the test
+        let (pager, root_page_id) = create_test_pager();
+        let mut cursor = BTreeCursor::new_table(None, pager.clone(), root_page_id, 10);
+
+        let mut agg = AggregateOperator::new(
+            1, // operator_id for testing
+            group_by,
+            aggregates.clone(),
+            input_columns,
+        );
 
         // Initialize with data
         let mut init_data = Delta::new();
         init_data.insert(1, vec![Value::Text("A".into()), Value::Integer(10)]);
         init_data.insert(2, vec![Value::Text("A".into()), Value::Integer(20)]);
         init_data.insert(3, vec![Value::Text("B".into()), Value::Integer(30)]);
-        agg.initialize(init_data);
+        pager
+            .io
+            .block(|| agg.commit(init_data.clone(), &mut cursor))
+            .unwrap();
 
         // Check initial counts
-        let state = agg.get_current_state();
+        let state = get_current_state_from_btree(&agg, &pager, &mut cursor);
         assert_eq!(state.changes.len(), 2);
 
         // Find group A and B
@@ -2115,14 +2681,16 @@ mod tests {
         let mut delete_delta = Delta::new();
         delete_delta.delete(1, vec![Value::Text("A".into()), Value::Integer(10)]);
 
-        let output = agg.eval(delete_delta.clone(), None);
-        agg.commit(delete_delta);
+        let output = pager
+            .io
+            .block(|| agg.commit(delete_delta.clone(), &mut cursor))
+            .unwrap();
 
         // Should emit retraction for old count and insertion for new count
         assert_eq!(output.changes.len(), 2);
 
         // Check final state
-        let final_state = agg.get_current_state();
+        let final_state = get_current_state_from_btree(&agg, &pager, &mut cursor);
         let group_a_final = final_state
             .changes
             .iter()
@@ -2134,13 +2702,15 @@ mod tests {
         let mut delete_all_b = Delta::new();
         delete_all_b.delete(3, vec![Value::Text("B".into()), Value::Integer(30)]);
 
-        let output_b = agg.eval(delete_all_b.clone(), None);
-        agg.commit(delete_all_b);
+        let output_b = pager
+            .io
+            .block(|| agg.commit(delete_all_b.clone(), &mut cursor))
+            .unwrap();
         assert_eq!(output_b.changes.len(), 1); // Only retraction, no new row
         assert_eq!(output_b.changes[0].1, -1); // Retraction
 
         // Final state should not have group B
-        let final_state2 = agg.get_current_state();
+        let final_state2 = get_current_state_from_btree(&agg, &pager, &mut cursor);
         assert_eq!(final_state2.changes.len(), 1); // Only group A remains
         assert_eq!(final_state2.changes[0].0.values[0], Value::Text("A".into()));
     }
@@ -2151,7 +2721,16 @@ mod tests {
         let group_by = vec!["category".to_string()];
         let input_columns = vec!["category".to_string(), "value".to_string()];
 
-        let mut agg = AggregateOperator::new(group_by, aggregates.clone(), input_columns);
+        // Create a persistent pager for the test
+        let (pager, root_page_id) = create_test_pager();
+        let mut cursor = BTreeCursor::new_table(None, pager.clone(), root_page_id, 10);
+
+        let mut agg = AggregateOperator::new(
+            1, // operator_id for testing
+            group_by,
+            aggregates.clone(),
+            input_columns,
+        );
 
         // Initialize with data
         let mut init_data = Delta::new();
@@ -2159,10 +2738,13 @@ mod tests {
         init_data.insert(2, vec![Value::Text("A".into()), Value::Integer(20)]);
         init_data.insert(3, vec![Value::Text("B".into()), Value::Integer(30)]);
         init_data.insert(4, vec![Value::Text("B".into()), Value::Integer(15)]);
-        agg.initialize(init_data);
+        pager
+            .io
+            .block(|| agg.commit(init_data.clone(), &mut cursor))
+            .unwrap();
 
         // Check initial sums
-        let state = agg.get_current_state();
+        let state = get_current_state_from_btree(&agg, &pager, &mut cursor);
         let group_a = state
             .changes
             .iter()
@@ -2181,11 +2763,13 @@ mod tests {
         let mut delete_delta = Delta::new();
         delete_delta.delete(2, vec![Value::Text("A".into()), Value::Integer(20)]);
 
-        let _ = agg.eval(delete_delta.clone(), None);
-        agg.commit(delete_delta);
+        pager
+            .io
+            .block(|| agg.commit(delete_delta.clone(), &mut cursor))
+            .unwrap();
 
         // Check updated sum
-        let state = agg.get_current_state();
+        let state = get_current_state_from_btree(&agg, &pager, &mut cursor);
         let group_a = state
             .changes
             .iter()
@@ -2198,11 +2782,13 @@ mod tests {
         delete_all_b.delete(3, vec![Value::Text("B".into()), Value::Integer(30)]);
         delete_all_b.delete(4, vec![Value::Text("B".into()), Value::Integer(15)]);
 
-        let _ = agg.eval(delete_all_b.clone(), None);
-        agg.commit(delete_all_b);
+        pager
+            .io
+            .block(|| agg.commit(delete_all_b.clone(), &mut cursor))
+            .unwrap();
 
         // Group B should be gone
-        let final_state = agg.get_current_state();
+        let final_state = get_current_state_from_btree(&agg, &pager, &mut cursor);
         assert_eq!(final_state.changes.len(), 1); // Only group A remains
         assert_eq!(final_state.changes[0].0.values[0], Value::Text("A".into()));
     }
@@ -2213,17 +2799,29 @@ mod tests {
         let group_by = vec!["category".to_string()];
         let input_columns = vec!["category".to_string(), "value".to_string()];
 
-        let mut agg = AggregateOperator::new(group_by, aggregates.clone(), input_columns);
+        // Create a persistent pager for the test
+        let (pager, root_page_id) = create_test_pager();
+        let mut cursor = BTreeCursor::new_table(None, pager.clone(), root_page_id, 10);
+
+        let mut agg = AggregateOperator::new(
+            1, // operator_id for testing
+            group_by,
+            aggregates.clone(),
+            input_columns,
+        );
 
         // Initialize with data
         let mut init_data = Delta::new();
         init_data.insert(1, vec![Value::Text("A".into()), Value::Integer(10)]);
         init_data.insert(2, vec![Value::Text("A".into()), Value::Integer(20)]);
         init_data.insert(3, vec![Value::Text("A".into()), Value::Integer(30)]);
-        agg.initialize(init_data);
+        pager
+            .io
+            .block(|| agg.commit(init_data.clone(), &mut cursor))
+            .unwrap();
 
         // Check initial average
-        let state = agg.get_current_state();
+        let state = get_current_state_from_btree(&agg, &pager, &mut cursor);
         assert_eq!(state.changes.len(), 1);
         assert_eq!(state.changes[0].0.values[1], Value::Float(20.0)); // AVG = (10+20+30)/3 = 20
 
@@ -2231,21 +2829,25 @@ mod tests {
         let mut delete_delta = Delta::new();
         delete_delta.delete(2, vec![Value::Text("A".into()), Value::Integer(20)]);
 
-        let _ = agg.eval(delete_delta.clone(), None);
-        agg.commit(delete_delta);
+        pager
+            .io
+            .block(|| agg.commit(delete_delta.clone(), &mut cursor))
+            .unwrap();
 
         // Check updated average
-        let state = agg.get_current_state();
+        let state = get_current_state_from_btree(&agg, &pager, &mut cursor);
         assert_eq!(state.changes[0].0.values[1], Value::Float(20.0)); // AVG = (10+30)/2 = 20 (same!)
 
         // Delete another to change the average
         let mut delete_another = Delta::new();
         delete_another.delete(3, vec![Value::Text("A".into()), Value::Integer(30)]);
 
-        let _ = agg.eval(delete_another.clone(), None);
-        agg.commit(delete_another);
+        pager
+            .io
+            .block(|| agg.commit(delete_another.clone(), &mut cursor))
+            .unwrap();
 
-        let state = agg.get_current_state();
+        let state = get_current_state_from_btree(&agg, &pager, &mut cursor);
         assert_eq!(state.changes[0].0.values[1], Value::Float(10.0)); // AVG = 10/1 = 10
     }
 
@@ -2260,17 +2862,29 @@ mod tests {
         let group_by = vec!["category".to_string()];
         let input_columns = vec!["category".to_string(), "value".to_string()];
 
-        let mut agg = AggregateOperator::new(group_by, aggregates.clone(), input_columns);
+        // Create a persistent pager for the test
+        let (pager, root_page_id) = create_test_pager();
+        let mut cursor = BTreeCursor::new_table(None, pager.clone(), root_page_id, 10);
+
+        let mut agg = AggregateOperator::new(
+            1, // operator_id for testing
+            group_by,
+            aggregates.clone(),
+            input_columns,
+        );
 
         // Initialize with data
         let mut init_data = Delta::new();
         init_data.insert(1, vec![Value::Text("A".into()), Value::Integer(100)]);
         init_data.insert(2, vec![Value::Text("A".into()), Value::Integer(200)]);
         init_data.insert(3, vec![Value::Text("B".into()), Value::Integer(50)]);
-        agg.initialize(init_data);
+        pager
+            .io
+            .block(|| agg.commit(init_data.clone(), &mut cursor))
+            .unwrap();
 
         // Check initial state
-        let state = agg.get_current_state();
+        let state = get_current_state_from_btree(&agg, &pager, &mut cursor);
         let group_a = state
             .changes
             .iter()
@@ -2285,11 +2899,13 @@ mod tests {
         let mut delete_delta = Delta::new();
         delete_delta.delete(1, vec![Value::Text("A".into()), Value::Integer(100)]);
 
-        let _ = agg.eval(delete_delta.clone(), None);
-        agg.commit(delete_delta);
+        pager
+            .io
+            .block(|| agg.commit(delete_delta.clone(), &mut cursor))
+            .unwrap();
 
         // Check all aggregates updated correctly
-        let state = agg.get_current_state();
+        let state = get_current_state_from_btree(&agg, &pager, &mut cursor);
         let group_a = state
             .changes
             .iter()
@@ -2304,10 +2920,12 @@ mod tests {
         let mut insert_delta = Delta::new();
         insert_delta.insert(4, vec![Value::Text("A".into()), Value::Float(50.5)]);
 
-        let _ = agg.eval(insert_delta.clone(), None);
-        agg.commit(insert_delta);
+        pager
+            .io
+            .block(|| agg.commit(insert_delta.clone(), &mut cursor))
+            .unwrap();
 
-        let state = agg.get_current_state();
+        let state = get_current_state_from_btree(&agg, &pager, &mut cursor);
         let group_a = state
             .changes
             .iter()
@@ -2324,6 +2942,10 @@ mod tests {
         // When a row's rowid changes (e.g., UPDATE t SET a=1 WHERE a=3 on INTEGER PRIMARY KEY),
         // the operator should properly consolidate the state
 
+        // Create a persistent pager for the test
+        let (pager, root_page_id) = create_test_pager();
+        let mut cursor = BTreeCursor::new_table(None, pager.clone(), root_page_id, 10);
+
         let mut filter = FilterOperator::new(
             FilterPredicate::GreaterThan {
                 column: "b".to_string(),
@@ -2335,10 +2957,12 @@ mod tests {
         // Initialize with a row (rowid=3, values=[3, 3])
         let mut init_data = Delta::new();
         init_data.insert(3, vec![Value::Integer(3), Value::Integer(3)]);
-        filter.initialize(init_data);
+        let state = pager
+            .io
+            .block(|| filter.commit(init_data.clone(), &mut cursor))
+            .unwrap();
 
         // Check initial state
-        let state = filter.get_current_state();
         assert_eq!(state.changes.len(), 1);
         assert_eq!(state.changes[0].0.rowid, 3);
         assert_eq!(
@@ -2352,29 +2976,15 @@ mod tests {
         update_delta.delete(3, vec![Value::Integer(3), Value::Integer(3)]);
         update_delta.insert(1, vec![Value::Integer(1), Value::Integer(3)]);
 
-        let output = filter.eval(update_delta.clone(), None);
-        filter.commit(update_delta);
+        let output = pager
+            .io
+            .block(|| filter.commit(update_delta.clone(), &mut cursor))
+            .unwrap();
 
         // The output delta should have both changes (both pass the filter b > 2)
         assert_eq!(output.changes.len(), 2);
         assert_eq!(output.changes[0].1, -1); // delete weight
         assert_eq!(output.changes[1].1, 1); // insert weight
-
-        // The current state should be consolidated to only have rows with positive weight
-        let final_state = filter.get_current_state();
-
-        // After consolidation, we should have only one row with rowid=1
-        assert_eq!(
-            final_state.changes.len(),
-            1,
-            "State should be consolidated to have only one row"
-        );
-        assert_eq!(final_state.changes[0].0.rowid, 1);
-        assert_eq!(
-            final_state.changes[0].0.values,
-            vec![Value::Integer(1), Value::Integer(3)]
-        );
-        assert_eq!(final_state.changes[0].1, 1); // positive weight
     }
 
     // ============================================================================
@@ -2388,6 +2998,10 @@ mod tests {
 
     #[test]
     fn test_filter_eval_with_uncommitted() {
+        // Create a persistent pager for the test
+        let (pager, root_page_id) = create_test_pager();
+        let mut cursor = BTreeCursor::new_table(None, pager.clone(), root_page_id, 10);
+
         let mut filter = FilterOperator::new(
             FilterPredicate::GreaterThan {
                 column: "age".to_string(),
@@ -2414,10 +3028,12 @@ mod tests {
                 Value::Integer(20),
             ],
         );
-        filter.initialize(init_data);
+        let state = pager
+            .io
+            .block(|| filter.commit(init_data.clone(), &mut cursor))
+            .unwrap();
 
         // Verify initial state (only Alice passes filter)
-        let state = filter.get_current_state();
         assert_eq!(state.changes.len(), 1);
         assert_eq!(state.changes[0].0.rowid, 1);
 
@@ -2441,7 +3057,11 @@ mod tests {
         );
 
         // Eval with uncommitted - should return filtered uncommitted rows
-        let result = filter.eval(Delta::new(), Some(uncommitted.clone()));
+        let mut eval_state = uncommitted.clone().into();
+        let result = pager
+            .io
+            .block(|| filter.eval(&mut eval_state, &mut cursor))
+            .unwrap();
         assert_eq!(
             result.changes.len(),
             1,
@@ -2449,23 +3069,16 @@ mod tests {
         );
         assert_eq!(result.changes[0].0.rowid, 3);
 
-        // Verify state hasn't changed
-        let state_after_eval = filter.get_current_state();
-        assert_eq!(
-            state_after_eval.changes.len(),
-            1,
-            "State should still only have Alice"
-        );
-        assert_eq!(state_after_eval.changes[0].0.rowid, 1);
-
         // Now commit the changes
-        filter.commit(uncommitted);
+        let state = pager
+            .io
+            .block(|| filter.commit(uncommitted.clone(), &mut cursor))
+            .unwrap();
 
         // State should now include Charlie (who passes filter)
-        let final_state = filter.get_current_state();
         assert_eq!(
-            final_state.changes.len(),
-            2,
+            state.changes.len(),
+            1,
             "State should now have Alice and Charlie"
         );
     }
@@ -2473,7 +3086,12 @@ mod tests {
     #[test]
     fn test_aggregate_eval_with_uncommitted_preserves_state() {
         // This is the critical test - aggregations must not modify internal state during eval
+        // Create a persistent pager for the test
+        let (pager, root_page_id) = create_test_pager();
+        let mut cursor = BTreeCursor::new_table(None, pager.clone(), root_page_id, 10);
+
         let mut agg = AggregateOperator::new(
+            1, // operator_id for testing
             vec!["category".to_string()],
             vec![
                 AggregateFunction::Count,
@@ -2512,10 +3130,13 @@ mod tests {
                 Value::Integer(150),
             ],
         );
-        agg.initialize(init_data);
+        pager
+            .io
+            .block(|| agg.commit(init_data.clone(), &mut cursor))
+            .unwrap();
 
         // Check initial state: A -> (count=2, sum=300), B -> (count=1, sum=150)
-        let initial_state = agg.get_current_state();
+        let initial_state = get_current_state_from_btree(&agg, &pager, &mut cursor);
         assert_eq!(initial_state.changes.len(), 2);
 
         // Store initial state for comparison
@@ -2547,7 +3168,11 @@ mod tests {
         );
 
         // Eval with uncommitted should return the delta (changes to aggregates)
-        let result = agg.eval(Delta::new(), Some(uncommitted.clone()));
+        let mut eval_state = uncommitted.clone().into();
+        let result = pager
+            .io
+            .block(|| agg.eval(&mut eval_state, &mut cursor))
+            .unwrap();
 
         // Result should contain updates for A and new group C
         // For A: retraction of old (2, 300) and insertion of new (3, 350)
@@ -2555,7 +3180,7 @@ mod tests {
         assert!(!result.changes.is_empty(), "Should have aggregate changes");
 
         // CRITICAL: Verify internal state hasn't changed
-        let state_after_eval = agg.get_current_state();
+        let state_after_eval = get_current_state_from_btree(&agg, &pager, &mut cursor);
         assert_eq!(
             state_after_eval.changes.len(),
             2,
@@ -2579,10 +3204,13 @@ mod tests {
         );
 
         // Now commit the changes
-        agg.commit(uncommitted);
+        pager
+            .io
+            .block(|| agg.commit(uncommitted.clone(), &mut cursor))
+            .unwrap();
 
         // State should now be updated
-        let final_state = agg.get_current_state();
+        let final_state = get_current_state_from_btree(&agg, &pager, &mut cursor);
         assert_eq!(final_state.changes.len(), 3, "Should now have A, B, and C");
 
         let a_final = final_state
@@ -2622,7 +3250,12 @@ mod tests {
     fn test_aggregate_eval_multiple_times_without_commit() {
         // Test that calling eval multiple times with different uncommitted data
         // doesn't pollute the internal state
+        // Create a persistent pager for the test
+        let (pager, root_page_id) = create_test_pager();
+        let mut cursor = BTreeCursor::new_table(None, pager.clone(), root_page_id, 10);
+
         let mut agg = AggregateOperator::new(
+            1,      // operator_id for testing
             vec![], // No GROUP BY
             vec![
                 AggregateFunction::Count,
@@ -2635,10 +3268,13 @@ mod tests {
         let mut init_data = Delta::new();
         init_data.insert(1, vec![Value::Integer(1), Value::Integer(100)]);
         init_data.insert(2, vec![Value::Integer(2), Value::Integer(200)]);
-        agg.initialize(init_data);
+        pager
+            .io
+            .block(|| agg.commit(init_data.clone(), &mut cursor))
+            .unwrap();
 
         // Initial state: count=2, sum=300
-        let initial_state = agg.get_current_state();
+        let initial_state = get_current_state_from_btree(&agg, &pager, &mut cursor);
         assert_eq!(initial_state.changes.len(), 1);
         assert_eq!(initial_state.changes[0].0.values[0], Value::Integer(2));
         assert_eq!(initial_state.changes[0].0.values[1], Value::Float(300.0));
@@ -2646,10 +3282,14 @@ mod tests {
         // First eval with uncommitted
         let mut uncommitted1 = Delta::new();
         uncommitted1.insert(3, vec![Value::Integer(3), Value::Integer(50)]);
-        let _ = agg.eval(Delta::new(), Some(uncommitted1));
+        let mut eval_state1 = uncommitted1.clone().into();
+        let _ = pager
+            .io
+            .block(|| agg.eval(&mut eval_state1, &mut cursor))
+            .unwrap();
 
         // State should be unchanged
-        let state1 = agg.get_current_state();
+        let state1 = get_current_state_from_btree(&agg, &pager, &mut cursor);
         assert_eq!(state1.changes[0].0.values[0], Value::Integer(2));
         assert_eq!(state1.changes[0].0.values[1], Value::Float(300.0));
 
@@ -2657,20 +3297,28 @@ mod tests {
         let mut uncommitted2 = Delta::new();
         uncommitted2.insert(4, vec![Value::Integer(4), Value::Integer(75)]);
         uncommitted2.insert(5, vec![Value::Integer(5), Value::Integer(25)]);
-        let _ = agg.eval(Delta::new(), Some(uncommitted2));
+        let mut eval_state2 = uncommitted2.clone().into();
+        let _ = pager
+            .io
+            .block(|| agg.eval(&mut eval_state2, &mut cursor))
+            .unwrap();
 
         // State should STILL be unchanged
-        let state2 = agg.get_current_state();
+        let state2 = get_current_state_from_btree(&agg, &pager, &mut cursor);
         assert_eq!(state2.changes[0].0.values[0], Value::Integer(2));
         assert_eq!(state2.changes[0].0.values[1], Value::Float(300.0));
 
         // Third eval with deletion as uncommitted
         let mut uncommitted3 = Delta::new();
         uncommitted3.delete(1, vec![Value::Integer(1), Value::Integer(100)]);
-        let _ = agg.eval(Delta::new(), Some(uncommitted3));
+        let mut eval_state3 = uncommitted3.clone().into();
+        let _ = pager
+            .io
+            .block(|| agg.eval(&mut eval_state3, &mut cursor))
+            .unwrap();
 
         // State should STILL be unchanged
-        let state3 = agg.get_current_state();
+        let state3 = get_current_state_from_btree(&agg, &pager, &mut cursor);
         assert_eq!(state3.changes[0].0.values[0], Value::Integer(2));
         assert_eq!(state3.changes[0].0.values[1], Value::Float(300.0));
     }
@@ -2678,7 +3326,12 @@ mod tests {
     #[test]
     fn test_aggregate_eval_with_mixed_committed_and_uncommitted() {
         // Test eval with both committed delta and uncommitted changes
+        // Create a persistent pager for the test
+        let (pager, root_page_id) = create_test_pager();
+        let mut cursor = BTreeCursor::new_table(None, pager.clone(), root_page_id, 10);
+
         let mut agg = AggregateOperator::new(
+            1, // operator_id for testing
             vec!["type".to_string()],
             vec![AggregateFunction::Count],
             vec!["id".to_string(), "type".to_string()],
@@ -2688,7 +3341,10 @@ mod tests {
         let mut init_data = Delta::new();
         init_data.insert(1, vec![Value::Integer(1), Value::Text("X".into())]);
         init_data.insert(2, vec![Value::Integer(2), Value::Text("Y".into())]);
-        agg.initialize(init_data);
+        pager
+            .io
+            .block(|| agg.commit(init_data.clone(), &mut cursor))
+            .unwrap();
 
         // Create a committed delta (to be processed)
         let mut committed_delta = Delta::new();
@@ -2700,20 +3356,76 @@ mod tests {
         uncommitted.insert(5, vec![Value::Integer(5), Value::Text("Z".into())]);
 
         // Eval with both - should process both but not commit
-        let result = agg.eval(committed_delta.clone(), Some(uncommitted));
+        let mut combined = committed_delta.clone();
+        combined.merge(&uncommitted);
+        let mut eval_state = combined.clone().into();
+        let result = pager
+            .io
+            .block(|| agg.eval(&mut eval_state, &mut cursor))
+            .unwrap();
 
         // Result should reflect changes from both
-        assert!(!result.changes.is_empty());
+        assert!(!result.changes.is_empty(), "Result should not be empty");
+
+        // Verify the DBSP pattern: retraction (-1) followed by insertion (1) for updates,
+        // and just insertion (1) for new groups
+
+        // We expect exactly 5 changes:
+        // - X: retraction + insertion (was 1, now 2)
+        // - Y: retraction + insertion (was 1, now 2)
+        // - Z: insertion only (new group with count 1)
+        assert_eq!(
+            result.changes.len(),
+            5,
+            "Should have 5 changes (2 retractions + 3 insertions)"
+        );
+
+        // Sort by group name then by weight to get predictable order
+        let mut sorted_changes: Vec<_> = result.changes.iter().collect();
+        sorted_changes.sort_by(|a, b| {
+            let a_group = &a.0.values[0];
+            let b_group = &b.0.values[0];
+            match a_group.partial_cmp(b_group).unwrap() {
+                std::cmp::Ordering::Equal => a.1.cmp(&b.1), // Sort by weight if same group
+                other => other,
+            }
+        });
+
+        // Check X group: should have retraction (-1) for count=1, then insertion (1) for count=2
+        assert_eq!(sorted_changes[0].0.values[0], Value::Text("X".into()));
+        assert_eq!(sorted_changes[0].0.values[1], Value::Integer(1)); // old count
+        assert_eq!(sorted_changes[0].1, -1); // retraction
+
+        assert_eq!(sorted_changes[1].0.values[0], Value::Text("X".into()));
+        assert_eq!(sorted_changes[1].0.values[1], Value::Integer(2)); // new count
+        assert_eq!(sorted_changes[1].1, 1); // insertion
+
+        // Check Y group: should have retraction (-1) for count=1, then insertion (1) for count=2
+        assert_eq!(sorted_changes[2].0.values[0], Value::Text("Y".into()));
+        assert_eq!(sorted_changes[2].0.values[1], Value::Integer(1)); // old count
+        assert_eq!(sorted_changes[2].1, -1); // retraction
+
+        assert_eq!(sorted_changes[3].0.values[0], Value::Text("Y".into()));
+        assert_eq!(sorted_changes[3].0.values[1], Value::Integer(2)); // new count
+        assert_eq!(sorted_changes[3].1, 1); // insertion
+
+        // Check Z group: should only have insertion (1) for count=1 (new group)
+        assert_eq!(sorted_changes[4].0.values[0], Value::Text("Z".into()));
+        assert_eq!(sorted_changes[4].0.values[1], Value::Integer(1)); // new count
+        assert_eq!(sorted_changes[4].1, 1); // insertion only (no retraction as it's new);
 
         // But internal state should be unchanged
-        let state = agg.get_current_state();
+        let state = get_current_state_from_btree(&agg, &pager, &mut cursor);
         assert_eq!(state.changes.len(), 2, "Should still have only X and Y");
 
         // Now commit only the committed_delta
-        agg.commit(committed_delta);
+        pager
+            .io
+            .block(|| agg.commit(committed_delta.clone(), &mut cursor))
+            .unwrap();
 
         // State should now have X count=2, Y count=1
-        let final_state = agg.get_current_state();
+        let final_state = get_current_state_from_btree(&agg, &pager, &mut cursor);
         let x = final_state
             .changes
             .iter()

@@ -1,0 +1,16 @@
+{
+  "compilerOptions": {
+    "skipLibCheck": true,
+    "declaration": true,
+    "declarationMap": true,
+    "module": "esnext",
+    "target": "esnext",
+    "outDir": "dist/",
+    "lib": [
+      "es2020"
+    ],
+  },
+  "include": [
+    "*"
+  ]
+}

@@ -23,6 +23,12 @@ pub fn translate_delete(
     connection: &Arc<crate::Connection>,
 ) -> Result<ProgramBuilder> {
     let tbl_name = normalize_ident(tbl_name.name.as_str());
+
+    // Check if this is a system table that should be protected from direct writes
+    if crate::schema::is_system_table(&tbl_name) {
+        crate::bail_parse_error!("table {} may not be modified", tbl_name);
+    }
+
     if schema.table_has_indexes(&tbl_name) && !schema.indexes_enabled() {
         // Let's disable altering a table with indices altogether instead of checking column by
         // column to be extra safe.
@@ -76,6 +82,12 @@ pub fn prepare_delete_plan(
         Some(table) => table,
         None => crate::bail_parse_error!("no such table: {}", tbl_name),
     };
+
+    // Check if this is a materialized view
+    if schema.is_materialized_view(&tbl_name) {
+        crate::bail_parse_error!("cannot modify materialized view {}", tbl_name);
+    }
+
     let table = if let Some(table) = table.virtual_table() {
         Table::Virtual(table.clone())
     } else if let Some(table) = table.btree() {
@@ -107,7 +119,8 @@ pub fn prepare_delete_plan(
     )?;
 
     // Parse the LIMIT/OFFSET clause
-    let (resolved_limit, resolved_offset) = limit.map_or(Ok((None, None)), |l| parse_limit(&l))?;
+    let (resolved_limit, resolved_offset) =
+        limit.map_or(Ok((None, None)), |mut l| parse_limit(&mut l, connection))?;
 
     let plan = DeletePlan {
         table_references,

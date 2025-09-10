@@ -64,9 +64,6 @@ impl TempDatabase {
     }
 
     pub fn new_with_rusqlite(table_sql: &str, enable_indexes: bool) -> Self {
-        let _ = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::TRACE)
-            .finish();
         let mut path = TempDir::new().unwrap().keep();
         path.push("test.db");
         {
@@ -209,6 +206,45 @@ pub(crate) fn limbo_exec_rows(
         rows.push(row);
     }
     rows
+}
+
+pub(crate) fn limbo_exec_rows_fallible(
+    _db: &TempDatabase,
+    conn: &Arc<turso_core::Connection>,
+    query: &str,
+) -> Result<Vec<Vec<rusqlite::types::Value>>, turso_core::LimboError> {
+    let mut stmt = conn.prepare(query)?;
+    let mut rows = Vec::new();
+    'outer: loop {
+        let row = loop {
+            let result = stmt.step()?;
+            match result {
+                turso_core::StepResult::Row => {
+                    let row = stmt.row().unwrap();
+                    break row;
+                }
+                turso_core::StepResult::IO => {
+                    stmt.run_once()?;
+                    continue;
+                }
+
+                turso_core::StepResult::Done => break 'outer,
+                r => panic!("unexpected result {r:?}: expecting single row"),
+            }
+        };
+        let row = row
+            .get_values()
+            .map(|x| match x {
+                turso_core::Value::Null => rusqlite::types::Value::Null,
+                turso_core::Value::Integer(x) => rusqlite::types::Value::Integer(*x),
+                turso_core::Value::Float(x) => rusqlite::types::Value::Real(*x),
+                turso_core::Value::Text(x) => rusqlite::types::Value::Text(x.as_str().to_string()),
+                turso_core::Value::Blob(x) => rusqlite::types::Value::Blob(x.to_vec()),
+            })
+            .collect();
+        rows.push(row);
+    }
+    Ok(rows)
 }
 
 pub(crate) fn limbo_exec_rows_error(

@@ -10,7 +10,10 @@ mod tests {
     use rusqlite::{params, types::Value};
 
     use crate::{
-        common::{limbo_exec_rows, rng_from_time, sqlite_exec_rows, TempDatabase},
+        common::{
+            limbo_exec_rows, limbo_exec_rows_fallible, rng_from_time, sqlite_exec_rows,
+            TempDatabase,
+        },
         fuzz::grammar_generator::{const_str, rand_int, rand_str, GrammarGenerator},
     };
 
@@ -499,6 +502,136 @@ mod tests {
                         "DIFFERENT RESULTS! limbo: {:?}, sqlite: {:?}, seed: {}, query: {}, table def: {}",
                         limbo, sqlite, seed, query, table_defs[i]
                     );
+                }
+            }
+        }
+    }
+
+    #[test]
+    /// Create a table with a random number of columns and indexes, and then randomly update or delete rows from the table.
+    /// Verify that the results are the same for SQLite and Turso.
+    pub fn table_index_mutation_fuzz() {
+        let _ = env_logger::try_init();
+        let (mut rng, seed) = rng_from_time();
+        println!("index_scan_single_key_mutation_fuzz seed: {seed}");
+
+        const OUTER_ITERATIONS: usize = 30;
+        for i in 0..OUTER_ITERATIONS {
+            println!(
+                "table_index_mutation_fuzz iteration {}/{}",
+                i + 1,
+                OUTER_ITERATIONS
+            );
+            let limbo_db = TempDatabase::new_empty(true);
+            let sqlite_db = TempDatabase::new_empty(true);
+            let num_cols = rng.random_range(1..=10);
+            let table_def = (0..num_cols)
+                .map(|i| format!("c{i} INTEGER"))
+                .collect::<Vec<_>>();
+            let table_def = table_def.join(", ");
+            let table_def = format!("CREATE TABLE t ({table_def})");
+
+            let num_indexes = rng.random_range(0..=num_cols);
+            let indexes = (0..num_indexes)
+                .map(|i| format!("CREATE INDEX idx_{i} ON t(c{i})"))
+                .collect::<Vec<_>>();
+
+            // Create tables and indexes in both databases
+            let limbo_conn = limbo_db.connect_limbo();
+            limbo_exec_rows(&limbo_db, &limbo_conn, &table_def);
+            for t in indexes.iter() {
+                limbo_exec_rows(&limbo_db, &limbo_conn, t);
+            }
+
+            let sqlite_conn = rusqlite::Connection::open(sqlite_db.path.clone()).unwrap();
+            sqlite_conn.execute(&table_def, params![]).unwrap();
+            for t in indexes.iter() {
+                sqlite_conn.execute(t, params![]).unwrap();
+            }
+
+            // Generate initial data
+            let num_inserts = rng.random_range(10..=1000);
+            let mut tuples = HashSet::new();
+            while tuples.len() < num_inserts {
+                tuples.insert(
+                    (0..num_cols)
+                        .map(|_| rng.random_range(0..1000))
+                        .collect::<Vec<_>>(),
+                );
+            }
+            let mut insert_values = Vec::new();
+            for tuple in tuples {
+                insert_values.push(format!(
+                    "({})",
+                    tuple
+                        .iter()
+                        .map(|x| x.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            // Track executed statements in case we fail
+            let mut dml_statements = Vec::new();
+            let insert = format!("INSERT INTO t VALUES {}", insert_values.join(", "));
+            dml_statements.push(insert.clone());
+
+            // Insert initial data into both databases
+            sqlite_conn.execute(&insert, params![]).unwrap();
+            limbo_exec_rows(&limbo_db, &limbo_conn, &insert);
+
+            const COMPARISONS: [&str; 3] = ["=", "<", ">"];
+            const INNER_ITERATIONS: usize = 100;
+
+            for _ in 0..INNER_ITERATIONS {
+                let do_update = rng.random_range(0..2) == 0;
+
+                let comparison = COMPARISONS[rng.random_range(0..COMPARISONS.len())];
+                let affected_col = rng.random_range(0..num_cols);
+                let predicate_col = rng.random_range(0..num_cols);
+                let predicate_value = rng.random_range(0..1000);
+
+                let query = if do_update {
+                    let new_y = rng.random_range(0..1000);
+                    format!("UPDATE t SET c{affected_col} = {new_y} WHERE c{predicate_col} {comparison} {predicate_value}")
+                } else {
+                    format!("DELETE FROM t WHERE c{predicate_col} {comparison} {predicate_value}")
+                };
+
+                dml_statements.push(query.clone());
+
+                // Execute on both databases
+                sqlite_conn.execute(&query, params![]).unwrap();
+                let limbo_res = limbo_exec_rows_fallible(&limbo_db, &limbo_conn, &query);
+                if let Err(e) = &limbo_res {
+                    // print all the DDL and DML statements
+                    println!("{table_def};");
+                    for t in indexes.iter() {
+                        println!("{t};");
+                    }
+                    for t in dml_statements.iter() {
+                        println!("{t};");
+                    }
+                    panic!("Error executing query: {e}");
+                }
+
+                // Verify results match exactly
+                let verify_query = format!(
+                    "SELECT * FROM t ORDER BY {}",
+                    (0..num_cols)
+                        .map(|i| format!("c{i}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                let sqlite_rows = sqlite_exec_rows(&sqlite_conn, &verify_query);
+                let limbo_rows = limbo_exec_rows(&limbo_db, &limbo_conn, &verify_query);
+
+                assert_eq!(
+                    sqlite_rows, limbo_rows,
+                    "Different results after mutation! limbo: {limbo_rows:?}, sqlite: {sqlite_rows:?}, seed: {seed}, query: {query}",
+                );
+
+                if sqlite_rows.is_empty() {
+                    break;
                 }
             }
         }
@@ -1381,9 +1514,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
-    /// Ignored because of https://github.com/tursodatabase/turso/issues/2040, https://github.com/tursodatabase/turso/issues/2041
-    /// TODO: add fuzzing for other aggregate functions
     pub fn min_max_agg_fuzz() {
         let _ = env_logger::try_init();
 
@@ -1438,6 +1568,107 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    pub fn affinity_fuzz() {
+        let _ = env_logger::try_init();
+
+        let (mut rng, seed) = rng_from_time();
+        log::info!("affinity_fuzz seed: {seed}");
+
+        for iteration in 0..500 {
+            let db = TempDatabase::new_empty(false);
+            let limbo_conn = db.connect_limbo();
+            let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
+
+            // Test different column affinities - cover all SQLite affinity types
+            let affinities = [
+                "INTEGER",
+                "TEXT",
+                "REAL",
+                "NUMERIC",
+                "BLOB",
+                "INT",
+                "TINYINT",
+                "SMALLINT",
+                "MEDIUMINT",
+                "BIGINT",
+                "UNSIGNED BIG INT",
+                "INT2",
+                "INT8",
+                "CHARACTER(20)",
+                "VARCHAR(255)",
+                "VARYING CHARACTER(255)",
+                "NCHAR(55)",
+                "NATIVE CHARACTER(70)",
+                "NVARCHAR(100)",
+                "CLOB",
+                "DOUBLE",
+                "DOUBLE PRECISION",
+                "FLOAT",
+                "DECIMAL(10,5)",
+                "BOOLEAN",
+                "DATE",
+                "DATETIME",
+            ];
+            let affinity = affinities[rng.random_range(0..affinities.len())];
+
+            let create_table = format!("CREATE TABLE t (x {affinity})");
+            limbo_exec_rows(&db, &limbo_conn, &create_table);
+            sqlite_exec_rows(&sqlite_conn, &create_table);
+
+            // Insert various values that test affinity conversion rules
+            let mut values = Vec::new();
+            for _ in 0..20 {
+                let value = match rng.random_range(0..9) {
+                    0 => format!("'{}'", rng.random_range(-10000..10000)), // Pure integer as text
+                    1 => format!(
+                        "'{}.{}'",
+                        rng.random_range(-1000..1000),
+                        rng.random_range(1..999) // Ensure non-zero decimal part
+                    ), // Float as text with decimal
+                    2 => format!("'a{}'", rng.random_range(0..1000)), // Text with integer suffix
+                    3 => format!("'  {}  '", rng.random_range(-100..100)), // Integer with whitespace
+                    4 => format!("'-{}'", rng.random_range(1..1000)), // Negative integer as text
+                    5 => format!("{}", rng.random_range(-10000..10000)), // Direct integer
+                    6 => format!(
+                        "{}.{}",
+                        rng.random_range(-100..100),
+                        rng.random_range(1..999) // Ensure non-zero decimal part
+                    ), // Direct float
+                    7 => "'text_value'".to_string(), // Pure text that won't convert
+                    8 => "NULL".to_string(),         // NULL value
+                    _ => unreachable!(),
+                };
+                values.push(format!("({value})"));
+            }
+
+            let insert = format!("INSERT INTO t VALUES {}", values.join(","));
+            limbo_exec_rows(&db, &limbo_conn, &insert);
+            sqlite_exec_rows(&sqlite_conn, &insert);
+
+            // Query values and their types to verify affinity rules are applied correctly
+            let query = "SELECT x, typeof(x) FROM t";
+            let limbo_result = limbo_exec_rows(&db, &limbo_conn, query);
+            let sqlite_result = sqlite_exec_rows(&sqlite_conn, query);
+
+            assert_eq!(
+                limbo_result, sqlite_result,
+                "iteration: {iteration}, seed: {seed}, affinity: {affinity}, values: {values:?}"
+            );
+
+            // Also test with ORDER BY to ensure affinity affects sorting
+            let query_ordered = "SELECT x FROM t ORDER BY x";
+            let limbo_ordered = limbo_exec_rows(&db, &limbo_conn, query_ordered);
+            let sqlite_ordered = sqlite_exec_rows(&sqlite_conn, query_ordered);
+
+            assert_eq!(
+                limbo_ordered, sqlite_ordered,
+                "ORDER BY failed - iteration: {iteration}, seed: {seed}, affinity: {affinity}"
+            );
+        }
+    }
+
     #[test]
     // Simple fuzz test for SUM with floats
     pub fn sum_agg_fuzz_floats() {

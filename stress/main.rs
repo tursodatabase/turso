@@ -204,7 +204,7 @@ impl ArbitrarySchema {
                     .collect::<Vec<_>>()
                     .join(",");
 
-                format!("CREATE TABLE {} ({});", table.name, columns)
+                format!("CREATE TABLE IF NOT EXISTS {} ({});", table.name, columns)
             })
             .collect()
     }
@@ -476,9 +476,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         tempfile.path().to_string_lossy().to_string()
     };
 
+    let vfs_option = opts.vfs.clone();
+
     for thread in 0..opts.nr_threads {
         let db_file = db_file.clone();
-        let db = Arc::new(Mutex::new(Builder::new_local(&db_file).build().await?));
+        let mut builder = Builder::new_local(&db_file);
+        if let Some(ref vfs) = vfs_option {
+            builder = builder.with_io(vfs.clone());
+        }
+        let db = Arc::new(Mutex::new(builder.build().await?));
         let plan = plan.clone();
         let conn = db.lock().await.connect()?;
 
@@ -507,6 +513,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
         let nr_iterations = opts.nr_iterations;
         let db = db.clone();
+        let vfs_for_task = vfs_option.clone();
 
         let handle = tokio::spawn(async move {
             let mut conn = db.lock().await.connect()?;
@@ -518,7 +525,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     }
                     // Reopen the database
                     let mut db_guard = db.lock().await;
-                    *db_guard = Builder::new_local(&db_file).build().await?;
+                    let mut builder = Builder::new_local(&db_file);
+                    if let Some(ref vfs) = vfs_for_task {
+                        builder = builder.with_io(vfs.clone());
+                    }
+                    *db_guard = builder.build().await?;
                     conn = db_guard.connect()?;
                 } else if gen_bool(0.01) {
                     // Reconnect to the database
@@ -559,13 +570,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 const INTEGRITY_CHECK_INTERVAL: usize = 100;
                 if query_index % INTEGRITY_CHECK_INTERVAL == 0 {
                     let mut res = conn.query("PRAGMA integrity_check", ()).await.unwrap();
-                    if let Some(row) = res.next().await? {
-                        let value = row.get_value(0).unwrap();
-                        if value != "ok".into() {
-                            panic!("integrity check failed: {:?}", value);
+                    match res.next().await {
+                        Ok(Some(row)) => {
+                            let value = row.get_value(0).unwrap();
+                            if value != "ok".into() {
+                                panic!("integrity check failed: {:?}", value);
+                            }
                         }
-                    } else {
-                        panic!("integrity check failed: no rows");
+                        Ok(None) => {
+                            panic!("integrity check failed: no rows");
+                        }
+                        Err(e) => {
+                            println!("Error performing integrity check: {e}");
+                        }
                     }
                 }
             }

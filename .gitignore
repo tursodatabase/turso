@@ -4,6 +4,7 @@
 
 *.so
 *.ipynb
+*.o
 
 # Python
 .mypy_cache/
@@ -41,3 +42,5 @@ simulator.log
 **/*.txt
 profile.json.gz
 simulator-output/
+
+&1

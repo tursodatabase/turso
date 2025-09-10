@@ -115,6 +115,7 @@ pub fn handle_distinct(program: &mut ProgramBuilder, agg: &Aggregate, agg_arg_re
         count: num_regs,
         dest_reg: record_reg,
         index_name: Some(distinct_ctx.ephemeral_index_name.to_string()),
+        affinity_str: None,
     });
     program.emit_insn(Insn::IdxInsert {
         cursor_id: distinct_ctx.cursor_id,

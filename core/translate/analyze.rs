@@ -212,6 +212,7 @@ pub fn translate_analyze(
         count: 3,
         dest_reg: record_reg,
         index_name: None,
+        affinity_str: None,
     });
     program.emit_insn(Insn::NewRowid {
         cursor: stat_cursor,

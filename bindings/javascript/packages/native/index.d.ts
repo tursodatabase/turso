@@ -8,13 +8,13 @@ export declare class Database {
    * # Arguments
    * * `path` - The path to the database file.
    */
-  constructor(path: string)
+  constructor(path: string, opts?: DatabaseOpts | undefined | null)
   /** Returns whether the database is in memory-only mode. */
   get memory(): boolean
   /** Returns whether the database connection is open. */
   get open(): boolean
   /**
-   * Executes a batch of SQL statements.
+   * Executes a batch of SQL statements on main thread
    *
    * # Arguments
    *
@@ -22,7 +22,17 @@ export declare class Database {
    *
    * # Returns
    */
-  batch(sql: string): void
+  batchSync(sql: string): void
+  /**
+   * Executes a batch of SQL statements outside of main thread
+   *
+   * # Arguments
+   *
+   * * `sql` - The SQL statements to execute.
+   *
+   * # Returns
+   */
+  batchAsync(sql: string): Promise<unknown>
   /**
    * Prepares a statement for execution.
    *
@@ -105,10 +115,15 @@ export declare class Statement {
    */
   bindAt(index: number, value: unknown): void
   /**
-   * Step the statement and return result code:
+   * Step the statement and return result code (executed on the main thread):
    * 1 = Row available, 2 = Done, 3 = I/O needed
    */
-  step(): number
+  stepSync(): number
+  /**
+   * Step the statement and return result code (executed on the background thread):
+   * 1 = Row available, 2 = Done, 3 = I/O needed
+   */
+  stepAsync(): Promise<unknown>
   /** Get the current row data according to the presentation mode */
   row(): unknown
   /** Sets the presentation mode to raw. */
@@ -127,4 +142,8 @@ export declare class Statement {
   columns(): unknown[]
   /** Finalizes the statement. */
   finalize(): void
+}
+
+export interface DatabaseOpts {
+  tracing?: string
 }

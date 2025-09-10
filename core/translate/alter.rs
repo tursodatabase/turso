@@ -28,6 +28,12 @@ pub fn translate_alter_table(
         body: alter_table,
     } = alter;
     let table_name = table_name.name.as_str();
+
+    // Check if someone is trying to ALTER a system table
+    if crate::schema::is_system_table(table_name) {
+        crate::bail_parse_error!("table {} may not be modified", table_name);
+    }
+
     if schema.table_has_indexes(table_name) && !schema.indexes_enabled() {
         // Let's disable altering a table with indices altogether instead of checking column by
         // column to be extra safe.
@@ -135,11 +141,18 @@ pub fn translate_alter_table(
 
                         let record = program.alloc_register();
 
+                        let affinity_str = btree
+                            .columns
+                            .iter()
+                            .map(|col| col.affinity().aff_mask())
+                            .collect::<String>();
+
                         program.emit_insn(Insn::MakeRecord {
                             start_reg: first_column,
                             count: column_count,
                             dest_reg: record,
                             index_name: None,
+                            affinity_str: Some(affinity_str),
                         });
 
                         program.emit_insn(Insn::Insert {
@@ -295,6 +308,7 @@ pub fn translate_alter_table(
                     count: sqlite_schema_column_len,
                     dest_reg: record,
                     index_name: None,
+                    affinity_str: None,
                 });
 
                 program.emit_insn(Insn::Insert {
@@ -436,6 +450,7 @@ pub fn translate_alter_table(
                     count: sqlite_schema_column_len,
                     dest_reg: record,
                     index_name: None,
+                    affinity_str: None,
                 });
 
                 program.emit_insn(Insn::Insert {

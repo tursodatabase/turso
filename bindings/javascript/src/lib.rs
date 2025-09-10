@@ -10,14 +10,20 @@
 //! - Iterating through query results
 //! - Managing the I/O event loop
 
+#[cfg(feature = "browser")]
+pub mod browser;
+
 use napi::bindgen_prelude::*;
 use napi::{Env, Task};
 use napi_derive::napi;
+use std::sync::OnceLock;
 use std::{
     cell::{Cell, RefCell},
     num::NonZeroUsize,
     sync::Arc,
 };
+use tracing_subscriber::filter::LevelFilter;
+use tracing_subscriber::fmt::format::FmtSpan;
 
 /// Step result constants
 const STEP_ROW: u32 = 1;
@@ -38,10 +44,105 @@ enum PresentationMode {
 pub struct Database {
     _db: Option<Arc<turso_core::Database>>,
     io: Arc<dyn turso_core::IO>,
-    conn: Arc<turso_core::Connection>,
+    conn: Option<Arc<turso_core::Connection>>,
     is_memory: bool,
     is_open: Cell<bool>,
     default_safe_integers: Cell<bool>,
+}
+
+pub(crate) fn is_memory(path: &str) -> bool {
+    path == ":memory:"
+}
+
+static TRACING_INIT: OnceLock<()> = OnceLock::new();
+pub(crate) fn init_tracing(level_filter: Option<String>) {
+    let Some(level_filter) = level_filter else {
+        return;
+    };
+    let level_filter = match level_filter.as_ref() {
+        "info" => LevelFilter::INFO,
+        "debug" => LevelFilter::DEBUG,
+        "trace" => LevelFilter::TRACE,
+        _ => return,
+    };
+    TRACING_INIT.get_or_init(|| {
+        tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_thread_ids(true)
+            .with_span_events(FmtSpan::ACTIVE)
+            .with_max_level(level_filter)
+            .init();
+    });
+}
+
+pub enum DbTask {
+    Batch {
+        conn: Arc<turso_core::Connection>,
+        sql: String,
+    },
+    Step {
+        stmt: Arc<RefCell<Option<turso_core::Statement>>>,
+    },
+}
+
+unsafe impl Send for DbTask {}
+
+impl Task for DbTask {
+    type Output = u32;
+    type JsValue = u32;
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        match self {
+            DbTask::Batch { conn, sql } => {
+                batch_sync(conn, sql)?;
+                Ok(0)
+            }
+            DbTask::Step { stmt } => step_sync(stmt),
+        }
+    }
+
+    fn resolve(&mut self, _: Env, output: Self::Output) -> Result<Self::JsValue> {
+        Ok(output)
+    }
+}
+
+#[napi(object)]
+pub struct DatabaseOpts {
+    pub tracing: Option<String>,
+}
+
+fn batch_sync(conn: &Arc<turso_core::Connection>, sql: &str) -> napi::Result<()> {
+    conn.prepare_execute_batch(sql).map_err(|e| {
+        Error::new(
+            Status::GenericFailure,
+            format!("Failed to execute batch: {e}"),
+        )
+    })?;
+    Ok(())
+}
+
+fn step_sync(stmt: &Arc<RefCell<Option<turso_core::Statement>>>) -> napi::Result<u32> {
+    let mut stmt_ref = stmt.borrow_mut();
+    let stmt = stmt_ref
+        .as_mut()
+        .ok_or_else(|| Error::new(Status::GenericFailure, "Statement has been finalized"))?;
+
+    match stmt.step() {
+        Ok(turso_core::StepResult::Row) => Ok(STEP_ROW),
+        Ok(turso_core::StepResult::IO) => Ok(STEP_IO),
+        Ok(turso_core::StepResult::Done) => Ok(STEP_DONE),
+        Ok(turso_core::StepResult::Interrupt) => Err(Error::new(
+            Status::GenericFailure,
+            "Statement was interrupted",
+        )),
+        Ok(turso_core::StepResult::Busy) => {
+            Err(Error::new(Status::GenericFailure, "Database is busy"))
+        }
+        Err(e) => Err(Error::new(
+            Status::GenericFailure,
+            format!("Step failed: {e}"),
+        )),
+    }
 }
 
 #[napi]
@@ -51,15 +152,22 @@ impl Database {
     /// # Arguments
     /// * `path` - The path to the database file.
     #[napi(constructor)]
-    pub fn new(path: String) -> Result<Self> {
-        let is_memory = path == ":memory:";
-        let io: Arc<dyn turso_core::IO> = if is_memory {
+    pub fn new(path: String, opts: Option<DatabaseOpts>) -> Result<Self> {
+        if let Some(opts) = opts {
+            init_tracing(opts.tracing);
+        }
+        let io: Arc<dyn turso_core::IO> = if is_memory(&path) {
             Arc::new(turso_core::MemoryIO::new())
         } else {
             Arc::new(turso_core::PlatformIO::new().map_err(|e| {
                 Error::new(Status::GenericFailure, format!("Failed to create IO: {e}"))
             })?)
         };
+
+        #[cfg(feature = "browser")]
+        if !is_memory(&path) {
+            return Err(Error::new(Status::GenericFailure, "sync constructor is not supported for FS-backed databases in the WASM. Use async connect(...) method instead".to_string()));
+        }
 
         let file = io
             .open_file(&path, turso_core::OpenFlags::Create, false)
@@ -78,7 +186,7 @@ impl Database {
             .connect()
             .map_err(|e| Error::new(Status::GenericFailure, format!("Failed to connect: {e}")))?;
 
-        Ok(Self::create(Some(db), io, conn, is_memory))
+        Ok(Self::create(Some(db), io, conn, is_memory(&path)))
     }
 
     pub fn create(
@@ -90,11 +198,21 @@ impl Database {
         Database {
             _db: db,
             io,
-            conn,
+            conn: Some(conn),
             is_memory,
             is_open: Cell::new(true),
             default_safe_integers: Cell::new(false),
         }
+    }
+
+    fn conn(&self) -> Result<Arc<turso_core::Connection>> {
+        let Some(conn) = self.conn.as_ref() else {
+            return Err(napi::Error::new(
+                napi::Status::GenericFailure,
+                "connection is not set",
+            ));
+        };
+        Ok(conn.clone())
     }
 
     /// Returns whether the database is in memory-only mode.
@@ -109,7 +227,7 @@ impl Database {
         self.is_open.get()
     }
 
-    /// Executes a batch of SQL statements.
+    /// Executes a batch of SQL statements on main thread
     ///
     /// # Arguments
     ///
@@ -117,14 +235,23 @@ impl Database {
     ///
     /// # Returns
     #[napi]
-    pub fn batch(&self, sql: String) -> Result<()> {
-        self.conn.prepare_execute_batch(&sql).map_err(|e| {
-            Error::new(
-                Status::GenericFailure,
-                format!("Failed to execute batch: {e}"),
-            )
-        })?;
-        Ok(())
+    pub fn batch_sync(&self, sql: String) -> Result<()> {
+        batch_sync(&self.conn()?, &sql)
+    }
+
+    /// Executes a batch of SQL statements outside of main thread
+    ///
+    /// # Arguments
+    ///
+    /// * `sql` - The SQL statements to execute.
+    ///
+    /// # Returns
+    #[napi]
+    pub fn batch_async(&self, sql: String) -> Result<AsyncTask<DbTask>> {
+        Ok(AsyncTask::new(DbTask::Batch {
+            conn: self.conn()?.clone(),
+            sql,
+        }))
     }
 
     /// Prepares a statement for execution.
@@ -139,14 +266,15 @@ impl Database {
     #[napi]
     pub fn prepare(&self, sql: String) -> Result<Statement> {
         let stmt = self
-            .conn
+            .conn()?
             .prepare(&sql)
             .map_err(|e| Error::new(Status::GenericFailure, format!("{e}")))?;
         let column_names: Vec<std::ffi::CString> = (0..stmt.num_columns())
             .map(|i| std::ffi::CString::new(stmt.get_column_name(i).to_string()).unwrap())
             .collect();
         Ok(Statement {
-            stmt: RefCell::new(Some(stmt)),
+            #[allow(clippy::arc_with_non_send_sync)]
+            stmt: Arc::new(RefCell::new(Some(stmt))),
             column_names,
             mode: RefCell::new(PresentationMode::Expanded),
             safe_integers: Cell::new(self.default_safe_integers.get()),
@@ -160,7 +288,7 @@ impl Database {
     /// The rowid of the last row inserted.
     #[napi]
     pub fn last_insert_rowid(&self) -> Result<i64> {
-        Ok(self.conn.last_insert_rowid())
+        Ok(self.conn()?.last_insert_rowid())
     }
 
     /// Returns the number of changes made by the last statement.
@@ -170,7 +298,7 @@ impl Database {
     /// The number of changes made by the last statement.
     #[napi]
     pub fn changes(&self) -> Result<i64> {
-        Ok(self.conn.changes())
+        Ok(self.conn()?.changes())
     }
 
     /// Returns the total number of changes made by all statements.
@@ -180,7 +308,7 @@ impl Database {
     /// The total number of changes made by all statements.
     #[napi]
     pub fn total_changes(&self) -> Result<i64> {
-        Ok(self.conn.total_changes())
+        Ok(self.conn()?.total_changes())
     }
 
     /// Closes the database connection.
@@ -189,9 +317,10 @@ impl Database {
     ///
     /// `Ok(())` if the database is closed successfully.
     #[napi]
-    pub fn close(&self) -> Result<()> {
+    pub fn close(&mut self) -> Result<()> {
         self.is_open.set(false);
-        // Database close is handled automatically when dropped
+        let _ = self._db.take().unwrap();
+        let _ = self.conn.take().unwrap();
         Ok(())
     }
 
@@ -225,7 +354,7 @@ impl Database {
 /// A prepared statement.
 #[napi]
 pub struct Statement {
-    stmt: RefCell<Option<turso_core::Statement>>,
+    stmt: Arc<RefCell<Option<turso_core::Statement>>>,
     column_names: Vec<std::ffi::CString>,
     mode: RefCell<PresentationMode>,
     safe_integers: Cell<bool>,
@@ -344,31 +473,20 @@ impl Statement {
         Ok(())
     }
 
-    /// Step the statement and return result code:
+    /// Step the statement and return result code (executed on the main thread):
     /// 1 = Row available, 2 = Done, 3 = I/O needed
     #[napi]
-    pub fn step(&self) -> Result<u32> {
-        let mut stmt_ref = self.stmt.borrow_mut();
-        let stmt = stmt_ref
-            .as_mut()
-            .ok_or_else(|| Error::new(Status::GenericFailure, "Statement has been finalized"))?;
+    pub fn step_sync(&self) -> Result<u32> {
+        step_sync(&self.stmt)
+    }
 
-        match stmt.step() {
-            Ok(turso_core::StepResult::Row) => Ok(STEP_ROW),
-            Ok(turso_core::StepResult::Done) => Ok(STEP_DONE),
-            Ok(turso_core::StepResult::IO) => Ok(STEP_IO),
-            Ok(turso_core::StepResult::Interrupt) => Err(Error::new(
-                Status::GenericFailure,
-                "Statement was interrupted",
-            )),
-            Ok(turso_core::StepResult::Busy) => {
-                Err(Error::new(Status::GenericFailure, "Database is busy"))
-            }
-            Err(e) => Err(Error::new(
-                Status::GenericFailure,
-                format!("Step failed: {e}"),
-            )),
-        }
+    /// Step the statement and return result code (executed on the background thread):
+    /// 1 = Row available, 2 = Done, 3 = I/O needed
+    #[napi]
+    pub fn step_async(&self) -> Result<AsyncTask<DbTask>> {
+        Ok(AsyncTask::new(DbTask::Step {
+            stmt: self.stmt.clone(),
+        }))
     }
 
     /// Get the current row data according to the presentation mode
@@ -543,8 +661,17 @@ fn to_js_value<'a>(
         turso_core::Value::Float(f) => ToNapiValue::into_unknown(*f, env),
         turso_core::Value::Text(s) => ToNapiValue::into_unknown(s.as_str(), env),
         turso_core::Value::Blob(b) => {
-            let buffer = Buffer::from(b.as_slice());
-            ToNapiValue::into_unknown(buffer, env)
+            #[cfg(not(feature = "browser"))]
+            {
+                let buffer = Buffer::from(b.as_slice());
+                ToNapiValue::into_unknown(buffer, env)
+            }
+            // emnapi do not support Buffer
+            #[cfg(feature = "browser")]
+            {
+                let buffer = Uint8Array::from(b.as_slice());
+                ToNapiValue::into_unknown(buffer, env)
+            }
         }
     }
 }

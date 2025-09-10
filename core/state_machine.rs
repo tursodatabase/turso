@@ -27,6 +27,7 @@ pub trait StateTransition {
     fn is_finalized(&self) -> bool;
 }
 
+#[derive(Debug)]
 pub struct StateMachine<State: StateTransition> {
     state: State,
     is_finalized: bool,

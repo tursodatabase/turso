@@ -1,5 +1,4 @@
-use std::collections::HashSet;
-
+use indexmap::IndexSet;
 use rand::Rng;
 use turso_core::Value;
 
@@ -28,7 +27,7 @@ impl Arbitrary for Table {
         } else {
             rng.random_range(opts.column_range)
         } as usize;
-        let mut column_set = HashSet::with_capacity(column_size);
+        let mut column_set = IndexSet::with_capacity(column_size);
         for col in std::iter::repeat_with(|| Column::arbitrary(rng, context)) {
             column_set.insert(col);
             if column_set.len() == column_size {

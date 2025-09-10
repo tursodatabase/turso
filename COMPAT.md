@@ -393,7 +393,7 @@ Modifiers:
 | jsonb_group_array(value)           | Yes     |                                                                                                                                              |
 | json_group_object(label,value)     | Yes     |                                                                                                                                              |
 | jsonb_group_object(name,value)     | Yes     |                                                                                                                                              |
-| json_each(json)                    |         |                                                                                                                                              |
+| json_each(json)                    | Yes     |                                                                                                                                              |
 | json_each(json,path)               |         |                                                                                                                                              |
 | json_tree(json)                    |         |                                                                                                                                              |
 | json_tree(json,path)               |         |                                                                                                                                              |

@@ -1,12 +1,6 @@
-import { Database as NativeDB, Statement as NativeStatement } from "#entry-point";
 import { bindParams } from "./bind.js";
-
 import { SqliteError } from "./sqlite-error.js";
-
-// Step result constants
-const STEP_ROW = 1;
-const STEP_DONE = 2;
-const STEP_IO = 3;
+import { NativeDatabase, NativeStatement, STEP_IO, STEP_ROW, STEP_DONE } from "./types.js";
 
 const convertibleErrorTypes = { TypeError };
 const CONVERTIBLE_ERROR_PREFIX = "[TURSO_CONVERT_TYPE]";
@@ -35,10 +29,11 @@ function createErrorByName(name, message) {
  * Database represents a connection that can prepare and execute SQL statements.
  */
 class Database {
-  db: NativeDB;
+  db: NativeDatabase;
   memory: boolean;
   open: boolean;
   private _inTransaction: boolean = false;
+
   /**
    * Creates a new database connection. If the database file pointed to by `path` does not exists, it will be created.
    *
@@ -49,33 +44,27 @@ class Database {
    * @param {boolean} [opts.fileMustExist=false] - If true, throws if database file does not exist.
    * @param {number} [opts.timeout=0] - Timeout duration in milliseconds for database operations. Defaults to 0 (no timeout).
    */
-  constructor(path: string, opts: any = {}) {
+  constructor(db: NativeDatabase, opts: any = {}) {
     opts.readonly = opts.readonly === undefined ? false : opts.readonly;
     opts.fileMustExist =
       opts.fileMustExist === undefined ? false : opts.fileMustExist;
     opts.timeout = opts.timeout === undefined ? 0 : opts.timeout;
 
-    const db = new NativeDB(path);
-    this.initialize(db, opts.path, opts.readonly);
-  }
-  static create() {
-    return Object.create(this.prototype);
-  }
-  initialize(db: NativeDB, name, readonly) {
     this.db = db;
-    this.memory = db.memory;
+    this.memory = this.db.memory;
+
     Object.defineProperties(this, {
       inTransaction: {
         get: () => this._inTransaction,
       },
       name: {
         get() {
-          return name;
+          return db.path;
         },
       },
       readonly: {
         get() {
-          return readonly;
+          return opts.readonly;
         },
       },
       open: {
@@ -203,7 +192,7 @@ class Database {
     }
 
     try {
-      this.db.batch(sql);
+      this.db.batchSync(sql);
     } catch (err) {
       throw convertError(err);
     }
@@ -239,7 +228,8 @@ class Database {
 class Statement {
   stmt: NativeStatement;
   db: Database;
-  constructor(stmt, database) {
+
+  constructor(stmt: NativeStatement, database: Database) {
     this.stmt = stmt;
     this.db = database;
   }
@@ -298,16 +288,15 @@ class Statement {
   /**
    * Executes the SQL statement and returns an info object.
    */
-  async run(...bindParameters) {
+  run(...bindParameters) {
     const totalChangesBefore = this.db.db.totalChanges();
 
     this.stmt.reset();
     bindParams(this.stmt, bindParameters);
-
-    while (true) {
-      const stepResult = this.stmt.step();
+    for (; ;) {
+      const stepResult = this.stmt.stepSync();
       if (stepResult === STEP_IO) {
-        await this.db.db.ioLoopAsync();
+        this.db.db.ioLoopSync();
         continue;
       }
       if (stepResult === STEP_DONE) {
@@ -330,14 +319,13 @@ class Statement {
    *
    * @param bindParameters - The bind parameters for executing the statement.
    */
-  async get(...bindParameters) {
+  get(...bindParameters) {
     this.stmt.reset();
     bindParams(this.stmt, bindParameters);
-
-    while (true) {
-      const stepResult = this.stmt.step();
+    for (; ;) {
+      const stepResult = this.stmt.stepSync();
       if (stepResult === STEP_IO) {
-        await this.db.db.ioLoopAsync();
+        this.db.db.ioLoopSync();
         continue;
       }
       if (stepResult === STEP_DONE) {
@@ -354,14 +342,14 @@ class Statement {
    *
    * @param bindParameters - The bind parameters for executing the statement.
    */
-  async *iterate(...bindParameters) {
+  *iterate(...bindParameters) {
     this.stmt.reset();
     bindParams(this.stmt, bindParameters);
 
     while (true) {
-      const stepResult = this.stmt.step();
+      const stepResult = this.stmt.stepSync();
       if (stepResult === STEP_IO) {
-        await this.db.db.ioLoopAsync();
+        this.db.db.ioLoopSync();
         continue;
       }
       if (stepResult === STEP_DONE) {
@@ -378,15 +366,14 @@ class Statement {
    *
    * @param bindParameters - The bind parameters for executing the statement.
    */
-  async all(...bindParameters) {
+  all(...bindParameters) {
     this.stmt.reset();
     bindParams(this.stmt, bindParameters);
     const rows: any[] = [];
-
-    while (true) {
-      const stepResult = this.stmt.step();
+    for (; ;) {
+      const stepResult = this.stmt.stepSync();
       if (stepResult === STEP_IO) {
-        await this.db.db.ioLoopAsync();
+        this.db.db.ioLoopSync();
         continue;
       }
       if (stepResult === STEP_DONE) {
@@ -423,15 +410,4 @@ class Statement {
   }
 }
 
-/**
- * Creates a new database connection asynchronously.
- * 
- * @param {string} path - Path to the database file.
- * @param {Object} opts - Options for database behavior.
- * @returns {Promise<Database>} - A promise that resolves to a Database instance.
- */
-async function connect(path: string, opts: any = {}): Promise<Database> {
-  return new Database(path, opts);
-}
-
-export { Database, SqliteError, connect }
+export { Database, Statement }

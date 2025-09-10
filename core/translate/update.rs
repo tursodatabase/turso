@@ -4,6 +4,7 @@ use std::sync::Arc;
 use crate::schema::{BTreeTable, Column, Type};
 use crate::translate::optimizer::optimize_select_plan;
 use crate::translate::plan::{Operation, QueryDestination, Scan, Search, SelectPlan};
+use crate::translate::planner::parse_limit;
 use crate::vdbe::builder::CursorType;
 use crate::{
     bail_parse_error,
@@ -21,8 +22,7 @@ use super::plan::{
     ColumnUsedMask, IterationDirection, JoinedTable, Plan, ResultSetColumn, TableReferences,
     UpdatePlan,
 };
-use super::planner::bind_column_references;
-use super::planner::{parse_limit, parse_where};
+use super::planner::{bind_column_references, parse_where};
 /*
 * Update is simple. By default we scan the table, and for each row, we check the WHERE
 * clause. If it evaluates to true, we build the new record with the updated value and insert.
@@ -59,7 +59,7 @@ pub fn translate_update(
     mut program: ProgramBuilder,
     connection: &Arc<crate::Connection>,
 ) -> crate::Result<ProgramBuilder> {
-    let mut plan = prepare_update_plan(&mut program, schema, body, connection)?;
+    let mut plan = prepare_update_plan(&mut program, schema, body, connection, false)?;
     optimize_plan(&mut plan, schema)?;
     // TODO: freestyling these numbers
     let opts = ProgramBuilderOpts {
@@ -81,7 +81,7 @@ pub fn translate_update_for_schema_change(
     ddl_query: &str,
     after: impl FnOnce(&mut ProgramBuilder),
 ) -> crate::Result<ProgramBuilder> {
-    let mut plan = prepare_update_plan(&mut program, schema, body, connection)?;
+    let mut plan = prepare_update_plan(&mut program, schema, body, connection, true)?;
 
     if let Plan::Update(plan) = &mut plan {
         if program.capture_data_changes_mode().has_updates() {
@@ -106,6 +106,7 @@ pub fn prepare_update_plan(
     schema: &Schema,
     body: &mut ast::Update,
     connection: &Arc<crate::Connection>,
+    is_internal_schema_change: bool,
 ) -> crate::Result<Plan> {
     if body.with.is_some() {
         bail_parse_error!("WITH clause is not supported in UPDATE");
@@ -121,6 +122,13 @@ pub fn prepare_update_plan(
         bail_parse_error!("INDEXED BY clause is not supported in UPDATE");
     }
     let table_name = &body.tbl_name.name;
+
+    // Check if this is a system table that should be protected from direct writes
+    // Skip this check for internal schema change operations (like ALTER TABLE)
+    if !is_internal_schema_change && crate::schema::is_system_table(table_name.as_str()) {
+        bail_parse_error!("table {} may not be modified", table_name);
+    }
+
     if schema.table_has_indexes(&table_name.to_string()) && !schema.indexes_enabled() {
         // Let's disable altering a table with indices altogether instead of checking column by
         // column to be extra safe.
@@ -132,6 +140,12 @@ pub fn prepare_update_plan(
         Some(table) => table,
         None => bail_parse_error!("Parse error: no such table: {}", table_name),
     };
+
+    // Check if this is a materialized view
+    if schema.is_materialized_view(table_name.as_str()) {
+        bail_parse_error!("cannot modify materialized view {}", table_name);
+    }
+
     let table_name = table.get_name();
     let iter_dir = body
         .order_by
@@ -332,7 +346,10 @@ pub fn prepare_update_plan(
     };
 
     // Parse the LIMIT/OFFSET clause
-    let (limit, offset) = body.limit.as_ref().map_or(Ok((None, None)), parse_limit)?;
+    let (limit, offset) = body
+        .limit
+        .as_mut()
+        .map_or(Ok((None, None)), |l| parse_limit(l, connection))?;
 
     // Check what indexes will need to be updated by checking set_clauses and see
     // if a column is contained in an index.

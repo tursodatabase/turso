@@ -1,14 +1,16 @@
 #![allow(unused)]
+use crate::incremental::view::IncrementalView;
 use crate::translate::expr::WalkControl;
 use crate::types::IOResult;
 use crate::{
-    schema::{self, Column, MaterializedViewsMap, Schema, Type},
+    schema::{self, BTreeTable, Column, Schema, Table, Type, DBSP_TABLE_PREFIX},
     translate::{collate::CollationSeq, expr::walk_expr, plan::JoinOrderMember},
     types::{Value, ValueType},
     LimboError, OpenFlags, Result, Statement, StepResult, SymbolTable,
 };
 use crate::{Connection, IO};
 use std::{
+    collections::HashMap,
     rc::Rc,
     sync::{Arc, Mutex},
 };
@@ -148,7 +150,7 @@ pub fn parse_schema_rows(
     schema: &mut Schema,
     syms: &SymbolTable,
     mv_tx_id: Option<u64>,
-    mut existing_views: MaterializedViewsMap,
+    mut existing_views: HashMap<String, Arc<Mutex<IncrementalView>>>,
 ) -> Result<()> {
     rows.set_mv_tx_id(mv_tx_id);
     // TODO: if we IO, this unparsed indexes is lost. Will probably need some state between
@@ -156,8 +158,12 @@ pub fn parse_schema_rows(
     let mut from_sql_indexes = Vec::with_capacity(10);
     let mut automatic_indices = std::collections::HashMap::with_capacity(10);
 
-    // Collect views for second pass to populate table_to_views mapping
-    let mut views_to_process: Vec<(String, Vec<String>)> = Vec::new();
+    // Store DBSP state table root pages: view_name -> dbsp_state_root_page
+    let mut dbsp_state_roots: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    // Store materialized view info (SQL and root page) for later creation
+    let mut materialized_view_info: std::collections::HashMap<String, (String, usize)> =
+        std::collections::HashMap::new();
     loop {
         match rows.step()? {
             StepResult::Row => {
@@ -189,6 +195,18 @@ pub fn parse_schema_rows(
                             schema.add_virtual_table(vtab);
                         } else {
                             let table = schema::BTreeTable::from_sql(sql, root_page as usize)?;
+
+                            // Check if this is a DBSP state table
+                            if table.name.starts_with(DBSP_TABLE_PREFIX) {
+                                // Extract the view name from __turso_internal_dbsp_state_<viewname>
+                                let view_name = table
+                                    .name
+                                    .strip_prefix(DBSP_TABLE_PREFIX)
+                                    .unwrap()
+                                    .to_string();
+                                dbsp_state_roots.insert(view_name, root_page as usize);
+                            }
+
                             schema.add_btree_table(Arc::new(table));
                         }
                     }
@@ -228,6 +246,7 @@ pub fn parse_schema_rows(
                         use turso_parser::parser::Parser;
 
                         let name: &str = row.get::<&str>(1)?;
+                        let root_page = row.get::<i64>(3)?;
                         let sql: &str = row.get::<&str>(4)?;
                         let view_name = name.to_string();
 
@@ -236,52 +255,17 @@ pub fn parse_schema_rows(
                         if let Ok(Some(Cmd::Stmt(stmt))) = parser.next_cmd() {
                             match stmt {
                                 Stmt::CreateMaterializedView { .. } => {
-                                    // Handle materialized view with potential reuse
-                                    let should_create_new = if let Some(existing_view) =
-                                        existing_views.remove(&view_name)
-                                    {
-                                        // Check if we can reuse this view (same SQL definition)
-                                        let can_reuse = if let Ok(view_guard) = existing_view.lock()
-                                        {
-                                            view_guard.has_same_sql(sql)
-                                        } else {
-                                            false
-                                        };
+                                    // Store materialized view info for later creation
+                                    // We'll handle reuse logic and create the actual IncrementalView
+                                    // in a later pass when we have both the main root page and DBSP state root
+                                    materialized_view_info.insert(
+                                        view_name.clone(),
+                                        (sql.to_string(), root_page as usize),
+                                    );
 
-                                        if can_reuse {
-                                            // Reuse the existing view - it's already populated!
-                                            let referenced_tables =
-                                                if let Ok(view_guard) = existing_view.lock() {
-                                                    view_guard.get_referenced_table_names()
-                                                } else {
-                                                    vec![]
-                                                };
-
-                                            // Add the existing view to the new schema
-                                            schema
-                                                .materialized_views
-                                                .insert(view_name.clone(), existing_view);
-
-                                            // Store for second pass processing
-                                            views_to_process
-                                                .push((view_name.clone(), referenced_tables));
-                                            false // Don't create new
-                                        } else {
-                                            true // SQL changed, need to create new
-                                        }
-                                    } else {
-                                        true // No existing view, need to create new
-                                    };
-
-                                    if should_create_new {
-                                        // Create a new IncrementalView
-                                        // If this fails, we should propagate the error so the transaction rolls back
-                                        let incremental_view =
-                                            IncrementalView::from_sql(sql, schema)?;
-                                        let referenced_tables =
-                                            incremental_view.get_referenced_table_names();
-                                        schema.add_materialized_view(incremental_view);
-                                        views_to_process.push((view_name, referenced_tables));
+                                    // Mark the existing view for potential reuse
+                                    if existing_views.contains_key(&view_name) {
+                                        // We'll check for reuse in the third pass
                                     }
                                 }
                                 Stmt::CreateView {
@@ -359,11 +343,56 @@ pub fn parse_schema_rows(
         }
     }
 
-    // Second pass: populate table_to_views mapping
-    for (view_name, referenced_tables) in views_to_process {
-        // Register this view as dependent on each referenced table
-        for table_name in referenced_tables {
-            schema.add_materialized_view_dependency(&table_name, &view_name);
+    // Third pass: Create materialized views now that we have both root pages
+    for (view_name, (sql, main_root)) in materialized_view_info {
+        // Look up the DBSP state root for this view - must exist for materialized views
+        let dbsp_state_root = dbsp_state_roots.get(&view_name).ok_or_else(|| {
+            LimboError::InternalError(format!(
+                "Materialized view {view_name} is missing its DBSP state table"
+            ))
+        })?;
+
+        // Check if we can reuse the existing view
+        let mut reuse_view = false;
+        if let Some(existing_view_mutex) = schema.get_materialized_view(&view_name) {
+            let existing_view = existing_view_mutex.lock().unwrap();
+            if let Some(existing_sql) = schema.materialized_view_sql.get(&view_name) {
+                if existing_sql == &sql {
+                    reuse_view = true;
+                }
+            }
+        }
+
+        if reuse_view {
+            // View already exists with same SQL, just update dependencies
+            let existing_view_mutex = schema.get_materialized_view(&view_name).unwrap();
+            let existing_view = existing_view_mutex.lock().unwrap();
+            let referenced_tables = existing_view.get_referenced_table_names();
+            drop(existing_view); // Release lock before modifying schema
+            for table_name in referenced_tables {
+                schema.add_materialized_view_dependency(&table_name, &view_name);
+            }
+        } else {
+            // Create new IncrementalView with both root pages
+            let incremental_view =
+                IncrementalView::from_sql(&sql, schema, main_root, *dbsp_state_root)?;
+            let referenced_tables = incremental_view.get_referenced_table_names();
+
+            // Create a Table for the materialized view
+            let table = Arc::new(schema::Table::BTree(Arc::new(schema::BTreeTable {
+                root_page: main_root,
+                name: view_name.clone(),
+                columns: incremental_view.columns.clone(), // Use the view's columns, not the base table's
+                primary_key_columns: vec![],
+                has_rowid: true,
+                is_strict: false,
+                unique_sets: None,
+            })));
+
+            schema.add_materialized_view(incremental_view, table, sql.clone());
+            for table_name in referenced_tables {
+                schema.add_materialized_view_dependency(&table_name, &view_name);
+            }
         }
     }
 
@@ -679,11 +708,11 @@ pub(crate) fn type_from_name(type_name: &str) -> (Type, bool) {
         return (Type::Integer, true);
     }
 
-    if let Some(ty) = type_name.windows(4).find_map(|s| {
-        if contains_ignore_ascii_case!(s, b"INT") {
-            return Some(Type::Integer);
-        }
+    if contains_ignore_ascii_case!(type_name, b"INT") {
+        return (Type::Integer, false);
+    }
 
+    if let Some(ty) = type_name.windows(4).find_map(|s| {
         match_ignore_ascii_case!(match s {
             b"CHAR" | b"CLOB" | b"TEXT" => Some(Type::Text),
             b"BLOB" => Some(Type::Blob),
@@ -1370,6 +1399,7 @@ pub fn extract_view_columns(select_stmt: &ast::Select, schema: &Schema) -> Vec<C
 #[cfg(test)]
 pub mod tests {
     use super::*;
+    use crate::schema::Type as SchemaValueType;
     use turso_parser::ast::{self, Expr, Literal, Name, Operator::*, Type};
 
     #[test]
@@ -2358,5 +2388,27 @@ pub mod tests {
         assert!(parse_pragma_bool(&Expr::Name(Name::Ident("nono".into()))).is_err());
         assert!(parse_pragma_bool(&Expr::Name(Name::Ident("10".into()))).is_err());
         assert!(parse_pragma_bool(&Expr::Name(Name::Ident("-1".into()))).is_err());
+    }
+
+    #[test]
+    fn test_type_from_name() {
+        let tc = vec![
+            ("", (SchemaValueType::Blob, false)),
+            ("INTEGER", (SchemaValueType::Integer, true)),
+            ("INT", (SchemaValueType::Integer, false)),
+            ("CHAR", (SchemaValueType::Text, false)),
+            ("CLOB", (SchemaValueType::Text, false)),
+            ("TEXT", (SchemaValueType::Text, false)),
+            ("BLOB", (SchemaValueType::Blob, false)),
+            ("REAL", (SchemaValueType::Real, false)),
+            ("FLOAT", (SchemaValueType::Real, false)),
+            ("DOUBLE", (SchemaValueType::Real, false)),
+            ("U128", (SchemaValueType::Numeric, false)),
+        ];
+
+        for (input, expected) in tc {
+            let result = type_from_name(input);
+            assert_eq!(result, expected, "Failed for input: {input}");
+        }
     }
 }
