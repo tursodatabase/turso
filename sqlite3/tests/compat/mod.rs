@@ -72,6 +72,7 @@ extern "C" {
         len: i32,
         destructor: Option<unsafe extern "C" fn(*mut libc::c_void)>,
     ) -> i32;
+    fn sqlite3_bind_zeroblob(stmt: *mut sqlite3_stmt, idx: i32, len: i32) -> i32;
     fn sqlite3_column_text(stmt: *mut sqlite3_stmt, idx: i32) -> *const libc::c_char;
     fn sqlite3_column_bytes(stmt: *mut sqlite3_stmt, idx: i32) -> i64;
     fn sqlite3_column_blob(stmt: *mut sqlite3_stmt, idx: i32) -> *const libc::c_void;
@@ -598,6 +599,68 @@ mod tests {
             let col2_slice = std::slice::from_raw_parts(col2_ptr as *const u8, col2_len as usize);
             assert_eq!(col2_slice, &data2[..2]);
 
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    fn test_sqlite3_bind_zeroblob() {
+        unsafe {
+            let temp_file = tempfile::NamedTempFile::with_suffix(".db").unwrap();
+            let path = std::ffi::CString::new(temp_file.path().to_str().unwrap()).unwrap();
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(path.as_ptr(), &mut db), SQLITE_OK);
+
+            let mut stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"CREATE TABLE test_bind_zeroblob (id INTEGER PRIMARY KEY, data BLOB)".as_ptr(),
+                    -1,
+                    &mut stmt,
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_step(stmt), SQLITE_DONE);
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+
+            let mut stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"INSERT INTO test_bind_zeroblob (data) VALUES (?)".as_ptr(),
+                    -1,
+                    &mut stmt,
+                    ptr::null_mut()
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_bind_zeroblob(stmt, 1, 1024), SQLITE_OK);
+            assert_eq!(sqlite3_step(stmt), SQLITE_DONE);
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+
+            let mut stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"SELECT data FROM test_bind_zeroblob ORDER BY id".as_ptr(),
+                    -1,
+                    &mut stmt,
+                    ptr::null_mut()
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+
+            let col1_len = sqlite3_column_bytes(stmt, 0);
+            assert_eq!(col1_len, 1024);
+
+            let col1_ptr = sqlite3_column_blob(stmt, 0);
+            let col1_slice = std::slice::from_raw_parts(col1_ptr as *const u8, col1_len as usize);
+            assert!(col1_slice.iter().all(|&byte| byte == 0));
+            assert_eq!(sqlite3_step(stmt), SQLITE_DONE);
             assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
             assert_eq!(sqlite3_close(db), SQLITE_OK);
         }

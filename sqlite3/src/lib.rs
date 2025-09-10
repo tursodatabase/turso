@@ -823,6 +823,30 @@ pub unsafe extern "C" fn sqlite3_bind_blob(
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn sqlite3_bind_zeroblob(
+    stmt: *mut sqlite3_stmt,
+    idx: ffi::c_int,
+    len: ffi::c_int,
+) -> ffi::c_int {
+    if stmt.is_null() {
+        return SQLITE_MISUSE;
+    }
+    if idx <= 0 {
+        return SQLITE_RANGE;
+    }
+
+    let stmt_ref = &mut *stmt;
+    let zeroblob = vec![0u8; len as usize];
+    let blob_value = Value::from_blob(zeroblob);
+
+    stmt_ref
+        .stmt
+        .bind_at(NonZero::new_unchecked(idx as usize), blob_value);
+
+    SQLITE_OK
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn sqlite3_clear_bindings(stmt: *mut sqlite3_stmt) -> ffi::c_int {
     if stmt.is_null() {
         return SQLITE_MISUSE;
