@@ -665,11 +665,11 @@ impl PageContent {
 
     /// The size of the page header in bytes.
     /// 8 bytes for leaf pages, 12 bytes for interior pages (due to storing rightmost child pointer)
-    pub fn header_size(&self) -> usize {
+    pub const fn header_size(&self) -> usize {
         self.cached_header_size
     }
 
-    fn header_size_init(buffer: &[u8], offset: usize) -> usize {
+    const fn header_size_init(buffer: &[u8], offset: usize) -> usize {
         let is_interior = buffer[offset + BTREE_PAGE_TYPE] <= PageType::TableInterior as u8;
         (!is_interior as usize) * LEAF_PAGE_HEADER_SIZE_BYTES
             + (is_interior as usize) * INTERIOR_PAGE_HEADER_SIZE_BYTES
@@ -787,7 +787,6 @@ impl PageContent {
     /// Get the start offset of a cell's payload, not taking into account the 100-byte offset that is present on page 1.
     pub fn cell_get_raw_start_offset(&self, idx: usize) -> usize {
         let cell_pointer_array_start = self.cell_pointer_array_offset();
-        debug_assert!(CELL_PTR_SIZE_BYTES == 2);
         let cell_pointer = cell_pointer_array_start + (idx << 1);
         self.read_u16_no_offset(cell_pointer) as usize
     }
