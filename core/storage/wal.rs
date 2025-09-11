@@ -839,10 +839,6 @@ impl Wal for WalFile {
             self.max_frame_read_lock_index.set(lock_0_idx);
             self.min_frame = nbackfills + 1;
             self.last_checksum = last_checksum;
-            println!(
-                "begin_read_tx(max_frame={}, min_frame={}, lock_0_idx={})",
-                self.max_frame, self.min_frame, lock_0_idx
-            );
             return Ok((LimboResult::Ok, db_changed));
         }
 

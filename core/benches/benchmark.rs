@@ -2,7 +2,7 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 use pprof::criterion::{Output, PProfProfiler};
 use regex::Regex;
 use std::{sync::Arc, time::Instant};
-use turso_core::{Database, LimboError, MemoryIO, PlatformIO, StepResult};
+use turso_core::{Database, LimboError, PlatformIO, StepResult};
 
 #[cfg(not(target_family = "wasm"))]
 #[global_allocator]
@@ -673,7 +673,7 @@ fn bench_limbo(
                 break;
             }
         }
-        for (_, conn) in connecitons.iter_mut().enumerate() {
+        for conn in connecitons.iter_mut() {
             if conn.current_statement.is_none() && !conn.inserts.is_empty() {
                 let write = conn.inserts.pop().unwrap();
                 conn.current_statement = Some(conn.conn.prepare(&write).unwrap());
@@ -755,7 +755,7 @@ fn bench_limbo_mvcc(
                 break;
             }
         }
-        for (_, conn) in connecitons.iter_mut().enumerate() {
+        for conn in connecitons.iter_mut() {
             if conn.current_statement.is_none() && !conn.inserts.is_empty() {
                 let write = conn.inserts.pop().unwrap();
                 conn.current_statement = Some(conn.conn.prepare(&write).unwrap());
@@ -790,7 +790,7 @@ fn bench_limbo_mvcc(
                     if let LimboError::SchemaUpdated = err {
                         conn.current_statement = Some(
                             conn.conn
-                                .prepare(&conn.current_insert.clone().as_ref().unwrap())
+                                .prepare(conn.current_insert.clone().as_ref().unwrap())
                                 .unwrap(),
                         );
                         continue;

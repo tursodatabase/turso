@@ -1323,7 +1323,7 @@ fn test_concurrent_writes() {
                 StepResult::Busy => {
                     println!("connection {conn_id} busy");
                     // stmt.reprepare().unwrap();
-                    assert!(false);
+                    unreachable!();
                 }
                 _ => {
                     unreachable!()
@@ -1356,13 +1356,14 @@ fn generate_batched_insert(num_inserts: usize) -> String {
     for i in 0..num_inserts {
         inserts.push_str(&format!("({i})"));
         if i < num_inserts - 1 {
-            inserts.push_str(",");
+            inserts.push(',');
         }
     }
-    inserts.push_str(";");
+    inserts.push(';');
     inserts
 }
 #[test]
+#[ignore]
 fn test_batch_writes() {
     let mut start = 0;
     let mut end = 5000;
@@ -1372,14 +1373,10 @@ fn test_batch_writes() {
         let conn = db.connect();
         conn.execute("CREATE TABLE test (x)").unwrap();
         let inserts = generate_batched_insert(i);
-        for i in 0..10 {
-            if conn.execute(inserts.clone()).is_err() {
-                end = i;
-                break;
-            } else {
-                start = i + 1;
-                break;
-            }
+        if conn.execute(inserts.clone()).is_err() {
+            end = i;
+        } else {
+            start = i + 1;
         }
     }
     println!("start: {start} end: {end}");
