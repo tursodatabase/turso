@@ -26,7 +26,6 @@ use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::ops::Bound;
 use std::rc::Rc;
-use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -294,14 +293,6 @@ struct CommitCoordinator {
     commits_waiting: Arc<AtomicU64>,
 }
 
-impl CommitCoordinator {
-    fn new() -> Self {
-        Self {
-            pager_commit_lock: Arc::new(TursoRwLock::new()),
-            commits_waiting: Arc::new(AtomicU64::new(0)),
-        }
-    }
-}
 pub struct CommitStateMachine<Clock: LogicalClock> {
     state: CommitState,
     is_finalized: bool,
@@ -330,7 +321,6 @@ impl<Clock: LogicalClock> Debug for CommitStateMachine<Clock> {
 pub struct WriteRowStateMachine {
     state: WriteRowState,
     is_finalized: bool,
-    pager: Rc<Pager>,
     row: Row,
     record: Option<ImmutableRecord>,
     cursor: Arc<RwLock<BTreeCursor>>,
@@ -347,9 +337,7 @@ pub enum DeleteRowState {
 pub struct DeleteRowStateMachine {
     state: DeleteRowState,
     is_finalized: bool,
-    pager: Rc<Pager>,
     rowid: RowID,
-    column_count: usize,
     cursor: Arc<RwLock<BTreeCursor>>,
 }
 
@@ -380,16 +368,10 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
 }
 
 impl WriteRowStateMachine {
-    fn new(
-        pager: Rc<Pager>,
-        row: Row,
-        cursor: Arc<RwLock<BTreeCursor>>,
-        requires_seek: bool,
-    ) -> Self {
+    fn new(row: Row, cursor: Arc<RwLock<BTreeCursor>>, requires_seek: bool) -> Self {
         Self {
             state: WriteRowState::Initial,
             is_finalized: false,
-            pager,
             row,
             record: None,
             cursor,
@@ -595,7 +577,6 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                                     cursor
                                 };
                                 let state_machine = mvcc_store.write_row_to_pager(
-                                    self.pager.clone(),
                                     &row_version.row,
                                     cursor,
                                     requires_seek,
@@ -625,12 +606,8 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                                     self.cursors.insert(id.table_id, cursor.clone());
                                     cursor
                                 };
-                                let state_machine = mvcc_store.delete_row_from_pager(
-                                    self.pager.clone(),
-                                    row_version.row.id,
-                                    column_count,
-                                    cursor,
-                                )?;
+                                let state_machine =
+                                    mvcc_store.delete_row_from_pager(row_version.row.id, cursor)?;
                                 self.delete_row_state_machine = Some(state_machine);
                                 self.state = CommitState::DeleteRowStateMachine {
                                     end_ts,
@@ -705,62 +682,37 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 // Flush dirty pages to WAL - this is critical for data persistence
                 // Similar to what step_end_write_txn does for legacy transactions
 
-                loop {
-                    let result = self
-                        .pager
-                        .end_tx(
-                            false, // rollback = false since we're committing
-                            &self.connection,
-                        )
-                        .map_err(|e| LimboError::InternalError(e.to_string()))
-                        .unwrap();
-                    match result {
-                        IOResult::Done(_) => {
-                            // FIXME: hack for now to keep database header updated for pager commit
-                            self.pager.io.block(|| {
-                                self.pager.with_header(|header| {
-                                    self.header.write().replace(header.clone());
-                                })
-                            })?;
-                            self.commit_coordinator.pager_commit_lock.unlock();
-                            // TODO: here mark we are ready for a batch
-                            self.state = CommitState::SyncWal { end_ts };
-                            return Ok(TransitionResult::Continue);
-                        }
-                        IOResult::IO(io) => {
-                            return Ok(TransitionResult::Io(io));
-                        }
+                let result = self
+                    .pager
+                    .end_tx(
+                        false, // rollback = false since we're committing
+                        &self.connection,
+                    )
+                    .map_err(|e| LimboError::InternalError(e.to_string()))
+                    .unwrap();
+                match result {
+                    IOResult::Done(_) => {
+                        // FIXME: hack for now to keep database header updated for pager commit
+                        self.pager.io.block(|| {
+                            self.pager.with_header(|header| {
+                                self.header.write().replace(*header);
+                            })
+                        })?;
+                        self.commit_coordinator.pager_commit_lock.unlock();
+                        // TODO: here mark we are ready for a batch
+                        self.state = CommitState::SyncWal { end_ts };
+                        return Ok(TransitionResult::Continue);
+                    }
+                    IOResult::IO(io) => {
+                        return Ok(TransitionResult::Io(io));
                     }
                 }
             }
             CommitState::SyncWal { end_ts } => {
-                // Here if we haven't started syncing yet:
-                // 1. Are there any commits waiting?
-                // 2. If not, we can sync and commit
-                // 3. If yes, we want to wait for a bit for them to finish and batch them.
-
-                // * How do we coordinate this?
-                // * How many before we start syncing?
-                // naive approach would be to wait for all commits we've just seen.
-                // * How do we gate other commits that are not batch to wait finish fsync from other batch?
-
-                // wait for x ns
-                // start fsync
-                // we could wait for
-                // TODO: wait timeout to start fsync
-                // TODO: mark which txns
-                // if self
-                //     .commit_coordinator
-                //     .commits_waiting
-                //     .load(Ordering::SeqCst)
-                //     > 0
-                // {
-                //     return Ok(TransitionResult::Continue);
-                // }
                 let mut wal = self.pager.wal.as_ref().unwrap().borrow_mut();
                 let c = wal.sync()?;
+                self.state = CommitState::Commit { end_ts };
                 if c.is_completed() {
-                    self.state = CommitState::Commit { end_ts };
                     return Ok(TransitionResult::Continue);
                 } else {
                     return Ok(TransitionResult::Io(IOCompletions::Single(c)));
@@ -839,7 +791,6 @@ impl StateTransition for WriteRowStateMachine {
 
     #[tracing::instrument(fields(state = ?self.state), skip(self, _context))]
     fn step(&mut self, _context: &Self::Context) -> Result<TransitionResult<Self::SMResult>> {
-        use crate::storage::btree::BTreeCursor;
         use crate::types::{IOResult, SeekKey, SeekOp};
 
         match self.state {
@@ -926,7 +877,6 @@ impl StateTransition for DeleteRowStateMachine {
 
     #[tracing::instrument(fields(state = ?self.state), skip(self, _context))]
     fn step(&mut self, _context: &Self::Context) -> Result<TransitionResult<Self::SMResult>> {
-        use crate::storage::btree::BTreeCursor;
         use crate::types::{IOResult, SeekKey, SeekOp};
 
         match self.state {
@@ -987,18 +937,11 @@ impl StateTransition for DeleteRowStateMachine {
 }
 
 impl DeleteRowStateMachine {
-    fn new(
-        pager: Rc<Pager>,
-        rowid: RowID,
-        column_count: usize,
-        cursor: Arc<RwLock<BTreeCursor>>,
-    ) -> Self {
+    fn new(rowid: RowID, cursor: Arc<RwLock<BTreeCursor>>) -> Self {
         Self {
             state: DeleteRowState::Initial,
             is_finalized: false,
-            pager,
             rowid,
-            column_count,
             cursor,
         }
     }
@@ -1586,14 +1529,12 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
     pub fn write_row_to_pager(
         &self,
-        pager: Rc<Pager>,
         row: &Row,
         cursor: Arc<RwLock<BTreeCursor>>,
         requires_seek: bool,
     ) -> Result<StateMachine<WriteRowStateMachine>> {
         let state_machine: StateMachine<WriteRowStateMachine> =
             StateMachine::<WriteRowStateMachine>::new(WriteRowStateMachine::new(
-                pager,
                 row.clone(),
                 cursor,
                 requires_seek,
@@ -1604,16 +1545,11 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
     pub fn delete_row_from_pager(
         &self,
-        pager: Rc<Pager>,
         rowid: RowID,
-        column_count: usize,
         cursor: Arc<RwLock<BTreeCursor>>,
     ) -> Result<StateMachine<DeleteRowStateMachine>> {
-        let state_machine: StateMachine<DeleteRowStateMachine> = StateMachine::<
-            DeleteRowStateMachine,
-        >::new(
-            DeleteRowStateMachine::new(pager, rowid, column_count, cursor),
-        );
+        let state_machine: StateMachine<DeleteRowStateMachine> =
+            StateMachine::<DeleteRowStateMachine>::new(DeleteRowStateMachine::new(rowid, cursor));
 
         Ok(state_machine)
     }
