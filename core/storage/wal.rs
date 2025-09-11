@@ -1607,7 +1607,8 @@ impl Wal for WalFile {
     }
 
     fn update_max_frame(&mut self) {
-        self.max_frame = self.get_shared().max_frame.load(Ordering::Acquire);
+        let new_max_frame = self.get_shared().max_frame.load(Ordering::Acquire);
+        self.max_frame = new_max_frame;
     }
 }
 
