@@ -2278,7 +2278,8 @@ pub fn op_transaction(
             if header_schema_cookie != *schema_cookie {
                 tracing::debug!(
                     "schema changed, force reprepare: {} != {}",
-                    header_schema_cookie, *schema_cookie
+                    header_schema_cookie,
+                    *schema_cookie
                 );
                 return Err(LimboError::SchemaUpdated);
             }
