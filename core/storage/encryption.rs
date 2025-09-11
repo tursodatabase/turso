@@ -1,4 +1,5 @@
 #![allow(unused_variables, dead_code)]
+use crate::storage::sqlite3_ondisk::DatabaseHeader;
 use crate::{LimboError, Result};
 use aegis::aegis128l::Aegis128L;
 use aegis::aegis128x2::Aegis128X2;
@@ -425,10 +426,6 @@ impl EncryptionContext {
 
     #[cfg(feature = "encryption")]
     pub fn encrypt_page(&self, page: &[u8], page_id: usize) -> Result<Vec<u8>> {
-        if page_id == 1 {
-            tracing::debug!("skipping encryption for page 1 (database header)");
-            return Ok(page.to_vec());
-        }
         tracing::debug!("encrypting page {}", page_id);
         assert_eq!(
             page.len(),
@@ -437,6 +434,10 @@ impl EncryptionContext {
             self.page_size
         );
 
+        let encryption_start_offset = match page_id {
+            DatabaseHeader::PAGE_ID => DatabaseHeader::SIZE,
+            _ => 0,
+        };
         let metadata_size = self.cipher_mode.metadata_size();
         let reserved_bytes = &page[self.page_size - metadata_size..];
         let reserved_bytes_zeroed = reserved_bytes.iter().all(|&b| b == 0);
@@ -445,18 +446,20 @@ impl EncryptionContext {
             "last reserved bytes must be empty/zero, but found non-zero bytes"
         );
 
-        let payload = &page[..self.page_size - metadata_size];
+        let payload = &page[encryption_start_offset..self.page_size - metadata_size];
         let (encrypted, nonce) = self.encrypt_raw(payload)?;
 
         let nonce_size = self.cipher_mode.nonce_size();
         assert_eq!(
             encrypted.len(),
-            self.page_size - nonce_size,
+            self.page_size - nonce_size - encryption_start_offset,
             "Encrypted page must be exactly {} bytes",
-            self.page_size - nonce_size
+            self.page_size - nonce_size - encryption_start_offset
         );
 
         let mut result = Vec::with_capacity(self.page_size);
+
+        result.extend_from_slice(&page[..encryption_start_offset]);
         result.extend_from_slice(&encrypted);
         result.extend_from_slice(&nonce);
         assert_eq!(
@@ -470,10 +473,6 @@ impl EncryptionContext {
 
     #[cfg(feature = "encryption")]
     pub fn decrypt_page(&self, encrypted_page: &[u8], page_id: usize) -> Result<Vec<u8>> {
-        if page_id == 1 {
-            tracing::debug!("skipping decryption for page 1 (database header)");
-            return Ok(encrypted_page.to_vec());
-        }
         tracing::debug!("decrypting page {}", page_id);
         assert_eq!(
             encrypted_page.len(),
@@ -481,23 +480,30 @@ impl EncryptionContext {
             "Encrypted page data must be exactly {} bytes",
             self.page_size
         );
+        // for page 1, the encrypted page starts after the database header
+        // for other pages, the encrypted page starts at the beginning
+        let encrypted_page_offset = match page_id {
+            DatabaseHeader::PAGE_ID => DatabaseHeader::SIZE,
+            _ => 0,
+        };
 
         let nonce_size = self.cipher_mode.nonce_size();
-        let nonce_start = encrypted_page.len() - nonce_size;
-        let payload = &encrypted_page[..nonce_start];
-        let nonce = &encrypted_page[nonce_start..];
+        let nonce_offset = encrypted_page.len() - nonce_size;
+        let payload = &encrypted_page[encrypted_page_offset..nonce_offset];
+        let nonce = &encrypted_page[nonce_offset..];
 
         let decrypted_data = self.decrypt_raw(payload, nonce)?;
 
         let metadata_size = self.cipher_mode.metadata_size();
         assert_eq!(
             decrypted_data.len(),
-            self.page_size - metadata_size,
+            self.page_size - metadata_size - encrypted_page_offset,
             "Decrypted page data must be exactly {} bytes",
-            self.page_size - metadata_size
+            self.page_size - metadata_size - encrypted_page_offset
         );
 
         let mut result = Vec::with_capacity(self.page_size);
+        result.extend_from_slice(&encrypted_page[..encrypted_page_offset]);
         result.extend_from_slice(&decrypted_data);
         result.resize(self.page_size, 0);
         assert_eq!(

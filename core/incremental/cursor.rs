@@ -318,6 +318,7 @@ mod tests {
                 enable_views: true,
                 enable_strict: false,
             },
+            None,
         )?;
         let conn = db.connect()?;
 
