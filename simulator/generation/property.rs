@@ -171,6 +171,24 @@ pub(crate) enum Property {
         select: Select,
         where_clause: Predicate,
     },
+    /// Short Write Corruption is a property that tests data durability
+    /// when short writes occur during transaction commits.
+    /// The execution of the property is as follows:
+    ///     BEGIN TRANSACTION
+    ///     INSERT INTO <t> VALUES (...)
+    ///     COMMIT  -- This may trigger a short write in WAL
+    ///     [Database restart simulation]
+    ///     SELECT * FROM <t> WHERE <predicate>
+    /// The assertion is that the data should be recoverable after restart
+    /// even if a short write occurred during commit.
+    ShortWriteCorruption {
+        /// The table to test
+        table: String,
+        /// The insert query within transaction
+        insert: Insert,
+        /// The select query to verify data after restart
+        select: Select,
+    },
     /// FsyncNoWait is a property which tests if we do not loose any data after not waiting for fsync.
     ///
     /// # Interactions
@@ -210,6 +228,7 @@ impl Property {
             Property::FsyncNoWait { .. } => "FsyncNoWait",
             Property::FaultyQuery { .. } => "FaultyQuery",
             Property::UNIONAllPreservesCardinality { .. } => "UNION-All-Preserves-Cardinality",
+            Property::ShortWriteCorruption { .. } => "Short-Write-Corruption",
         }
     }
     /// interactions construct a list of interactions, which is an executable representation of the property.
@@ -967,6 +986,67 @@ impl Property {
                     }),
                 ]
             }
+            Property::ShortWriteCorruption {
+                table,
+                insert,
+                select,
+            } => {
+                use sql_generation::model::query::transaction::{Begin, Commit};
+
+                let table_name = table.clone();
+                let assumption = Interaction::Assumption(Assertion {
+                    name: format!("table {table} exists"),
+                    func: Box::new(move |_: &Vec<ResultSet>, env: &mut SimulatorEnv| {
+                        if env.tables.iter().any(|t| t.name == table_name) {
+                            Ok(Ok(()))
+                        } else {
+                            Ok(Err(format!("table {table_name} does not exist")))
+                        }
+                    }),
+                });
+
+                let begin_tx = Interaction::Query(Query::Begin(Begin { immediate: false }));
+                let insert_query = Interaction::Query(Query::Insert(insert.clone()));
+                let commit_tx = Interaction::Query(Query::Commit(Commit {}));
+
+                let restart_db = Interaction::Assertion(Assertion {
+                    name: "restart database to test durability".to_string(),
+                    func: Box::new(|_: &Vec<ResultSet>, env: &mut SimulatorEnv| {
+                        env.connections.iter_mut().for_each(|c| c.disconnect());
+                        env.clear();
+                        Ok(Ok(()))
+                    }),
+                });
+
+                let select_query = Interaction::Query(Query::Select(select.clone()));
+
+                let assertion = Interaction::Assertion(Assertion {
+                    name: "data should be recoverable after short write and restart".to_string(),
+                    func: Box::new(move |stack: &Vec<ResultSet>, _env: &mut SimulatorEnv| {
+                        let result = stack.last().unwrap();
+                        match result {
+                            Ok(rows) => {
+                                if rows.is_empty() {
+                                    Ok(Err("Data was lost due to short write corruption - this indicates a durability bug".to_string()))
+                                } else {
+                                    Ok(Ok(()))
+                                }
+                            }
+                            Err(e) => Ok(Err(format!("Query failed after restart: {e}"))),
+                        }
+                    }),
+                });
+
+                vec![
+                    assumption,
+                    begin_tx,
+                    insert_query,
+                    commit_tx,
+                    restart_db,
+                    select_query,
+                    assertion,
+                ]
+            }
         }
     }
 }
@@ -1543,9 +1623,35 @@ impl ArbitraryFrom<(&SimulatorEnv, &InteractionStats)> for Property {
                     },
                     Box::new(|rng: &mut R| property_faulty_query(rng, env, &remaining_)),
                 ),
+                (
+                    if env.profile.io.enable && env.profile.io.fault.short_write.enable {
+                        15
+                    } else {
+                        0
+                    },
+                    Box::new(|rng: &mut R| property_short_write_corruption(rng, env)),
+                ),
             ],
             rng,
         )
+    }
+}
+
+fn property_short_write_corruption<R: rand::Rng>(rng: &mut R, env: &SimulatorEnv) -> Property {
+    use sql_generation::model::query::predicate::Predicate;
+
+    // pick a random table that has at least one column, generate random insert
+    // and create a simple select query
+    let table = pick(&env.tables, rng);
+    let table_name = table.name.clone();
+    let insert = Insert::arbitrary(rng, env);
+    let predicate = Predicate::true_();
+    let select = Select::simple(table_name.clone(), predicate);
+
+    Property::ShortWriteCorruption {
+        table: table_name,
+        insert,
+        select,
     }
 }
 

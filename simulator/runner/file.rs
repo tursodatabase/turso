@@ -9,6 +9,7 @@ use rand_chacha::ChaCha8Rng;
 use tracing::{Level, instrument};
 use turso_core::{File, Result};
 
+use crate::profiles::io::ShortWriteProfile;
 use crate::runner::{FAULT_ERROR_MSG, clock::SimulatorClock};
 pub(crate) struct SimulatorFile {
     pub path: String,
@@ -42,6 +43,7 @@ pub(crate) struct SimulatorFile {
     pub sync_completion: RefCell<Option<turso_core::Completion>>,
     pub queued_io: RefCell<Vec<DelayedIo>>,
     pub clock: Arc<SimulatorClock>,
+    pub short_write_profile: ShortWriteProfile,
 }
 
 type IoOperation = Box<dyn FnOnce(&SimulatorFile) -> Result<turso_core::Completion>>;
@@ -65,6 +67,29 @@ unsafe impl Sync for SimulatorFile {}
 impl SimulatorFile {
     pub(crate) fn inject_fault(&self, fault: bool) {
         self.fault.replace(fault);
+    }
+
+    /// Check if this file should be subject to short write faults
+    fn should_apply_short_write(&self) -> bool {
+        if !self.short_write_profile.enable {
+            return false;
+        }
+
+        if self.short_write_profile.wal_only && !self.path.ends_with("-wal") {
+            return false;
+        }
+
+        let mut rng = self.rng.borrow_mut();
+        rng.random_range(0..100) < self.short_write_profile.probability
+    }
+
+    /// Calculate short write length for a given buffer size
+    fn calculate_short_write_length(&self, full_length: usize) -> usize {
+        let mut rng = self.rng.borrow_mut();
+        let bytes_to_subtract =
+            rng.random_range(1..=self.short_write_profile.max_bytes_short.min(full_length));
+        let short_length = full_length.saturating_sub(bytes_to_subtract);
+        short_length.max(self.short_write_profile.min_bytes)
     }
 
     pub(crate) fn stats_table(&self) -> String {
@@ -172,7 +197,55 @@ impl File for SimulatorFile {
                 FAULT_ERROR_MSG.into(),
             ));
         }
-        if let Some(latency) = self.generate_latency_duration() {
+
+        if self.should_apply_short_write() {
+            let full_length = buffer.len();
+            let short_length = self.calculate_short_write_length(full_length);
+
+            if short_length < full_length {
+                tracing::debug!(
+                    "Injecting short write: {} bytes instead of {} bytes",
+                    short_length,
+                    full_length
+                );
+
+                let short_buffer = turso_core::Buffer::new_temporary(short_length);
+                short_buffer
+                    .as_mut_slice()
+                    .copy_from_slice(&buffer.as_slice()[..short_length]);
+
+                let short_buffer_arc = Arc::new(short_buffer);
+
+                if let Some(latency) = self.generate_latency_duration() {
+                    let cloned_c = c.clone();
+                    let op = Box::new(move |file: &SimulatorFile| {
+                        let result = file.inner.pwrite(pos, short_buffer_arc, cloned_c);
+                        if let Ok(completion) = &result {
+                            completion.complete(short_length as i32);
+                        }
+                        result
+                    });
+                    self.queued_io
+                        .borrow_mut()
+                        .push(DelayedIo { time: latency, op });
+                    Ok(c)
+                } else {
+                    // Simulate short write by completing directly without calling underlying I/O
+                    c.complete(short_length as i32);
+                    Ok(c)
+                }
+            } else if let Some(latency) = self.generate_latency_duration() {
+                let cloned_c = c.clone();
+                let op =
+                    Box::new(move |file: &SimulatorFile| file.inner.pwrite(pos, buffer, cloned_c));
+                self.queued_io
+                    .borrow_mut()
+                    .push(DelayedIo { time: latency, op });
+                Ok(c)
+            } else {
+                self.inner.pwrite(pos, buffer, c)
+            }
+        } else if let Some(latency) = self.generate_latency_duration() {
             let cloned_c = c.clone();
             let op = Box::new(move |file: &SimulatorFile| file.inner.pwrite(pos, buffer, cloned_c));
             self.queued_io
@@ -226,7 +299,67 @@ impl File for SimulatorFile {
                 FAULT_ERROR_MSG.into(),
             ));
         }
-        if let Some(latency) = self.generate_latency_duration() {
+
+        if self.should_apply_short_write() {
+            let total_length: usize = buffers.iter().map(|b| b.len()).sum();
+            let short_length = self.calculate_short_write_length(total_length);
+
+            if short_length < total_length {
+                tracing::debug!(
+                    "Injecting short vectored write: {} bytes instead of {} bytes",
+                    short_length,
+                    total_length
+                );
+
+                let mut remaining = short_length;
+                let mut short_buffers = Vec::new();
+
+                for buffer in buffers.iter() {
+                    if remaining == 0 {
+                        break;
+                    }
+
+                    let take_len = buffer.len().min(remaining);
+                    let short_buffer = turso_core::Buffer::new_temporary(take_len);
+                    short_buffer
+                        .as_mut_slice()
+                        .copy_from_slice(&buffer.as_slice()[..take_len]);
+                    short_buffers.push(Arc::new(short_buffer));
+                    remaining -= take_len;
+                }
+
+                if let Some(latency) = self.generate_latency_duration() {
+                    let cloned_c = c.clone();
+                    let op = Box::new(move |file: &SimulatorFile| {
+                        let result = file.inner.pwritev(pos, short_buffers, cloned_c);
+                        if let Ok(completion) = &result {
+                            completion.complete(short_length as i32);
+                        }
+                        result
+                    });
+                    self.queued_io
+                        .borrow_mut()
+                        .push(DelayedIo { time: latency, op });
+                    Ok(c)
+                } else {
+                    // Simulate short write by completing directly without calling underlying I/O
+                    c.complete(short_length as i32);
+                    Ok(c)
+                }
+            } else if let Some(latency) = self.generate_latency_duration() {
+                let cloned_c = c.clone();
+                let op = Box::new(move |file: &SimulatorFile| {
+                    file.inner.pwritev(pos, buffers, cloned_c)
+                });
+                self.queued_io
+                    .borrow_mut()
+                    .push(DelayedIo { time: latency, op });
+                Ok(c)
+            } else {
+                let c = self.inner.pwritev(pos, buffers, c)?;
+                Ok(c)
+            }
+        } else if let Some(latency) = self.generate_latency_duration() {
             let cloned_c = c.clone();
             let op =
                 Box::new(move |file: &SimulatorFile| file.inner.pwritev(pos, buffers, cloned_c));
