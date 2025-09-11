@@ -1,0 +1,60 @@
+#!/bin/bash
+
+if [ $# -lt 1 ]; then
+    echo "usage: $0 <database_file> [sql_command]"
+    echo
+    echo "Examples:"
+    echo "  $0 database.db"
+    echo "  $0 database.db '.dump'"
+    echo "  $0 database.db 'SELECT * FROM t;'"
+    exit 1
+fi
+
+DATABASE="$1"
+SQL_COMMAND="${2:-.dump}"
+
+if [ ! -f "$DATABASE" ]; then
+    echo "error: Database file '$DATABASE' not found"
+    exit 1
+fi
+
+SQLITE3_BIN="sqlite3"
+TURSO_BIN="../../target/debug/tursodb"
+
+SQLITE_OUTPUT=$(mktemp)
+TURSO_OUTPUT=$(mktemp)
+
+cleanup() {
+    rm -f "$SQLITE_OUTPUT" "$TURSO_OUTPUT"
+}
+trap cleanup EXIT
+
+if "$SQLITE3_BIN" "$DATABASE" "$SQL_COMMAND" > "$SQLITE_OUTPUT" 2>&1; then
+    SQLITE_EXIT_CODE=0
+else
+    SQLITE_EXIT_CODE=$?
+    echo "SQLite failed with exit code: $SQLITE_EXIT_CODE"
+    cat "$SQLITE_OUTPUT"
+fi
+
+if "$TURSO_BIN" -m list "$DATABASE" "$SQL_COMMAND" > "$TURSO_OUTPUT" 2>&1; then
+    TURSO_EXIT_CODE=0
+else
+    TURSO_EXIT_CODE=$?
+    echo "Turso failed with exit code: $TURSO_EXIT_CODE"
+    cat "$TURSO_OUTPUT"
+fi
+
+if [ "$SQLITE_EXIT_CODE" -ne "$TURSO_EXIT_CODE" ]; then
+    echo "Exit codes differ: SQLite=$SQLITE_EXIT_CODE, Turso=$TURSO_EXIT_CODE"
+fi
+
+if ! diff -u "$SQLITE_OUTPUT" "$TURSO_OUTPUT" > /dev/null; then
+    echo "Outputs differ:"
+    echo
+    diff -u "$SQLITE_OUTPUT" "$TURSO_OUTPUT" | head -20
+    if [ $(diff -u "$SQLITE_OUTPUT" "$TURSO_OUTPUT" | wc -l) -gt 20 ]; then
+        echo "... (output truncated, showing first 20 lines of diff)"
+    fi
+    exit 1
+fi
