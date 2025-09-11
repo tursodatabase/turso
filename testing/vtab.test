@@ -394,7 +394,7 @@ do_execsql_test_error tvf-circular-column-references {
 } {No valid query plan found|no query solution}
 
 do_execsql_test_on_specific_db {:memory:} ok-empty-vtab-setup {
-    CREATE VIRTUAL TABLE e USING ok_empty;
+    CREATE VIRTUAL TABLE e USING kv_store;
 } {}
 
 do_execsql_test_on_specific_db {:memory:} ok-empty-vtab-select-star {
