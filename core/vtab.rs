@@ -227,8 +227,12 @@ impl VirtualTableCursor {
     ) -> crate::Result<()> {
         match self {
             VirtualTableCursor::Pragma(cursor) => cursor.filter(args),
-            VirtualTableCursor::External(cursor) => cursor.filter(idx_num, idx_str, arg_count, args),
-            VirtualTableCursor::Internal(cursor) => cursor.borrow_mut().filter(&args, idx_str, idx_num),
+            VirtualTableCursor::External(cursor) => {
+                cursor.filter(idx_num, idx_str, arg_count, args)
+            }
+            VirtualTableCursor::Internal(cursor) => {
+                cursor.borrow_mut().filter(&args, idx_str, idx_num)
+            }
         }
     }
 }
