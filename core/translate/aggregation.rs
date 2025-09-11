@@ -156,7 +156,11 @@ pub enum AggArgumentSource<'a> {
         aggregate: &'a Aggregate,
     },
     /// The aggregate function arguments are retrieved by evaluating expressions.
-    Expression { aggregate: &'a Aggregate },
+    Expression {
+        func: &'a AggFunc,
+        args: &'a Vec<ast::Expr>,
+        distinctness: &'a Distinctness,
+    },
 }
 
 impl<'a> AggArgumentSource<'a> {
@@ -185,15 +189,23 @@ impl<'a> AggArgumentSource<'a> {
     }
 
     /// Create a new [AggArgumentSource] that retrieves the values by evaluating `args` expressions.
-    pub fn new_from_expression(aggregate: &'a Aggregate) -> Self {
-        Self::Expression { aggregate }
+    pub fn new_from_expression(
+        func: &'a AggFunc,
+        args: &'a Vec<ast::Expr>,
+        distinctness: &'a Distinctness,
+    ) -> Self {
+        Self::Expression {
+            func,
+            args,
+            distinctness,
+        }
     }
 
     pub fn distinctness(&self) -> &Distinctness {
         match self {
             AggArgumentSource::PseudoCursor { aggregate, .. } => &aggregate.distinctness,
             AggArgumentSource::Register { aggregate, .. } => &aggregate.distinctness,
-            AggArgumentSource::Expression { aggregate } => &aggregate.distinctness,
+            AggArgumentSource::Expression { distinctness, .. } => distinctness,
         }
     }
 
@@ -201,21 +213,21 @@ impl<'a> AggArgumentSource<'a> {
         match self {
             AggArgumentSource::PseudoCursor { aggregate, .. } => &aggregate.func,
             AggArgumentSource::Register { aggregate, .. } => &aggregate.func,
-            AggArgumentSource::Expression { aggregate } => &aggregate.func,
+            AggArgumentSource::Expression { func, .. } => func,
         }
     }
     pub fn arg_at(&self, idx: usize) -> &ast::Expr {
         match self {
             AggArgumentSource::PseudoCursor { aggregate, .. } => &aggregate.args[idx],
             AggArgumentSource::Register { aggregate, .. } => &aggregate.args[idx],
-            AggArgumentSource::Expression { aggregate } => &aggregate.args[idx],
+            AggArgumentSource::Expression { args, .. } => &args[idx],
         }
     }
     pub fn num_args(&self) -> usize {
         match self {
             AggArgumentSource::PseudoCursor { aggregate, .. } => aggregate.args.len(),
             AggArgumentSource::Register { aggregate, .. } => aggregate.args.len(),
-            AggArgumentSource::Expression { aggregate } => aggregate.args.len(),
+            AggArgumentSource::Expression { args, .. } => args.len(),
         }
     }
     /// Read the value of an aggregate function argument
@@ -244,12 +256,12 @@ impl<'a> AggArgumentSource<'a> {
                 src_reg_start: start_reg,
                 ..
             } => Ok(*start_reg + arg_idx),
-            AggArgumentSource::Expression { aggregate } => {
+            AggArgumentSource::Expression { args, .. } => {
                 let dest_reg = program.alloc_register();
                 translate_expr(
                     program,
                     Some(referenced_tables),
-                    &aggregate.args[arg_idx],
+                    &args[arg_idx],
                     dest_reg,
                     resolver,
                 )

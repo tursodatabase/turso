@@ -879,7 +879,7 @@ fn emit_loop_source(
                 translate_aggregation_step(
                     program,
                     &plan.table_references,
-                    AggArgumentSource::new_from_expression(agg),
+                    AggArgumentSource::new_from_expression(&agg.func, &agg.args, &agg.distinctness),
                     reg,
                     &t_ctx.resolver,
                 )?;
