@@ -306,7 +306,7 @@ impl PragmaVirtualTableCursor {
         Ok(value)
     }
 
-    pub(crate) fn filter(&mut self, args: Vec<Value>) -> crate::Result<bool> {
+    pub(crate) fn filter(&mut self, args: Vec<Value>) -> crate::Result<()> {
         if args.len() > self.max_arg_count {
             return Err(LimboError::ParseError(format!(
                 "Too many arguments for pragma {}: expected at most {}, got {}",
@@ -340,7 +340,8 @@ impl PragmaVirtualTableCursor {
 
         self.stmt = Some(self.conn.prepare(sql)?);
 
-        self.next()
+        let _ = self.next()?;
+        Ok(())
     }
 
     pub fn eof(&self) -> bool {

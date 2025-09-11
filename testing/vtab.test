@@ -392,3 +392,15 @@ do_execsql_test tvf-args-from-another-tvf {
 do_execsql_test_error tvf-circular-column-references {
     SELECT * FROM generate_series(a.start, a.stop) b, generate_series(b.start, b.stop) a;
 } {No valid query plan found|no query solution}
+
+do_execsql_test_on_specific_db {:memory:} ok-empty-vtab-setup {
+    CREATE VIRTUAL TABLE e USING ok_empty;
+} {}
+
+do_execsql_test_on_specific_db {:memory:} ok-empty-vtab-select-star {
+    SELECT * FROM e;
+} {}
+
+do_execsql_test_on_specific_db {:memory:} ok-empty-vtab-count {
+    SELECT COUNT(*) FROM e;
+} {0}

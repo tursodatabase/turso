@@ -160,9 +160,10 @@ impl InternalVirtualTableCursor for JsonEachCursor {
         args: &[Value],
         _idx_str: Option<String>,
         _idx_num: i32,
-    ) -> Result<bool, LimboError> {
+    ) -> Result<(), LimboError> {
         if args.is_empty() {
-            return Ok(false);
+            self.has_row = false;
+            return Ok(());
         }
         if args.len() != 1 && args.len() != 2 {
             return Err(LimboError::InvalidArgument(
@@ -183,7 +184,8 @@ impl InternalVirtualTableCursor for JsonEachCursor {
             self.json = if let Some(json) = navigate_to_path(&mut jsonb, &args[1])? {
                 json
             } else {
-                return Ok(false);
+                self.has_row = false;
+                return Ok(());
             };
         }
         let json_element_type = self.json.element_type()?;
@@ -217,19 +219,12 @@ impl InternalVirtualTableCursor for JsonEachCursor {
             }
         };
 
-        // prime to first row and report whether there is a row
-        self.rowid = 0;
-        self.has_row = false;
         self.next()?;
-        Ok(self.has_row)
+        Ok(())
     }
 
     fn next(&mut self) -> Result<(), LimboError> {
         self.rowid += 1;
-        if matches!(self.iterator_state, IteratorState::None) {
-            self.has_row = false;
-            return Ok(());
-        }
 
         match &self.iterator_state {
             IteratorState::Array(state) => {
@@ -268,7 +263,9 @@ impl InternalVirtualTableCursor for JsonEachCursor {
                 self.iterator_state = IteratorState::None;
                 self.has_row = true;
             }
-            IteratorState::None => unreachable!(),
+            IteratorState::None => {
+                self.has_row = false;
+            }
         };
 
         Ok(())

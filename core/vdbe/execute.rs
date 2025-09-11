@@ -1106,6 +1106,7 @@ pub fn op_vfilter(
         },
         insn
     );
+    
     let has_rows = {
         let cursor = get_cursor!(state, *cursor_id);
         let cursor = cursor.as_virtual_mut();
@@ -1118,7 +1119,8 @@ pub fn op_vfilter(
         } else {
             None
         };
-        cursor.filter(*idx_num as i32, idx_str, *arg_count, args)?
+        let _ = cursor.filter(*idx_num as i32, idx_str, *arg_count, args)?;
+        !cursor.eof()
     };
     // Increment filter_operations metric for virtual table filter
     state.metrics.filter_operations = state.metrics.filter_operations.saturating_add(1);

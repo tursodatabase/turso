@@ -216,12 +216,9 @@ impl VTabCursor for GenerateSeriesCursor {
             return ResultCode::OK;
         }
 
-        self.current = match self.current.checked_add(self.step) {
-            Some(val) => val,
-            None => {
-                return ResultCode::OK;
-            }
-        };
+        if let Some(val) = self.current.checked_add(self.step) {
+            self.current = val;
+        }
 
         ResultCode::OK
     }

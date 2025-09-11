@@ -224,15 +224,11 @@ impl VirtualTableCursor {
         idx_str: Option<String>,
         arg_count: usize,
         args: Vec<Value>,
-    ) -> crate::Result<bool> {
+    ) -> crate::Result<()> {
         match self {
             VirtualTableCursor::Pragma(cursor) => cursor.filter(args),
-            VirtualTableCursor::External(cursor) => {
-                cursor.filter(idx_num, idx_str, arg_count, args)
-            }
-            VirtualTableCursor::Internal(cursor) => {
-                cursor.borrow_mut().filter(&args, idx_str, idx_num)
-            }
+            VirtualTableCursor::External(cursor) => cursor.filter(idx_num, idx_str, arg_count, args),
+            VirtualTableCursor::Internal(cursor) => cursor.borrow_mut().filter(&args, idx_str, idx_num),
         }
     }
 }
@@ -375,7 +371,7 @@ impl ExtVirtualTableCursor {
         idx_str: Option<String>,
         arg_count: usize,
         args: Vec<Value>,
-    ) -> crate::Result<bool> {
+    ) -> crate::Result<()> {
         tracing::trace!("xFilter");
         let ext_args = args.iter().map(|arg| arg.to_ffi()).collect::<Vec<_>>();
         let c_idx_str = idx_str
@@ -397,8 +393,9 @@ impl ExtVirtualTableCursor {
             }
         }
         match rc {
-            ResultCode::OK => Ok(true),
-            ResultCode::EOF => Ok(false),
+            // Per SQLite contract, xFilter should be followed by xEof; treat both OK and EOF
+            // as success and defer row-availability to eof().
+            ResultCode::OK | ResultCode::EOF => Ok(()),
             _ => Err(LimboError::ExtensionError(rc.to_string())),
         }
     }
@@ -453,5 +450,5 @@ pub trait InternalVirtualTableCursor {
         args: &[Value],
         idx_str: Option<String>,
         idx_num: i32,
-    ) -> Result<bool, LimboError>;
+    ) -> Result<(), LimboError>;
 }
