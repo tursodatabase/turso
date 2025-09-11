@@ -707,6 +707,7 @@ fn test_wal_bad_frame() -> anyhow::Result<()> {
                 db_path.to_str().unwrap(),
                 turso_core::OpenFlags::default(),
                 turso_core::DatabaseOpts::new().with_indexes(false),
+                None,
             )
             .unwrap();
             let tmp_db = TempDatabase {

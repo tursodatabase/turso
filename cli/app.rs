@@ -183,6 +183,7 @@ impl Limbo {
                     .with_indexes(indexes_enabled)
                     .with_views(opts.experimental_views)
                     .with_strict(opts.experimental_strict),
+                None,
             )?;
             let conn = db.connect()?;
             (io, conn)
