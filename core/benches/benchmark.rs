@@ -705,7 +705,7 @@ fn bench_limbo(
                 }
             }
         }
-        db.io.run_once().unwrap();
+        db.io.step().unwrap();
 
         if all_finished {
             break;
@@ -775,7 +775,7 @@ fn bench_limbo_mvcc(
                     conn.current_insert = None;
                 }
                 Ok(StepResult::IO) => {
-                    stmt.run_once().unwrap();
+                    stmt.step().unwrap();
                     // let's skip doing I/O here, we want to perform io only after all the statements are stepped
                 }
                 Ok(StepResult::Busy) => {
@@ -802,7 +802,7 @@ fn bench_limbo_mvcc(
                 }
             }
         }
-        db.io.run_once().unwrap();
+        db.io.step().unwrap();
 
         if all_finished {
             break;
