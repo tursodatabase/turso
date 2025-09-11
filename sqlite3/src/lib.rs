@@ -835,7 +835,7 @@ pub unsafe extern "C" fn sqlite3_bind_zeroblob(
         return SQLITE_RANGE;
     }
     if len < 0 {
-        return SQLITE_RANGE;
+        return SQLITE_ERROR;
     }
 
     let stmt_ref = &mut *stmt;
