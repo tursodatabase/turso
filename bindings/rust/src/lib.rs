@@ -37,6 +37,7 @@ mod rows;
 pub mod transaction;
 pub mod value;
 
+use futures_util::TryStreamExt;
 use transaction::TransactionBehavior;
 #[cfg(feature = "conn_raw_api")]
 use turso_core::types::WalFrameInfo;
@@ -44,6 +45,8 @@ pub use value::Value;
 
 pub use params::params_from_iter;
 pub use params::IntoParams;
+
+pub use futures_util;
 
 use std::fmt::Debug;
 use std::num::NonZero;
@@ -447,50 +450,16 @@ impl Statement {
             // Reset the statement before executing
             self.inner.lock().unwrap().reset();
         }
-        let params = params.into_params()?;
-        match params {
-            params::Params::None => (),
-            params::Params::Positional(values) => {
-                for (i, value) in values.into_iter().enumerate() {
-                    let mut stmt = self.inner.lock().unwrap();
-                    stmt.bind_at(NonZero::new(i + 1).unwrap(), value.into());
-                }
-            }
-            params::Params::Named(values) => {
-                for (name, value) in values.into_iter() {
-                    let mut stmt = self.inner.lock().unwrap();
-                    let i = stmt.parameters().index(name).unwrap();
-                    stmt.bind_at(i, value.into());
-                }
-            }
-        }
-        loop {
-            let mut stmt = self.inner.lock().unwrap();
-            match stmt.step() {
-                Ok(turso_core::StepResult::Row) => {
-                    return Err(Error::SqlExecutionFailure(
-                        "unexpected row during execution".to_string(),
-                    ));
-                }
-                Ok(turso_core::StepResult::Done) => {
-                    let changes = stmt.n_change();
-                    assert!(changes >= 0);
-                    return Ok(changes as u64);
-                }
-                Ok(turso_core::StepResult::IO) => {
-                    stmt.run_once()?;
-                }
-                Ok(turso_core::StepResult::Busy) => {
-                    return Err(Error::SqlExecutionFailure("database is locked".to_string()));
-                }
-                Ok(turso_core::StepResult::Interrupt) => {
-                    return Err(Error::SqlExecutionFailure("interrupted".to_string()));
-                }
-                Err(err) => {
-                    return Err(err.into());
-                }
-            }
-        }
+        let mut rows = self.query(params).await?;
+        // Ignore the rows returned
+        while rows.try_next().await?.is_some() {}
+        let stmt = self
+            .inner
+            .lock()
+            .map_err(|e| Error::MutexError(e.to_string()))?;
+        let changes = stmt.n_change();
+        assert!(changes >= 0);
+        Ok(changes as u64)
     }
 
     /// Returns columns of the result of this prepared statement.
@@ -526,7 +495,7 @@ impl Statement {
     pub async fn query_row(&mut self, params: impl IntoParams) -> Result<Row> {
         let mut rows = self.query(params).await?;
 
-        rows.next().await?.ok_or(Error::QueryReturnedNoRows)
+        rows.try_next().await?.ok_or(Error::QueryReturnedNoRows)
     }
 }
 
@@ -594,13 +563,13 @@ mod tests {
             .query("SELECT name FROM test_persistence ORDER BY id;", ())
             .await?;
 
-        let row1 = rows.next().await?.expect("Expected first row");
+        let row1 = rows.try_next().await?.expect("Expected first row");
         assert_eq!(row1.get_value(0)?, Value::Text("Alice".to_string()));
 
-        let row2 = rows.next().await?.expect("Expected second row");
+        let row2 = rows.try_next().await?.expect("Expected second row");
         assert_eq!(row2.get_value(0)?, Value::Text("Bob".to_string()));
 
-        assert!(rows.next().await?.is_none(), "Expected no more rows");
+        assert!(rows.try_next().await?.is_none(), "Expected no more rows");
 
         Ok(())
     }
@@ -651,7 +620,7 @@ mod tests {
 
             for (i, value) in original_data.iter().enumerate().take(NUM_INSERTS) {
                 let row = rows
-                    .next()
+                    .try_next()
                     .await?
                     .unwrap_or_else(|| panic!("Expected row {i} but found None"));
                 assert_eq!(
@@ -662,7 +631,7 @@ mod tests {
             }
 
             assert!(
-                rows.next().await?.is_none(),
+                rows.try_next().await?.is_none(),
                 "Expected no more rows after retrieving all inserted data"
             );
 
@@ -718,9 +687,9 @@ mod tests {
                 let mut rows_iter = conn
                     .query("SELECT count(*) FROM test_persistence;", ())
                     .await?;
-                let rows = rows_iter.next().await?.unwrap();
+                let rows = rows_iter.try_next().await?.unwrap();
                 assert_eq!(rows.get_value(0)?, Value::Integer(i as i64 + 1));
-                assert!(rows_iter.next().await?.is_none());
+                assert!(rows_iter.try_next().await?.is_none());
             }
         }
 

@@ -4161,6 +4161,7 @@ dependencies = [
 name = "turso"
 version = "0.2.0-pre.2"
 dependencies = [
+ "futures-util",
  "rand 0.8.5",
  "rand_chacha 0.3.1",
  "tempfile",

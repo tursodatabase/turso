@@ -1,3 +1,4 @@
+use futures_util::TryStreamExt;
 use turso::Builder;
 
 #[tokio::main]
@@ -32,7 +33,7 @@ async fn main() {
 
     let mut rows = stmt.query(["foo@example.com"]).await.unwrap();
 
-    let row = rows.next().await.unwrap().unwrap();
+    let row = rows.try_next().await.unwrap().unwrap();
 
     let value = row.get_value(0).unwrap();
 

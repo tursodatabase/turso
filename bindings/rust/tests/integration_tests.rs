@@ -1,3 +1,4 @@
+use futures_util::{StreamExt, TryStreamExt};
 use tokio::fs;
 use turso::{Builder, Error, Value};
 
@@ -40,26 +41,26 @@ async fn test_rows_next() {
     assert_eq!(conn.last_insert_rowid(), 5);
     let mut res = conn.query("SELECT * FROM test", ()).await.unwrap();
     assert_eq!(
-        res.next().await.unwrap().unwrap().get_value(0).unwrap(),
+        res.try_next().await.unwrap().unwrap().get_value(0).unwrap(),
         1.into()
     );
     assert_eq!(
-        res.next().await.unwrap().unwrap().get_value(0).unwrap(),
+        res.try_next().await.unwrap().unwrap().get_value(0).unwrap(),
         2.into()
     );
     assert_eq!(
-        res.next().await.unwrap().unwrap().get_value(0).unwrap(),
+        res.try_next().await.unwrap().unwrap().get_value(0).unwrap(),
         3.into()
     );
     assert_eq!(
-        res.next().await.unwrap().unwrap().get_value(0).unwrap(),
+        res.try_next().await.unwrap().unwrap().get_value(0).unwrap(),
         4.into()
     );
     assert_eq!(
-        res.next().await.unwrap().unwrap().get_value(0).unwrap(),
+        res.try_next().await.unwrap().unwrap().get_value(0).unwrap(),
         5.into()
     );
-    assert!(res.next().await.unwrap().is_none());
+    assert!(res.try_next().await.unwrap().is_none());
 }
 
 #[tokio::test]
@@ -91,11 +92,11 @@ async fn test_cacheflush() {
     let mut res = conn.query("SELECT * FROM asdf", ()).await.unwrap();
 
     assert_eq!(
-        res.next().await.unwrap().unwrap().get_value(0).unwrap(),
+        res.try_next().await.unwrap().unwrap().get_value(0).unwrap(),
         2.into()
     );
     assert_eq!(
-        res.next().await.unwrap().unwrap().get_value(0).unwrap(),
+        res.try_next().await.unwrap().unwrap().get_value(0).unwrap(),
         3.into()
     );
 
@@ -113,7 +114,7 @@ async fn test_cacheflush() {
         .unwrap();
 
     assert_eq!(
-        res.next().await.unwrap().unwrap().get_value(0).unwrap(),
+        res.try_next().await.unwrap().unwrap().get_value(0).unwrap(),
         1.into()
     );
 
@@ -212,7 +213,7 @@ pub async fn test_execute_batch() {
         .query("SELECT COUNT(*) FROM authors;", ())
         .await
         .unwrap();
-    if let Some(row) = rows.next().await.unwrap() {
+    if let Some(row) = rows.try_next().await.unwrap() {
         assert_eq!(row.get_value(0).unwrap(), Value::Integer(2));
     }
 }
@@ -328,14 +329,14 @@ async fn test_index() {
     let row = rows.next().await.unwrap().unwrap();
     assert!(row.get::<String>(0).unwrap() == "alice");
     assert!(row.get::<String>(1).unwrap() == "a@b.c");
-    assert!(rows.next().await.unwrap().is_none());
+    assert!(rows.try_next().await.unwrap().is_none());
 
     let mut rows = conn
         .query("SELECT * FROM users WHERE email = 'b@d.e'", ())
         .await
         .unwrap();
-    let row = rows.next().await.unwrap().unwrap();
+    let row = rows.try_next().await.unwrap().unwrap();
     assert!(row.get::<String>(0).unwrap() == "bob");
     assert!(row.get::<String>(1).unwrap() == "b@d.e");
-    assert!(rows.next().await.unwrap().is_none());
+    assert!(rows.try_next().await.unwrap().is_none());
 }
