@@ -712,7 +712,7 @@ pub(crate) fn commit_tx(
     tx_id: u64,
 ) -> Result<()> {
     let mut sm = mv_store
-        .commit_tx(tx_id, conn.pager.borrow().clone(), conn)
+        .commit_tx(tx_id)
         .unwrap();
     // TODO: sync IO hack
     loop {
@@ -736,7 +736,7 @@ pub(crate) fn commit_tx_no_conn(
 ) -> Result<(), LimboError> {
     let mv_store = db.get_mvcc_store();
     let mut sm = mv_store
-        .commit_tx(tx_id, conn.pager.borrow().clone(), conn)
+        .commit_tx(tx_id)
         .unwrap();
     // TODO: sync IO hack
     loop {

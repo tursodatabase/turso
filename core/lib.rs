@@ -316,6 +316,7 @@ impl Database {
             return Self::open_with_flags_bypass_registry_internal(
                 io,
                 path,
+                &format!("{path}-log"),
                 &format!("{path}-wal"),
                 db_file,
                 flags,
@@ -336,6 +337,7 @@ impl Database {
         let db = Self::open_with_flags_bypass_registry_internal(
             io,
             path,
+            &format!("{path}-log"),
             &format!("{path}-wal"),
             db_file,
             flags,
@@ -350,18 +352,22 @@ impl Database {
     pub fn open_with_flags_bypass_registry(
         io: Arc<dyn IO>,
         path: &str,
+        log_path: &str,
         wal_path: &str,
         db_file: Arc<dyn DatabaseStorage>,
         flags: OpenFlags,
         opts: DatabaseOpts,
     ) -> Result<Arc<Database>> {
-        Self::open_with_flags_bypass_registry_internal(io, path, wal_path, db_file, flags, opts)
+        Self::open_with_flags_bypass_registry_internal(
+            io, path, log_path, wal_path, db_file, flags, opts,
+        )
     }
 
     #[allow(clippy::arc_with_non_send_sync)]
     fn open_with_flags_bypass_registry_internal(
         io: Arc<dyn IO>,
         path: &str,
+        log_path: &str,
         wal_path: &str,
         db_file: Arc<dyn DatabaseStorage>,
         flags: OpenFlags,
@@ -370,10 +376,12 @@ impl Database {
         let shared_wal = WalFileShared::open_shared_if_exists(&io, wal_path)?;
 
         let mv_store = if opts.enable_mvcc {
-            Some(Arc::new(MvStore::new(
-                mvcc::LocalClock::new(),
-                mvcc::persistent_storage::Storage::new_noop(),
-            )))
+            let storage = if !log_path.is_empty() {
+                mvcc::persistent_storage::Storage::new_logical_wal(log_path)?
+            } else {
+                mvcc::persistent_storage::Storage::new_noop()
+            };
+            Some(Arc::new(MvStore::new(mvcc::LocalClock::new(), storage)))
         } else {
             None
         };

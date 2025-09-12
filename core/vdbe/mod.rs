@@ -785,7 +785,7 @@ impl Program {
                         return Ok(IOResult::Done(()));
                     }
                     let tx_id = mv_transactions.first().unwrap();
-                    let state_machine = mv_store.commit_tx(*tx_id, pager.clone(), &conn).unwrap();
+                    let state_machine = mv_store.commit_tx(*tx_id).unwrap();
                     program_state.commit_state = CommitState::CommitingMvcc { state_machine };
                 }
                 let CommitState::CommitingMvcc { state_machine } = &mut program_state.commit_state

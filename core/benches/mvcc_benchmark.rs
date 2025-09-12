@@ -47,7 +47,7 @@ fn bench(c: &mut Criterion) {
             let tx_id = db.mvcc_store.begin_tx(conn.get_pager().clone());
             let mv_store = &db.mvcc_store;
             let mut sm = mv_store
-                .commit_tx(tx_id, conn.get_pager().clone(), conn)
+                .commit_tx(tx_id)
                 .unwrap();
             // TODO: sync IO hack
             loop {
@@ -77,7 +77,7 @@ fn bench(c: &mut Criterion) {
                 .unwrap();
             let mv_store = &db.mvcc_store;
             let mut sm = mv_store
-                .commit_tx(tx_id, conn.get_pager().clone(), conn)
+                .commit_tx(tx_id)
                 .unwrap();
             // TODO: sync IO hack
             loop {
@@ -114,7 +114,7 @@ fn bench(c: &mut Criterion) {
                 .unwrap();
             let mv_store = &db.mvcc_store;
             let mut sm = mv_store
-                .commit_tx(tx_id, conn.get_pager().clone(), conn)
+                .commit_tx(tx_id)
                 .unwrap();
             // TODO: sync IO hack
             loop {

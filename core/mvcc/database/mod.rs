@@ -6,13 +6,10 @@ use crate::state_machine::StateMachine;
 use crate::state_machine::StateTransition;
 use crate::state_machine::TransitionResult;
 use crate::storage::btree::BTreeCursor;
-use crate::storage::btree::BTreeKey;
 use crate::types::IOResult;
-use crate::types::ImmutableRecord;
-use crate::IOExt;
 use crate::LimboError;
 use crate::Result;
-use crate::{Connection, Pager};
+use crate::Pager;
 use crossbeam_skiplist::{SkipMap, SkipSet};
 use parking_lot::RwLock;
 use std::collections::HashSet;
@@ -21,7 +18,6 @@ use std::marker::PhantomData;
 use std::ops::Bound;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 
 #[cfg(test)]
 pub mod tests;
@@ -71,7 +67,7 @@ pub type TxID = u64;
 #[derive(Clone, Debug)]
 pub struct LogRecord {
     pub(crate) tx_timestamp: TxID,
-    row_versions: Vec<RowVersion>,
+    pub(crate) row_versions: Vec<RowVersion>,
 }
 
 impl LogRecord {
@@ -245,31 +241,14 @@ impl AtomicTransactionState {
 #[derive(Debug)]
 pub enum CommitState {
     Initial,
-    BeginPagerTxn { end_ts: u64 },
-    WriteRow { end_ts: u64, write_set_index: usize },
-    WriteRowStateMachine { end_ts: u64, write_set_index: usize },
-    DeleteRowStateMachine { end_ts: u64, write_set_index: usize },
-    CommitPagerTxn { end_ts: u64 },
     Commit { end_ts: u64 },
-}
-
-#[derive(Debug)]
-pub enum WriteRowState {
-    Initial,
-    CreateCursor,
-    Seek,
-    Insert,
 }
 
 pub struct CommitStateMachine<Clock: LogicalClock> {
     state: CommitState,
     is_finalized: bool,
-    pager: Rc<Pager>,
     tx_id: TxID,
-    connection: Arc<Connection>,
     write_set: Vec<RowID>,
-    write_row_state_machine: Option<StateMachine<WriteRowStateMachine>>,
-    delete_row_state_machine: Option<StateMachine<DeleteRowStateMachine>>,
     _phantom: PhantomData<Clock>,
 }
 
@@ -282,60 +261,19 @@ impl<Clock: LogicalClock> Debug for CommitStateMachine<Clock> {
     }
 }
 
-pub struct WriteRowStateMachine {
-    state: WriteRowState,
-    is_finalized: bool,
-    pager: Rc<Pager>,
-    row: Row,
-    record: Option<ImmutableRecord>,
-    cursor: Option<BTreeCursor>,
-}
-
-#[derive(Debug)]
-pub enum DeleteRowState {
-    Initial,
-    CreateCursor,
-    Seek,
-    Delete,
-}
-
-pub struct DeleteRowStateMachine {
-    state: DeleteRowState,
-    is_finalized: bool,
-    pager: Rc<Pager>,
-    rowid: RowID,
-    column_count: usize,
-    cursor: Option<BTreeCursor>,
-}
 
 impl<Clock: LogicalClock> CommitStateMachine<Clock> {
-    fn new(state: CommitState, pager: Rc<Pager>, tx_id: TxID, connection: Arc<Connection>) -> Self {
+    fn new(state: CommitState, tx_id: TxID) -> Self {
         Self {
             state,
             is_finalized: false,
-            pager,
             tx_id,
-            connection,
             write_set: Vec::new(),
-            write_row_state_machine: None,
-            delete_row_state_machine: None,
             _phantom: PhantomData,
         }
     }
 }
 
-impl WriteRowStateMachine {
-    fn new(pager: Rc<Pager>, row: Row) -> Self {
-        Self {
-            state: WriteRowState::Initial,
-            is_finalized: false,
-            pager,
-            row,
-            record: None,
-            cursor: None,
-        }
-    }
-}
 
 impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
     type Context = MvStore<Clock>;
@@ -441,137 +379,6 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 tracing::trace!("commit_tx(tx_id={})", self.tx_id);
                 self.write_set
                     .extend(tx.write_set.iter().map(|v| *v.value()));
-                self.state = CommitState::BeginPagerTxn { end_ts };
-                Ok(TransitionResult::Continue)
-            }
-            CommitState::BeginPagerTxn { end_ts } => {
-                // FIXME: how do we deal with multiple concurrent writes?
-                // WAL requires a txn to be written sequentially. Either we:
-                // 1. Wait for currently writer to finish before second txn starts.
-                // 2. Choose a txn to write depending on some heuristics like amount of frames will be written.
-                // 3. ..
-
-                // If this is the exclusive transaction, we already acquired a write transaction
-                // on the pager in begin_exclusive_tx() and don't need to acquire it.
-                if !mvcc_store.is_exclusive_tx(&self.tx_id) {
-                    let result = self.pager.io.block(|| self.pager.begin_write_tx())?;
-                    if let LimboResult::Busy = result {
-                        return Err(LimboError::Busy);
-                    }
-                }
-                self.state = CommitState::WriteRow {
-                    end_ts,
-                    write_set_index: 0,
-                };
-                return Ok(TransitionResult::Continue);
-            }
-            CommitState::WriteRow {
-                end_ts,
-                write_set_index,
-            } => {
-                if write_set_index == self.write_set.len() {
-                    self.state = CommitState::CommitPagerTxn { end_ts };
-                    return Ok(TransitionResult::Continue);
-                }
-                let id = &self.write_set[write_set_index];
-                if let Some(row_versions) = mvcc_store.rows.get(id) {
-                    let row_versions = row_versions.value().read();
-                    // Find rows that were written by this transaction
-                    for row_version in row_versions.iter() {
-                        if let TxTimestampOrID::TxID(row_tx_id) = row_version.begin {
-                            if row_tx_id == self.tx_id {
-                                let state_machine = mvcc_store
-                                    .write_row_to_pager(self.pager.clone(), &row_version.row)?;
-                                self.write_row_state_machine = Some(state_machine);
-                                self.state = CommitState::WriteRowStateMachine {
-                                    end_ts,
-                                    write_set_index,
-                                };
-                                break;
-                            }
-                        }
-                        if let Some(TxTimestampOrID::TxID(row_tx_id)) = row_version.end {
-                            if row_tx_id == self.tx_id {
-                                let column_count = row_version.row.column_count;
-                                let state_machine = mvcc_store.delete_row_from_pager(
-                                    self.pager.clone(),
-                                    row_version.row.id,
-                                    column_count,
-                                )?;
-                                self.delete_row_state_machine = Some(state_machine);
-                                self.state = CommitState::DeleteRowStateMachine {
-                                    end_ts,
-                                    write_set_index,
-                                };
-                                break;
-                            }
-                        }
-                    }
-                }
-                Ok(TransitionResult::Continue)
-            }
-
-            CommitState::WriteRowStateMachine {
-                end_ts,
-                write_set_index,
-            } => {
-                let write_row_state_machine = self.write_row_state_machine.as_mut().unwrap();
-                match write_row_state_machine.step(&())? {
-                    TransitionResult::Io(io) => return Ok(TransitionResult::Io(io)),
-                    TransitionResult::Continue => {
-                        return Ok(TransitionResult::Continue);
-                    }
-                    TransitionResult::Done(_) => {
-                        self.state = CommitState::WriteRow {
-                            end_ts,
-                            write_set_index: write_set_index + 1,
-                        };
-                        return Ok(TransitionResult::Continue);
-                    }
-                }
-            }
-            CommitState::DeleteRowStateMachine {
-                end_ts,
-                write_set_index,
-            } => {
-                let delete_row_state_machine = self.delete_row_state_machine.as_mut().unwrap();
-                match delete_row_state_machine.step(&())? {
-                    TransitionResult::Io(io) => return Ok(TransitionResult::Io(io)),
-                    TransitionResult::Continue => {
-                        return Ok(TransitionResult::Continue);
-                    }
-                    TransitionResult::Done(_) => {
-                        self.state = CommitState::WriteRow {
-                            end_ts,
-                            write_set_index: write_set_index + 1,
-                        };
-                        return Ok(TransitionResult::Continue);
-                    }
-                }
-            }
-            CommitState::CommitPagerTxn { end_ts } => {
-                // Write committed data to pager for persistence
-                // Flush dirty pages to WAL - this is critical for data persistence
-                // Similar to what step_end_write_txn does for legacy transactions
-                loop {
-                    let result = self
-                        .pager
-                        .end_tx(
-                            false, // rollback = false since we're committing
-                            &self.connection,
-                        )
-                        .map_err(|e| LimboError::InternalError(e.to_string()))
-                        .unwrap();
-                    match result {
-                        crate::types::IOResult::Done(_) => {
-                            break;
-                        }
-                        crate::types::IOResult::IO(io) => {
-                            io.wait(self.pager.io.as_ref())?;
-                            continue;
-                        }
-                    }
-                }
                 self.state = CommitState::Commit { end_ts };
                 Ok(TransitionResult::Continue)
             }
@@ -639,179 +446,6 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
 
     fn is_finalized(&self) -> bool {
         self.is_finalized
-    }
-}
-
-impl StateTransition for WriteRowStateMachine {
-    type Context = ();
-    type SMResult = ();
-
-    #[tracing::instrument(fields(state = ?self.state), skip(self, _context))]
-    fn step(&mut self, _context: &Self::Context) -> Result<TransitionResult<Self::SMResult>> {
-        use crate::storage::btree::BTreeCursor;
-        use crate::types::{IOResult, SeekKey, SeekOp};
-
-        match self.state {
-            WriteRowState::Initial => {
-                // Create the record and key
-                let mut record = ImmutableRecord::new(self.row.data.len());
-                record.start_serialization(&self.row.data);
-                self.record = Some(record);
-
-                self.state = WriteRowState::CreateCursor;
-                Ok(TransitionResult::Continue)
-            }
-            WriteRowState::CreateCursor => {
-                // Create the cursor
-                let root_page = self.row.id.table_id as usize;
-                let num_columns = self.row.column_count;
-
-                let cursor = BTreeCursor::new_table(
-                    None, // Write directly to B-tree
-                    self.pager.clone(),
-                    root_page,
-                    num_columns,
-                );
-                self.cursor = Some(cursor);
-
-                self.state = WriteRowState::Seek;
-                Ok(TransitionResult::Continue)
-            }
-            WriteRowState::Seek => {
-                // Position the cursor by seeking to the row position
-                let seek_key = SeekKey::TableRowId(self.row.id.row_id);
-                let cursor = self.cursor.as_mut().unwrap();
-
-                match cursor.seek(seek_key, SeekOp::GE { eq_only: true })? {
-                    IOResult::Done(_) => {
-                        self.state = WriteRowState::Insert;
-                        Ok(TransitionResult::Continue)
-                    }
-                    IOResult::IO(io) => {
-                        return Ok(TransitionResult::Io(io));
-                    }
-                }
-            }
-            WriteRowState::Insert => {
-                // Insert the record into the B-tree
-                let cursor = self.cursor.as_mut().unwrap();
-                let key = BTreeKey::new_table_rowid(self.row.id.row_id, self.record.as_ref());
-
-                match cursor
-                    .insert(&key)
-                    .map_err(|e| LimboError::InternalError(e.to_string()))?
-                {
-                    IOResult::Done(()) => {
-                        tracing::trace!(
-                            "write_row_to_pager(table_id={}, row_id={})",
-                            self.row.id.table_id,
-                            self.row.id.row_id
-                        );
-                        self.finalize(&())?;
-                        Ok(TransitionResult::Done(()))
-                    }
-                    IOResult::IO(io) => {
-                        return Ok(TransitionResult::Io(io));
-                    }
-                }
-            }
-        }
-    }
-
-    fn finalize(&mut self, _context: &Self::Context) -> Result<()> {
-        self.is_finalized = true;
-        Ok(())
-    }
-
-    fn is_finalized(&self) -> bool {
-        self.is_finalized
-    }
-}
-
-impl StateTransition for DeleteRowStateMachine {
-    type Context = ();
-    type SMResult = ();
-
-    #[tracing::instrument(fields(state = ?self.state), skip(self, _context))]
-    fn step(&mut self, _context: &Self::Context) -> Result<TransitionResult<Self::SMResult>> {
-        use crate::storage::btree::BTreeCursor;
-        use crate::types::{IOResult, SeekKey, SeekOp};
-
-        match self.state {
-            DeleteRowState::Initial => {
-                self.state = DeleteRowState::CreateCursor;
-                Ok(TransitionResult::Continue)
-            }
-            DeleteRowState::CreateCursor => {
-                let root_page = self.rowid.table_id as usize;
-                let num_columns = self.column_count;
-
-                let cursor =
-                    BTreeCursor::new_table(None, self.pager.clone(), root_page, num_columns);
-                self.cursor = Some(cursor);
-
-                self.state = DeleteRowState::Seek;
-                Ok(TransitionResult::Continue)
-            }
-            DeleteRowState::Seek => {
-                let seek_key = SeekKey::TableRowId(self.rowid.row_id);
-                let cursor = self.cursor.as_mut().unwrap();
-
-                match cursor.seek(seek_key, SeekOp::GE { eq_only: true })? {
-                    IOResult::Done(_) => {
-                        self.state = DeleteRowState::Delete;
-                        Ok(TransitionResult::Continue)
-                    }
-                    IOResult::IO(io) => {
-                        return Ok(TransitionResult::Io(io));
-                    }
-                }
-            }
-            DeleteRowState::Delete => {
-                // Insert the record into the B-tree
-                let cursor = self.cursor.as_mut().unwrap();
-
-                match cursor
-                    .delete()
-                    .map_err(|e| LimboError::InternalError(e.to_string()))?
-                {
-                    IOResult::Done(()) => {
-                        tracing::trace!(
-                            "delete_row_from_pager(table_id={}, row_id={})",
-                            self.rowid.table_id,
-                            self.rowid.row_id
-                        );
-                        self.finalize(&())?;
-                        Ok(TransitionResult::Done(()))
-                    }
-                    IOResult::IO(io) => {
-                        return Ok(TransitionResult::Io(io));
-                    }
-                }
-            }
-        }
-    }
-
-    fn finalize(&mut self, _context: &Self::Context) -> Result<()> {
-        self.is_finalized = true;
-        Ok(())
-    }
-
-    fn is_finalized(&self) -> bool {
-        self.is_finalized
-    }
-}
-
-impl DeleteRowStateMachine {
-    fn new(pager: Rc<Pager>, rowid: RowID, column_count: usize) -> Self {
-        Self {
-            state: DeleteRowState::Initial,
-            is_finalized: false,
-            pager,
-            rowid,
-            column_count,
-            cursor: None,
-        }
     }
 }
 
@@ -1126,34 +760,13 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
         self.acquire_exclusive_tx(&tx_id)?;
 
-        // Try to acquire the pager read lock
-        match pager.begin_read_tx()? {
-            LimboResult::Busy => {
-                self.release_exclusive_tx(&tx_id);
-                return Err(LimboError::Busy);
-            }
-            LimboResult::Ok => {}
-        }
-        // Try to acquire the pager write lock
-        match return_if_io!(pager.begin_write_tx()) {
-            LimboResult::Busy => {
-                tracing::debug!("begin_exclusive_tx: tx_id={} failed with Busy", tx_id);
-                // Failed to get pager lock - release our exclusive lock
-                self.release_exclusive_tx(&tx_id);
-                pager.end_read_tx()?;
-                return Err(LimboError::Busy);
-            }
-            LimboResult::Ok => {
-                let tx = Transaction::new(tx_id, begin_ts);
-                tracing::trace!(
-                    "begin_exclusive_tx(tx_id={}) - exclusive write transaction",
-                    tx_id
-                );
-                tracing::debug!("begin_exclusive_tx: tx_id={} succeeded", tx_id);
-                self.txs.insert(tx_id, tx);
-            }
-        }
-
+        let tx = Transaction::new(tx_id, begin_ts);
+        tracing::trace!(
+            "begin_exclusive_tx(tx_id={}) - exclusive write transaction",
+            tx_id
+        );
+        tracing::debug!("begin_exclusive_tx: tx_id={} succeeded", tx_id);
+        self.txs.insert(tx_id, tx);
         Ok(IOResult::Done(tx_id))
     }
 
@@ -1168,10 +781,6 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         let tx = Transaction::new(tx_id, begin_ts);
         tracing::trace!("begin_tx(tx_id={})", tx_id);
         self.txs.insert(tx_id, tx);
-
-        // TODO: we need to tie a pager's read transaction to a transaction ID, so that future refactors to read
-        // pages from WAL/DB read from a consistent state to maintiain snapshot isolation.
-        pager.begin_read_tx().unwrap();
         tx_id
     }
 
@@ -1187,14 +796,12 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     pub fn commit_tx(
         &self,
         tx_id: TxID,
-        pager: Rc<Pager>,
-        connection: &Arc<Connection>,
     ) -> Result<StateMachine<CommitStateMachine<Clock>>> {
         tracing::trace!("commit_tx(tx_id={})", tx_id);
         let state_machine: StateMachine<CommitStateMachine<Clock>> = StateMachine::<
             CommitStateMachine<Clock>,
         >::new(
-            CommitStateMachine::new(CommitState::Initial, pager, tx_id, connection.clone()),
+            CommitStateMachine::new(CommitState::Initial, tx_id),
         );
         Ok(state_machine)
     }
@@ -1383,34 +990,6 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         versions.insert(position, row_version);
     }
 
-    pub fn write_row_to_pager(
-        &self,
-        pager: Rc<Pager>,
-        row: &Row,
-    ) -> Result<StateMachine<WriteRowStateMachine>> {
-        let state_machine: StateMachine<WriteRowStateMachine> =
-            StateMachine::<WriteRowStateMachine>::new(WriteRowStateMachine::new(
-                pager,
-                row.clone(),
-            ));
-
-        Ok(state_machine)
-    }
-
-    pub fn delete_row_from_pager(
-        &self,
-        pager: Rc<Pager>,
-        rowid: RowID,
-        column_count: usize,
-    ) -> Result<StateMachine<DeleteRowStateMachine>> {
-        let state_machine: StateMachine<DeleteRowStateMachine> = StateMachine::<
-            DeleteRowStateMachine,
-        >::new(
-            DeleteRowStateMachine::new(pager, rowid, column_count),
-        );
-
-        Ok(state_machine)
-    }
 
     /// Try to scan for row ids in the table.
     ///
