@@ -78,11 +78,11 @@ async fn main() -> Result<()> {
     }
 
     let mut total_inserts = 0;
-    for handle in handles {
+    for (idx, handle) in handles.into_iter().enumerate() {
         match handle.await {
             Ok(Ok(inserts)) => total_inserts += inserts,
             Ok(Err(e)) => {
-                eprintln!("Thread error: {e}");
+                eprintln!("Thread error {idx}: {e}");
                 return Err(e);
             }
             Err(_) => {
