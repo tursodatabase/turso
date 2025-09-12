@@ -1,3 +1,4 @@
+use std::cmp::PartialEq;
 use std::sync::Arc;
 
 use super::{
@@ -12,6 +13,7 @@ use super::{
 };
 use crate::function::{AggFunc, ExtFunc};
 use crate::translate::expr::WalkControl;
+use crate::translate::plan::{Window, WindowFunction};
 use crate::{
     ast::Limit,
     function::Func,
@@ -24,17 +26,35 @@ use crate::{
 use turso_macros::match_ignore_ascii_case;
 use turso_parser::ast::Literal::Null;
 use turso_parser::ast::{
-    self, As, Expr, FromClause, JoinType, Literal, Materialized, QualifiedName, TableInternalId,
-    With,
+    self, As, Expr, FromClause, JoinType, Literal, Materialized, Over, QualifiedName,
+    TableInternalId, With,
 };
 
 pub const ROWID: &str = "rowid";
 
-pub fn resolve_aggregates(
+/// This function walks the expression tree and identifies aggregate
+/// and window functions.
+///
+/// # Window functions
+/// - If `windows` is `Some`, window functions will be resolved against the
+///   provided set of windows or added to it if not present.
+/// - If `windows` is `None`, any encountered window function is treated
+///   as a misuse and results in a parse error.
+///
+/// # Aggregates
+/// Aggregate functions are always allowed. They are collected in `aggs`.
+///
+/// # Returns
+/// - `Ok(true)` if at least one aggregate function was found.
+/// - `Ok(false)` if no aggregates were found.
+/// - `Err(..)` if an invalid function usage is detected (e.g., window
+///   function encountered while `windows` is `None`).
+pub fn resolve_window_and_aggregate_functions(
     schema: &Schema,
     syms: &SymbolTable,
     top_level_expr: &Expr,
     aggs: &mut Vec<Aggregate>,
+    mut windows: Option<&mut Vec<Window>>,
 ) -> Result<bool> {
     let mut contains_aggregates = false;
     walk_expr(top_level_expr, &mut |expr: &Expr| -> Result<WalkControl> {
@@ -46,7 +66,7 @@ pub fn resolve_aggregates(
                 filter_over,
                 order_by,
             } => {
-                if filter_over.filter_clause.is_some() || filter_over.over_clause.is_some() {
+                if filter_over.filter_clause.is_some() {
                     crate::bail_parse_error!(
                         "FILTER clause is not supported yet in aggregate functions"
                     );
@@ -64,50 +84,95 @@ pub fn resolve_aggregates(
                         "SELECT with DISTINCT is not allowed without indexes enabled"
                     );
                 }
-                if distinctness.is_distinct() && args_count != 1 {
-                    crate::bail_parse_error!(
-                        "DISTINCT aggregate functions must have exactly one argument"
-                    );
-                }
                 match Func::resolve_function(name.as_str(), args_count) {
                     Ok(Func::Agg(f)) => {
-                        add_aggregate_if_not_exists(aggs, expr, args, distinctness, f);
-                        contains_aggregates = true;
+                        if let Some(over_clause) = filter_over.over_clause.as_ref() {
+                            link_with_window(
+                                windows.as_deref_mut(),
+                                expr,
+                                f,
+                                over_clause,
+                                distinctness,
+                            )?;
+                        } else {
+                            add_aggregate_if_not_exists(aggs, expr, args, distinctness, f)?;
+                            contains_aggregates = true;
+                        }
                         return Ok(WalkControl::SkipChildren);
                     }
                     Err(e) => {
                         if let Some(f) = syms.resolve_function(name.as_str(), args_count) {
+                            let func = AggFunc::External(f.func.clone().into());
                             if let ExtFunc::Aggregate { .. } = f.as_ref().func {
-                                add_aggregate_if_not_exists(
-                                    aggs,
-                                    expr,
-                                    args,
-                                    distinctness,
-                                    AggFunc::External(f.func.clone().into()),
-                                );
-                                contains_aggregates = true;
+                                if let Some(over_clause) = filter_over.over_clause.as_ref() {
+                                    link_with_window(
+                                        windows.as_deref_mut(),
+                                        expr,
+                                        func,
+                                        over_clause,
+                                        distinctness,
+                                    )?;
+                                } else {
+                                    add_aggregate_if_not_exists(
+                                        aggs,
+                                        expr,
+                                        args,
+                                        distinctness,
+                                        func,
+                                    )?;
+                                    contains_aggregates = true;
+                                }
                                 return Ok(WalkControl::SkipChildren);
                             }
                         } else {
                             return Err(e);
                         }
                     }
-                    _ => {}
+                    _ => {
+                        if filter_over.over_clause.is_some() {
+                            crate::bail_parse_error!(
+                                "{} may not be used as a window function",
+                                name.as_str()
+                            );
+                        }
+                    }
                 }
             }
             Expr::FunctionCallStar { name, filter_over } => {
-                if filter_over.filter_clause.is_some() || filter_over.over_clause.is_some() {
+                if filter_over.filter_clause.is_some() {
                     crate::bail_parse_error!(
                         "FILTER clause is not supported yet in aggregate functions"
                     );
                 }
                 match Func::resolve_function(name.as_str(), 0) {
                     Ok(Func::Agg(f)) => {
-                        add_aggregate_if_not_exists(aggs, expr, &[], Distinctness::NonDistinct, f);
-                        contains_aggregates = true;
+                        if let Some(over_clause) = filter_over.over_clause.as_ref() {
+                            link_with_window(
+                                windows.as_deref_mut(),
+                                expr,
+                                f,
+                                over_clause,
+                                Distinctness::NonDistinct,
+                            )?;
+                        } else {
+                            add_aggregate_if_not_exists(
+                                aggs,
+                                expr,
+                                &[],
+                                Distinctness::NonDistinct,
+                                f,
+                            )?;
+                            contains_aggregates = true;
+                        }
                         return Ok(WalkControl::SkipChildren);
                     }
                     Ok(_) => {
+                        if filter_over.over_clause.is_some() {
+                            crate::bail_parse_error!(
+                                "{} may not be used as a window function",
+                                name.as_str()
+                            );
+                        }
                         crate::bail_parse_error!("Invalid aggregate function: {}", name.as_str());
                     }
                     Err(e) => match e {
@@ -132,19 +197,69 @@ pub fn resolve_aggregates(
     Ok(contains_aggregates)
 }
 
+fn link_with_window(
+    windows: Option<&mut Vec<Window>>,
+    expr: &Expr,
+    func: AggFunc,
+    over_clause: &Over,
+    distinctness: Distinctness,
+) -> Result<()> {
+    if distinctness.is_distinct() {
+        crate::bail_parse_error!("DISTINCT is not supported for window functions");
+    }
+    if let Some(windows) = windows {
+        let window = resolve_window(windows, over_clause)?;
+        window.functions.push(WindowFunction {
+            func,
+            original_expr: expr.clone(),
+        });
+    } else {
+        crate::bail_parse_error!("misuse of window function: {}()", func.to_string());
+    }
+    Ok(())
+}
+
+fn resolve_window<'a>(windows: &'a mut Vec<Window>, over_clause: &Over) -> Result<&'a mut Window> {
+    match over_clause {
+        Over::Window(window) => {
+            if let Some(idx) = windows.iter().position(|w| w.is_equivalent(window)) {
+                return Ok(&mut windows[idx]);
+            }
+
+            windows.push(Window::new(None, window)?);
+            Ok(windows.last_mut().expect("just pushed, so must exist"))
+        }
+        Over::Name(name) => {
+            let window_name = normalize_ident(name.as_str());
+            // When multiple windows share the same name, SQLite uses the most recent
+            // definition. Iterate in reverse so we find the last definition first.
+            for window in windows.iter_mut().rev() {
+                if window.name.as_ref() == Some(&window_name) {
+                    return Ok(window);
+                }
+            }
+            crate::bail_parse_error!("no such window: {}", window_name);
+        }
+    }
+}
+
 fn add_aggregate_if_not_exists(
     aggs: &mut Vec<Aggregate>,
     expr: &Expr,
     args: &[Box<Expr>],
     distinctness: Distinctness,
     func: AggFunc,
-) {
+) -> Result<()> {
+    if distinctness.is_distinct() && args.len() != 1 {
+        crate::bail_parse_error!("DISTINCT aggregate functions must have exactly one argument");
+    }
     if aggs
         .iter()
         .all(|a| !exprs_are_equivalent(&a.original_expr, expr))
     {
         aggs.push(Aggregate::new(func, args, expr, distinctness));
     }
+    Ok(())
 }
 
 pub fn bind_column_references(

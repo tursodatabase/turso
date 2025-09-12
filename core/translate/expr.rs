@@ -685,7 +685,7 @@ pub fn translate_expr(
             name,
             distinctness: _,
             args,
-            filter_over: _,
+            filter_over,
             order_by: _,
         } => {
             let args_count = args.len();
@@ -702,7 +702,15 @@ pub fn translate_expr(
 
             match &func_ctx.func {
                 Func::Agg(_) => {
-                    crate::bail_parse_error!("misuse of aggregate function {}()", name.as_str())
+                    crate::bail_parse_error!(
+                        "misuse of {} function {}()",
+                        if filter_over.over_clause.is_some() {
+                            "window"
+                        } else {
+                            "aggregate"
+                        },
+                        name.as_str()
+                    )
                 }
                 Func::External(_) => {
                     let regs = program.alloc_registers(args_count);

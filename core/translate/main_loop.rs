@@ -2,22 +2,6 @@ use turso_parser::ast::{fmt::ToTokens, SortOrder};
 
 use std::sync::Arc;
 
-use crate::{
-    schema::{Affinity, Index, IndexColumn, Table},
-    translate::{
-        emitter::prepare_cdc_if_necessary,
-        plan::{DistinctCtx, Distinctness, Scan},
-        result_row::emit_select_result,
-    },
-    types::SeekOp,
-    vdbe::{
-        builder::{CursorKey, CursorType, ProgramBuilder},
-        insn::{CmpInsFlags, IdxInsertFlags, Insn},
-        BranchOffset, CursorID,
-    },
-    Result,
-};
-
 use super::{
     aggregation::{translate_aggregation_step, AggArgumentSource},
     display::PlanContext,
@@ -33,6 +17,22 @@ use super::{
         Aggregate, GroupBy, IterationDirection, JoinOrderMember, Operation, QueryDestination,
         Search, SeekDef, SelectPlan, TableReferences, WhereTerm,
     },
+};
+use crate::translate::window::emit_window_loop_source;
+use crate::{
+    schema::{Affinity, Index, IndexColumn, Table},
+    translate::{
+        emitter::prepare_cdc_if_necessary,
+        plan::{DistinctCtx, Distinctness, Scan},
+        result_row::emit_select_result,
+    },
+    types::SeekOp,
+    vdbe::{
+        builder::{CursorKey, CursorType, ProgramBuilder},
+        insn::{CmpInsFlags, IdxInsertFlags, Insn},
+        BranchOffset, CursorID,
+    },
+    Result,
 };
 
 // Metadata for handling LEFT JOIN operations
@@ -724,13 +724,15 @@ fn emit_conditions(
 /// The loop may emit rows to various destinations depending on the query:
 /// - a GROUP BY sorter (grouping is done by sorting based on the GROUP BY keys and aggregating while the GROUP BY keys match)
 /// - a GROUP BY phase with no sorting (when the rows are already in the order required by the GROUP BY keys)
-/// - an ORDER BY sorter (when there is no GROUP BY, but there is an ORDER BY)
 /// - an AggStep (the columns are collected for aggregation, which is finished later)
+/// - a Window (rows are buffered and returned according to the rules of the window definition)
+/// - an ORDER BY sorter (when there is none of the above, but there is an ORDER BY)
 /// - a QueryResult (there is none of the above, so the loop either emits a ResultRow, or if it's a subquery, yields to the parent query)
 enum LoopEmitTarget {
     GroupBy,
     OrderBySorter,
     AggStep,
+    Window,
     QueryResult,
 }
 
@@ -751,7 +753,15 @@ pub fn emit_loop(
     if !plan.aggregates.is_empty() {
         return emit_loop_source(program, t_ctx, plan, LoopEmitTarget::AggStep);
     }
-    // if we DONT have a group by, but we have an order by, we emit a record into the order by sorter.
+
+    // Window processing is planned so that the query plan has neither GROUP BY nor aggregates.
+    // If the original query contained them, they are pushed down into a subquery.
+    // Rows are buffered and returned according to the rules of the window definition.
+    if plan.window.is_some() {
+        return emit_loop_source(program, t_ctx, plan, LoopEmitTarget::Window);
+    }
+
+    // if NONE of the above applies, but we have an order by, we emit a record into the order by sorter.
     if !plan.order_by.is_empty() {
         return emit_loop_source(program, t_ctx, plan, LoopEmitTarget::OrderBySorter);
     }
@@ -957,6 +967,11 @@ fn emit_loop_source(
                 let distinct_ctx = ctx.as_ref().expect("distinct context must exist");
                 program.preassign_label_to_next_insn(distinct_ctx.label_on_conflict);
             }
+
+            Ok(())
+        }
+        LoopEmitTarget::Window => {
+            emit_window_loop_source(program, t_ctx, plan)?;
 
             Ok(())
         }

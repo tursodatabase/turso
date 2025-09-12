@@ -38,6 +38,7 @@ pub(crate) mod update;
 pub(crate) mod upsert;
 mod values;
 pub(crate) mod view;
+mod window;
 
 use crate::schema::Schema;
 use crate::storage::pager::Pager;

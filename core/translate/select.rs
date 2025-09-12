@@ -1,15 +1,16 @@
 use super::emitter::{emit_program, TranslateCtx};
 use super::plan::{
     select_star, Distinctness, JoinOrderMember, Operation, OuterQueryReference, QueryDestination,
-    Search, TableReferences, WhereTerm,
+    Search, TableReferences, WhereTerm, Window,
 };
 use crate::schema::Table;
 use crate::translate::optimizer::optimize_plan;
 use crate::translate::plan::{GroupBy, Plan, ResultSetColumn, SelectPlan};
 use crate::translate::planner::{
     bind_column_references, break_predicate_at_and_boundaries, parse_from, parse_limit,
-    parse_where, resolve_aggregates,
+    parse_where, resolve_window_and_aggregate_functions,
 };
+use crate::translate::window::plan_windows;
 use crate::util::normalize_ident;
 use crate::vdbe::builder::{ProgramBuilderOpts, TableRefIdCounter};
 use crate::vdbe::insn::Insn;
@@ -199,9 +200,7 @@ fn prepare_one_select_plan(
                     "SELECT with DISTINCT is not allowed without indexes enabled"
                 );
             }
-            if !window_clause.is_empty() {
-                crate::bail_parse_error!("WINDOW clause is not supported yet");
-            }
+
             let col_count = columns.len();
             if col_count == 0 {
                 crate::bail_parse_error!("SELECT without columns is not allowed");
@@ -280,7 +279,33 @@ fn prepare_one_select_plan(
                 query_destination,
                 distinctness: Distinctness::from_ast(distinctness.as_ref()),
                 values: vec![],
+                window: None,
             };
+
+            let mut windows = Vec::with_capacity(window_clause.len());
+            for window_def in window_clause.iter() {
+                let name = normalize_ident(window_def.name.as_str());
+                let mut window = Window::new(Some(name), &window_def.window)?;
+
+                for expr in window.partition_by.iter_mut() {
+                    bind_column_references(
+                        expr,
+                        &mut plan.table_references,
+                        Some(&plan.result_columns),
+                        connection,
+                    )?;
+                }
+                for (expr, _) in window.order_by.iter_mut() {
+                    bind_column_references(
+                        expr,
+                        &mut plan.table_references,
+                        Some(&plan.result_columns),
+                        connection,
+                    )?;
+                }
+
+                windows.push(window);
+            }
 
             let mut aggregate_expressions = Vec::new();
             for column in columns.iter_mut() {
@@ -338,8 +363,13 @@ fn prepare_one_select_plan(
                             Some(&plan.result_columns),
                             connection,
                         )?;
-                        let contains_aggregates =
-                            resolve_aggregates(schema, syms, expr, &mut aggregate_expressions)?;
+                        let contains_aggregates = resolve_window_and_aggregate_functions(
+                            schema,
+                            syms,
+                            expr,
+                            &mut aggregate_expressions,
+                            Some(&mut windows),
+                        )?;
                         plan.result_columns.push(ResultSetColumn {
                             alias: maybe_alias.as_ref().map(|alias| match alias {
                                 ast::As::Elided(alias) => alias.as_str().to_string(),
@@ -390,8 +420,13 @@ fn prepare_one_select_plan(
                                 Some(&plan.result_columns),
                                 connection,
                             )?;
-                            let contains_aggregates =
-                                resolve_aggregates(schema, syms, expr, &mut aggregate_expressions)?;
+                            let contains_aggregates = resolve_window_and_aggregate_functions(
+                                schema,
+                                syms,
+                                expr,
+                                &mut aggregate_expressions,
+                                None,
+                            )?;
                             if !contains_aggregates {
                                 // TODO: sqlite allows HAVING clauses with non aggregate expressions like
                                 // HAVING id = 5. We should support this too eventually (I guess).
@@ -423,7 +458,13 @@ fn prepare_one_select_plan(
                     Some(&plan.result_columns),
                     connection,
                 )?;
-                resolve_aggregates(schema, syms, &o.expr, &mut plan.aggregates)?;
+                resolve_window_and_aggregate_functions(
+                    schema,
+                    syms,
+                    &o.expr,
+                    &mut plan.aggregates,
+                    Some(&mut windows),
+                )?;
 
                 key.push((o.expr, o.order.unwrap_or(ast::SortOrder::Asc)));
             }
@@ -432,6 +473,11 @@ fn prepare_one_select_plan(
             // Parse the LIMIT/OFFSET clause
             (plan.limit, plan.offset) =
                 limit.map_or(Ok((None, None)), |mut l| parse_limit(&mut l, connection))?;
+
+            if !windows.is_empty() {
+                plan_windows(schema, syms, &mut plan, table_ref_counter, &mut windows)?;
+            }
+
             // Return the unoptimized query plan
             Ok(plan)
         }
@@ -463,6 +509,7 @@ fn prepare_one_select_plan(
                     .iter()
                     .map(|values| values.iter().map(|value| *value.clone()).collect())
                     .collect(),
+                window: None,
             };
 
             Ok(plan)

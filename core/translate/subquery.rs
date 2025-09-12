@@ -122,6 +122,7 @@ pub fn emit_subquery(
         resolver: Resolver::new(t_ctx.resolver.schema, t_ctx.resolver.symbol_table),
         non_aggregate_expressions: Vec::new(),
         cdc_cursor_id: None,
+        meta_window: None,
     };
     let subquery_body_end_label = program.allocate_label();
     program.emit_insn(Insn::InitCoroutine {
