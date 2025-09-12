@@ -578,6 +578,11 @@ fn rewrite_exprs_select(plan: &mut SelectPlan) -> Result<()> {
     for (expr, _) in plan.order_by.iter_mut() {
         rewrite_expr(expr, &mut param_count)?;
     }
+    if let Some(window) = &mut plan.window {
+        for func in window.functions.iter_mut() {
+            rewrite_expr(&mut func.original_expr, &mut param_count)?;
+        }
+    }
 
     Ok(())
 }
