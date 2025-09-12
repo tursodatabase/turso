@@ -498,11 +498,14 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
 
                 // If this is the exclusive transaction, we already acquired a write transaction
                 // on the pager in begin_exclusive_tx() and don't need to acquire it.
-                if !mvcc_store.is_exclusive_tx(&self.tx_id) {
-                    let result = self.pager.io.block(|| self.pager.begin_write_tx())?;
-                    if let LimboResult::Busy = result {
-                        return Err(LimboError::Busy);
-                    }
+                if mvcc_store.is_exclusive_tx(&self.tx_id) {
+                    self.state = CommitState::WriteRow {
+                        end_ts,
+                        write_set_index: 0,
+                        requires_seek: true,
+                    };
+                    return Ok(TransitionResult::Continue);
+                }
                 // Currently txns are queued without any heuristics whasoever. This is important because
                 // we need to ensure writes to disk happen sequentially.
                 // * We don't want txns to write to WAL in parallel.
@@ -1273,14 +1276,18 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             }
             LimboResult::Ok => {}
         }
+        let locked = self.commit_coordinator.pager_commit_lock.write();
+        if !locked {
+            self.release_exclusive_tx(&tx_id);
+            pager.end_read_tx()?;
+            return Err(LimboError::Busy);
+        }
         // Try to acquire the pager write lock
         match return_if_io!(pager.begin_write_tx()) {
             LimboResult::Busy => {
                 tracing::debug!("begin_exclusive_tx: tx_id={} failed with Busy", tx_id);
                 // Failed to get pager lock - release our exclusive lock
-                self.release_exclusive_tx(&tx_id);
-                pager.end_read_tx()?;
-                return Err(LimboError::Busy);
+                panic!("begin_exclusive_tx: tx_id={} failed with Busy, this should never happen as we were able to lock mvcc exclusive write lock", tx_id);
             }
             LimboResult::Ok => {
                 let tx = Transaction::new(tx_id, begin_ts);
