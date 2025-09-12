@@ -173,11 +173,11 @@ fn watch_mode(env: SimulatorEnv) -> notify::Result<()> {
             Ok(event) => {
                 if let EventKind::Modify(ModifyKind::Data(DataChange::Content)) = event.kind {
                     tracing::info!("plan file modified, rerunning simulation");
-                    let env = env.clone_without_connections();
+                    let env_clone = env.clone_without_connections();
                     let last_execution_ = last_execution.clone();
                     let result = SandboxedResult::from(
                         std::panic::catch_unwind(move || {
-                            let mut env = env;
+                            let mut env = env_clone;
                             let plan: Vec<Vec<Interaction>> =
                                 InteractionPlan::compute_via_diff(&env.get_plan_path());
                             tracing::error!("plan_len: {}", plan.len());
@@ -279,6 +279,23 @@ fn run_simulator(
             }
 
             tracing::error!("simulation failed: '{}'", error);
+
+            // Post-panic recovery verification: reopen the database and run integrity_check.
+            // This helps determine whether short writes caused persistent corruption
+            let db_path = env.get_db_path();
+            match integrity_check(&db_path) {
+                Ok(()) => {
+                    tracing::info!(
+                        "post-panic integrity_check passed for {}",
+                        db_path.display()
+                    );
+                    println!("post-panic integrity_check passed");
+                }
+                Err(e) => {
+                    tracing::error!("post-panic integrity_check failed: {}", e);
+                    println!("post-panic integrity_check failed: {e}");
+                }
+            }
 
             if cli_opts.disable_heuristic_shrinking && !cli_opts.enable_brute_force_shrinking {
                 tracing::info!("shrinking is disabled, skipping shrinking");

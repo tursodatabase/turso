@@ -993,14 +993,20 @@ impl Property {
             } => {
                 use sql_generation::model::query::transaction::{Begin, Commit};
 
-                let table_name = table.clone();
+                let table_name_for_assumption = table.clone();
                 let assumption = Interaction::Assumption(Assertion {
                     name: format!("table {table} exists"),
                     func: Box::new(move |_: &Vec<ResultSet>, env: &mut SimulatorEnv| {
-                        if env.tables.iter().any(|t| t.name == table_name) {
+                        if env
+                            .tables
+                            .iter()
+                            .any(|t| t.name == table_name_for_assumption)
+                        {
                             Ok(Ok(()))
                         } else {
-                            Ok(Err(format!("table {table_name} does not exist")))
+                            Ok(Err(format!(
+                                "table {table_name_for_assumption} does not exist"
+                            )))
                         }
                     }),
                 });
@@ -1009,30 +1015,56 @@ impl Property {
                 let insert_query = Interaction::Query(Query::Insert(insert.clone()));
                 let commit_tx = Interaction::Query(Query::Commit(Commit {}));
 
-                let restart_db = Interaction::Assertion(Assertion {
-                    name: "restart database to test durability".to_string(),
-                    func: Box::new(|_: &Vec<ResultSet>, env: &mut SimulatorEnv| {
-                        env.connections.iter_mut().for_each(|c| c.disconnect());
-                        env.clear();
-                        Ok(Ok(()))
-                    }),
-                });
+                // Use a proper reopen without deleting files to simulate a crash/restart,
+                // ensuring any on-disk corruption persists across reopen.
+                let restart_db = Interaction::Fault(super::plan::Fault::ReopenDatabase);
 
                 let select_query = Interaction::Query(Query::Select(select.clone()));
 
                 let assertion = Interaction::Assertion(Assertion {
-                    name: "data should be recoverable after short write and restart".to_string(),
-                    func: Box::new(move |stack: &Vec<ResultSet>, _env: &mut SimulatorEnv| {
-                        let result = stack.last().unwrap();
-                        match result {
-                            Ok(rows) => {
-                                if rows.is_empty() {
-                                    Ok(Err("Data was lost due to short write corruption - this indicates a durability bug".to_string()))
-                                } else {
+                    name: "table content should match model after short write + restart"
+                        .to_string(),
+                    func: Box::new({
+                        let table_name = table.clone();
+                        move |stack: &Vec<ResultSet>, env: &mut SimulatorEnv| {
+                            // Compare last SELECT result with the model's table rows for exact match
+                            let result = stack.last().unwrap();
+                            let table = env
+                                .tables
+                                .iter()
+                                .find(|t| t.name == table_name)
+                                .ok_or_else(|| {
+                                    LimboError::InternalError(format!(
+                                        "table {table_name} should exist in simulator env"
+                                    ))
+                                })?;
+
+                            match result {
+                                Ok(rows) => {
+                                    // db_contains_model: every model row must be present in DB
+                                    let missing_in_db =
+                                        table.rows.iter().find(|v| !rows.iter().any(|r| r == *v));
+                                    if let Some(missing) = missing_in_db {
+                                        return Ok(Err(format!(
+                                            "Model row missing from DB after restart: {}",
+                                            print_row(missing)
+                                        )));
+                                    }
+
+                                    // model_contains_db: ensure DB has no extra rows
+                                    let extra_in_db =
+                                        rows.iter().find(|r| !table.rows.iter().any(|v| v == *r));
+                                    if let Some(extra) = extra_in_db {
+                                        return Ok(Err(format!(
+                                            "Unexpected extra row in DB after restart: {}",
+                                            print_row(extra)
+                                        )));
+                                    }
+
                                     Ok(Ok(()))
                                 }
+                                Err(e) => Ok(Err(format!("Query failed after restart: {e}"))),
                             }
-                            Err(e) => Ok(Err(format!("Query failed after restart: {e}"))),
                         }
                     }),
                 });
