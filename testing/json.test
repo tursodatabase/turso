@@ -1320,11 +1320,12 @@ do_execsql_test json_each_objects_empty_container_yields_zero_rows {
 
 do_execsql_test json_each_objects_keys_require_quoting_in_json_path {
   SELECT key, fullkey
-  FROM json_each('{"a space":1,"a.b":2,"\"q\"":3}')
+  FROM json_each('{"a space":1,"a.b":2,"\"q\"":3, "_c": 4}')
   ORDER BY key DESC;
 } {
 {a.b|$."a.b"}
 {a space|$."a space"}
+{_c|$."_c"}
 {"q"|$."\"q\""}
 }
 
@@ -1467,3 +1468,309 @@ do_execsql_test_in_memory_any_error non-string-path {
 do_execsql_test_in_memory_any_error invalid-path {
   SELECT * FROM json_each('{}', '$$$');
 }
+
+do_execsql_test json-each-no-arguments {
+  SELECT * FROM json_each();
+} {}
+
+do_execsql_test_error json_each_3_arguments {
+  SELECT * FROM json_each(1, 2, 3);
+} {.*(t|T)oo many arguments (for|on) json_each.*}
+
+do_execsql_test json-tree-1arg-root-object-and-children-preorder {
+  SELECT key, type, fullkey, path
+  FROM json_tree('{"a":1,"b":{"c":2},"d":[3,4]}')
+  ORDER BY id;
+} {
+{|object|$|$}
+{a|integer|$.a|$}
+{b|object|$.b|$}
+{c|integer|$.b.c|$.b}
+{d|array|$.d|$}
+{0|integer|$.d[0]|$.d}
+{1|integer|$.d[1]|$.d}
+}
+
+do_execsql_test json-tree-1arg-root-array-and-children-preorder {
+  SELECT key, type, fullkey, path
+  FROM json_tree('[null,1,"two",{"three":4.5}]')
+  ORDER BY id;
+} {
+{|array|$|$}
+{0|null|$[0]|$}
+{1|integer|$[1]|$}
+{2|text|$[2]|$}
+{3|object|$[3]|$}
+{three|real|$[3].three|$[3]}
+}
+
+do_execsql_test json-tree-1arg-primitive-root-null-single-row {
+  SELECT typeof(key), typeof(value), type, fullkey, path
+  FROM json_tree('null');
+} {{null|null|null|$|$}}
+
+do_execsql_test json-tree-1arg-primitive-root-true-single-row {
+  SELECT typeof(key), value, type, atom, fullkey, path
+  FROM json_tree('true');
+} {{null|1|true|1|$|$}}
+
+do_execsql_test json-tree-1arg-primitive-root-false-single-row {
+  SELECT typeof(key), value, type, atom, fullkey, path
+  FROM json_tree('false');
+} {{null|0|false|0|$|$}}
+
+do_execsql_test json-tree-1arg-primitive-root-integer-single-row {
+  SELECT typeof(key), value, type, atom, fullkey, path
+  FROM json_tree('42');
+} {{null|42|integer|42|$|$}}
+
+do_execsql_test json-tree-1arg-primitive-root-real-single-row {
+  SELECT typeof(key), value, type, atom, fullkey, path
+  FROM json_tree('3.14');
+} {{null|3.14|real|3.14|$|$}}
+
+do_execsql_test json-tree-1arg-primitive-root-text-single-row {
+  SELECT typeof(key), value, type, atom, fullkey, path
+  FROM json_tree('"hi"');
+} {{null|hi|text|hi|$|$}}
+
+do_execsql_test json-tree-atom-null-for-containers {
+  SELECT type, typeof(atom)
+  FROM json_tree('{"x":[1,2]}')
+  WHERE type IN ('object','array')
+  ORDER BY fullkey;
+} {
+{object|null}
+{array|null}
+}
+
+do_execsql_test json-tree-value-minified-for-containers {
+  SELECT fullkey, value
+  FROM json_tree('{"o":{"x":1,"y":2},"a":[1,2]}')
+  WHERE type IN ('object','array')
+  ORDER BY fullkey;
+} {
+{$|{"o":{"x":1,"y":2},"a":[1,2]}}
+{$.a|[1,2]}
+{$.o|{"x":1,"y":2}}
+}
+
+do_execsql_test json-tree-key-types-by-parent-kind {
+  SELECT fullkey, typeof(key)
+  FROM json_tree('{"o":{"x":1},"a":[10]}')
+  WHERE fullkey IN ('$.o','$.o.x','$.a','$.a[0]')
+  ORDER BY fullkey;
+} {
+{$.a|text}
+{$.a[0]|integer}
+{$.o|text}
+{$.o.x|text}
+}
+
+# TODO When {} is fixed, this can be reverted to a simpler 
+# and more reliable version:
+# WITH t AS (SELECT * FROM json_tree('{"a":[1]}'))
+# SELECT c.fullkey, p.fullkey
+# FROM t AS c JOIN t AS p
+# ON c.parent = p.id
+# WHERE c.fullkey IN ('$.a','$.a[0]')
+# ORDER BY c.fullkey;
+do_execsql_test json-tree-parent-links-self-join {
+  WITH c AS (SELECT * FROM json_tree('{"a":[1]}')),
+  p AS (SELECT * FROM json_tree('{"a":[1]}'))
+  SELECT c.fullkey, p.fullkey
+  FROM c JOIN p
+  ON c.parent = p.id
+  WHERE c.fullkey IN ('$.a','$.a[0]')
+  ORDER BY c.fullkey;
+} {
+{$.a|$}
+{$.a[0]|$.a}
+}
+
+do_execsql_test json-tree-parent-null-at-top {
+  SELECT typeof(parent), fullkey
+  FROM json_tree('{"k":1}')
+  WHERE fullkey='$';
+} {{null|$}}
+
+do_execsql_test json-tree-2arg-start-at-object {
+  SELECT key, type, path, fullkey
+  FROM json_tree('{"obj":{"x":1,"y":2}}', '$.obj')
+  ORDER BY id;
+} {
+{obj|object|$|$.obj}
+{x|integer|$.obj|$.obj.x}
+{y|integer|$.obj|$.obj.y}
+}
+
+do_execsql_test json-tree-2arg-start-at-array {
+  SELECT key, type, path, fullkey
+  FROM json_tree('{"arr":[10,20]}', '$.arr')
+  ORDER BY id;
+} {
+{arr|array|$|$.arr}
+{0|integer|$.arr|$.arr[0]}
+{1|integer|$.arr|$.arr[1]}
+}
+
+do_execsql_test json-tree-2arg-start-at-primitive-yields-single-row-and-path-to-self {
+  SELECT typeof(key), value, type, path, fullkey
+  FROM json_tree('{"a":5}', '$.a');
+} {{text|5|integer|$|$.a}}
+
+do_execsql_test json-tree-2arg-nonexistent-path-returns-no-rows {
+  SELECT count(*) FROM json_tree('{"a":1}', '$.missing');
+} {{0}}
+
+do_execsql_test json-tree-2arg-empty-array {
+  SELECT count(*) FROM json_tree('{"a":[]}', '$.a');
+} {{1}}
+
+do_execsql_test json-tree-2arg-empty-object {
+  SELECT count(*) FROM json_tree('{"o":{}}', '$.o');
+} {{1}}
+
+do_execsql_test json-tree-2arg-bools-and-null-under-array {
+  SELECT typeof(value), type
+  FROM json_tree('{"a":[null,true,false]}', '$.a')
+  WHERE fullkey != '$.a'
+  ORDER BY key;
+} {
+{null|null}
+{integer|true}
+{integer|false}
+}
+
+do_execsql_test json-tree-fullkey-remains-absolute-under-subpath {
+  SELECT DISTINCT substr(fullkey,1,4) FROM json_tree('{"x":{"y":1}}', '$.x');
+} {
+{$.x}
+{$.x.}
+}
+
+do_execsql_test json-tree-path-points-to-container {
+  SELECT fullkey, path
+  FROM json_tree('{"x":[{"y":1}]}')
+  WHERE fullkey IN ('$.x','$.x[0]','$.x[0].y')
+  ORDER BY id;
+} {
+{$.x|$}
+{$.x[0]|$.x}
+{$.x[0].y|$.x[0]}
+}
+
+do_execsql_test json-tree-count-includes-containers-and-leaves {
+  SELECT count(*) FROM json_tree('{"a":[1,2,3],"b":{"c":4}}');
+} {{7}}
+
+do_execsql_test json-tree-escapes-in-fullkey {
+  SELECT fullkey, value
+  FROM json_tree('{"a.b":{"c d":1, "e_f": 2, "g\"h": 3}}')
+} {
+{$|{"a.b":{"c d":1,"e_f":2,"g\"h":3}}}
+{$."a.b"|{"c d":1,"e_f":2,"g\"h":3}}
+{$."a.b"."c d"|1}
+{$."a.b"."e_f"|2}
+{$."a.b"."g\"h"|3}
+}
+
+do_execsql_test json-tree-deeply-nested-mixed-types {
+  SELECT type
+  FROM json_tree('{"o":{"a":[1,{"b":[null,2.5]}]}}')
+  ORDER BY id;
+} {object object array integer object array null real}
+
+do_execsql_test json-tree-ordering-by-fullkey-stable-hierarchy {
+  SELECT fullkey
+  FROM json_tree('{"z":0,"a":{"b":1,"a":2}}')
+  ORDER BY fullkey;
+} {
+{$}
+{$.a}
+{$.a.a}
+{$.a.b}
+{$.z}
+}
+
+do_execsql_test json-tree-type-spectrum {
+  SELECT type
+  FROM json_tree('{"n":null,"t":true,"f":false,"i":1,"r":1.25,"s":"x","a":[],"o":{}}')
+  WHERE fullkey != '$'
+  ORDER BY fullkey;
+} {array false integer null object real text true}
+
+do_execsql_test json-tree-key-null-at-root {
+  SELECT typeof(key), fullkey
+  FROM json_tree('{"a":1}');
+} {
+{null|$}
+{text|$.a}
+}
+
+do_execsql_test json-tree-key-integer-for-array-elements {
+  SELECT typeof(key)
+  FROM json_tree('[10,20]')
+  WHERE fullkey IN ('$[0]','$[1]')
+  ORDER BY key;
+} {integer integer}
+
+do_execsql_test json-tree-key-text-for-object-entries {
+  SELECT typeof(key)
+  FROM json_tree('{"x":1,"y":2}')
+  WHERE fullkey IN ('$.x','$.y')
+  ORDER BY key;
+} {text text}
+
+do_execsql_test json-tree-id-uniqueness {
+  SELECT count(DISTINCT id)=count(*)
+  FROM json_tree('{"a":[1,2],"b":3}');
+} {{1}}
+
+do_execsql_test_in_memory_any_error json-tree-non-string-path {
+  SELECT * FROM json_tree('{}', 123);
+}
+
+do_execsql_test_in_memory_any_error json-tree-invalid-path {
+  SELECT * FROM json_tree('{}', '$$$');
+}
+
+do_execsql_test json-tree-no-arguments {
+  SELECT * FROM json_tree();
+} {}
+
+do_execsql_test_error json_tree_3_arguments {
+  SELECT * FROM json_tree(1, 2, 3);
+} {.*(t|T)oo many arguments (for|on) json_tree.*}
+
+# TODO these tests are disabled because negative indices 
+# are buggy with json_tree in SQLite. Uncomment them and 
+# implement the correct behaviour when 
+# https://www.sqlite.org/forum/forumpost/48f5763d8c is addressed.
+# do_execsql_test json-tree-2arg-negative-index-root-array-element {
+#   SELECT key, value, type, fullkey, path
+#   FROM json_tree('[{"a":1},{"b":2},{"c":3}]', '$[#-1]')
+#   ORDER BY id;
+# } {
+# {0|{"c":3}|object|$[#-1]|$}
+# {c|3|integer|$[#-1].c|$[#-1]}
+# }
+
+# do_execsql_test json-tree-2arg-negative-index-inside {
+#   SELECT key, value, type, fullkey
+#   FROM json_tree('{"arr":[0,1,2]}', '$.arr[#-2]');
+# } {
+# {arr[#-2]|1|integer|$.arr[#-2]}
+# }
+
+# TODO add key and path columns back when 
+# https://www.sqlite.org/forum/forumpost/48f5763d8c is addressed.
+do_execsql_test json-tree-nested-object {
+  select fullkey, j.value from generate_series(0,2) s 
+  join json_tree('{"a": [1,2,3]}', '$.a[' || s.value || ']') j;
+} {
+{$.a[0]|1}
+{$.a[1]|2}
+{$.a[2]|3}
+}
+
