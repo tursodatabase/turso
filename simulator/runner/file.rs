@@ -111,21 +111,8 @@ impl SimulatorFile {
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn run_queued_io(&self, now: turso_core::Instant) -> Result<()> {
         let mut queued_io = self.queued_io.borrow_mut();
-        // TODO: as we are not in version 1.87 we cannot use `extract_if`
-        // so we have to do something different to achieve the same thing
-        // This code was acquired from: https://doc.rust-lang.org/beta/std/vec/struct.Vec.html#method.extract_if
-        let range = 0..queued_io.len();
-        let mut i = range.start;
-        let end_items = queued_io.len() - range.end;
-
-        while i < queued_io.len() - end_items {
-            if queued_io[i].time <= now {
-                let io = queued_io.remove(i);
-                // your code here
-                let _c = (io.op)(self)?;
-            } else {
-                i += 1;
-            }
+        for io in queued_io.extract_if(.., |item| item.time <= now) {
+            let _c = (io.op)(self)?;
         }
         Ok(())
     }

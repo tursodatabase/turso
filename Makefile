@@ -9,7 +9,7 @@ MINIMUM_TCL_VERSION := 8.6
 SQLITE_EXEC ?= scripts/limbo-sqlite3
 RUST_LOG := off
 
-all: check-rust-version limbo
+all: check-rust-version build 
 .PHONY: all
 
 check-rust-version:
@@ -39,13 +39,13 @@ check-tcl-version:
 	| tclsh
 .PHONY: check-tcl-version
 
-limbo:
+build: check-rust-version
 	cargo build
-.PHONY: limbo
+.PHONY: build
 
-limbo-c:
+turso-c:
 	cargo cbuild
-.PHONY: limbo-c
+.PHONY: turso-c
 
 uv-sync:
 	uv sync --all-packages
@@ -55,14 +55,14 @@ uv-sync-test:
 	uv sync --all-extras --dev --package turso_test
 .PHONE: uv-sync
 
-test: limbo uv-sync-test test-compat test-alter-column test-vector test-sqlite3 test-shell test-memory test-write test-update test-constraint test-collate test-extensions test-mvcc test-matviews
+test: build uv-sync-test test-compat test-alter-column test-vector test-sqlite3 test-shell test-memory test-write test-update test-constraint test-collate test-extensions test-mvcc test-matviews
 .PHONY: test
 
-test-extensions: limbo uv-sync-test
+test-extensions: build uv-sync-test
 	RUST_LOG=$(RUST_LOG) uv run --project limbo_test test-extensions
 .PHONY: test-extensions
 
-test-shell: limbo uv-sync-test
+test-shell: build uv-sync-test
 	RUST_LOG=$(RUST_LOG) SQLITE_EXEC=$(SQLITE_EXEC) uv run --project limbo_test test-shell
 .PHONY: test-shell
 
@@ -100,11 +100,11 @@ test-json:
 	RUST_LOG=$(RUST_LOG) SQLITE_EXEC=$(SQLITE_EXEC) ./testing/json.test
 .PHONY: test-json
 
-test-memory: limbo uv-sync-test
+test-memory: build uv-sync-test
 	RUST_LOG=$(RUST_LOG) SQLITE_EXEC=$(SQLITE_EXEC) uv run --project limbo_test test-memory
 .PHONY: test-memory
 
-test-write: limbo uv-sync-test
+test-write: build uv-sync-test
 	@if [ "$(SQLITE_EXEC)" != "scripts/limbo-sqlite3" ]; then \
 		RUST_LOG=$(RUST_LOG) SQLITE_EXEC=$(SQLITE_EXEC) uv run --project limbo_test test-write; \
 	else \
@@ -112,7 +112,7 @@ test-write: limbo uv-sync-test
 	fi
 .PHONY: test-write
 
-test-update: limbo uv-sync-test
+test-update: build uv-sync-test
 	@if [ "$(SQLITE_EXEC)" != "scripts/limbo-sqlite3" ]; then \
 		RUST_LOG=$(RUST_LOG) SQLITE_EXEC=$(SQLITE_EXEC) uv run --project limbo_test test-update; \
 	else \
@@ -120,7 +120,7 @@ test-update: limbo uv-sync-test
 	fi
 .PHONY: test-update
 
-test-collate: limbo uv-sync-test
+test-collate: build uv-sync-test
 	@if [ "$(SQLITE_EXEC)" != "scripts/limbo-sqlite3" ]; then \
 		RUST_LOG=$(RUST_LOG) SQLITE_EXEC=$(SQLITE_EXEC) uv run --project limbo_test test-collate; \
 	else \
@@ -128,7 +128,7 @@ test-collate: limbo uv-sync-test
 	fi
 .PHONY: test-collate
 
-test-constraint: limbo uv-sync-test
+test-constraint: build uv-sync-test
 	@if [ "$(SQLITE_EXEC)" != "scripts/limbo-sqlite3" ]; then \
 		RUST_LOG=$(RUST_LOG) SQLITE_EXEC=$(SQLITE_EXEC) uv run --project limbo_test test-constraint; \
 	else \
@@ -136,22 +136,22 @@ test-constraint: limbo uv-sync-test
 	fi
 .PHONY: test-constraint
 
-test-mvcc: limbo uv-sync-test
+test-mvcc: build uv-sync-test
 	RUST_LOG=$(RUST_LOG) SQLITE_EXEC=$(SQLITE_EXEC) uv run --project limbo_test test-mvcc;
 .PHONY: test-mvcc
 
-bench-vfs: uv-sync-test
-	cargo build --release
+bench-vfs: uv-sync-test build-release
 	RUST_LOG=$(RUST_LOG) uv run --project limbo_test bench-vfs "$(SQL)" "$(N)"
 
-bench-sqlite: uv-sync-test
-	cargo build --release
+bench-sqlite: uv-sync-test build-release
 	RUST_LOG=$(RUST_LOG) uv run --project limbo_test bench-sqlite "$(VFS)" "$(SQL)" "$(N)"
 
 clickbench:
 	./perf/clickbench/benchmark.sh
 .PHONY: clickbench
 
+build-release: check-rust-version
+	cargo build --bin tursodb --release --features=tracing_release
 
 bench-exclude-tpc-h:
 	@benchmarks=$$(cargo bench --bench 2>&1 | grep -A 1000 '^Available bench targets:' | grep -v '^Available bench targets:' | grep -v '^ *$$' | grep -v 'tpc_h_benchmark' | xargs -I {} printf -- "--bench %s " {}); \

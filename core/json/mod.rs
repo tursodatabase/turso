@@ -118,24 +118,20 @@ pub fn convert_dbtype_to_jsonb(val: &Value, strict: Conv) -> crate::Result<Jsonb
     )
 }
 
+fn parse_as_json_text(slice: &[u8]) -> crate::Result<Jsonb> {
+    let str = std::str::from_utf8(slice)
+        .map_err(|_| LimboError::ParseError("malformed JSON".to_string()))?;
+    Jsonb::from_str_with_mode(str, Conv::Strict).map_err(Into::into)
+}
+
 pub fn convert_ref_dbtype_to_jsonb(val: &RefValue, strict: Conv) -> crate::Result<Jsonb> {
     match val {
         RefValue::Text(text) => {
             let res = if text.subtype == TextSubtype::Json || matches!(strict, Conv::Strict) {
-                // Parse directly as JSON if it's already JSON subtype or strict mode is on
-                let json = if matches!(strict, Conv::ToString) {
-                    let mut str = text.as_str().replace('"', "\\\"");
-                    str.insert(0, '"');
-                    str.push('"');
-                    Jsonb::from_str(&str)
-                } else {
-                    Jsonb::from_str(text.as_str())
-                };
-                json
+                Jsonb::from_str_with_mode(text.as_str(), strict)
             } else {
                 // Handle as a string literal otherwise
                 let mut str = text.as_str().replace('"', "\\\"");
-
                 // Quote the string to make it a JSON string
                 str.insert(0, '"');
                 str.push('"');
@@ -144,7 +140,40 @@ pub fn convert_ref_dbtype_to_jsonb(val: &RefValue, strict: Conv) -> crate::Resul
             res.map_err(|_| LimboError::ParseError("malformed JSON".to_string()))
         }
         RefValue::Blob(blob) => {
-            let json = Jsonb::from_raw_data(blob.to_slice());
+            let bytes = blob.to_slice();
+            // Valid JSON can start with these whitespace characters
+            let index = bytes
+                .iter()
+                .position(|&b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
+                .unwrap_or(bytes.len());
+            let slice = &bytes[index..];
+            let json = match slice {
+                // branch with no overlapping initial byte
+                [b'"', ..] | [b'-', ..] | [b'0'..=b'2', ..] => parse_as_json_text(slice)?,
+                _ => match JsonbHeader::from_slice(0, slice) {
+                    Ok((header, header_offset)) => {
+                        let payload_size = header.payload_size();
+                        let total_expected = header_offset + payload_size;
+
+                        if total_expected != slice.len() {
+                            parse_as_json_text(slice)?
+                        } else {
+                            let jsonb = Jsonb::from_raw_data(slice);
+                            let is_valid_json = if payload_size <= 7 {
+                                jsonb.is_valid()
+                            } else {
+                                jsonb.element_type().is_ok()
+                            };
+                            if is_valid_json {
+                                jsonb
+                            } else {
+                                parse_as_json_text(slice)?
+                            }
+                        }
+                    }
+                    Err(_) => parse_as_json_text(slice)?,
+                },
+            };
             json.element_type()?;
             Ok(json)
         }

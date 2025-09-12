@@ -553,7 +553,6 @@ impl fmt::Debug for OngoingCheckpoint {
     }
 }
 
-#[allow(dead_code)]
 pub struct WalFile {
     io: Arc<dyn IO>,
     buffer_pool: Arc<BufferPool>,
@@ -660,7 +659,6 @@ impl fmt::Debug for WalFile {
 // TODO(pere): lock only important parts + pin WalFileShared
 /// WalFileShared is the part of a WAL that will be shared between threads. A wal has information
 /// that needs to be communicated between threads so this struct does the job.
-#[allow(dead_code)]
 pub struct WalFileShared {
     pub enabled: AtomicBool,
     pub wal_header: Arc<SpinLock<WalHeader>>,
@@ -676,7 +674,6 @@ pub struct WalFileShared {
     pub frame_cache: Arc<SpinLock<HashMap<u64, Vec<u64>>>>,
     pub last_checksum: (u32, u32), // Check of last frame in WAL, this is a cumulative checksum over all frames in the WAL
     pub file: Option<Arc<dyn File>>,
-
     /// Read locks advertise the maximum WAL frame a reader may access.
     /// Slot 0 is special, when it is held (shared) the reader bypasses the WAL and uses the main DB file.
     /// When checkpointing, we must acquire the exclusive read lock 0 to ensure that no readers read
@@ -877,7 +874,9 @@ impl Wal for WalFile {
             }
         }
 
-        if best_idx == -1 {
+        if best_idx == -1 || best_mark != shared_max as u32 {
+            // If we cannot find a valid slot or the highest readmark has a stale max frame, we must return busy;
+            // otherwise we would not see some committed changes.
             return Ok((LimboResult::Busy, db_changed));
         }
 
@@ -2086,7 +2085,7 @@ impl WalFile {
             "We must hold writer and checkpoint locks to restart the log, found: {:?}",
             self.checkpoint_guard
         );
-        tracing::info!("restart_log(mode={mode:?})");
+        tracing::debug!("restart_log(mode={mode:?})");
         {
             // Block all readers
             let mut shared = self.get_shared_mut();
@@ -2238,21 +2237,17 @@ impl WalFileShared {
         path: &str,
     ) -> Result<Arc<RwLock<WalFileShared>>> {
         let file = io.open_file(path, crate::io::OpenFlags::Create, false)?;
-        if file.size()? > 0 {
-            let wal_file_shared = sqlite3_ondisk::read_entire_wal_dumb(&file)?;
-            // TODO: Return a completion instead.
-            let mut max_loops = 100_000;
-            while !wal_file_shared.read().loaded.load(Ordering::Acquire) {
-                io.run_once()?;
-                max_loops -= 1;
-                if max_loops == 0 {
-                    panic!("WAL file not loaded");
-                }
-            }
-            Ok(wal_file_shared)
-        } else {
-            WalFileShared::new_noop()
+        if file.size()? == 0 {
+            return WalFileShared::new_noop();
         }
+        let wal_file_shared = sqlite3_ondisk::build_shared_wal(&file, io)?;
+        turso_assert!(
+            wal_file_shared
+                .try_read()
+                .is_some_and(|wfs| wfs.loaded.load(Ordering::Acquire)),
+            "Unable to read WAL shared state"
+        );
+        Ok(wal_file_shared)
     }
 
     pub fn is_initialized(&self) -> Result<bool> {

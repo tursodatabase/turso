@@ -1,0 +1,272 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Brutal DB Viewer</title>
+  <style>
+    :root {
+      --fg: #000;
+      --bg: #fff;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html,
+    body {
+      margin: 0 10%;
+      padding: 0;
+      background: var(--bg);
+      color: var(--fg);
+      font: 14px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+    }
+
+    header {
+      border-bottom: 2px solid #000;
+      padding: 12px 16px;
+      font-weight: 700;
+      letter-spacing: .03em;
+      text-transform: uppercase;
+    }
+
+    main {
+      padding: 16px;
+      display: grid;
+      gap: 12px;
+    }
+
+    label {
+      display: block;
+      margin-bottom: 6px;
+    }
+
+    textarea {
+      width: 100%;
+      min-height: 128px;
+      max-height: 60vh;
+      resize: vertical;
+      border: 1px solid #000;
+      padding: 8px;
+      background: #fff;
+      color: #000;
+    }
+
+    .controls {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-top: 8px;
+    }
+
+    button {
+      appearance: none;
+      background: #fff;
+      color: #000;
+      border: 1px solid #000;
+      padding: 6px 10px;
+      cursor: pointer;
+      font: inherit;
+    }
+
+    button:hover {
+      transform: translate(-1px, -1px);
+      box-shadow: 2px 2px 0 #000;
+    }
+
+    button:active {
+      transform: translate(0, 0);
+      box-shadow: none;
+    }
+
+    .status {
+      margin-left: auto;
+      opacity: .9;
+    }
+
+    #result {
+      border-top: 2px solid #000;
+      padding-top: 12px;
+    }
+
+    .meta {
+      margin-bottom: 8px;
+    }
+
+    .error {
+      border: 1px solid #000;
+      padding: 8px;
+      margin-bottom: 8px;
+      white-space: pre-wrap;
+    }
+
+    .table-wrap {
+      overflow: auto;
+      border: 1px solid #000;
+      max-height: 65vh;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+    }
+
+    thead th {
+      position: sticky;
+      top: 0;
+      background: #fff;
+    }
+
+    th,
+    td {
+      border: 1px solid #000;
+      padding: 6px 8px;
+      vertical-align: top;
+      white-space: pre;
+    }
+
+    .sr-only {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      padding: 0;
+      margin: -1px;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      border: 0;
+    }
+  </style>
+</head>
+
+<body>
+  <header>DB Viewer</header>
+  <main>
+    <section>
+      <label for="sql">Query</label>
+      <textarea id="sql" spellcheck="false" placeholder="SELECT * FROM people;">SELECT 'hello, world';</textarea>
+      <div class="controls">
+        <button id="run" type="button" title="Run (Ctrl/⌘ + Enter)">Run</button>
+        <div class="status" id="status">Ready</div>
+      </div>
+      <div class="sr-only" aria-live="polite" id="live"></div>
+    </section>
+
+    <section id="result">
+      <div class="meta" id="meta">No results yet.</div>
+      <div id="error" class="error" hidden></div>
+      <div class="table-wrap">
+        <table id="table" role="table" aria-label="Query results">
+          <thead></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <script type="module">
+    import { connect } from "@tursodatabase/database-browser";
+    const db = await connect('data.db');
+    // --- Wire your DB here --------------------------------------------------
+    // Provide window.executeQuery = async (sql) => ({ columns: string[], rows: any[][] })
+    // If not provided, a tiny mock dataset is used for demo purposes.
+
+    (function () {
+      const $ = (sel) => document.querySelector(sel);
+      const sqlEl = $('#sql');
+      const runBtn = $('#run');
+      const statusEl = $('#status');
+      const liveEl = $('#live');
+      const metaEl = $('#meta');
+      const errEl = $('#error');
+      const thead = $('#table thead');
+      const tbody = $('#table tbody');
+
+      function fmt(v) {
+        if (v === null || v === undefined) return 'NULL';
+        if (typeof v === 'object') {
+          try { return JSON.stringify(v); } catch { return String(v); }
+        }
+        return String(v);
+      }
+
+      function clearTable() { thead.innerHTML = ''; tbody.innerHTML = ''; }
+
+      function renderTable(result) {
+        clearTable();
+        const { columns = [], rows = [] } = result || {};
+
+        // Header
+        const trh = document.createElement('tr');
+        for (const name of columns) {
+          const th = document.createElement('th');
+          th.textContent = String(name);
+          trh.appendChild(th);
+        }
+        thead.appendChild(trh);
+
+        // Body
+        const frag = document.createDocumentFragment();
+        for (const r of rows) {
+          const tr = document.createElement('tr');
+          for (let i = 0; i < columns.length; i++) {
+            const td = document.createElement('td');
+            td.textContent = fmt(r[i] ?? null);
+            tr.appendChild(td);
+          }
+          frag.appendChild(tr);
+        }
+        tbody.appendChild(frag);
+
+        metaEl.textContent = rows.length
+          ? `${rows.length} row${rows.length === 1 ? '' : 's'} × ${columns.length} column${columns.length === 1 ? '' : 's'}`
+          : 'No rows.';
+      }
+
+      async function run(sql) {
+        // errEl.hidden = true; errEl.textContent = '';
+        // statusEl.textContent = 'Running…';
+        let t0 = performance.now();
+        try {
+          for (let i = 0; i < 1; i++) {
+            await db.pingSync();
+          }
+          const res = {};
+          // const stmt = await scheduler.postTask(async () => await db.prepare(sql), { priority: 'user-blocking' });
+          // const columns = await scheduler.postTask(async () => (await stmt.columns()).map(x => x.name), { priority: 'user-blocking' });
+          // const rows = await scheduler.postTask(async () => await stmt.all(), { priority: 'user-blocking' });
+          // const res = {
+          //   columns: columns,
+          //   rows: rows.map(r => columns.map(c => r[c]))
+          // };
+          const t1 = performance.now();
+          renderTable(res);
+          const took = Math.max(0, t1 - t0);
+          statusEl.textContent = `OK (${took}ms)`;
+          liveEl.textContent = `Query finished in ${took} milliseconds.`;
+        } catch (e) {
+          clearTable();
+          statusEl.textContent = 'ERROR';
+          const msg = (e && (e.message || e.toString())) || 'Unknown error';
+          errEl.textContent = 'ERROR: ' + msg;
+          errEl.hidden = false;
+          liveEl.textContent = 'Query failed.';
+        }
+      }
+
+      runBtn.addEventListener('click', () => run(sqlEl.value));
+      sqlEl.addEventListener('keydown', (e) => {
+        if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+          e.preventDefault();
+          run(sqlEl.value);
+        }
+      });
+
+      // Initial demo run
+      run(sqlEl.value);
+    })();
+  </script>
+</body>
+
+</html>

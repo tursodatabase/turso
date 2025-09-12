@@ -45,7 +45,7 @@ impl IO for VfsMod {
         Ok(())
     }
 
-    fn run_once(&self) -> Result<()> {
+    fn step(&self) -> Result<()> {
         if self.ctx.is_null() {
             return Err(LimboError::ExtensionError("VFS is null".to_string()));
         }

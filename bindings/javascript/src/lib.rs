@@ -45,7 +45,7 @@ pub struct Database {
     _db: Option<Arc<turso_core::Database>>,
     io: Arc<dyn turso_core::IO>,
     conn: Option<Arc<turso_core::Connection>>,
-    is_memory: bool,
+    path: String,
     is_open: Cell<bool>,
     default_safe_integers: Cell<bool>,
 }
@@ -186,20 +186,20 @@ impl Database {
             .connect()
             .map_err(|e| Error::new(Status::GenericFailure, format!("Failed to connect: {e}")))?;
 
-        Ok(Self::create(Some(db), io, conn, is_memory(&path)))
+        Ok(Self::create(Some(db), io, conn, path))
     }
 
     pub fn create(
         db: Option<Arc<turso_core::Database>>,
         io: Arc<dyn turso_core::IO>,
         conn: Arc<turso_core::Connection>,
-        is_memory: bool,
+        path: String,
     ) -> Self {
         Database {
             _db: db,
             io,
             conn: Some(conn),
-            is_memory,
+            path,
             is_open: Cell::new(true),
             default_safe_integers: Cell::new(false),
         }
@@ -218,7 +218,13 @@ impl Database {
     /// Returns whether the database is in memory-only mode.
     #[napi(getter)]
     pub fn memory(&self) -> bool {
-        self.is_memory
+        is_memory(&self.path)
+    }
+
+    /// Returns whether the database is in memory-only mode.
+    #[napi(getter)]
+    pub fn path(&self) -> String {
+        self.path.clone()
     }
 
     /// Returns whether the database connection is open.
@@ -246,7 +252,7 @@ impl Database {
     /// * `sql` - The SQL statements to execute.
     ///
     /// # Returns
-    #[napi]
+    #[napi(ts_return_type = "Promise<void>")]
     pub fn batch_async(&self, sql: String) -> Result<AsyncTask<DbTask>> {
         Ok(AsyncTask::new(DbTask::Batch {
             conn: self.conn()?.clone(),
@@ -319,7 +325,7 @@ impl Database {
     #[napi]
     pub fn close(&mut self) -> Result<()> {
         self.is_open.set(false);
-        let _ = self._db.take().unwrap();
+        let _ = self._db.take();
         let _ = self.conn.take().unwrap();
         Ok(())
     }
@@ -338,7 +344,7 @@ impl Database {
     #[napi]
     pub fn io_loop_sync(&self) -> Result<()> {
         self.io
-            .run_once()
+            .step()
             .map_err(|e| Error::new(Status::GenericFailure, format!("IO error: {e}")))?;
         Ok(())
     }
@@ -482,7 +488,7 @@ impl Statement {
 
     /// Step the statement and return result code (executed on the background thread):
     /// 1 = Row available, 2 = Done, 3 = I/O needed
-    #[napi]
+    #[napi(ts_return_type = "Promise<number>")]
     pub fn step_async(&self) -> Result<AsyncTask<DbTask>> {
         Ok(AsyncTask::new(DbTask::Step {
             stmt: self.stmt.clone(),
@@ -577,7 +583,7 @@ impl Statement {
     }
 
     /// Get column information for the statement
-    #[napi]
+    #[napi(ts_return_type = "Promise<any>")]
     pub fn columns<'env>(&self, env: &'env Env) -> Result<Array<'env>> {
         let stmt_ref = self.stmt.borrow();
         let stmt = stmt_ref
@@ -631,7 +637,7 @@ impl Task for IoLoopTask {
     type JsValue = ();
 
     fn compute(&mut self) -> napi::Result<Self::Output> {
-        self.io.run_once().map_err(|e| {
+        self.io.step().map_err(|e| {
             napi::Error::new(napi::Status::GenericFailure, format!("IO error: {e}"))
         })?;
         Ok(())

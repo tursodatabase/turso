@@ -191,6 +191,7 @@ pub enum TransactionMode {
     None,
     Read,
     Write,
+    Concurrent,
 }
 
 /// Main entry point for emitting bytecode for a SQL query
@@ -530,48 +531,57 @@ fn emit_delete_insns(
             .schema
             .indexes
             .get(table_reference.table.get_name());
-        let index_refs_opt = indexes.map(|indexes| {
-            indexes
-                .iter()
-                .map(|index| {
-                    (
-                        index.clone(),
-                        program.resolve_cursor_id(&CursorKey::index(
-                            table_reference.internal_id,
-                            index.clone(),
-                        )),
-                    )
-                })
-                .collect::<Vec<_>>()
-        });
 
-        if let Some(index_refs) = index_refs_opt {
-            for (index, index_cursor_id) in index_refs {
-                let num_regs = index.columns.len() + 1;
-                let start_reg = program.alloc_registers(num_regs);
-                // Emit columns that are part of the index
-                index
-                    .columns
+        // Get the index that is being used to iterate the deletion loop, if there is one.
+        let iteration_index = table_reference.op.index();
+        // Get all indexes that are not the iteration index.
+        let other_indexes = indexes
+            .map(|indexes| {
+                indexes
                     .iter()
-                    .enumerate()
-                    .for_each(|(reg_offset, column_index)| {
-                        program.emit_column_or_rowid(
-                            main_table_cursor_id,
-                            column_index.pos_in_table,
-                            start_reg + reg_offset,
-                        );
-                    });
-                program.emit_insn(Insn::RowId {
-                    cursor_id: main_table_cursor_id,
-                    dest: start_reg + num_regs - 1,
+                    .filter(|index| {
+                        iteration_index
+                            .as_ref()
+                            .is_none_or(|it_idx| !Arc::ptr_eq(it_idx, index))
+                    })
+                    .map(|index| {
+                        (
+                            index.clone(),
+                            program.resolve_cursor_id(&CursorKey::index(
+                                table_reference.internal_id,
+                                index.clone(),
+                            )),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        for (index, index_cursor_id) in other_indexes {
+            let num_regs = index.columns.len() + 1;
+            let start_reg = program.alloc_registers(num_regs);
+            // Emit columns that are part of the index
+            index
+                .columns
+                .iter()
+                .enumerate()
+                .for_each(|(reg_offset, column_index)| {
+                    program.emit_column_or_rowid(
+                        main_table_cursor_id,
+                        column_index.pos_in_table,
+                        start_reg + reg_offset,
+                    );
                 });
-                program.emit_insn(Insn::IdxDelete {
-                    start_reg,
-                    num_regs,
-                    cursor_id: index_cursor_id,
-                    raise_error_if_no_matching_entry: true,
-                });
-            }
+            program.emit_insn(Insn::RowId {
+                cursor_id: main_table_cursor_id,
+                dest: start_reg + num_regs - 1,
+            });
+            program.emit_insn(Insn::IdxDelete {
+                start_reg,
+                num_regs,
+                cursor_id: index_cursor_id,
+                raise_error_if_no_matching_entry: true,
+            });
         }
 
         // Emit update in the CDC table if necessary (before DELETE updated the table)
@@ -636,6 +646,17 @@ fn emit_delete_insns(
             cursor_id: main_table_cursor_id,
             table_name: table_reference.table.get_name().to_string(),
         });
+
+        if let Some(index) = iteration_index {
+            let iteration_index_cursor = program.resolve_cursor_id(&CursorKey::index(
+                table_reference.internal_id,
+                index.clone(),
+            ));
+            program.emit_insn(Insn::Delete {
+                cursor_id: iteration_index_cursor,
+                table_name: index.name.clone(),
+            });
+        }
     }
     if let Some(limit_ctx) = t_ctx.limit_ctx {
         program.emit_insn(Insn::DecrJumpZero {

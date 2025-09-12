@@ -6,12 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.math.BigDecimal;
-import java.sql.Date;
-import java.sql.PreparedStatement;
-import java.sql.ResultSet;
-import java.sql.SQLException;
-import java.sql.Time;
-import java.sql.Timestamp;
+import java.sql.*;
 import java.util.Properties;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -341,5 +336,36 @@ class JDBC4PreparedStatementTest {
     assertEquals(2.2f, rs.getFloat(2));
     assertEquals("row2", rs.getString(3));
     assertArrayEquals(new byte[] {4, 5, 6}, rs.getBytes(4));
+  }
+
+  @Test
+  void execute_insert_should_return_number_of_inserted_elements() throws Exception {
+    connection.prepareStatement("CREATE TABLE test (col INTEGER)").execute();
+    PreparedStatement prepareStatement =
+        connection.prepareStatement("INSERT INTO test (col) VALUES (?), (?), (?)");
+    prepareStatement.setInt(1, 1);
+    prepareStatement.setInt(2, 2);
+    prepareStatement.setInt(3, 3);
+    assertEquals(prepareStatement.executeUpdate(), 3);
+  }
+
+  @Test
+  void execute_update_should_return_number_of_updated_elements() throws Exception {
+    connection.prepareStatement("CREATE TABLE test (col INTEGER)").execute();
+    connection.prepareStatement("INSERT INTO test (col) VALUES (1), (2), (3)").execute();
+    PreparedStatement preparedStatement =
+        connection.prepareStatement("UPDATE test SET col = ? where col = 1 ");
+    preparedStatement.setInt(1, 4);
+    assertEquals(preparedStatement.executeUpdate(), 1);
+  }
+
+  @Test
+  void execute_delete_should_return_number_of_deleted_elements() throws Exception {
+    connection.prepareStatement("CREATE TABLE test (col INTEGER)").execute();
+    connection.prepareStatement("INSERT INTO test (col) VALUES (1), (2), (3)").execute();
+    PreparedStatement preparedStatement =
+        connection.prepareStatement("DELETE  FROM test   where col = ? ");
+    preparedStatement.setInt(1, 1);
+    assertEquals(preparedStatement.executeUpdate(), 1);
   }
 }

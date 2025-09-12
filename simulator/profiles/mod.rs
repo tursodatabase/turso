@@ -93,7 +93,7 @@ impl Profile {
             },
             query: QueryProfile {
                 create_table_weight: 0,
-                create_index_weight: 0,
+                create_index_weight: 4,
                 ..Default::default()
             },
             ..Default::default()

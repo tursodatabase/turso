@@ -1,0 +1,7 @@
+#!/bin/bash
+
+set -e
+
+cargo build -p turso_whopper
+
+time RUST_BACKTRACE=full ./target/debug/turso_whopper $*

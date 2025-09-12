@@ -528,20 +528,36 @@ impl PageCache {
     }
 
     pub fn clear(&mut self) -> Result<(), CacheError> {
-        for e in self.entries.iter() {
+        if self.map.len() == 0 {
+            // Fast path: nothing to do.
+            self.clock_hand = NULL;
+            return Ok(());
+        }
+
+        for node in self.map.iter() {
+            let e = &self.entries[node.slot_index];
             if let Some(ref p) = e.page {
                 if p.is_dirty() {
                     return Err(CacheError::Dirty { pgno: p.get().id });
                 }
+            }
+        }
+        let mut used_slots = Vec::with_capacity(self.map.len());
+        for node in self.map.iter() {
+            used_slots.push(node.slot_index);
+        }
+        // don't touch already-free slots at all.
+        for &i in &used_slots {
+            if let Some(p) = self.entries[i].page.take() {
                 p.clear_loaded();
                 let _ = p.get().contents.take();
             }
+            self.entries[i].clear_ref();
+            self.entries[i].reset_links();
         }
-        self.entries.fill(PageCacheEntry::empty());
-        self.map.clear();
         self.clock_hand = NULL;
-        self.freelist.clear();
-        for i in (0..self.capacity).rev() {
+        self.map = PageHashMap::new(self.capacity);
+        for &i in used_slots.iter().rev() {
             self.freelist.push(i);
         }
         Ok(())
@@ -629,16 +645,6 @@ impl PageCache {
 
     pub fn capacity(&self) -> usize {
         self.capacity
-    }
-
-    pub fn unset_dirty_all_pages(&mut self) {
-        let entries = &self.entries;
-        for entry in entries.iter() {
-            if entry.page.is_none() {
-                continue;
-            }
-            entry.page.as_ref().unwrap().clear_dirty();
-        }
     }
 
     #[cfg(test)]

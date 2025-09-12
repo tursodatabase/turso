@@ -1,0 +1,12 @@
+[package]
+name = "write-throughput"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "write-throughput"
+path = "src/main.rs"
+
+[dependencies]
+rusqlite = { version = "0.31", features = ["bundled"] }
+clap = { version = "4.0", features = ["derive"] }

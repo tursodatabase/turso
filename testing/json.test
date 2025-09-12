@@ -279,9 +279,46 @@ do_execsql_test json_arrow_object {
     SELECT '{"a": [1,2,3]}' -> '$.a'
 } {{[1,2,3]}}
 
-do_execsql_test json_arrow_shift_object {
-    SELECT '{"a": [1,2,3]}' ->> '$.a'
-} {{[1,2,3]}}
+do_execsql_test json_arrow_blob_object {
+    SELECT cast('{"age":30,"name":"John"}' as blob) -> '$.age'
+} {{30}}
+
+# Tests against valid jsonb [b'{',.., b'}'] vs json text '{..}'
+# b'{' = ElementType::Array, PayloadSize of 7.
+# b'}' = last element in array ends in '}'
+# x'7B0707070707177D' = jsonb(["", "", "", "", "", "}"])
+do_execsql_test json_arrow_blob_array {
+    SELECT x'7B0707070707177D' -> '$[5]'
+} {\"\}\"}
+
+# Tests against valid jsonb [b'[',.., b']'] vs json text '[..]'
+# b'[' = ElementType::Array, PayloadSize of 5.
+# b']' = last element in array ends in ']'
+# x'5B070707175D' = jsonb(["", "", "", "}"])
+do_execsql_test json_arrow_blob_array_2 {
+    SELECT x'5B070707175D' -> '$[3]'
+} {\"\]\"}
+
+do_execsql_test json_arrow_blob_number {
+    SELECT cast('4' as blob) -> '$'
+} {{4}}
+
+do_execsql_test json_arrow_blob_number_2 {
+    SELECT cast(33 as blob) -> '$'
+} {{33}}
+
+# jsonb(333)
+do_execsql_test json_arrow_blob_number_3 {
+    SELECT x'33333333' -> '$'
+} {{333}}
+
+do_execsql_test json_arrow_blob_negative_number {
+    SELECT cast('-4' as blob) -> '$'
+} {{-4}}
+
+do_execsql_test json_arrow_shift_blob {
+    SELECT cast('{"age":30,"name":"John"}' as blob) ->> '$.age'
+} {{30}}
 
 do_execsql_test json_extract_object_2 {
     SELECT json_extract('{"a": [1,2,3]}', '$.a', '$.a[0]', '$.a[1]', '$.a[3]')
@@ -290,7 +327,6 @@ do_execsql_test json_extract_object_2 {
 do_execsql_test json_extract_object_3 {
     SELECT json_extract('{"a": [1,2,3]}', '$.a', '$.a[0]', '$.a[1]', null, '$.a[3]')
 } {{}}
-
 
 #       \x61 is the ASCII code for 'a'
 do_execsql_test json_extract_with_escaping {
@@ -510,10 +546,9 @@ do_execsql_test json_extract_overflow_int64 {
 #  SELECT json_extract('[1, 2, 3]', '$[170141183460469231731687303715884105729]');
 #} {{2}}
 
-# TODO: fix me - this passes on SQLite and needs to be fixed in Limbo.
-#do_execsql_test json_extract_blob {
-#  select json_extract(CAST('[1,2,3]' as BLOB), '$[1]')
-#} {{2}}
+do_execsql_test json_extract_blob {
+  select json_extract(CAST('[1,2,3]' as BLOB), '$[1]')
+} {{2}}
 
 do_execsql_test json_array_length {
    SELECT json_array_length('[1,2,3,4]');
@@ -680,12 +715,11 @@ do_execsql_test json_valid_1 {
 do_execsql_test json_valid_2 {
    SELECT json_valid('["a",55,"b",72]');
 } {1}
-#
-# Unimplemented
-#do_execsql_test json_valid_3 {
-#   SELECT json_valid( CAST('{"a":"1}' AS BLOB) );
-#} {0}
-#
+
+do_execsql_test json_valid_3 {
+   SELECT json_valid( CAST('{"a":"1}' AS BLOB) );
+} {0}
+
 do_execsql_test json_valid_4 {
   SELECT json_valid(123);
 } {1}
@@ -830,6 +864,14 @@ do_execsql_test json-remove-7 {
     SELECT json_remove('{"a": 1, "b": [1,2], "c": {"d": 3}}', '$.a', '$.b[0]', '$.c.d');
 } {{{"b":[2],"c":{}}}}
 
+do_execsql_test json-remove-8 {
+    SELECT json_remove(cast('{"age":30,"name":"John"}' as blob), '$.age');
+} {{{"name":"John"}}}
+
+do_execsql_test json-remove-9 {
+    SELECT json_remove(cast('{"user":{"id":123,"profile":{"name":"Alice","age":25}}}' as blob), '$.user.id');
+} {{{"user":{"profile":{"name":"Alice","age":25}}}}}
+
 do_execsql_test json_set_field_empty_object {
    SELECT json_set('{}', '$.field', 'value');
 } {{{"field":"value"}}}
@@ -837,6 +879,10 @@ do_execsql_test json_set_field_empty_object {
 do_execsql_test json_set_replace_field {
    SELECT json_set('{"field":"old_value"}', '$.field', 'new_value');
 } {{{"field":"new_value"}}}
+
+do_execsql_test json_set_replace_field_2 {
+    SELECT json_set(cast('{"age":30,"name":"John"}' as blob), '$.age', 40);
+} {{{"age":40,"name":"John"}}}
 
 do_execsql_test json_set_set_deeply_nested_key {
    SELECT json_set('{}', '$.object.doesnt.exist', 'value');
@@ -1342,3 +1388,82 @@ do_execsql_test json_each_json_extract_on_value {
   {k3|[3]}
 }
 
+do_execsql_test json-each-2arg-array-basic {
+  SELECT key, value, type, path, fullkey FROM json_each('{"a":[1,2,3]}', '$.a') ORDER BY key;
+} {
+  {0|1|integer|$.a|$.a[0]} 
+  {1|2|integer|$.a|$.a[1]} 
+  {2|3|integer|$.a|$.a[2]}
+}
+
+do_execsql_test json-each-2arg-object-basic {
+  SELECT key, value, type, path, fullkey
+    FROM json_each('{"obj":{"a":[1,2],"n":10,"x":"y"}}', '$.obj')
+   ORDER BY key;
+} {
+  {a|[1,2]|array|$.obj|$.obj.a} 
+  {n|10|integer|$.obj|$.obj.n} 
+  {x|y|text|$.obj|$.obj.x}
+}
+
+do_execsql_test json-each-2arg-root-dollar-array {
+  SELECT key, value, type
+    FROM json_each('[4,5]', '$')
+   ORDER BY key;
+} {
+  {0|4|integer} 
+  {1|5|integer}
+}
+
+do_execsql_test json-each-2arg-start-at-primitive {
+  SELECT value, type, path, fullkey FROM json_each('{"a":[1,2,3]}', '$.a[1]');
+} {
+  {2|integer|$.a[1]|$.a[1]}
+}
+
+do_execsql_test json-each-2arg-start-at-object-inside-array {
+  SELECT key, value, type, path, fullkey
+    FROM json_each('{"arr":[{"x":1},{"y":2}]}', '$.arr[1]');
+} {
+  {y|2|integer|$.arr[1]|$.arr[1].y}
+}
+
+do_execsql_test json-each-2arg-nonexistent-path-returns-no-rows {
+  SELECT count(*) FROM json_each('{"a":1}', '$.missing');
+} {{0}}
+
+do_execsql_test json-each-2arg-empty-array {
+  SELECT count(*) FROM json_each('{"a":[]}', '$.a');
+} {{0}}
+
+do_execsql_test json-each-2arg-empty-object {
+  SELECT count(*) FROM json_each('{"o":{}}', '$.o');
+} {{0}}
+
+do_execsql_test json-each-2arg-bools-and-null {
+  SELECT typeof(value), type
+    FROM json_each('{"a":[null,true,false]}', '$.a')
+   ORDER BY key;
+} {
+  {null|null} 
+  {integer|true} 
+  {integer|false}
+}
+
+do_execsql_test json-each-2arg-primitive-key-null {
+  SELECT typeof(key), value, type, path, fullkey
+    FROM json_each('{"s":"hi"}', '$.s');
+} {{null|hi|text|$.s|$.s}}
+
+do_execsql_test json-each-2arg-negative-index-root {
+  SELECT key, value, type
+    FROM json_each('[{"a":1},{"b":2},{"c":3}]', '$[#-1]');
+} {{c|3|integer}}
+
+do_execsql_test_in_memory_any_error non-string-path {
+  SELECT * FROM json_each('{}', 123);
+}
+
+do_execsql_test_in_memory_any_error invalid-path {
+  SELECT * FROM json_each('{}', '$$$');
+}

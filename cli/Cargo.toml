@@ -51,6 +51,7 @@ mimalloc = { workspace = true }
 [features]
 default = ["io_uring"]
 io_uring = ["turso_core/io_uring"]
+tracing_release = ["turso_core/tracing_release"]
 
 [build-dependencies]
 syntect = { git = "https://github.com/trishume/syntect.git", rev = "64644ffe064457265cbcee12a0c1baf9485ba6ee" }

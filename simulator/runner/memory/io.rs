@@ -227,7 +227,7 @@ impl IO for MemorySimIO {
         Ok(file)
     }
 
-    fn run_once(&self) -> Result<()> {
+    fn step(&self) -> Result<()> {
         let mut callbacks = self.callbacks.lock();
         let mut timeouts = self.timeouts.lock();
         tracing::trace!(

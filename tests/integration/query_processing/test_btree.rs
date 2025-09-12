@@ -436,7 +436,7 @@ fn write_at(io: &impl IO, file: Arc<dyn File>, offset: usize, data: &[u8]) {
     });
     let result = file.pwrite(offset as u64, buffer, completion).unwrap();
     while !result.is_completed() {
-        io.run_once().unwrap();
+        io.step().unwrap();
     }
 }
 

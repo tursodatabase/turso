@@ -1,11 +1,11 @@
 use std::{cell::RefCell, result::Result, sync::Arc};
 
-use turso_ext::{ConstraintUsage, ResultCode};
+use turso_ext::{ConstraintOp, ConstraintUsage, ResultCode};
 
 use crate::{
     json::{
-        convert_dbtype_to_jsonb,
-        jsonb::{ArrayIteratorState, Jsonb, ObjectIteratorState},
+        convert_dbtype_to_jsonb, json_path_from_db_value,
+        jsonb::{ArrayIteratorState, Jsonb, ObjectIteratorState, SearchOperation},
         vtab::columns::Columns,
         Conv,
     },
@@ -46,8 +46,6 @@ impl InternalVirtualTable for JsonEachVirtualTable {
         constraints: &[turso_ext::ConstraintInfo],
         _order_by: &[turso_ext::OrderByInfo],
     ) -> Result<turso_ext::IndexInfo, ResultCode> {
-        use turso_ext::ConstraintOp;
-
         let mut usages = vec![
             ConstraintUsage {
                 argv_index: None,
@@ -55,25 +53,51 @@ impl InternalVirtualTable for JsonEachVirtualTable {
             };
             constraints.len()
         ];
-        let mut have_json = false;
 
+        let mut json_idx: Option<usize> = None;
+        let mut path_idx: Option<usize> = None;
         for (i, c) in constraints.iter().enumerate() {
-            if c.usable && c.op == ConstraintOp::Eq && c.column_index as usize == COL_JSON {
-                usages[i] = ConstraintUsage {
-                    argv_index: Some(1),
-                    omit: true,
-                };
-                have_json = true;
-                break;
+            if !c.usable || c.op != ConstraintOp::Eq {
+                continue;
+            }
+            match c.column_index as usize {
+                COL_JSON => json_idx = Some(i),
+                COL_ROOT => path_idx = Some(i),
+                _ => {}
             }
         }
 
+        let argc = match (json_idx, path_idx) {
+            (Some(_), Some(_)) => 2,
+            (Some(_), None) => 1,
+            _ => 0,
+        };
+
+        if argc >= 1 {
+            usages[json_idx.unwrap()] = ConstraintUsage {
+                argv_index: Some(1),
+                omit: true,
+            };
+        }
+        if argc == 2 {
+            usages[path_idx.unwrap()] = ConstraintUsage {
+                argv_index: Some(2),
+                omit: true,
+            };
+        }
+
+        let (cost, rows) = match argc {
+            1 => (1., 25),
+            2 => (1., 25),
+            _ => (f64::MAX, 25),
+        };
+
         Ok(turso_ext::IndexInfo {
-            idx_num: i32::from(have_json),
+            idx_num: -1,
             idx_str: None,
             order_by_consumed: false,
-            estimated_cost: if have_json { 10.0 } else { 1_000_000.0 },
-            estimated_rows: if have_json { 100 } else { u32::MAX },
+            estimated_cost: cost,
+            estimated_rows: rows,
             constraint_usages: usages,
         })
     }
@@ -112,6 +136,7 @@ pub struct JsonEachCursor {
     rowid: i64,
     no_more_rows: bool,
     json: Jsonb,
+    root_path: Option<String>,
     iterator_state: IteratorState,
     columns: Columns,
 }
@@ -122,6 +147,7 @@ impl Default for JsonEachCursor {
             rowid: 0,
             no_more_rows: false,
             json: Jsonb::new(0, None),
+            root_path: None,
             iterator_state: IteratorState::None,
             columns: Columns::default(),
         }
@@ -138,25 +164,31 @@ impl InternalVirtualTableCursor for JsonEachCursor {
         if args.is_empty() {
             return Ok(false);
         }
-        if args.len() == 2 {
-            return Err(LimboError::InvalidArgument(
-                "2-arg json_each is not supported yet".to_owned(),
-            ));
-        }
         if args.len() != 1 && args.len() != 2 {
             return Err(LimboError::InvalidArgument(
                 "json_each accepts 1 or 2 arguments".to_owned(),
             ));
         }
 
-        let db_value = &args[0];
+        let mut jsonb = convert_dbtype_to_jsonb(&args[0], Conv::Strict)?;
+        if args.len() == 1 {
+            self.json = jsonb;
+        } else if args.len() == 2 {
+            let Value::Text(root_path) = &args[1] else {
+                return Err(LimboError::InvalidArgument(
+                    "root path should be text".to_owned(),
+                ));
+            };
+            self.root_path = Some(root_path.as_str().to_owned());
+            self.json = if let Some(json) = navigate_to_path(&mut jsonb, &args[1])? {
+                json
+            } else {
+                return Ok(false);
+            };
+        }
+        let json_element_type = self.json.element_type()?;
 
-        let jsonb = convert_dbtype_to_jsonb(db_value, Conv::Strict)?;
-
-        let element_type = jsonb.element_type()?;
-        self.json = jsonb;
-
-        match element_type {
+        match json_element_type {
             jsonb::ElementType::ARRAY => {
                 let iter = self.json.array_iterator()?;
                 self.iterator_state = IteratorState::Array(iter);
@@ -181,7 +213,7 @@ impl InternalVirtualTableCursor for JsonEachCursor {
             jsonb::ElementType::RESERVED1
             | jsonb::ElementType::RESERVED2
             | jsonb::ElementType::RESERVED3 => {
-                unreachable!("element type not supported: {element_type:?}");
+                unreachable!("element type not supported: {json_element_type:?}");
             }
         };
 
@@ -201,7 +233,11 @@ impl InternalVirtualTableCursor for JsonEachCursor {
                     return Ok(false);
                 };
                 self.iterator_state = IteratorState::Array(new_state);
-                self.columns = Columns::new(columns::Key::Integer(idx as i64), jsonb);
+                self.columns = Columns::new(
+                    columns::Key::Integer(idx as i64),
+                    jsonb,
+                    self.root_path.clone(),
+                );
             }
             IteratorState::Object(state) => {
                 let Some(((_idx, key, value), new_state)): Option<(
@@ -214,11 +250,12 @@ impl InternalVirtualTableCursor for JsonEachCursor {
 
                 self.iterator_state = IteratorState::Object(new_state);
                 let key = key.to_string();
-                self.columns = Columns::new(columns::Key::String(key), value);
+                self.columns =
+                    Columns::new(columns::Key::String(key), value, self.root_path.clone());
             }
             IteratorState::Primitive => {
                 let json = std::mem::replace(&mut self.json, Jsonb::new(0, None));
-                self.columns = Columns::new_from_primitive(json);
+                self.columns = Columns::new_from_primitive(json, self.root_path.clone());
                 self.no_more_rows = true;
             }
             IteratorState::None => unreachable!(),
@@ -247,6 +284,20 @@ impl InternalVirtualTableCursor for JsonEachCursor {
     }
 }
 
+fn navigate_to_path(jsonb: &mut Jsonb, path: &Value) -> Result<Option<Jsonb>, LimboError> {
+    let json_path = json_path_from_db_value(path, true)?.ok_or_else(|| {
+        LimboError::InvalidArgument(format!("path '{path}' is not a valid json path"))
+    })?;
+    let mut search_operation = SearchOperation::new(jsonb.len() / 2);
+    if jsonb
+        .operate_on_path(&json_path, &mut search_operation)
+        .is_err()
+    {
+        return Ok(None);
+    }
+    Ok(Some(search_operation.result()))
+}
+
 mod columns {
     use crate::{
         json::{
@@ -262,16 +313,17 @@ mod columns {
     pub(super) enum Key {
         Integer(i64),
         String(String),
+        None,
     }
 
     impl Key {
         fn empty() -> Self {
-            Self::Integer(0)
+            Self::None
         }
 
-        fn fullkey_representation(&self) -> Value {
+        fn fullkey_representation(&self, root_path: &str) -> Value {
             match self {
-                Key::Integer(ref i) => Value::Text(Text::new(&format!("$[{i}]"))),
+                Key::Integer(ref i) => Value::Text(Text::new(&format!("{root_path}[{i}]"))),
                 Key::String(ref text) => {
                     let mut needs_quoting: bool = false;
 
@@ -283,10 +335,11 @@ mod columns {
                     if needs_quoting {
                         text = format!("\"{text}\"");
                     }
-                    let s = format!("$.{text}");
+                    let s = format!("{root_path}.{text}");
 
                     Value::Text(Text::new(&s))
                 }
+                Key::None => Value::Text(Text::new(root_path)),
             }
         }
 
@@ -296,6 +349,7 @@ mod columns {
                 Key::String(ref s) => Value::Text(Text::new(
                     &s[1..s.len() - 1].to_owned().replace("\\\"", "\""),
                 )),
+                Key::None => Value::Null,
             }
         }
     }
@@ -303,7 +357,7 @@ mod columns {
     pub(super) struct Columns {
         key: Key,
         value: Jsonb,
-        is_primitive: bool,
+        root_path: String,
     }
 
     impl Default for Columns {
@@ -311,25 +365,25 @@ mod columns {
             Self {
                 key: Key::empty(),
                 value: Jsonb::new(0, None),
-                is_primitive: false,
+                root_path: String::new(),
             }
         }
     }
 
     impl Columns {
-        pub(super) fn new(key: Key, value: Jsonb) -> Self {
+        pub(super) fn new(key: Key, value: Jsonb, root_path: Option<String>) -> Self {
             Self {
                 key,
                 value,
-                is_primitive: false,
+                root_path: root_path.unwrap_or_else(|| "$".to_owned()),
             }
         }
 
-        pub(super) fn new_from_primitive(value: Jsonb) -> Self {
+        pub(super) fn new_from_primitive(value: Jsonb, root_path: Option<String>) -> Self {
             Self {
                 key: Key::empty(),
                 value,
-                is_primitive: true,
+                root_path: root_path.unwrap_or_else(|| "$".to_owned()),
             }
         }
 
@@ -348,9 +402,6 @@ mod columns {
         }
 
         pub(super) fn key(&self) -> Value {
-            if self.is_primitive {
-                return Value::Null;
-            }
             self.key.key_representation()
         }
 
@@ -397,14 +448,11 @@ mod columns {
         }
 
         pub(super) fn fullkey(&self) -> Value {
-            if self.is_primitive {
-                return Value::Text(Text::new("$"));
-            }
-            self.key.fullkey_representation()
+            self.key.fullkey_representation(&self.root_path)
         }
 
         pub(super) fn path(&self) -> Value {
-            Value::Text(Text::new("$"))
+            Value::Text(Text::new(&self.root_path))
         }
 
         pub(super) fn parent(&self) -> Value {

@@ -121,12 +121,12 @@ impl IO for SimulatorIO {
         Ok(())
     }
 
-    fn run_once(&self) -> Result<()> {
+    fn step(&self) -> Result<()> {
         let now = self.now();
         for file in self.files.borrow().iter() {
             file.run_queued_io(now)?;
         }
-        self.inner.run_once()?;
+        self.inner.step()?;
         Ok(())
     }
 

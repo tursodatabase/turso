@@ -63,14 +63,8 @@ fn main() -> anyhow::Result<()> {
     }
 
     loop {
-        let readline = app.readline();
-        match readline {
-            Ok(line) => match app.handle_input_line(line.trim()) {
-                Ok(_) => {}
-                Err(e) => {
-                    eprintln!("{e}");
-                }
-            },
+        match app.readline() {
+            Ok(_) => app.consume(false),
             Err(ReadlineError::Interrupted) => {
                 // At prompt, increment interrupt count
                 if app.interrupt_count.fetch_add(1, Ordering::SeqCst) >= 1 {
@@ -83,7 +77,8 @@ fn main() -> anyhow::Result<()> {
                 continue;
             }
             Err(ReadlineError::Eof) => {
-                app.handle_remaining_input();
+                // consume remaining input before exit
+                app.consume(true);
                 let _ = app.close_conn();
                 break;
             }

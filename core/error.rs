@@ -124,6 +124,8 @@ pub enum CompletionError {
     Aborted,
     #[error("Decryption failed for page={page_idx}")]
     DecryptionError { page_idx: usize },
+    #[error("I/O error: partial write")]
+    ShortWrite,
 }
 
 #[macro_export]

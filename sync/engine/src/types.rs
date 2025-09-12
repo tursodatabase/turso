@@ -2,10 +2,7 @@ use std::{cell::RefCell, collections::HashMap, sync::Arc};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{errors::Error, Result};
-
-pub type Transform<Ctx> =
-    Arc<dyn Fn(&Ctx, DatabaseRowMutation) -> Result<Option<DatabaseRowStatement>> + 'static>;
+use crate::{database_sync_operations::MutexSlot, errors::Error, Result};
 
 pub struct Coro<Ctx> {
     pub ctx: RefCell<Ctx>,
@@ -48,15 +45,28 @@ pub struct DbSyncStatus {
     pub max_frame_no: u64,
 }
 
-#[derive(Debug)]
 pub struct DbChangesStatus {
+    pub time: turso_core::Instant,
     pub revision: DatabasePullRevision,
-    pub file_path: String,
+    pub file_slot: Option<MutexSlot<Arc<dyn turso_core::File>>>,
+}
+
+impl std::fmt::Debug for DbChangesStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DbChangesStatus")
+            .field("time", &self.time)
+            .field("revision", &self.revision)
+            .field("file_slot.is_some()", &self.file_slot.is_some())
+            .finish()
+    }
 }
 
 pub struct SyncEngineStats {
     pub cdc_operations: i64,
-    pub wal_size: i64,
+    pub main_wal_size: u64,
+    pub revert_wal_size: u64,
+    pub last_pull_unix_time: i64,
+    pub last_push_unix_time: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -66,8 +76,11 @@ pub enum DatabaseChangeType {
     Insert,
 }
 
+pub const DATABASE_METADATA_VERSION: &str = "v1";
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct DatabaseMetadata {
+    pub version: String,
     /// Unique identifier of the client - generated on sync startup
     pub client_unique_id: String,
     /// Latest generation from remote which was pulled locally to the Synced DB
@@ -75,6 +88,10 @@ pub struct DatabaseMetadata {
     /// pair of frame_no for Draft and Synced DB such that content of the database file up to these frames is identical
     pub revert_since_wal_salt: Option<Vec<u32>>,
     pub revert_since_wal_watermark: u64,
+    /// Unix time of last successful pull
+    pub last_pull_unix_time: i64,
+    /// Unix time of last successful push
+    pub last_push_unix_time: Option<i64>,
     pub last_pushed_pull_gen_hint: i64,
     pub last_pushed_change_id_hint: i64,
 }
@@ -269,11 +286,20 @@ pub struct DatabaseRowMutation {
     pub updates: Option<HashMap<String, turso_core::Value>>,
 }
 
-pub struct DatabaseRowStatement {
+#[derive(Debug, Clone)]
+pub struct DatabaseStatementReplay {
     pub sql: String,
     pub values: Vec<turso_core::Value>,
 }
 
+#[derive(Debug, Clone)]
+pub enum DatabaseRowTransformResult {
+    Keep,
+    Skip,
+    Rewrite(DatabaseStatementReplay),
+}
+
+#[derive(Clone)]
 pub enum DatabaseTapeRowChangeType {
     Delete {
         before: Vec<turso_core::Value>,
@@ -304,12 +330,13 @@ impl From<&DatabaseTapeRowChangeType> for DatabaseChangeType {
 /// by consuming events from [crate::database_tape::DatabaseChangesIterator]
 #[derive(Debug)]
 pub enum DatabaseTapeOperation {
+    StmtReplay(DatabaseStatementReplay),
     RowChange(DatabaseTapeRowChange),
     Commit,
 }
 
 /// [DatabaseTapeRowChange] is the specific operation over single row which can be performed on database
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DatabaseTapeRowChange {
     pub change_id: i64,
     pub change_time: u64,

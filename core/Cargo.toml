@@ -16,6 +16,7 @@ path = "lib.rs"
 [features]
 default = ["fs", "uuid", "time", "json", "series"]
 antithesis = ["dep:antithesis_sdk"]
+tracing_release = ["tracing/release_max_level_info"]
 conn_raw_api = []
 fs = ["turso_ext/vfs"]
 json = []
@@ -101,7 +102,6 @@ rand = "0.8.5" # Required for quickcheck
 rand_chacha = "0.9.0"
 env_logger = "0.11.6"
 test-log = { version = "0.2.17", features = ["trace"] }
-lru = "0.14.0"
 sorted-vec = "0.8.6"
 mimalloc = { version = "0.1.46", default-features = false }
 

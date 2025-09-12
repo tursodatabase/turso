@@ -32,19 +32,41 @@ jobs:
         settings:
           - host: windows-latest
             target: x86_64-pc-windows-msvc
+            artifact: db-bindings-x86_64-pc-windows-msvc
             build: yarn workspace @tursodatabase/database napi-build --target x86_64-pc-windows-msvc
+          - host: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: sync-bindings-x86_64-pc-windows-msvc
+            build: yarn workspace @tursodatabase/sync napi-build --target x86_64-pc-windows-msvc
           - host: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+            artifact: db-bindings-x86_64-unknown-linux-gnu
             docker: ghcr.io/napi-rs/napi-rs/nodejs-rust:lts-debian
             build: yarn workspace @tursodatabase/database napi-build --target x86_64-unknown-linux-gnu
+          - host: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: sync-bindings-x86_64-unknown-linux-gnu
+            docker: ghcr.io/napi-rs/napi-rs/nodejs-rust:lts-debian
+            build: yarn workspace @tursodatabase/sync napi-build --target x86_64-unknown-linux-gnu
           - host: macos-latest
             target: aarch64-apple-darwin
+            artifact: db-bindings-aarch64-apple-darwin
             build: yarn workspace @tursodatabase/database napi-build --target aarch64-apple-darwin
+          - host: macos-latest
+            target: aarch64-apple-darwin
+            artifact: sync-bindings-aarch64-apple-darwin
+            build: yarn workspace @tursodatabase/sync napi-build --target aarch64-apple-darwin
           - host: blacksmith-2vcpu-ubuntu-2404-arm
             target: aarch64-unknown-linux-gnu
+            artifact: db-bindings-aarch64-unknown-linux-gnu
             build: yarn workspace @tursodatabase/database napi-build --target aarch64-unknown-linux-gnu
+          - host: blacksmith-2vcpu-ubuntu-2404-arm
+            target: aarch64-unknown-linux-gnu
+            artifact: sync-bindings-aarch64-unknown-linux-gnu
+            build: yarn workspace @tursodatabase/sync napi-build --target aarch64-unknown-linux-gnu
           - host: ubuntu-latest
             target: wasm32-wasip1-threads
+            artifact: db-bindings-wasm32-wasip1-threads
             setup: |
               rustup target add wasm32-wasip1-threads
               wget https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-25/wasi-sdk-25.0-x86_64-linux.tar.gz
@@ -55,6 +77,19 @@ jobs:
               export TARGET_CXXFLAGS="--target=wasm32-wasi-threads --sysroot=$(pwd)/wasi-sdk-25.0-x86_64-linux/share/wasi-sysroot -pthread -mllvm -wasm-enable-sjlj -lsetjmp"
               export TARGET_CFLAGS="$TARGET_CXXFLAGS"
               yarn workspace @tursodatabase/database-browser build
+          - host: ubuntu-latest
+            target: wasm32-wasip1-threads
+            artifact: sync-bindings-wasm32-wasip1-threads
+            setup: |
+              rustup target add wasm32-wasip1-threads
+              wget https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-25/wasi-sdk-25.0-x86_64-linux.tar.gz
+              tar -xvf wasi-sdk-25.0-x86_64-linux.tar.gz
+            build: |
+              export WASI_SDK_PATH="$(pwd)/wasi-sdk-25.0-x86_64-linux"
+              export CMAKE_BUILD_PARALLEL_LEVEL=$(nproc)
+              export TARGET_CXXFLAGS="--target=wasm32-wasi-threads --sysroot=$(pwd)/wasi-sdk-25.0-x86_64-linux/share/wasi-sysroot -pthread -mllvm -wasm-enable-sjlj -lsetjmp"
+              export TARGET_CFLAGS="$TARGET_CXXFLAGS"
+              yarn workspace @tursodatabase/sync-browser build
     name: stable - ${{ matrix.settings.target }} - node@20
     runs-on: ${{ matrix.settings.host }}
     steps:
@@ -112,13 +147,15 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: bindings-${{ matrix.settings.target }}
+          name: ${{ matrix.settings.artifact }}
           path: |
-            bindings/javascript/packages/native/${{ env.APP_NAME }}.*.node
-            bindings/javascript/packages/browser/${{ env.APP_NAME }}.*.wasm
+            bindings/javascript/packages/native/turso.*.node
+            bindings/javascript/packages/browser/turso.*.wasm
+            bindings/javascript/sync/packages/native/sync.*.node
+            bindings/javascript/sync/packages/browser/sync.*.wasm
           if-no-files-found: error
-  test-linux-x64-gnu-binding:
-    name: Test bindings on Linux-x64-gnu - node@${{ matrix.node }}
+  test-db-linux-x64-gnu-binding:
+    name: Test DB bindings on Linux-x64-gnu - node@${{ matrix.node }}
     needs:
       - build
     strategy:
@@ -137,11 +174,12 @@ jobs:
         run: yarn install
       - name: Build common
         run: yarn workspace @tursodatabase/database-common build
-      - name: Download all artifacts
+      - name: Download all DB artifacts
         uses: actions/download-artifact@v4
         with:
-          path: bindings/javascript/packages
+          path: bindings/javascript
           merge-multiple: true
+          pattern: 'db*'
       - name: List packages
         run: ls -R .
         shell: bash
@@ -154,18 +192,28 @@ jobs:
       contents: read
       id-token: write
     needs:
-      - test-linux-x64-gnu-binding
+      - test-db-linux-x64-gnu-binding
     steps:
       - uses: actions/checkout@v4
       - name: Setup node
         uses: useblacksmith/setup-node@v5
         with:
           node-version: 20
-      - name: Download all artifacts
+      - name: Download all DB artifacts
         uses: actions/download-artifact@v4
         with:
-          path: bindings/javascript/packages
+          path: bindings/javascript
           merge-multiple: true
+          pattern: 'db*'
+      - name: Download all sync artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: bindings/javascript
+          merge-multiple: true
+          pattern: 'sync*'
+      - name: List packages
+        run: ls -R .
+        shell: bash
       - name: Install dependencies
         run: yarn install
       - name: Install dependencies

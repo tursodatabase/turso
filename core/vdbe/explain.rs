@@ -5,13 +5,13 @@ use crate::vdbe::{builder::CursorType, insn::RegisterOrLiteral};
 use super::{Insn, InsnReference, Program, Value};
 use crate::function::{Func, ScalarFunc};
 
-pub fn insn_to_str(
+pub const EXPLAIN_COLUMNS: [&str; 8] = ["addr", "opcode", "p1", "p2", "p3", "p4", "p5", "comment"];
+pub const EXPLAIN_QUERY_PLAN_COLUMNS: [&str; 4] = ["id", "parent", "notused", "detail"];
+
+pub fn insn_to_row(
     program: &Program,
-    addr: InsnReference,
     insn: &Insn,
-    indent: String,
-    manual_comment: Option<&'static str>,
-) -> String {
+) -> (&'static str, i32, i32, i32, Value, u16, String) {
     let get_table_or_index_name = |cursor_id: usize| {
         let cursor_type = &program.cursor_ref[cursor_id].1;
         match cursor_type {
@@ -23,8 +23,7 @@ pub fn insn_to_str(
             CursorType::Sorter => "sorter",
         }
     };
-    let (opcode, p1, p2, p3, p4, p5, comment): (&str, i32, i32, i32, Value, u16, String) =
-        match insn {
+    match insn {
             Insn::Init { target_pc } => (
                 "Init",
                 0,
@@ -653,14 +652,14 @@ pub fn insn_to_str(
                 0,
                 "".to_string(),
             ),
-            Insn::Transaction { db, write , schema_cookie} => (
+            Insn::Transaction { db, tx_mode, schema_cookie} => (
                 "Transaction",
                 *db as i32,
-                *write as i32,
+                *tx_mode as i32,
                 *schema_cookie as i32,
                 Value::build_text(""),
                 0,
-                format!("iDb={db} write={write}"),
+                format!("iDb={db} tx_mode={tx_mode:?}"),
             ),
             Insn::Goto { target_pc } => (
                 "Goto",
@@ -1724,7 +1723,34 @@ pub fn insn_to_str(
                 0,
                 format!("if (r[{}] < 0) goto {}", reg, target_pc.as_debug_int()),
             ),
-        };
+        }
+}
+
+pub fn insn_to_row_with_comment(
+    program: &Program,
+    insn: &Insn,
+    manual_comment: Option<&str>,
+) -> (&'static str, i32, i32, i32, Value, u16, String) {
+    let (opcode, p1, p2, p3, p4, p5, comment) = insn_to_row(program, insn);
+    (
+        opcode,
+        p1,
+        p2,
+        p3,
+        p4,
+        p5,
+        manual_comment.map_or(comment.to_string(), |mc| format!("{comment}; {mc}")),
+    )
+}
+
+pub fn insn_to_str(
+    program: &Program,
+    addr: InsnReference,
+    insn: &Insn,
+    indent: String,
+    manual_comment: Option<&str>,
+) -> String {
+    let (opcode, p1, p2, p3, p4, p5, comment) = insn_to_row(program, insn);
     format!(
         "{:<4}  {:<17}  {:<4}  {:<4}  {:<4}  {:<13}  {:<2}  {}",
         addr,

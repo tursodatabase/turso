@@ -53,12 +53,13 @@ use crate::{
 #[cfg(feature = "json")]
 use crate::json::JsonCacheCell;
 use crate::{Connection, MvStore, Result, TransactionState};
-use builder::CursorKey;
+use builder::{CursorKey, QueryMode};
 use execute::{
     InsnFunction, InsnFunctionStepResult, OpIdxDeleteState, OpIntegrityCheckState,
     OpOpenEphemeralState,
 };
 
+use explain::{insn_to_row_with_comment, EXPLAIN_COLUMNS, EXPLAIN_QUERY_PLAN_COLUMNS};
 use regex::Regex;
 use std::{cell::Cell, collections::HashMap, num::NonZero, rc::Rc, sync::Arc};
 use tracing::{instrument, Level};
@@ -372,8 +373,16 @@ impl ProgramState {
         self.parameters.get(&index).cloned().unwrap_or(Value::Null)
     }
 
-    pub fn reset(&mut self) {
+    pub fn reset(&mut self, max_registers: Option<usize>, max_cursors: Option<usize>) {
         self.pc = 0;
+
+        if let Some(max_cursors) = max_cursors {
+            self.cursors.resize_with(max_cursors, || None);
+        }
+        if let Some(max_resgisters) = max_registers {
+            self.registers
+                .resize_with(max_resgisters, || Register::Value(Value::Null));
+        }
         self.cursors.iter_mut().for_each(|c| *c = None);
         self.registers
             .iter_mut()
@@ -386,7 +395,29 @@ impl ProgramState {
         self.parameters.clear();
         self.current_collation = None;
         #[cfg(feature = "json")]
-        self.json_cache.clear()
+        self.json_cache.clear();
+
+        // Reset state machines
+        self.op_delete_state = OpDeleteState {
+            sub_state: OpDeleteSubState::MaybeCaptureRecord,
+            deleted_record: None,
+        };
+        self.op_idx_delete_state = None;
+        self.op_integrity_check_state = OpIntegrityCheckState::Start;
+        self.metrics = StatementMetrics::new();
+        self.op_open_ephemeral_state = OpOpenEphemeralState::Start;
+        self.op_new_rowid_state = OpNewRowidState::Start;
+        self.op_idx_insert_state = OpIdxInsertState::MaybeSeek;
+        self.op_insert_state = OpInsertState {
+            sub_state: OpInsertSubState::MaybeCaptureRecord,
+            old_record: None,
+        };
+        self.op_no_conflict_state = OpNoConflictState::Start;
+        self.seek_state = OpSeekState::Start;
+        self.current_collation = None;
+        self.op_column_state = OpColumnState::Start;
+        self.op_row_id_state = OpRowIdState::Start;
+        self.view_delta_state = ViewDeltaCommitState::NotStarted;
     }
 
     pub fn get_cursor(&mut self, cursor_id: CursorID) -> &mut Cursor {
@@ -465,8 +496,88 @@ impl Program {
         self.connection.get_pager_from_database_index(idx)
     }
 
-    #[instrument(skip_all, level = Level::DEBUG)]
     pub fn step(
+        &self,
+        state: &mut ProgramState,
+        mv_store: Option<Arc<MvStore>>,
+        pager: Rc<Pager>,
+        query_mode: QueryMode,
+    ) -> Result<StepResult> {
+        match query_mode {
+            QueryMode::Normal => self.normal_step(state, mv_store, pager),
+            QueryMode::Explain => self.explain_step(state, mv_store, pager),
+            QueryMode::ExplainQueryPlan => self.explain_query_plan_step(state, mv_store, pager),
+        }
+    }
+
+    fn explain_step(
+        &self,
+        state: &mut ProgramState,
+        _mv_store: Option<Arc<MvStore>>,
+        pager: Rc<Pager>,
+    ) -> Result<StepResult> {
+        debug_assert!(state.column_count() == EXPLAIN_COLUMNS.len());
+        if self.connection.closed.get() {
+            // Connection is closed for whatever reason, rollback the transaction.
+            let state = self.connection.transaction_state.get();
+            if let TransactionState::Write { .. } = state {
+                pager.io.block(|| pager.end_tx(true, &self.connection))?;
+            }
+            return Err(LimboError::InternalError("Connection closed".to_string()));
+        }
+
+        if state.is_interrupted() {
+            return Ok(StepResult::Interrupt);
+        }
+
+        // FIXME: do we need this?
+        state.metrics.vm_steps = state.metrics.vm_steps.saturating_add(1);
+
+        if state.pc as usize >= self.insns.len() {
+            return Ok(StepResult::Done);
+        }
+
+        let (current_insn, _) = &self.insns[state.pc as usize];
+        let (opcode, p1, p2, p3, p4, p5, comment) = insn_to_row_with_comment(
+            self,
+            current_insn,
+            self.comments.as_ref().and_then(|comments| {
+                comments
+                    .iter()
+                    .find(|(offset, _)| *offset == state.pc)
+                    .map(|(_, comment)| comment)
+                    .copied()
+            }),
+        );
+
+        state.registers[0] = Register::Value(Value::Integer(state.pc as i64));
+        state.registers[1] = Register::Value(Value::from_text(opcode));
+        state.registers[2] = Register::Value(Value::Integer(p1 as i64));
+        state.registers[3] = Register::Value(Value::Integer(p2 as i64));
+        state.registers[4] = Register::Value(Value::Integer(p3 as i64));
+        state.registers[5] = Register::Value(p4);
+        state.registers[6] = Register::Value(Value::Integer(p5 as i64));
+        state.registers[7] = Register::Value(Value::from_text(&comment));
+        state.result_row = Some(Row {
+            values: &state.registers[0] as *const Register,
+            count: EXPLAIN_COLUMNS.len(),
+        });
+        state.pc += 1;
+        Ok(StepResult::Row)
+    }
+
+    fn explain_query_plan_step(
+        &self,
+        state: &mut ProgramState,
+        _mv_store: Option<Arc<MvStore>>,
+        _pager: Rc<Pager>,
+    ) -> Result<StepResult> {
+        debug_assert!(state.column_count() == EXPLAIN_QUERY_PLAN_COLUMNS.len());
+        todo!("we need OP_Explain to be implemented first")
+    }
+
+    #[instrument(skip_all, level = Level::DEBUG)]
+    fn normal_step(
         &self,
         state: &mut ProgramState,
         mv_store: Option<Arc<MvStore>>,
@@ -787,27 +898,6 @@ impl Program {
             }
         }
     }
-
-    #[rustfmt::skip]
-    pub fn explain(&self) -> String {
-        let mut buff = String::with_capacity(1024);
-        buff.push_str("addr  opcode             p1    p2    p3    p4             p5  comment\n");
-        buff.push_str("----  -----------------  ----  ----  ----  -------------  --  -------\n");
-        let indent = "  ";
-        let indent_counts = get_indent_counts(&self.insns);
-        for (addr, (insn, _)) in self.insns.iter().enumerate() {
-            let indent_count = indent_counts[addr];
-            print_insn(
-                self,
-                addr as InsnReference,
-                insn,
-                indent.repeat(indent_count),
-                &mut buff,
-            );
-            buff.push('\n');
-        }
-        buff
-    }
 }
 
 fn make_record(registers: &[Register], start_reg: &usize, count: &usize) -> ImmutableRecord {
@@ -850,82 +940,6 @@ fn trace_insn(program: &Program, addr: InsnReference, insn: &Insn) {
                 .copied())
         )
     );
-}
-
-fn print_insn(program: &Program, addr: InsnReference, insn: &Insn, indent: String, w: &mut String) {
-    let s = explain::insn_to_str(
-        program,
-        addr,
-        insn,
-        indent,
-        program.comments.as_ref().and_then(|comments| {
-            comments
-                .iter()
-                .find(|(offset, _)| *offset == addr)
-                .map(|(_, comment)| comment)
-                .copied()
-        }),
-    );
-    w.push_str(&s);
-}
-
-// The indenting rules are(from SQLite):
-//
-//  * For each "Next", "Prev", "VNext" or "VPrev" instruction, increase the ident number for
-//    all opcodes that occur between the p2 jump destination and the opcode itself.
-//
-//   * Do the previous for "Return" instructions for when P2 is positive.
-//
-//   * For each "Goto", if the jump destination is earlier in the program and ends on one of:
-//        Yield  SeekGt  SeekLt  RowSetRead  Rewind
-//     or if the P1 parameter is one instead of zero, then increase the indent number for all
-//     opcodes between the earlier instruction and "Goto"
-fn get_indent_counts(insns: &[(Insn, InsnFunction)]) -> Vec<usize> {
-    let mut indents = vec![0; insns.len()];
-
-    for (i, (insn, _)) in insns.iter().enumerate() {
-        let mut start = 0;
-        let mut end = 0;
-        match insn {
-            Insn::Next { pc_if_next, .. } | Insn::VNext { pc_if_next, .. } => {
-                let dest = pc_if_next.as_debug_int() as usize;
-                if dest < i {
-                    start = dest;
-                    end = i;
-                }
-            }
-            Insn::Prev { pc_if_prev, .. } => {
-                let dest = pc_if_prev.as_debug_int() as usize;
-                if dest < i {
-                    start = dest;
-                    end = i;
-                }
-            }
-
-            Insn::Goto { target_pc } => {
-                let dest = target_pc.as_debug_int() as usize;
-                if dest < i
-                    && matches!(
-                        insns.get(dest).map(|(insn, _)| insn),
-                        Some(Insn::Yield { .. })
-                            | Some(Insn::SeekGT { .. })
-                            | Some(Insn::SeekLT { .. })
-                            | Some(Insn::Rewind { .. })
-                    )
-                {
-                    start = dest;
-                    end = i;
-                }
-            }
-
-            _ => {}
-        }
-        for indent in indents.iter_mut().take(end).skip(start) {
-            *indent += 1;
-        }
-    }
-
-    indents
 }
 
 pub trait FromValueRow<'a> {

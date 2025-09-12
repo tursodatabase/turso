@@ -49,9 +49,7 @@ public final class JDBC4PreparedStatement extends JDBC4Statement implements Prep
     requireNonNull(this.statement);
     final TursoResultSet resultSet = statement.getResultSet();
     resultSet.consumeAll();
-
-    // TODO: return updated count
-    return 0;
+    return Math.toIntExact(statement.changes());
   }
 
   @Override

@@ -551,7 +551,7 @@ fn parse_table(
             is_strict: false,
             has_autoincrement: false,
 
-            unique_sets: None,
+            unique_sets: vec![],
         });
         drop(view_guard);
 
@@ -998,6 +998,12 @@ fn parse_join(
 
     let (outer, natural) = match join_operator {
         ast::JoinOperator::TypedJoin(Some(join_type)) => {
+            if join_type.contains(JoinType::RIGHT) {
+                crate::bail_parse_error!("RIGHT JOIN is not supported");
+            }
+            if join_type.contains(JoinType::CROSS) {
+                crate::bail_parse_error!("CROSS JOIN is not supported");
+            }
             let is_outer = join_type.contains(JoinType::OUTER);
             let is_natural = join_type.contains(JoinType::NATURAL);
             (is_outer, is_natural)

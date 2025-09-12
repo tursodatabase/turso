@@ -77,7 +77,7 @@ pub fn translate_create_materialized_view(
         is_strict: false,
         has_autoincrement: false,
 
-        unique_sets: None,
+        unique_sets: vec![],
     });
 
     // Allocate a cursor for writing to the view's btree during population

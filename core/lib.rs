@@ -99,8 +99,8 @@ pub use types::RefValue;
 pub use types::Value;
 use util::parse_schema_rows;
 pub use util::IOExt;
-use vdbe::builder::QueryMode;
 use vdbe::builder::TableRefIdCounter;
+pub use vdbe::{builder::QueryMode, explain::EXPLAIN_COLUMNS, explain::EXPLAIN_QUERY_PLAN_COLUMNS};
 
 /// Configuration for database features
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -969,21 +969,23 @@ impl Connection {
             .trim();
         self.maybe_update_schema()?;
         let pager = self.pager.borrow().clone();
-        match cmd {
-            Cmd::Stmt(stmt) => {
-                let program = translate::translate(
-                    self.schema.borrow().deref(),
-                    stmt,
-                    pager.clone(),
-                    self.clone(),
-                    &syms,
-                    QueryMode::Normal,
-                    input,
-                )?;
-                Ok(Statement::new(program, self._db.mv_store.clone(), pager))
-            }
-            _ => unreachable!(),
-        }
+        let mode = QueryMode::new(&cmd);
+        let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
+        let program = translate::translate(
+            self.schema.borrow().deref(),
+            stmt,
+            pager.clone(),
+            self.clone(),
+            &syms,
+            mode,
+            input,
+        )?;
+        Ok(Statement::new(
+            program,
+            self._db.mv_store.clone(),
+            pager,
+            mode,
+        ))
     }
 
     /// Parse schema from scratch if version of schema for the connection differs from the schema cookie in the root page
@@ -1106,6 +1108,7 @@ impl Connection {
                 "The supplied SQL string contains no statements".to_string(),
             ));
         }
+        self.maybe_update_schema()?;
         let sql = sql.as_ref();
         tracing::trace!("Preparing and executing batch: {}", sql);
         let mut parser = Parser::new(sql.as_bytes());
@@ -1116,23 +1119,19 @@ impl Connection {
             let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
                 .unwrap()
                 .trim();
-            match cmd {
-                Cmd::Stmt(stmt) => {
-                    let program = translate::translate(
-                        self.schema.borrow().deref(),
-                        stmt,
-                        pager.clone(),
-                        self.clone(),
-                        &syms,
-                        QueryMode::Normal,
-                        input,
-                    )?;
-
-                    Statement::new(program, self._db.mv_store.clone(), pager.clone())
-                        .run_ignore_rows()?;
-                }
-                _ => unreachable!(),
-            }
+            let mode = QueryMode::new(&cmd);
+            let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
+            let program = translate::translate(
+                self.schema.borrow().deref(),
+                stmt,
+                pager.clone(),
+                self.clone(),
+                &syms,
+                mode,
+                input,
+            )?;
+            Statement::new(program, self._db.mv_store.clone(), pager.clone(), mode)
+                .run_ignore_rows()?;
         }
         Ok(())
     }
@@ -1143,6 +1142,7 @@ impl Connection {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
         let sql = sql.as_ref();
+        self.maybe_update_schema()?;
         tracing::trace!("Querying: {}", sql);
         let mut parser = Parser::new(sql.as_bytes());
         let cmd = parser.next_cmd()?;
@@ -1169,6 +1169,7 @@ impl Connection {
         // self.maybe_update_schema()?;
         let syms = self.syms.borrow();
         let pager = self.pager.borrow().clone();
+        let mode = QueryMode::new(&cmd);
         match cmd {
             Cmd::Stmt(ref stmt) | Cmd::Explain(ref stmt) => {
                 let program = translate::translate(
@@ -1177,14 +1178,16 @@ impl Connection {
                     pager.clone(),
                     self.clone(),
                     &syms,
-                    cmd.into(),
+                    mode,
                     input,
                 )?;
-                let stmt = Statement::new(program, self._db.mv_store.clone(), pager);
+                let stmt = Statement::new(program, self._db.mv_store.clone(), pager, mode);
                 Ok(Some(stmt))
             }
             Cmd::ExplainQueryPlan(stmt) => {
                 let mut table_ref_counter = TableRefIdCounter::new();
+
+                // TODO: we need OP_Explain
                 match stmt {
                     ast::Stmt::Select(select) => {
                         let mut plan = prepare_select_plan(
@@ -1218,6 +1221,7 @@ impl Connection {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
         let sql = sql.as_ref();
+        self.maybe_update_schema()?;
         let mut parser = Parser::new(sql.as_bytes());
         while let Some(cmd) = parser.next_cmd()? {
             let syms = self.syms.borrow();
@@ -1226,36 +1230,19 @@ impl Connection {
             let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
                 .unwrap()
                 .trim();
-            self.maybe_update_schema()?;
-            match cmd {
-                Cmd::Explain(stmt) => {
-                    let program = translate::translate(
-                        self.schema.borrow().deref(),
-                        stmt,
-                        pager,
-                        self.clone(),
-                        &syms,
-                        QueryMode::Explain,
-                        input,
-                    )?;
-                    let _ = std::io::stdout().write_all(program.explain().as_bytes());
-                }
-                Cmd::ExplainQueryPlan(_stmt) => todo!(),
-                Cmd::Stmt(stmt) => {
-                    let program = translate::translate(
-                        self.schema.borrow().deref(),
-                        stmt,
-                        pager.clone(),
-                        self.clone(),
-                        &syms,
-                        QueryMode::Normal,
-                        input,
-                    )?;
-
-                    Statement::new(program, self._db.mv_store.clone(), pager.clone())
-                        .run_ignore_rows()?;
-                }
-            }
+            let mode = QueryMode::new(&cmd);
+            let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
+            let program = translate::translate(
+                self.schema.borrow().deref(),
+                stmt,
+                pager.clone(),
+                self.clone(),
+                &syms,
+                mode,
+                input,
+            )?;
+            Statement::new(program, self._db.mv_store.clone(), pager.clone(), mode)
+                .run_ignore_rows()?;
         }
         Ok(())
     }
@@ -2105,20 +2092,43 @@ pub struct Statement {
     /// Used to determine whether we need to check for schema changes when
     /// starting a transaction.
     accesses_db: bool,
+
+    /// indicates if the statement is a NORMAL/EXPLAIN/EXPLAIN QUERY PLAN
+    query_mode: QueryMode,
+    /// Flag to show if the statement was busy
+    busy: bool,
 }
 
 impl Statement {
-    pub fn new(program: vdbe::Program, mv_store: Option<Arc<MvStore>>, pager: Rc<Pager>) -> Self {
+    pub fn new(
+        program: vdbe::Program,
+        mv_store: Option<Arc<MvStore>>,
+        pager: Rc<Pager>,
+        query_mode: QueryMode,
+    ) -> Self {
         let accesses_db = program.accesses_db;
-        let state = vdbe::ProgramState::new(program.max_registers, program.cursor_ref.len());
+        let state = vdbe::ProgramState::new(
+            match query_mode {
+                QueryMode::Normal => program.max_registers,
+                QueryMode::Explain => EXPLAIN_COLUMNS.len(),
+                QueryMode::ExplainQueryPlan => EXPLAIN_QUERY_PLAN_COLUMNS.len(),
+            },
+            program.cursor_ref.len(),
+        );
         let schema_version = program.connection.schema.borrow().schema_version;
+
         Self {
             program,
             state,
             mv_store,
             pager,
             accesses_db,
+            query_mode,
+            busy: false,
         }
+    }
+    pub fn get_query_mode(&self) -> QueryMode {
+        self.query_mode
     }
 
     pub fn n_change(&self) -> i64 {
@@ -2135,13 +2145,20 @@ impl Statement {
 
     pub fn step(&mut self) -> Result<StepResult> {
         let res = if !self.accesses_db {
-            self.program
-                .step(&mut self.state, self.mv_store.clone(), self.pager.clone())
+            self.program.step(
+                &mut self.state,
+                self.mv_store.clone(),
+                self.pager.clone(),
+                self.query_mode,
+            )
         } else {
             const MAX_SCHEMA_RETRY: usize = 50;
-            let mut res =
-                self.program
-                    .step(&mut self.state, self.mv_store.clone(), self.pager.clone());
+            let mut res = self.program.step(
+                &mut self.state,
+                self.mv_store.clone(),
+                self.pager.clone(),
+                self.query_mode,
+            );
             for attempt in 0..MAX_SCHEMA_RETRY {
                 // Only reprepare if we still need to update schema
                 if !matches!(res, Err(LimboError::SchemaUpdated)) {
@@ -2149,9 +2166,12 @@ impl Statement {
                 }
                 tracing::debug!("reprepare: attempt={}", attempt);
                 self.reprepare()?;
-                res = self
-                    .program
-                    .step(&mut self.state, self.mv_store.clone(), self.pager.clone());
+                res = self.program.step(
+                    &mut self.state,
+                    self.mv_store.clone(),
+                    self.pager.clone(),
+                    self.query_mode,
+                );
             }
             res
         };
@@ -2160,6 +2180,9 @@ impl Statement {
         if matches!(res, Ok(StepResult::Done)) {
             let mut conn_metrics = self.program.connection.metrics.borrow_mut();
             conn_metrics.record_statement(self.state.metrics.clone());
+            self.busy = false;
+        } else {
+            self.busy = true;
         }
 
         res
@@ -2206,32 +2229,37 @@ impl Statement {
             let cmd = cmd.expect("Same SQL string should be able to be parsed");
 
             let syms = conn.syms.borrow();
-
-            match cmd {
-                Cmd::Stmt(stmt) => translate::translate(
-                    conn.schema.borrow().deref(),
-                    stmt,
-                    self.pager.clone(),
-                    conn.clone(),
-                    &syms,
-                    QueryMode::Normal,
-                    &self.program.sql,
-                )?,
-                Cmd::Explain(_stmt) => todo!(),
-                Cmd::ExplainQueryPlan(_stmt) => todo!(),
-            }
+            let mode = self.query_mode;
+            debug_assert_eq!(QueryMode::new(&cmd), mode,);
+            let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
+            translate::translate(
+                conn.schema.borrow().deref(),
+                stmt,
+                self.pager.clone(),
+                conn.clone(),
+                &syms,
+                mode,
+                &self.program.sql,
+            )?
         };
 
         // Save parameters before they are reset
         let parameters = std::mem::take(&mut self.state.parameters);
-        self.reset();
+        self._reset(
+            Some(match self.query_mode {
+                QueryMode::Normal => self.program.max_registers,
+                QueryMode::Explain => EXPLAIN_COLUMNS.len(),
+                QueryMode::ExplainQueryPlan => EXPLAIN_QUERY_PLAN_COLUMNS.len(),
+            }),
+            Some(self.program.cursor_ref.len()),
+        );
         // Load the parameters back into the state
         self.state.parameters = parameters;
         Ok(())
     }
 
     pub fn run_once(&self) -> Result<()> {
-        let res = self.pager.io.run_once();
+        let res = self.pager.io.step();
         if self.program.connection.is_nested_stmt.get() {
             return res;
         }
@@ -2256,14 +2284,24 @@ impl Statement {
     }
 
     pub fn num_columns(&self) -> usize {
-        self.program.result_columns.len()
+        match self.query_mode {
+            QueryMode::Normal => self.program.result_columns.len(),
+            QueryMode::Explain => EXPLAIN_COLUMNS.len(),
+            QueryMode::ExplainQueryPlan => EXPLAIN_QUERY_PLAN_COLUMNS.len(),
+        }
     }
 
     pub fn get_column_name(&self, idx: usize) -> Cow<str> {
-        let column = &self.program.result_columns.get(idx).expect("No column");
-        match column.name(&self.program.table_references) {
-            Some(name) => Cow::Borrowed(name),
-            None => Cow::Owned(column.expr.to_string()),
+        match self.query_mode {
+            QueryMode::Normal => {
+                let column = &self.program.result_columns.get(idx).expect("No column");
+                match column.name(&self.program.table_references) {
+                    Some(name) => Cow::Borrowed(name),
+                    None => Cow::Owned(column.expr.to_string()),
+                }
+            }
+            QueryMode::Explain => Cow::Borrowed(EXPLAIN_COLUMNS[idx]),
+            QueryMode::ExplainQueryPlan => Cow::Borrowed(EXPLAIN_QUERY_PLAN_COLUMNS[idx]),
         }
     }
 
@@ -2314,15 +2352,24 @@ impl Statement {
     }
 
     pub fn reset(&mut self) {
-        self.state.reset();
+        self._reset(None, None);
+    }
+
+    pub fn _reset(&mut self, max_registers: Option<usize>, max_cursors: Option<usize>) {
+        self.state.reset(max_registers, max_cursors);
+        self.busy = false;
     }
 
     pub fn row(&self) -> Option<&Row> {
         self.state.result_row.as_ref()
     }
 
-    pub fn explain(&self) -> String {
-        self.program.explain()
+    pub fn get_sql(&self) -> &str {
+        &self.program.sql
+    }
+
+    pub fn is_busy(&self) -> bool {
+        self.busy
     }
 }
 

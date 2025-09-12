@@ -1,0 +1,25 @@
+{
+  "name": "@tursodatabase/sync-common",
+  "version": "0.2.0-pre.1",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/tursodatabase/turso"
+  },
+  "type": "module",
+  "license": "MIT",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "packageManager": "yarn@4.9.2",
+  "files": [
+    "dist/**",
+    "README.md"
+  ],
+  "devDependencies": {
+    "typescript": "^5.9.2"
+  },
+  "scripts": {
+    "tsc-build": "npm exec tsc",
+    "build": "npm run tsc-build",
+    "test": "echo 'no tests'"
+  }
+}

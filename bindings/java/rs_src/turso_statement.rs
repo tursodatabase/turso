@@ -284,6 +284,23 @@ pub extern "system" fn Java_tech_turso_core_TursoStatement_totalChanges<'local>(
     stmt.connection.conn.total_changes()
 }
 
+#[no_mangle]
+pub extern "system" fn Java_tech_turso_core_TursoStatement_changes<'local>(
+    mut env: JNIEnv<'local>,
+    obj: JObject<'local>,
+    stmt_ptr: jlong,
+) -> jlong {
+    let stmt = match to_turso_statement(stmt_ptr) {
+        Ok(stmt) => stmt,
+        Err(e) => {
+            set_err_msg_and_throw_exception(&mut env, obj, SQLITE_ERROR, e.to_string());
+            return -1;
+        }
+    };
+
+    stmt.connection.conn.changes()
+}
+
 /// Converts an optional `JObject` into Java's `TursoStepResult`.
 ///
 /// This function takes an optional `JObject` and converts it into a Java object

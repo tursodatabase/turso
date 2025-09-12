@@ -35,6 +35,24 @@ impl TempDatabase {
         Self { path, io, db }
     }
 
+    pub fn new_with_opts(db_name: &str, opts: turso_core::DatabaseOpts) -> Self {
+        let mut path = TempDir::new().unwrap().keep();
+        path.push(db_name);
+        let io: Arc<dyn IO + Send> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let db = Database::open_file_with_flags(
+            io.clone(),
+            path.to_str().unwrap(),
+            turso_core::OpenFlags::default(),
+            opts,
+        )
+        .unwrap();
+        Self {
+            path: path.to_path_buf(),
+            io,
+            db,
+        }
+    }
+
     pub fn new_with_existent(db_path: &Path, enable_indexes: bool) -> Self {
         Self::new_with_existent_with_flags(
             db_path,

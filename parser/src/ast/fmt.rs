@@ -2204,6 +2204,7 @@ impl ToTokens for TransactionType {
                 Self::Deferred => TK_DEFERRED,
                 Self::Immediate => TK_IMMEDIATE,
                 Self::Exclusive => TK_EXCLUSIVE,
+                Self::Concurrent => TK_CONCURRENT,
             },
             None,
         )

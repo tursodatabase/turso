@@ -5,6 +5,7 @@ import {
   WASI as __WASI,
 } from '@napi-rs/wasm-runtime'
 
+import { MainDummyImports } from "@tursodatabase/database-browser-common";
 
 
 const __wasi = new __WASI({
@@ -24,10 +25,6 @@ const __sharedMemory = new WebAssembly.Memory({
 const __wasmFile = await fetch(__wasmUrl).then((res) => res.arrayBuffer())
 
 export let MainWorker = null;
-
-function panic(name) {
-  throw new Error(`method ${name} must be invoked only from the main thread`);
-}
 
 const {
   instance: __napiInstance,
@@ -49,14 +46,8 @@ const {
       ...importObject.env,
       ...importObject.napi,
       ...importObject.emnapi,
+      ...MainDummyImports,
       memory: __sharedMemory,
-      is_web_worker: () => false,
-      lookup_file: () => panic("lookup_file"),
-      read: () => panic("read"),
-      write: () => panic("write"),
-      sync: () => panic("sync"),
-      truncate: () => panic("truncate"),
-      size: () => panic("size"),
     }
     return importObject
   },

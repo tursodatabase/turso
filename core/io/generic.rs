@@ -37,7 +37,7 @@ impl IO for GenericIO {
     }
 
     #[instrument(err, skip_all, level = Level::TRACE)]
-    fn run_once(&self) -> Result<()> {
+    fn step(&self) -> Result<()> {
         Ok(())
     }
 }

@@ -11,7 +11,7 @@ use crate::{
     errors::Error,
     types::{
         Coro, DatabaseChange, DatabaseTapeOperation, DatabaseTapeRowChange,
-        DatabaseTapeRowChangeType, ProtocolCommand, Transform,
+        DatabaseTapeRowChangeType, ProtocolCommand,
     },
     wal_session::WalSession,
     Result,
@@ -169,8 +169,8 @@ impl DatabaseTape {
     pub async fn start_replay_session<Ctx>(
         &self,
         coro: &Coro<Ctx>,
-        opts: DatabaseReplaySessionOpts<Ctx>,
-    ) -> Result<DatabaseReplaySession<Ctx>> {
+        opts: DatabaseReplaySessionOpts,
+    ) -> Result<DatabaseReplaySession> {
         tracing::debug!("opening replay session");
         let conn = self.connect(coro).await?;
         conn.execute("BEGIN IMMEDIATE")?;
@@ -431,16 +431,14 @@ impl DatabaseChangesIterator {
 }
 
 #[derive(Clone)]
-pub struct DatabaseReplaySessionOpts<Ctx = ()> {
+pub struct DatabaseReplaySessionOpts {
     pub use_implicit_rowid: bool,
-    pub transform: Option<Transform<Ctx>>,
 }
 
-impl<Ctx> std::fmt::Debug for DatabaseReplaySessionOpts<Ctx> {
+impl std::fmt::Debug for DatabaseReplaySessionOpts {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DatabaseReplaySessionOpts")
             .field("use_implicit_rowid", &self.use_implicit_rowid)
-            .field("transform_mutation.is_some()", &self.transform.is_some())
             .finish()
     }
 }
@@ -450,13 +448,13 @@ pub(crate) struct CachedStmt {
     info: ReplayInfo,
 }
 
-pub struct DatabaseReplaySession<Ctx = ()> {
+pub struct DatabaseReplaySession {
     pub(crate) conn: Arc<turso_core::Connection>,
     pub(crate) cached_delete_stmt: HashMap<String, CachedStmt>,
     pub(crate) cached_insert_stmt: HashMap<(String, usize), CachedStmt>,
     pub(crate) cached_update_stmt: HashMap<(String, Vec<bool>), CachedStmt>,
     pub(crate) in_txn: bool,
-    pub(crate) generator: DatabaseReplayGenerator<Ctx>,
+    pub(crate) generator: DatabaseReplayGenerator,
 }
 
 async fn replay_stmt<Ctx>(
@@ -472,11 +470,11 @@ async fn replay_stmt<Ctx>(
     Ok(())
 }
 
-impl<Ctx> DatabaseReplaySession<Ctx> {
+impl DatabaseReplaySession {
     pub fn conn(&self) -> Arc<turso_core::Connection> {
         self.conn.clone()
     }
-    pub async fn replay(
+    pub async fn replay<Ctx>(
         &mut self,
         coro: &Coro<Ctx>,
         operation: DatabaseTapeOperation,
@@ -488,6 +486,11 @@ impl<Ctx> DatabaseReplaySession<Ctx> {
                     self.conn.execute("COMMIT")?;
                     self.in_txn = false;
                 }
+            }
+            DatabaseTapeOperation::StmtReplay(replay) => {
+                let mut stmt = self.conn.prepare(&replay.sql)?;
+                replay_stmt(coro, &mut stmt, replay.values).await?;
+                return Ok(());
             }
             DatabaseTapeOperation::RowChange(change) => {
                 if !self.in_txn {
@@ -502,21 +505,6 @@ impl<Ctx> DatabaseReplaySession<Ctx> {
                     let replay_info = self.generator.replay_info(coro, &change).await?;
                     self.conn.execute(replay_info.query.as_str())?;
                 } else {
-                    if let Some(transform) = &self.generator.opts.transform {
-                        let replay_info = self.generator.replay_info(coro, &change).await?;
-                        let mutation = self.generator.create_mutation(&replay_info, &change)?;
-                        let statement = transform(&coro.ctx.borrow(), mutation)?;
-                        if let Some(statement) = statement {
-                            tracing::info!(
-                                "replay: use mutation from custom transformer: sql={}, values={:?}",
-                                statement.sql,
-                                statement.values
-                            );
-                            let mut stmt = self.conn.prepare(&statement.sql)?;
-                            replay_stmt(coro, &mut stmt, statement.values).await?;
-                            return Ok(());
-                        }
-                    }
                     match change.change {
                         DatabaseTapeRowChangeType::Delete { before } => {
                             let key = self.populate_delete_stmt(coro, table).await?;
@@ -625,7 +613,7 @@ impl<Ctx> DatabaseReplaySession<Ctx> {
         }
         Ok(())
     }
-    async fn populate_delete_stmt<'a>(
+    async fn populate_delete_stmt<'a, Ctx>(
         &mut self,
         coro: &Coro<Ctx>,
         table: &'a str,
@@ -640,7 +628,7 @@ impl<Ctx> DatabaseReplaySession<Ctx> {
             .insert(table.to_string(), CachedStmt { stmt, info });
         Ok(table)
     }
-    async fn populate_insert_stmt(
+    async fn populate_insert_stmt<Ctx>(
         &mut self,
         coro: &Coro<Ctx>,
         table: &str,
@@ -661,7 +649,7 @@ impl<Ctx> DatabaseReplaySession<Ctx> {
             .insert(key.clone(), CachedStmt { stmt, info });
         Ok(key)
     }
-    async fn populate_update_stmt(
+    async fn populate_update_stmt<Ctx>(
         &mut self,
         coro: &Coro<Ctx>,
         table: &str,
@@ -716,7 +704,7 @@ mod tests {
         });
         let rows = loop {
             match gen.resume_with(Ok(())) {
-                genawaiter::GeneratorState::Yielded(..) => io.run_once().unwrap(),
+                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
                 genawaiter::GeneratorState::Complete(result) => break result,
             }
         };
@@ -750,7 +738,7 @@ mod tests {
         });
         let changes = loop {
             match gen.resume_with(Ok(())) {
-                genawaiter::GeneratorState::Yielded(..) => io.run_once().unwrap(),
+                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
                 genawaiter::GeneratorState::Complete(result) => break result,
             }
         };
@@ -822,7 +810,6 @@ mod tests {
                 {
                     let opts = DatabaseReplaySessionOpts {
                         use_implicit_rowid: true,
-                        transform: None,
                     };
                     let mut session = db2.start_replay_session(&coro, opts).await.unwrap();
                     let opts = Default::default();
@@ -841,7 +828,7 @@ mod tests {
         });
         let rows = loop {
             match gen.resume_with(Ok(())) {
-                genawaiter::GeneratorState::Yielded(..) => io.run_once().unwrap(),
+                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
                 genawaiter::GeneratorState::Complete(rows) => break rows,
             }
         };
@@ -902,7 +889,6 @@ mod tests {
                 {
                     let opts = DatabaseReplaySessionOpts {
                         use_implicit_rowid: false,
-                        transform: None,
                     };
                     let mut session = db2.start_replay_session(&coro, opts).await.unwrap();
                     let opts = Default::default();
@@ -921,7 +907,7 @@ mod tests {
         });
         let rows = loop {
             match gen.resume_with(Ok(())) {
-                genawaiter::GeneratorState::Yielded(..) => io.run_once().unwrap(),
+                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
                 genawaiter::GeneratorState::Complete(rows) => break rows,
             }
         };
@@ -973,7 +959,6 @@ mod tests {
                 {
                     let opts = DatabaseReplaySessionOpts {
                         use_implicit_rowid: false,
-                        transform: None,
                     };
                     let mut session = db2.start_replay_session(&coro, opts).await.unwrap();
                     let opts = Default::default();
@@ -992,7 +977,7 @@ mod tests {
         });
         let rows = loop {
             match gen.resume_with(Ok(())) {
-                genawaiter::GeneratorState::Yielded(..) => io.run_once().unwrap(),
+                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
                 genawaiter::GeneratorState::Complete(rows) => break rows,
             }
         };
@@ -1048,7 +1033,6 @@ mod tests {
                 {
                     let opts = DatabaseReplaySessionOpts {
                         use_implicit_rowid: false,
-                        transform: None,
                     };
                     let mut session = db3.start_replay_session(&coro, opts).await.unwrap();
 
@@ -1129,7 +1113,7 @@ mod tests {
         });
         loop {
             match gen.resume_with(Ok(())) {
-                genawaiter::GeneratorState::Yielded(..) => io.run_once().unwrap(),
+                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
                 genawaiter::GeneratorState::Complete(result) => {
                     result.unwrap();
                     break;
@@ -1166,7 +1150,6 @@ mod tests {
                 {
                     let opts = DatabaseReplaySessionOpts {
                         use_implicit_rowid: false,
-                        transform: None,
                     };
                     let mut session = db2.start_replay_session(&coro, opts).await.unwrap();
 
@@ -1214,7 +1197,7 @@ mod tests {
         });
         loop {
             match gen.resume_with(Ok(())) {
-                genawaiter::GeneratorState::Yielded(..) => io.run_once().unwrap(),
+                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
                 genawaiter::GeneratorState::Complete(result) => {
                     result.unwrap();
                     break;
@@ -1252,7 +1235,6 @@ mod tests {
                 {
                     let opts = DatabaseReplaySessionOpts {
                         use_implicit_rowid: false,
-                        transform: None,
                     };
                     let mut session = db2.start_replay_session(&coro, opts).await.unwrap();
 
@@ -1289,7 +1271,7 @@ mod tests {
         });
         loop {
             match gen.resume_with(Ok(())) {
-                genawaiter::GeneratorState::Yielded(..) => io.run_once().unwrap(),
+                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
                 genawaiter::GeneratorState::Complete(result) => {
                     result.unwrap();
                     break;
@@ -1349,7 +1331,6 @@ mod tests {
                 {
                     let opts = DatabaseReplaySessionOpts {
                         use_implicit_rowid: false,
-                        transform: None,
                     };
                     let mut session = db3.start_replay_session(&coro, opts).await.unwrap();
 
@@ -1385,7 +1366,7 @@ mod tests {
         });
         loop {
             match gen.resume_with(Ok(())) {
-                genawaiter::GeneratorState::Yielded(..) => io.run_once().unwrap(),
+                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
                 genawaiter::GeneratorState::Complete(result) => {
                     result.unwrap();
                     break;

@@ -283,8 +283,45 @@ pub fn translate_condition_expr(
     resolver: &Resolver,
 ) -> Result<()> {
     match expr {
+        ast::Expr::Register(_) => {
+            crate::bail_parse_error!("Register in WHERE clause is currently unused. Consider removing Resolver::expr_to_reg_cache and using Expr::Register instead");
+        }
+        ast::Expr::Collate(_, _) => {
+            crate::bail_parse_error!("Collate in WHERE clause is not supported");
+        }
+        ast::Expr::DoublyQualified(_, _, _) | ast::Expr::Id(_) | ast::Expr::Qualified(_, _) => {
+            crate::bail_parse_error!(
+                "DoublyQualified/Id/Qualified should have been rewritten in optimizer"
+            );
+        }
+        ast::Expr::Exists(_) => {
+            crate::bail_parse_error!("EXISTS in WHERE clause is not supported");
+        }
+        ast::Expr::Subquery(_) => {
+            crate::bail_parse_error!("Subquery in WHERE clause is not supported");
+        }
+        ast::Expr::InSelect { .. } => {
+            crate::bail_parse_error!("IN (...subquery) in WHERE clause is not supported");
+        }
+        ast::Expr::InTable { .. } => {
+            crate::bail_parse_error!("Table expression in WHERE clause is not supported");
+        }
+        ast::Expr::FunctionCallStar { .. } => {
+            crate::bail_parse_error!("FunctionCallStar in WHERE clause is not supported");
+        }
+        ast::Expr::Raise(_, _) => {
+            crate::bail_parse_error!("RAISE in WHERE clause is not supported");
+        }
         ast::Expr::Between { .. } => {
-            unreachable!("expression should have been rewritten in optmizer")
+            crate::bail_parse_error!("BETWEEN expression should have been rewritten in optmizer")
+        }
+        ast::Expr::Variable(_) => {
+            crate::bail_parse_error!(
+                "Variable as a direct predicate in WHERE clause is not supported"
+            );
+        }
+        ast::Expr::Name(_) => {
+            crate::bail_parse_error!("Name as a direct predicate in WHERE clause is not supported");
         }
         ast::Expr::Binary(lhs, ast::Operator::And, rhs) => {
             // In a binary AND, never jump to the parent 'jump_target_when_true' label on the first condition, because
@@ -445,7 +482,6 @@ pub fn translate_condition_expr(
             translate_expr(program, Some(referenced_tables), expr, expr_reg, resolver)?;
             emit_cond_jump(program, condition_metadata, expr_reg);
         }
-        other => todo!("expression {:?} not implemented", other),
     }
     Ok(())
 }
@@ -641,8 +677,10 @@ pub fn translate_expr(
             program.set_collation(Some((collation, true)));
             Ok(target_register)
         }
-        ast::Expr::DoublyQualified(_, _, _) => todo!(),
-        ast::Expr::Exists(_) => todo!(),
+        ast::Expr::DoublyQualified(_, _, _) => {
+            crate::bail_parse_error!("DoublyQualified should have been rewritten in optimizer")
+        }
+        ast::Expr::Exists(_) => crate::bail_parse_error!("EXISTS in WHERE clause is not supported"),
         ast::Expr::FunctionCall {
             name,
             distinctness: _,
@@ -1768,7 +1806,9 @@ pub fn translate_expr(
                 Func::AlterTable(_) => unreachable!(),
             }
         }
-        ast::Expr::FunctionCallStar { .. } => todo!("{:?}", &expr),
+        ast::Expr::FunctionCallStar { .. } => {
+            crate::bail_parse_error!("FunctionCallStar in WHERE clause is not supported")
+        }
         ast::Expr::Id(id) => {
             // Treat double-quoted identifiers as string literals (SQLite compatibility)
             program.emit_insn(Insn::String8 {
@@ -1979,8 +2019,12 @@ pub fn translate_expr(
 
             Ok(result_reg)
         }
-        ast::Expr::InSelect { .. } => todo!(),
-        ast::Expr::InTable { .. } => todo!(),
+        ast::Expr::InSelect { .. } => {
+            crate::bail_parse_error!("IN (...subquery) in WHERE clause is not supported")
+        }
+        ast::Expr::InTable { .. } => {
+            crate::bail_parse_error!("Table expression in WHERE clause is not supported")
+        }
         ast::Expr::IsNull(expr) => {
             let reg = program.alloc_register();
             translate_expr(program, referenced_tables, expr, reg, resolver)?;
@@ -2016,7 +2060,9 @@ pub fn translate_expr(
             Ok(target_register)
         }
         ast::Expr::Literal(lit) => emit_literal(program, lit, target_register),
-        ast::Expr::Name(_) => todo!(),
+        ast::Expr::Name(_) => {
+            crate::bail_parse_error!("ast::Expr::Name in WHERE clause is not supported")
+        }
         ast::Expr::NotNull(expr) => {
             let reg = program.alloc_register();
             translate_expr(program, referenced_tables, expr, reg, resolver)?;
@@ -2051,15 +2097,19 @@ pub fn translate_expr(
             } else {
                 // Parenthesized expressions with multiple arguments are reserved for special cases
                 // like `(a, b) IN ((1, 2), (3, 4))`.
-                todo!("TODO: parenthesized expression with multiple arguments not yet supported");
+                crate::bail_parse_error!(
+                    "TODO: parenthesized expression with multiple arguments not yet supported"
+                );
             }
             Ok(target_register)
         }
         ast::Expr::Qualified(_, _) => {
             unreachable!("Qualified should be resolved to a Column before translation")
         }
-        ast::Expr::Raise(_, _) => todo!(),
-        ast::Expr::Subquery(_) => todo!(),
+        ast::Expr::Raise(_, _) => crate::bail_parse_error!("RAISE is not supported"),
+        ast::Expr::Subquery(_) => {
+            crate::bail_parse_error!("Subquery in WHERE clause is not supported")
+        }
         ast::Expr::Unary(op, expr) => match (op, expr.as_ref()) {
             (UnaryOperator::Positive, expr) => {
                 translate_expr(program, referenced_tables, expr, target_register, resolver)
@@ -2848,8 +2898,8 @@ fn translate_like_base(
                 },
             });
         }
-        ast::LikeOperator::Match => todo!(),
-        ast::LikeOperator::Regexp => todo!(),
+        ast::LikeOperator::Match => crate::bail_parse_error!("MATCH in LIKE is not supported"),
+        ast::LikeOperator::Regexp => crate::bail_parse_error!("REGEXP in LIKE is not supported"),
     }
 
     Ok(target_register)
@@ -3582,7 +3632,9 @@ pub fn emit_literal(
             });
             Ok(target_register)
         }
-        ast::Literal::Keyword(_) => todo!(),
+        ast::Literal::Keyword(_) => {
+            crate::bail_parse_error!("Keyword in WHERE clause is not supported")
+        }
         ast::Literal::Null => {
             program.emit_insn(Insn::Null {
                 dest: target_register,

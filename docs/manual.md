@@ -9,6 +9,8 @@ Welcome to Turso database manual!
   - [Introduction](#introduction)
     - [Getting Started](#getting-started)
     - [Limitations](#limitations)
+  - [Transactions](#transactions)
+    - [Deferred transaction lifecycle](#deferred-transaction-lifecycle)
   - [The SQL shell](#the-sql-shell)
     - [Shell commands](#shell-commands)
     - [Command line options](#command-line-options)
@@ -139,6 +141,23 @@ The SQL shell supports the following command line options:
 | `--experimental-mvcc` | Enable experimental MVCC feature. **Note:**  the feature is not production ready so do not use it for critical data right now. |
 | `--experimental-views` | Enable experimental views feature. **Note**: the feature is not production ready so do not use it for critical data right now. |
 
+## Transactions
+
+A transaction is a sequence of one or more SQL statements that execute as a single, atomic unit of work.
+A transaction ensures **atomicity** and **isolation**, meaning that either all SQL statements are executed or none of them are, and that concurrent transactions don't interfere with other transactions.
+Transactions maintain database integrity in the presence of errors, crashes, and concurrent access.
+
+Turso supports two types of transactions: **deferred** and **immediate** transactions:
+
+* **Deferred (default)**: The transaction begins in a suspended state and does not acquire locks immediately. It starts a read transaction when the first read SQL statement (e.g., `SELECT`) runs, and upgrades to a write transaction only when the first write SQL statement (e.g., `INSERT`, `UPDATE`, `DELETE`) executes. This mode allows concurrency for reads and delays write locks, which can reduce contention.
+* **Immediate**: The transaction starts immediately with a reserved write lock, preventing other write transactions from starting concurrently but allowing reads. It attempts to acquire the write lock right away on the `BEGIN` statement, which can fail if another write transaction exists. The `EXCLUSIVE` mode is always an alias for `IMMEDIATE` in Turso, just like it is in SQLite in WAL mode.
+
+### Deferred transaction lifecycle
+
+When the `BEGIN DEFERRED TRANSACTION` statement executes, the database acquires no snapshot or locks. Instead, the transaction is in a suspended state until the first read or write SQL statement executes. When the first read statement executes, a read transaction begins. The database allows multiple read transactions to exist concurrently. When the first write statement executes, a read transaction is either upgraded to a write transaction or a write transaction begins. The database allows a single write transaction at a time. Concurrent write transactions fail with `SQLITE_BUSY` error.
+
+If a deferred transaction remains unused (no reads or writes), it is automatically restarted by the database if another write transaction commits before the transaction is used. However, if the deferred transaction has already performed reads and another concurrent write transaction commits, it cannot automatically restart due to potential snapshot inconsistency. In this case, the deferred transaction must be manually rolled back and restarted by the application.
+
 ## The SQL language
 
 ### `ALTER TABLE` — change table definition
@@ -177,12 +196,13 @@ BEGIN [ transaction_mode ] [ TRANSACTION ]
 
 where `transaction_mode` is one of the following:
 
-* `DEFERRED`
-* `IMMEDIATE`
-* `EXCLUSIVE`
+* A `DEFERRED` transaction in a suspended state and does not acquire locks immediately. It starts a read transaction when the first read SQL statement (e.g., `SELECT`) runs, and upgrades to a write transaction only when the first write SQL statement (e.g., `INSERT`, `UPDATE`, `DELETE`) executes.
+* An `IMMEDIATE` transaction starts immediately with a reserved write lock, preventing other write transactions from starting concurrently but allowing reads. It attempts to acquire the write lock right away on the `BEGIN` statement, which can fail if another write transaction exists.
+* An `EXCLUSIVE` transaction is always an alias for `IMMEDIATE`.
 
 **See also:**
 
+* [Transactions](#transactions)
 * [END TRANSACTION](#end-transaction--commit-the-current-transaction)
 
 ### `COMMIT TRANSACTION` — commit the current transaction

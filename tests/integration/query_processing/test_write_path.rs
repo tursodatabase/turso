@@ -317,7 +317,7 @@ fn test_wal_restart() -> anyhow::Result<()> {
         let insert_query = format!("INSERT INTO test VALUES ({i})");
         run_query(tmp_db, conn, &insert_query)?;
         debug!("inserted {i}");
-        tmp_db.io.run_once()?;
+        tmp_db.io.step()?;
         Ok(())
     }
 

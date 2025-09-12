@@ -652,6 +652,10 @@ impl<'a> Parser<'a> {
                     eat_assert!(self, TK_EXCLUSIVE);
                     Some(TransactionType::Exclusive)
                 }
+                TK_CONCURRENT => {
+                    eat_assert!(self, TK_CONCURRENT);
+                    Some(TransactionType::Concurrent)
+                }
                 _ => None,
             },
         };
@@ -4126,6 +4130,27 @@ mod tests {
                 b"BEGIN EXCLUSIVE TRANSACTION 'my_transaction'".as_slice(),
                 vec![Cmd::Stmt(Stmt::Begin {
                     typ: Some(TransactionType::Exclusive),
+                    name: Some(Name::Quoted("'my_transaction'".to_string())),
+                })],
+            ),
+            (
+                b"BEGIN CONCURRENT TRANSACTION".as_slice(),
+                vec![Cmd::Stmt(Stmt::Begin {
+                    typ: Some(TransactionType::Concurrent),
+                    name: None,
+                })],
+            ),
+            (
+                b"BEGIN CONCURRENT TRANSACTION my_transaction".as_slice(),
+                vec![Cmd::Stmt(Stmt::Begin {
+                    typ: Some(TransactionType::Concurrent),
+                    name: Some(Name::Ident("my_transaction".to_string())),
+                })],
+            ),
+            (
+                b"BEGIN CONCURRENT TRANSACTION 'my_transaction'".as_slice(),
+                vec![Cmd::Stmt(Stmt::Begin {
+                    typ: Some(TransactionType::Concurrent),
                     name: Some(Name::Quoted("'my_transaction'".to_string())),
                 })],
             ),

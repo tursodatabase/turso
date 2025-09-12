@@ -1,0 +1,10 @@
+#!/bin/bash
+
+set -e
+
+cargo build -p turso_whopper
+
+echo "Running Whopper in an infinite loop in 'chaos' mode..."
+while true; do
+    time RUST_BACKTRACE=full ./target/debug/turso_whopper --mode chaos
+done

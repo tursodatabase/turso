@@ -1275,34 +1275,36 @@ impl Pager {
             };
             pages.push(page);
             if pages.len() == IOV_MAX {
-                let c = wal
-                    .borrow_mut()
-                    .append_frames_vectored(
-                        std::mem::replace(
-                            &mut pages,
-                            Vec::with_capacity(std::cmp::min(IOV_MAX, dirty_pages.len() - idx)),
-                        ),
-                        page_sz,
-                        commit_frame,
-                    )
-                    .inspect_err(|_| {
-                        for c in completions.iter() {
-                            c.abort();
-                        }
-                    })?;
-                completions.push(c);
+                match wal.borrow_mut().append_frames_vectored(
+                    std::mem::replace(
+                        &mut pages,
+                        Vec::with_capacity(std::cmp::min(IOV_MAX, dirty_pages.len() - idx)),
+                    ),
+                    page_sz,
+                    commit_frame,
+                ) {
+                    Err(e) => {
+                        self.io.cancel(&completions)?;
+                        self.io.drain()?;
+                        return Err(e);
+                    }
+                    Ok(c) => completions.push(c),
+                }
             }
         }
         if !pages.is_empty() {
-            let c = wal
+            match wal
                 .borrow_mut()
                 .append_frames_vectored(pages, page_sz, commit_frame)
-                .inspect_err(|_| {
-                    for c in completions.iter() {
-                        c.abort();
-                    }
-                })?;
-            completions.push(c);
+            {
+                Ok(c) => completions.push(c),
+                Err(e) => {
+                    tracing::error!("cacheflush: error appending frames: {e}");
+                    self.io.cancel(&completions)?;
+                    self.io.drain()?;
+                    return Err(e);
+                }
+            }
         }
         Ok(completions)
     }
@@ -1379,9 +1381,7 @@ impl Pager {
                             match r {
                                 Ok(c) => completions.push(c),
                                 Err(e) => {
-                                    for c in &completions {
-                                        c.abort();
-                                    }
+                                    self.io.cancel(&completions)?;
                                     return Err(e);
                                 }
                             }
@@ -1563,12 +1563,15 @@ impl Pager {
     /// of a rollback or in case we want to invalidate page cache after starting a read transaction
     /// right after new writes happened which would invalidate current page cache.
     pub fn clear_page_cache(&self) {
-        self.dirty_pages.borrow_mut().clear();
-        self.page_cache.write().unset_dirty_all_pages();
-        self.page_cache
-            .write()
-            .clear()
-            .expect("Failed to clear page cache");
+        let dirty_pages = self.dirty_pages.borrow();
+        let mut cache = self.page_cache.write();
+        for page_id in dirty_pages.iter() {
+            let page_key = PageCacheKey::new(*page_id);
+            if let Some(page) = cache.get(&page_key).unwrap_or(None) {
+                page.clear_dirty();
+            }
+        }
+        cache.clear().expect("Failed to clear page cache");
     }
 
     /// Checkpoint in Truncate mode and delete the WAL file. This method is _only_ to be called
@@ -1981,7 +1984,7 @@ impl Pager {
                     // Freelist is not empty, so we can reuse the trunk itself as a new page
                     // and update the database's first freelist trunk page to the next trunk page.
                     header.freelist_trunk_page = next_trunk_page_id.into();
-                    header.freelist_pages = (header.freelist_pages.get() + 1).into();
+                    header.freelist_pages = (header.freelist_pages.get() - 1).into();
                     self.add_dirty(trunk_page);
                     // zero out the page
                     turso_assert!(
@@ -2118,6 +2121,7 @@ impl Pager {
         is_write: bool,
     ) -> Result<(), LimboError> {
         tracing::debug!(schema_did_change);
+        self.clear_page_cache();
         if is_write {
             self.dirty_pages.borrow_mut().clear();
         } else {
@@ -2126,12 +2130,7 @@ impl Pager {
                 "dirty pages should be empty for read txn"
             );
         }
-        let mut cache = self.page_cache.write();
-
         self.reset_internal_states();
-
-        cache.unset_dirty_all_pages();
-        cache.clear().expect("failed to clear page cache");
         if schema_did_change {
             connection.schema.replace(connection._db.clone_schema()?);
         }

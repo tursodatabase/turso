@@ -1,0 +1,53 @@
+{
+  "name": "@tursodatabase/sync",
+  "version": "0.2.0-pre.1",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/tursodatabase/turso"
+  },
+  "license": "MIT",
+  "module": "./dist/promise.js",
+  "main": "./dist/promise.js",
+  "type": "module",
+  "exports": {
+    ".": "./dist/promise.js",
+    "./compat": "./dist/compat.js"
+  },
+  "files": [
+    "index.js",
+    "dist/**",
+    "README.md"
+  ],
+  "packageManager": "yarn@4.9.2",
+  "devDependencies": {
+    "@napi-rs/cli": "^3.1.5",
+    "@types/node": "^24.3.1",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
+  },
+  "scripts": {
+    "napi-build": "napi build --platform --release --esm --manifest-path ../../Cargo.toml --output-dir .",
+    "napi-dirs": "napi create-npm-dirs",
+    "napi-artifacts": "napi artifacts --output-dir .",
+    "tsc-build": "npm exec tsc",
+    "build": "npm run napi-build && npm run tsc-build",
+    "test": "VITE_TURSO_DB_URL=http://b--a--a.localhost:10000 vitest --run",
+    "prepublishOnly": "npm run napi-dirs && npm run napi-artifacts && napi prepublish -t npm"
+  },
+  "napi": {
+    "binaryName": "sync",
+    "targets": [
+      "x86_64-unknown-linux-gnu",
+      "x86_64-pc-windows-msvc",
+      "universal-apple-darwin",
+      "aarch64-unknown-linux-gnu"
+    ]
+  },
+  "dependencies": {
+    "@tursodatabase/database-common": "^0.2.0-pre.1",
+    "@tursodatabase/sync-common": "^0.2.0-pre.1"
+  },
+  "imports": {
+    "#index": "./index.js"
+  }
+}

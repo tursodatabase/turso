@@ -189,6 +189,65 @@ What this means is that the behavior of a test run is deterministic based on the
 If the simulator catches a bug, you can always reproduce the exact same sequence of events by passing the same seed.
 The simulator also performs fault injection to discover interesting bugs.
 
+### Whopper
+
+Whopper is a DST that, unlike `simulator`, performs concurrent query execution.
+
+To run Whopper for your local changes, run:
+
+```console
+./whopper/bin/run
+```
+
+The output of the simulation run looks as follows:
+
+```
+mode = fast
+seed = 11621338508193870992
+       .             I/U/D/C
+       .             22/17/15/0
+       .             41/34/20/3
+       |             62/43/27/4
+       |             88/55/30/5
+      ╱|╲            97/58/30/6
+     ╱╲|╱╲           108/62/30/7
+    ╱╲╱|╲╱╲          115/67/32/7
+   ╱╲╱╲|╱╲╱╲         121/74/35/7
+  ╱╲╱╲╱|╲╱╲╱╲        125/80/38/7
+ ╱╲╱╲╱╲|╱╲╱╲╱╲       141/94/43/8
+
+real    0m1.250s
+user    0m0.843s
+sys     0m0.043s
+```
+
+The simulator prints ten progress indication lines, regardless of how long a run takes. The progress indicator line shows the following stats:
+
+* `I` -- the number of `INSERT` statements executed
+* `U` -- the number of `UPDATE` statements executed
+* `D` -- the number of `DELETE` statements executed
+* `C` -- the number of `PRAGMA integrity_check` statements executed
+
+This will do a short sanity check run in using the `fast` mode.
+
+If you need to reproduce a run, just defined the `SEED` environment variable as follows:
+
+```console
+SEED=1234 ./whopper/bin/run
+```
+
+You can also run Whopper in exploration mode to find more serious bugs:
+
+```console
+./whopper/bin/explore
+```
+
+Note that exploration uses the `chaos` mode so if you need to reproduce a run, use:
+
+```console
+SEED=1234 ./whopper/bin/run --mode chaos
+```
+
 ## Python Bindings
 
 Turso provides Python bindings built on top of the [PyO3](https://pyo3.rs) project.

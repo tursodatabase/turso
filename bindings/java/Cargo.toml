@@ -6,7 +6,8 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 publish = false
-
+[features]
+tracing_release = ["turso_core/tracing_release"]
 [lib]
 name = "_turso_java"
 crate-type = ["cdylib"]

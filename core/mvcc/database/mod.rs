@@ -1,5 +1,7 @@
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::persistent_storage::Storage;
+use crate::result::LimboResult;
+use crate::return_if_io;
 use crate::state_machine::StateMachine;
 use crate::state_machine::StateTransition;
 use crate::state_machine::TransitionResult;
@@ -125,7 +127,7 @@ impl Transaction {
         self.read_set.insert(id);
     }
 
-    fn insert_to_write_set(&mut self, id: RowID) {
+    fn insert_to_write_set(&self, id: RowID) {
         self.write_set.insert(id);
     }
 }
@@ -350,7 +352,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     .txs
                     .get(&self.tx_id)
                     .ok_or(LimboError::TxTerminated)?;
-                let tx = tx.value().write();
+                let tx = tx.value();
                 match tx.state.load() {
                     TransactionState::Terminated => {
                         return Err(LimboError::TxTerminated);
@@ -448,12 +450,14 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 // 1. Wait for currently writer to finish before second txn starts.
                 // 2. Choose a txn to write depending on some heuristics like amount of frames will be written.
                 // 3. ..
-                //
-                let result = self.pager.io.block(|| self.pager.begin_write_tx())?;
-                if let crate::result::LimboResult::Busy = result {
-                    return Err(LimboError::InternalError(
-                        "Pager write transaction busy".to_string(),
-                    ));
+
+                // If this is the exclusive transaction, we already acquired a write transaction
+                // on the pager in begin_exclusive_tx() and don't need to acquire it.
+                if !mvcc_store.is_exclusive_tx(&self.tx_id) {
+                    let result = self.pager.io.block(|| self.pager.begin_write_tx())?;
+                    if let LimboResult::Busy = result {
+                        return Err(LimboError::Busy);
+                    }
                 }
                 self.state = CommitState::WriteRow {
                     end_ts,
@@ -613,6 +617,11 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 // FIXME: it actually just become a problem for today!!!
                 // TODO: test that reproduces this failure, and then a fix
                 mvcc_store.txs.remove(&self.tx_id);
+
+                if mvcc_store.is_exclusive_tx(&self.tx_id) {
+                    mvcc_store.release_exclusive_tx(&self.tx_id);
+                }
+
                 if !log_record.row_versions.is_empty() {
                     mvcc_store.storage.log_tx(log_record)?;
                 }
@@ -810,12 +819,19 @@ impl DeleteRowStateMachine {
 #[derive(Debug)]
 pub struct MvStore<Clock: LogicalClock> {
     rows: SkipMap<RowID, RwLock<Vec<RowVersion>>>,
-    txs: SkipMap<TxID, RwLock<Transaction>>,
+    txs: SkipMap<TxID, Transaction>,
     tx_ids: AtomicU64,
     next_rowid: AtomicU64,
     clock: Clock,
     storage: Storage,
     loaded_tables: RwLock<HashSet<u64>>,
+
+    /// The transaction ID of a transaction that has acquired an exclusive write lock, if any.
+    ///
+    /// An exclusive MVCC transaction is one that has a write lock on the pager, which means
+    /// every other MVCC transaction must wait for it to commit before they can commit. We have
+    /// exclusive transactions to support single-writer semantics for compatibility with SQLite.
+    exclusive_tx: RwLock<Option<TxID>>,
 }
 
 impl<Clock: LogicalClock> MvStore<Clock> {
@@ -829,6 +845,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             clock,
             storage,
             loaded_tables: RwLock::new(HashSet::new()),
+            exclusive_tx: RwLock::new(None),
         }
     }
 
@@ -852,7 +869,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             .txs
             .get(&tx_id)
             .ok_or(LimboError::NoSuchTransactionID(tx_id.to_string()))?;
-        let mut tx = tx.value().write();
+        let tx = tx.value();
         assert_eq!(tx.state, TransactionState::Active);
         let id = row.id;
         let row_version = RowVersion {
@@ -861,7 +878,6 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             row,
         };
         tx.insert_to_write_set(id);
-        drop(tx);
         self.insert_version(id, row_version);
         Ok(())
     }
@@ -925,17 +941,16 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                     .txs
                     .get(&tx_id)
                     .ok_or(LimboError::NoSuchTransactionID(tx_id.to_string()))?;
-                let tx = tx.value().read();
+                let tx = tx.value();
                 assert_eq!(tx.state, TransactionState::Active);
                 // A transaction cannot delete a version that it cannot see,
                 // nor can it conflict with it.
-                if !rv.is_visible_to(&tx, &self.txs) {
+                if !rv.is_visible_to(tx, &self.txs) {
                     continue;
                 }
-                if is_write_write_conflict(&self.txs, &tx, rv) {
+                if is_write_write_conflict(&self.txs, tx, rv) {
                     drop(row_versions);
                     drop(row_versions_opt);
-                    drop(tx);
                     self.rollback_tx(tx_id, pager);
                     return Err(LimboError::WriteWriteConflict);
                 }
@@ -943,12 +958,11 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 rv.end = Some(TxTimestampOrID::TxID(tx.tx_id));
                 drop(row_versions);
                 drop(row_versions_opt);
-                drop(tx);
                 let tx = self
                     .txs
                     .get(&tx_id)
                     .ok_or(LimboError::NoSuchTransactionID(tx_id.to_string()))?;
-                let mut tx = tx.value().write();
+                let tx = tx.value();
                 tx.insert_to_write_set(id);
                 return Ok(true);
             }
@@ -973,14 +987,14 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     pub fn read(&self, tx_id: TxID, id: RowID) -> Result<Option<Row>> {
         tracing::trace!("read(tx_id={}, id={:?})", tx_id, id);
         let tx = self.txs.get(&tx_id).unwrap();
-        let tx = tx.value().read();
+        let tx = tx.value();
         assert_eq!(tx.state, TransactionState::Active);
         if let Some(row_versions) = self.rows.get(&id) {
             let row_versions = row_versions.value().read();
             if let Some(rv) = row_versions
                 .iter()
                 .rev()
-                .find(|rv| rv.is_visible_to(&tx, &self.txs))
+                .find(|rv| rv.is_visible_to(tx, &self.txs))
             {
                 tx.insert_to_read_set(id);
                 return Ok(Some(rv.row.clone()));
@@ -1048,7 +1062,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         };
 
         let tx = self.txs.get(&tx_id).unwrap();
-        let tx = tx.value().read();
+        let tx = tx.value();
         let mut rows = self.rows.range(min_bound..max_bound);
         loop {
             // We are moving forward, so if a row was deleted we just need to skip it. Therefore, we need
@@ -1057,7 +1071,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             let row = next_row?;
 
             // We found a row, let's check if it's visible to the transaction.
-            if let Some(visible_row) = self.find_last_visible_version(&tx, row) {
+            if let Some(visible_row) = self.find_last_visible_version(tx, row) {
                 return Some(visible_row);
             }
             // If this row is not visible, continue to the next row
@@ -1066,7 +1080,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
     fn find_last_visible_version(
         &self,
-        tx: &parking_lot::lock_api::RwLockReadGuard<'_, parking_lot::RawRwLock, Transaction>,
+        tx: &Transaction,
         row: crossbeam_skiplist::map::Entry<
             '_,
             RowID,
@@ -1090,16 +1104,57 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         tracing::trace!("seek_rowid(bound={:?}, lower_bound={})", bound, lower_bound,);
 
         let tx = self.txs.get(&tx_id).unwrap();
-        let tx = tx.value().read();
+        let tx = tx.value();
         if lower_bound {
             self.rows
                 .lower_bound(bound)
-                .and_then(|entry| self.find_last_visible_version(&tx, entry))
+                .and_then(|entry| self.find_last_visible_version(tx, entry))
         } else {
             self.rows
                 .upper_bound(bound)
-                .and_then(|entry| self.find_last_visible_version(&tx, entry))
+                .and_then(|entry| self.find_last_visible_version(tx, entry))
         }
+    }
+
+    /// Begins an exclusive write transaction that prevents concurrent writes.
+    ///
+    /// This is used for IMMEDIATE and EXCLUSIVE transaction types where we need
+    /// to ensure exclusive write access as per SQLite semantics.
+    pub fn begin_exclusive_tx(&self, pager: Rc<Pager>) -> Result<IOResult<TxID>> {
+        let tx_id = self.get_tx_id();
+        let begin_ts = self.get_timestamp();
+
+        self.acquire_exclusive_tx(&tx_id)?;
+
+        // Try to acquire the pager read lock
+        match pager.begin_read_tx()? {
+            LimboResult::Busy => {
+                self.release_exclusive_tx(&tx_id);
+                return Err(LimboError::Busy);
+            }
+            LimboResult::Ok => {}
+        }
+        // Try to acquire the pager write lock
+        match return_if_io!(pager.begin_write_tx()) {
+            LimboResult::Busy => {
+                tracing::debug!("begin_exclusive_tx: tx_id={} failed with Busy", tx_id);
+                // Failed to get pager lock - release our exclusive lock
+                self.release_exclusive_tx(&tx_id);
+                pager.end_read_tx()?;
+                return Err(LimboError::Busy);
+            }
+            LimboResult::Ok => {
+                let tx = Transaction::new(tx_id, begin_ts);
+                tracing::trace!(
+                    "begin_exclusive_tx(tx_id={}) - exclusive write transaction",
+                    tx_id
+                );
+                tracing::debug!("begin_exclusive_tx: tx_id={} succeeded", tx_id);
+                self.txs.insert(tx_id, tx);
+            }
+        }
+
+        Ok(IOResult::Done(tx_id))
     }
 
     /// Begins a new transaction in the database.
@@ -1112,7 +1167,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         let begin_ts = self.get_timestamp();
         let tx = Transaction::new(tx_id, begin_ts);
         tracing::trace!("begin_tx(tx_id={})", tx_id);
-        self.txs.insert(tx_id, RwLock::new(tx));
+        self.txs.insert(tx_id, tx);
 
         // TODO: we need to tie a pager's read transaction to a transaction ID, so that future refactors to read
         // pages from WAL/DB read from a consistent state to maintiain snapshot isolation.
@@ -1154,12 +1209,15 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     /// * `tx_id` - The ID of the transaction to abort.
     pub fn rollback_tx(&self, tx_id: TxID, pager: Rc<Pager>) {
         let tx_unlocked = self.txs.get(&tx_id).unwrap();
-        let tx = tx_unlocked.value().write();
+        let tx = tx_unlocked.value();
         assert_eq!(tx.state, TransactionState::Active);
         tx.state.store(TransactionState::Aborted);
         tracing::trace!("abort(tx_id={})", tx_id);
         let write_set: Vec<RowID> = tx.write_set.iter().map(|v| *v.value()).collect();
-        drop(tx);
+
+        if self.is_exclusive_tx(&tx_id) {
+            self.release_exclusive_tx(&tx_id);
+        }
 
         for ref id in write_set {
             if let Some(row_versions) = self.rows.get(id) {
@@ -1171,13 +1229,37 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             }
         }
 
-        let tx = tx_unlocked.value().read();
+        let tx = tx_unlocked.value();
         tx.state.store(TransactionState::Terminated);
         tracing::trace!("terminate(tx_id={})", tx_id);
         pager.end_read_tx().unwrap();
         // FIXME: verify that we can already remove the transaction here!
         // Maybe it's fine for snapshot isolation, but too early for serializable?
         self.txs.remove(&tx_id);
+    }
+
+    /// Returns true if the given transaction is the exclusive transaction.
+    fn is_exclusive_tx(&self, tx_id: &TxID) -> bool {
+        self.exclusive_tx.read().as_ref() == Some(tx_id)
+    }
+
+    /// Acquires the exclusive transaction lock to the given transaction ID.
+    fn acquire_exclusive_tx(&self, tx_id: &TxID) -> Result<()> {
+        let mut exclusive_tx = self.exclusive_tx.write();
+        if exclusive_tx.is_some() {
+            // Another transaction already holds the exclusive lock
+            return Err(LimboError::Busy);
+        }
+        // Reserve the exclusive lock with our tx_id
+        *exclusive_tx = Some(*tx_id);
+        Ok(())
+    }
+
+    /// Release the exclusive transaction lock if held by the this transaction.
+    fn release_exclusive_tx(&self, tx_id: &TxID) {
+        let mut exclusive_tx = self.exclusive_tx.write();
+        assert_eq!(exclusive_tx.as_ref(), Some(tx_id));
+        *exclusive_tx = None;
     }
 
     /// Generates next unique transaction id
@@ -1210,7 +1292,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         // a transaction started before this row version ended, ergo row version is needed
                         // NOTICE: O(row_versions x transactions), but also lock-free, so sounds acceptable
                         self.txs.iter().any(|tx| {
-                            let tx = tx.value().read();
+                            let tx = tx.value();
                             // FIXME: verify!
                             match tx.state.load() {
                                 TransactionState::Active | TransactionState::Preparing => {
@@ -1264,7 +1346,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     fn get_begin_timestamp(&self, ts_or_id: &TxTimestampOrID) -> u64 {
         match ts_or_id {
             TxTimestampOrID::Timestamp(ts) => *ts,
-            TxTimestampOrID::TxID(tx_id) => self.txs.get(tx_id).unwrap().value().read().begin_ts,
+            TxTimestampOrID::TxID(tx_id) => self.txs.get(tx_id).unwrap().value().begin_ts,
         }
     }
 
@@ -1455,14 +1537,14 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 /// Ref: https://www.cs.cmu.edu/~15721-f24/papers/Hekaton.pdf , page 301,
 /// 2.6. Updating a Version.
 pub(crate) fn is_write_write_conflict(
-    txs: &SkipMap<TxID, RwLock<Transaction>>,
+    txs: &SkipMap<TxID, Transaction>,
     tx: &Transaction,
     rv: &RowVersion,
 ) -> bool {
     match rv.end {
         Some(TxTimestampOrID::TxID(rv_end)) => {
             let te = txs.get(&rv_end).unwrap();
-            let te = te.value().read();
+            let te = te.value();
             if te.tx_id == tx.tx_id {
                 return false;
             }
@@ -1478,25 +1560,17 @@ pub(crate) fn is_write_write_conflict(
 }
 
 impl RowVersion {
-    pub fn is_visible_to(
-        &self,
-        tx: &Transaction,
-        txs: &SkipMap<TxID, RwLock<Transaction>>,
-    ) -> bool {
+    pub fn is_visible_to(&self, tx: &Transaction, txs: &SkipMap<TxID, Transaction>) -> bool {
         is_begin_visible(txs, tx, self) && is_end_visible(txs, tx, self)
     }
 }
 
-fn is_begin_visible(
-    txs: &SkipMap<TxID, RwLock<Transaction>>,
-    tx: &Transaction,
-    rv: &RowVersion,
-) -> bool {
+fn is_begin_visible(txs: &SkipMap<TxID, Transaction>, tx: &Transaction, rv: &RowVersion) -> bool {
     match rv.begin {
         TxTimestampOrID::Timestamp(rv_begin_ts) => tx.begin_ts >= rv_begin_ts,
         TxTimestampOrID::TxID(rv_begin) => {
             let tb = txs.get(&rv_begin).unwrap();
-            let tb = tb.value().read();
+            let tb = tb.value();
             let visible = match tb.state.load() {
                 TransactionState::Active => tx.tx_id == tb.tx_id && rv.end.is_none(),
                 TransactionState::Preparing => false, // NOTICE: makes sense for snapshot isolation, not so much for serializable!
@@ -1518,7 +1592,7 @@ fn is_begin_visible(
 }
 
 fn is_end_visible(
-    txs: &SkipMap<TxID, RwLock<Transaction>>,
+    txs: &SkipMap<TxID, Transaction>,
     current_tx: &Transaction,
     row_version: &RowVersion,
 ) -> bool {
@@ -1526,7 +1600,7 @@ fn is_end_visible(
         Some(TxTimestampOrID::Timestamp(rv_end_ts)) => current_tx.begin_ts < rv_end_ts,
         Some(TxTimestampOrID::TxID(rv_end)) => {
             let other_tx = txs.get(&rv_end).unwrap();
-            let other_tx = other_tx.value().read();
+            let other_tx = other_tx.value();
             let visible = match other_tx.state.load() {
                 // V's sharp mind discovered an issue with the hekaton paper which basically states that a
                 // transaction can see a row version if the end is a TXId only if it isn't the same transaction.

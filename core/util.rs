@@ -1,5 +1,6 @@
 #![allow(unused)]
 use crate::incremental::view::IncrementalView;
+use crate::numeric::StrToF64;
 use crate::translate::expr::WalkControl;
 use crate::types::IOResult;
 use crate::{
@@ -169,139 +170,22 @@ pub fn parse_schema_rows(
             StepResult::Row => {
                 let row = rows.row().unwrap();
                 let ty = row.get::<&str>(0)?;
-                match ty {
-                    "table" => {
-                        let root_page: i64 = row.get::<i64>(3)?;
-                        let sql: &str = row.get::<&str>(4)?;
-                        let sql_bytes = sql.as_bytes();
-                        if root_page == 0
-                            && contains_ignore_ascii_case!(sql_bytes, b"create virtual")
-                        {
-                            let name: &str = row.get::<&str>(1)?;
-                            // a virtual table is found in the sqlite_schema, but it's no
-                            // longer in the in-memory schema. We need to recreate it if
-                            // the module is loaded in the symbol table.
-                            let vtab = if let Some(vtab) = syms.vtabs.get(name) {
-                                vtab.clone()
-                            } else {
-                                let mod_name = module_name_from_sql(sql)?;
-                                crate::VirtualTable::table(
-                                    Some(name),
-                                    mod_name,
-                                    module_args_from_sql(sql)?,
-                                    syms,
-                                )?
-                            };
-                            schema.add_virtual_table(vtab);
-                        } else {
-                            let table = schema::BTreeTable::from_sql(sql, root_page as usize)?;
-
-                            // Check if this is a DBSP state table
-                            if table.name.starts_with(DBSP_TABLE_PREFIX) {
-                                // Extract the view name from __turso_internal_dbsp_state_<viewname>
-                                let view_name = table
-                                    .name
-                                    .strip_prefix(DBSP_TABLE_PREFIX)
-                                    .unwrap()
-                                    .to_string();
-                                dbsp_state_roots.insert(view_name, root_page as usize);
-                            }
-
-                            schema.add_btree_table(Arc::new(table));
-                        }
-                    }
-                    "index" => {
-                        let root_page: i64 = row.get::<i64>(3)?;
-                        match row.get::<&str>(4) {
-                            Ok(sql) => {
-                                from_sql_indexes.push(UnparsedFromSqlIndex {
-                                    table_name: row.get::<&str>(2)?.to_string(),
-                                    root_page: root_page as usize,
-                                    sql: sql.to_string(),
-                                });
-                            }
-                            _ => {
-                                // Automatic index on primary key and/or unique constraint, e.g.
-                                // table|foo|foo|2|CREATE TABLE foo (a text PRIMARY KEY, b)
-                                // index|sqlite_autoindex_foo_1|foo|3|
-                                let index_name = row.get::<&str>(1)?.to_string();
-                                let table_name = row.get::<&str>(2)?.to_string();
-                                let root_page = row.get::<i64>(3)?;
-                                match automatic_indices.entry(table_name) {
-                                    std::collections::hash_map::Entry::Vacant(e) => {
-                                        e.insert(vec![(index_name, root_page as usize)]);
-                                    }
-                                    std::collections::hash_map::Entry::Occupied(mut e) => {
-                                        e.get_mut().push((index_name, root_page as usize));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    "view" => {
-                        use crate::incremental::view::IncrementalView;
-                        use crate::schema::View;
-                        use fallible_iterator::FallibleIterator;
-                        use turso_parser::ast::{Cmd, Stmt};
-                        use turso_parser::parser::Parser;
-
-                        let name: &str = row.get::<&str>(1)?;
-                        let root_page = row.get::<i64>(3)?;
-                        let sql: &str = row.get::<&str>(4)?;
-                        let view_name = name.to_string();
-
-                        // Parse the SQL to determine if it's a regular or materialized view
-                        let mut parser = Parser::new(sql.as_bytes());
-                        if let Ok(Some(Cmd::Stmt(stmt))) = parser.next_cmd() {
-                            match stmt {
-                                Stmt::CreateMaterializedView { .. } => {
-                                    // Store materialized view info for later creation
-                                    // We'll handle reuse logic and create the actual IncrementalView
-                                    // in a later pass when we have both the main root page and DBSP state root
-                                    materialized_view_info.insert(
-                                        view_name.clone(),
-                                        (sql.to_string(), root_page as usize),
-                                    );
-
-                                    // Mark the existing view for potential reuse
-                                    if existing_views.contains_key(&view_name) {
-                                        // We'll check for reuse in the third pass
-                                    }
-                                }
-                                Stmt::CreateView {
-                                    view_name: _,
-                                    columns: column_names,
-                                    select,
-                                    ..
-                                } => {
-                                    // Extract actual columns from the SELECT statement
-                                    let view_columns =
-                                        crate::util::extract_view_columns(&select, schema);
-
-                                    // If column names were provided in CREATE VIEW (col1, col2, ...),
-                                    // use them to rename the columns
-                                    let mut final_columns = view_columns;
-                                    for (i, indexed_col) in column_names.iter().enumerate() {
-                                        if let Some(col) = final_columns.get_mut(i) {
-                                            col.name = Some(indexed_col.col_name.to_string());
-                                        }
-                                    }
-
-                                    // Create regular view
-                                    let view = View {
-                                        name: name.to_string(),
-                                        sql: sql.to_string(),
-                                        select_stmt: select,
-                                        columns: final_columns,
-                                    };
-                                    schema.add_view(view);
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                    _ => continue,
-                }
+                let name = row.get::<&str>(1)?;
+                let table_name = row.get::<&str>(2)?;
+                let root_page = row.get::<i64>(3)?;
+                let sql = row.get::<&str>(4).ok();
+                schema.handle_schema_row(
+                    ty,
+                    name,
+                    table_name,
+                    root_page,
+                    sql,
+                    syms,
+                    &mut from_sql_indexes,
+                    &mut automatic_indices,
+                    &mut dbsp_state_roots,
+                    &mut materialized_view_info,
+                )?;
             }
             StepResult::IO => {
                 // TODO: How do we ensure that the I/O we submitted to
@@ -313,90 +197,9 @@ pub fn parse_schema_rows(
             StepResult::Busy => break,
         }
     }
-    for unparsed_sql_from_index in from_sql_indexes {
-        if !schema.indexes_enabled() {
-            schema.table_set_has_index(&unparsed_sql_from_index.table_name);
-        } else {
-            let table = schema
-                .get_btree_table(&unparsed_sql_from_index.table_name)
-                .unwrap();
-            let index = schema::Index::from_sql(
-                &unparsed_sql_from_index.sql,
-                unparsed_sql_from_index.root_page,
-                table.as_ref(),
-            )?;
-            schema.add_index(Arc::new(index));
-        }
-    }
-    for automatic_index in automatic_indices {
-        if !schema.indexes_enabled() {
-            schema.table_set_has_index(&automatic_index.0);
-        } else {
-            let table = schema.get_btree_table(&automatic_index.0).unwrap();
-            let ret_index = schema::Index::automatic_from_primary_key_and_unique(
-                table.as_ref(),
-                automatic_index.1,
-            )?;
-            for index in ret_index {
-                schema.add_index(Arc::new(index));
-            }
-        }
-    }
 
-    // Third pass: Create materialized views now that we have both root pages
-    for (view_name, (sql, main_root)) in materialized_view_info {
-        // Look up the DBSP state root for this view - must exist for materialized views
-        let dbsp_state_root = dbsp_state_roots.get(&view_name).ok_or_else(|| {
-            LimboError::InternalError(format!(
-                "Materialized view {view_name} is missing its DBSP state table"
-            ))
-        })?;
-
-        // Check if we can reuse the existing view
-        let mut reuse_view = false;
-        if let Some(existing_view_mutex) = schema.get_materialized_view(&view_name) {
-            let existing_view = existing_view_mutex.lock().unwrap();
-            if let Some(existing_sql) = schema.materialized_view_sql.get(&view_name) {
-                if existing_sql == &sql {
-                    reuse_view = true;
-                }
-            }
-        }
-
-        if reuse_view {
-            // View already exists with same SQL, just update dependencies
-            let existing_view_mutex = schema.get_materialized_view(&view_name).unwrap();
-            let existing_view = existing_view_mutex.lock().unwrap();
-            let referenced_tables = existing_view.get_referenced_table_names();
-            drop(existing_view); // Release lock before modifying schema
-            for table_name in referenced_tables {
-                schema.add_materialized_view_dependency(&table_name, &view_name);
-            }
-        } else {
-            // Create new IncrementalView with both root pages
-            let incremental_view =
-                IncrementalView::from_sql(&sql, schema, main_root, *dbsp_state_root)?;
-            let referenced_tables = incremental_view.get_referenced_table_names();
-
-            // Create a Table for the materialized view
-            let table = Arc::new(schema::Table::BTree(Arc::new(schema::BTreeTable {
-                root_page: main_root,
-                name: view_name.clone(),
-                columns: incremental_view.columns.clone(), // Use the view's columns, not the base table's
-                primary_key_columns: vec![],
-                has_rowid: true,
-                is_strict: false,
-                has_autoincrement: false,
-
-                unique_sets: None,
-            })));
-
-            schema.add_materialized_view(incremental_view, table, sql.clone());
-            for table_name in referenced_tables {
-                schema.add_materialized_view_dependency(&table_name, &view_name);
-            }
-        }
-    }
+    schema.populate_indices(from_sql_indexes, automatic_indices)?;
+    schema.populate_materialized_views(materialized_view_info, dbsp_state_roots)?;
 
     Ok(())
 }
@@ -1187,8 +990,12 @@ pub fn parse_numeric_literal(text: &str) -> Result<Value> {
         return Ok(Value::Integer(int_value));
     }
 
-    let float_value = text.parse::<f64>()?;
-    Ok(Value::Float(float_value))
+    let Some(StrToF64::Fractional(float) | StrToF64::Decimal(float)) =
+        crate::numeric::str_to_f64(text)
+    else {
+        unreachable!();
+    };
+    Ok(Value::Float(float.into()))
 }
 
 pub fn parse_signed_number(expr: &Expr) -> Result<Value> {

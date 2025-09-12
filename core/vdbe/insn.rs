@@ -7,7 +7,7 @@ use super::{execute, AggFunc, BranchOffset, CursorID, FuncCtx, InsnFunction, Pag
 use crate::{
     schema::{Affinity, BTreeTable, Column, Index},
     storage::{pager::CreateBTreeFlags, wal::CheckpointMode},
-    translate::collate::CollationSeq,
+    translate::{collate::CollationSeq, emitter::TransactionMode},
     Value,
 };
 use turso_macros::Description;
@@ -465,9 +465,9 @@ pub enum Insn {
 
     /// Start a transaction.
     Transaction {
-        db: usize,          // p1
-        write: bool,        // p2
-        schema_cookie: u32, // p3
+        db: usize,                // p1
+        tx_mode: TransactionMode, // p2
+        schema_cookie: u32,       // p3
     },
 
     /// Set database auto-commit mode and potentially rollback.

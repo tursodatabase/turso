@@ -116,11 +116,26 @@ impl rusqlite::types::FromSql for Value {
     }
 }
 
+str_enum! {
+    enum UnaryFunc {
+        Ceil => "ceil",
+        Floor => "floor",
+    }
+}
+
+str_enum! {
+    enum BinaryFunc {
+        Power => "pow",
+    }
+}
+
 #[derive(Debug, Arbitrary)]
 enum Expr {
     Value(Value),
     Binary(Binary, Box<Expr>, Box<Expr>),
     Unary(Unary, Box<Expr>),
+    UnaryFunc(UnaryFunc, Box<Expr>),
+    BinaryFunc(BinaryFunc, Box<Expr>, Box<Expr>),
 }
 
 #[derive(Debug)]
@@ -156,6 +171,26 @@ impl Expr {
                         lhs.parameters
                     },
                     depth: lhs.depth.max(rhs.depth) + 1,
+                }
+            }
+            Expr::BinaryFunc(func, lhs, rhs) => {
+                let mut lhs = lhs.lower();
+                let mut rhs = rhs.lower();
+                Output {
+                    query: format!("{func}({}, {})", lhs.query, rhs.query),
+                    parameters: {
+                        lhs.parameters.append(&mut rhs.parameters);
+                        lhs.parameters
+                    },
+                    depth: lhs.depth.max(rhs.depth) + 1,
+                }
+            }
+            Expr::UnaryFunc(func, expr) => {
+                let expr = expr.lower();
+                Output {
+                    query: format!("{func}({})", expr.query),
+                    parameters: expr.parameters,
+                    depth: expr.depth + 1,
                 }
             }
         }

@@ -1,48 +1,22 @@
-import { DatabasePromise, NativeDatabase, DatabaseOpts, SqliteError } from "@tursodatabase/database-common"
+import { registerFileAtWorker, unregisterFileAtWorker } from "@tursodatabase/database-browser-common"
+import { DatabasePromise, NativeDatabase, DatabaseOpts, SqliteError, } from "@tursodatabase/database-common"
 import { connect as nativeConnect, initThreadPool, MainWorker } from "#index";
 
-let workerRequestId = 0;
 class Database extends DatabasePromise {
-    files: string[];
-    constructor(db: NativeDatabase, files: string[], opts: DatabaseOpts = {}) {
+    path: string | null;
+    constructor(db: NativeDatabase, fsPath: string | null, opts: DatabaseOpts = {}) {
         super(db, opts)
-        this.files = files;
+        this.path = fsPath;
     }
     async close() {
-        let currentId = workerRequestId;
-        workerRequestId += this.files.length;
-
-        let tasks = [];
-        for (const file of this.files) {
-            (MainWorker as any).postMessage({ __turso__: "unregister", path: file, id: currentId });
-            tasks.push(waitFor(currentId));
-            currentId += 1;
+        if (this.path != null) {
+            await Promise.all([
+                unregisterFileAtWorker(MainWorker, this.path),
+                unregisterFileAtWorker(MainWorker, `${this.path}-wal`)
+            ]);
         }
-        await Promise.all(tasks);
         this.db.close();
     }
-}
-
-function waitFor(id: number): Promise<any> {
-    let waitResolve, waitReject;
-    const callback = msg => {
-        if (msg.data.id == id) {
-            if (msg.data.error != null) {
-                waitReject(msg.data.error)
-            } else {
-                waitResolve()
-            }
-            cleanup();
-        }
-    };
-    const cleanup = () => (MainWorker as any).removeEventListener("message", callback);
-
-    (MainWorker as any).addEventListener("message", callback);
-    const result = new Promise((resolve, reject) => {
-        waitResolve = resolve;
-        waitReject = reject;
-    });
-    return result;
 }
 
 /**
@@ -55,24 +29,18 @@ function waitFor(id: number): Promise<any> {
 async function connect(path: string, opts: DatabaseOpts = {}): Promise<Database> {
     if (path == ":memory:") {
         const db = await nativeConnect(path, { tracing: opts.tracing });
-        return new Database(db, [], opts);
+        return new Database(db, null, opts);
     }
     await initThreadPool();
     if (MainWorker == null) {
         throw new Error("panic: MainWorker is not set");
     }
-
-    let currentId = workerRequestId;
-    workerRequestId += 2;
-
-    let dbHandlePromise = waitFor(currentId);
-    let walHandlePromise = waitFor(currentId + 1);
-    (MainWorker as any).postMessage({ __turso__: "register", path: `${path}`, id: currentId });
-    (MainWorker as any).postMessage({ __turso__: "register", path: `${path}-wal`, id: currentId + 1 });
-    await Promise.all([dbHandlePromise, walHandlePromise]);
+    await Promise.all([
+        registerFileAtWorker(MainWorker, path),
+        registerFileAtWorker(MainWorker, `${path}-wal`)
+    ]);
     const db = await nativeConnect(path, { tracing: opts.tracing });
-    const files = [path, `${path}-wal`];
-    return new Database(db, files, opts);
+    return new Database(db, path, opts);
 }
 
 export { connect, Database, SqliteError }

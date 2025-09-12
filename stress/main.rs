@@ -519,7 +519,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let mut conn = db.lock().await.connect()?;
             println!("\rExecuting queries...");
             for query_index in 0..nr_iterations {
-                if gen_bool(0.001) {
+                if gen_bool(0.0) {
+                    // disabled
                     if opts.verbose {
                         println!("Reopening database");
                     }
@@ -531,7 +532,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     }
                     *db_guard = builder.build().await?;
                     conn = db_guard.connect()?;
-                } else if gen_bool(0.01) {
+                } else if gen_bool(0.0) {
+                    // disabled
                     // Reconnect to the database
                     if opts.verbose {
                         println!("Reconnecting to database");

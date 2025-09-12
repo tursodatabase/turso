@@ -3,7 +3,7 @@
 use super::{common, Completion, CompletionInner, File, OpenFlags, IO};
 use crate::io::clock::{Clock, Instant};
 use crate::storage::wal::CKPT_BATCH_PAGES;
-use crate::{turso_assert, LimboError, Result};
+use crate::{turso_assert, CompletionError, LimboError, Result};
 use parking_lot::Mutex;
 use rustix::fs::{self, FlockOperation, OFlags};
 use std::ptr::NonNull;
@@ -47,6 +47,9 @@ const ARENA_COUNT: usize = 2;
 /// Arbitrary non-zero user_data for barrier operation when handling a partial writev
 /// writing a commit frame.
 const BARRIER_USER_DATA: u64 = 1;
+
+/// user_data tag for cancellation operations
+const CANCEL_TAG: u64 = 1;
 
 pub struct UringIO {
     inner: Arc<Mutex<InnerUringIO>>,
@@ -317,6 +320,18 @@ impl WrappedIOUring {
         self.ring.submit().expect("submiting when full");
     }
 
+    fn submit_cancel_urgent(&mut self, entry: &io_uring::squeue::Entry) -> Result<()> {
+        let pushed = unsafe { self.ring.submission().push(entry).is_ok() };
+        if pushed {
+            self.pending_ops += 1;
+            return Ok(());
+        }
+        // place cancel op at the front, if overflowed
+        self.overflow.push_front(entry.clone());
+        self.ring.submit()?;
+        Ok(())
+    }
+
     /// Flush overflow entries to submission queue when possible
     fn flush_overflow(&mut self) -> Result<()> {
         while !self.overflow.is_empty() {
@@ -468,10 +483,18 @@ impl WrappedIOUring {
         }
 
         let written = result;
+
+        // guard against no-progress loop
+        if written == 0 && state.remaining() > 0 {
+            state.free_last_iov(&mut self.iov_pool);
+            completion_from_key(user_data).error(CompletionError::ShortWrite);
+            return;
+        }
         state.advance(written as u64);
+
         match state.remaining() {
             0 => {
-                tracing::info!(
+                tracing::debug!(
                     "writev operation completed: wrote {} bytes",
                     state.total_written
                 );
@@ -546,8 +569,63 @@ impl IO for UringIO {
         Ok(())
     }
 
-    fn run_once(&self) -> Result<()> {
-        trace!("run_once()");
+    /// Drain calls `run_once` in a loop until the ring is empty.
+    /// To prevent mutex churn of checking if ring.empty() on each iteration, we violate DRY
+    fn drain(&self) -> Result<()> {
+        trace!("drain()");
+        let mut inner = self.inner.lock();
+        let ring = &mut inner.ring;
+        loop {
+            ring.flush_overflow()?;
+            if ring.empty() {
+                return Ok(());
+            }
+            ring.submit_and_wait()?;
+            'inner: loop {
+                let Some(cqe) = ring.ring.completion().next() else {
+                    break 'inner;
+                };
+                ring.pending_ops -= 1;
+                let user_data = cqe.user_data();
+                if user_data == CANCEL_TAG {
+                    // ignore if this is a cancellation CQE
+                    continue 'inner;
+                }
+                let result = cqe.result();
+                turso_assert!(
+                user_data != 0,
+                "user_data must not be zero, we dont submit linked timeouts that would cause this"
+            );
+                if let Some(state) = ring.writev_states.remove(&user_data) {
+                    // if we have ongoing writev state, handle it separately and don't call completion
+                    ring.handle_writev_completion(state, user_data, result);
+                    continue 'inner;
+                }
+                if result < 0 {
+                    let errno = -result;
+                    let err = std::io::Error::from_raw_os_error(errno);
+                    completion_from_key(user_data).error(err.into());
+                } else {
+                    completion_from_key(user_data).complete(result)
+                }
+            }
+        }
+    }
+
+    fn cancel(&self, completions: &[Completion]) -> Result<()> {
+        let mut inner = self.inner.lock();
+        for c in completions {
+            c.abort();
+            let e = io_uring::opcode::AsyncCancel::new(get_key(c.clone()))
+                .build()
+                .user_data(CANCEL_TAG);
+            inner.ring.submit_cancel_urgent(&e)?;
+        }
+        Ok(())
+    }
+
+    fn step(&self) -> Result<()> {
+        trace!("step()");
         let mut inner = self.inner.lock();
         let ring = &mut inner.ring;
         ring.flush_overflow()?;
@@ -561,11 +639,15 @@ impl IO for UringIO {
             };
             ring.pending_ops -= 1;
             let user_data = cqe.user_data();
+            if user_data == CANCEL_TAG {
+                // ignore if this is a cancellation CQE
+                continue;
+            }
             let result = cqe.result();
             turso_assert!(
-                    user_data != 0,
-                    "user_data must not be zero, we dont submit linked timeouts or cancelations that would cause this"
-                );
+                user_data != 0,
+                "user_data must not be zero, we dont submit linked timeouts that would cause this"
+            );
             if let Some(state) = ring.writev_states.remove(&user_data) {
                 // if we have ongoing writev state, handle it separately and don't call completion
                 ring.handle_writev_completion(state, user_data, result);
@@ -579,7 +661,13 @@ impl IO for UringIO {
                 }
                 continue;
             }
-            completion_from_key(user_data).complete(result)
+            if result < 0 {
+                let errno = -result;
+                let err = std::io::Error::from_raw_os_error(errno);
+                completion_from_key(user_data).error(err.into());
+            } else {
+                completion_from_key(user_data).complete(result)
+            }
         }
     }
 

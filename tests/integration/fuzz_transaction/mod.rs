@@ -86,9 +86,12 @@ impl ShadowDb {
         );
     }
 
-    fn take_snapshot(&mut self, tx_id: usize) {
+    fn take_snapshot_if_not_exists(&mut self, tx_id: usize) {
         if let Some(tx_state) = self.transactions.get_mut(&tx_id) {
-            assert!(tx_state.is_none());
+            if tx_state.is_some() {
+                // tx already has snapshot
+                return;
+            }
             tx_state.replace(TransactionState {
                 schema: self.schema.clone(),
                 visible_rows: self.committed_rows.clone(),
@@ -490,9 +493,10 @@ async fn multiple_connections_fuzz(mvcc_enabled: bool) {
 
     const NUM_ITERATIONS: usize = 50;
     const OPERATIONS_PER_CONNECTION: usize = 30;
-    const NUM_CONNECTIONS: usize = 2;
+    const MAX_NUM_CONNECTIONS: usize = 8;
 
     for iteration in 0..NUM_ITERATIONS {
+        let num_connections = rng.random_range(2..=MAX_NUM_CONNECTIONS);
         println!("--- Seed {seed} Iteration {iteration} ---");
         // Create a fresh database for each iteration
         let tempfile = tempfile::NamedTempFile::new().unwrap();
@@ -526,7 +530,7 @@ async fn multiple_connections_fuzz(mvcc_enabled: bool) {
 
         // Create connections
         let mut connections = Vec::new();
-        for conn_id in 0..NUM_CONNECTIONS {
+        for conn_id in 0..num_connections {
             let conn = db.connect().unwrap();
 
             // Create table if it doesn't exist
@@ -547,7 +551,11 @@ async fn multiple_connections_fuzz(mvcc_enabled: bool) {
                 let (operation, visible_rows) =
                     generate_operation(&mut rng, *current_tx_id, &mut shared_shadow_db);
 
-                println!("Connection {conn_id}(op={op_num}): {operation}");
+                let is_in_tx = current_tx_id.is_some();
+                let has_snapshot = current_tx_id.is_some_and(|tx_id| {
+                    shared_shadow_db.transactions.get(&tx_id).unwrap().is_some()
+                });
+                println!("Connection {conn_id}(op={op_num}): {operation}, is_in_tx={is_in_tx}, has_snapshot={has_snapshot}");
 
                 match operation {
                     Operation::Begin => {
@@ -572,11 +580,6 @@ async fn multiple_connections_fuzz(mvcc_enabled: bool) {
                             }
                             Err(e) => {
                                 println!("Connection {conn_id}(op={op_num}) FAILED: {e}");
-                                if let Some(tx_id) = *current_tx_id {
-                                    shared_shadow_db.rollback_transaction(tx_id);
-                                    *current_tx_id = None;
-                                }
-
                                 // Check if it's an acceptable error
                                 if !e.to_string().contains("database is locked") {
                                     panic!("Unexpected error during commit: {e}");
@@ -597,9 +600,6 @@ async fn multiple_connections_fuzz(mvcc_enabled: bool) {
                                 }
                                 Err(e) => {
                                     println!("Connection {conn_id}(op={op_num}) FAILED: {e}");
-                                    shared_shadow_db.rollback_transaction(tx_id);
-                                    *current_tx_id = None;
-
                                     // Check if it's an acceptable error
                                     if !e.to_string().contains("Busy")
                                         && !e.to_string().contains("database is locked")
@@ -630,6 +630,7 @@ async fn multiple_connections_fuzz(mvcc_enabled: bool) {
                             Ok(_) => {
                                 // Success - update shadow DB
                                 if let Some(tx_id) = *current_tx_id {
+                                    shared_shadow_db.take_snapshot_if_not_exists(tx_id);
                                     // In transaction - update transaction's view
                                     shared_shadow_db
                                         .insert(tx_id, id, other_columns.clone())
@@ -646,10 +647,6 @@ async fn multiple_connections_fuzz(mvcc_enabled: bool) {
                             }
                             Err(e) => {
                                 println!("Connection {conn_id}(op={op_num}) FAILED: {e}");
-                                if let Some(tx_id) = *current_tx_id {
-                                    shared_shadow_db.rollback_transaction(tx_id);
-                                    *current_tx_id = None;
-                                }
                                 // Check if it's an acceptable error
                                 if !e.to_string().contains("database is locked") {
                                     panic!("Unexpected error during insert: {e}");
@@ -671,6 +668,7 @@ async fn multiple_connections_fuzz(mvcc_enabled: bool) {
                             Ok(_) => {
                                 // Success - update shadow DB
                                 if let Some(tx_id) = *current_tx_id {
+                                    shared_shadow_db.take_snapshot_if_not_exists(tx_id);
                                     // In transaction - update transaction's view
                                     shared_shadow_db
                                         .update(tx_id, id, other_columns.clone())
@@ -687,10 +685,6 @@ async fn multiple_connections_fuzz(mvcc_enabled: bool) {
                             }
                             Err(e) => {
                                 println!("Connection {conn_id}(op={op_num}) FAILED: {e}");
-                                if let Some(tx_id) = *current_tx_id {
-                                    shared_shadow_db.rollback_transaction(tx_id);
-                                    *current_tx_id = None;
-                                }
                                 // Check if it's an acceptable error
                                 if !e.to_string().contains("database is locked") {
                                     panic!("Unexpected error during update: {e}");
@@ -711,6 +705,7 @@ async fn multiple_connections_fuzz(mvcc_enabled: bool) {
                             Ok(_) => {
                                 // Success - update shadow DB
                                 if let Some(tx_id) = *current_tx_id {
+                                    shared_shadow_db.take_snapshot_if_not_exists(tx_id);
                                     // In transaction - update transaction's view
                                     shared_shadow_db.delete(tx_id, id).unwrap();
                                 } else {
@@ -723,10 +718,6 @@ async fn multiple_connections_fuzz(mvcc_enabled: bool) {
                             }
                             Err(e) => {
                                 println!("Connection {conn_id}(op={op_num}) FAILED: {e}");
-                                if let Some(tx_id) = *current_tx_id {
-                                    shared_shadow_db.rollback_transaction(tx_id);
-                                    *current_tx_id = None;
-                                }
                                 // Check if it's an acceptable error
                                 if !e.to_string().contains("database is locked") {
                                     panic!("Unexpected error during delete: {e}");
@@ -741,18 +732,40 @@ async fn multiple_connections_fuzz(mvcc_enabled: bool) {
                         let mut rows = stmt.query(()).await.unwrap();
 
                         let mut real_rows = Vec::new();
-                        while let Some(row) = rows.next().await.unwrap() {
-                            let Value::Integer(id) = row.get_value(0).unwrap() else {
-                                panic!("Unexpected value for id: {:?}", row.get_value(0));
-                            };
-                            let mut other_columns = HashMap::new();
-                            for i in 1..columns.len() {
-                                let column = columns.get(i).unwrap();
-                                let value = row.get_value(i).unwrap();
-                                other_columns.insert(column.name().to_string(), value);
+                        let ok = loop {
+                            match rows.next().await {
+                                Err(e) => {
+                                    if !e.to_string().contains("database is locked") {
+                                        panic!("Unexpected error during select: {e}");
+                                    }
+                                    break false;
+                                }
+                                Ok(None) => {
+                                    break true;
+                                }
+                                Ok(Some(row)) => {
+                                    let Value::Integer(id) = row.get_value(0).unwrap() else {
+                                        panic!("Unexpected value for id: {:?}", row.get_value(0));
+                                    };
+                                    let mut other_columns = HashMap::new();
+                                    for i in 1..columns.len() {
+                                        let column = columns.get(i).unwrap();
+                                        let value = row.get_value(i).unwrap();
+                                        other_columns.insert(column.name().to_string(), value);
+                                    }
+                                    real_rows.push(DbRow { id, other_columns });
+                                }
                             }
-                            real_rows.push(DbRow { id, other_columns });
+                        };
+
+                        if !ok {
+                            continue;
                         }
+
+                        if let Some(tx_id) = *current_tx_id {
+                            shared_shadow_db.take_snapshot_if_not_exists(tx_id);
+                        }
+
                         real_rows.sort_by_key(|r| r.id);
 
                         let mut expected_rows = visible_rows.clone();
@@ -788,6 +801,7 @@ async fn multiple_connections_fuzz(mvcc_enabled: bool) {
                         match result {
                             Ok(_) => {
                                 if let Some(tx_id) = *current_tx_id {
+                                    shared_shadow_db.take_snapshot_if_not_exists(tx_id);
                                     // In transaction - update transaction's view
                                     shared_shadow_db.alter_table(tx_id, op).unwrap();
                                 } else {
@@ -803,12 +817,7 @@ async fn multiple_connections_fuzz(mvcc_enabled: bool) {
                             Err(e) => {
                                 println!("Connection {conn_id}(op={op_num}) FAILED: {e}");
                                 // Check if it's an acceptable error
-                                if e.to_string().contains("database is locked") {
-                                    if let Some(tx_id) = *current_tx_id {
-                                        shared_shadow_db.rollback_transaction(tx_id);
-                                        *current_tx_id = None;
-                                    }
-                                } else {
+                                if !e.to_string().contains("database is locked") {
                                     panic!("Unexpected error during alter table: {e}");
                                 }
                             }
@@ -863,13 +872,8 @@ fn generate_operation(
     } else {
         shadow_db.schema.clone()
     };
-    let mut get_visible_rows = |accesses_db: bool| {
+    let get_visible_rows = || {
         if let Some(tx_id) = current_tx_id {
-            let tx_state = shadow_db.transactions.get(&tx_id).unwrap();
-            // Take snapshot during first operation that accesses the DB after a BEGIN, not immediately at BEGIN (the semantics is BEGIN DEFERRED)
-            if accesses_db && tx_state.is_none() {
-                shadow_db.take_snapshot(tx_id);
-            }
             shadow_db.get_visible_rows(Some(tx_id))
         } else {
             shadow_db.get_visible_rows(None) // No transaction
@@ -878,9 +882,9 @@ fn generate_operation(
     match rng.random_range(0..100) {
         0..=9 => {
             if !in_transaction {
-                (Operation::Begin, get_visible_rows(false))
+                (Operation::Begin, get_visible_rows())
             } else {
-                let visible_rows = get_visible_rows(true);
+                let visible_rows = get_visible_rows();
                 (
                     generate_data_operation(rng, &visible_rows, &schema_clone),
                     visible_rows,
@@ -889,9 +893,9 @@ fn generate_operation(
         }
         10..=14 => {
             if in_transaction {
-                (Operation::Commit, get_visible_rows(false))
+                (Operation::Commit, get_visible_rows())
             } else {
-                let visible_rows = get_visible_rows(true);
+                let visible_rows = get_visible_rows();
                 (
                     generate_data_operation(rng, &visible_rows, &schema_clone),
                     visible_rows,
@@ -900,9 +904,9 @@ fn generate_operation(
         }
         15..=19 => {
             if in_transaction {
-                (Operation::Rollback, get_visible_rows(false))
+                (Operation::Rollback, get_visible_rows())
             } else {
-                let visible_rows = get_visible_rows(true);
+                let visible_rows = get_visible_rows();
                 (
                     generate_data_operation(rng, &visible_rows, &schema_clone),
                     visible_rows,
@@ -917,7 +921,7 @@ fn generate_operation(
                 3 => CheckpointMode::Full,
                 _ => unreachable!(),
             };
-            (Operation::Checkpoint { mode }, get_visible_rows(false))
+            (Operation::Checkpoint { mode }, get_visible_rows())
         }
         23..=26 => {
             let op = match rng.random_range(0..6) {
@@ -967,10 +971,10 @@ fn generate_operation(
                 }
                 _ => unreachable!(),
             };
-            (Operation::AlterTable { op }, get_visible_rows(true))
+            (Operation::AlterTable { op }, get_visible_rows())
         }
         _ => {
-            let visible_rows = get_visible_rows(true);
+            let visible_rows = get_visible_rows();
             (
                 generate_data_operation(rng, &visible_rows, &schema_clone),
                 visible_rows,

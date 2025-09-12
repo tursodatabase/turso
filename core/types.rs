@@ -226,10 +226,7 @@ where
 {
     let s = String::deserialize(deserializer)?;
     match crate::numeric::str_to_f64(s) {
-        Some(result) => Ok(match result {
-            crate::numeric::StrToF64::Fractional(non_nan) => non_nan.into(),
-            crate::numeric::StrToF64::Decimal(non_nan) => non_nan.into(),
-        }),
+        Some(result) => Ok(result.into()),
         None => Err(serde::de::Error::custom("")),
     }
 }
@@ -667,7 +664,7 @@ impl PartialEq<Value> for Value {
         match (self, other) {
             (Self::Integer(int_left), Self::Integer(int_right)) => int_left == int_right,
             (Self::Integer(int), Self::Float(float)) | (Self::Float(float), Self::Integer(int)) => {
-                int_float_cmp(*int, *float).is_eq()
+                sqlite_int_float_compare(*int, *float).is_eq()
             }
             (Self::Float(float_left), Self::Float(float_right)) => float_left == float_right,
             (Self::Integer(_) | Self::Float(_), Self::Text(_) | Self::Blob(_)) => false,
@@ -682,32 +679,17 @@ impl PartialEq<Value> for Value {
     }
 }
 
-fn int_float_cmp(int: i64, float: f64) -> std::cmp::Ordering {
-    if float.is_nan() {
-        return std::cmp::Ordering::Greater;
-    }
-
-    if float < -9223372036854775808.0 {
-        return std::cmp::Ordering::Greater;
-    }
-
-    if float >= 9223372036854775808.0 {
-        return std::cmp::Ordering::Less;
-    }
-
-    match int.cmp(&(float as i64)) {
-        std::cmp::Ordering::Equal => (int as f64).total_cmp(&float),
-        cmp => cmp,
-    }
-}
-
 #[allow(clippy::non_canonical_partial_ord_impl)]
 impl PartialOrd<Value> for Value {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         match (self, other) {
             (Self::Integer(int_left), Self::Integer(int_right)) => int_left.partial_cmp(int_right),
-            (Self::Float(float), Self::Integer(int)) => Some(int_float_cmp(*int, *float).reverse()),
-            (Self::Integer(int), Self::Float(float)) => Some(int_float_cmp(*int, *float)),
+            (Self::Float(float), Self::Integer(int)) => {
+                Some(sqlite_int_float_compare(*int, *float).reverse())
+            }
+            (Self::Integer(int), Self::Float(float)) => {
+                Some(sqlite_int_float_compare(*int, *float))
+            }
             (Self::Float(float_left), Self::Float(float_right)) => {
                 float_left.partial_cmp(float_right)
             }
@@ -2354,6 +2336,18 @@ pub enum Cursor {
     Sorter(Sorter),
     Virtual(VirtualTableCursor),
     MaterializedView(Box<crate::incremental::cursor::MaterializedViewCursor>),
+}
+
+impl Debug for Cursor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BTree(..) => f.debug_tuple("BTree").finish(),
+            Self::Pseudo(..) => f.debug_tuple("Pseudo").finish(),
+            Self::Sorter(..) => f.debug_tuple("Sorter").finish(),
+            Self::Virtual(..) => f.debug_tuple("Virtual").finish(),
+            Self::MaterializedView(..) => f.debug_tuple("MaterializedView").finish(),
+        }
+    }
 }
 
 impl Cursor {

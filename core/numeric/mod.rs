@@ -46,6 +46,44 @@ pub enum Numeric {
 }
 
 impl Numeric {
+    pub fn from_value_strict(value: &Value) -> Numeric {
+        match value {
+            Value::Null | Value::Blob(_) => Self::Null,
+            Value::Integer(v) => Self::Integer(*v),
+            Value::Float(v) => match NonNan::new(*v) {
+                Some(v) => Self::Float(v),
+                None => Self::Null,
+            },
+            Value::Text(text) => {
+                let s = text.as_str();
+
+                match str_to_f64(s) {
+                    None
+                    | Some(StrToF64::FractionalPrefix(_))
+                    | Some(StrToF64::DecimalPrefix(_)) => Self::Null,
+                    Some(StrToF64::Fractional(value)) => Self::Float(value),
+                    Some(StrToF64::Decimal(real)) => {
+                        let integer = str_to_i64(s).unwrap_or(0);
+
+                        if real == integer as f64 {
+                            Self::Integer(integer)
+                        } else {
+                            Self::Float(real)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn try_into_f64(&self) -> Option<f64> {
+        match self {
+            Numeric::Null => None,
+            Numeric::Integer(v) => Some(*v as _),
+            Numeric::Float(v) => Some((*v).into()),
+        }
+    }
+
     pub fn try_into_bool(&self) -> Option<bool> {
         match self {
             Numeric::Null => None,
@@ -82,8 +120,10 @@ impl<T: AsRef<str>> From<T> for Numeric {
 
         match str_to_f64(text) {
             None => Self::Integer(0),
-            Some(StrToF64::Fractional(value)) => Self::Float(value),
-            Some(StrToF64::Decimal(real)) => {
+            Some(StrToF64::Fractional(value) | StrToF64::FractionalPrefix(value)) => {
+                Self::Float(value)
+            }
+            Some(StrToF64::Decimal(real) | StrToF64::DecimalPrefix(real)) => {
                 let integer = str_to_i64(text).unwrap_or(0);
 
                 if real == integer as f64 {
@@ -460,9 +500,23 @@ pub fn str_to_i64(input: impl AsRef<str>) -> Option<i64> {
     )
 }
 
+#[derive(Debug)]
 pub enum StrToF64 {
     Fractional(NonNan),
     Decimal(NonNan),
+    FractionalPrefix(NonNan),
+    DecimalPrefix(NonNan),
+}
+
+impl From<StrToF64> for f64 {
+    fn from(value: StrToF64) -> Self {
+        match value {
+            StrToF64::Fractional(non_nan) => non_nan.into(),
+            StrToF64::Decimal(non_nan) => non_nan.into(),
+            StrToF64::FractionalPrefix(non_nan) => non_nan.into(),
+            StrToF64::DecimalPrefix(non_nan) => non_nan.into(),
+        }
+    }
 }
 
 pub fn str_to_f64(input: impl AsRef<str>) -> Option<StrToF64> {
@@ -479,10 +533,6 @@ pub fn str_to_f64(input: impl AsRef<str>) -> Option<StrToF64> {
 
     let mut had_digits = false;
     let mut is_fractional = false;
-
-    if matches!(input.peek(), Some('e' | 'E')) {
-        return None;
-    }
 
     let mut significant: u64 = 0;
 
@@ -509,12 +559,12 @@ pub fn str_to_f64(input: impl AsRef<str>) -> Option<StrToF64> {
     }
 
     if input.next_if(|ch| matches!(ch, '.')).is_some() {
-        if matches!(input.peek(), Some('e' | 'E')) {
-            return None;
+        if had_digits {
+            is_fractional = true;
         }
 
-        if had_digits || input.peek().is_some_and(char::is_ascii_digit) {
-            is_fractional = true
+        if input.peek().is_some_and(char::is_ascii_digit) {
+            is_fractional = true;
         }
 
         while let Some(digit) = input.peek().and_then(|ch| ch.to_digit(10)) {
@@ -527,26 +577,31 @@ pub fn str_to_f64(input: impl AsRef<str>) -> Option<StrToF64> {
         }
     };
 
-    if input.next_if(|ch| matches!(ch, 'e' | 'E')).is_some() {
+    let mut valid_exponent = true;
+
+    if (had_digits || is_fractional) && input.next_if(|ch| matches!(ch, 'e' | 'E')).is_some() {
         let sign = match input.next_if(|ch| matches!(ch, '-' | '+')) {
             Some('-') => -1,
             _ => 1,
         };
 
         if input.peek().is_some_and(char::is_ascii_digit) {
-            is_fractional = true
-        }
+            is_fractional = true;
+            let mut e = 0;
 
-        let e = input.map_while(|ch| ch.to_digit(10)).fold(0, |acc, digit| {
-            if acc < 1000 {
-                acc * 10 + digit as i32
-            } else {
-                1000
+            while let Some(ch) = input.next_if(char::is_ascii_digit) {
+                e = (e * 10 + ch.to_digit(10).unwrap() as i32).min(1000);
             }
-        });
 
-        exponent += sign * e;
+            exponent += sign * e;
+        } else {
+            valid_exponent = false;
+        }
     };
+
+    if !(had_digits || is_fractional) {
+        return None;
+    }
 
     while exponent.is_positive() && significant < MAX_EXACT / 10 {
         significant *= 10;
@@ -590,6 +645,14 @@ pub fn str_to_f64(input: impl AsRef<str>) -> Option<StrToF64> {
 
     let result = NonNan::new(f64::from(result) * sign)
         .unwrap_or_else(|| NonNan::new(sign * f64::INFINITY).unwrap());
+
+    if !valid_exponent || input.count() > 0 {
+        if is_fractional {
+            return Some(StrToF64::FractionalPrefix(result));
+        } else {
+            return Some(StrToF64::DecimalPrefix(result));
+        }
+    }
 
     Some(if is_fractional {
         StrToF64::Fractional(result)

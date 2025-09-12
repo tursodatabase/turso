@@ -1,18 +1,18 @@
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use turso_core::OpenFlags;
-use uuid::Uuid;
 
 use crate::{
     database_replay_generator::DatabaseReplayGenerator,
     database_sync_operations::{
-        bootstrap_db_file, connect_untracked, count_local_changes, fetch_last_change_id, has_table,
-        push_logical_changes, read_wal_salt, reset_wal_file, update_last_change_id, wait_full_body,
-        wal_apply_from_file, wal_pull_to_file, PAGE_SIZE, WAL_FRAME_HEADER, WAL_FRAME_SIZE,
+        acquire_slot, apply_transformation, bootstrap_db_file, connect_untracked,
+        count_local_changes, fetch_last_change_id, has_table, push_logical_changes, read_wal_salt,
+        reset_wal_file, update_last_change_id, wait_all_results, wal_apply_from_file,
+        wal_pull_to_file, PAGE_SIZE, WAL_FRAME_HEADER, WAL_FRAME_SIZE,
     },
     database_tape::{
         DatabaseChangesIteratorMode, DatabaseChangesIteratorOpts, DatabaseReplaySession,
@@ -23,34 +23,24 @@ use crate::{
     io_operations::IoOperations,
     protocol_io::ProtocolIO,
     types::{
-        Coro, DatabaseMetadata, DatabasePullRevision, DatabaseSyncEngineProtocolVersion,
-        DatabaseTapeOperation, DbChangesStatus, SyncEngineStats, Transform,
+        Coro, DatabaseMetadata, DatabasePullRevision, DatabaseRowTransformResult,
+        DatabaseSyncEngineProtocolVersion, DatabaseTapeOperation, DbChangesStatus, SyncEngineStats,
+        DATABASE_METADATA_VERSION,
     },
     wal_session::WalSession,
     Result,
 };
 
-#[derive(Clone)]
-pub struct DatabaseSyncEngineOpts<Ctx> {
+#[derive(Clone, Debug)]
+pub struct DatabaseSyncEngineOpts {
     pub client_name: String,
     pub tables_ignore: Vec<String>,
-    pub transform: Option<Transform<Ctx>>,
+    pub use_transform: bool,
     pub wal_pull_batch_size: u64,
     pub protocol_version_hint: DatabaseSyncEngineProtocolVersion,
 }
 
-impl<Ctx> std::fmt::Debug for DatabaseSyncEngineOpts<Ctx> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DatabaseSyncEngineOpts")
-            .field("client_name", &self.client_name)
-            .field("tables_ignore", &self.tables_ignore)
-            .field("transform.is_some()", &self.transform.is_some())
-            .field("wal_pull_batch_size", &self.wal_pull_batch_size)
-            .finish()
-    }
-}
-
-pub struct DatabaseSyncEngine<P: ProtocolIO, Ctx> {
+pub struct DatabaseSyncEngine<P: ProtocolIO> {
     io: Arc<dyn turso_core::IO>,
     protocol: Arc<P>,
     db_file: Arc<dyn turso_core::DatabaseStorage>,
@@ -59,7 +49,8 @@ pub struct DatabaseSyncEngine<P: ProtocolIO, Ctx> {
     revert_db_wal_path: String,
     main_db_path: String,
     meta_path: String,
-    opts: DatabaseSyncEngineOpts<Ctx>,
+    changes_file: Arc<Mutex<Option<Arc<dyn turso_core::File>>>>,
+    opts: DatabaseSyncEngineOpts,
     meta: RefCell<DatabaseMetadata>,
     client_unique_id: String,
 }
@@ -68,18 +59,19 @@ fn db_size_from_page(page: &[u8]) -> u32 {
     u32::from_be_bytes(page[28..28 + 4].try_into().unwrap())
 }
 
-impl<P: ProtocolIO, Ctx> DatabaseSyncEngine<P, Ctx> {
+impl<P: ProtocolIO> DatabaseSyncEngine<P> {
     /// Creates new instance of SyncEngine and initialize it immediately if no consistent local data exists
-    pub async fn new(
+    pub async fn new<Ctx>(
         coro: &Coro<Ctx>,
         io: Arc<dyn turso_core::IO>,
         protocol: Arc<P>,
         main_db_path: &str,
-        opts: DatabaseSyncEngineOpts<Ctx>,
+        opts: DatabaseSyncEngineOpts,
     ) -> Result<Self> {
         let main_db_wal_path = format!("{main_db_path}-wal");
         let revert_db_wal_path = format!("{main_db_path}-wal-revert");
         let meta_path = format!("{main_db_path}-info");
+        let changes_path = format!("{main_db_path}-changes");
 
         let db_file = io.open_file(main_db_path, turso_core::OpenFlags::Create, false)?;
         let db_file = Arc::new(turso_core::storage::database::DatabaseFile::new(db_file));
@@ -87,7 +79,7 @@ impl<P: ProtocolIO, Ctx> DatabaseSyncEngine<P, Ctx> {
         tracing::info!("init(path={}): opts={:?}", main_db_path, opts);
 
         let completion = protocol.full_read(&meta_path)?;
-        let data = wait_full_body(coro, &completion).await?;
+        let data = wait_all_results(coro, &completion).await?;
         let meta = if data.is_empty() {
             None
         } else {
@@ -107,20 +99,32 @@ impl<P: ProtocolIO, Ctx> DatabaseSyncEngine<P, Ctx> {
                 )
                 .await?;
                 let meta = DatabaseMetadata {
+                    version: DATABASE_METADATA_VERSION.to_string(),
                     client_unique_id,
                     synced_revision: Some(revision),
                     revert_since_wal_salt: None,
                     revert_since_wal_watermark: 0,
                     last_pushed_change_id_hint: 0,
                     last_pushed_pull_gen_hint: 0,
+                    last_pull_unix_time: io.now().secs,
+                    last_push_unix_time: None,
                 };
                 tracing::info!("write meta after successful bootstrap: meta={meta:?}");
                 let completion = protocol.full_write(&meta_path, meta.dump()?)?;
                 // todo: what happen if we will actually update the metadata on disk but fail and so in memory state will not be updated
-                wait_full_body(coro, &completion).await?;
+                wait_all_results(coro, &completion).await?;
                 meta
             }
         };
+
+        if meta.version != DATABASE_METADATA_VERSION {
+            return Err(Error::DatabaseSyncEngineError(format!(
+                "unsupported metadata version: {}",
+                meta.version
+            )));
+        }
+
+        tracing::info!("check if main db file exists");
 
         let main_exists = io.try_open(main_db_path)?.is_some();
         if !main_exists {
@@ -140,8 +144,9 @@ impl<P: ProtocolIO, Ctx> DatabaseSyncEngine<P, Ctx> {
             cdc_table: None,
             cdc_mode: Some("full".to_string()),
         };
-        let main_tape = DatabaseTape::new_with_opts(main_db, tape_opts);
         tracing::info!("initialize database tape connection: path={}", main_db_path);
+        let main_tape = DatabaseTape::new_with_opts(main_db, tape_opts);
+        let changes_file = io.open_file(&changes_path, OpenFlags::Create, false)?;
         let mut db = Self {
             io,
             protocol,
@@ -151,6 +156,7 @@ impl<P: ProtocolIO, Ctx> DatabaseSyncEngine<P, Ctx> {
             revert_db_wal_path,
             main_db_path: main_db_path.to_string(),
             meta_path: format!("{main_db_path}-info"),
+            changes_file: Arc::new(Mutex::new(Some(changes_file))),
             opts,
             meta: RefCell::new(meta.clone()),
             client_unique_id: meta.client_unique_id.clone(),
@@ -163,10 +169,10 @@ impl<P: ProtocolIO, Ctx> DatabaseSyncEngine<P, Ctx> {
         } = synced_revision
         {
             // sync WAL from the remote in case of bootstrap - all subsequent initializations will be fast
-            if let Some(changes) = db.wait_changes_from_remote(coro).await? {
-                db.apply_changes_from_remote(coro, changes).await?;
-            }
+            db.pull_changes_from_remote(coro).await?;
         }
+
+        tracing::info!("sync engine was initialized");
         Ok(db)
     }
 
@@ -184,7 +190,10 @@ impl<P: ProtocolIO, Ctx> DatabaseSyncEngine<P, Ctx> {
         Ok(conn)
     }
 
-    async fn checkpoint_passive(&mut self, coro: &Coro<Ctx>) -> Result<(Option<Vec<u32>>, u64)> {
+    async fn checkpoint_passive<Ctx>(
+        &mut self,
+        coro: &Coro<Ctx>,
+    ) -> Result<(Option<Vec<u32>>, u64)> {
         let watermark = self.meta().revert_since_wal_watermark;
         tracing::info!(
             "checkpoint(path={:?}): revert_since_wal_watermark={}",
@@ -232,16 +241,32 @@ impl<P: ProtocolIO, Ctx> DatabaseSyncEngine<P, Ctx> {
         Ok((main_wal_salt, watermark))
     }
 
-    pub async fn stats(&self, coro: &Coro<Ctx>) -> Result<SyncEngineStats> {
+    pub async fn stats<Ctx>(&self, coro: &Coro<Ctx>) -> Result<SyncEngineStats> {
         let main_conn = connect_untracked(&self.main_tape)?;
         let change_id = self.meta().last_pushed_change_id_hint;
+        let last_pull_unix_time = self.meta().last_pull_unix_time;
+        let last_push_unix_time = self.meta().last_push_unix_time;
+        let revert_wal_path = &self.revert_db_wal_path;
+        let revert_wal_file = self
+            .io
+            .open_file(revert_wal_path, OpenFlags::all(), false)?;
+        let revert_wal_size = revert_wal_file.size()?;
+        let main_wal_frames = main_conn.wal_state()?.max_frame;
+        let main_wal_size = if main_wal_frames == 0 {
+            0
+        } else {
+            WAL_FRAME_HEADER as u64 + WAL_FRAME_SIZE as u64 * main_wal_frames
+        };
         Ok(SyncEngineStats {
             cdc_operations: count_local_changes(coro, &main_conn, change_id).await?,
-            wal_size: main_conn.wal_state()?.max_frame as i64,
+            main_wal_size,
+            revert_wal_size,
+            last_pull_unix_time,
+            last_push_unix_time,
         })
     }
 
-    pub async fn checkpoint(&mut self, coro: &Coro<Ctx>) -> Result<()> {
+    pub async fn checkpoint<Ctx>(&mut self, coro: &Coro<Ctx>) -> Result<()> {
         let (main_wal_salt, watermark) = self.checkpoint_passive(coro).await?;
 
         let main_conn = connect_untracked(&self.main_tape)?;
@@ -341,36 +366,32 @@ impl<P: ProtocolIO, Ctx> DatabaseSyncEngine<P, Ctx> {
         Ok(())
     }
 
-    pub async fn wait_changes_from_remote(
-        &self,
-        coro: &Coro<Ctx>,
-    ) -> Result<Option<DbChangesStatus>> {
-        let file_path = format!("{}-frames-{}", self.main_db_path, Uuid::new_v4());
-        tracing::info!(
-            "wait_changes(path={}): file_path={}",
-            self.main_db_path,
-            file_path
-        );
-        let file = self.io.create(&file_path)?;
+    pub async fn wait_changes_from_remote<Ctx>(&self, coro: &Coro<Ctx>) -> Result<DbChangesStatus> {
+        tracing::info!("wait_changes(path={})", self.main_db_path);
 
+        let file = acquire_slot(&self.changes_file)?;
+
+        let now = self.io.now();
         let revision = self.meta().synced_revision.clone().unwrap();
         let next_revision = wal_pull_to_file(
             coro,
             self.protocol.as_ref(),
-            file.clone(),
+            &file.value,
             &revision,
             self.opts.wal_pull_batch_size,
         )
         .await?;
 
-        if file.size()? == 0 {
+        if file.value.size()? == 0 {
             tracing::info!(
-                "wait_changes(path={}): no changes detected, removing changes file {}",
-                self.main_db_path,
-                file_path
+                "wait_changes(path={}): no changes detected",
+                self.main_db_path
             );
-            self.io.remove_file(&file_path)?;
-            return Ok(None);
+            return Ok(DbChangesStatus {
+                time: now,
+                revision: next_revision,
+                file_slot: None,
+            });
         }
 
         tracing::info!(
@@ -380,26 +401,25 @@ impl<P: ProtocolIO, Ctx> DatabaseSyncEngine<P, Ctx> {
             next_revision
         );
 
-        Ok(Some(DbChangesStatus {
+        Ok(DbChangesStatus {
+            time: now,
             revision: next_revision,
-            file_path,
-        }))
+            file_slot: Some(file),
+        })
     }
 
     /// Sync all new changes from remote DB and apply them locally
     /// This method will **not** send local changed to the remote
     /// This method will block writes for the period of pull
-    pub async fn apply_changes_from_remote(
+    pub async fn apply_changes_from_remote<Ctx>(
         &mut self,
         coro: &Coro<Ctx>,
         remote_changes: DbChangesStatus,
+        now: turso_core::Instant,
     ) -> Result<()> {
-        let pull_result = self.apply_changes_internal(coro, &remote_changes).await;
-        let cleanup_result: Result<()> = self
-            .io
-            .remove_file(&remote_changes.file_path)
-            .inspect_err(|e| tracing::error!("failed to cleanup changes file: {e}"))
-            .map_err(|e| e.into());
+        assert!(remote_changes.file_slot.is_some(), "file_slot must be set");
+        let changes_file = remote_changes.file_slot.as_ref().unwrap().value.clone();
+        let pull_result = self.apply_changes_internal(coro, &changes_file).await;
         let Ok(revert_since_wal_watermark) = pull_result else {
             return Err(pull_result.err().unwrap());
         };
@@ -411,33 +431,23 @@ impl<P: ProtocolIO, Ctx> DatabaseSyncEngine<P, Ctx> {
         )?;
         reset_wal_file(coro, revert_wal_file, 0).await?;
 
-        self.update_meta(coro, |meta| {
-            meta.revert_since_wal_watermark = revert_since_wal_watermark;
-            meta.synced_revision = Some(remote_changes.revision);
-            meta.last_pushed_change_id_hint = 0;
+        self.update_meta(coro, |m| {
+            m.revert_since_wal_watermark = revert_since_wal_watermark;
+            m.synced_revision = Some(remote_changes.revision);
+            m.last_pushed_change_id_hint = 0;
+            m.last_pull_unix_time = now.secs;
         })
         .await?;
-
-        cleanup_result
+        Ok(())
     }
-    async fn apply_changes_internal(
+    async fn apply_changes_internal<Ctx>(
         &mut self,
         coro: &Coro<Ctx>,
-        remote_changes: &DbChangesStatus,
+        changes_file: &Arc<dyn turso_core::File>,
     ) -> Result<u64> {
-        tracing::info!(
-            "apply_changes(path={}, changes={:?})",
-            self.main_db_path,
-            remote_changes
-        );
+        tracing::info!("apply_changes(path={})", self.main_db_path);
 
         let (_, watermark) = self.checkpoint_passive(coro).await?;
-
-        let changes_file = self.io.open_file(
-            &remote_changes.file_path,
-            turso_core::OpenFlags::empty(),
-            false,
-        )?;
 
         let revert_conn = self.open_revert_db_conn()?;
         let main_conn = connect_untracked(&self.main_tape)?;
@@ -476,6 +486,9 @@ impl<P: ProtocolIO, Ctx> DatabaseSyncEngine<P, Ctx> {
         let mut iterator = self.main_tape.iterate_changes(iterate_opts)?;
         while let Some(operation) = iterator.next(coro).await? {
             match operation {
+                DatabaseTapeOperation::StmtReplay(_) => {
+                    panic!("changes iterator must not use StmtReplay option")
+                }
                 DatabaseTapeOperation::RowChange(change) => local_changes.push(change),
                 DatabaseTapeOperation::Commit => continue,
             }
@@ -553,18 +566,46 @@ impl<P: ProtocolIO, Ctx> DatabaseSyncEngine<P, Ctx> {
                 cached_insert_stmt: HashMap::new(),
                 cached_update_stmt: HashMap::new(),
                 in_txn: true,
-                generator: DatabaseReplayGenerator::<Ctx> {
+                generator: DatabaseReplayGenerator {
                     conn: main_conn.clone(),
-                    opts: DatabaseReplaySessionOpts::<Ctx> {
+                    opts: DatabaseReplaySessionOpts {
                         use_implicit_rowid: false,
-                        transform: self.opts.transform.clone(),
                     },
                 },
             };
-            for change in local_changes {
-                let operation = DatabaseTapeOperation::RowChange(change);
+
+            let mut transformed = if self.opts.use_transform {
+                Some(
+                    apply_transformation(
+                        coro,
+                        self.protocol.as_ref(),
+                        &local_changes,
+                        &replay.generator,
+                    )
+                    .await?,
+                )
+            } else {
+                None
+            };
+
+            assert!(!replay.conn().get_auto_commit());
+            for (i, change) in local_changes.into_iter().enumerate() {
+                let operation = if let Some(transformed) = &mut transformed {
+                    match std::mem::replace(&mut transformed[i], DatabaseRowTransformResult::Skip) {
+                        DatabaseRowTransformResult::Keep => {
+                            DatabaseTapeOperation::RowChange(change)
+                        }
+                        DatabaseRowTransformResult::Skip => continue,
+                        DatabaseRowTransformResult::Rewrite(replay) => {
+                            DatabaseTapeOperation::StmtReplay(replay)
+                        }
+                    }
+                } else {
+                    DatabaseTapeOperation::RowChange(change)
+                };
                 replay.replay(coro, operation).await?;
             }
+            assert!(!replay.conn().get_auto_commit());
 
             main_session.wal_session.end(true)?;
         }
@@ -575,7 +616,7 @@ impl<P: ProtocolIO, Ctx> DatabaseSyncEngine<P, Ctx> {
     /// Sync local changes to remote DB
     /// This method will **not** pull remote changes to the local DB
     /// This method will **not** block writes for the period of sync
-    pub async fn push_changes_to_remote(&self, coro: &Coro<Ctx>) -> Result<()> {
+    pub async fn push_changes_to_remote<Ctx>(&self, coro: &Coro<Ctx>) -> Result<()> {
         tracing::info!("push_changes(path={})", self.main_db_path);
 
         let (_, change_id) = push_logical_changes(
@@ -589,6 +630,7 @@ impl<P: ProtocolIO, Ctx> DatabaseSyncEngine<P, Ctx> {
 
         self.update_meta(coro, |m| {
             m.last_pushed_change_id_hint = change_id;
+            m.last_push_unix_time = Some(self.io.now().secs);
         })
         .await?;
 
@@ -596,7 +638,7 @@ impl<P: ProtocolIO, Ctx> DatabaseSyncEngine<P, Ctx> {
     }
 
     /// Create read/write database connection and appropriately configure it before use
-    pub async fn connect_rw(&self, coro: &Coro<Ctx>) -> Result<Arc<turso_core::Connection>> {
+    pub async fn connect_rw<Ctx>(&self, coro: &Coro<Ctx>) -> Result<Arc<turso_core::Connection>> {
         let conn = self.main_tape.connect(coro).await?;
         conn.wal_auto_checkpoint_disable();
         Ok(conn)
@@ -604,12 +646,24 @@ impl<P: ProtocolIO, Ctx> DatabaseSyncEngine<P, Ctx> {
 
     /// Sync local changes to remote DB and bring new changes from remote to local
     /// This method will block writes for the period of sync
-    pub async fn sync(&mut self, coro: &Coro<Ctx>) -> Result<()> {
+    pub async fn sync<Ctx>(&mut self, coro: &Coro<Ctx>) -> Result<()> {
         // todo(sivukhin): this is bit suboptimal as both 'push' and 'pull' will call pull_synced_from_remote
         // but for now - keep it simple
         self.push_changes_to_remote(coro).await?;
-        if let Some(changes) = self.wait_changes_from_remote(coro).await? {
-            self.apply_changes_from_remote(coro, changes).await?;
+        self.pull_changes_from_remote(coro).await?;
+        Ok(())
+    }
+
+    pub async fn pull_changes_from_remote<Ctx>(&mut self, coro: &Coro<Ctx>) -> Result<()> {
+        let now = self.io.now();
+        let changes = self.wait_changes_from_remote(coro).await?;
+        if changes.file_slot.is_some() {
+            self.apply_changes_from_remote(coro, changes, now).await?;
+        } else {
+            self.update_meta(coro, |m| {
+                m.last_pull_unix_time = now.secs;
+            })
+            .await?;
         }
         Ok(())
     }
@@ -618,7 +672,7 @@ impl<P: ProtocolIO, Ctx> DatabaseSyncEngine<P, Ctx> {
         self.meta.borrow()
     }
 
-    async fn update_meta(
+    async fn update_meta<Ctx>(
         &self,
         coro: &Coro<Ctx>,
         update: impl FnOnce(&mut DatabaseMetadata),
@@ -628,7 +682,7 @@ impl<P: ProtocolIO, Ctx> DatabaseSyncEngine<P, Ctx> {
         tracing::info!("update_meta: {meta:?}");
         let completion = self.protocol.full_write(&self.meta_path, meta.dump()?)?;
         // todo: what happen if we will actually update the metadata on disk but fail and so in memory state will not be updated
-        wait_full_body(coro, &completion).await?;
+        wait_all_results(coro, &completion).await?;
         self.meta.replace(meta);
         Ok(())
     }

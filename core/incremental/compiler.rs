@@ -1310,7 +1310,7 @@ mod tests {
                 has_rowid: true,
                 is_strict: false,
                 has_autoincrement: false,
-                unique_sets: None,
+                unique_sets: vec![],
             };
             schema.add_btree_table(Arc::new(users_table));
             let sales_table = BTreeTable {
@@ -1346,7 +1346,7 @@ mod tests {
                 has_rowid: true,
                 is_strict: false,
                 has_autoincrement: false,
-                unique_sets: None,
+                unique_sets: vec![],
             };
             schema.add_btree_table(Arc::new(sales_table));
 

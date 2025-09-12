@@ -143,9 +143,24 @@ impl Display for DeletePlan {
 
                     writeln!(f, "{indent}DELETE FROM {table_name}")?;
                 }
-                Operation::Search { .. } => {
-                    panic!("DELETE plans should not contain search operations");
-                }
+                Operation::Search(search) => match search {
+                    Search::RowidEq { .. } | Search::Seek { index: None, .. } => {
+                        writeln!(
+                            f,
+                            "{}SEARCH {} USING INTEGER PRIMARY KEY (rowid=?)",
+                            indent, reference.identifier
+                        )?;
+                    }
+                    Search::Seek {
+                        index: Some(index), ..
+                    } => {
+                        writeln!(
+                            f,
+                            "{}SEARCH {} USING INDEX {}",
+                            indent, reference.identifier, index.name
+                        )?;
+                    }
+                },
             }
         }
         Ok(())

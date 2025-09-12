@@ -18,7 +18,6 @@ export interface NativeDatabase {
 
     prepare(sql: string): NativeStatement;
 
-    pluck(pluckMode: boolean);
     defaultSafeIntegers(toggle: boolean);
     totalChanges(): number;
     changes(): number;
@@ -32,6 +31,11 @@ export const STEP_ROW = 1;
 export const STEP_DONE = 2;
 export const STEP_IO = 3;
 
+export interface TableColumn {
+    name: string,
+    type: string
+}
+
 export interface NativeStatement {
     stepAsync(): Promise<number>;
     stepSync(): number;
@@ -39,7 +43,7 @@ export interface NativeStatement {
     pluck(pluckMode: boolean);
     safeIntegers(toggle: boolean);
     raw(toggle: boolean);
-    columns(): string[];
+    columns(): TableColumn[];
     row(): any;
     reset();
     finalize();

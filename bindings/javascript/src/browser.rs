@@ -28,7 +28,6 @@ pub fn init_thread_pool() -> napi::Result<AsyncTask<NoopTask>> {
 
 pub struct ConnectTask {
     path: String,
-    is_memory: bool,
     io: Arc<dyn turso_core::IO>,
 }
 
@@ -70,7 +69,7 @@ impl Task for ConnectTask {
             Some(result.db),
             self.io.clone(),
             result.conn,
-            self.is_memory,
+            self.path.clone(),
         ))
     }
 }
@@ -88,16 +87,11 @@ pub fn connect(path: String, opts: Option<DatabaseOpts>) -> Result<AsyncTask<Con
     let task = if is_memory(&path) {
         ConnectTask {
             io: Arc::new(turso_core::MemoryIO::new()),
-            is_memory: true,
             path,
         }
     } else {
         let io = Arc::new(Opfs::new()?);
-        ConnectTask {
-            io,
-            is_memory: false,
-            path,
-        }
+        ConnectTask { io, path }
     };
     Ok(AsyncTask::new(task))
 }

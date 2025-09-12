@@ -88,7 +88,7 @@ pub fn optimize_select_plan(plan: &mut SelectPlan, schema: &Schema) -> Result<()
     Ok(())
 }
 
-fn optimize_delete_plan(plan: &mut DeletePlan, _schema: &Schema) -> Result<()> {
+fn optimize_delete_plan(plan: &mut DeletePlan, schema: &Schema) -> Result<()> {
     rewrite_exprs_delete(plan)?;
     if let ConstantConditionEliminationResult::ImpossibleCondition =
         eliminate_constant_conditions(&mut plan.where_clause)?
@@ -97,15 +97,14 @@ fn optimize_delete_plan(plan: &mut DeletePlan, _schema: &Schema) -> Result<()> {
         return Ok(());
     }
 
-    // FIXME: don't use indexes for delete right now because it's buggy. See for example:
-    // https://github.com/tursodatabase/turso/issues/1714
-    // let _ = optimize_table_access(
-    //     &mut plan.table_references,
-    //     &schema.indexes,
-    //     &mut plan.where_clause,
-    //     &mut plan.order_by,
-    //     &mut None,
-    // )?;
+    let _ = optimize_table_access(
+        schema,
+        &mut plan.table_references,
+        &schema.indexes,
+        &mut plan.where_clause,
+        &mut plan.order_by,
+        &mut None,
+    )?;
 
     Ok(())
 }

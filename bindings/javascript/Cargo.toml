@@ -20,6 +20,6 @@ tracing.workspace = true
 [features]
 encryption = ["turso_core/encryption"]
 browser = []
-
+tracing_release = ["turso_core/tracing_release"]
 [build-dependencies]
 napi-build = "2.2.3"

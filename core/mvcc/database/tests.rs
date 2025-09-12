@@ -983,20 +983,20 @@ Terminated   | Irrelevant         | Reread V’s End field. TE has terminated so
 or not found |                    | the timestamp.
 */
 
-fn new_tx(tx_id: TxID, begin_ts: u64, state: TransactionState) -> RwLock<Transaction> {
+fn new_tx(tx_id: TxID, begin_ts: u64, state: TransactionState) -> Transaction {
     let state = state.into();
-    RwLock::new(Transaction {
+    Transaction {
         state,
         tx_id,
         begin_ts,
         write_set: SkipSet::new(),
         read_set: SkipSet::new(),
-    })
+    }
 }
 
 #[test]
 fn test_snapshot_isolation_tx_visible1() {
-    let txs: SkipMap<TxID, RwLock<Transaction>> = SkipMap::from_iter([
+    let txs: SkipMap<TxID, Transaction> = SkipMap::from_iter([
         (1, new_tx(1, 1, TransactionState::Committed(2))),
         (2, new_tx(2, 2, TransactionState::Committed(5))),
         (3, new_tx(3, 3, TransactionState::Aborted)),
@@ -1006,7 +1006,6 @@ fn test_snapshot_isolation_tx_visible1() {
     ]);
 
     let current_tx = new_tx(4, 4, TransactionState::Preparing);
-    let current_tx = current_tx.read();
 
     let rv_visible = |begin: TxTimestampOrID, end: Option<TxTimestampOrID>| {
         let row_version = RowVersion {
@@ -1309,7 +1308,7 @@ fn test_concurrent_writes() {
                 }
             }
         }
-        db.get_db().io.run_once().unwrap();
+        db.get_db().io.step().unwrap();
 
         if all_finished {
             break;
