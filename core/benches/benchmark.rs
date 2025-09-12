@@ -758,6 +758,7 @@ fn bench_limbo_mvcc(
         for conn in connecitons.iter_mut() {
             if conn.current_statement.is_none() && !conn.inserts.is_empty() {
                 let write = conn.inserts.pop().unwrap();
+                conn.conn.execute("BEGIN CONCURRENT").unwrap();
                 conn.current_statement = Some(conn.conn.prepare(&write).unwrap());
                 conn.current_insert = Some(write);
             }
@@ -771,8 +772,8 @@ fn bench_limbo_mvcc(
                 // No interrupt because insert doesn't interrupt
                 // No busy because insert in mvcc should be multi concurrent write
                 Ok(StepResult::Done) => {
-                    conn.current_statement = None;
-                    conn.current_insert = None;
+                    // Now do commit
+                    conn.current_statement = Some(conn.conn.prepare("COMMIT").unwrap());
                 }
                 Ok(StepResult::IO) => {
                     stmt.step().unwrap();

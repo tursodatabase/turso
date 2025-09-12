@@ -1047,11 +1047,9 @@ pub fn handle_program_error(
         // Table locked errors, e.g. trying to checkpoint in an interactive transaction, do not cause a rollback.
         LimboError::TableLocked => {}
         _ => {
-            if let Some(_mv_store) = mv_store {
-                if let Some(_tx_id) = connection.mv_tx_id.get() {
-                    // println!("rollback_tx(tx_id={})", tx_id);
-                    // println!("error: {err:?}");
-                    // mv_store.rollback_tx(tx_id, pager.clone());
+            if let Some(mv_store) = mv_store {
+                if let Some(tx_id) = connection.mv_tx_id.get() {
+                    mv_store.rollback_tx(tx_id, pager.clone());
                 }
             } else {
                 pager
