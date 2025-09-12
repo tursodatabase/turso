@@ -1,4 +1,5 @@
 pub mod grammar_generator;
+pub mod rowid_alias;
 
 #[cfg(test)]
 mod tests {
