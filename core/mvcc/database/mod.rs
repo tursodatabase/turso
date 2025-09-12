@@ -1287,7 +1287,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             LimboResult::Busy => {
                 tracing::debug!("begin_exclusive_tx: tx_id={} failed with Busy", tx_id);
                 // Failed to get pager lock - release our exclusive lock
-                panic!("begin_exclusive_tx: tx_id={} failed with Busy, this should never happen as we were able to lock mvcc exclusive write lock", tx_id);
+                panic!("begin_exclusive_tx: tx_id={tx_id} failed with Busy, this should never happen as we were able to lock mvcc exclusive write lock");
             }
             LimboResult::Ok => {
                 let tx = Transaction::new(tx_id, begin_ts);
