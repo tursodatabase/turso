@@ -75,6 +75,7 @@ use std::{
         atomic::{AtomicUsize, Ordering},
         Arc, LazyLock, Mutex, Weak,
     },
+    time::Duration,
 };
 #[cfg(feature = "fs")]
 use storage::database::DatabaseFile;
@@ -2098,6 +2099,40 @@ impl Connection {
     }
 }
 
+#[derive(Debug, Default)]
+struct BusyTimeout {
+    /// Busy timeout instant
+    timeout: Option<Instant>,
+    iteration: usize,
+}
+
+impl BusyTimeout {
+    const DELAYS: [std::time::Duration; 12] = [
+        Duration::from_millis(1),
+        Duration::from_millis(2),
+        Duration::from_millis(5),
+        Duration::from_millis(10),
+        Duration::from_millis(15),
+        Duration::from_millis(20),
+        Duration::from_millis(25),
+        Duration::from_millis(25),
+        Duration::from_millis(25),
+        Duration::from_millis(50),
+        Duration::from_millis(50),
+        Duration::from_millis(100),
+    ];
+
+    pub fn timeout(&self) -> Option<Instant> {
+        self.timeout
+    }
+
+    /// Modifies in place the next timeout instant
+    pub fn next_timeout(&mut self, now: Instant) {
+        self.iteration = self.iteration.saturating_add(1);
+        self.timeout = Self::DELAYS.get(self.iteration).map(|delay| now + *delay);
+    }
+}
+
 pub struct Statement {
     program: vdbe::Program,
     state: vdbe::ProgramState,
@@ -2111,6 +2146,8 @@ pub struct Statement {
     query_mode: QueryMode,
     /// Flag to show if the statement was busy
     busy: bool,
+    /// Busy timeout instant
+    busy_timeout: BusyTimeout,
 }
 
 impl Statement {
@@ -2135,6 +2172,7 @@ impl Statement {
             accesses_db,
             query_mode,
             busy: false,
+            busy_timeout: BusyTimeout::default(),
         }
     }
     pub fn get_query_mode(&self) -> QueryMode {
@@ -2154,7 +2192,16 @@ impl Statement {
     }
 
     pub fn step(&mut self) -> Result<StepResult> {
-        let res = if !self.accesses_db {
+        if let Some(instant) = self.busy_timeout.timeout() {
+            let now = self.pager.io.now();
+
+            if instant > now {
+                // Yield the query as the timeout has not been reached yet
+                return Ok(StepResult::IO);
+            }
+        }
+
+        let mut res = if !self.accesses_db {
             self.program.step(
                 &mut self.state,
                 self.mv_store.clone(),
@@ -2193,6 +2240,14 @@ impl Statement {
             self.busy = false;
         } else {
             self.busy = true;
+        }
+
+        if matches!(res, Ok(StepResult::Busy)) {
+            self.busy_timeout.next_timeout(self.pager.io.now());
+            if self.busy_timeout.timeout().is_some() {
+                // Yield if there is a next timeout
+                res = Ok(StepResult::IO);
+            }
         }
 
         res
