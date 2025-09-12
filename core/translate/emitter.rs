@@ -191,6 +191,7 @@ pub enum TransactionMode {
     None,
     Read,
     Write,
+    Concurrent,
 }
 
 /// Main entry point for emitting bytecode for a SQL query

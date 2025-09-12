@@ -1,8 +1,6 @@
 import { registerFileAtWorker, unregisterFileAtWorker } from "@tursodatabase/database-browser-common"
 import { DatabasePromise, DatabaseOpts, NativeDatabase } from "@tursodatabase/database-common"
-import { ProtocolIo, run, SyncOpts, RunOpts, DatabaseRowMutation, DatabaseRowStatement, DatabaseRowTransformResult, memoryIO } from "@tursodatabase/sync-common";
-import { connect as nativeConnect, initThreadPool, MainWorker } from "#index";
-import { Database as NativeDB, SyncEngine } from "#index";
+import { ProtocolIo, run, SyncOpts, RunOpts, memoryIO } from "@tursodatabase/sync-common";
 
 let BrowserIo: ProtocolIo = {
     async read(path: string): Promise<Buffer | Uint8Array | null> {
@@ -24,13 +22,15 @@ class Database extends DatabasePromise {
     runOpts: RunOpts;
     engine: any;
     io: ProtocolIo;
+    worker: Worker | null;
     fsPath: string | null;
-    constructor(db: NativeDatabase, io: ProtocolIo, runOpts: RunOpts, engine: any, fsPath: string | null, opts: DatabaseOpts = {}) {
+    constructor(db: NativeDatabase, io: ProtocolIo, worker: Worker | null, runOpts: RunOpts, engine: any, fsPath: string | null, opts: DatabaseOpts = {}) {
         super(db, opts)
+        this.io = io;
+        this.worker = worker;
         this.runOpts = runOpts;
         this.engine = engine;
         this.fsPath = fsPath;
-        this.io = io;
     }
     async sync() {
         await run(this.runOpts, this.io, this.engine, this.engine.sync());
@@ -50,13 +50,13 @@ class Database extends DatabasePromise {
     override async close(): Promise<void> {
         this.db.close();
         this.engine.close();
-        if (this.fsPath != null) {
+        if (this.fsPath != null && this.worker != null) {
             await Promise.all([
-                unregisterFileAtWorker(MainWorker, this.fsPath),
-                unregisterFileAtWorker(MainWorker, `${this.fsPath}-wal`),
-                unregisterFileAtWorker(MainWorker, `${this.fsPath}-revert`),
-                unregisterFileAtWorker(MainWorker, `${this.fsPath}-info`),
-                unregisterFileAtWorker(MainWorker, `${this.fsPath}-changes`),
+                unregisterFileAtWorker(this.worker, this.fsPath),
+                unregisterFileAtWorker(this.worker, `${this.fsPath}-wal`),
+                unregisterFileAtWorker(this.worker, `${this.fsPath}-revert`),
+                unregisterFileAtWorker(this.worker, `${this.fsPath}-info`),
+                unregisterFileAtWorker(this.worker, `${this.fsPath}-changes`),
             ]);
         }
     }
@@ -69,8 +69,8 @@ class Database extends DatabasePromise {
  * @param {Object} opts - Options for database behavior.
  * @returns {Promise<Database>} - A promise that resolves to a Database instance.
  */
-async function connect(opts: SyncOpts): Promise<Database> {
-    const engine = new SyncEngine({
+async function connect(opts: SyncOpts, connect: (any) => any, init: () => Promise<Worker>): Promise<Database> {
+    const engine = connect({
         path: opts.path,
         clientName: opts.clientName,
         tablesIgnore: opts.tablesIgnore,
@@ -90,24 +90,19 @@ async function connect(opts: SyncOpts): Promise<Database> {
     const isMemory = opts.path == ':memory:';
     let io = isMemory ? memoryIO() : BrowserIo;
 
-    await initThreadPool();
-    if (MainWorker == null) {
-        throw new Error("panic: MainWorker is not set");
-    }
+    const worker = await init();
     if (!isMemory) {
         await Promise.all([
-            registerFileAtWorker(MainWorker, opts.path),
-            registerFileAtWorker(MainWorker, `${opts.path}-wal`),
-            registerFileAtWorker(MainWorker, `${opts.path}-revert`),
-            registerFileAtWorker(MainWorker, `${opts.path}-info`),
-            registerFileAtWorker(MainWorker, `${opts.path}-changes`),
+            registerFileAtWorker(worker, opts.path),
+            registerFileAtWorker(worker, `${opts.path}-wal`),
+            registerFileAtWorker(worker, `${opts.path}-revert`),
+            registerFileAtWorker(worker, `${opts.path}-info`),
+            registerFileAtWorker(worker, `${opts.path}-changes`),
         ]);
     }
     await run(runOpts, io, engine, engine.init());
-
     const nativeDb = engine.open();
-    return new Database(nativeDb as any, io, runOpts, engine, isMemory ? null : opts.path, {});
+    return new Database(nativeDb as any, io, worker, runOpts, engine, isMemory ? null : opts.path, {});
 }
 
-export { connect, Database, }
-export type { DatabaseRowMutation, DatabaseRowStatement, DatabaseRowTransformResult }
+export { connect, Database }

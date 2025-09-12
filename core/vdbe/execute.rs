@@ -30,6 +30,7 @@ use crate::{
         },
         printf::exec_printf,
     },
+    translate::emitter::TransactionMode,
 };
 use crate::{get_cursor, MvCursor};
 use std::env::temp_dir;
@@ -2094,13 +2095,14 @@ pub fn op_transaction(
     load_insn!(
         Transaction {
             db,
-            write,
+            tx_mode,
             schema_cookie,
         },
         insn
     );
     let conn = program.connection.clone();
-    if *write && conn._db.open_flags.contains(OpenFlags::ReadOnly) {
+    let write = matches!(tx_mode, TransactionMode::Write);
+    if write && conn._db.open_flags.contains(OpenFlags::ReadOnly) {
         return Err(LimboError::ReadOnly);
     }
 
@@ -2116,7 +2118,7 @@ pub fn op_transaction(
             // instead of ending the read tx, just update the state to pending.
             (TransactionState::PendingUpgrade, write) => {
                 turso_assert!(
-                    *write,
+                    write,
                     "pending upgrade should only be set for write transactions"
                 );
                 (
@@ -2164,11 +2166,59 @@ pub fn op_transaction(
             // if header_schema_cookie != *schema_cookie {
             //     return Err(LimboError::SchemaUpdated);
             // }
-            let tx_id = mv_store.begin_tx(pager.clone());
+            let tx_id = match tx_mode {
+                TransactionMode::None | TransactionMode::Read | TransactionMode::Concurrent => {
+                    mv_store.begin_tx(pager.clone())
+                }
+                TransactionMode::Write => {
+                    return_if_io!(mv_store.begin_exclusive_tx(pager.clone()))
+                }
+            };
             conn.mv_transactions.borrow_mut().push(tx_id);
             program.connection.mv_tx_id.set(Some(tx_id));
+        } else if updated
+            && matches!(new_transaction_state, TransactionState::Write { .. })
+            && matches!(tx_mode, TransactionMode::Write)
+        {
+            // Handle upgrade from read to write transaction for MVCC
+            // Similar to non-MVCC path, we need to try upgrading to exclusive write transaction
+            turso_assert!(
+                !conn.is_nested_stmt.get(),
+                "nested stmt should not begin a new write transaction"
+            );
+            match mv_store.begin_exclusive_tx(pager.clone()) {
+                Ok(IOResult::Done(tx_id)) => {
+                    // Successfully upgraded to exclusive write transaction
+                    // Remove the old read transaction and replace with write transaction
+                    conn.mv_transactions.borrow_mut().push(tx_id);
+                    program.connection.mv_tx_id.set(Some(tx_id));
+                }
+                Err(LimboError::Busy) => {
+                    // We failed to upgrade to write transaction so put the transaction into its original state.
+                    // For MVCC, we don't need to end the transaction like in non-MVCC case, since MVCC transactions
+                    // can be restarted automatically if they haven't performed any reads or writes yet.
+                    // Just ensure the transaction state remains in its original state.
+                    assert_eq!(conn.transaction_state.get(), current_state);
+                    return Ok(InsnFunctionStepResult::Busy);
+                }
+                Ok(IOResult::IO(io)) => {
+                    // set the transaction state to pending so we don't have to
+                    // end the transaction.
+                    program
+                        .connection
+                        .transaction_state
+                        .replace(TransactionState::PendingUpgrade);
+                    return Ok(InsnFunctionStepResult::IO(io));
+                }
+                Err(e) => return Err(e),
+            }
         }
     } else {
+        if matches!(tx_mode, TransactionMode::Concurrent) {
+            return Err(LimboError::TxError(
+                "Concurrent transaction mode is only supported when MVCC is enabled".to_string(),
+            ));
+        }
         if updated && matches!(current_state, TransactionState::None) {
             turso_assert!(
                 !conn.is_nested_stmt.get(),
@@ -2275,19 +2325,25 @@ pub fn op_auto_commit(
         } else {
             conn.auto_commit.replace(*auto_commit);
         }
-    } else if !*auto_commit {
-        return Err(LimboError::TxError(
-            "cannot start a transaction within a transaction".to_string(),
-        ));
-    } else if *rollback {
-        return Err(LimboError::TxError(
-            "cannot rollback - no transaction is active".to_string(),
-        ));
     } else {
-        return Err(LimboError::TxError(
-            "cannot commit - no transaction is active".to_string(),
-        ));
+        let mvcc_tx_active = program.connection.mv_tx_id.get().is_some();
+        if !mvcc_tx_active {
+            if !*auto_commit {
+                return Err(LimboError::TxError(
+                    "cannot start a transaction within a transaction".to_string(),
+                ));
+            } else if *rollback {
+                return Err(LimboError::TxError(
+                    "cannot rollback - no transaction is active".to_string(),
+                ));
+            } else {
+                return Err(LimboError::TxError(
+                    "cannot commit - no transaction is active".to_string(),
+                ));
+            }
+        }
     }
+
     program
         .commit_txn(pager.clone(), state, mv_store, *rollback)
         .map(Into::into)
@@ -5525,7 +5581,7 @@ pub fn op_insert(
                             .connection
                             .view_transaction_states
                             .get_or_create(view_name);
-                        tx_state.delete(key, values.clone());
+                        tx_state.delete(table_name, key, values.clone());
                     }
                 }
                 for view_name in dependent_views.iter() {
@@ -5534,7 +5590,7 @@ pub fn op_insert(
                         .view_transaction_states
                         .get_or_create(view_name);
 
-                    tx_state.insert(key, values.clone());
+                    tx_state.insert(table_name, key, values.clone());
                 }
 
                 break;
@@ -5668,7 +5724,7 @@ pub fn op_delete(
                             .connection
                             .view_transaction_states
                             .get_or_create(&view_name);
-                        tx_state.delete(key, values.clone());
+                        tx_state.delete(table_name, key, values.clone());
                     }
                 }
                 break;

@@ -74,11 +74,10 @@ pub fn translate_alter_table(
             }
 
             if column.unique
-                || btree.unique_sets.as_ref().is_some_and(|set| {
-                    set.iter().any(|set| {
-                        set.iter()
-                            .any(|(name, _)| name == &normalize_ident(column_name))
-                    })
+                || btree.unique_sets.iter().any(|set| {
+                    set.columns
+                        .iter()
+                        .any(|(name, _)| name == &normalize_ident(column_name))
                 })
             {
                 return Err(LimboError::ParseError(format!(

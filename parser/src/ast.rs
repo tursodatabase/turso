@@ -1530,6 +1530,8 @@ pub enum TransactionType {
     Immediate,
     /// `EXCLUSIVE`
     Exclusive,
+    /// `CONCURRENT`,
+    Concurrent,
 }
 
 /// Upsert clause

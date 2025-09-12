@@ -1,5 +1,5 @@
 import { expect, test, afterEach } from 'vitest'
-import { connect } from './promise.js'
+import { connect } from './promise-default.js'
 
 test('in-memory db', async () => {
     const db = await connect(":memory:");

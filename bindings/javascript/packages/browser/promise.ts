@@ -1,18 +1,19 @@
 import { registerFileAtWorker, unregisterFileAtWorker } from "@tursodatabase/database-browser-common"
 import { DatabasePromise, NativeDatabase, DatabaseOpts, SqliteError, } from "@tursodatabase/database-common"
-import { connect as nativeConnect, initThreadPool, MainWorker } from "#index";
 
 class Database extends DatabasePromise {
     path: string | null;
-    constructor(db: NativeDatabase, fsPath: string | null, opts: DatabaseOpts = {}) {
+    worker: Worker | null;
+    constructor(db: NativeDatabase, worker: Worker | null, fsPath: string | null, opts: DatabaseOpts = {}) {
         super(db, opts)
         this.path = fsPath;
+        this.worker = worker;
     }
     async close() {
-        if (this.path != null) {
+        if (this.path != null && this.worker != null) {
             await Promise.all([
-                unregisterFileAtWorker(MainWorker, this.path),
-                unregisterFileAtWorker(MainWorker, `${this.path}-wal`)
+                unregisterFileAtWorker(this.worker, this.path),
+                unregisterFileAtWorker(this.worker, `${this.path}-wal`)
             ]);
         }
         this.db.close();
@@ -26,21 +27,18 @@ class Database extends DatabasePromise {
  * @param {Object} opts - Options for database behavior.
  * @returns {Promise<Database>} - A promise that resolves to a Database instance.
  */
-async function connect(path: string, opts: DatabaseOpts = {}): Promise<Database> {
+async function connect(path: string, opts: DatabaseOpts, connect: any, init: () => Promise<Worker>): Promise<Database> {
     if (path == ":memory:") {
-        const db = await nativeConnect(path, { tracing: opts.tracing });
-        return new Database(db, null, opts);
+        const db = await connect(path, { tracing: opts.tracing });
+        return new Database(db, null, null, opts);
     }
-    await initThreadPool();
-    if (MainWorker == null) {
-        throw new Error("panic: MainWorker is not set");
-    }
+    const worker = await init();
     await Promise.all([
-        registerFileAtWorker(MainWorker, path),
-        registerFileAtWorker(MainWorker, `${path}-wal`)
+        registerFileAtWorker(worker, path),
+        registerFileAtWorker(worker, `${path}-wal`)
     ]);
-    const db = await nativeConnect(path, { tracing: opts.tracing });
-    return new Database(db, path, opts);
+    const db = await connect(path, { tracing: opts.tracing });
+    return new Database(db, worker, path, opts);
 }
 
 export { connect, Database, SqliteError }

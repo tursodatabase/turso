@@ -1,6 +1,6 @@
 {
   "name": "@tursodatabase/database-browser-common",
-  "version": "0.2.0-pre.1",
+  "version": "0.2.0-pre.3",
   "repository": {
     "type": "git",
     "url": "https://github.com/tursodatabase/turso"
@@ -21,5 +21,8 @@
     "tsc-build": "npm exec tsc",
     "build": "npm run tsc-build",
     "test": "echo 'no tests'"
+  },
+  "dependencies": {
+    "@tursodatabase/wasm-runtime": "^0.2.0-pre.3"
   }
 }

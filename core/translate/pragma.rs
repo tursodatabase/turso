@@ -77,6 +77,9 @@ pub fn translate_pragma(
         TransactionMode::Write => {
             program.begin_write_operation();
         }
+        TransactionMode::Concurrent => {
+            program.begin_concurrent_operation();
+        }
     }
 
     Ok(program)

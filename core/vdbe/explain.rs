@@ -652,14 +652,14 @@ pub fn insn_to_row(
                 0,
                 "".to_string(),
             ),
-            Insn::Transaction { db, write , schema_cookie} => (
+            Insn::Transaction { db, tx_mode, schema_cookie} => (
                 "Transaction",
                 *db as i32,
-                *write as i32,
+                *tx_mode as i32,
                 *schema_cookie as i32,
                 Value::build_text(""),
                 0,
-                format!("iDb={db} write={write}"),
+                format!("iDb={db} tx_mode={tx_mode:?}"),
             ),
             Insn::Goto { target_pc } => (
                 "Goto",
@@ -1722,6 +1722,15 @@ pub fn insn_to_row(
                 Value::build_text(""),
                 0,
                 format!("if (r[{}] < 0) goto {}", reg, target_pc.as_debug_int()),
+            ),
+            Insn::Explain { p1, p2, detail } => (
+                "Explain",
+                *p1 as i32,
+                p2.as_ref().map(|p| *p).unwrap_or(0) as i32,
+                0,
+                Value::build_text(detail.as_str()),
+                0,
+                String::new(),
             ),
         }
 }

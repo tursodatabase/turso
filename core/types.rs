@@ -2338,6 +2338,18 @@ pub enum Cursor {
     MaterializedView(Box<crate::incremental::cursor::MaterializedViewCursor>),
 }
 
+impl Debug for Cursor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BTree(..) => f.debug_tuple("BTree").finish(),
+            Self::Pseudo(..) => f.debug_tuple("Pseudo").finish(),
+            Self::Sorter(..) => f.debug_tuple("Sorter").finish(),
+            Self::Virtual(..) => f.debug_tuple("Virtual").finish(),
+            Self::MaterializedView(..) => f.debug_tuple("MaterializedView").finish(),
+        }
+    }
+}
+
 impl Cursor {
     pub fn new_btree(cursor: BTreeCursor) -> Self {
         Self::BTree(Box::new(cursor))

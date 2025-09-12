@@ -2,7 +2,7 @@ pub mod grammar_generator;
 
 #[cfg(test)]
 mod tests {
-    use rand::seq::IndexedRandom;
+    use rand::seq::{IndexedRandom, SliceRandom};
     use std::collections::HashSet;
 
     use rand::{Rng, SeedableRng};
@@ -11,7 +11,7 @@ mod tests {
 
     use crate::{
         common::{
-            limbo_exec_rows, limbo_exec_rows_fallible, rng_from_time, sqlite_exec_rows,
+            do_flush, limbo_exec_rows, limbo_exec_rows_fallible, rng_from_time, sqlite_exec_rows,
             TempDatabase,
         },
         fuzz::grammar_generator::{const_str, rand_int, rand_str, GrammarGenerator},
@@ -789,6 +789,130 @@ mod tests {
                 sqlite_results,
                 seed
             );
+        }
+    }
+
+    #[test]
+    pub fn ddl_compatibility_fuzz() {
+        let _ = env_logger::try_init();
+        let (mut rng, seed) = rng_from_time();
+        const ITERATIONS: usize = 1000;
+        for i in 0..ITERATIONS {
+            let db = TempDatabase::new_empty(true);
+            let conn = db.connect_limbo();
+            let num_cols = rng.random_range(1..=5);
+            let col_names: Vec<String> = (0..num_cols).map(|c| format!("c{c}")).collect();
+
+            // Decide whether to use a table-level PRIMARY KEY (possibly compound)
+            let use_table_pk = num_cols >= 1 && rng.random_bool(0.6);
+            let pk_len = if use_table_pk {
+                if num_cols == 1 {
+                    1
+                } else {
+                    rng.random_range(1..=num_cols.min(3))
+                }
+            } else {
+                0
+            };
+            let pk_cols: Vec<String> = if use_table_pk {
+                let mut col_names_shuffled = col_names.clone();
+                col_names_shuffled.shuffle(&mut rng);
+                col_names_shuffled.iter().take(pk_len).cloned().collect()
+            } else {
+                Vec::new()
+            };
+
+            let mut has_primary_key = false;
+
+            // Column definitions with optional types and column-level constraints
+            let mut column_defs: Vec<String> = Vec::new();
+            for name in col_names.iter() {
+                let mut parts = vec![name.clone()];
+                if rng.random_bool(0.7) {
+                    let types = ["INTEGER", "TEXT", "REAL", "BLOB", "NUMERIC"];
+                    let t = types[rng.random_range(0..types.len())];
+                    parts.push(t.to_string());
+                }
+                if !use_table_pk && !has_primary_key && rng.random_bool(0.3) {
+                    has_primary_key = true;
+                    parts.push("PRIMARY KEY".to_string());
+                } else if rng.random_bool(0.2) {
+                    parts.push("UNIQUE".to_string());
+                }
+                column_defs.push(parts.join(" "));
+            }
+
+            // Table-level constraints: PRIMARY KEY and some UNIQUE constraints (including compound)
+            let mut table_constraints: Vec<String> = Vec::new();
+            if use_table_pk {
+                let mut spec_parts: Vec<String> = Vec::new();
+                for col in pk_cols.iter() {
+                    if rng.random_bool(0.5) {
+                        let dir = if rng.random_bool(0.5) { "DESC" } else { "ASC" };
+                        spec_parts.push(format!("{col} {dir}"));
+                    } else {
+                        spec_parts.push(col.clone());
+                    }
+                }
+                table_constraints.push(format!("PRIMARY KEY ({})", spec_parts.join(", ")));
+            }
+
+            let num_uniques = if num_cols >= 2 {
+                rng.random_range(0..=2)
+            } else {
+                rng.random_range(0..=1)
+            };
+            for _ in 0..num_uniques {
+                let len = if num_cols == 1 {
+                    1
+                } else {
+                    rng.random_range(1..=num_cols.min(3))
+                };
+                let start = rng.random_range(0..num_cols);
+                let mut uniq_cols: Vec<String> = Vec::new();
+                for k in 0..len {
+                    let idx = (start + k) % num_cols;
+                    uniq_cols.push(col_names[idx].clone());
+                }
+                table_constraints.push(format!("UNIQUE ({})", uniq_cols.join(", ")));
+            }
+
+            let mut elements = column_defs;
+            elements.extend(table_constraints);
+            let table_name = format!("t{i}");
+            let create_sql = format!("CREATE TABLE {table_name} ({})", elements.join(", "));
+
+            println!("{create_sql}");
+
+            limbo_exec_rows(&db, &conn, &create_sql);
+            do_flush(&conn, &db).unwrap();
+
+            // Open with rusqlite and verify integrity_check returns OK
+            let sqlite_conn = rusqlite::Connection::open(db.path.clone()).unwrap();
+            let rows = sqlite_exec_rows(&sqlite_conn, "PRAGMA integrity_check");
+            assert!(
+                !rows.is_empty(),
+                "integrity_check returned no rows (seed: {seed})"
+            );
+            match &rows[0][0] {
+                Value::Text(s) => assert!(
+                    s.eq_ignore_ascii_case("ok"),
+                    "integrity_check failed (seed: {seed}): {rows:?}",
+                ),
+                other => panic!("unexpected integrity_check result (seed: {seed}): {other:?}",),
+            }
+
+            // Verify the stored SQL matches the create table statement
+            let conn = db.connect_limbo();
+            let verify_sql = format!(
+                "SELECT sql FROM sqlite_schema WHERE name = '{table_name}' and type = 'table'"
+            );
+            let res = limbo_exec_rows(&db, &conn, &verify_sql);
+            assert!(res.len() == 1, "Expected 1 row, got {res:?}");
+            let Value::Text(s) = &res[0][0] else {
+                panic!("sql should be TEXT");
+            };
+            assert_eq!(s.as_str(), create_sql);
         }
     }
 

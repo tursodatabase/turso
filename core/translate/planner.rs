@@ -549,7 +549,7 @@ fn parse_table(
             primary_key_columns: Vec::new(),
             has_rowid: true,
             is_strict: false,
-            unique_sets: None,
+            unique_sets: vec![],
         });
         drop(view_guard);
 

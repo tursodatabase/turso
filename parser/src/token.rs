@@ -178,6 +178,7 @@ pub enum TokenType {
     TK_OVER = 166,
     TK_FILTER = 167,
     TK_ILLEGAL = 185,
+    TK_CONCURRENT = 186,
 }
 
 impl TokenType {
@@ -229,6 +230,7 @@ impl TokenType {
             TokenType::TK_EXCEPT => Some("EXCEPT"),
             TokenType::TK_EXCLUDE => Some("EXCLUDE"),
             TokenType::TK_EXCLUSIVE => Some("EXCLUSIVE"),
+            TokenType::TK_CONCURRENT => Some("CONCURRENT"),
             TokenType::TK_EXISTS => Some("EXISTS"),
             TokenType::TK_EXPLAIN => Some("EXPLAIN"),
             TokenType::TK_FAIL => Some("FAIL"),
@@ -359,6 +361,7 @@ impl Display for TokenType {
             TK_DEFERRED => "TK_DEFERRED",
             TK_IMMEDIATE => "TK_IMMEDIATE",
             TK_EXCLUSIVE => "TK_EXCLUSIVE",
+            TK_CONCURRENT => "TK_CONCURRENT",
             TK_COMMIT => "TK_COMMIT",
             TK_END => "TK_END",
             TK_ROLLBACK => "TK_ROLLBACK",
@@ -531,15 +534,15 @@ impl TokenType {
         match self {
             TK_ABORT | TK_ACTION | TK_AFTER | TK_ANALYZE | TK_ASC | TK_ATTACH | TK_BEFORE
             | TK_BEGIN | TK_BY | TK_CASCADE | TK_CAST | TK_CONFLICT | TK_DATABASE | TK_DEFERRED
-            | TK_DESC | TK_DETACH | TK_DO | TK_EACH | TK_END | TK_EXCLUSIVE | TK_EXPLAIN
-            | TK_FAIL | TK_FOR | TK_IGNORE | TK_IMMEDIATE | TK_INITIALLY | TK_INSTEAD
-            | TK_LIKE_KW | TK_MATCH | TK_NO | TK_PLAN | TK_QUERY | TK_KEY | TK_OF | TK_OFFSET
-            | TK_PRAGMA | TK_RAISE | TK_RECURSIVE | TK_RELEASE | TK_REPLACE | TK_RESTRICT
-            | TK_ROW | TK_ROWS | TK_ROLLBACK | TK_SAVEPOINT | TK_TEMP | TK_TRIGGER | TK_VACUUM
-            | TK_VIEW | TK_VIRTUAL | TK_WITH | TK_NULLS | TK_FIRST | TK_LAST | TK_CURRENT
-            | TK_FOLLOWING | TK_PARTITION | TK_PRECEDING | TK_RANGE | TK_UNBOUNDED | TK_EXCLUDE
-            | TK_GROUPS | TK_OTHERS | TK_TIES | TK_ALWAYS | TK_MATERIALIZED | TK_REINDEX
-            | TK_RENAME | TK_CTIME_KW | TK_IF => TK_ID,
+            | TK_DESC | TK_DETACH | TK_DO | TK_EACH | TK_END | TK_EXCLUSIVE | TK_CONCURRENT
+            | TK_EXPLAIN | TK_FAIL | TK_FOR | TK_IGNORE | TK_IMMEDIATE | TK_INITIALLY
+            | TK_INSTEAD | TK_LIKE_KW | TK_MATCH | TK_NO | TK_PLAN | TK_QUERY | TK_KEY | TK_OF
+            | TK_OFFSET | TK_PRAGMA | TK_RAISE | TK_RECURSIVE | TK_RELEASE | TK_REPLACE
+            | TK_RESTRICT | TK_ROW | TK_ROWS | TK_ROLLBACK | TK_SAVEPOINT | TK_TEMP
+            | TK_TRIGGER | TK_VACUUM | TK_VIEW | TK_VIRTUAL | TK_WITH | TK_NULLS | TK_FIRST
+            | TK_LAST | TK_CURRENT | TK_FOLLOWING | TK_PARTITION | TK_PRECEDING | TK_RANGE
+            | TK_UNBOUNDED | TK_EXCLUDE | TK_GROUPS | TK_OTHERS | TK_TIES | TK_ALWAYS
+            | TK_MATERIALIZED | TK_REINDEX | TK_RENAME | TK_CTIME_KW | TK_IF => TK_ID,
             // | TK_COLUMNKW | TK_UNION | TK_EXCEPT | TK_INTERSECT | TK_GENERATED | TK_WITHOUT
             // see comments in `next_token` of parser
             _ => self,

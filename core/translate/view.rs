@@ -75,7 +75,7 @@ pub fn translate_create_materialized_view(
         primary_key_columns: vec![], // Materialized views use implicit rowid
         has_rowid: true,
         is_strict: false,
-        unique_sets: None,
+        unique_sets: vec![],
     });
 
     // Allocate a cursor for writing to the view's btree during population

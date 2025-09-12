@@ -141,24 +141,24 @@ pub struct PageInner {
 pub const TAG_UNSET: u64 = u64::MAX;
 
 /// Bit layout:
-/// seq: 20
+/// epoch: 20
 /// frame: 44
 const EPOCH_BITS: u32 = 20;
 const FRAME_BITS: u32 = 64 - EPOCH_BITS;
-const SEQ_SHIFT: u32 = FRAME_BITS;
-const SEQ_MAX: u32 = (1u32 << EPOCH_BITS) - 1;
+const EPOCH_SHIFT: u32 = FRAME_BITS;
+const EPOCH_MAX: u32 = (1u32 << EPOCH_BITS) - 1;
 const FRAME_MAX: u64 = (1u64 << FRAME_BITS) - 1;
 
 #[inline]
 pub fn pack_tag_pair(frame: u64, seq: u32) -> u64 {
-    ((seq as u64) << SEQ_SHIFT) | (frame & FRAME_MAX)
+    ((seq as u64) << EPOCH_SHIFT) | (frame & FRAME_MAX)
 }
 
 #[inline]
 pub fn unpack_tag_pair(tag: u64) -> (u64, u32) {
-    let seq = ((tag >> SEQ_SHIFT) & (SEQ_MAX as u64)) as u32;
+    let epoch = ((tag >> EPOCH_SHIFT) & (EPOCH_MAX as u64)) as u32;
     let frame = tag & FRAME_MAX;
-    (frame, seq)
+    (frame, epoch)
 }
 
 #[derive(Debug)]
@@ -217,12 +217,14 @@ impl Page {
 
     pub fn set_dirty(&self) {
         tracing::debug!("set_dirty(page={})", self.get().id);
+        self.clear_wal_tag();
         self.get().flags.fetch_or(PAGE_DIRTY, Ordering::Release);
     }
 
     pub fn clear_dirty(&self) {
         tracing::debug!("clear_dirty(page={})", self.get().id);
         self.get().flags.fetch_and(!PAGE_DIRTY, Ordering::Release);
+        self.clear_wal_tag();
     }
 
     pub fn is_loaded(&self) -> bool {
@@ -283,15 +285,15 @@ impl Page {
     }
 
     #[inline]
-    /// Set the WAL tag from a (frame, seq) pair.
+    /// Set the WAL tag from a (frame, epoch) pair.
     /// If inputs are invalid, stores TAG_UNSET, which will prevent
     /// the cached page from being used during checkpoint.
-    pub fn set_wal_tag(&self, frame: u64, seq: u32) {
+    pub fn set_wal_tag(&self, frame: u64, epoch: u32) {
         // use only first 20 bits for seq (max: 1048576)
-        let seq20 = seq & SEQ_MAX;
+        let e = epoch & EPOCH_MAX;
         self.get()
             .wal_tag
-            .store(pack_tag_pair(frame, seq20), Ordering::Release);
+            .store(pack_tag_pair(frame, e), Ordering::Release);
     }
 
     #[inline]
@@ -306,9 +308,9 @@ impl Page {
     }
 
     #[inline]
-    pub fn is_valid_for_checkpoint(&self, target_frame: u64, seq: u32) -> bool {
+    pub fn is_valid_for_checkpoint(&self, target_frame: u64, epoch: u32) -> bool {
         let (f, s) = self.wal_tag_pair();
-        f == target_frame && s == seq && !self.is_dirty()
+        f == target_frame && s == epoch && !self.is_dirty() && self.is_loaded() && !self.is_locked()
     }
 }
 
@@ -1196,12 +1198,9 @@ impl Pager {
         let page_key = PageCacheKey::new(page_idx);
         let page = page_cache.get(&page_key)?.and_then(|page| {
             if page.is_valid_for_checkpoint(target_frame, seq) {
-                tracing::trace!(
-                    "cache_get_for_checkpoint: page {} frame {} is valid",
-                    page_idx,
-                    target_frame
+                tracing::debug!(
+                    "cache_get_for_checkpoint: page {page_idx} frame {target_frame} is valid",
                 );
-                page.pin();
                 Some(page.clone())
             } else {
                 tracing::trace!(
@@ -2110,6 +2109,7 @@ impl Pager {
             ))
         })?;
         page.set_loaded();
+        page.clear_wal_tag();
         Ok(())
     }
 
@@ -2203,6 +2203,7 @@ pub fn allocate_new_page(page_id: usize, buffer_pool: &Arc<BufferPool>, offset: 
         let buffer = buffer_pool.get_page();
         let buffer = Arc::new(buffer);
         page.set_loaded();
+        page.clear_wal_tag();
         page.get().contents = Some(PageContent::new(offset, buffer));
     }
     page

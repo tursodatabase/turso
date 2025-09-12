@@ -41,7 +41,6 @@ mod numeric;
 
 use crate::incremental::view::AllViewsTxState;
 use crate::storage::encryption::CipherMode;
-use crate::translate::optimizer::optimize_plan;
 use crate::translate::pragma::TURSO_CDC_DEFAULT_TABLE_NAME;
 #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
 use crate::types::{WalFrameInfo, WalState};
@@ -67,7 +66,6 @@ use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
     fmt::{self, Display},
-    io::Write,
     num::NonZero,
     ops::Deref,
     rc::Rc,
@@ -91,7 +89,6 @@ pub use storage::{
     wal::{CheckpointMode, CheckpointResult, Wal, WalFile, WalFileShared},
 };
 use tracing::{instrument, Level};
-use translate::select::prepare_select_plan;
 use turso_macros::match_ignore_ascii_case;
 use turso_parser::{ast, ast::Cmd, parser::Parser};
 use types::IOResult;
@@ -99,7 +96,6 @@ pub use types::RefValue;
 pub use types::Value;
 use util::parse_schema_rows;
 pub use util::IOExt;
-use vdbe::builder::TableRefIdCounter;
 pub use vdbe::{builder::QueryMode, explain::EXPLAIN_COLUMNS, explain::EXPLAIN_QUERY_PLAN_COLUMNS};
 
 /// Configuration for database features
@@ -1168,43 +1164,18 @@ impl Connection {
         let syms = self.syms.borrow();
         let pager = self.pager.borrow().clone();
         let mode = QueryMode::new(&cmd);
-        match cmd {
-            Cmd::Stmt(ref stmt) | Cmd::Explain(ref stmt) => {
-                let program = translate::translate(
-                    self.schema.borrow().deref(),
-                    stmt.clone(),
-                    pager.clone(),
-                    self.clone(),
-                    &syms,
-                    mode,
-                    input,
-                )?;
-                let stmt = Statement::new(program, self._db.mv_store.clone(), pager, mode);
-                Ok(Some(stmt))
-            }
-            Cmd::ExplainQueryPlan(stmt) => {
-                let mut table_ref_counter = TableRefIdCounter::new();
-
-                // TODO: we need OP_Explain
-                match stmt {
-                    ast::Stmt::Select(select) => {
-                        let mut plan = prepare_select_plan(
-                            self.schema.borrow().deref(),
-                            select,
-                            &syms,
-                            &[],
-                            &mut table_ref_counter,
-                            translate::plan::QueryDestination::ResultRows,
-                            &self.clone(),
-                        )?;
-                        optimize_plan(&mut plan, self.schema.borrow().deref())?;
-                        let _ = std::io::stdout().write_all(plan.to_string().as_bytes());
-                    }
-                    _ => todo!(),
-                }
-                Ok(None)
-            }
-        }
+        let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
+        let program = translate::translate(
+            self.schema.borrow().deref(),
+            stmt.clone(),
+            pager.clone(),
+            self.clone(),
+            &syms,
+            mode,
+            input,
+        )?;
+        let stmt = Statement::new(program, self._db.mv_store.clone(), pager, mode);
+        Ok(Some(stmt))
     }
 
     pub fn query_runner<'a>(self: &'a Arc<Connection>, sql: &'a [u8]) -> QueryRunner<'a> {
@@ -2075,9 +2046,10 @@ pub struct Statement {
     /// Used to determine whether we need to check for schema changes when
     /// starting a transaction.
     accesses_db: bool,
-
     /// indicates if the statement is a NORMAL/EXPLAIN/EXPLAIN QUERY PLAN
     query_mode: QueryMode,
+    /// Flag to show if the statement was busy
+    busy: bool,
 }
 
 impl Statement {
@@ -2088,14 +2060,12 @@ impl Statement {
         query_mode: QueryMode,
     ) -> Self {
         let accesses_db = program.accesses_db;
-        let state = vdbe::ProgramState::new(
-            match query_mode {
-                QueryMode::Normal => program.max_registers,
-                QueryMode::Explain => EXPLAIN_COLUMNS.len(),
-                QueryMode::ExplainQueryPlan => EXPLAIN_QUERY_PLAN_COLUMNS.len(),
-            },
-            program.cursor_ref.len(),
-        );
+        let (max_registers, cursor_count) = match query_mode {
+            QueryMode::Normal => (program.max_registers, program.cursor_ref.len()),
+            QueryMode::Explain => (EXPLAIN_COLUMNS.len(), 0),
+            QueryMode::ExplainQueryPlan => (EXPLAIN_QUERY_PLAN_COLUMNS.len(), 0),
+        };
+        let state = vdbe::ProgramState::new(max_registers, cursor_count);
         Self {
             program,
             state,
@@ -2103,6 +2073,7 @@ impl Statement {
             pager,
             accesses_db,
             query_mode,
+            busy: false,
         }
     }
     pub fn get_query_mode(&self) -> QueryMode {
@@ -2158,6 +2129,9 @@ impl Statement {
         if matches!(res, Ok(StepResult::Done)) {
             let mut conn_metrics = self.program.connection.metrics.borrow_mut();
             conn_metrics.record_statement(self.state.metrics.clone());
+            self.busy = false;
+        } else {
+            self.busy = true;
         }
 
         res
@@ -2219,7 +2193,12 @@ impl Statement {
         };
         // Save parameters before they are reset
         let parameters = std::mem::take(&mut self.state.parameters);
-        self.reset();
+        let (max_registers, cursor_count) = match self.query_mode {
+            QueryMode::Normal => (self.program.max_registers, self.program.cursor_ref.len()),
+            QueryMode::Explain => (EXPLAIN_COLUMNS.len(), 0),
+            QueryMode::ExplainQueryPlan => (EXPLAIN_QUERY_PLAN_COLUMNS.len(), 0),
+        };
+        self._reset(Some(max_registers), Some(cursor_count));
         // Load the parameters back into the state
         self.state.parameters = parameters;
         Ok(())
@@ -2319,11 +2298,24 @@ impl Statement {
     }
 
     pub fn reset(&mut self) {
-        self.state.reset();
+        self._reset(None, None);
+    }
+
+    pub fn _reset(&mut self, max_registers: Option<usize>, max_cursors: Option<usize>) {
+        self.state.reset(max_registers, max_cursors);
+        self.busy = false;
     }
 
     pub fn row(&self) -> Option<&Row> {
         self.state.result_row.as_ref()
+    }
+
+    pub fn get_sql(&self) -> &str {
+        &self.program.sql
+    }
+
+    pub fn is_busy(&self) -> bool {
+        self.busy
     }
 }
 

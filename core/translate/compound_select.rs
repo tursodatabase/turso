@@ -6,7 +6,7 @@ use crate::translate::result_row::try_fold_expr_to_i64;
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::Insn;
 use crate::vdbe::BranchOffset;
-use crate::SymbolTable;
+use crate::{emit_explain, QueryMode, SymbolTable};
 use std::sync::Arc;
 use tracing::instrument;
 use turso_parser::ast::{CompoundOperator, SortOrder};
@@ -98,6 +98,7 @@ pub fn emit_program_for_compound_select(
         _ => (None, None),
     };
 
+    emit_explain!(program, true, "COMPOUND QUERY".to_owned());
     emit_compound_select(
         program,
         plan,
@@ -108,6 +109,7 @@ pub fn emit_program_for_compound_select(
         yield_reg,
         reg_result_cols_start,
     )?;
+    program.pop_current_parent_explain();
 
     program.result_columns = right_plan.result_columns;
     program.table_references.extend(right_plan.table_references);
@@ -187,7 +189,10 @@ fn emit_compound_select(
                     right_most.offset = offset;
                     right_most_ctx.reg_offset = offset_reg;
                 }
+
+                emit_explain!(program, true, "UNION ALL".to_owned());
                 emit_query(program, &mut right_most, &mut right_most_ctx)?;
+                program.pop_current_parent_explain();
                 program.preassign_label_to_next_insn(label_next_select);
             }
             CompoundOperator::Union => {
@@ -229,7 +234,10 @@ fn emit_compound_select(
                     index: dedupe_index.1.clone(),
                     is_delete: false,
                 };
+
+                emit_explain!(program, true, "UNION USING TEMP B-TREE".to_owned());
                 emit_query(program, &mut right_most, &mut right_most_ctx)?;
+                program.pop_current_parent_explain();
 
                 if new_dedupe_index {
                     read_deduplicated_union_or_except_rows(
@@ -282,7 +290,9 @@ fn emit_compound_select(
                     index: right_index,
                     is_delete: false,
                 };
+                emit_explain!(program, true, "INTERSECT USING TEMP B-TREE".to_owned());
                 emit_query(program, &mut right_most, &mut right_most_ctx)?;
+                program.pop_current_parent_explain();
                 read_intersect_rows(
                     program,
                     left_cursor_id,
@@ -332,7 +342,9 @@ fn emit_compound_select(
                     index: index.clone(),
                     is_delete: true,
                 };
+                emit_explain!(program, true, "EXCEPT USING TEMP B-TREE".to_owned());
                 emit_query(program, &mut right_most, &mut right_most_ctx)?;
+                program.pop_current_parent_explain();
                 if new_index {
                     read_deduplicated_union_or_except_rows(
                         program, cursor_id, &index, limit_ctx, offset_reg, yield_reg,
@@ -349,7 +361,9 @@ fn emit_compound_select(
                 right_most.offset = offset;
                 right_most_ctx.reg_offset = offset_reg;
             }
+            emit_explain!(program, true, "LEFT-MOST SUBQUERY".to_owned());
             emit_query(program, &mut right_most, &mut right_most_ctx)?;
+            program.pop_current_parent_explain();
         }
     }
 

@@ -1,0 +1,13 @@
+[package]
+name = "write-throughput"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "write-throughput"
+path = "src/main.rs"
+
+[dependencies]
+turso = { path = "../../../bindings/rust" }
+clap = { version = "4.0", features = ["derive"] }
+tokio = { version = "1.0", features = ["full"] }

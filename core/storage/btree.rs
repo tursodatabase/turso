@@ -6,8 +6,8 @@ use crate::{
     storage::{
         pager::{BtreePageAllocMode, Pager},
         sqlite3_ondisk::{
-            payload_overflows, read_u32, read_varint, BTreeCell, DatabaseHeader, PageContent,
-            PageSize, PageType, TableInteriorCell, TableLeafCell, CELL_PTR_SIZE_BYTES,
+            payload_overflows, read_u32, read_varint, write_varint, BTreeCell, DatabaseHeader,
+            PageContent, PageSize, PageType, TableInteriorCell, TableLeafCell, CELL_PTR_SIZE_BYTES,
             INTERIOR_PAGE_HEADER_SIZE_BYTES, LEAF_PAGE_HEADER_SIZE_BYTES,
             LEFT_CHILD_PTR_SIZE_BYTES,
         },
@@ -202,6 +202,7 @@ pub enum OverwriteCellState {
 /// State machine of a btree rebalancing operation.
 enum BalanceSubState {
     Start,
+    Quick,
     /// Choose which sibling pages to balance (max 3).
     /// Generally, the siblings involved will be the page that triggered the balancing and its left and right siblings.
     /// The exceptions are:
@@ -2468,10 +2469,48 @@ impl BTreeCursor {
                     if !self.stack.has_parent() {
                         let _res = self.balance_root()?;
                     }
-                    let BalanceState { sub_state, .. } = &mut self.balance_state;
-                    *sub_state = BalanceSubState::NonRootPickSiblings;
 
-                    self.stack.pop();
+                    let cur_page = self.stack.top_ref();
+                    let cur_page_contents = cur_page.get_contents();
+
+                    // Check if we can use the balance_quick() fast path.
+                    let mut do_quick = false;
+                    if cur_page_contents.page_type() == PageType::TableLeaf
+                        && cur_page_contents.overflow_cells.len() == 1
+                    {
+                        let overflow_cell_is_last =
+                            cur_page_contents.overflow_cells.first().unwrap().index
+                                == cur_page_contents.cell_count();
+                        if overflow_cell_is_last {
+                            let parent = self
+                                .stack
+                                .get_page_at_level(self.stack.current() - 1)
+                                .expect("parent page should be on the stack");
+                            let parent_contents = parent.get_contents();
+                            if parent.get().id != 1
+                                && parent_contents.rightmost_pointer().unwrap()
+                                    == cur_page.get().id as u32
+                            {
+                                // If all of the following are true, we can use the balance_quick() fast path:
+                                // - The page is a table leaf page
+                                // - The overflow cell would be the last cell on the leaf page
+                                // - The parent page is not page 1
+                                // - The leaf page is the rightmost page in the subtree
+                                do_quick = true;
+                            }
+                        }
+                    }
+
+                    let BalanceState { sub_state, .. } = &mut self.balance_state;
+                    if do_quick {
+                        *sub_state = BalanceSubState::Quick;
+                    } else {
+                        *sub_state = BalanceSubState::NonRootPickSiblings;
+                        self.stack.pop();
+                    }
+                }
+                BalanceSubState::Quick => {
+                    return_if_io!(self.balance_quick());
                 }
                 BalanceSubState::NonRootPickSiblings
                 | BalanceSubState::NonRootDoBalancing
@@ -2480,6 +2519,88 @@ impl BTreeCursor {
                 }
             }
         }
+    }
+
+    /// Fast balancing routine for the common special case where the rightmost leaf page of a given subtree overflows (= an append).
+    /// In this case we just add a new leaf page as the right sibling of that page, and insert a new divider cell into the parent.
+    /// The high level steps are:
+    /// 1. Allocate a new leaf page and insert the overflow cell payload in it.
+    /// 2. Create a new divider cell in the parent - it contains the page number of the old rightmost leaf, plus the largest rowid on that page.
+    /// 3. Update the rightmost pointer of the parent to point to the new leaf page.
+    /// 4. Continue balance from the parent page (inserting the new divider cell may have overflowed the parent)
+    #[instrument(skip(self), level = Level::DEBUG)]
+    fn balance_quick(&mut self) -> Result<IOResult<()>> {
+        // Allocate a new leaf page and insert the overflow cell payload in it.
+        let new_rightmost_leaf = return_if_io!(self.pager.do_allocate_page(
+            PageType::TableLeaf,
+            0,
+            BtreePageAllocMode::Any
+        ));
+
+        let usable_space = self.usable_space();
+        let old_rightmost_leaf = self.stack.top_ref();
+        let old_rightmost_leaf_contents = old_rightmost_leaf.get_contents();
+        turso_assert!(
+            old_rightmost_leaf_contents.overflow_cells.len() == 1,
+            "expected 1 overflow cell, got {}",
+            old_rightmost_leaf_contents.overflow_cells.len()
+        );
+
+        let parent = self
+            .stack
+            .get_page_at_level(self.stack.current() - 1)
+            .expect("parent page should be on the stack");
+        let parent_contents = parent.get_contents();
+        let rightmost_pointer = parent_contents
+            .rightmost_pointer()
+            .expect("parent should have a rightmost pointer");
+        turso_assert!(
+            rightmost_pointer == old_rightmost_leaf.get().id as u32,
+            "leaf should be the rightmost page in the subtree"
+        );
+
+        let overflow_cell = old_rightmost_leaf_contents
+            .overflow_cells
+            .pop()
+            .expect("overflow cell should be present");
+        turso_assert!(
+            overflow_cell.index == old_rightmost_leaf_contents.cell_count(),
+            "overflow cell must be the last cell in the leaf"
+        );
+
+        let new_rightmost_leaf_contents = new_rightmost_leaf.get_contents();
+        insert_into_cell(
+            new_rightmost_leaf_contents,
+            &overflow_cell.payload.as_ref(),
+            0,
+            usable_space,
+        )?;
+
+        // Create a new divider cell in the parent - it contains the page number of the old rightmost leaf, plus the largest rowid on that page.
+        let mut new_divider: [u8; 13] = [0; 13]; // 4 bytes for page number, max 9 bytes for rowid (varint)
+        new_divider[0..4].copy_from_slice(&(old_rightmost_leaf.get().id as u32).to_be_bytes());
+        let largest_rowid = old_rightmost_leaf_contents
+            .cell_table_leaf_read_rowid(old_rightmost_leaf_contents.cell_count() - 1)?;
+        let n = write_varint(&mut new_divider[4..], largest_rowid as u64);
+        let divider_length = 4 + n;
+
+        // Insert the new divider cell into the parent.
+        insert_into_cell(
+            parent_contents,
+            &new_divider[..divider_length],
+            parent_contents.cell_count(),
+            usable_space,
+        )?;
+        parent_contents.write_rightmost_ptr(new_rightmost_leaf.get().id as u32);
+        self.pager.add_dirty(parent);
+        self.pager.add_dirty(&new_rightmost_leaf);
+
+        // Continue balance from the parent page (inserting the new divider cell may have overflowed the parent)
+        self.stack.pop();
+
+        let BalanceState { sub_state, .. } = &mut self.balance_state;
+        *sub_state = BalanceSubState::Start;
+        Ok(IOResult::Done(()))
     }
 
     /// Balance a non root page by trying to balance cells between a maximum of 3 siblings that should be neighboring the page that overflowed/underflowed.
@@ -2494,7 +2615,7 @@ impl BTreeCursor {
             tracing::debug!(?sub_state);
 
             match sub_state {
-                BalanceSubState::Start => {
+                BalanceSubState::Start | BalanceSubState::Quick => {
                     panic!("balance_non_root: unexpected state {sub_state:?}")
                 }
                 BalanceSubState::NonRootPickSiblings => {
@@ -4352,14 +4473,11 @@ impl BTreeCursor {
     #[instrument(skip(self), level = Level::DEBUG)]
     pub fn rowid(&self) -> Result<IOResult<Option<i64>>> {
         if let Some(mv_cursor) = &self.mv_cursor {
-            if self.has_record.get() {
-                let mut mv_cursor = mv_cursor.borrow_mut();
-                return Ok(IOResult::Done(
-                    mv_cursor.current_row_id().map(|rowid| rowid.row_id),
-                ));
-            } else {
+            let mut mv_cursor = mv_cursor.borrow_mut();
+            let Some(rowid) = mv_cursor.current_row_id() else {
                 return Ok(IOResult::Done(None));
-            }
+            };
+            return Ok(IOResult::Done(Some(rowid.row_id)));
         }
         if self.get_null_flag() {
             return Ok(IOResult::Done(None));
@@ -4407,7 +4525,7 @@ impl BTreeCursor {
     /// back.
     #[instrument(skip(self), level = Level::DEBUG)]
     pub fn record(&self) -> Result<IOResult<Option<Ref<ImmutableRecord>>>> {
-        if !self.has_record.get() {
+        if !self.has_record.get() && self.mv_cursor.is_none() {
             return Ok(IOResult::Done(None));
         }
         let invalidated = self
@@ -4421,9 +4539,11 @@ impl BTreeCursor {
                     .unwrap();
             return Ok(IOResult::Done(Some(record_ref)));
         }
-        if self.mv_cursor.is_some() {
-            let mut mv_cursor = self.mv_cursor.as_ref().unwrap().borrow_mut();
-            let row = mv_cursor.current_row().unwrap().unwrap();
+        if let Some(mv_cursor) = &self.mv_cursor {
+            let mut mv_cursor = mv_cursor.borrow_mut();
+            let Some(row) = mv_cursor.current_row()? else {
+                return Ok(IOResult::Done(None));
+            };
             self.get_immutable_record_or_create()
                 .as_mut()
                 .unwrap()

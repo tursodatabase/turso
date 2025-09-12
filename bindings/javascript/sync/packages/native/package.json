@@ -1,6 +1,6 @@
 {
   "name": "@tursodatabase/sync",
-  "version": "0.2.0-pre.1",
+  "version": "0.2.0-pre.3",
   "repository": {
     "type": "git",
     "url": "https://github.com/tursodatabase/turso"
@@ -39,13 +39,13 @@
     "targets": [
       "x86_64-unknown-linux-gnu",
       "x86_64-pc-windows-msvc",
-      "universal-apple-darwin",
+      "aarch64-apple-darwin",
       "aarch64-unknown-linux-gnu"
     ]
   },
   "dependencies": {
-    "@tursodatabase/database-common": "^0.2.0-pre.1",
-    "@tursodatabase/sync-common": "^0.2.0-pre.1"
+    "@tursodatabase/database-common": "^0.2.0-pre.3",
+    "@tursodatabase/sync-common": "^0.2.0-pre.3"
   },
   "imports": {
     "#index": "./index.js"
