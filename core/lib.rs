@@ -16,6 +16,7 @@ mod parameters;
 mod pragma;
 mod pseudo;
 pub mod result;
+mod savepoint;
 mod schema;
 #[cfg(feature = "series")]
 mod series;
@@ -40,6 +41,7 @@ pub mod numeric;
 mod numeric;
 
 use crate::incremental::view::AllViewsTxState;
+use crate::savepoint::SavepointStack;
 use crate::storage::encryption::CipherMode;
 use crate::translate::optimizer::optimize_plan;
 use crate::translate::pragma::TURSO_CDC_DEFAULT_TABLE_NAME;
@@ -487,6 +489,8 @@ impl Database {
             encryption_key: RefCell::new(None),
             encryption_cipher_mode: Cell::new(None),
             sync_mode: Cell::new(SyncMode::Full),
+            savepoint_stack: RefCell::new(SavepointStack::new()),
+            is_txn_savepoint: Cell::new(false),
         });
         self.n_connections
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -932,6 +936,9 @@ pub struct Connection {
     encryption_key: RefCell<Option<EncryptionKey>>,
     encryption_cipher_mode: Cell<Option<CipherMode>>,
     sync_mode: Cell<SyncMode>,
+    savepoint_stack: RefCell<SavepointStack>,
+    /// Mark if the outermost transaction is a savepoint
+    is_txn_savepoint: Cell<bool>,
 }
 
 impl Drop for Connection {

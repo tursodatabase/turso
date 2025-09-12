@@ -9147,6 +9147,61 @@ pub fn op_journal_mode(
     Ok(InsnFunctionStepResult::Step)
 }
 
+// TODO NOW:
+// 1. Implement RELEASE for pure wal mode
+// 2. Handle non-autocommit environments (in-memory wal?)
+// 3. Add more tests (steal from sqlite)
+pub fn op_savepoint(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Rc<Pager>,
+    mv_store: Option<&Arc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    use crate::vdbe::insn::SavepointOp;
+
+    load_insn!(Savepoint { op, name }, insn);
+    let conn = program.connection.clone();
+
+    let mut savepoint_stack = conn.savepoint_stack.borrow_mut();
+    match op {
+        SavepointOp::Begin => {
+            if let Some(wal) = pager.as_ref().wal.as_ref() {
+                savepoint_stack.push_savepoint(name.clone(), wal.clone());
+            } else {
+                return Err(LimboError::InternalError(
+                    "WAL is not available for the pager".to_string(),
+                ));
+            }
+        }
+
+        SavepointOp::Release => {
+            if let Some(position) = savepoint_stack.find_savepoint(name.as_str()) {
+                let is_last_sp = position + 1 == savepoint_stack.len();
+                let is_txn = is_last_sp && conn.is_txn_savepoint.get();
+
+                savepoint_stack.release_savepoint(name.as_str())?;
+            } else {
+                return Err(LimboError::NoSuchSavepoint(name.clone()));
+            }
+        }
+        SavepointOp::Rollback => {
+            let mut savepoint = savepoint_stack.rollback_to_savepoint(name.as_str())?;
+            if let Some(wal) = pager.as_ref().wal.as_ref() {
+                let mut wal = wal.as_ref().borrow_mut();
+                wal.undo_savepoint(&mut savepoint.wal_data)?;
+            } else {
+                return Err(LimboError::InternalError(
+                    "WAL is not available for the pager".to_string(),
+                ));
+            }
+        }
+    }
+
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

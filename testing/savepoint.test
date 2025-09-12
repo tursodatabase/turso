@@ -1,0 +1,53 @@
+#!/usr/bin/env tclsh
+
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+
+do_execsql_test_on_specific_db {:memory:} savepoint-1.1 {
+    SAVEPOINT sp1;
+    RELEASE sp1;
+} {}
+
+do_execsql_test_on_specific_db {:memory:} savepoint-1.2 {
+    SAVEPOINT sp1;
+    ROLLBACK TO sp1;
+} {}
+
+do_execsql_test_on_specific_db {:memory:}  savepoint-2.1 {
+    CREATE TABLE t1(a, b, c);
+    INSERT INTO t1 VALUES(1, 2, 3);
+    SAVEPOINT one;
+    UPDATE t1 SET a = 2, b = 3, c = 4;
+    SELECT * FROM t1;
+} {2|3|4}
+
+do_execsql_test_on_specific_db {:memory:}  savepoint-2.2 {
+    CREATE TABLE t1(a, b, c);
+    INSERT INTO t1 VALUES(1, 2, 3);
+    SAVEPOINT one;
+    UPDATE t1 SET a = 2, b = 3, c = 4;
+    ROLLBACK TO one;
+    SELECT * FROM t1;
+} {1|2|3}
+
+do_execsql_test_on_specific_db {:memory:}  savepoint-2.3 {
+    CREATE TABLE t1(a, b, c);
+    INSERT INTO t1 VALUES(1, 2, 3);
+    SAVEPOINT one;
+    UPDATE t1 SET a = 2, b = 3, c = 4;
+    ROLLBACK TO one;
+    INSERT INTO t1 VALUES(4, 5, 6);
+    SELECT * FROM t1;
+} {1|2|3
+4|5|6}
+
+do_execsql_test_on_specific_db {:memory:}  savepoint-2.3 {
+    CREATE TABLE t1(a, b, c);
+    INSERT INTO t1 VALUES(1, 2, 3);
+    SAVEPOINT one;
+    UPDATE t1 SET a = 2, b = 3, c = 4;
+    ROLLBACK TO one;
+    INSERT INTO t1 VALUES(4, 5, 6);
+    ROLLBACK TO one;
+    SELECT * FROM t1;
+} {1|2|3}
