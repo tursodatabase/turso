@@ -452,14 +452,17 @@ pub struct PageContent {
     pub offset: usize,
     pub buffer: Arc<Buffer>,
     pub overflow_cells: Vec<OverflowCell>,
+    cached_header_size: usize,
 }
 
 impl PageContent {
     pub fn new(offset: usize, buffer: Arc<Buffer>) -> Self {
+        let header_size = Self::header_size_init(buffer.as_slice(), offset);
         Self {
             offset,
             buffer,
             overflow_cells: Vec::new(),
+            cached_header_size: header_size,
         }
     }
 
@@ -556,8 +559,9 @@ impl PageContent {
     }
 
     /// Assign a new page type to this page.
-    pub fn write_page_type(&self, value: u8) {
+    pub fn write_page_type(&mut self, value: u8) {
         self.write_u8(BTREE_PAGE_TYPE, value);
+        self.cached_header_size = Self::header_size_init(self.as_ptr(), self.offset);
     }
 
     /// Assign a new rightmost pointer to this page.
@@ -661,8 +665,12 @@ impl PageContent {
 
     /// The size of the page header in bytes.
     /// 8 bytes for leaf pages, 12 bytes for interior pages (due to storing rightmost child pointer)
-    pub fn header_size(&self) -> usize {
-        let is_interior = self.read_u8(BTREE_PAGE_TYPE) <= PageType::TableInterior as u8;
+    pub const fn header_size(&self) -> usize {
+        self.cached_header_size
+    }
+
+    const fn header_size_init(buffer: &[u8], offset: usize) -> usize {
+        let is_interior = buffer[offset + BTREE_PAGE_TYPE] <= PageType::TableInterior as u8;
         (!is_interior as usize) * LEAF_PAGE_HEADER_SIZE_BYTES
             + (is_interior as usize) * INTERIOR_PAGE_HEADER_SIZE_BYTES
     }
@@ -779,7 +787,7 @@ impl PageContent {
     /// Get the start offset of a cell's payload, not taking into account the 100-byte offset that is present on page 1.
     pub fn cell_get_raw_start_offset(&self, idx: usize) -> usize {
         let cell_pointer_array_start = self.cell_pointer_array_offset();
-        let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
+        let cell_pointer = cell_pointer_array_start + (idx << 1);
         self.read_u16_no_offset(cell_pointer) as usize
     }
 
