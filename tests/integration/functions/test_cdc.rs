@@ -1129,7 +1129,7 @@ fn test_cdc_schema_changes_alter_table() {
                 Value::Null,
                 Value::Integer(0),
                 Value::Text("sqlite_schema".to_string()),
-                Value::Integer(3), 
+                Value::Integer(3),
                 Value::Blob(record([
                     Value::Text("table".to_string()),
                     Value::Text("t".to_string()),
