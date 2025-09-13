@@ -92,7 +92,8 @@ impl InteractionPlan {
                             | Property::WhereTrueFalseNull { .. }
                             | Property::UNIONAllPreservesCardinality { .. }
                             | Property::ReadYourUpdatesBack { .. }
-                            | Property::TableHasExpectedContent { .. } => {}
+                            | Property::TableHasExpectedContent { .. }
+                            | Property::ShortWriteCorruption { .. } => {}
                         }
                     }
                     // Check again after query clear if the interactions still uses the failing table
@@ -215,7 +216,8 @@ impl InteractionPlan {
                     | Property::FaultyQuery { .. }
                     | Property::FsyncNoWait { .. }
                     | Property::ReadYourUpdatesBack { .. }
-                    | Property::TableHasExpectedContent { .. } => {}
+                    | Property::TableHasExpectedContent { .. }
+                    | Property::ShortWriteCorruption { .. } => {}
                 }
             }
         }
