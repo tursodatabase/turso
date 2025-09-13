@@ -27,6 +27,9 @@ pub fn translate_create_index(
     syms: &SymbolTable,
     mut program: ProgramBuilder,
 ) -> crate::Result<ProgramBuilder> {
+    if tbl_name.eq_ignore_ascii_case("sqlite_sequence") {
+        crate::bail_parse_error!("table sqlite_sequence may not be indexed");
+    }
     if !schema.indexes_enabled() {
         crate::bail_parse_error!(
             "CREATE INDEX is disabled by default. Run with `--experimental-indexes` to enable this feature."

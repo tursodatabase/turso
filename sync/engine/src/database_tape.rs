@@ -1090,9 +1090,22 @@ mod tests {
                     vec![
                         vec![
                             turso_core::Value::Text(turso_core::types::Text::new("table")),
+                            turso_core::Value::Text(turso_core::types::Text::new(
+                                "sqlite_sequence"
+                            )),
+                            turso_core::Value::Text(turso_core::types::Text::new(
+                                "sqlite_sequence"
+                            )),
+                            turso_core::Value::Integer(2),
+                            turso_core::Value::Text(turso_core::types::Text::new(
+                                "CREATE TABLE sqlite_sequence(name,seq)"
+                            )),
+                        ],
+                        vec![
+                            turso_core::Value::Text(turso_core::types::Text::new("table")),
                             turso_core::Value::Text(turso_core::types::Text::new("t")),
                             turso_core::Value::Text(turso_core::types::Text::new("t")),
-                            turso_core::Value::Integer(3),
+                            turso_core::Value::Integer(4),
                             turso_core::Value::Text(turso_core::types::Text::new(
                                 "CREATE TABLE t (x TEXT PRIMARY KEY, y)"
                             )),
@@ -1101,7 +1114,7 @@ mod tests {
                             turso_core::Value::Text(turso_core::types::Text::new("table")),
                             turso_core::Value::Text(turso_core::types::Text::new("q")),
                             turso_core::Value::Text(turso_core::types::Text::new("q")),
-                            turso_core::Value::Integer(5),
+                            turso_core::Value::Integer(6),
                             turso_core::Value::Text(turso_core::types::Text::new(
                                 "CREATE TABLE q (x TEXT PRIMARY KEY, y)"
                             )),
@@ -1176,7 +1189,7 @@ mod tests {
                             turso_core::Value::Text(turso_core::types::Text::new("table")),
                             turso_core::Value::Text(turso_core::types::Text::new("t")),
                             turso_core::Value::Text(turso_core::types::Text::new("t")),
-                            turso_core::Value::Integer(3),
+                            turso_core::Value::Integer(4),
                             turso_core::Value::Text(turso_core::types::Text::new(
                                 "CREATE TABLE t (x TEXT PRIMARY KEY, y)"
                             )),
@@ -1185,7 +1198,7 @@ mod tests {
                             turso_core::Value::Text(turso_core::types::Text::new("index")),
                             turso_core::Value::Text(turso_core::types::Text::new("t_idx")),
                             turso_core::Value::Text(turso_core::types::Text::new("t")),
-                            turso_core::Value::Integer(5),
+                            turso_core::Value::Integer(6),
                             turso_core::Value::Text(turso_core::types::Text::new(
                                 "CREATE INDEX t_idx ON t (y)"
                             )),
@@ -1260,7 +1273,7 @@ mod tests {
                         turso_core::Value::Text(turso_core::types::Text::new("table")),
                         turso_core::Value::Text(turso_core::types::Text::new("t")),
                         turso_core::Value::Text(turso_core::types::Text::new("t")),
-                        turso_core::Value::Integer(3),
+                        turso_core::Value::Integer(4),
                         turso_core::Value::Text(turso_core::types::Text::new(
                             "CREATE TABLE t (x TEXT PRIMARY KEY, z)"
                         )),

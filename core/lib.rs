@@ -1211,6 +1211,8 @@ impl Connection {
         if self.closed.get() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
+
+        // self.maybe_update_schema()?;
         let syms = self.syms.borrow();
         let pager = self.pager.borrow().clone();
         let mode = QueryMode::new(&cmd);
@@ -1345,6 +1347,7 @@ impl Connection {
         if matches!(self.transaction_state.get(), TransactionState::None)
             && current_schema_version != schema.schema_version
         {
+            //  if current_schema_version != schema.schema_version {
             self.schema.replace(schema.clone());
         }
 
@@ -1355,10 +1358,24 @@ impl Connection {
     #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
     pub fn read_schema_version(&self) -> Result<u32> {
         let pager = self.pager.borrow();
-        pager
+        let was_in_tx = self.transaction_state.get() != TransactionState::None;
+        if !was_in_tx {
+            pager.begin_read_tx()?;
+        }
+
+        let result = pager
             .io
-            .block(|| pager.with_header(|header| header.schema_cookie))
-            .map(|version| version.get())
+            .block(|| pager.with_header(|header| header.schema_cookie));
+
+        if !was_in_tx {
+            pager.end_read_tx()?;
+        }
+
+        match result {
+            Ok(version) => Ok(version.get()),
+            Err(LimboError::Page1NotAlloc) => Ok(0),
+            Err(e) => Err(e),
+        }
     }
 
     /// Update schema version to the new value within opened write transaction
@@ -2255,6 +2272,7 @@ impl Statement {
                 &self.program.sql,
             )?
         };
+
         // Save parameters before they are reset
         let parameters = std::mem::take(&mut self.state.parameters);
         let (max_registers, cursor_count) = match self.query_mode {

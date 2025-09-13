@@ -514,6 +514,8 @@ impl Schema {
                 primary_key_columns: Vec::new(),
                 has_rowid: true,
                 is_strict: false,
+                has_autoincrement: false,
+
                 unique_sets: vec![],
             })));
 
@@ -830,6 +832,7 @@ pub struct BTreeTable {
     pub columns: Vec<Column>,
     pub has_rowid: bool,
     pub is_strict: bool,
+    pub has_autoincrement: bool,
     pub unique_sets: Vec<UniqueSet>,
 }
 
@@ -964,6 +967,7 @@ pub fn create_table(
     let table_name = normalize_ident(tbl_name);
     trace!("Creating table {}", table_name);
     let mut has_rowid = true;
+    let mut has_autoincrement = false;
     let mut primary_key_columns = vec![];
     let mut cols = vec![];
     let is_strict: bool;
@@ -976,7 +980,16 @@ pub fn create_table(
         } => {
             is_strict = options.contains(TableOptions::STRICT);
             for c in constraints {
-                if let ast::TableConstraint::PrimaryKey { columns, .. } = &c.constraint {
+                if let ast::TableConstraint::PrimaryKey {
+                    columns,
+                    auto_increment,
+                    ..
+                } = &c.constraint
+                {
+                    if *auto_increment {
+                        has_autoincrement = true;
+                    }
+
                     for column in columns {
                         let col_name = match column.expr.as_ref() {
                             Expr::Id(id) => normalize_ident(id.as_str()),
@@ -1056,8 +1069,15 @@ pub fn create_table(
                 let mut collation = None;
                 for c_def in constraints {
                     match c_def.constraint {
-                        ast::ColumnConstraint::PrimaryKey { order: o, .. } => {
+                        ast::ColumnConstraint::PrimaryKey {
+                            order: o,
+                            auto_increment,
+                            ..
+                        } => {
                             primary_key = true;
+                            if auto_increment {
+                                has_autoincrement = true;
+                            }
                             if let Some(o) = o {
                                 order = o;
                             }
@@ -1066,6 +1086,12 @@ pub fn create_table(
                                 is_primary_key: true,
                             });
                         }
+                        // ast::ColumnConstraint::PrimaryKey { order: o, .. } => {
+                        //     primary_key = true;
+                        //     if let Some(o) = o {
+                        //         order = o;
+                        //     }
+                        // }
                         ast::ColumnConstraint::NotNull { nullable, .. } => {
                             notnull = !nullable;
                         }
@@ -1125,6 +1151,26 @@ pub fn create_table(
         }
     }
 
+    if has_autoincrement {
+        // only allow integers
+        if primary_key_columns.len() != 1 {
+            crate::bail_parse_error!("AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY");
+        }
+        let pk_col_name = &primary_key_columns[0].0;
+        let pk_col = cols.iter().find(|c| c.name.as_deref() == Some(pk_col_name));
+
+        if let Some(col) = pk_col {
+            if col.ty != Type::Integer {
+                crate::bail_parse_error!("AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY");
+            }
+        } else {
+            crate::bail_parse_error!(
+                "Primary key column '{}' not found for AUTOINCREMENT check",
+                pk_col_name
+            );
+        }
+    }
+
     for col in cols.iter() {
         if col.is_rowid_alias {
             // Unique sets are used for creating automatic indexes. An index is not created for a rowid alias PRIMARY KEY.
@@ -1145,6 +1191,7 @@ pub fn create_table(
         name: table_name,
         has_rowid,
         primary_key_columns,
+        has_autoincrement,
         columns: cols,
         is_strict,
         unique_sets: {
@@ -1472,6 +1519,7 @@ pub fn sqlite_schema_table() -> BTreeTable {
         name: "sqlite_schema".to_string(),
         has_rowid: true,
         is_strict: false,
+        has_autoincrement: false,
         primary_key_columns: vec![],
         columns: vec![
             Column {
@@ -2035,6 +2083,7 @@ mod tests {
             name: "t1".to_string(),
             has_rowid: true,
             is_strict: false,
+            has_autoincrement: false,
             primary_key_columns: vec![("nonexistent".to_string(), SortOrder::Asc)],
             columns: vec![Column {
                 name: Some("a".to_string()),
