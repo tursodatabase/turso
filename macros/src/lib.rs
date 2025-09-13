@@ -42,6 +42,10 @@ pub fn derive_description_from_doc(item: TokenStream) -> TokenStream {
                         TokenTree::Ident(ident) => {
                             // Capture the enum variant name and associate it with its description
                             let ident_str = ident.to_string();
+                            // this is a quick fix for derive(EnumDiscriminants)
+                            if ident_str == "strum_discriminants" {
+                                continue;
+                            }
                             if let Some(desc) = &last_seen_desc {
                                 variant_description_map.insert(ident_str.clone(), desc.clone());
                             }
