@@ -6,8 +6,9 @@ use crate::function::{AggFunc, Func};
 use crate::incremental::dbsp::{Delta, DeltaPair, HashableRow};
 use crate::incremental::expr_compiler::CompiledExpression;
 use crate::incremental::persistence::{ReadRecord, WriteRow};
+use crate::schema::{Index, IndexColumn};
 use crate::storage::btree::BTreeCursor;
-use crate::types::{IOResult, SeekKey, Text};
+use crate::types::{IOResult, ImmutableRecord, SeekKey, SeekOp, SeekResult, Text};
 use crate::{
     return_and_restore_if_io, return_if_io, Connection, Database, Result, SymbolTable, Value,
 };
@@ -16,6 +17,77 @@ use std::fmt::{self, Debug, Display};
 use std::sync::{Arc, Mutex};
 use turso_macros::match_ignore_ascii_case;
 use turso_parser::ast::{As, Expr, Literal, Name, OneSelect, Operator, ResultColumn};
+
+/// Struct to hold both table and index cursors for DBSP state operations
+pub struct DbspStateCursors {
+    /// Cursor for the DBSP state table
+    pub table_cursor: BTreeCursor,
+    /// Cursor for the DBSP state table's primary key index
+    pub index_cursor: BTreeCursor,
+}
+
+impl DbspStateCursors {
+    /// Create a new DbspStateCursors with both table and index cursors
+    pub fn new(table_cursor: BTreeCursor, index_cursor: BTreeCursor) -> Self {
+        Self {
+            table_cursor,
+            index_cursor,
+        }
+    }
+}
+
+/// Create an index definition for the DBSP state table
+/// This defines the primary key index on (operator_id, zset_id, element_id)
+pub fn create_dbsp_state_index(root_page: usize) -> Index {
+    Index {
+        name: "dbsp_state_pk".to_string(),
+        table_name: "dbsp_state".to_string(),
+        root_page,
+        columns: vec![
+            IndexColumn {
+                name: "operator_id".to_string(),
+                order: turso_parser::ast::SortOrder::Asc,
+                collation: None,
+                pos_in_table: 0,
+                default: None,
+            },
+            IndexColumn {
+                name: "zset_id".to_string(),
+                order: turso_parser::ast::SortOrder::Asc,
+                collation: None,
+                pos_in_table: 1,
+                default: None,
+            },
+            IndexColumn {
+                name: "element_id".to_string(),
+                order: turso_parser::ast::SortOrder::Asc,
+                collation: None,
+                pos_in_table: 2,
+                default: None,
+            },
+        ],
+        unique: true,
+        ephemeral: false,
+        has_rowid: true,
+    }
+}
+
+/// Storage key types for different operator contexts
+#[derive(Debug, Clone, Copy)]
+pub enum StorageKeyType {
+    /// For aggregate operators - uses operator_id * 2
+    Aggregate { operator_id: usize },
+}
+
+impl StorageKeyType {
+    /// Get the unique storage ID using the same formula as before
+    /// This ensures different operators get unique IDs
+    pub fn to_storage_id(self) -> u64 {
+        match self {
+            StorageKeyType::Aggregate { operator_id } => (operator_id as u64),
+        }
+    }
+}
 
 type ComputedStates = HashMap<String, (Vec<Value>, AggregateState)>; // group_key_str -> (group_key, state)
 #[derive(Debug)]
@@ -44,12 +116,20 @@ pub enum EvalState {
     Init {
         deltas: DeltaPair,
     },
+    FetchKey {
+        delta: Delta, // Keep original delta for merge operation
+        current_idx: usize,
+        groups_to_read: Vec<(String, Vec<Value>)>, // Changed to Vec for index-based access
+        existing_groups: HashMap<String, AggregateState>,
+        old_values: HashMap<String, Vec<Value>>,
+    },
     FetchData {
         delta: Delta, // Keep original delta for merge operation
         current_idx: usize,
         groups_to_read: Vec<(String, Vec<Value>)>, // Changed to Vec for index-based access
         existing_groups: HashMap<String, AggregateState>,
         old_values: HashMap<String, Vec<Value>>,
+        rowid: Option<i64>, // Rowid found by FetchKey (None if not found)
         read_record_state: Box<ReadRecord>,
     },
     Done,
@@ -101,20 +181,19 @@ impl EvalState {
 
         let _ = std::mem::replace(
             self,
-            EvalState::FetchData {
+            EvalState::FetchKey {
                 delta,
                 current_idx: 0,
                 groups_to_read: groups_to_read.into_iter().collect(), // Convert BTreeMap to Vec
                 existing_groups: HashMap::new(),
                 old_values: HashMap::new(),
-                read_record_state: Box::new(ReadRecord::new()),
             },
         );
     }
     fn process_delta(
         &mut self,
         operator: &mut AggregateOperator,
-        cursor: &mut BTreeCursor,
+        cursors: &mut DbspStateCursors,
     ) -> Result<IOResult<(Delta, ComputedStates)>> {
         loop {
             match self {
@@ -124,13 +203,12 @@ impl EvalState {
                 EvalState::Init { .. } => {
                     panic!("State machine not supposed to reach the init state! advance() should have been called");
                 }
-                EvalState::FetchData {
+                EvalState::FetchKey {
                     delta,
                     current_idx,
                     groups_to_read,
                     existing_groups,
                     old_values,
-                    read_record_state,
                 } => {
                     if *current_idx >= groups_to_read.len() {
                         // All groups processed, compute final output
@@ -140,31 +218,102 @@ impl EvalState {
                         return Ok(IOResult::Done(result));
                     } else {
                         // Get the current group to read
-                        let (group_key_str, group_key) = &groups_to_read[*current_idx];
+                        let (group_key_str, _group_key) = &groups_to_read[*current_idx];
 
-                        let seek_key = operator.generate_storage_key(group_key_str);
-                        let key = SeekKey::TableRowId(seek_key);
+                        // Build the key for the index: (operator_id, zset_id, element_id)
+                        let storage_key = StorageKeyType::Aggregate {
+                            operator_id: operator.operator_id,
+                        };
+                        let operator_storage_id = storage_key.to_storage_id() as i64;
+                        let zset_id = operator.generate_group_rowid(group_key_str);
+                        let element_id = 0i64; // Always 0 for aggregators
 
+                        // Create index key values
+                        let index_key_values = vec![
+                            Value::Integer(operator_storage_id),
+                            Value::Integer(zset_id),
+                            Value::Integer(element_id),
+                        ];
+
+                        // Create an immutable record for the index key
+                        let index_record =
+                            ImmutableRecord::from_values(&index_key_values, index_key_values.len());
+
+                        // Seek in the index to find if this row exists
+                        let seek_result = return_if_io!(cursors.index_cursor.seek(
+                            SeekKey::IndexKey(&index_record),
+                            SeekOp::GE { eq_only: true }
+                        ));
+
+                        let rowid = if matches!(seek_result, SeekResult::Found) {
+                            // Found in index, get the table rowid
+                            // The btree code handles extracting the rowid from the index record for has_rowid indexes
+                            let rowid = return_if_io!(cursors.index_cursor.rowid());
+                            rowid
+                        } else {
+                            // Not found in index, no existing state
+                            None
+                        };
+
+                        // Always transition to FetchData
+                        let taken_existing = std::mem::take(existing_groups);
+                        let taken_old_values = std::mem::take(old_values);
+                        let next_state = EvalState::FetchData {
+                            delta: std::mem::take(delta),
+                            current_idx: *current_idx,
+                            groups_to_read: std::mem::take(groups_to_read),
+                            existing_groups: taken_existing,
+                            old_values: taken_old_values,
+                            rowid,
+                            read_record_state: Box::new(ReadRecord::new()),
+                        };
+                        *self = next_state;
+                    }
+                }
+                EvalState::FetchData {
+                    delta,
+                    current_idx,
+                    groups_to_read,
+                    existing_groups,
+                    old_values,
+                    rowid,
+                    read_record_state,
+                } => {
+                    // Get the current group to read
+                    let (group_key_str, group_key) = &groups_to_read[*current_idx];
+
+                    // Only try to read if we have a rowid
+                    if let Some(rowid) = rowid {
+                        let key = SeekKey::TableRowId(*rowid);
                         let state = return_if_io!(read_record_state.read_record(
                             key,
                             &operator.aggregates,
-                            cursor
+                            &mut cursors.table_cursor
                         ));
-
-                        // Anything that mutates state has to happen after return_if_io!
-                        // Unfortunately there's no good way to enforce that without turning
-                        // this into a hot mess of mem::takes.
+                        // Process the fetched state
                         if let Some(state) = state {
                             let mut old_row = group_key.clone();
                             old_row.extend(state.to_values(&operator.aggregates));
                             old_values.insert(group_key_str.clone(), old_row);
                             existing_groups.insert(group_key_str.clone(), state.clone());
                         }
-
-                        // All attributes mutated in place.
-                        *current_idx += 1;
-                        *read_record_state = Box::new(ReadRecord::new());
+                    } else {
+                        // No rowid for this group, skipping read
                     }
+                    // If no rowid, there's no existing state for this group
+
+                    // Move to next group
+                    let next_idx = *current_idx + 1;
+                    let taken_existing = std::mem::take(existing_groups);
+                    let taken_old_values = std::mem::take(old_values);
+                    let next_state = EvalState::FetchKey {
+                        delta: std::mem::take(delta),
+                        current_idx: next_idx,
+                        groups_to_read: std::mem::take(groups_to_read),
+                        existing_groups: taken_existing,
+                        old_values: taken_old_values,
+                    };
+                    *self = next_state;
                 }
                 EvalState::Done => {
                     return Ok(IOResult::Done((Delta::new(), HashMap::new())));
@@ -511,17 +660,25 @@ pub trait IncrementalOperator: Debug {
     ///
     /// # Arguments
     /// * `state` - The evaluation state (may be in progress from a previous I/O operation)
-    /// * `cursor` - Cursor for reading operator state from storage
+    /// * `cursors` - Cursors for reading operator state from storage (table and optional index)
     ///
     /// # Returns
     /// The output delta from the evaluation
-    fn eval(&mut self, state: &mut EvalState, cursor: &mut BTreeCursor) -> Result<IOResult<Delta>>;
+    fn eval(
+        &mut self,
+        state: &mut EvalState,
+        cursors: &mut DbspStateCursors,
+    ) -> Result<IOResult<Delta>>;
 
     /// Commit deltas to the operator's internal state and return the output
     /// This is called when a transaction commits, making changes permanent
     /// Returns the output delta (what downstream operators should see)
-    /// The cursor parameter is for operators that need to persist state
-    fn commit(&mut self, deltas: DeltaPair, cursor: &mut BTreeCursor) -> Result<IOResult<Delta>>;
+    /// The cursors parameter is for operators that need to persist state
+    fn commit(
+        &mut self,
+        deltas: DeltaPair,
+        cursors: &mut DbspStateCursors,
+    ) -> Result<IOResult<Delta>>;
 
     /// Set computation tracker
     fn set_tracker(&mut self, tracker: Arc<Mutex<ComputationTracker>>);
@@ -548,7 +705,7 @@ impl IncrementalOperator for InputOperator {
     fn eval(
         &mut self,
         state: &mut EvalState,
-        _cursor: &mut BTreeCursor,
+        _cursors: &mut DbspStateCursors,
     ) -> Result<IOResult<Delta>> {
         match state {
             EvalState::Init { deltas } => {
@@ -567,7 +724,11 @@ impl IncrementalOperator for InputOperator {
         }
     }
 
-    fn commit(&mut self, deltas: DeltaPair, _cursor: &mut BTreeCursor) -> Result<IOResult<Delta>> {
+    fn commit(
+        &mut self,
+        deltas: DeltaPair,
+        _cursors: &mut DbspStateCursors,
+    ) -> Result<IOResult<Delta>> {
         // Input operator only uses left delta, right must be empty
         assert!(
             deltas.right.is_empty(),
@@ -697,7 +858,7 @@ impl IncrementalOperator for FilterOperator {
     fn eval(
         &mut self,
         state: &mut EvalState,
-        _cursor: &mut BTreeCursor,
+        _cursors: &mut DbspStateCursors,
     ) -> Result<IOResult<Delta>> {
         let delta = match state {
             EvalState::Init { deltas } => {
@@ -733,7 +894,11 @@ impl IncrementalOperator for FilterOperator {
         Ok(IOResult::Done(output_delta))
     }
 
-    fn commit(&mut self, deltas: DeltaPair, _cursor: &mut BTreeCursor) -> Result<IOResult<Delta>> {
+    fn commit(
+        &mut self,
+        deltas: DeltaPair,
+        _cursors: &mut DbspStateCursors,
+    ) -> Result<IOResult<Delta>> {
         // Filter operator only uses left delta, right must be empty
         assert!(
             deltas.right.is_empty(),
@@ -1106,7 +1271,7 @@ impl IncrementalOperator for ProjectOperator {
     fn eval(
         &mut self,
         state: &mut EvalState,
-        _cursor: &mut BTreeCursor,
+        _cursors: &mut DbspStateCursors,
     ) -> Result<IOResult<Delta>> {
         let delta = match state {
             EvalState::Init { deltas } => {
@@ -1138,7 +1303,11 @@ impl IncrementalOperator for ProjectOperator {
         Ok(IOResult::Done(output_delta))
     }
 
-    fn commit(&mut self, deltas: DeltaPair, _cursor: &mut BTreeCursor) -> Result<IOResult<Delta>> {
+    fn commit(
+        &mut self,
+        deltas: DeltaPair,
+        _cursors: &mut DbspStateCursors,
+    ) -> Result<IOResult<Delta>> {
         // Project operator only uses left delta, right must be empty
         assert!(
             deltas.right.is_empty(),
@@ -1466,7 +1635,7 @@ impl AggregateOperator {
     fn eval_internal(
         &mut self,
         state: &mut EvalState,
-        cursor: &mut BTreeCursor,
+        cursors: &mut DbspStateCursors,
     ) -> Result<IOResult<(Delta, ComputedStates)>> {
         match state {
             EvalState::Uninitialized => {
@@ -1493,7 +1662,7 @@ impl AggregateOperator {
                 }
                 state.advance(groups_to_read);
             }
-            EvalState::FetchData { .. } => {
+            EvalState::FetchKey { .. } | EvalState::FetchData { .. } => {
                 // Already in progress, continue processing on process_delta below.
             }
             EvalState::Done => {
@@ -1502,7 +1671,7 @@ impl AggregateOperator {
         }
 
         // Process the delta through the state machine
-        let result = return_if_io!(state.process_delta(self, cursor));
+        let result = return_if_io!(state.process_delta(self, cursors));
         Ok(IOResult::Done(result))
     }
 
@@ -1636,12 +1805,20 @@ impl AggregateOperator {
 }
 
 impl IncrementalOperator for AggregateOperator {
-    fn eval(&mut self, state: &mut EvalState, cursor: &mut BTreeCursor) -> Result<IOResult<Delta>> {
-        let (delta, _) = return_if_io!(self.eval_internal(state, cursor));
+    fn eval(
+        &mut self,
+        state: &mut EvalState,
+        cursors: &mut DbspStateCursors,
+    ) -> Result<IOResult<Delta>> {
+        let (delta, _) = return_if_io!(self.eval_internal(state, cursors));
         Ok(IOResult::Done(delta))
     }
 
-    fn commit(&mut self, deltas: DeltaPair, cursor: &mut BTreeCursor) -> Result<IOResult<Delta>> {
+    fn commit(
+        &mut self,
+        deltas: DeltaPair,
+        cursors: &mut DbspStateCursors,
+    ) -> Result<IOResult<Delta>> {
         // Aggregate operator only uses left delta, right must be empty
         assert!(
             deltas.right.is_empty(),
@@ -1666,7 +1843,7 @@ impl IncrementalOperator for AggregateOperator {
                     let (output_delta, computed_states) = return_and_restore_if_io!(
                         &mut self.commit_state,
                         state,
-                        self.eval_internal(eval_state, cursor)
+                        self.eval_internal(eval_state, cursors)
                     );
                     self.commit_state = AggregateCommitState::PersistDelta {
                         delta: output_delta,
@@ -1690,34 +1867,42 @@ impl IncrementalOperator for AggregateOperator {
                     } else {
                         let (group_key_str, (group_key, agg_state)) = states_vec[*current_idx];
 
-                        let seek_key = self.seek_key_from_str(group_key_str);
+                        // Build the key components for the new table structure
+                        let storage_key = StorageKeyType::Aggregate {
+                            operator_id: self.operator_id,
+                        };
+                        let operator_storage_id = storage_key.to_storage_id() as i64;
+                        let zset_id = self.generate_group_rowid(group_key_str);
+                        let element_id = 0i64;
 
                         // Determine weight: -1 to delete (cancels existing weight=1), 1 to insert/update
                         let weight = if agg_state.count == 0 { -1 } else { 1 };
 
                         // Serialize the aggregate state with group key (even for deletion, we need a row)
                         let state_blob = agg_state.to_blob(&self.aggregates, group_key);
-                        let blob_row = HashableRow::new(0, vec![Value::Blob(state_blob)]);
+                        let blob_value = Value::Blob(state_blob);
 
-                        // Build the aggregate storage format: [key, blob, weight]
-                        let seek_key_clone = seek_key.clone();
-                        let blob_value = blob_row.values[0].clone();
-                        let build_fn = move |final_weight: isize| -> Vec<Value> {
-                            let key_i64 = match seek_key_clone.clone() {
-                                SeekKey::TableRowId(id) => id,
-                                _ => panic!("Expected TableRowId"),
-                            };
-                            vec![
-                                Value::Integer(key_i64),
-                                blob_value.clone(), // The blob with serialized state
-                                Value::Integer(final_weight as i64),
-                            ]
-                        };
+                        // Build the aggregate storage format: [operator_id, zset_id, element_id, value, weight]
+                        let operator_id_val = Value::Integer(operator_storage_id);
+                        let zset_id_val = Value::Integer(zset_id);
+                        let element_id_val = Value::Integer(element_id);
+                        let blob_val = blob_value.clone();
+
+                        // Create index key - the first 3 columns of our primary key
+                        let index_key = vec![
+                            operator_id_val.clone(),
+                            zset_id_val.clone(),
+                            element_id_val.clone(),
+                        ];
+
+                        // Record values (without weight)
+                        let record_values =
+                            vec![operator_id_val, zset_id_val, element_id_val, blob_val];
 
                         return_and_restore_if_io!(
                             &mut self.commit_state,
                             state,
-                            write_row.write_row(cursor, seek_key, build_fn, weight)
+                            write_row.write_row(cursors, index_key, record_values, weight)
                         );
 
                         let delta = std::mem::take(delta);
@@ -1755,8 +1940,8 @@ mod tests {
     use crate::{Database, MemoryIO, IO};
     use std::sync::{Arc, Mutex};
 
-    /// Create a test pager for operator tests
-    fn create_test_pager() -> (std::rc::Rc<crate::Pager>, usize) {
+    /// Create a test pager for operator tests with both table and index
+    fn create_test_pager() -> (std::rc::Rc<crate::Pager>, usize, usize) {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db = Database::open_file(io.clone(), ":memory:", false, false).unwrap();
         let conn = db.connect().unwrap();
@@ -1766,14 +1951,21 @@ mod tests {
         // Allocate page 1 first (database header)
         let _ = pager.io.block(|| pager.allocate_page1());
 
-        // Properly create a BTree for aggregate state using the pager API
-        let root_page_id = pager
+        // Create a BTree for the table
+        let table_root_page_id = pager
             .io
             .block(|| pager.btree_create(&CreateBTreeFlags::new_table()))
-            .expect("Failed to create BTree for aggregate state")
+            .expect("Failed to create BTree for aggregate state table")
             as usize;
 
-        (pager, root_page_id)
+        // Create a BTree for the index
+        let index_root_page_id = pager
+            .io
+            .block(|| pager.btree_create(&CreateBTreeFlags::new_index()))
+            .expect("Failed to create BTree for aggregate state index")
+            as usize;
+
+        (pager, table_root_page_id, index_root_page_id)
     }
 
     /// Read the current state from the BTree (for testing)
@@ -1781,23 +1973,23 @@ mod tests {
     fn get_current_state_from_btree(
         agg: &AggregateOperator,
         pager: &std::rc::Rc<crate::Pager>,
-        cursor: &mut BTreeCursor,
+        cursors: &mut DbspStateCursors,
     ) -> Delta {
         let mut result = Delta::new();
 
         // Rewind to start of table
-        pager.io.block(|| cursor.rewind()).unwrap();
+        pager.io.block(|| cursors.table_cursor.rewind()).unwrap();
 
         loop {
             // Check if cursor is empty (no more rows)
-            if cursor.is_empty() {
+            if cursors.table_cursor.is_empty() {
                 break;
             }
 
             // Get the record at this position
             let record = pager
                 .io
-                .block(|| cursor.record())
+                .block(|| cursors.table_cursor.record())
                 .unwrap()
                 .unwrap()
                 .to_owned();
@@ -1805,18 +1997,21 @@ mod tests {
             let values_ref = record.get_values();
             let values: Vec<Value> = values_ref.into_iter().map(|x| x.to_owned()).collect();
 
-            // Check if this record belongs to our operator
-            if let Some(Value::Integer(key)) = values.first() {
-                let operator_part = (key >> 32) as usize;
+            // Parse the 5-column structure: operator_id, zset_id, element_id, value, weight
+            if let Some(Value::Integer(op_id)) = values.first() {
+                let storage_key = StorageKeyType::Aggregate {
+                    operator_id: agg.operator_id,
+                };
+                let expected_op_id = storage_key.to_storage_id() as i64;
 
                 // Skip if not our operator
-                if operator_part != agg.operator_id {
-                    pager.io.block(|| cursor.next()).unwrap();
+                if *op_id != expected_op_id {
+                    pager.io.block(|| cursors.table_cursor.next()).unwrap();
                     continue;
                 }
 
-                // Get the blob data
-                if let Some(Value::Blob(blob)) = values.get(1) {
+                // Get the blob data from column 3 (value column)
+                if let Some(Value::Blob(blob)) = values.get(3) {
                     // Deserialize the state
                     if let Some((state, group_key)) =
                         AggregateState::from_blob(blob, &agg.aggregates)
@@ -1836,7 +2031,7 @@ mod tests {
                 }
             }
 
-            pager.io.block(|| cursor.next()).unwrap();
+            pager.io.block(|| cursors.table_cursor.next()).unwrap();
         }
 
         result.consolidate();
@@ -1871,8 +2066,14 @@ mod tests {
         // and an insertion (+1) of the new value.
 
         // Create a persistent pager for the test
-        let (pager, root_page_id) = create_test_pager();
-        let mut cursor = BTreeCursor::new_table(None, pager.clone(), root_page_id, 10);
+        let (pager, table_root_page_id, index_root_page_id) = create_test_pager();
+        let table_cursor = BTreeCursor::new_table(None, pager.clone(), table_root_page_id, 5);
+        // Create index cursor with proper index definition for DBSP state table
+        let index_def = create_dbsp_state_index(index_root_page_id);
+        // Index has 4 columns: operator_id, zset_id, element_id, rowid
+        let index_cursor =
+            BTreeCursor::new_index(None, pager.clone(), index_root_page_id, &index_def, 4);
+        let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         // Create an aggregate operator for SUM(age) with no GROUP BY
         let mut agg = AggregateOperator::new(
@@ -1912,11 +2113,11 @@ mod tests {
         // Initialize with initial data
         pager
             .io
-            .block(|| agg.commit((&initial_delta).into(), &mut cursor))
+            .block(|| agg.commit((&initial_delta).into(), &mut cursors))
             .unwrap();
 
         // Verify initial state: SUM(age) = 25 + 30 + 35 = 90
-        let state = get_current_state_from_btree(&agg, &pager, &mut cursor);
+        let state = get_current_state_from_btree(&agg, &pager, &mut cursors);
         assert_eq!(state.changes.len(), 1, "Should have one aggregate row");
         let (row, weight) = &state.changes[0];
         assert_eq!(*weight, 1, "Aggregate row should have weight 1");
@@ -1936,7 +2137,7 @@ mod tests {
         // Process the incremental update
         let output_delta = pager
             .io
-            .block(|| agg.commit((&update_delta).into(), &mut cursor))
+            .block(|| agg.commit((&update_delta).into(), &mut cursors))
             .unwrap();
 
         // CRITICAL: The output delta should contain TWO changes:
@@ -1985,8 +2186,14 @@ mod tests {
 
         // Create an aggregate operator for SUM(score) GROUP BY team
         // Create a persistent pager for the test
-        let (pager, root_page_id) = create_test_pager();
-        let mut cursor = BTreeCursor::new_table(None, pager.clone(), root_page_id, 10);
+        let (pager, table_root_page_id, index_root_page_id) = create_test_pager();
+        let table_cursor = BTreeCursor::new_table(None, pager.clone(), table_root_page_id, 5);
+        // Create index cursor with proper index definition for DBSP state table
+        let index_def = create_dbsp_state_index(index_root_page_id);
+        // Index has 4 columns: operator_id, zset_id, element_id, rowid
+        let index_cursor =
+            BTreeCursor::new_index(None, pager.clone(), index_root_page_id, &index_def, 4);
+        let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         let mut agg = AggregateOperator::new(
             1,                        // operator_id for testing
@@ -2033,11 +2240,11 @@ mod tests {
         // Initialize with initial data
         pager
             .io
-            .block(|| agg.commit((&initial_delta).into(), &mut cursor))
+            .block(|| agg.commit((&initial_delta).into(), &mut cursors))
             .unwrap();
 
         // Verify initial state: red team = 30, blue team = 15
-        let state = get_current_state_from_btree(&agg, &pager, &mut cursor);
+        let state = get_current_state_from_btree(&agg, &pager, &mut cursors);
         assert_eq!(state.changes.len(), 2, "Should have two groups");
 
         // Find the red and blue team aggregates
@@ -2079,7 +2286,7 @@ mod tests {
         // Process the incremental update
         let output_delta = pager
             .io
-            .block(|| agg.commit((&update_delta).into(), &mut cursor))
+            .block(|| agg.commit((&update_delta).into(), &mut cursors))
             .unwrap();
 
         // Should have 2 changes: retraction of old red team sum, insertion of new red team sum
@@ -2130,8 +2337,14 @@ mod tests {
         let tracker = Arc::new(Mutex::new(ComputationTracker::new()));
 
         // Create a persistent pager for the test
-        let (pager, root_page_id) = create_test_pager();
-        let mut cursor = BTreeCursor::new_table(None, pager.clone(), root_page_id, 10);
+        let (pager, table_root_page_id, index_root_page_id) = create_test_pager();
+        let table_cursor = BTreeCursor::new_table(None, pager.clone(), table_root_page_id, 5);
+        // Create index cursor with proper index definition for DBSP state table
+        let index_def = create_dbsp_state_index(index_root_page_id);
+        // Index has 4 columns: operator_id, zset_id, element_id, rowid
+        let index_cursor =
+            BTreeCursor::new_index(None, pager.clone(), index_root_page_id, &index_def, 4);
+        let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         // Create COUNT(*) GROUP BY category
         let mut agg = AggregateOperator::new(
@@ -2161,7 +2374,7 @@ mod tests {
         }
         pager
             .io
-            .block(|| agg.commit((&initial).into(), &mut cursor))
+            .block(|| agg.commit((&initial).into(), &mut cursors))
             .unwrap();
 
         // Reset tracker for delta processing
@@ -2180,13 +2393,13 @@ mod tests {
 
         pager
             .io
-            .block(|| agg.commit((&delta).into(), &mut cursor))
+            .block(|| agg.commit((&delta).into(), &mut cursors))
             .unwrap();
 
         assert_eq!(tracker.lock().unwrap().aggregation_updates, 1);
 
         // Check the final state - cat_0 should now have count 11
-        let final_state = get_current_state_from_btree(&agg, &pager, &mut cursor);
+        let final_state = get_current_state_from_btree(&agg, &pager, &mut cursors);
         let cat_0 = final_state
             .changes
             .iter()
@@ -2205,8 +2418,14 @@ mod tests {
 
         // Create SUM(amount) GROUP BY product
         // Create a persistent pager for the test
-        let (pager, root_page_id) = create_test_pager();
-        let mut cursor = BTreeCursor::new_table(None, pager.clone(), root_page_id, 10);
+        let (pager, table_root_page_id, index_root_page_id) = create_test_pager();
+        let table_cursor = BTreeCursor::new_table(None, pager.clone(), table_root_page_id, 5);
+        // Create index cursor with proper index definition for DBSP state table
+        let index_def = create_dbsp_state_index(index_root_page_id);
+        // Index has 4 columns: operator_id, zset_id, element_id, rowid
+        let index_cursor =
+            BTreeCursor::new_index(None, pager.clone(), index_root_page_id, &index_def, 4);
+        let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         let mut agg = AggregateOperator::new(
             1, // operator_id for testing
@@ -2248,11 +2467,11 @@ mod tests {
         );
         pager
             .io
-            .block(|| agg.commit((&initial).into(), &mut cursor))
+            .block(|| agg.commit((&initial).into(), &mut cursors))
             .unwrap();
 
         // Check initial state: Widget=250, Gadget=200
-        let state = get_current_state_from_btree(&agg, &pager, &mut cursor);
+        let state = get_current_state_from_btree(&agg, &pager, &mut cursors);
         let widget_sum = state
             .changes
             .iter()
@@ -2277,13 +2496,13 @@ mod tests {
 
         pager
             .io
-            .block(|| agg.commit((&delta).into(), &mut cursor))
+            .block(|| agg.commit((&delta).into(), &mut cursors))
             .unwrap();
 
         assert_eq!(tracker.lock().unwrap().aggregation_updates, 1);
 
         // Check final state - Widget should now be 300 (250 + 50)
-        let final_state = get_current_state_from_btree(&agg, &pager, &mut cursor);
+        let final_state = get_current_state_from_btree(&agg, &pager, &mut cursors);
         let widget = final_state
             .changes
             .iter()
@@ -2296,8 +2515,14 @@ mod tests {
     fn test_count_and_sum_together() {
         // Test the example from DBSP_ROADMAP: COUNT(*) and SUM(amount) GROUP BY user_id
         // Create a persistent pager for the test
-        let (pager, root_page_id) = create_test_pager();
-        let mut cursor = BTreeCursor::new_table(None, pager.clone(), root_page_id, 10);
+        let (pager, table_root_page_id, index_root_page_id) = create_test_pager();
+        let table_cursor = BTreeCursor::new_table(None, pager.clone(), table_root_page_id, 5);
+        // Create index cursor with proper index definition for DBSP state table
+        let index_def = create_dbsp_state_index(index_root_page_id);
+        // Index has 4 columns: operator_id, zset_id, element_id, rowid
+        let index_cursor =
+            BTreeCursor::new_index(None, pager.clone(), index_root_page_id, &index_def, 4);
+        let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         let mut agg = AggregateOperator::new(
             1, // operator_id for testing
@@ -2329,13 +2554,13 @@ mod tests {
         );
         pager
             .io
-            .block(|| agg.commit((&initial).into(), &mut cursor))
+            .block(|| agg.commit((&initial).into(), &mut cursors))
             .unwrap();
 
         // Check initial state
         // User 1: count=2, sum=300
         // User 2: count=1, sum=150
-        let state = get_current_state_from_btree(&agg, &pager, &mut cursor);
+        let state = get_current_state_from_btree(&agg, &pager, &mut cursors);
         assert_eq!(state.changes.len(), 2);
 
         let user1 = state
@@ -2364,11 +2589,11 @@ mod tests {
         );
         pager
             .io
-            .block(|| agg.commit((&delta).into(), &mut cursor))
+            .block(|| agg.commit((&delta).into(), &mut cursors))
             .unwrap();
 
         // Check final state - user 1 should have updated count and sum
-        let final_state = get_current_state_from_btree(&agg, &pager, &mut cursor);
+        let final_state = get_current_state_from_btree(&agg, &pager, &mut cursors);
         let user1 = final_state
             .changes
             .iter()
@@ -2382,8 +2607,14 @@ mod tests {
     fn test_avg_maintains_sum_and_count() {
         // Test AVG aggregation
         // Create a persistent pager for the test
-        let (pager, root_page_id) = create_test_pager();
-        let mut cursor = BTreeCursor::new_table(None, pager.clone(), root_page_id, 10);
+        let (pager, table_root_page_id, index_root_page_id) = create_test_pager();
+        let table_cursor = BTreeCursor::new_table(None, pager.clone(), table_root_page_id, 5);
+        // Create index cursor with proper index definition for DBSP state table
+        let index_def = create_dbsp_state_index(index_root_page_id);
+        // Index has 4 columns: operator_id, zset_id, element_id, rowid
+        let index_cursor =
+            BTreeCursor::new_index(None, pager.clone(), index_root_page_id, &index_def, 4);
+        let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         let mut agg = AggregateOperator::new(
             1, // operator_id for testing
@@ -2424,13 +2655,13 @@ mod tests {
         );
         pager
             .io
-            .block(|| agg.commit((&initial).into(), &mut cursor))
+            .block(|| agg.commit((&initial).into(), &mut cursors))
             .unwrap();
 
         // Check initial averages
         // Category A: avg = (10 + 20) / 2 = 15
         // Category B: avg = 30 / 1 = 30
-        let state = get_current_state_from_btree(&agg, &pager, &mut cursor);
+        let state = get_current_state_from_btree(&agg, &pager, &mut cursors);
         let cat_a = state
             .changes
             .iter()
@@ -2459,11 +2690,11 @@ mod tests {
         );
         pager
             .io
-            .block(|| agg.commit((&delta).into(), &mut cursor))
+            .block(|| agg.commit((&delta).into(), &mut cursors))
             .unwrap();
 
         // Check final state - Category A avg should now be (10 + 20 + 30) / 3 = 20
-        let final_state = get_current_state_from_btree(&agg, &pager, &mut cursor);
+        let final_state = get_current_state_from_btree(&agg, &pager, &mut cursors);
         let cat_a = final_state
             .changes
             .iter()
@@ -2476,8 +2707,14 @@ mod tests {
     fn test_delete_updates_aggregates() {
         // Test that deletes (negative weights) properly update aggregates
         // Create a persistent pager for the test
-        let (pager, root_page_id) = create_test_pager();
-        let mut cursor = BTreeCursor::new_table(None, pager.clone(), root_page_id, 10);
+        let (pager, table_root_page_id, index_root_page_id) = create_test_pager();
+        let table_cursor = BTreeCursor::new_table(None, pager.clone(), table_root_page_id, 5);
+        // Create index cursor with proper index definition for DBSP state table
+        let index_def = create_dbsp_state_index(index_root_page_id);
+        // Index has 4 columns: operator_id, zset_id, element_id, rowid
+        let index_cursor =
+            BTreeCursor::new_index(None, pager.clone(), index_root_page_id, &index_def, 4);
+        let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         let mut agg = AggregateOperator::new(
             1, // operator_id for testing
@@ -2513,11 +2750,11 @@ mod tests {
         );
         pager
             .io
-            .block(|| agg.commit((&initial).into(), &mut cursor))
+            .block(|| agg.commit((&initial).into(), &mut cursors))
             .unwrap();
 
         // Check initial state: count=2, sum=300
-        let state = get_current_state_from_btree(&agg, &pager, &mut cursor);
+        let state = get_current_state_from_btree(&agg, &pager, &mut cursors);
         assert!(!state.changes.is_empty());
         let (row, _weight) = &state.changes[0];
         assert_eq!(row.values[1], Value::Integer(2)); // count
@@ -2536,11 +2773,11 @@ mod tests {
 
         pager
             .io
-            .block(|| agg.commit((&delta).into(), &mut cursor))
+            .block(|| agg.commit((&delta).into(), &mut cursors))
             .unwrap();
 
         // Check final state - should update to count=1, sum=200
-        let final_state = get_current_state_from_btree(&agg, &pager, &mut cursor);
+        let final_state = get_current_state_from_btree(&agg, &pager, &mut cursors);
         let cat_a = final_state
             .changes
             .iter()
@@ -2557,8 +2794,14 @@ mod tests {
         let input_columns = vec!["category".to_string(), "value".to_string()];
 
         // Create a persistent pager for the test
-        let (pager, root_page_id) = create_test_pager();
-        let mut cursor = BTreeCursor::new_table(None, pager.clone(), root_page_id, 10);
+        let (pager, table_root_page_id, index_root_page_id) = create_test_pager();
+        let table_cursor = BTreeCursor::new_table(None, pager.clone(), table_root_page_id, 5);
+        // Create index cursor with proper index definition for DBSP state table
+        let index_def = create_dbsp_state_index(index_root_page_id);
+        // Index has 4 columns: operator_id, zset_id, element_id, rowid
+        let index_cursor =
+            BTreeCursor::new_index(None, pager.clone(), index_root_page_id, &index_def, 4);
+        let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         let mut agg = AggregateOperator::new(
             1, // operator_id for testing
@@ -2574,11 +2817,11 @@ mod tests {
         init_data.insert(3, vec![Value::Text("B".into()), Value::Integer(30)]);
         pager
             .io
-            .block(|| agg.commit((&init_data).into(), &mut cursor))
+            .block(|| agg.commit((&init_data).into(), &mut cursors))
             .unwrap();
 
         // Check initial counts
-        let state = get_current_state_from_btree(&agg, &pager, &mut cursor);
+        let state = get_current_state_from_btree(&agg, &pager, &mut cursors);
         assert_eq!(state.changes.len(), 2);
 
         // Find group A and B
@@ -2602,14 +2845,14 @@ mod tests {
 
         let output = pager
             .io
-            .block(|| agg.commit((&delete_delta).into(), &mut cursor))
+            .block(|| agg.commit((&delete_delta).into(), &mut cursors))
             .unwrap();
 
         // Should emit retraction for old count and insertion for new count
         assert_eq!(output.changes.len(), 2);
 
         // Check final state
-        let final_state = get_current_state_from_btree(&agg, &pager, &mut cursor);
+        let final_state = get_current_state_from_btree(&agg, &pager, &mut cursors);
         let group_a_final = final_state
             .changes
             .iter()
@@ -2623,13 +2866,13 @@ mod tests {
 
         let output_b = pager
             .io
-            .block(|| agg.commit((&delete_all_b).into(), &mut cursor))
+            .block(|| agg.commit((&delete_all_b).into(), &mut cursors))
             .unwrap();
         assert_eq!(output_b.changes.len(), 1); // Only retraction, no new row
         assert_eq!(output_b.changes[0].1, -1); // Retraction
 
         // Final state should not have group B
-        let final_state2 = get_current_state_from_btree(&agg, &pager, &mut cursor);
+        let final_state2 = get_current_state_from_btree(&agg, &pager, &mut cursors);
         assert_eq!(final_state2.changes.len(), 1); // Only group A remains
         assert_eq!(final_state2.changes[0].0.values[0], Value::Text("A".into()));
     }
@@ -2641,8 +2884,14 @@ mod tests {
         let input_columns = vec!["category".to_string(), "value".to_string()];
 
         // Create a persistent pager for the test
-        let (pager, root_page_id) = create_test_pager();
-        let mut cursor = BTreeCursor::new_table(None, pager.clone(), root_page_id, 10);
+        let (pager, table_root_page_id, index_root_page_id) = create_test_pager();
+        let table_cursor = BTreeCursor::new_table(None, pager.clone(), table_root_page_id, 5);
+        // Create index cursor with proper index definition for DBSP state table
+        let index_def = create_dbsp_state_index(index_root_page_id);
+        // Index has 4 columns: operator_id, zset_id, element_id, rowid
+        let index_cursor =
+            BTreeCursor::new_index(None, pager.clone(), index_root_page_id, &index_def, 4);
+        let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         let mut agg = AggregateOperator::new(
             1, // operator_id for testing
@@ -2659,11 +2908,11 @@ mod tests {
         init_data.insert(4, vec![Value::Text("B".into()), Value::Integer(15)]);
         pager
             .io
-            .block(|| agg.commit((&init_data).into(), &mut cursor))
+            .block(|| agg.commit((&init_data).into(), &mut cursors))
             .unwrap();
 
         // Check initial sums
-        let state = get_current_state_from_btree(&agg, &pager, &mut cursor);
+        let state = get_current_state_from_btree(&agg, &pager, &mut cursors);
         let group_a = state
             .changes
             .iter()
@@ -2684,11 +2933,11 @@ mod tests {
 
         pager
             .io
-            .block(|| agg.commit((&delete_delta).into(), &mut cursor))
+            .block(|| agg.commit((&delete_delta).into(), &mut cursors))
             .unwrap();
 
         // Check updated sum
-        let state = get_current_state_from_btree(&agg, &pager, &mut cursor);
+        let state = get_current_state_from_btree(&agg, &pager, &mut cursors);
         let group_a = state
             .changes
             .iter()
@@ -2703,11 +2952,11 @@ mod tests {
 
         pager
             .io
-            .block(|| agg.commit((&delete_all_b).into(), &mut cursor))
+            .block(|| agg.commit((&delete_all_b).into(), &mut cursors))
             .unwrap();
 
         // Group B should be gone
-        let final_state = get_current_state_from_btree(&agg, &pager, &mut cursor);
+        let final_state = get_current_state_from_btree(&agg, &pager, &mut cursors);
         assert_eq!(final_state.changes.len(), 1); // Only group A remains
         assert_eq!(final_state.changes[0].0.values[0], Value::Text("A".into()));
     }
@@ -2719,8 +2968,14 @@ mod tests {
         let input_columns = vec!["category".to_string(), "value".to_string()];
 
         // Create a persistent pager for the test
-        let (pager, root_page_id) = create_test_pager();
-        let mut cursor = BTreeCursor::new_table(None, pager.clone(), root_page_id, 10);
+        let (pager, table_root_page_id, index_root_page_id) = create_test_pager();
+        let table_cursor = BTreeCursor::new_table(None, pager.clone(), table_root_page_id, 5);
+        // Create index cursor with proper index definition for DBSP state table
+        let index_def = create_dbsp_state_index(index_root_page_id);
+        // Index has 4 columns: operator_id, zset_id, element_id, rowid
+        let index_cursor =
+            BTreeCursor::new_index(None, pager.clone(), index_root_page_id, &index_def, 4);
+        let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         let mut agg = AggregateOperator::new(
             1, // operator_id for testing
@@ -2736,11 +2991,11 @@ mod tests {
         init_data.insert(3, vec![Value::Text("A".into()), Value::Integer(30)]);
         pager
             .io
-            .block(|| agg.commit((&init_data).into(), &mut cursor))
+            .block(|| agg.commit((&init_data).into(), &mut cursors))
             .unwrap();
 
         // Check initial average
-        let state = get_current_state_from_btree(&agg, &pager, &mut cursor);
+        let state = get_current_state_from_btree(&agg, &pager, &mut cursors);
         assert_eq!(state.changes.len(), 1);
         assert_eq!(state.changes[0].0.values[1], Value::Float(20.0)); // AVG = (10+20+30)/3 = 20
 
@@ -2750,11 +3005,11 @@ mod tests {
 
         pager
             .io
-            .block(|| agg.commit((&delete_delta).into(), &mut cursor))
+            .block(|| agg.commit((&delete_delta).into(), &mut cursors))
             .unwrap();
 
         // Check updated average
-        let state = get_current_state_from_btree(&agg, &pager, &mut cursor);
+        let state = get_current_state_from_btree(&agg, &pager, &mut cursors);
         assert_eq!(state.changes[0].0.values[1], Value::Float(20.0)); // AVG = (10+30)/2 = 20 (same!)
 
         // Delete another to change the average
@@ -2763,10 +3018,10 @@ mod tests {
 
         pager
             .io
-            .block(|| agg.commit((&delete_another).into(), &mut cursor))
+            .block(|| agg.commit((&delete_another).into(), &mut cursors))
             .unwrap();
 
-        let state = get_current_state_from_btree(&agg, &pager, &mut cursor);
+        let state = get_current_state_from_btree(&agg, &pager, &mut cursors);
         assert_eq!(state.changes[0].0.values[1], Value::Float(10.0)); // AVG = 10/1 = 10
     }
 
@@ -2782,8 +3037,14 @@ mod tests {
         let input_columns = vec!["category".to_string(), "value".to_string()];
 
         // Create a persistent pager for the test
-        let (pager, root_page_id) = create_test_pager();
-        let mut cursor = BTreeCursor::new_table(None, pager.clone(), root_page_id, 10);
+        let (pager, table_root_page_id, index_root_page_id) = create_test_pager();
+        let table_cursor = BTreeCursor::new_table(None, pager.clone(), table_root_page_id, 5);
+        // Create index cursor with proper index definition for DBSP state table
+        let index_def = create_dbsp_state_index(index_root_page_id);
+        // Index has 4 columns: operator_id, zset_id, element_id, rowid
+        let index_cursor =
+            BTreeCursor::new_index(None, pager.clone(), index_root_page_id, &index_def, 4);
+        let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         let mut agg = AggregateOperator::new(
             1, // operator_id for testing
@@ -2799,11 +3060,11 @@ mod tests {
         init_data.insert(3, vec![Value::Text("B".into()), Value::Integer(50)]);
         pager
             .io
-            .block(|| agg.commit((&init_data).into(), &mut cursor))
+            .block(|| agg.commit((&init_data).into(), &mut cursors))
             .unwrap();
 
         // Check initial state
-        let state = get_current_state_from_btree(&agg, &pager, &mut cursor);
+        let state = get_current_state_from_btree(&agg, &pager, &mut cursors);
         let group_a = state
             .changes
             .iter()
@@ -2820,11 +3081,11 @@ mod tests {
 
         pager
             .io
-            .block(|| agg.commit((&delete_delta).into(), &mut cursor))
+            .block(|| agg.commit((&delete_delta).into(), &mut cursors))
             .unwrap();
 
         // Check all aggregates updated correctly
-        let state = get_current_state_from_btree(&agg, &pager, &mut cursor);
+        let state = get_current_state_from_btree(&agg, &pager, &mut cursors);
         let group_a = state
             .changes
             .iter()
@@ -2841,10 +3102,10 @@ mod tests {
 
         pager
             .io
-            .block(|| agg.commit((&insert_delta).into(), &mut cursor))
+            .block(|| agg.commit((&insert_delta).into(), &mut cursors))
             .unwrap();
 
-        let state = get_current_state_from_btree(&agg, &pager, &mut cursor);
+        let state = get_current_state_from_btree(&agg, &pager, &mut cursors);
         let group_a = state
             .changes
             .iter()
@@ -2862,8 +3123,14 @@ mod tests {
         // the operator should properly consolidate the state
 
         // Create a persistent pager for the test
-        let (pager, root_page_id) = create_test_pager();
-        let mut cursor = BTreeCursor::new_table(None, pager.clone(), root_page_id, 10);
+        let (pager, table_root_page_id, index_root_page_id) = create_test_pager();
+        let table_cursor = BTreeCursor::new_table(None, pager.clone(), table_root_page_id, 5);
+        // Create index cursor with proper index definition for DBSP state table
+        let index_def = create_dbsp_state_index(index_root_page_id);
+        // Index has 4 columns: operator_id, zset_id, element_id, rowid
+        let index_cursor =
+            BTreeCursor::new_index(None, pager.clone(), index_root_page_id, &index_def, 4);
+        let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         let mut filter = FilterOperator::new(
             FilterPredicate::GreaterThan {
@@ -2878,7 +3145,7 @@ mod tests {
         init_data.insert(3, vec![Value::Integer(3), Value::Integer(3)]);
         let state = pager
             .io
-            .block(|| filter.commit((&init_data).into(), &mut cursor))
+            .block(|| filter.commit((&init_data).into(), &mut cursors))
             .unwrap();
 
         // Check initial state
@@ -2897,7 +3164,7 @@ mod tests {
 
         let output = pager
             .io
-            .block(|| filter.commit((&update_delta).into(), &mut cursor))
+            .block(|| filter.commit((&update_delta).into(), &mut cursors))
             .unwrap();
 
         // The output delta should have both changes (both pass the filter b > 2)
@@ -2918,8 +3185,14 @@ mod tests {
     #[test]
     fn test_filter_eval_with_uncommitted() {
         // Create a persistent pager for the test
-        let (pager, root_page_id) = create_test_pager();
-        let mut cursor = BTreeCursor::new_table(None, pager.clone(), root_page_id, 10);
+        let (pager, table_root_page_id, index_root_page_id) = create_test_pager();
+        let table_cursor = BTreeCursor::new_table(None, pager.clone(), table_root_page_id, 5);
+        // Create index cursor with proper index definition for DBSP state table
+        let index_def = create_dbsp_state_index(index_root_page_id);
+        // Index has 4 columns: operator_id, zset_id, element_id, rowid
+        let index_cursor =
+            BTreeCursor::new_index(None, pager.clone(), index_root_page_id, &index_def, 4);
+        let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         let mut filter = FilterOperator::new(
             FilterPredicate::GreaterThan {
@@ -2949,7 +3222,7 @@ mod tests {
         );
         let state = pager
             .io
-            .block(|| filter.commit((&init_data).into(), &mut cursor))
+            .block(|| filter.commit((&init_data).into(), &mut cursors))
             .unwrap();
 
         // Verify initial state (only Alice passes filter)
@@ -2979,7 +3252,7 @@ mod tests {
         let mut eval_state = uncommitted.clone().into();
         let result = pager
             .io
-            .block(|| filter.eval(&mut eval_state, &mut cursor))
+            .block(|| filter.eval(&mut eval_state, &mut cursors))
             .unwrap();
         assert_eq!(
             result.changes.len(),
@@ -2991,7 +3264,7 @@ mod tests {
         // Now commit the changes
         let state = pager
             .io
-            .block(|| filter.commit((&uncommitted).into(), &mut cursor))
+            .block(|| filter.commit((&uncommitted).into(), &mut cursors))
             .unwrap();
 
         // State should now include Charlie (who passes filter)
@@ -3006,8 +3279,14 @@ mod tests {
     fn test_aggregate_eval_with_uncommitted_preserves_state() {
         // This is the critical test - aggregations must not modify internal state during eval
         // Create a persistent pager for the test
-        let (pager, root_page_id) = create_test_pager();
-        let mut cursor = BTreeCursor::new_table(None, pager.clone(), root_page_id, 10);
+        let (pager, table_root_page_id, index_root_page_id) = create_test_pager();
+        let table_cursor = BTreeCursor::new_table(None, pager.clone(), table_root_page_id, 5);
+        // Create index cursor with proper index definition for DBSP state table
+        let index_def = create_dbsp_state_index(index_root_page_id);
+        // Index has 4 columns: operator_id, zset_id, element_id, rowid
+        let index_cursor =
+            BTreeCursor::new_index(None, pager.clone(), index_root_page_id, &index_def, 4);
+        let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         let mut agg = AggregateOperator::new(
             1, // operator_id for testing
@@ -3051,11 +3330,11 @@ mod tests {
         );
         pager
             .io
-            .block(|| agg.commit((&init_data).into(), &mut cursor))
+            .block(|| agg.commit((&init_data).into(), &mut cursors))
             .unwrap();
 
         // Check initial state: A -> (count=2, sum=300), B -> (count=1, sum=150)
-        let initial_state = get_current_state_from_btree(&agg, &pager, &mut cursor);
+        let initial_state = get_current_state_from_btree(&agg, &pager, &mut cursors);
         assert_eq!(initial_state.changes.len(), 2);
 
         // Store initial state for comparison
@@ -3090,7 +3369,7 @@ mod tests {
         let mut eval_state = uncommitted.clone().into();
         let result = pager
             .io
-            .block(|| agg.eval(&mut eval_state, &mut cursor))
+            .block(|| agg.eval(&mut eval_state, &mut cursors))
             .unwrap();
 
         // Result should contain updates for A and new group C
@@ -3099,7 +3378,7 @@ mod tests {
         assert!(!result.changes.is_empty(), "Should have aggregate changes");
 
         // CRITICAL: Verify internal state hasn't changed
-        let state_after_eval = get_current_state_from_btree(&agg, &pager, &mut cursor);
+        let state_after_eval = get_current_state_from_btree(&agg, &pager, &mut cursors);
         assert_eq!(
             state_after_eval.changes.len(),
             2,
@@ -3125,11 +3404,11 @@ mod tests {
         // Now commit the changes
         pager
             .io
-            .block(|| agg.commit((&uncommitted).into(), &mut cursor))
+            .block(|| agg.commit((&uncommitted).into(), &mut cursors))
             .unwrap();
 
         // State should now be updated
-        let final_state = get_current_state_from_btree(&agg, &pager, &mut cursor);
+        let final_state = get_current_state_from_btree(&agg, &pager, &mut cursors);
         assert_eq!(final_state.changes.len(), 3, "Should now have A, B, and C");
 
         let a_final = final_state
@@ -3170,8 +3449,14 @@ mod tests {
         // Test that calling eval multiple times with different uncommitted data
         // doesn't pollute the internal state
         // Create a persistent pager for the test
-        let (pager, root_page_id) = create_test_pager();
-        let mut cursor = BTreeCursor::new_table(None, pager.clone(), root_page_id, 10);
+        let (pager, table_root_page_id, index_root_page_id) = create_test_pager();
+        let table_cursor = BTreeCursor::new_table(None, pager.clone(), table_root_page_id, 5);
+        // Create index cursor with proper index definition for DBSP state table
+        let index_def = create_dbsp_state_index(index_root_page_id);
+        // Index has 4 columns: operator_id, zset_id, element_id, rowid
+        let index_cursor =
+            BTreeCursor::new_index(None, pager.clone(), index_root_page_id, &index_def, 4);
+        let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         let mut agg = AggregateOperator::new(
             1,      // operator_id for testing
@@ -3189,11 +3474,11 @@ mod tests {
         init_data.insert(2, vec![Value::Integer(2), Value::Integer(200)]);
         pager
             .io
-            .block(|| agg.commit((&init_data).into(), &mut cursor))
+            .block(|| agg.commit((&init_data).into(), &mut cursors))
             .unwrap();
 
         // Initial state: count=2, sum=300
-        let initial_state = get_current_state_from_btree(&agg, &pager, &mut cursor);
+        let initial_state = get_current_state_from_btree(&agg, &pager, &mut cursors);
         assert_eq!(initial_state.changes.len(), 1);
         assert_eq!(initial_state.changes[0].0.values[0], Value::Integer(2));
         assert_eq!(initial_state.changes[0].0.values[1], Value::Float(300.0));
@@ -3204,11 +3489,11 @@ mod tests {
         let mut eval_state1 = uncommitted1.clone().into();
         let _ = pager
             .io
-            .block(|| agg.eval(&mut eval_state1, &mut cursor))
+            .block(|| agg.eval(&mut eval_state1, &mut cursors))
             .unwrap();
 
         // State should be unchanged
-        let state1 = get_current_state_from_btree(&agg, &pager, &mut cursor);
+        let state1 = get_current_state_from_btree(&agg, &pager, &mut cursors);
         assert_eq!(state1.changes[0].0.values[0], Value::Integer(2));
         assert_eq!(state1.changes[0].0.values[1], Value::Float(300.0));
 
@@ -3219,11 +3504,11 @@ mod tests {
         let mut eval_state2 = uncommitted2.clone().into();
         let _ = pager
             .io
-            .block(|| agg.eval(&mut eval_state2, &mut cursor))
+            .block(|| agg.eval(&mut eval_state2, &mut cursors))
             .unwrap();
 
         // State should STILL be unchanged
-        let state2 = get_current_state_from_btree(&agg, &pager, &mut cursor);
+        let state2 = get_current_state_from_btree(&agg, &pager, &mut cursors);
         assert_eq!(state2.changes[0].0.values[0], Value::Integer(2));
         assert_eq!(state2.changes[0].0.values[1], Value::Float(300.0));
 
@@ -3233,11 +3518,11 @@ mod tests {
         let mut eval_state3 = uncommitted3.clone().into();
         let _ = pager
             .io
-            .block(|| agg.eval(&mut eval_state3, &mut cursor))
+            .block(|| agg.eval(&mut eval_state3, &mut cursors))
             .unwrap();
 
         // State should STILL be unchanged
-        let state3 = get_current_state_from_btree(&agg, &pager, &mut cursor);
+        let state3 = get_current_state_from_btree(&agg, &pager, &mut cursors);
         assert_eq!(state3.changes[0].0.values[0], Value::Integer(2));
         assert_eq!(state3.changes[0].0.values[1], Value::Float(300.0));
     }
@@ -3246,8 +3531,14 @@ mod tests {
     fn test_aggregate_eval_with_mixed_committed_and_uncommitted() {
         // Test eval with both committed delta and uncommitted changes
         // Create a persistent pager for the test
-        let (pager, root_page_id) = create_test_pager();
-        let mut cursor = BTreeCursor::new_table(None, pager.clone(), root_page_id, 10);
+        let (pager, table_root_page_id, index_root_page_id) = create_test_pager();
+        let table_cursor = BTreeCursor::new_table(None, pager.clone(), table_root_page_id, 5);
+        // Create index cursor with proper index definition for DBSP state table
+        let index_def = create_dbsp_state_index(index_root_page_id);
+        // Index has 4 columns: operator_id, zset_id, element_id, rowid
+        let index_cursor =
+            BTreeCursor::new_index(None, pager.clone(), index_root_page_id, &index_def, 4);
+        let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         let mut agg = AggregateOperator::new(
             1, // operator_id for testing
@@ -3262,7 +3553,7 @@ mod tests {
         init_data.insert(2, vec![Value::Integer(2), Value::Text("Y".into())]);
         pager
             .io
-            .block(|| agg.commit((&init_data).into(), &mut cursor))
+            .block(|| agg.commit((&init_data).into(), &mut cursors))
             .unwrap();
 
         // Create a committed delta (to be processed)
@@ -3280,7 +3571,7 @@ mod tests {
         let mut eval_state = combined.clone().into();
         let result = pager
             .io
-            .block(|| agg.eval(&mut eval_state, &mut cursor))
+            .block(|| agg.eval(&mut eval_state, &mut cursors))
             .unwrap();
 
         // Result should reflect changes from both
@@ -3334,17 +3625,17 @@ mod tests {
         assert_eq!(sorted_changes[4].1, 1); // insertion only (no retraction as it's new);
 
         // But internal state should be unchanged
-        let state = get_current_state_from_btree(&agg, &pager, &mut cursor);
+        let state = get_current_state_from_btree(&agg, &pager, &mut cursors);
         assert_eq!(state.changes.len(), 2, "Should still have only X and Y");
 
         // Now commit only the committed_delta
         pager
             .io
-            .block(|| agg.commit((&committed_delta).into(), &mut cursor))
+            .block(|| agg.commit((&committed_delta).into(), &mut cursors))
             .unwrap();
 
         // State should now have X count=2, Y count=1
-        let final_state = get_current_state_from_btree(&agg, &pager, &mut cursor);
+        let final_state = get_current_state_from_btree(&agg, &pager, &mut cursors);
         let x = final_state
             .changes
             .iter()
