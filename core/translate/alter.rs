@@ -198,6 +198,7 @@ pub fn translate_alter_table(
                 }
             }
 
+            // TODO: All quoted ids will be quoted with `[]`, we should store some info from the parsed AST
             btree.columns.push(column.clone());
 
             let sql = btree.to_sql();
