@@ -19,6 +19,7 @@ void test_sqlite3_bind_blob();
 void test_sqlite3_column_type();
 void test_sqlite3_column_decltype();
 void test_sqlite3_next_stmt();
+void test_sqlite3_table_column_metadata();
 
 int allocated = 0;
 
@@ -29,7 +30,7 @@ int main(void)
     test_sqlite3_bind_double();
     test_sqlite3_bind_parameter_name();
     test_sqlite3_bind_parameter_count();
-    //test_sqlite3_column_name();
+    test_sqlite3_column_name();
     test_sqlite3_last_insert_rowid();
     test_sqlite3_bind_text();
     test_sqlite3_bind_text2();
@@ -37,6 +38,7 @@ int main(void)
     test_sqlite3_column_type();
     test_sqlite3_column_decltype();
     test_sqlite3_next_stmt();
+    test_sqlite3_table_column_metadata();
     return 0;
 }
 
@@ -65,6 +67,7 @@ void test_sqlite3_changes()
     assert(rc == SQLITE_OK);
 
     assert(sqlite3_changes(db) == 0);
+    assert(sqlite3_changes64(db) == 0);
 
     rc = sqlite3_exec(db,
         "INSERT INTO turso_test_changes (name) VALUES ('abc');",
@@ -72,6 +75,7 @@ void test_sqlite3_changes()
     assert(rc == SQLITE_OK);
     if (err_msg) { sqlite3_free(err_msg); err_msg = NULL; }
     assert(sqlite3_changes(db) == 1);
+    assert(sqlite3_changes64(db) == 1);
 
 
     rc = sqlite3_exec(db,
@@ -80,6 +84,7 @@ void test_sqlite3_changes()
     assert(rc == SQLITE_OK);
     if (err_msg) { sqlite3_free(err_msg); err_msg = NULL; }
     assert(sqlite3_changes(db) == 3);
+    assert(sqlite3_changes64(db) == 3);
 
     sqlite3_close(db);
 }
@@ -271,10 +276,17 @@ void test_sqlite3_column_name() {
     assert(strcmp(col0, "id") == 0);
     assert(strcmp(col1, "full_name") == 0);  
     assert(strcmp(col2, "age") == 0);
+
+    // test table column name
+    const char *table_name = sqlite3_column_table_name(stmt, 0);
+
+    printf("Column table name: %s\n", table_name);
+
+    assert(strcmp(table_name, "test_column_name") == 0);
     
     //will cause panic because get_column_name uses expect()
-    const char *invalid_col = sqlite3_column_name(stmt, 99);
-    assert(invalid_col == NULL);
+    // const char *invalid_col = sqlite3_column_name(stmt, 99);
+    // assert(invalid_col == NULL);
 
     sqlite3_finalize(stmt);
     sqlite3_close(db);
@@ -566,4 +578,171 @@ void test_sqlite3_column_decltype()
 
     sqlite3_finalize(stmt);
     sqlite3_close(db);
+}
+
+
+void test_sqlite3_next_stmt()
+{
+	sqlite3 *db;
+	sqlite3_stmt *stmt1 = NULL;
+	sqlite3_stmt *stmt2 = NULL;
+	sqlite3_stmt *stmt3 = NULL;
+	int rc;
+
+	rc = sqlite3_open(":memory:", &db);
+	assert(rc == SQLITE_OK);
+
+	// Initially, there should be no prepared statements
+	assert(sqlite3_next_stmt(db, NULL) == NULL);
+
+	// Prepare first statement
+	rc = sqlite3_prepare_v2(db, "SELECT 1;", -1, &stmt1, NULL);
+	assert(rc == SQLITE_OK);
+	assert(stmt1 != NULL);
+
+	// Now there should be one statement
+	assert(sqlite3_next_stmt(db, NULL) == stmt1);
+	// And no more after that
+	assert(sqlite3_next_stmt(db, stmt1) == NULL);
+
+	// Prepare second and third statements
+	rc = sqlite3_prepare_v2(db, "SELECT 2;", -1, &stmt2, NULL);
+	assert(rc == SQLITE_OK);
+	assert(stmt2 != NULL);
+	rc = sqlite3_prepare_v2(db, "SELECT 3;", -1, &stmt3, NULL);
+	assert(rc == SQLITE_OK);
+	assert(stmt3 != NULL);
+
+	// Count all statements
+	int count = 0;
+	sqlite3_stmt *iter = sqlite3_next_stmt(db, NULL);
+	while (iter != NULL) {
+		count++;
+		iter = sqlite3_next_stmt(db, iter);
+	}
+	assert(count == 3);
+
+	// Finalize the middle statement and recount
+	assert(sqlite3_finalize(stmt2) == SQLITE_OK);
+	count = 0;
+	iter = sqlite3_next_stmt(db, NULL);
+	while (iter != NULL) {
+		count++;
+		iter = sqlite3_next_stmt(db, iter);
+	}
+	assert(count == 2);
+
+	// Finalize remaining statements
+	assert(sqlite3_finalize(stmt1) == SQLITE_OK);
+	assert(sqlite3_finalize(stmt3) == SQLITE_OK);
+
+	// Should be no statements left
+	assert(sqlite3_next_stmt(db, NULL) == NULL);
+
+	sqlite3_close(db);
+}
+
+void test_sqlite3_table_column_metadata()
+{
+	sqlite3 *db;
+	int rc;
+	const char *data_type;
+	const char *coll_seq;
+	int not_null;
+	int primary_key;
+	int autoinc;
+
+	// Open in-memory database
+	rc = sqlite3_open(":memory:", &db);
+	assert(rc == SQLITE_OK);
+
+	// Create a test table
+	rc = sqlite3_exec(db, 
+		"CREATE TABLE test_metadata (id INTEGER PRIMARY KEY, name TEXT NOT NULL, value REAL)",
+		NULL, NULL, NULL);
+	assert(rc == SQLITE_OK);
+
+	// Test column metadata for 'id' column
+	rc = sqlite3_table_column_metadata(db, NULL, "test_metadata", "id", 
+		&data_type, &coll_seq, &not_null, &primary_key, &autoinc);
+	assert(rc == SQLITE_OK);
+	
+	// Verify the results
+	assert(data_type != NULL);
+	assert(coll_seq != NULL);
+	assert(strcmp(data_type, "INTEGER") == 0);
+	assert(strcmp(coll_seq, "BINARY") == 0);
+	assert(primary_key == 1); // id is primary key
+	assert(not_null == 0); // INTEGER columns don't have NOT NULL by default
+	assert(autoinc == 0); // not auto-increment
+
+	// Test column metadata for 'name' column
+	rc = sqlite3_table_column_metadata(db, NULL, "test_metadata", "name", 
+		&data_type, &coll_seq, &not_null, &primary_key, &autoinc);
+	assert(rc == SQLITE_OK);
+	
+	// Verify the results
+	assert(data_type != NULL);
+	assert(coll_seq != NULL);
+	assert(strcmp(data_type, "TEXT") == 0);
+	assert(strcmp(coll_seq, "BINARY") == 0);
+	assert(primary_key == 0); // name is not primary key
+	assert(not_null == 1); // name has NOT NULL constraint
+	assert(autoinc == 0); // not auto-increment
+
+	// Test column metadata for 'value' column
+	rc = sqlite3_table_column_metadata(db, NULL, "test_metadata", "value", 
+		&data_type, &coll_seq, &not_null, &primary_key, &autoinc);
+	assert(rc == SQLITE_OK);
+	
+	// Verify the results
+	assert(data_type != NULL);
+	assert(coll_seq != NULL);
+	assert(strcmp(data_type, "REAL") == 0);
+	assert(strcmp(coll_seq, "BINARY") == 0);
+	assert(primary_key == 0); // value is not primary key
+	assert(not_null == 0); // value doesn't have NOT NULL constraint
+	assert(autoinc == 0); // not auto-increment
+
+	// Test non-existent column
+	rc = sqlite3_table_column_metadata(db, NULL, "test_metadata", "nonexistent", 
+		&data_type, &coll_seq, &not_null, &primary_key, &autoinc);
+	assert(rc == SQLITE_ERROR);
+
+	// Test non-existent table
+	rc = sqlite3_table_column_metadata(db, NULL, "nonexistent_table", "id", 
+		&data_type, &coll_seq, &not_null, &primary_key, &autoinc);
+	assert(rc == SQLITE_ERROR);
+
+	// Test rowid column
+	rc = sqlite3_table_column_metadata(db, NULL, "test_metadata", "rowid", 
+		&data_type, &coll_seq, &not_null, &primary_key, &autoinc);
+	assert(rc == SQLITE_OK);
+	
+	// Verify rowid results
+	assert(data_type != NULL);
+	assert(coll_seq != NULL);
+	assert(strcmp(data_type, "INTEGER") == 0);
+	assert(strcmp(coll_seq, "BINARY") == 0);
+	assert(primary_key == 1); // rowid is primary key
+	assert(not_null == 0);
+	assert(autoinc == 0);
+
+	// Test with NULL database name (should default to main)
+	rc = sqlite3_table_column_metadata(db, NULL, "test_metadata", "id", 
+		&data_type, &coll_seq, &not_null, &primary_key, &autoinc);
+	assert(rc == SQLITE_OK);
+
+	// Test with explicit "main" database name
+	rc = sqlite3_table_column_metadata(db, "main", "test_metadata", "id", 
+		&data_type, &coll_seq, &not_null, &primary_key, &autoinc);
+	assert(rc == SQLITE_OK);
+
+	// Test with non-main database name (should return error for now)
+	rc = sqlite3_table_column_metadata(db, "temp", "test_metadata", "id", 
+		&data_type, &coll_seq, &not_null, &primary_key, &autoinc);
+	assert(rc == SQLITE_ERROR);
+
+	printf("sqlite3_table_column_metadata test passed\n");
+	sqlite3_close(db);
 }

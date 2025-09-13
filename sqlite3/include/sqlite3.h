@@ -103,6 +103,8 @@ int sqlite3_reset(sqlite3_stmt *stmt);
 
 int sqlite3_changes(sqlite3 *_db);
 
+int64_t sqlite3_changes64(sqlite3 *_db);
+
 int sqlite3_stmt_readonly(sqlite3_stmt *_stmt);
 
 int sqlite3_stmt_busy(sqlite3_stmt *_stmt);
@@ -176,6 +178,8 @@ int sqlite3_column_count(sqlite3_stmt *_stmt);
 const char *sqlite3_column_decltype(sqlite3_stmt *_stmt, int _idx);
 
 const char *sqlite3_column_name(sqlite3_stmt *_stmt, int _idx);
+
+const char *sqlite3_column_table_name(sqlite3_stmt *_stmt, int _idx);
 
 int64_t sqlite3_column_int64(sqlite3_stmt *_stmt, int _idx);
 
@@ -306,6 +310,32 @@ int sqlite3_wal_checkpoint_v2(sqlite3 *db, const char *_db_name, int _mode, int 
  *   the number of frames in the WAL file.
  */
 int libsql_wal_frame_count(sqlite3 *db, uint32_t *p_frame_count);
+
+/**
+ * Return meta information about a specific column of a database table.
+ * 
+ * @param db Connection handle
+ * @param zDbName Database name or NULL for main database
+ * @param zTableName Table name
+ * @param zColumnName Column name
+ * @param pzDataType OUTPUT: Declared data type
+ * @param pzCollSeq OUTPUT: Collation sequence name
+ * @param pNotNull OUTPUT: True if NOT NULL constraint exists
+ * @param pPrimaryKey OUTPUT: True if column part of PK
+ * @param pAutoinc OUTPUT: True if column is auto-increment
+ * @return SQLITE_OK on success, SQLITE_ERROR on error
+ */
+int sqlite3_table_column_metadata(
+    sqlite3 *db,
+    const char *zDbName,
+    const char *zTableName,
+    const char *zColumnName,
+    char const **pzDataType,
+    char const **pzCollSeq,
+    int *pNotNull,
+    int *pPrimaryKey,
+    int *pAutoinc
+);
 
 #ifdef __cplusplus
 }  // extern "C"
