@@ -357,6 +357,7 @@ pub enum BtreePageAllocMode {
 /// This will keep track of the state of current cache commit in order to not repeat work
 struct CommitInfo {
     completions: RefCell<Vec<Completion>>,
+    result: RefCell<Option<PagerCommitResult>>,
     state: Cell<CommitState>,
     time: Cell<crate::io::clock::Instant>,
 }
@@ -584,6 +585,7 @@ impl Pager {
                 hash::BuildHasherDefault::new(),
             ))),
             commit_info: CommitInfo {
+                result: RefCell::new(None),
                 completions: RefCell::new(Vec::new()),
                 state: CommitState::Start.into(),
                 time: now.into(),
@@ -1325,7 +1327,6 @@ impl Pager {
             ));
         };
 
-        let mut pager_result = None;
         loop {
             let state = self.commit_info.state.get();
             trace!(?state);
@@ -1395,8 +1396,10 @@ impl Pager {
                         // Skip sync if synchronous mode is OFF
                         if sync_mode == crate::SyncMode::Off {
                             if wal_auto_checkpoint_disabled || !wal.borrow().should_checkpoint() {
-                                pager_result = Some(PagerCommitResult::WalWritten);
+                                *self.commit_info.result.borrow_mut() =
+                                    Some(PagerCommitResult::WalWritten);
                                 self.commit_info.state.set(CommitState::Done);
+                                continue;
                             }
                             self.commit_info.state.set(CommitState::Checkpoint);
                         } else {
@@ -1415,7 +1418,7 @@ impl Pager {
                     };
                     self.commit_info.completions.borrow_mut().push(c);
                     if wal_auto_checkpoint_disabled || !wal.borrow().should_checkpoint() {
-                        pager_result = Some(PagerCommitResult::WalWritten);
+                        *self.commit_info.result.borrow_mut() = Some(PagerCommitResult::WalWritten);
                         self.commit_info.state.set(CommitState::Done);
                         continue;
                     }
@@ -1437,7 +1440,8 @@ impl Pager {
                             io_yield_many!(std::mem::take(&mut *completions));
                         }
                         IOResult::Done(res) => {
-                            pager_result = Some(PagerCommitResult::Checkpointed(res));
+                            *self.commit_info.result.borrow_mut() =
+                                Some(PagerCommitResult::Checkpointed(res));
                             // Skip sync if synchronous mode is OFF
                             if sync_mode == crate::SyncMode::Off {
                                 self.commit_info.state.set(CommitState::Done);
@@ -1473,13 +1477,12 @@ impl Pager {
                             .as_millis()
                     );
                     let mut completions = self.commit_info.completions.borrow_mut();
-                    if completions.is_empty() || completions.iter().all(|c| c.is_completed()) {
+                    if completions.iter().all(|c| c.is_completed()) {
                         completions.clear();
                         self.commit_info.state.set(CommitState::Start);
                         wal.borrow_mut().finish_append_frames_commit()?;
-                        return Ok(IOResult::Done(
-                            pager_result.expect("pager_result should be set at this point"),
-                        ));
+                        let result = self.commit_info.result.borrow_mut().take();
+                        return Ok(IOResult::Done(result.expect("commit result should be set")));
                     }
                     io_yield_many!(std::mem::take(&mut completions));
                 }
