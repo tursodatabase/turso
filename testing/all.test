@@ -2,6 +2,8 @@
 
 set testdir [file dirname $argv0]
 
+source $testdir/autoincr.test
+
 source $testdir/cmdlineshell.test
 source $testdir/alter_table.test
 source $testdir/agg-functions.test

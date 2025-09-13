@@ -980,7 +980,16 @@ pub fn create_table(
         } => {
             is_strict = options.contains(TableOptions::STRICT);
             for c in constraints {
-                if let ast::TableConstraint::PrimaryKey { columns, .. } = &c.constraint {
+                if let ast::TableConstraint::PrimaryKey {
+                    columns,
+                    auto_increment,
+                    ..
+                } = &c.constraint
+                {
+                    if *auto_increment {
+                        has_autoincrement = true;
+                    }
+
                     for column in columns {
                         let col_name = match column.expr.as_ref() {
                             Expr::Id(id) => normalize_ident(id.as_str()),
@@ -1139,6 +1148,26 @@ pub fn create_table(
     if !has_rowid || primary_key_columns.len() > 1 {
         for col in cols.iter_mut() {
             col.is_rowid_alias = false;
+        }
+    }
+
+    if has_autoincrement {
+        // only allow integers
+        if primary_key_columns.len() != 1 {
+            crate::bail_parse_error!("AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY");
+        }
+        let pk_col_name = &primary_key_columns[0].0;
+        let pk_col = cols.iter().find(|c| c.name.as_deref() == Some(pk_col_name));
+
+        if let Some(col) = pk_col {
+            if col.ty != Type::Integer {
+                crate::bail_parse_error!("AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY");
+            }
+        } else {
+            crate::bail_parse_error!(
+                "Primary key column '{}' not found for AUTOINCREMENT check",
+                pk_col_name
+            );
         }
     }
 

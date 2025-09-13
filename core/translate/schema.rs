@@ -19,12 +19,10 @@ use crate::translate::emitter::Resolver;
 use crate::translate::ProgramBuilder;
 use crate::translate::ProgramBuilderOpts;
 use crate::util::normalize_ident;
-use crate::util::PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX;
 use crate::vdbe::builder::CursorType;
 use crate::vdbe::insn::Cookie;
 use crate::vdbe::insn::{CmpInsFlags, InsertFlags, Insn};
 use crate::Connection;
-use crate::LimboError;
 use crate::SymbolTable;
 use crate::{bail_parse_error, Result};
 
@@ -367,7 +365,7 @@ pub fn emit_schema_entry(
 /// An automatic PRIMARY KEY index is not required if:
 /// - The table has no PRIMARY KEY
 /// - The table has a single-column PRIMARY KEY whose typename is _exactly_ "INTEGER" e.g. not "INT".
-/// In this case, the PRIMARY KEY column becomes an alias for the rowid.
+///   In this case, the PRIMARY KEY column becomes an alias for the rowid.
 ///
 /// Otherwise, an automatic PRIMARY KEY index is required.
 fn check_automatic_pk_index_required(
@@ -548,6 +546,14 @@ pub fn translate_drop_table(
     syms: &SymbolTable,
     mut program: ProgramBuilder,
 ) -> Result<ProgramBuilder> {
+    if tbl_name
+        .name
+        .as_str()
+        .eq_ignore_ascii_case("sqlite_sequence")
+    {
+        bail_parse_error!("table sqlite_sequence may not be dropped");
+    }
+
     if !schema.indexes_enabled() && schema.table_has_indexes(&tbl_name.name.to_string()) {
         bail_parse_error!(
             "DROP TABLE with indexes on the table is disabled by default. Omit the `--experimental-indexes=false` flag to enable this feature."
