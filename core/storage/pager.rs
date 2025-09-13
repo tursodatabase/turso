@@ -321,12 +321,11 @@ enum CommitState {
     Start,
     /// Fsync the on-disk WAL.
     SyncWal,
-    /// After Fsync the on-disk WAL.
-    AfterSyncWal,
     /// Checkpoint the WAL to the database file (if needed).
     Checkpoint,
     /// Fsync the database file.
     SyncDbFile,
+    Done,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1326,8 +1325,8 @@ impl Pager {
             ));
         };
 
-        let mut checkpoint_result = CheckpointResult::default();
-        let res = loop {
+        let mut pager_result = None;
+        loop {
             let state = self.commit_info.state.get();
             trace!(?state);
             match state {
@@ -1395,14 +1394,17 @@ impl Pager {
                     } else {
                         // Skip sync if synchronous mode is OFF
                         if sync_mode == crate::SyncMode::Off {
-                            self.commit_info.state.set(CommitState::AfterSyncWal);
+                            if wal_auto_checkpoint_disabled || !wal.borrow().should_checkpoint() {
+                                pager_result = Some(PagerCommitResult::WalWritten);
+                                self.commit_info.state.set(CommitState::Done);
+                            }
+                            self.commit_info.state.set(CommitState::Checkpoint);
                         } else {
                             self.commit_info.state.set(CommitState::SyncWal);
                         }
                     }
                 }
                 CommitState::SyncWal => {
-                    self.commit_info.state.set(CommitState::AfterSyncWal);
                     let sync_result = wal.borrow_mut().sync();
                     let c = match sync_result {
                         Ok(c) => c,
@@ -1412,12 +1414,10 @@ impl Pager {
                         Err(e) => return Err(e),
                     };
                     self.commit_info.completions.borrow_mut().push(c);
-                }
-                CommitState::AfterSyncWal => {
-                    // turso_assert!(!wal.borrow().is_syncing(), "wal should have synced");
                     if wal_auto_checkpoint_disabled || !wal.borrow().should_checkpoint() {
-                        self.commit_info.state.set(CommitState::Start);
-                        break PagerCommitResult::WalWritten;
+                        pager_result = Some(PagerCommitResult::WalWritten);
+                        self.commit_info.state.set(CommitState::Done);
+                        continue;
                     }
                     self.commit_info.state.set(CommitState::Checkpoint);
                 }
@@ -1437,11 +1437,10 @@ impl Pager {
                             io_yield_many!(std::mem::take(&mut *completions));
                         }
                         IOResult::Done(res) => {
-                            checkpoint_result = res;
+                            pager_result = Some(PagerCommitResult::Checkpointed(res));
                             // Skip sync if synchronous mode is OFF
                             if sync_mode == crate::SyncMode::Off {
-                                self.commit_info.state.set(CommitState::Start);
-                                break PagerCommitResult::Checkpointed(checkpoint_result);
+                                self.commit_info.state.set(CommitState::Done);
                             } else {
                                 self.commit_info.state.set(CommitState::SyncDbFile);
                             }
@@ -1451,35 +1450,41 @@ impl Pager {
                 CommitState::SyncDbFile => {
                     let sync_result =
                         sqlite3_ondisk::begin_sync(self.db_file.clone(), self.syncing.clone());
-                    let c = match sync_result {
-                        Ok(c) => c,
-                        Err(e) if !data_sync_retry => {
-                            panic!("fsync error on database file (data_sync_retry=off): {e:?}");
-                        }
-                        Err(e) => return Err(e),
-                    };
-                    self.commit_info.completions.borrow_mut().push(c);
-                    self.commit_info.state.set(CommitState::Start);
-                    break PagerCommitResult::Checkpointed(checkpoint_result);
+                    self.commit_info
+                        .completions
+                        .borrow_mut()
+                        .push(match sync_result {
+                            Ok(c) => c,
+                            Err(e) if !data_sync_retry => {
+                                panic!("fsync error on database file (data_sync_retry=off): {e:?}");
+                            }
+                            Err(e) => return Err(e),
+                        });
+                    self.commit_info.state.set(CommitState::Done);
+                }
+                CommitState::Done => {
+                    tracing::debug!(
+                        "total time flushing cache: {} ms",
+                        self.io
+                            .now()
+                            .to_system_time()
+                            .duration_since(self.commit_info.time.get().to_system_time())
+                            .unwrap()
+                            .as_millis()
+                    );
+                    let mut completions = self.commit_info.completions.borrow_mut();
+                    if completions.is_empty() || completions.iter().all(|c| c.is_completed()) {
+                        completions.clear();
+                        self.commit_info.state.set(CommitState::Start);
+                        wal.borrow_mut().finish_append_frames_commit()?;
+                        return Ok(IOResult::Done(
+                            pager_result.expect("pager_result should be set at this point"),
+                        ));
+                    }
+                    io_yield_many!(std::mem::take(&mut completions));
                 }
             }
-        };
-        tracing::debug!(
-            "total time flushing cache: {} ms",
-            self.io
-                .now()
-                .to_system_time()
-                .duration_since(self.commit_info.time.get().to_system_time())
-                .unwrap()
-                .as_millis()
-        );
-        let mut completions = self.commit_info.completions.borrow_mut();
-        if completions.is_empty() || completions.iter().all(|c| c.is_completed()) {
-            completions.clear();
-            wal.borrow_mut().finish_append_frames_commit()?;
-            return Ok(IOResult::Done(res));
         }
-        io_yield_many!(std::mem::take(&mut completions));
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
