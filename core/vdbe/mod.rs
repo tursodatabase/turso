@@ -96,7 +96,7 @@ pub enum JumpTarget {
     AfterThisInsn,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 /// Represents a target for a jump instruction.
 /// Stores 32-bit ints to keep the enum word-sized.
 pub enum BranchOffset {
@@ -108,6 +108,7 @@ pub enum BranchOffset {
     Offset(InsnReference),
     /// A placeholder is a temporary value to satisfy the compiler.
     /// It must be set later.
+    #[default]
     Placeholder,
 }
 
@@ -475,7 +476,9 @@ macro_rules! get_cursor {
 
 pub struct Program {
     pub max_registers: usize,
-    pub insns: Vec<(Insn, InsnFunction)>,
+    // we store original indices because we don't want to create new vec from
+    // ProgramBuilder
+    pub insns: Vec<(Insn, usize)>,
     pub cursor_ref: Vec<(Option<CursorKey>, CursorType)>,
     pub comments: Vec<(InsnReference, &'static str)>,
     pub parameters: crate::parameters::Parameters,
@@ -644,7 +647,8 @@ impl Program {
             }
             // invalidate row
             let _ = state.result_row.take();
-            let (insn, insn_function) = &self.insns[state.pc as usize];
+            let (insn, _) = &self.insns[state.pc as usize];
+            let insn_function = insn.to_function_fast();
             if enable_tracing {
                 trace_insn(self, state.pc as InsnReference, insn);
             }

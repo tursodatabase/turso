@@ -412,7 +412,8 @@ impl CompiledExpression {
                 // Execute the program
                 let mut pc = 0usize;
                 while pc < program.insns.len() {
-                    let (insn, insn_fn) = &program.insns[pc];
+                    let (insn, _) = &program.insns[pc];
+                    let insn_fn = insn.to_function_fast();
                     state.pc = pc as u32;
 
                     // Execute the instruction

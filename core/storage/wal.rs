@@ -64,7 +64,7 @@ impl CheckpointResult {
     }
 }
 
-#[derive(Debug, Copy, Clone, EnumString)]
+#[derive(Debug, Copy, Clone, Default, EnumString)]
 #[strum(ascii_case_insensitive)]
 pub enum CheckpointMode {
     /// Checkpoint as many frames as possible without waiting for any database readers or writers to finish, then sync the database file if all frames in the log were checkpointed.
@@ -73,6 +73,7 @@ pub enum CheckpointMode {
     /// Optional upper_bound_inclusive parameter can be set in order to checkpoint frames with number no larger than the parameter
     Passive { upper_bound_inclusive: Option<u64> },
     /// This mode blocks until there is no database writer and all readers are reading from the most recent database snapshot. It then checkpoints all frames in the log file and syncs the database file. This mode blocks new database writers while it is pending, but new database readers are allowed to continue unimpeded.
+    #[default]
     Full,
     /// This mode works the same way as `Full` with the addition that after checkpointing the log file it blocks (calls the busy-handler callback) until all readers are reading from the database file only. This ensures that the next writer will restart the log file from the beginning. Like `Full`, this mode blocks new database writer attempts while it is pending, but does not impede readers.
     Restart,

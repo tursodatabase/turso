@@ -10,6 +10,10 @@ use crate::{
     translate::{collate::CollationSeq, emitter::TransactionMode},
     Value,
 };
+use std::sync::LazyLock;
+use strum::EnumCount;
+use strum::VariantArray as _;
+use strum_macros::{EnumDiscriminants, VariantArray};
 use turso_macros::Description;
 use turso_parser::ast::SortOrder;
 
@@ -150,7 +154,11 @@ impl<T: Copy + std::fmt::Display> std::fmt::Display for RegisterOrLiteral<T> {
     }
 }
 
-#[derive(Description, Debug)]
+#[derive(Description, Debug, EnumDiscriminants)]
+#[strum_discriminants(vis(pub(crate)))]
+#[strum_discriminants(derive(VariantArray, EnumCount))]
+#[strum_discriminants(repr(u8))]
+#[strum_discriminants(name(InsnVariants))]
 pub enum Insn {
     /// Initialize the program state and jump to the given PC.
     Init {
@@ -1095,144 +1103,172 @@ pub enum Insn {
     },
 }
 
-impl Insn {
-    pub fn to_function(&self) -> InsnFunction {
+static INSN_VIRTUAL_TABLE: LazyLock<[InsnFunction; InsnVariants::COUNT]> = LazyLock::new(|| {
+    let mut result: [InsnFunction; InsnVariants::COUNT] = [execute::op_null; InsnVariants::COUNT];
+
+    for variant in InsnVariants::VARIANTS {
+        result[*variant as u8 as usize] = variant.to_function();
+    }
+
+    result
+});
+
+impl InsnVariants {
+    pub(crate) fn to_function_fast(&self) -> InsnFunction {
+        INSN_VIRTUAL_TABLE[*self as u8 as usize]
+    }
+
+    pub(crate) fn to_function(&self) -> InsnFunction {
         match self {
-            Insn::Init { .. } => execute::op_init,
-            Insn::Null { .. } => execute::op_null,
-            Insn::BeginSubrtn { .. } => execute::op_null,
-            Insn::NullRow { .. } => execute::op_null_row,
-            Insn::Add { .. } => execute::op_add,
-            Insn::Subtract { .. } => execute::op_subtract,
-            Insn::Multiply { .. } => execute::op_multiply,
-            Insn::Divide { .. } => execute::op_divide,
-            Insn::DropIndex { .. } => execute::op_drop_index,
-            Insn::Compare { .. } => execute::op_compare,
-            Insn::BitAnd { .. } => execute::op_bit_and,
-            Insn::BitOr { .. } => execute::op_bit_or,
-            Insn::BitNot { .. } => execute::op_bit_not,
-            Insn::Checkpoint { .. } => execute::op_checkpoint,
-            Insn::Remainder { .. } => execute::op_remainder,
-            Insn::Jump { .. } => execute::op_jump,
-            Insn::Move { .. } => execute::op_move,
-            Insn::IfPos { .. } => execute::op_if_pos,
-            Insn::NotNull { .. } => execute::op_not_null,
-            Insn::Eq { .. }
-            | Insn::Ne { .. }
-            | Insn::Lt { .. }
-            | Insn::Le { .. }
-            | Insn::Gt { .. }
-            | Insn::Ge { .. } => execute::op_comparison,
-            Insn::If { .. } => execute::op_if,
-            Insn::IfNot { .. } => execute::op_if_not,
-            Insn::OpenRead { .. } => execute::op_open_read,
-            Insn::VOpen { .. } => execute::op_vopen,
-            Insn::VCreate { .. } => execute::op_vcreate,
-            Insn::VFilter { .. } => execute::op_vfilter,
-            Insn::VColumn { .. } => execute::op_vcolumn,
-            Insn::VUpdate { .. } => execute::op_vupdate,
-            Insn::VNext { .. } => execute::op_vnext,
-            Insn::VDestroy { .. } => execute::op_vdestroy,
+            InsnVariants::Init { .. } => execute::op_init,
+            InsnVariants::Null { .. } => execute::op_null,
+            InsnVariants::BeginSubrtn { .. } => execute::op_null,
+            InsnVariants::NullRow { .. } => execute::op_null_row,
+            InsnVariants::Add { .. } => execute::op_add,
+            InsnVariants::Subtract { .. } => execute::op_subtract,
+            InsnVariants::Multiply { .. } => execute::op_multiply,
+            InsnVariants::Divide { .. } => execute::op_divide,
+            InsnVariants::DropIndex { .. } => execute::op_drop_index,
+            InsnVariants::Compare { .. } => execute::op_compare,
+            InsnVariants::BitAnd { .. } => execute::op_bit_and,
+            InsnVariants::BitOr { .. } => execute::op_bit_or,
+            InsnVariants::BitNot { .. } => execute::op_bit_not,
+            InsnVariants::Checkpoint { .. } => execute::op_checkpoint,
+            InsnVariants::Remainder { .. } => execute::op_remainder,
+            InsnVariants::Jump { .. } => execute::op_jump,
+            InsnVariants::Move { .. } => execute::op_move,
+            InsnVariants::IfPos { .. } => execute::op_if_pos,
+            InsnVariants::NotNull { .. } => execute::op_not_null,
+            InsnVariants::Eq { .. }
+            | InsnVariants::Ne { .. }
+            | InsnVariants::Lt { .. }
+            | InsnVariants::Le { .. }
+            | InsnVariants::Gt { .. }
+            | InsnVariants::Ge { .. } => execute::op_comparison,
+            InsnVariants::If { .. } => execute::op_if,
+            InsnVariants::IfNot { .. } => execute::op_if_not,
+            InsnVariants::OpenRead { .. } => execute::op_open_read,
+            InsnVariants::VOpen { .. } => execute::op_vopen,
+            InsnVariants::VCreate { .. } => execute::op_vcreate,
+            InsnVariants::VFilter { .. } => execute::op_vfilter,
+            InsnVariants::VColumn { .. } => execute::op_vcolumn,
+            InsnVariants::VUpdate { .. } => execute::op_vupdate,
+            InsnVariants::VNext { .. } => execute::op_vnext,
+            InsnVariants::VDestroy { .. } => execute::op_vdestroy,
 
-            Insn::OpenPseudo { .. } => execute::op_open_pseudo,
-            Insn::Rewind { .. } => execute::op_rewind,
-            Insn::Last { .. } => execute::op_last,
-            Insn::Column { .. } => execute::op_column,
-            Insn::TypeCheck { .. } => execute::op_type_check,
-            Insn::MakeRecord { .. } => execute::op_make_record,
-            Insn::ResultRow { .. } => execute::op_result_row,
-            Insn::Next { .. } => execute::op_next,
-            Insn::Prev { .. } => execute::op_prev,
-            Insn::Halt { .. } => execute::op_halt,
-            Insn::HaltIfNull { .. } => execute::op_halt_if_null,
-            Insn::Transaction { .. } => execute::op_transaction,
-            Insn::AutoCommit { .. } => execute::op_auto_commit,
-            Insn::Goto { .. } => execute::op_goto,
-            Insn::Gosub { .. } => execute::op_gosub,
-            Insn::Return { .. } => execute::op_return,
-            Insn::Integer { .. } => execute::op_integer,
-            Insn::Real { .. } => execute::op_real,
-            Insn::RealAffinity { .. } => execute::op_real_affinity,
-            Insn::String8 { .. } => execute::op_string8,
-            Insn::Blob { .. } => execute::op_blob,
-            Insn::RowData { .. } => execute::op_row_data,
-            Insn::RowId { .. } => execute::op_row_id,
-            Insn::IdxRowId { .. } => execute::op_idx_row_id,
-            Insn::SeekRowid { .. } => execute::op_seek_rowid,
-            Insn::DeferredSeek { .. } => execute::op_deferred_seek,
-            Insn::SeekGE { .. }
-            | Insn::SeekGT { .. }
-            | Insn::SeekLE { .. }
-            | Insn::SeekLT { .. } => execute::op_seek,
-            Insn::SeekEnd { .. } => execute::op_seek_end,
-            Insn::IdxGE { .. } => execute::op_idx_ge,
-            Insn::IdxGT { .. } => execute::op_idx_gt,
-            Insn::IdxLE { .. } => execute::op_idx_le,
-            Insn::IdxLT { .. } => execute::op_idx_lt,
-            Insn::DecrJumpZero { .. } => execute::op_decr_jump_zero,
-            Insn::AggStep { .. } => execute::op_agg_step,
-            Insn::AggFinal { .. } => execute::op_agg_final,
-            Insn::SorterOpen { .. } => execute::op_sorter_open,
-            Insn::SorterInsert { .. } => execute::op_sorter_insert,
-            Insn::SorterSort { .. } => execute::op_sorter_sort,
-            Insn::SorterData { .. } => execute::op_sorter_data,
-            Insn::SorterNext { .. } => execute::op_sorter_next,
-            Insn::Function { .. } => execute::op_function,
-            Insn::Cast { .. } => execute::op_cast,
-            Insn::InitCoroutine { .. } => execute::op_init_coroutine,
-            Insn::EndCoroutine { .. } => execute::op_end_coroutine,
-            Insn::Yield { .. } => execute::op_yield,
-            Insn::Insert { .. } => execute::op_insert,
-            Insn::Int64 { .. } => execute::op_int_64,
-            Insn::IdxInsert { .. } => execute::op_idx_insert,
-            Insn::Delete { .. } => execute::op_delete,
-            Insn::NewRowid { .. } => execute::op_new_rowid,
-            Insn::MustBeInt { .. } => execute::op_must_be_int,
-            Insn::SoftNull { .. } => execute::op_soft_null,
-            Insn::NoConflict { .. } => execute::op_no_conflict,
-            Insn::NotExists { .. } => execute::op_not_exists,
-            Insn::OffsetLimit { .. } => execute::op_offset_limit,
-            Insn::OpenWrite { .. } => execute::op_open_write,
-            Insn::Copy { .. } => execute::op_copy,
-            Insn::CreateBtree { .. } => execute::op_create_btree,
-            Insn::Destroy { .. } => execute::op_destroy,
+            InsnVariants::OpenPseudo { .. } => execute::op_open_pseudo,
+            InsnVariants::Rewind { .. } => execute::op_rewind,
+            InsnVariants::Last { .. } => execute::op_last,
+            InsnVariants::Column { .. } => execute::op_column,
+            InsnVariants::TypeCheck { .. } => execute::op_type_check,
+            InsnVariants::MakeRecord { .. } => execute::op_make_record,
+            InsnVariants::ResultRow { .. } => execute::op_result_row,
+            InsnVariants::Next { .. } => execute::op_next,
+            InsnVariants::Prev { .. } => execute::op_prev,
+            InsnVariants::Halt { .. } => execute::op_halt,
+            InsnVariants::HaltIfNull { .. } => execute::op_halt_if_null,
+            InsnVariants::Transaction { .. } => execute::op_transaction,
+            InsnVariants::AutoCommit { .. } => execute::op_auto_commit,
+            InsnVariants::Goto { .. } => execute::op_goto,
+            InsnVariants::Gosub { .. } => execute::op_gosub,
+            InsnVariants::Return { .. } => execute::op_return,
+            InsnVariants::Integer { .. } => execute::op_integer,
+            InsnVariants::Real { .. } => execute::op_real,
+            InsnVariants::RealAffinity { .. } => execute::op_real_affinity,
+            InsnVariants::String8 { .. } => execute::op_string8,
+            InsnVariants::Blob { .. } => execute::op_blob,
+            InsnVariants::RowData { .. } => execute::op_row_data,
+            InsnVariants::RowId { .. } => execute::op_row_id,
+            InsnVariants::IdxRowId { .. } => execute::op_idx_row_id,
+            InsnVariants::SeekRowid { .. } => execute::op_seek_rowid,
+            InsnVariants::DeferredSeek { .. } => execute::op_deferred_seek,
+            InsnVariants::SeekGE { .. }
+            | InsnVariants::SeekGT { .. }
+            | InsnVariants::SeekLE { .. }
+            | InsnVariants::SeekLT { .. } => execute::op_seek,
+            InsnVariants::SeekEnd { .. } => execute::op_seek_end,
+            InsnVariants::IdxGE { .. } => execute::op_idx_ge,
+            InsnVariants::IdxGT { .. } => execute::op_idx_gt,
+            InsnVariants::IdxLE { .. } => execute::op_idx_le,
+            InsnVariants::IdxLT { .. } => execute::op_idx_lt,
+            InsnVariants::DecrJumpZero { .. } => execute::op_decr_jump_zero,
+            InsnVariants::AggStep { .. } => execute::op_agg_step,
+            InsnVariants::AggFinal { .. } => execute::op_agg_final,
+            InsnVariants::SorterOpen { .. } => execute::op_sorter_open,
+            InsnVariants::SorterInsert { .. } => execute::op_sorter_insert,
+            InsnVariants::SorterSort { .. } => execute::op_sorter_sort,
+            InsnVariants::SorterData { .. } => execute::op_sorter_data,
+            InsnVariants::SorterNext { .. } => execute::op_sorter_next,
+            InsnVariants::Function { .. } => execute::op_function,
+            InsnVariants::Cast { .. } => execute::op_cast,
+            InsnVariants::InitCoroutine { .. } => execute::op_init_coroutine,
+            InsnVariants::EndCoroutine { .. } => execute::op_end_coroutine,
+            InsnVariants::Yield { .. } => execute::op_yield,
+            InsnVariants::Insert { .. } => execute::op_insert,
+            InsnVariants::Int64 { .. } => execute::op_int_64,
+            InsnVariants::IdxInsert { .. } => execute::op_idx_insert,
+            InsnVariants::Delete { .. } => execute::op_delete,
+            InsnVariants::NewRowid { .. } => execute::op_new_rowid,
+            InsnVariants::MustBeInt { .. } => execute::op_must_be_int,
+            InsnVariants::SoftNull { .. } => execute::op_soft_null,
+            InsnVariants::NoConflict { .. } => execute::op_no_conflict,
+            InsnVariants::NotExists { .. } => execute::op_not_exists,
+            InsnVariants::OffsetLimit { .. } => execute::op_offset_limit,
+            InsnVariants::OpenWrite { .. } => execute::op_open_write,
+            InsnVariants::Copy { .. } => execute::op_copy,
+            InsnVariants::CreateBtree { .. } => execute::op_create_btree,
+            InsnVariants::Destroy { .. } => execute::op_destroy,
 
-            Insn::DropTable { .. } => execute::op_drop_table,
-            Insn::DropView { .. } => execute::op_drop_view,
-            Insn::Close { .. } => execute::op_close,
-            Insn::IsNull { .. } => execute::op_is_null,
-            Insn::CollSeq { .. } => execute::op_coll_seq,
-            Insn::ParseSchema { .. } => execute::op_parse_schema,
-            Insn::PopulateMaterializedViews { .. } => execute::op_populate_materialized_views,
-            Insn::ShiftRight { .. } => execute::op_shift_right,
-            Insn::ShiftLeft { .. } => execute::op_shift_left,
-            Insn::AddImm { .. } => execute::op_add_imm,
-            Insn::Variable { .. } => execute::op_variable,
-            Insn::ZeroOrNull { .. } => execute::op_zero_or_null,
-            Insn::Not { .. } => execute::op_not,
-            Insn::Concat { .. } => execute::op_concat,
-            Insn::And { .. } => execute::op_and,
-            Insn::Or { .. } => execute::op_or,
-            Insn::Noop => execute::op_noop,
-            Insn::PageCount { .. } => execute::op_page_count,
-            Insn::ReadCookie { .. } => execute::op_read_cookie,
-            Insn::SetCookie { .. } => execute::op_set_cookie,
-            Insn::OpenEphemeral { .. } | Insn::OpenAutoindex { .. } => execute::op_open_ephemeral,
-            Insn::Once { .. } => execute::op_once,
-            Insn::Found { .. } | Insn::NotFound { .. } => execute::op_found,
-            Insn::Affinity { .. } => execute::op_affinity,
-            Insn::IdxDelete { .. } => execute::op_idx_delete,
-            Insn::Count { .. } => execute::op_count,
-            Insn::IntegrityCk { .. } => execute::op_integrity_check,
-            Insn::RenameTable { .. } => execute::op_rename_table,
-            Insn::DropColumn { .. } => execute::op_drop_column,
-            Insn::AddColumn { .. } => execute::op_add_column,
-            Insn::AlterColumn { .. } => execute::op_alter_column,
-            Insn::MaxPgcnt { .. } => execute::op_max_pgcnt,
-            Insn::JournalMode { .. } => execute::op_journal_mode,
-            Insn::IfNeg { .. } => execute::op_if_neg,
-            Insn::Explain { .. } => execute::op_noop,
+            InsnVariants::DropTable { .. } => execute::op_drop_table,
+            InsnVariants::DropView { .. } => execute::op_drop_view,
+            InsnVariants::Close { .. } => execute::op_close,
+            InsnVariants::IsNull { .. } => execute::op_is_null,
+            InsnVariants::CollSeq { .. } => execute::op_coll_seq,
+            InsnVariants::ParseSchema { .. } => execute::op_parse_schema,
+            InsnVariants::PopulateMaterializedViews { .. } => {
+                execute::op_populate_materialized_views
+            }
+            InsnVariants::ShiftRight { .. } => execute::op_shift_right,
+            InsnVariants::ShiftLeft { .. } => execute::op_shift_left,
+            InsnVariants::AddImm { .. } => execute::op_add_imm,
+            InsnVariants::Variable { .. } => execute::op_variable,
+            InsnVariants::ZeroOrNull { .. } => execute::op_zero_or_null,
+            InsnVariants::Not { .. } => execute::op_not,
+            InsnVariants::Concat { .. } => execute::op_concat,
+            InsnVariants::And { .. } => execute::op_and,
+            InsnVariants::Or { .. } => execute::op_or,
+            InsnVariants::Noop => execute::op_noop,
+            InsnVariants::PageCount { .. } => execute::op_page_count,
+            InsnVariants::ReadCookie { .. } => execute::op_read_cookie,
+            InsnVariants::SetCookie { .. } => execute::op_set_cookie,
+            InsnVariants::OpenEphemeral { .. } | InsnVariants::OpenAutoindex { .. } => {
+                execute::op_open_ephemeral
+            }
+            InsnVariants::Once { .. } => execute::op_once,
+            InsnVariants::Found { .. } | InsnVariants::NotFound { .. } => execute::op_found,
+            InsnVariants::Affinity { .. } => execute::op_affinity,
+            InsnVariants::IdxDelete { .. } => execute::op_idx_delete,
+            InsnVariants::Count { .. } => execute::op_count,
+            InsnVariants::IntegrityCk { .. } => execute::op_integrity_check,
+            InsnVariants::RenameTable { .. } => execute::op_rename_table,
+            InsnVariants::DropColumn { .. } => execute::op_drop_column,
+            InsnVariants::AddColumn { .. } => execute::op_add_column,
+            InsnVariants::AlterColumn { .. } => execute::op_alter_column,
+            InsnVariants::MaxPgcnt { .. } => execute::op_max_pgcnt,
+            InsnVariants::JournalMode { .. } => execute::op_journal_mode,
+            InsnVariants::IfNeg { .. } => execute::op_if_neg,
+            InsnVariants::Explain { .. } => execute::op_noop,
         }
+    }
+}
+
+impl Insn {
+    pub fn to_function_fast(&self) -> InsnFunction {
+        InsnVariants::from(self).to_function_fast()
+    }
+
+    pub fn to_function(&self) -> InsnFunction {
+        InsnVariants::from(self).to_function()
     }
 }
 
@@ -1255,4 +1291,22 @@ pub enum Cookie {
     IncrementalVacuum = 7,
     /// The application ID as set by the application_id pragma.
     ApplicationId = 8,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_make_sure_correct_insn_table() {
+        for variant in super::InsnVariants::VARIANTS {
+            let func1 = variant.to_function();
+            let func2 = variant.to_function_fast();
+            assert_eq!(
+                func1 as usize, func2 as usize,
+                "Variant {:?} does not match in fast table",
+                variant
+            );
+        }
+    }
 }
