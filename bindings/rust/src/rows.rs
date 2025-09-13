@@ -1,8 +1,10 @@
+use futures_util::Stream;
 use turso_core::types::FromValue;
 
 use crate::{Error, Result, Value};
 use std::fmt::Debug;
 use std::sync::{Arc, Mutex};
+use std::task::Poll;
 
 /// Results of a prepared statement query.
 pub struct Rows {
@@ -26,34 +28,68 @@ impl Rows {
             inner: Arc::clone(inner),
         }
     }
-    /// Fetch the next row of this result set.
-    pub async fn next(&mut self) -> Result<Option<Row>> {
-        loop {
-            let mut stmt = self
-                .inner
-                .lock()
-                .map_err(|e| Error::MutexError(e.to_string()))?;
-            match stmt.step()? {
-                turso_core::StepResult::Row => {
-                    let row = stmt.row().unwrap();
-                    return Ok(Some(Row {
-                        values: row.get_values().map(|v| v.to_owned()).collect(),
-                    }));
-                }
-                turso_core::StepResult::Done => return Ok(None),
-                turso_core::StepResult::IO => {
-                    if let Err(e) = stmt.run_once() {
-                        return Err(e.into());
-                    }
-                    continue;
-                }
-                turso_core::StepResult::Busy => {
-                    return Err(Error::SqlExecutionFailure("database is locked".to_string()))
-                }
-                turso_core::StepResult::Interrupt => {
-                    return Err(Error::SqlExecutionFailure("interrupted".to_string()))
-                }
+    // /// Fetch the next row of this result set.
+    // pub async fn next(&mut self) -> Result<Option<Row>> {
+    //     loop {
+    //         let mut stmt = self
+    //             .inner
+    //             .lock()
+    //             .map_err(|e| Error::MutexError(e.to_string()))?;
+    //         match stmt.step()? {
+    //             turso_core::StepResult::Row => {
+    //                 let row = stmt.row().unwrap();
+    //                 return Ok(Some(Row {
+    //                     values: row.get_values().map(|v| v.to_owned()).collect(),
+    //                 }));
+    //             }
+    //             turso_core::StepResult::Done => return Ok(None),
+    //             turso_core::StepResult::IO => {
+    //                 if let Err(e) = stmt.run_once() {
+    //                     return Err(e.into());
+    //                 }
+    //                 continue;
+    //             }
+    //             turso_core::StepResult::Busy => {
+    //                 return Err(Error::SqlExecutionFailure("database is locked".to_string()))
+    //             }
+    //             turso_core::StepResult::Interrupt => {
+    //                 return Err(Error::SqlExecutionFailure("interrupted".to_string()))
+    //             }
+    //         }
+    //     }
+    // }
+}
+
+impl Stream for Rows {
+    type Item = crate::Result<Row>;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let mut stmt = self
+            .inner
+            .lock()
+            .map_err(|e| Error::MutexError(e.to_string()))?;
+        match stmt.step()? {
+            turso_core::StepResult::Row => {
+                let row = stmt.row().unwrap();
+                Poll::Ready(Some(Ok(Row {
+                    values: row.get_values().map(|v| v.to_owned()).collect(),
+                })))
             }
+            turso_core::StepResult::Done => Poll::Ready(None),
+            turso_core::StepResult::IO => {
+                stmt.run_once()?;
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+            turso_core::StepResult::Busy => Poll::Ready(Some(Err(Error::SqlExecutionFailure(
+                "database is locked".to_string(),
+            )))),
+            turso_core::StepResult::Interrupt => Poll::Ready(Some(Err(
+                Error::SqlExecutionFailure("interrupted".to_string()),
+            ))),
         }
     }
 }

@@ -2,7 +2,7 @@ use rand::seq::IndexedRandom;
 use rand::Rng;
 use rand_chacha::{rand_core::SeedableRng, ChaCha8Rng};
 use std::collections::HashMap;
-use turso::{Builder, Value};
+use turso::{futures_util::TryStreamExt, Builder, Value};
 
 // In-memory representation of the database state
 #[derive(Debug, Clone, PartialEq)]
@@ -733,7 +733,7 @@ async fn multiple_connections_fuzz(mvcc_enabled: bool) {
 
                         let mut real_rows = Vec::new();
                         let ok = loop {
-                            match rows.next().await {
+                            match rows.try_next().await {
                                 Err(e) => {
                                     if !e.to_string().contains("database is locked") {
                                         panic!("Unexpected error during select: {e}");
@@ -827,7 +827,7 @@ async fn multiple_connections_fuzz(mvcc_enabled: bool) {
                         let query = format!("PRAGMA wal_checkpoint({mode})");
                         let mut rows = conn.query(&query, ()).await.unwrap();
 
-                        match rows.next().await {
+                        match rows.try_next().await {
                             Ok(Some(row)) => {
                                 let checkpoint_ok = matches!(row.get_value(0).unwrap(), Value::Integer(0));
                                 let wal_page_count = match row.get_value(1).unwrap() {

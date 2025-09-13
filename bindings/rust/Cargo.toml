@@ -19,6 +19,7 @@ tracing_release = ["turso_core/tracing_release"]
 [dependencies]
 turso_core = { workspace = true, features = ["io_uring"] }
 thiserror = "2.0.9"
+futures-util = "0.3.31"
 
 [dev-dependencies]
 tempfile = "3.20.0"
