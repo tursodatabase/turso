@@ -582,6 +582,27 @@ impl BTreeNodeState {
 }
 
 impl BTreeCursor {
+    #[inline]
+    fn validate_overflow_pointer(&self, next: u32, allow_zero: bool) -> Result<(), LimboError> {
+        if next == 0 {
+            return if allow_zero {
+                Ok(())
+            } else {
+                Err(LimboError::Corrupt(
+                    "Overflow chain ends prematurely".into(),
+                ))
+            };
+        }
+        let db_size = self
+            .pager
+            .io
+            .block(|| self.pager.with_header(|header| header.database_size))?
+            .get();
+        if next < 2 || next > db_size {
+            return Err(LimboError::Corrupt("Invalid overflow page number".into()));
+        }
+        Ok(())
+    }
     pub fn new(
         mv_cursor: Option<Rc<RefCell<MvCursor>>>,
         pager: Rc<Pager>,
@@ -856,17 +877,10 @@ impl BTreeCursor {
             payload.extend_from_slice(&buf[4..4 + to_read]);
             *remaining_to_read -= to_read;
 
-            if *remaining_to_read != 0 && next != 0 {
-                // Validate overflow pointer before following it, just like we do in clear_overflow_pages.
-                let db_size = self
-                    .pager
-                    .io
-                    .block(|| self.pager.with_header(|header| header.database_size))?
-                    .get();
-                if next < 2 || next > db_size {
-                    // Reset state to avoid leaving a partial read state behind.
+            if *remaining_to_read != 0 {
+                if let Err(e) = self.validate_overflow_pointer(next, false) {
                     let _ = read_overflow_state.take();
-                    return Err(LimboError::Corrupt("Invalid overflow page number".into()));
+                    return Err(e);
                 }
                 let (new_page, c) = self.pager.read_page(next as usize)?;
                 *page = new_page;
@@ -876,10 +890,9 @@ impl BTreeCursor {
                 }
                 continue;
             }
-            turso_assert!(
-                *remaining_to_read == 0 && next == 0,
-                "we can't have more pages to read while also have read everything"
-            );
+            turso_assert!(*remaining_to_read == 0, "no remaining bytes expected");
+            // For completion, ensure chain ends here
+            self.validate_overflow_pointer(next, true)?;
             let mut payload_swap = Vec::new();
             std::mem::swap(payload, &mut payload_swap);
 
@@ -1085,21 +1098,7 @@ impl BTreeCursor {
 
                     let contents = next_page.get_contents();
                     let next = contents.read_u32_no_offset(0);
-
-                    if next == 0 {
-                        return Err(LimboError::Corrupt(
-                            "Overflow chain ends prematurely".into(),
-                        ));
-                    }
-                    // Validate the overflow pointer is within database bounds
-                    let db_size = self
-                        .pager
-                        .io
-                        .block(|| self.pager.with_header(|header| header.database_size))?
-                        .get();
-                    if next < 2 || next > db_size {
-                        return Err(LimboError::Corrupt("Invalid overflow page number".into()));
-                    }
+                    self.validate_overflow_pointer(next, false)?;
                     pages_left_to_skip -= 1;
 
                     let (next_page, c) = self.read_page(next as usize)?;
@@ -1166,17 +1165,8 @@ impl BTreeCursor {
                             "Overflow chain ends prematurely".into(),
                         ));
                     }
-                    // Validate the overflow pointer is within database bounds
-                    let db_size = self
-                        .pager
-                        .io
-                        .block(|| self.pager.with_header(|header| header.database_size))?
-                        .get();
-                    if next < 2 || next > db_size {
-                        return Err(LimboError::Corrupt("Invalid overflow page number".into()));
-                    }
-
-                    // Load next page
+                    // Validate and load next page
+                    self.validate_overflow_pointer(next, false)?;
                     current_offset = 0; // Reset offset for new page
                     let (next_page, c) = self.read_page(next as usize)?;
                     page = next_page;
