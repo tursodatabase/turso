@@ -1145,6 +1145,17 @@ impl Pager {
         Ok((page, Some(c)))
     }
 
+    //Force read the header page from disk and cache it.
+    //This is currently used for decrypting the database header page on startup.
+    #[instrument(skip_all, level = Level::DEBUG)]
+    pub fn force_read_header_page_from_disk(&self) -> Result<(PageRef, Option<Completion>)> {
+        let mut page_cache = self.page_cache.write();
+        let (page, c) = self.read_page_no_cache(DatabaseHeader::PAGE_ID, None, false)?;
+        let page_key = PageCacheKey::new(DatabaseHeader::PAGE_ID);
+        page_cache.upsert_page(page_key, page.clone())?;
+        Ok((page, Some(c)))
+    }
+
     fn begin_read_disk_page(
         &self,
         page_idx: usize,

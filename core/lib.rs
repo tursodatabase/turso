@@ -144,6 +144,18 @@ impl DatabaseOpts {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct EncryptionOpts {
+    pub cipher: String,
+    pub hexkey: String,
+}
+
+impl EncryptionOpts {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
 pub type Result<T, E = LimboError> = std::result::Result<T, E>;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -264,6 +276,7 @@ impl Database {
             DatabaseOpts::new()
                 .with_mvcc(enable_mvcc)
                 .with_indexes(enable_indexes),
+            None,
         )
     }
 
@@ -273,10 +286,11 @@ impl Database {
         path: &str,
         flags: OpenFlags,
         opts: DatabaseOpts,
+        encryption_opts: Option<EncryptionOpts>,
     ) -> Result<Arc<Database>> {
         let file = io.open_file(path, flags, true)?;
         let db_file = Arc::new(DatabaseFile::new(file));
-        Self::open_with_flags(io, path, db_file, flags, opts)
+        Self::open_with_flags(io, path, db_file, flags, opts, encryption_opts)
     }
 
     #[allow(clippy::arc_with_non_send_sync)]
@@ -295,6 +309,7 @@ impl Database {
             DatabaseOpts::new()
                 .with_mvcc(enable_mvcc)
                 .with_indexes(enable_indexes),
+            None,
         )
     }
 
@@ -305,6 +320,7 @@ impl Database {
         db_file: Arc<dyn DatabaseStorage>,
         flags: OpenFlags,
         opts: DatabaseOpts,
+        encryption_opts: Option<EncryptionOpts>,
     ) -> Result<Arc<Database>> {
         // turso-sync-engine create 2 databases with different names in the same IO if MemoryIO is used
         // in this case we need to bypass registry (as this is MemoryIO DB) but also preserve original distinction in names (e.g. :memory:-draft and :memory:-synced)
@@ -316,6 +332,7 @@ impl Database {
                 db_file,
                 flags,
                 opts,
+                None,
             );
         }
 
@@ -329,6 +346,7 @@ impl Database {
         if let Some(db) = registry.get(&canonical_path).and_then(Weak::upgrade) {
             return Ok(db);
         }
+        tracing::trace!("open_with_flags_bypass_registry_internal");
         let db = Self::open_with_flags_bypass_registry_internal(
             io,
             path,
@@ -336,6 +354,7 @@ impl Database {
             db_file,
             flags,
             opts,
+            encryption_opts,
         )?;
         registry.insert(canonical_path, Arc::downgrade(&db));
         Ok(db)
@@ -350,8 +369,17 @@ impl Database {
         db_file: Arc<dyn DatabaseStorage>,
         flags: OpenFlags,
         opts: DatabaseOpts,
+        encryption_opts: Option<EncryptionOpts>,
     ) -> Result<Arc<Database>> {
-        Self::open_with_flags_bypass_registry_internal(io, path, wal_path, db_file, flags, opts)
+        Self::open_with_flags_bypass_registry_internal(
+            io,
+            path,
+            wal_path,
+            db_file,
+            flags,
+            opts,
+            encryption_opts,
+        )
     }
 
     #[allow(clippy::arc_with_non_send_sync)]
@@ -362,6 +390,7 @@ impl Database {
         db_file: Arc<dyn DatabaseStorage>,
         flags: OpenFlags,
         opts: DatabaseOpts,
+        encryption_opts: Option<EncryptionOpts>,
     ) -> Result<Arc<Database>> {
         let shared_wal = WalFileShared::open_shared_if_exists(&io, wal_path)?;
 
@@ -417,6 +446,11 @@ impl Database {
             let syms = conn.syms.borrow();
             let pager = conn.pager.borrow().clone();
 
+            if let Some(encryption_opts) = encryption_opts {
+                conn.pragma_update("cipher", format!("'{}'", encryption_opts.cipher))?;
+                conn.pragma_update("hexkey", format!("'{}'", encryption_opts.hexkey))?;
+                pager.force_read_header_page_from_disk()?;
+            }
             db.with_schema_mut(|schema| {
                 let header_schema_cookie = pager
                     .io
@@ -450,7 +484,7 @@ impl Database {
             .block(|| pager.with_header(|header| header.default_page_cache_size))
             .unwrap_or_default()
             .get();
-
+        tracing::trace!("connecting");
         let conn = Arc::new(Connection {
             _db: self.clone(),
             pager: RefCell::new(Rc::new(pager)),
@@ -663,6 +697,7 @@ impl Database {
         vfs: Option<S>,
         flags: OpenFlags,
         opts: DatabaseOpts,
+        encryption_opts: Option<EncryptionOpts>,
     ) -> Result<(Arc<dyn IO>, Arc<Database>)>
     where
         S: AsRef<str> + std::fmt::Display,
@@ -672,7 +707,7 @@ impl Database {
             .or_else(|| Some(Self::io_for_path(path)))
             .transpose()?
             .unwrap();
-        let db = Self::open_file_with_flags(io.clone(), path, flags, opts)?;
+        let db = Self::open_file_with_flags(io.clone(), path, flags, opts, encryption_opts)?;
         Ok((io, db))
     }
 
@@ -1238,10 +1273,17 @@ impl Connection {
                     .with_indexes(use_indexes)
                     .with_views(views)
                     .with_strict(strict),
+                None,
             )?;
             let conn = db.connect()?;
             return Ok((io, conn));
         }
+        let encryption_opts = match (opts.cipher.clone(), opts.hexkey.clone()) {
+            (Some(cipher), Some(hexkey)) => Some(EncryptionOpts { cipher, hexkey }),
+            (Some(_), None) => panic!("hexkey is required when cipher is provided"),
+            (None, Some(_)) => panic!("cipher is required when hexkey is provided"),
+            (None, None) => None,
+        };
         let (io, db) = Database::open_new(
             &opts.path,
             opts.vfs.as_ref(),
@@ -1251,6 +1293,7 @@ impl Connection {
                 .with_indexes(use_indexes)
                 .with_views(views)
                 .with_strict(strict),
+            encryption_opts.clone(),
         )?;
         if let Some(modeof) = opts.modeof {
             let perms = std::fs::metadata(modeof)?;
@@ -1262,6 +1305,14 @@ impl Connection {
         }
         if let Some(hexkey) = opts.hexkey {
             let _ = conn.pragma_update("hexkey", format!("'{hexkey}'"));
+        }
+        if let Some(encryption_opts) = encryption_opts {
+            let _ = conn.pragma_update("cipher", encryption_opts.cipher.to_string());
+            let _ = conn.pragma_update("hexkey", encryption_opts.hexkey.to_string());
+            let pager = conn.pager.borrow();
+            if db.db_state.is_initialized() {
+                pager.force_read_header_page_from_disk()?;
+            }
         }
         Ok((io, conn))
     }
@@ -1277,7 +1328,7 @@ impl Connection {
         opts.mode = OpenMode::ReadOnly;
         let flags = opts.get_flags()?;
         let io = opts.vfs.map(Database::io_for_vfs).unwrap_or(Ok(io))?;
-        let db = Database::open_file_with_flags(io.clone(), &opts.path, flags, db_opts)?;
+        let db = Database::open_file_with_flags(io.clone(), &opts.path, flags, db_opts, None)?;
         if let Some(modeof) = opts.modeof {
             let perms = std::fs::metadata(modeof)?;
             std::fs::set_permissions(&opts.path, perms.permissions())?;
