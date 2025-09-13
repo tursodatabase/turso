@@ -857,6 +857,17 @@ impl BTreeCursor {
             *remaining_to_read -= to_read;
 
             if *remaining_to_read != 0 && next != 0 {
+                // Validate overflow pointer before following it, just like we do in clear_overflow_pages.
+                let db_size = self
+                    .pager
+                    .io
+                    .block(|| self.pager.with_header(|header| header.database_size))?
+                    .get();
+                if next < 2 || next > db_size {
+                    // Reset state to avoid leaving a partial read state behind.
+                    let _ = read_overflow_state.take();
+                    return Err(LimboError::Corrupt("Invalid overflow page number".into()));
+                }
                 let (new_page, c) = self.pager.read_page(next as usize)?;
                 *page = new_page;
                 *next_page = next;
@@ -1080,6 +1091,15 @@ impl BTreeCursor {
                             "Overflow chain ends prematurely".into(),
                         ));
                     }
+                    // Validate the overflow pointer is within database bounds
+                    let db_size = self
+                        .pager
+                        .io
+                        .block(|| self.pager.with_header(|header| header.database_size))?
+                        .get();
+                    if next < 2 || next > db_size {
+                        return Err(LimboError::Corrupt("Invalid overflow page number".into()));
+                    }
                     pages_left_to_skip -= 1;
 
                     let (next_page, c) = self.read_page(next as usize)?;
@@ -1145,6 +1165,15 @@ impl BTreeCursor {
                         return Err(LimboError::Corrupt(
                             "Overflow chain ends prematurely".into(),
                         ));
+                    }
+                    // Validate the overflow pointer is within database bounds
+                    let db_size = self
+                        .pager
+                        .io
+                        .block(|| self.pager.with_header(|header| header.database_size))?
+                        .get();
+                    if next < 2 || next > db_size {
+                        return Err(LimboError::Corrupt("Invalid overflow page number".into()));
                     }
 
                     // Load next page
@@ -7992,6 +8021,127 @@ mod tests {
         (pager, page2.get().id, db, conn)
     }
 
+    fn table_overflow_fixture() -> (Rc<Pager>, BTreeCursor, u32, usize) {
+        let (pager, root_page, _, _) = empty_btree();
+        let num_columns = 1;
+        let mut cursor = BTreeCursor::new(None, pager.clone(), root_page, num_columns);
+        let large_blob = vec![b'X'; 40960];
+        let regs = &[Register::Value(Value::Blob(large_blob))];
+        let value = ImmutableRecord::from_registers(regs, regs.len());
+        run_until_done(
+            || cursor.seek(SeekKey::TableRowId(1), SeekOp::GE { eq_only: true }),
+            pager.deref(),
+        )
+        .unwrap();
+        run_until_done(
+            || cursor.insert(&BTreeKey::new_table_rowid(1, Some(&value))),
+            pager.deref(),
+        )
+        .unwrap();
+        cursor
+            .stack
+            .set_cell_index(cursor.stack.current_cell_index() + 1);
+        let contents = cursor.stack.top_ref().get_contents();
+        let cell = contents
+            .cell_get(
+                cursor.stack.current_cell_index() as usize - 1,
+                pager.usable_space(),
+            )
+            .unwrap();
+        let (payload_size, first_overflow) = match cell {
+            BTreeCell::TableLeafCell(cell) => {
+                (cell.payload_size, cell.first_overflow_page.unwrap())
+            }
+            _ => unreachable!(),
+        };
+        let (local_size, _) = cursor
+            .parse_cell_info(
+                payload_size as usize,
+                contents.page_type(),
+                pager.usable_space(),
+            )
+            .unwrap();
+        (pager, cursor, first_overflow, local_size)
+    }
+
+    fn corrupt_overflow_next_pointer(pager: &Rc<Pager>, overflow_page: u32) {
+        let (page, c) = pager.read_page(overflow_page as usize).unwrap();
+        if let Some(c) = c {
+            pager.io.wait_for_completion(c).unwrap();
+        }
+        let db_size = pager
+            .io
+            .block(|| pager.with_header(|h| h.database_size))
+            .unwrap()
+            .get();
+        page.get_contents().write_u32_no_offset(0, db_size + 100);
+    }
+
+    fn index_overflow_fixture() -> (Rc<Pager>, BTreeCursor, Vec<Register>) {
+        let (pager, _, _conn, _db) = empty_btree();
+        let index_root = pager
+            .io
+            .block(|| pager.btree_create(&crate::storage::pager::CreateBTreeFlags::new_index()))
+            .unwrap() as usize;
+        let index_def = crate::schema::Index {
+            name: "idx_overflow".into(),
+            columns: vec![IndexColumn {
+                name: "col0".into(),
+                order: SortOrder::Asc,
+                collation: None,
+                pos_in_table: 0,
+                default: None,
+            }],
+            table_name: "test".into(),
+            root_page: index_root,
+            unique: false,
+            ephemeral: false,
+            has_rowid: false,
+        };
+        let mut cursor = BTreeCursor::new_index(
+            None,
+            pager.clone(),
+            index_root,
+            &index_def,
+            index_def.columns.len(),
+        );
+
+        pager.begin_read_tx().unwrap();
+        pager.io.block(|| pager.begin_write_tx()).unwrap();
+        let regs = vec![Register::Value(Value::Blob(vec![b'K'; 40960]))];
+        let value = ImmutableRecord::from_registers(&regs, regs.len());
+        run_until_done(
+            || {
+                let record = ImmutableRecord::from_registers(&regs, regs.len());
+                cursor.seek(SeekKey::IndexKey(&record), SeekOp::GE { eq_only: true })
+            },
+            pager.deref(),
+        )
+        .unwrap();
+        run_until_done(
+            || cursor.insert(&BTreeKey::new_index_key(&value)),
+            pager.deref(),
+        )
+        .unwrap();
+
+        cursor
+            .stack
+            .set_cell_index(cursor.stack.current_cell_index() + 1);
+        let contents = cursor.stack.top_ref().get_contents();
+        let cell = contents
+            .cell_get(
+                cursor.stack.current_cell_index() as usize - 1,
+                pager.usable_space(),
+            )
+            .unwrap();
+        let first_overflow = match cell {
+            BTreeCell::IndexLeafCell(cell) => cell.first_overflow_page.unwrap(),
+            _ => unreachable!(),
+        };
+        corrupt_overflow_next_pointer(&pager, first_overflow);
+        (pager, cursor, regs)
+    }
+
     #[test]
     fn btree_with_virtual_page_1() -> Result<()> {
         #[allow(clippy::arc_with_non_send_sync)]
@@ -10276,5 +10426,48 @@ mod tests {
         )
         .unwrap();
         insert_into_cell(contents, &payload, cell_idx as usize, pager.usable_space()).unwrap();
+    }
+
+    #[test]
+    pub fn test_continue_payload_overflow_with_offset_invalid_pointer() {
+        let (pager, mut cursor, first_overflow, local_size) = table_overflow_fixture();
+        corrupt_overflow_next_pointer(&pager, first_overflow);
+
+        // Attempt to read across overflow boundary, which should now fail with Corrupt
+        let mut buf = Vec::new();
+        let res = run_until_done(
+            || {
+                cursor.read_write_payload_with_offset(
+                    local_size as u32,
+                    &mut buf,
+                    pager.usable_space() as u32,
+                    false,
+                )
+            },
+            pager.deref(),
+        );
+        assert!(
+            matches!(res, Err(LimboError::Corrupt(_))),
+            "expected Corrupt, got: {res:?}"
+        );
+    }
+
+    #[test]
+    pub fn test_process_overflow_read_invalid_pointer() {
+        let (pager, mut cursor, regs) = index_overflow_fixture();
+
+        // Re-seek the same key; process_overflow_read should raise Corrupt
+        let res = run_until_done(
+            || {
+                let record = ImmutableRecord::from_registers(&regs, regs.len());
+                cursor.seek(SeekKey::IndexKey(&record), SeekOp::GE { eq_only: true })
+            },
+            pager.deref(),
+        );
+
+        assert!(
+            matches!(res, Err(LimboError::Corrupt(_))),
+            "expected Corrupt, got: {res:?}"
+        );
     }
 }
