@@ -1,3 +1,12 @@
+import {
+    createOnMessage as __wasmCreateOnMessageForFsProxy,
+    getDefaultContext as __emnapiGetDefaultContext,
+    instantiateNapiModule as __emnapiInstantiateNapiModule,
+    WASI as __WASI,
+    instantiateNapiModuleSync,
+    MessageHandler
+} from '@tursodatabase/wasm-runtime'
+
 function getUint8ArrayFromMemory(memory: WebAssembly.Memory, ptr: number, len: number): Uint8Array {
     ptr = ptr >>> 0;
     return new Uint8Array(memory.buffer).subarray(ptr, ptr + len);
@@ -197,7 +206,7 @@ class OpfsDirectory {
     }
 }
 
-var workerRequestId = 0;
+let workerRequestId = 0;
 function waitForWorkerResponse(worker: Worker, id: number): Promise<any> {
     let waitResolve, waitReject;
     const callback = msg => {
@@ -236,4 +245,103 @@ function unregisterFileAtWorker(worker: Worker, path: string): Promise<void> {
     return promise;
 }
 
-export { OpfsDirectory, workerImports, MainDummyImports, waitForWorkerResponse, registerFileAtWorker, unregisterFileAtWorker }
+function isWebWorker(): boolean {
+    return typeof WorkerGlobalScope !== 'undefined' && self instanceof WorkerGlobalScope;
+}
+
+function setupWebWorker() {
+    let opfs = new OpfsDirectory();
+    let memory = null;
+
+    const handler = new MessageHandler({
+        onLoad({ wasmModule, wasmMemory }) {
+            memory = wasmMemory;
+            const wasi = new __WASI({
+                print: function () {
+                    // eslint-disable-next-line no-console
+                    console.log.apply(console, arguments)
+                },
+                printErr: function () {
+                    // eslint-disable-next-line no-console
+                    console.error.apply(console, arguments)
+                },
+            })
+            return instantiateNapiModuleSync(wasmModule, {
+                childThread: true,
+                wasi,
+                overwriteImports(importObject) {
+                    importObject.env = {
+                        ...importObject.env,
+                        ...importObject.napi,
+                        ...importObject.emnapi,
+                        ...workerImports(opfs, memory),
+                        memory: wasmMemory,
+                    }
+                },
+            })
+        },
+    })
+
+    globalThis.onmessage = async function (e) {
+        if (e.data.__turso__ == 'register') {
+            try {
+                await opfs.registerFile(e.data.path);
+                self.postMessage({ id: e.data.id });
+            } catch (error) {
+                self.postMessage({ id: e.data.id, error: error });
+            }
+            return;
+        } else if (e.data.__turso__ == 'unregister') {
+            try {
+                await opfs.unregisterFile(e.data.path);
+                self.postMessage({ id: e.data.id });
+            } catch (error) {
+                self.postMessage({ id: e.data.id, error: error });
+            }
+            return;
+        }
+        handler.handle(e)
+    }
+}
+
+async function setupMainThread(wasmFile: ArrayBuffer, factory: () => Worker): Promise<any> {
+    const __emnapiContext = __emnapiGetDefaultContext()
+    const __wasi = new __WASI({
+        version: 'preview1',
+    })
+    const __sharedMemory = new WebAssembly.Memory({
+        initial: 4000,
+        maximum: 65536,
+        shared: true,
+    })
+    const {
+        instance: __napiInstance,
+        module: __wasiModule,
+        napiModule: __napiModule,
+    } = await __emnapiInstantiateNapiModule(wasmFile, {
+        context: __emnapiContext,
+        asyncWorkPoolSize: 1,
+        wasi: __wasi,
+        onCreateWorker() { return factory() },
+        overwriteImports(importObject) {
+            importObject.env = {
+                ...importObject.env,
+                ...importObject.napi,
+                ...importObject.emnapi,
+                ...MainDummyImports,
+                memory: __sharedMemory,
+            }
+            return importObject
+        },
+        beforeInit({ instance }) {
+            for (const name of Object.keys(instance.exports)) {
+                if (name.startsWith('__napi_register__')) {
+                    instance.exports[name]()
+                }
+            }
+        },
+    })
+    return __napiModule;
+}
+
+export { OpfsDirectory, workerImports, MainDummyImports, waitForWorkerResponse, registerFileAtWorker, unregisterFileAtWorker, isWebWorker, setupWebWorker, setupMainThread }

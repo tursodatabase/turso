@@ -11,12 +11,7 @@
       "es2020",
       "DOM",
       "WebWorker"
-    ],
-    "paths": {
-      "#index": [
-        "./index.js"
-      ]
-    }
+    ]
   },
   "include": [
     "*"

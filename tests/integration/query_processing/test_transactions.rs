@@ -244,3 +244,150 @@ fn test_mvcc_transactions_deferred() {
         assert_eq!(*row.get::<&Value>(0).unwrap(), Value::Integer(2));
     }
 }
+
+#[test]
+fn test_mvcc_insert_select_basic() {
+    let tmp_db = TempDatabase::new_with_opts(
+        "test_mvcc_update_basic.db",
+        turso_core::DatabaseOpts::new().with_mvcc(true),
+    );
+    let conn1 = tmp_db.connect_limbo();
+
+    conn1
+        .execute("CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT)")
+        .unwrap();
+
+    conn1
+        .execute("INSERT INTO test (id, value) VALUES (1, 'first')")
+        .unwrap();
+
+    let stmt = conn1
+        .query("SELECT * FROM test WHERE id = 1")
+        .unwrap()
+        .unwrap();
+    let row = helper_read_single_row(stmt);
+    assert_eq!(row, vec![Value::Integer(1), Value::build_text("first")]);
+}
+
+#[test]
+fn test_mvcc_update_basic() {
+    let tmp_db = TempDatabase::new_with_opts(
+        "test_mvcc_update_basic.db",
+        turso_core::DatabaseOpts::new().with_mvcc(true),
+    );
+    let conn1 = tmp_db.connect_limbo();
+
+    conn1
+        .execute("CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT)")
+        .unwrap();
+
+    conn1
+        .execute("INSERT INTO test (id, value) VALUES (1, 'first')")
+        .unwrap();
+
+    let stmt = conn1
+        .query("SELECT value FROM test WHERE id = 1")
+        .unwrap()
+        .unwrap();
+    let row = helper_read_single_row(stmt);
+    assert_eq!(row, vec![Value::build_text("first")]);
+
+    conn1
+        .execute("UPDATE test SET value = 'second' WHERE id = 1")
+        .unwrap();
+
+    let stmt = conn1
+        .query("SELECT value FROM test WHERE id = 1")
+        .unwrap()
+        .unwrap();
+    let row = helper_read_single_row(stmt);
+    assert_eq!(row, vec![Value::build_text("second")]);
+}
+
+#[test]
+fn test_mvcc_begin_concurrent_smoke() {
+    let tmp_db = TempDatabase::new_with_opts(
+        "test_mvcc_begin_concurrent_smoke.db",
+        turso_core::DatabaseOpts::new().with_mvcc(true),
+    );
+    let conn1 = tmp_db.connect_limbo();
+    conn1.execute("BEGIN CONCURRENT").unwrap();
+    conn1
+        .execute("CREATE TABLE test (id INTEGER, value TEXT)")
+        .unwrap();
+    conn1.execute("COMMIT").unwrap();
+}
+
+#[test]
+fn test_mvcc_concurrent_insert_basic() {
+    let tmp_db = TempDatabase::new_with_opts(
+        "test_mvcc_update_basic.db",
+        turso_core::DatabaseOpts::new().with_mvcc(true),
+    );
+    let conn1 = tmp_db.connect_limbo();
+    let conn2 = tmp_db.connect_limbo();
+
+    conn1
+        .execute("CREATE TABLE test (id INTEGER, value TEXT)")
+        .unwrap();
+
+    conn1.execute("BEGIN CONCURRENT").unwrap();
+    conn2.execute("BEGIN CONCURRENT").unwrap();
+
+    conn1
+        .execute("INSERT INTO test (id, value) VALUES (1, 'first')")
+        .unwrap();
+    conn2
+        .execute("INSERT INTO test (id, value) VALUES (2, 'second')")
+        .unwrap();
+
+    conn1.execute("COMMIT").unwrap();
+    conn2.execute("COMMIT").unwrap();
+
+    let stmt = conn1.query("SELECT * FROM test").unwrap().unwrap();
+    let rows = helper_read_all_rows(stmt);
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Integer(1), Value::build_text("first")],
+            vec![Value::Integer(2), Value::build_text("second")],
+        ]
+    );
+}
+
+fn helper_read_all_rows(mut stmt: turso_core::Statement) -> Vec<Vec<Value>> {
+    let mut ret = Vec::new();
+    loop {
+        match stmt.step().unwrap() {
+            StepResult::Row => {
+                ret.push(stmt.row().unwrap().get_values().cloned().collect());
+            }
+            StepResult::IO => stmt.run_once().unwrap(),
+            StepResult::Done => break,
+            StepResult::Busy => panic!("database is busy"),
+            StepResult::Interrupt => panic!("interrupted"),
+        }
+    }
+    ret
+}
+
+fn helper_read_single_row(mut stmt: turso_core::Statement) -> Vec<Value> {
+    let mut read_count = 0;
+    let mut ret = None;
+    loop {
+        match stmt.step().unwrap() {
+            StepResult::Row => {
+                assert_eq!(read_count, 0);
+                read_count += 1;
+                let row = stmt.row().unwrap();
+                ret = Some(row.get_values().cloned().collect());
+            }
+            StepResult::IO => stmt.run_once().unwrap(),
+            StepResult::Done => break,
+            StepResult::Busy => panic!("database is busy"),
+            StepResult::Interrupt => panic!("interrupted"),
+        }
+    }
+
+    ret.unwrap()
+}

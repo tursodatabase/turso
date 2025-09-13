@@ -1086,6 +1086,13 @@ pub enum Insn {
         reg: usize,
         target_pc: BranchOffset,
     },
+
+    // OP_Explain
+    Explain {
+        p1: usize,         // P1: address of instruction
+        p2: Option<usize>, // P2: address of parent explain instruction
+        detail: String,    // P4: detail text
+    },
 }
 
 impl Insn {
@@ -1224,6 +1231,7 @@ impl Insn {
             Insn::MaxPgcnt { .. } => execute::op_max_pgcnt,
             Insn::JournalMode { .. } => execute::op_journal_mode,
             Insn::IfNeg { .. } => execute::op_if_neg,
+            Insn::Explain { .. } => execute::op_noop,
         }
     }
 }

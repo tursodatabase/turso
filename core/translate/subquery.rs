@@ -1,13 +1,14 @@
 use crate::{
+    emit_explain,
     schema::Table,
     vdbe::{builder::ProgramBuilder, insn::Insn},
-    Result,
+    QueryMode, Result,
 };
 
 use super::{
     emitter::{emit_query, Resolver, TranslateCtx},
     main_loop::LoopLabels,
-    plan::{QueryDestination, SelectPlan, TableReferences},
+    plan::{Operation, QueryDestination, Search, SelectPlan, TableReferences},
 };
 
 /// Emit the subqueries contained in the FROM clause.
@@ -17,7 +18,45 @@ pub fn emit_subqueries(
     t_ctx: &mut TranslateCtx,
     tables: &mut TableReferences,
 ) -> Result<()> {
+    if tables.joined_tables().is_empty() {
+        emit_explain!(program, false, "SCAN CONSTANT ROW".to_owned());
+    }
+
     for table_reference in tables.joined_tables_mut() {
+        emit_explain!(
+            program,
+            true,
+            match &table_reference.op {
+                Operation::Scan { .. } => {
+                    if table_reference.table.get_name() == table_reference.identifier {
+                        format!("SCAN {}", table_reference.identifier)
+                    } else {
+                        format!(
+                            "SCAN {} AS {}",
+                            table_reference.table.get_name(),
+                            table_reference.identifier
+                        )
+                    }
+                }
+                Operation::Search(search) => match search {
+                    Search::RowidEq { .. } | Search::Seek { index: None, .. } => {
+                        format!(
+                            "SEARCH {} USING INTEGER PRIMARY KEY (rowid=?)",
+                            table_reference.identifier
+                        )
+                    }
+                    Search::Seek {
+                        index: Some(index), ..
+                    } => {
+                        format!(
+                            "SEARCH {} USING INDEX {}",
+                            table_reference.identifier, index.name
+                        )
+                    }
+                },
+            }
+        );
+
         if let Table::FromClauseSubquery(from_clause_subquery) = &mut table_reference.table {
             // Emit the subquery and get the start register of the result columns.
             let result_columns_start =
@@ -27,6 +66,8 @@ pub fn emit_subqueries(
             // as if it were reading from a regular table.
             from_clause_subquery.result_columns_start_reg = Some(result_columns_start);
         }
+
+        program.pop_current_parent_explain();
     }
     Ok(())
 }

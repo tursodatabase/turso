@@ -45,7 +45,9 @@ pub const DBSP_TABLE_PREFIX: &str = "__turso_internal_dbsp_state_";
 /// Check if a table name refers to a system table that should be protected from direct writes
 pub fn is_system_table(table_name: &str) -> bool {
     let normalized = table_name.to_lowercase();
-    normalized == SCHEMA_TABLE_NAME || normalized == SCHEMA_TABLE_NAME_ALT
+    normalized == SCHEMA_TABLE_NAME
+        || normalized == SCHEMA_TABLE_NAME_ALT
+        || table_name.starts_with(DBSP_TABLE_PREFIX)
 }
 
 #[derive(Debug)]

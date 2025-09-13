@@ -76,6 +76,8 @@ jobs:
               export CMAKE_BUILD_PARALLEL_LEVEL=$(nproc)
               export TARGET_CXXFLAGS="--target=wasm32-wasi-threads --sysroot=$(pwd)/wasi-sdk-25.0-x86_64-linux/share/wasi-sysroot -pthread -mllvm -wasm-enable-sjlj -lsetjmp"
               export TARGET_CFLAGS="$TARGET_CXXFLAGS"
+              yarn workspace @tursodatabase/database-common build
+              yarn workspace @tursodatabase/database-browser-common build
               yarn workspace @tursodatabase/database-browser build
           - host: ubuntu-latest
             target: wasm32-wasip1-threads
@@ -89,8 +91,11 @@ jobs:
               export CMAKE_BUILD_PARALLEL_LEVEL=$(nproc)
               export TARGET_CXXFLAGS="--target=wasm32-wasi-threads --sysroot=$(pwd)/wasi-sdk-25.0-x86_64-linux/share/wasi-sysroot -pthread -mllvm -wasm-enable-sjlj -lsetjmp"
               export TARGET_CFLAGS="$TARGET_CXXFLAGS"
+              yarn workspace @tursodatabase/database-common build
+              yarn workspace @tursodatabase/database-browser-common build
+              yarn workspace @tursodatabase/sync-common build
               yarn workspace @tursodatabase/sync-browser build
-    name: stable - ${{ matrix.settings.target }} - node@20
+    name: ${{ matrix.settings.artifact }} - node@20
     runs-on: ${{ matrix.settings.host }}
     steps:
       - uses: actions/checkout@v4

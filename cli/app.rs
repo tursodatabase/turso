@@ -740,6 +740,77 @@ impl Limbo {
     ) -> anyhow::Result<()> {
         match output {
             Ok(Some(ref mut rows)) => match (self.opts.output_mode, rows.get_query_mode()) {
+                (_, QueryMode::ExplainQueryPlan) => {
+                    struct Entry {
+                        id: usize,
+                        detail: String,
+                        child_prefix: String,
+                        children: Vec<Entry>,
+                    }
+
+                    let mut root = Entry {
+                        id: 0,
+                        detail: "QUERY PLAN".to_owned(),
+                        child_prefix: "".to_owned(),
+                        children: vec![],
+                    };
+
+                    fn add_children(
+                        id: usize,
+                        parent_id: usize,
+                        detail: String,
+                        current: &mut Entry,
+                    ) -> bool {
+                        if current.id == parent_id {
+                            current.children.push(Entry {
+                                id,
+                                detail,
+                                child_prefix: current.child_prefix.clone() + "   ",
+                                children: vec![],
+                            });
+                            if current.children.len() > 1 {
+                                let idx = current.children.len() - 2;
+                                current.children[idx].child_prefix =
+                                    current.child_prefix.clone() + "|  ";
+                            }
+
+                            return false;
+                        }
+
+                        for child in &mut current.children {
+                            if !add_children(id, parent_id, detail.clone(), child) {
+                                return false;
+                            }
+                        }
+
+                        true
+                    }
+
+                    fn print_entry(app: &mut Limbo, entry: &Entry, prefix: &str) {
+                        writeln!(app, "{}{}", prefix, entry.detail).unwrap();
+                        for (i, child) in entry.children.iter().enumerate() {
+                            let is_last = i == entry.children.len() - 1;
+                            let child_prefix = format!(
+                                "{}{}",
+                                entry.child_prefix,
+                                if is_last { "`--" } else { "|--" }
+                            );
+                            print_entry(app, child, child_prefix.as_str());
+                        }
+                    }
+
+                    loop {
+                        row_step_result_query!(self, sql, rows, statistics, {
+                            let row = rows.row().unwrap();
+                            let id: usize = row.get_value(0).as_uint() as usize;
+                            let parent_id: usize = row.get_value(1).as_uint() as usize;
+                            let detail = row.get_value(3).to_string();
+                            add_children(id, parent_id, detail, &mut root);
+                        });
+                    }
+
+                    print_entry(self, &root, "");
+                }
                 (_, QueryMode::Explain) => {
                     fn get_explain_indent(
                         indent_count: usize,

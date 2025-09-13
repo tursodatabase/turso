@@ -71,7 +71,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::mem::MaybeUninit;
 use std::pin::Pin;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 /// The minimum size of a cell in bytes.
@@ -1652,6 +1652,7 @@ pub fn build_shared_wal(
         loaded: AtomicBool::new(false),
         checkpoint_lock: TursoRwLock::new(),
         initialized: AtomicBool::new(false),
+        epoch: AtomicU32::new(0),
     }));
 
     if size < WAL_HEADER_SIZE as u64 {

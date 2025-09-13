@@ -1,5 +1,5 @@
 import { expect, test } from 'vitest'
-import { connect, DatabaseRowMutation, DatabaseRowTransformResult } from './promise.js'
+import { connect, DatabaseRowMutation, DatabaseRowTransformResult } from './promise-default.js'
 
 const localeCompare = (a, b) => a.x.localeCompare(b.x);
 

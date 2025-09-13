@@ -1723,6 +1723,15 @@ pub fn insn_to_row(
                 0,
                 format!("if (r[{}] < 0) goto {}", reg, target_pc.as_debug_int()),
             ),
+            Insn::Explain { p1, p2, detail } => (
+                "Explain",
+                *p1 as i32,
+                p2.as_ref().map(|p| *p).unwrap_or(0) as i32,
+                0,
+                Value::build_text(detail.as_str()),
+                0,
+                String::new(),
+            ),
         }
 }
 

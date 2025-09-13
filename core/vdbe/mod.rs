@@ -477,7 +477,7 @@ pub struct Program {
     pub max_registers: usize,
     pub insns: Vec<(Insn, InsnFunction)>,
     pub cursor_ref: Vec<(Option<CursorKey>, CursorType)>,
-    pub comments: Option<Vec<(InsnReference, &'static str)>>,
+    pub comments: Vec<(InsnReference, &'static str)>,
     pub parameters: crate::parameters::Parameters,
     pub connection: Arc<Connection>,
     pub n_change: Cell<i64>,
@@ -541,13 +541,11 @@ impl Program {
         let (opcode, p1, p2, p3, p4, p5, comment) = insn_to_row_with_comment(
             self,
             current_insn,
-            self.comments.as_ref().and_then(|comments| {
-                comments
-                    .iter()
-                    .find(|(offset, _)| *offset == state.pc)
-                    .map(|(_, comment)| comment)
-                    .copied()
-            }),
+            self.comments
+                .iter()
+                .find(|(offset, _)| *offset == state.pc)
+                .map(|(_, comment)| comment)
+                .copied(),
         );
 
         state.registers[0] = Register::Value(Value::Integer(state.pc as i64));
@@ -570,10 +568,47 @@ impl Program {
         &self,
         state: &mut ProgramState,
         _mv_store: Option<Arc<MvStore>>,
-        _pager: Rc<Pager>,
+        pager: Rc<Pager>,
     ) -> Result<StepResult> {
         debug_assert!(state.column_count() == EXPLAIN_QUERY_PLAN_COLUMNS.len());
-        todo!("we need OP_Explain to be implemented first")
+        loop {
+            if self.connection.closed.get() {
+                // Connection is closed for whatever reason, rollback the transaction.
+                let state = self.connection.transaction_state.get();
+                if let TransactionState::Write { .. } = state {
+                    pager.io.block(|| pager.end_tx(true, &self.connection))?;
+                }
+                return Err(LimboError::InternalError("Connection closed".to_string()));
+            }
+
+            if state.is_interrupted() {
+                return Ok(StepResult::Interrupt);
+            }
+
+            // FIXME: do we need this?
+            state.metrics.vm_steps = state.metrics.vm_steps.saturating_add(1);
+
+            if state.pc as usize >= self.insns.len() {
+                return Ok(StepResult::Done);
+            }
+
+            let Insn::Explain { p1, p2, detail } = &self.insns[state.pc as usize].0 else {
+                state.pc += 1;
+                continue;
+            };
+
+            state.registers[0] = Register::Value(Value::Integer(*p1 as i64));
+            state.registers[1] =
+                Register::Value(Value::Integer(p2.as_ref().map(|p| *p).unwrap_or(0) as i64));
+            state.registers[2] = Register::Value(Value::Integer(0));
+            state.registers[3] = Register::Value(Value::from_text(detail.as_str()));
+            state.result_row = Some(Row {
+                values: &state.registers[0] as *const Register,
+                count: EXPLAIN_QUERY_PLAN_COLUMNS.len(),
+            });
+            state.pc += 1;
+            return Ok(StepResult::Row);
+        }
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
@@ -602,7 +637,7 @@ impl Program {
                 }
                 if let Some(err) = io.get_error() {
                     let err = err.into();
-                    handle_program_error(&pager, &self.connection, &err)?;
+                    handle_program_error(&pager, &self.connection, &err, mv_store.as_ref())?;
                     return Err(err);
                 }
                 state.io_completions = None;
@@ -645,7 +680,7 @@ impl Program {
                     return Ok(StepResult::Busy);
                 }
                 Err(err) => {
-                    handle_program_error(&pager, &self.connection, &err)?;
+                    handle_program_error(&pager, &self.connection, &err, mv_store.as_ref())?;
                     return Err(err);
                 }
             }
@@ -714,19 +749,25 @@ impl Program {
 
                     let view_name = &views[*current_index];
 
-                    let delta = self
+                    let table_deltas = self
                         .connection
                         .view_transaction_states
                         .get(view_name)
                         .unwrap()
-                        .get_delta();
+                        .get_table_deltas();
 
                     let schema = self.connection.schema.borrow();
                     if let Some(view_mutex) = schema.get_materialized_view(view_name) {
                         let mut view = view_mutex.lock().unwrap();
 
+                        // Create a DeltaSet from the per-table deltas
+                        let mut delta_set = crate::incremental::compiler::DeltaSet::new();
+                        for (table_name, delta) in table_deltas {
+                            delta_set.insert(table_name, delta);
+                        }
+
                         // Handle I/O from merge_delta - pass pager, circuit will create its own cursor
-                        match view.merge_delta(&delta, pager.clone())? {
+                        match view.merge_delta(delta_set, pager.clone())? {
                             IOResult::Done(_) => {
                                 // Move to next view
                                 state.view_delta_state = ViewDeltaCommitState::Processing {
@@ -765,12 +806,16 @@ impl Program {
         // Reset state for next use
         program_state.view_delta_state = ViewDeltaCommitState::NotStarted;
 
-        if self.connection.transaction_state.get() == TransactionState::None && mv_store.is_none() {
+        if self.connection.transaction_state.get() == TransactionState::None {
             // No need to do any work here if not in tx. Current MVCC logic doesn't work with this assumption,
             // hence the mv_store.is_none() check.
             return Ok(IOResult::Done(()));
         }
         if let Some(mv_store) = mv_store {
+            if self.connection.is_nested_stmt.get() {
+                // We don't want to commit on nested statements. Let parent handle it.
+                return Ok(IOResult::Done(()));
+            }
             let conn = self.connection.clone();
             let auto_commit = conn.auto_commit.get();
             if auto_commit {
@@ -933,11 +978,12 @@ fn trace_insn(program: &Program, addr: InsnReference, insn: &Insn) {
             addr,
             insn,
             String::new(),
-            program.comments.as_ref().and_then(|comments| comments
+            program
+                .comments
                 .iter()
                 .find(|(offset, _)| *offset == addr)
                 .map(|(_, comment)| comment)
-                .copied())
+                .copied()
         )
     );
 }
@@ -1025,6 +1071,7 @@ pub fn handle_program_error(
     pager: &Rc<Pager>,
     connection: &Connection,
     err: &LimboError,
+    mv_store: Option<&Arc<MvStore>>,
 ) -> Result<()> {
     if connection.is_nested_stmt.get() {
         // Errors from nested statements are handled by the parent statement.
@@ -1036,12 +1083,18 @@ pub fn handle_program_error(
         // Table locked errors, e.g. trying to checkpoint in an interactive transaction, do not cause a rollback.
         LimboError::TableLocked => {}
         _ => {
-            pager
-                .io
-                .block(|| pager.end_tx(true, connection))
-                .inspect_err(|e| {
-                    tracing::error!("end_tx failed: {e}");
-                })?;
+            if let Some(mv_store) = mv_store {
+                if let Some(tx_id) = connection.mv_tx_id.get() {
+                    mv_store.rollback_tx(tx_id, pager.clone());
+                }
+            } else {
+                pager
+                    .io
+                    .block(|| pager.end_tx(true, connection))
+                    .inspect_err(|e| {
+                        tracing::error!("end_tx failed: {e}");
+                    })?;
+            }
             connection.transaction_state.replace(TransactionState::None);
         }
     }

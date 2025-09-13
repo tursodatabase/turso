@@ -5,18 +5,18 @@
 //!
 //! Based on the DBSP paper: "DBSP: Automatic Incremental View Maintenance for Rich Query Languages"
 
-use crate::incremental::dbsp::Delta;
+use crate::incremental::dbsp::{Delta, DeltaPair};
 use crate::incremental::expr_compiler::CompiledExpression;
-use crate::incremental::hashable_row::HashableRow;
 use crate::incremental::operator::{
     EvalState, FilterOperator, FilterPredicate, IncrementalOperator, InputOperator, ProjectOperator,
 };
-use crate::storage::btree::{BTreeCursor, BTreeKey};
+use crate::incremental::persistence::WriteRow;
+use crate::storage::btree::BTreeCursor;
 // Note: logical module must be made pub(crate) in translate/mod.rs
 use crate::translate::logical::{
     BinaryOperator, LogicalExpr, LogicalPlan, LogicalSchema, SchemaRef,
 };
-use crate::types::{IOResult, SeekKey, SeekOp, SeekResult, Value};
+use crate::types::{IOResult, SeekKey, Value};
 use crate::Pager;
 use crate::{return_and_restore_if_io, return_if_io, LimboError, Result};
 use std::collections::HashMap;
@@ -26,119 +26,6 @@ use std::sync::Arc;
 
 // The state table is always a key-value store with 3 columns: key, state, and weight.
 const OPERATOR_COLUMNS: usize = 3;
-
-/// State machine for writing a row to the materialized view
-#[derive(Debug)]
-pub enum WriteViewRow {
-    /// Initial empty state
-    Empty,
-
-    /// Reading existing record to get current weight
-    GetRecord,
-
-    /// Deleting the row (when final weight <= 0)
-    Delete,
-
-    /// Inserting/updating the row with new weight
-    Insert {
-        /// The final weight to write
-        final_weight: isize,
-    },
-
-    /// Completed processing this row
-    Done,
-}
-
-impl WriteViewRow {
-    fn new() -> Self {
-        Self::Empty
-    }
-    fn write_row(
-        &mut self,
-        cursor: &mut BTreeCursor,
-        row: HashableRow,
-        weight: isize,
-    ) -> Result<IOResult<()>> {
-        loop {
-            match self {
-                WriteViewRow::Empty => {
-                    let key = SeekKey::TableRowId(row.rowid);
-                    let res = return_if_io!(cursor.seek(key, SeekOp::GE { eq_only: true }));
-                    match res {
-                        SeekResult::Found => *self = WriteViewRow::GetRecord,
-                        _ => {
-                            *self = WriteViewRow::Insert {
-                                final_weight: weight,
-                            }
-                        }
-                    }
-                }
-                WriteViewRow::GetRecord => {
-                    let existing_record = return_if_io!(cursor.record());
-                    let r = existing_record.ok_or_else(|| {
-                        crate::LimboError::InternalError(format!(
-                            "Found rowid {} in storage but could not read record",
-                            row.rowid
-                        ))
-                    })?;
-                    let values = r.get_values();
-
-                    // last value should contain the weight
-                    let existing_weight = match values.last() {
-                        Some(ref_val) => match ref_val.to_owned() {
-                            Value::Integer(w) => w as isize,
-                            _ => {
-                                return Err(crate::LimboError::InternalError(format!(
-                                    "Invalid weight value in storage for rowid {}",
-                                    row.rowid
-                                )))
-                            }
-                        },
-                        None => {
-                            return Err(crate::LimboError::InternalError(format!(
-                                "No weight value found in storage for rowid {}",
-                                row.rowid
-                            )))
-                        }
-                    };
-                    let final_weight = existing_weight + weight;
-                    if final_weight <= 0 {
-                        *self = WriteViewRow::Delete
-                    } else {
-                        *self = WriteViewRow::Insert { final_weight }
-                    }
-                }
-                WriteViewRow::Delete => {
-                    // Delete the row. Important: when delete returns I/O, the btree operation
-                    // has already completed in memory, so mark as Done to avoid retry
-                    *self = WriteViewRow::Done;
-                    return_if_io!(cursor.delete());
-                }
-                WriteViewRow::Insert { final_weight } => {
-                    let key = SeekKey::TableRowId(row.rowid);
-                    return_if_io!(cursor.seek(key, SeekOp::GE { eq_only: true }));
-
-                    // Create the record values: row values + weight
-                    let mut values = row.values.clone();
-                    values.push(Value::Integer(*final_weight as i64));
-
-                    // Create an ImmutableRecord from the values
-                    let immutable_record =
-                        crate::types::ImmutableRecord::from_values(&values, values.len());
-                    let btree_key = BTreeKey::new_table_rowid(row.rowid, Some(&immutable_record));
-                    // Insert the row. Important: when insert returns I/O, the btree operation
-                    // has already completed in memory, so mark as Done to avoid retry
-                    *self = WriteViewRow::Done;
-                    return_if_io!(cursor.insert(&btree_key));
-                }
-                WriteViewRow::Done => {
-                    break;
-                }
-            }
-        }
-        Ok(IOResult::Done(()))
-    }
-}
 
 /// State machine for commit operations
 pub enum CommitState {
@@ -160,7 +47,7 @@ pub enum CommitState {
         /// Current index in delta.changes being processed
         current_index: usize,
         /// State for writing individual rows
-        write_row_state: WriteViewRow,
+        write_row_state: WriteRow,
         /// Cursor for view data btree - created fresh for each row
         view_cursor: Box<BTreeCursor>,
     },
@@ -261,6 +148,16 @@ impl DeltaSet {
             .cloned()
             .unwrap_or_else(Delta::new)
     }
+
+    /// Convert DeltaSet into the underlying HashMap
+    pub fn into_map(self) -> HashMap<String, Delta> {
+        self.deltas
+    }
+
+    /// Check if all deltas in the set are empty
+    pub fn is_empty(&self) -> bool {
+        self.deltas.values().all(|d| d.is_empty())
+    }
 }
 
 /// Represents a DBSP operator in the compiled circuit
@@ -344,13 +241,13 @@ impl DbspNode {
         };
 
         let state = if commit_operators {
-            // Clone the delta from eval_state - don't extract it
+            // Clone the deltas from eval_state - don't extract them
             // in case we need to re-execute due to I/O
-            let delta = match eval_state {
-                EvalState::Init { delta } => delta.clone(),
+            let deltas = match eval_state {
+                EvalState::Init { deltas } => deltas.clone(),
                 _ => panic!("commit can only be called when eval_state is in Init state"),
             };
-            let result = return_if_io!(op.commit(delta, cursor));
+            let result = return_if_io!(op.commit(deltas, cursor));
             // After successful commit, move state to Done
             *eval_state = EvalState::Done;
             result
@@ -537,7 +434,7 @@ impl DbspCircuit {
                     self.commit_state = CommitState::UpdateView {
                         delta,
                         current_index: 0,
-                        write_row_state: WriteViewRow::new(),
+                        write_row_state: WriteRow::new(),
                         view_cursor,
                     };
                 }
@@ -554,9 +451,9 @@ impl DbspCircuit {
                     } else {
                         let (row, weight) = delta.changes[*current_index].clone();
 
-                        // If we're starting a new row (Empty state), we need a fresh cursor
+                        // If we're starting a new row (GetRecord state), we need a fresh cursor
                         // due to btree cursor state machine limitations
-                        if matches!(write_row_state, WriteViewRow::Empty) {
+                        if matches!(write_row_state, WriteRow::GetRecord) {
                             *view_cursor = Box::new(BTreeCursor::new_table(
                                 None,
                                 pager.clone(),
@@ -565,10 +462,19 @@ impl DbspCircuit {
                             ));
                         }
 
+                        // Build the view row format: row values + weight
+                        let key = SeekKey::TableRowId(row.rowid);
+                        let row_values = row.values.clone();
+                        let build_fn = move |final_weight: isize| -> Vec<Value> {
+                            let mut values = row_values.clone();
+                            values.push(Value::Integer(final_weight as i64));
+                            values
+                        };
+
                         return_and_restore_if_io!(
                             &mut self.commit_state,
                             state,
-                            write_row_state.write_row(view_cursor, row, weight)
+                            write_row_state.write_row(view_cursor, key, build_fn, weight)
                         );
 
                         // Move to next row
@@ -587,7 +493,7 @@ impl DbspCircuit {
                         self.commit_state = CommitState::UpdateView {
                             delta,
                             current_index: *current_index + 1,
-                            write_row_state: WriteViewRow::new(),
+                            write_row_state: WriteRow::new(),
                             view_cursor,
                         };
                     }
@@ -622,7 +528,9 @@ impl DbspCircuit {
                             // Input nodes get their delta directly from input_data
                             let delta = input_data.get(name);
                             *execute_state = ExecuteState::ProcessingNode {
-                                eval_state: Box::new(EvalState::Init { delta }),
+                                eval_state: Box::new(EvalState::Init {
+                                    deltas: delta.into(),
+                                }),
                             };
                         }
                         _ => {
@@ -656,22 +564,14 @@ impl DbspCircuit {
                     input_deltas,
                 } => {
                     if *current_index >= input_states.len() {
-                        // All inputs processed, check we have exactly one delta
-                        // (Input nodes never reach here since they go straight to ProcessingNode)
-                        let delta = if input_deltas.is_empty() {
-                            return Err(LimboError::InternalError(
-                                "execute() cannot be called without a Delta".to_string(),
-                            ));
-                        } else if input_deltas.len() > 1 {
-                            return Err(LimboError::InternalError(
-                                format!("Until joins are supported, only one delta is expected. Got {} deltas", input_deltas.len()),
-                            ));
-                        } else {
-                            input_deltas[0].clone()
-                        };
+                        // All inputs processed
+                        let left_delta = input_deltas.first().cloned().unwrap_or_else(Delta::new);
+                        let right_delta = input_deltas.get(1).cloned().unwrap_or_else(Delta::new);
 
                         *execute_state = ExecuteState::ProcessingNode {
-                            eval_state: Box::new(EvalState::Init { delta }),
+                            eval_state: Box::new(EvalState::Init {
+                                deltas: DeltaPair::new(left_delta, right_delta),
+                            }),
                         };
                     } else {
                         // Get the (node_id, state) pair for the current index

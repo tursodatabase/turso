@@ -100,7 +100,7 @@ pub struct ProgramBuilder {
     // Bitmask of cursors that have emitted a SeekRowid instruction.
     seekrowid_emitted_bitmask: u64,
     // map of instruction index to manual comment (used in EXPLAIN only)
-    comments: Option<Vec<(InsnReference, &'static str)>>,
+    comments: Vec<(InsnReference, &'static str)>,
     pub parameters: Parameters,
     pub result_columns: Vec<ResultSetColumn>,
     pub table_references: TableReferences,
@@ -114,6 +114,10 @@ pub struct ProgramBuilder {
     // TODO: when we support multiple dbs, this should be a write mask to track which DBs need to be written
     txn_mode: TransactionMode,
     rollback: bool,
+    /// The mode in which the query is being executed.
+    query_mode: QueryMode,
+    /// Current parent explain address, if any.
+    current_parent_explain_idx: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -158,6 +162,18 @@ pub struct ProgramBuilderOpts {
     pub approx_num_labels: usize,
 }
 
+/// Use this macro to emit an OP_Explain instruction.
+/// Please use this macro instead of calling emit_explain() directly,
+/// because we want to avoid allocating a String if we are not in explain mode.
+#[macro_export]
+macro_rules! emit_explain {
+    ($builder:expr, $push:expr, $detail:expr) => {
+        if let QueryMode::ExplainQueryPlan = $builder.get_query_mode() {
+            $builder.emit_explain($push, $detail);
+        }
+    };
+}
+
 impl ProgramBuilder {
     pub fn new(
         query_mode: QueryMode,
@@ -173,11 +189,7 @@ impl ProgramBuilder {
             constant_spans: Vec::new(),
             label_to_resolved_offset: Vec::with_capacity(opts.approx_num_labels),
             seekrowid_emitted_bitmask: 0,
-            comments: if let QueryMode::Explain | QueryMode::ExplainQueryPlan = query_mode {
-                Some(Vec::new())
-            } else {
-                None
-            },
+            comments: Vec::new(),
             parameters: Parameters::new(),
             result_columns: Vec::new(),
             table_references: TableReferences::new(vec![], vec![]),
@@ -189,6 +201,8 @@ impl ProgramBuilder {
             capture_data_changes_mode,
             txn_mode: TransactionMode::None,
             rollback: false,
+            query_mode,
+            current_parent_explain_idx: None,
         }
     }
 
@@ -378,8 +392,40 @@ impl ProgramBuilder {
     }
 
     pub fn add_comment(&mut self, insn_index: BranchOffset, comment: &'static str) {
-        if let Some(comments) = &mut self.comments {
-            comments.push((insn_index.as_offset_int(), comment));
+        if let QueryMode::Explain | QueryMode::ExplainQueryPlan = self.query_mode {
+            self.comments.push((insn_index.as_offset_int(), comment));
+        }
+    }
+
+    pub fn get_query_mode(&self) -> QueryMode {
+        self.query_mode
+    }
+
+    /// use emit_explain macro instead, because we don't want to allocate
+    /// String if we are not in explain mode
+    pub fn emit_explain(&mut self, push: bool, detail: String) {
+        if let QueryMode::ExplainQueryPlan = self.query_mode {
+            self.emit_insn(Insn::Explain {
+                p1: self.insns.len(),
+                p2: self.current_parent_explain_idx,
+                detail,
+            });
+            if push {
+                self.current_parent_explain_idx = Some(self.insns.len() - 1);
+            }
+        }
+    }
+
+    pub fn pop_current_parent_explain(&mut self) {
+        if let QueryMode::ExplainQueryPlan = self.query_mode {
+            if let Some(current) = self.current_parent_explain_idx {
+                let (Insn::Explain { p2, .. }, _, _) = &self.insns[current] else {
+                    unreachable!("current_parent_explain_idx must point to an Explain insn");
+                };
+                self.current_parent_explain_idx = *p2;
+            }
+        } else {
+            debug_assert!(self.current_parent_explain_idx.is_none())
         }
     }
 
@@ -432,14 +478,44 @@ impl ProgramBuilder {
         }
 
         // Fix comments to refer to new locations
-        if let Some(comments) = &mut self.comments {
-            for (old_offset, _) in comments.iter_mut() {
-                let new_offset = self
-                    .insns
-                    .iter()
-                    .position(|(_, _, index)| *old_offset == *index as u32)
-                    .expect("comment must exist") as u32;
-                *old_offset = new_offset;
+        for (old_offset, _) in self.comments.iter_mut() {
+            let new_offset = self
+                .insns
+                .iter()
+                .position(|(_, _, index)| *old_offset == *index as u32)
+                .expect("comment must exist") as u32;
+            *old_offset = new_offset;
+        }
+
+        if let QueryMode::ExplainQueryPlan = self.query_mode {
+            self.current_parent_explain_idx =
+                if let Some(old_parent) = self.current_parent_explain_idx {
+                    self.insns
+                        .iter()
+                        .position(|(_, _, index)| old_parent == *index)
+                } else {
+                    None
+                };
+
+            for i in 0..self.insns.len() {
+                let (Insn::Explain { p2, .. }, _, _) = &self.insns[i] else {
+                    continue;
+                };
+
+                let new_p2 = if p2.is_some() {
+                    self.insns
+                        .iter()
+                        .position(|(_, _, index)| *p2 == Some(*index))
+                } else {
+                    None
+                };
+
+                let (Insn::Explain { p1, p2, .. }, _, _) = &mut self.insns[i] else {
+                    unreachable!();
+                };
+
+                *p1 = i;
+                *p2 = new_p2;
             }
         }
     }

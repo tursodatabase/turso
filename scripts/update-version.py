@@ -17,6 +17,7 @@ from pathlib import Path
 # Define all npm package paths in one place
 NPM_PACKAGES = [
     "bindings/javascript",
+    "bindings/javascript/packages/wasm-runtime",
     "bindings/javascript/packages/common",
     "bindings/javascript/packages/native",
     "bindings/javascript/packages/browser",
@@ -27,6 +28,7 @@ NPM_PACKAGES = [
 ]
 
 NPM_WORKSPACE_PACKAGES = [
+    "@tursodatabase/wasm-runtime",
     "@tursodatabase/database-common",
     "@tursodatabase/database-browser-common",
     "@tursodatabase/sync-common",

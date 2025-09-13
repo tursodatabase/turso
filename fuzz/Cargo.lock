@@ -1182,7 +1182,7 @@ dependencies = [
 
 [[package]]
 name = "turso_core"
-version = "0.1.5"
+version = "0.2.0-pre.1"
 dependencies = [
  "aegis",
  "aes",
@@ -1225,7 +1225,7 @@ dependencies = [
 
 [[package]]
 name = "turso_ext"
-version = "0.1.5"
+version = "0.2.0-pre.1"
 dependencies = [
  "chrono",
  "getrandom 0.3.1",
@@ -1234,7 +1234,7 @@ dependencies = [
 
 [[package]]
 name = "turso_macros"
-version = "0.1.5"
+version = "0.2.0-pre.1"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1243,7 +1243,7 @@ dependencies = [
 
 [[package]]
 name = "turso_parser"
-version = "0.1.5"
+version = "0.2.0-pre.1"
 dependencies = [
  "bitflags",
  "miette",
@@ -1255,7 +1255,7 @@ dependencies = [
 
 [[package]]
 name = "turso_sqlite3_parser"
-version = "0.1.5"
+version = "0.2.0-pre.1"
 dependencies = [
  "bitflags",
  "cc",

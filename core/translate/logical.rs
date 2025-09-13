@@ -181,6 +181,7 @@ pub struct Limit {
 #[derive(Debug, Clone, PartialEq)]
 pub struct TableScan {
     pub table_name: String,
+    pub alias: Option<String>,
     pub schema: SchemaRef,
     pub projection: Option<Vec<usize>>, // Column indices to project
 }
@@ -533,7 +534,7 @@ impl<'a> LogicalPlanBuilder<'a> {
     // Build a table reference
     fn build_select_table(&mut self, table: &ast::SelectTable) -> Result<LogicalPlan> {
         match table {
-            ast::SelectTable::Table(name, _alias, _indexed) => {
+            ast::SelectTable::Table(name, alias, _indexed) => {
                 let table_name = Self::name_to_string(&name.name);
                 // Check if it's a CTE reference
                 if let Some(cte_plan) = self.ctes.get(&table_name) {
@@ -545,8 +546,13 @@ impl<'a> LogicalPlanBuilder<'a> {
 
                 // Regular table scan
                 let table_schema = self.get_table_schema(&table_name)?;
+                let table_alias = alias.as_ref().map(|a| match a {
+                    ast::As::As(name) => Self::name_to_string(name),
+                    ast::As::Elided(name) => Self::name_to_string(name),
+                });
                 Ok(LogicalPlan::TableScan(TableScan {
                     table_name,
+                    alias: table_alias,
                     schema: table_schema,
                     projection: None,
                 }))

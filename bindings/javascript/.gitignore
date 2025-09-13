@@ -198,3 +198,4 @@ Cargo.lock
 *.wasm
 
 npm
+bundle

@@ -1,6 +1,7 @@
 use turso_parser::ast::{self, SortOrder};
 
 use crate::{
+    emit_explain,
     schema::PseudoCursorType,
     translate::collate::CollationSeq,
     util::exprs_are_equivalent,
@@ -8,7 +9,7 @@ use crate::{
         builder::{CursorType, ProgramBuilder},
         insn::Insn,
     },
-    Result,
+    QueryMode, Result,
 };
 
 use super::{
@@ -100,6 +101,10 @@ pub fn emit_order_by(
     } = *t_ctx.meta_sort.as_ref().unwrap();
     let sorter_column_count =
         order_by.len() + remappings.iter().filter(|r| !r.deduplicated).count();
+
+    // TODO: we need to know how many indices used for sorting
+    // to emit correct explain output.
+    emit_explain!(program, false, "USE TEMP B-TREE FOR ORDER BY".to_owned());
 
     let pseudo_cursor = program.alloc_cursor_id(CursorType::Pseudo(PseudoCursorType {
         column_count: sorter_column_count,

@@ -9,7 +9,7 @@ use tracing::{instrument, Level};
 
 use parking_lot::RwLock;
 use std::fmt::{Debug, Formatter};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::{cell::Cell, fmt, rc::Rc, sync::Arc};
 
 use super::buffer_pool::BufferPool;
@@ -306,6 +306,11 @@ pub trait Wal: Debug {
 
     fn set_io_context(&mut self, ctx: IOContext);
 
+    /// Update the max frame to the current shared max frame.
+    /// Currently this is only used for MVCC as it takes care of write conflicts on its own.
+    /// This should't be used with regular WAL mode.
+    fn update_max_frame(&mut self);
+
     #[cfg(debug_assertions)]
     fn as_any(&self) -> &dyn std::any::Any;
 }
@@ -449,9 +454,8 @@ struct OngoingCheckpoint {
     inflight_reads: Vec<InflightRead>,
     /// Array of atomic counters representing write operations that are currently in flight.
     inflight_writes: Vec<Arc<AtomicBool>>,
-    /// List of all page_id + frame_id combinations to be backfilled, with a boolean
-    /// to denote that a cached page was used
-    pages_to_checkpoint: Vec<(u64, u64, bool)>,
+    /// List of all page_id + frame_id combinations to be backfilled
+    pages_to_checkpoint: Vec<(u64, u64)>,
 }
 
 impl OngoingCheckpoint {
@@ -572,6 +576,7 @@ pub struct WalFile {
     min_frame: u64,
     /// Check of last frame in WAL, this is a cumulative checksum over all frames in the WAL
     last_checksum: (u32, u32),
+    checkpoint_seq: AtomicU32,
 
     /// Count of possible pages to checkpoint, and number of backfilled
     prev_checkpoint: CheckpointResult,
@@ -689,6 +694,9 @@ pub struct WalFileShared {
     pub checkpoint_lock: TursoRwLock,
     pub loaded: AtomicBool,
     pub initialized: AtomicBool,
+    /// Increments on each checkpoint, used to prevent stale cached pages being used for
+    /// backfilling.
+    pub epoch: AtomicU32,
 }
 
 impl fmt::Debug for WalFileShared {
@@ -818,7 +826,7 @@ impl Wal for WalFile {
         };
         let db_changed = shared_max != self.max_frame
             || last_checksum != self.last_checksum
-            || checkpoint_seq != self.header.checkpoint_seq;
+            || checkpoint_seq != self.checkpoint_seq.load(Ordering::Acquire);
 
         // WAL is already fully back‑filled into the main DB image
         // (mxFrame == nBackfill). Readers can therefore ignore the
@@ -1073,10 +1081,11 @@ impl Wal for WalFile {
         page.set_locked();
         let frame = page.clone();
         let page_idx = page.get().id;
-        let seq = self.header.checkpoint_seq;
+        let shared_file = self.shared.clone();
         let complete = Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
             let Ok((buf, bytes_read)) = res else {
                 page.clear_locked();
+                page.clear_wal_tag();
                 return;
             };
             let buf_len = buf.len();
@@ -1086,7 +1095,8 @@ impl Wal for WalFile {
             );
             let cloned = frame.clone();
             finish_read_page(page.get().id, buf, cloned);
-            frame.set_wal_tag(frame_id, seq);
+            let epoch = shared_file.read().epoch.load(Ordering::Acquire);
+            frame.set_wal_tag(frame_id, epoch);
         });
         let shared = self.get_shared();
         assert!(
@@ -1295,8 +1305,8 @@ impl Wal for WalFile {
         tracing::debug!(frame_id, offset, page_id);
         let (c, checksums) = {
             let shared = self.get_shared();
-            let header = shared.wal_header.clone();
-            let header = header.lock();
+            let shared_file = self.shared.clone();
+            let header = shared.wal_header.lock();
             let checksums = self.last_checksum;
             let page_content = page.get_contents();
             let page_buf = page_content.as_ptr();
@@ -1316,7 +1326,6 @@ impl Wal for WalFile {
                 page_buf
             };
 
-            let seq = header.checkpoint_seq;
             let (frame_checksums, frame_bytes) = prepare_wal_frame(
                 &self.buffer_pool,
                 &header,
@@ -1340,6 +1349,7 @@ impl Wal for WalFile {
                     );
 
                     page.clear_dirty();
+                    let seq = shared_file.read().epoch.load(Ordering::Acquire);
                     page.set_wal_tag(frame_id, seq);
                 }
             });
@@ -1404,7 +1414,7 @@ impl Wal for WalFile {
     }
 
     fn get_checkpoint_seq(&self) -> u32 {
-        self.header.checkpoint_seq
+        self.get_shared().wal_header.lock().checkpoint_seq
     }
 
     fn get_max_frame(&self) -> u64 {
@@ -1481,13 +1491,13 @@ impl Wal for WalFile {
         );
         self.ensure_header_if_needed(page_sz)?;
 
-        let (header, shared_page_size, seq) = {
+        let (header, shared_page_size, epoch) = {
             let shared = self.get_shared();
             let hdr_guard = shared.wal_header.lock();
             let header: WalHeader = *hdr_guard;
             let shared_page_size = header.page_size;
-            let seq = header.checkpoint_seq;
-            (header, shared_page_size, seq)
+            let epoch = shared.epoch.load(Ordering::Acquire);
+            (header, shared_page_size, epoch)
         };
         turso_assert!(
             shared_page_size == page_sz.get(),
@@ -1567,7 +1577,7 @@ impl Wal for WalFile {
 
             for (page, fid, _csum) in &page_frame_for_cb {
                 page.clear_dirty();
-                page.set_wal_tag(*fid, seq);
+                page.set_wal_tag(*fid, epoch);
             }
         };
 
@@ -1594,6 +1604,11 @@ impl Wal for WalFile {
 
     fn set_io_context(&mut self, ctx: IOContext) {
         self.io_ctx.replace(ctx);
+    }
+
+    fn update_max_frame(&mut self) {
+        let new_max_frame = self.get_shared().max_frame.load(Ordering::Acquire);
+        self.max_frame = new_max_frame;
     }
 }
 
@@ -1631,6 +1646,7 @@ impl WalFile {
             },
             checkpoint_threshold: 1000,
             buffer_pool,
+            checkpoint_seq: AtomicU32::new(0),
             syncing: Rc::new(Cell::new(false)),
             min_frame: 0,
             max_frame_read_lock_index: NO_LOCK_HELD.into(),
@@ -1805,7 +1821,7 @@ impl WalFile {
                                 f >= self.ongoing_checkpoint.min_frame
                                     && f <= self.ongoing_checkpoint.max_frame
                             }) {
-                                list.push((page_id, frame, false));
+                                list.push((page_id, frame));
                             }
                         }
                         // sort by frame_id for read locality
@@ -1841,44 +1857,58 @@ impl WalFile {
                     if self.ongoing_checkpoint.process_pending_reads() {
                         tracing::trace!("Drained reads into batch");
                     }
-
-                    let seq = self.header.checkpoint_seq;
+                    let epoch = self.get_shared().epoch.load(Ordering::Acquire);
                     // Issue reads until we hit limits
-                    while self.ongoing_checkpoint.should_issue_reads() {
-                        let (page_id, target_frame, _) =
-                            self.ongoing_checkpoint.pages_to_checkpoint
-                                [self.ongoing_checkpoint.current_page as usize];
+                    'inner: while self.ongoing_checkpoint.should_issue_reads() {
+                        let (page_id, target_frame) = self.ongoing_checkpoint.pages_to_checkpoint
+                            [self.ongoing_checkpoint.current_page as usize];
+                        'fast_path: {
+                            if let Some(cached_page) = pager.cache_get_for_checkpoint(
+                                page_id as usize,
+                                target_frame,
+                                epoch,
+                            )? {
+                                let contents = cached_page.get_contents().buffer.clone();
+                                // to avoid TOCTOU issues with using cached pages, we snapshot the contents and pay the memcpy
+                                // instead of risking the page changing out from under us.
+                                let buffer = Arc::new(self.buffer_pool.get_page());
+                                buffer.as_mut_slice()[..contents.len()]
+                                    .copy_from_slice(contents.as_slice());
+                                if !cached_page.is_valid_for_checkpoint(target_frame, epoch) {
+                                    // check again, atomically, if the page is still valid after we
+                                    // copied a snapshot of it, if not: fallthrough to reading
+                                    // from disk
+                                    break 'fast_path;
+                                }
+                                // TODO: remove this eventually to actually benefit from the
+                                // performance.. for now we assert that the cached page has the
+                                // exact contents as one read from the WAL.
+                                #[cfg(debug_assertions)]
+                                {
+                                    let mut raw = vec![
+                                        0u8;
+                                        self.page_size() as usize
+                                            + WAL_FRAME_HEADER_SIZE
+                                    ];
+                                    self.io.wait_for_completion(
+                                        self.read_frame_raw(target_frame, &mut raw)?,
+                                    )?;
+                                    let (_, wal_page) =
+                                        sqlite3_ondisk::parse_wal_frame_header(&raw);
+                                    let cached = buffer.as_slice();
+                                    turso_assert!(wal_page == cached, "cached page content differs from WAL read for page_id={page_id}, frame_id={target_frame}");
+                                }
+                                self.ongoing_checkpoint
+                                    .pending_writes
+                                    .insert(page_id as usize, buffer);
 
-                        // Try cache first, if enabled
-                        if let Some(cached_page) =
-                            pager.cache_get_for_checkpoint(page_id as usize, target_frame, seq)?
-                        {
-                            let contents = cached_page.get_contents();
-                            let buffer = contents.buffer.clone();
-                            // TODO: remove this eventually to actually benefit from the
-                            // performance.. for now we assert that the cached page has the
-                            // exact contents as one read from the WAL.
-                            #[cfg(debug_assertions)]
-                            {
-                                let mut raw =
-                                    vec![0u8; self.page_size() as usize + WAL_FRAME_HEADER_SIZE];
-                                self.io.wait_for_completion(
-                                    self.read_frame_raw(target_frame, &mut raw)?,
-                                )?;
-                                let (_, wal_page) = sqlite3_ondisk::parse_wal_frame_header(&raw);
-                                let cached = cached_page.get_contents().buffer.as_slice();
-                                turso_assert!(wal_page == cached, "cache fast-path returned wrong content for page {page_id} frame {target_frame}");
+                                // signify that a cached page was used, so it can be unpinned
+                                self.ongoing_checkpoint.pages_to_checkpoint
+                                    [self.ongoing_checkpoint.current_page as usize] =
+                                    (page_id, target_frame);
+                                self.ongoing_checkpoint.current_page += 1;
+                                continue 'inner;
                             }
-                            self.ongoing_checkpoint
-                                .pending_writes
-                                .insert(page_id as usize, buffer);
-
-                            // signify that a cached page was used, so it can be unpinned
-                            self.ongoing_checkpoint.pages_to_checkpoint
-                                [self.ongoing_checkpoint.current_page as usize] =
-                                (page_id, target_frame, true);
-                            self.ongoing_checkpoint.current_page += 1;
-                            continue;
                         }
                         // Issue read if page wasn't found in the page cache or doesnt meet
                         // the frame requirements
@@ -1906,20 +1936,6 @@ impl WalFile {
                     if !completions.is_empty() {
                         io_yield_many!(completions);
                     } else if self.ongoing_checkpoint.complete() {
-                        // if we are completely done backfilling, we need to unpin any pages we used from the page cache.
-                        for (page_id, _, cached) in
-                            self.ongoing_checkpoint.pages_to_checkpoint.iter()
-                        {
-                            if *cached {
-                                let page = pager.cache_get((*page_id) as usize)?;
-                                turso_assert!(
-                                    page.is_some(),
-                                    "page should still exist in the page cache"
-                                );
-                                // if we used a cached page, unpin it
-                                page.map(|p| p.try_unpin());
-                            }
-                        }
                         self.ongoing_checkpoint.state = CheckpointState::Done;
                     }
                 }
@@ -1980,6 +1996,8 @@ impl WalFile {
                     if mode.should_restart_log() {
                         self.restart_log(mode)?;
                     }
+                    // increment wal epoch to ensure no stale pages are used for backfilling
+                    self.get_shared().epoch.fetch_add(1, Ordering::Release);
 
                     // store a copy of the checkpoint result to return in the future if pragma
                     // wal_checkpoint is called and we haven't backfilled again since.
@@ -2123,16 +2141,11 @@ impl WalFile {
             .inspect_err(|e| {
                 unlock(Some(e));
             })?;
-        let (header, cksm) = {
-            let shared = self.get_shared();
-            let header = *shared.wal_header.lock();
-            let cksm = shared.last_checksum;
-            (header, cksm)
-        };
+        let cksm = self.get_shared().last_checksum;
         self.last_checksum = cksm;
-        self.header = header;
         self.max_frame = 0;
         self.min_frame = 0;
+        self.checkpoint_seq.fetch_add(1, Ordering::Release);
 
         // For TRUNCATE mode: shrink the WAL file to 0 B
         if matches!(mode, CheckpointMode::Truncate { .. }) {
@@ -2285,6 +2298,7 @@ impl WalFileShared {
             checkpoint_lock: TursoRwLock::new(),
             loaded: AtomicBool::new(true),
             initialized: AtomicBool::new(false),
+            epoch: AtomicU32::new(0),
         };
         Ok(Arc::new(RwLock::new(shared)))
     }
@@ -2328,6 +2342,7 @@ impl WalFileShared {
             checkpoint_lock: TursoRwLock::new(),
             loaded: AtomicBool::new(true),
             initialized: AtomicBool::new(false),
+            epoch: AtomicU32::new(0),
         };
         Ok(Arc::new(RwLock::new(shared)))
     }

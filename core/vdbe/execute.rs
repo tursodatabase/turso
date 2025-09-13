@@ -2180,38 +2180,11 @@ pub fn op_transaction(
             && matches!(new_transaction_state, TransactionState::Write { .. })
             && matches!(tx_mode, TransactionMode::Write)
         {
-            // Handle upgrade from read to write transaction for MVCC
-            // Similar to non-MVCC path, we need to try upgrading to exclusive write transaction
-            turso_assert!(
-                !conn.is_nested_stmt.get(),
-                "nested stmt should not begin a new write transaction"
-            );
-            match mv_store.begin_exclusive_tx(pager.clone()) {
-                Ok(IOResult::Done(tx_id)) => {
-                    // Successfully upgraded to exclusive write transaction
-                    // Remove the old read transaction and replace with write transaction
-                    conn.mv_transactions.borrow_mut().push(tx_id);
-                    program.connection.mv_tx_id.set(Some(tx_id));
-                }
-                Err(LimboError::Busy) => {
-                    // We failed to upgrade to write transaction so put the transaction into its original state.
-                    // For MVCC, we don't need to end the transaction like in non-MVCC case, since MVCC transactions
-                    // can be restarted automatically if they haven't performed any reads or writes yet.
-                    // Just ensure the transaction state remains in its original state.
-                    assert_eq!(conn.transaction_state.get(), current_state);
-                    return Ok(InsnFunctionStepResult::Busy);
-                }
-                Ok(IOResult::IO(io)) => {
-                    // set the transaction state to pending so we don't have to
-                    // end the transaction.
-                    program
-                        .connection
-                        .transaction_state
-                        .replace(TransactionState::PendingUpgrade);
-                    return Ok(InsnFunctionStepResult::IO(io));
-                }
-                Err(e) => return Err(e),
-            }
+            // For MVCC with concurrent transactions, we don't need to upgrade to exclusive.
+            // The existing MVCC transaction can handle both reads and writes.
+            // We only upgrade to exclusive for IMMEDIATE/EXCLUSIVE transaction modes.
+            // Since we already have an MVCC transaction from BEGIN CONCURRENT,
+            // we can just continue using it for writes.
         }
     } else {
         if matches!(tx_mode, TransactionMode::Concurrent) {
@@ -5581,7 +5554,7 @@ pub fn op_insert(
                             .connection
                             .view_transaction_states
                             .get_or_create(view_name);
-                        tx_state.delete(key, values.clone());
+                        tx_state.delete(table_name, key, values.clone());
                     }
                 }
                 for view_name in dependent_views.iter() {
@@ -5590,7 +5563,7 @@ pub fn op_insert(
                         .view_transaction_states
                         .get_or_create(view_name);
 
-                    tx_state.insert(key, values.clone());
+                    tx_state.insert(table_name, key, values.clone());
                 }
 
                 break;
@@ -5724,7 +5697,7 @@ pub fn op_delete(
                             .connection
                             .view_transaction_states
                             .get_or_create(&view_name);
-                        tx_state.delete(key, values.clone());
+                        tx_state.delete(table_name, key, values.clone());
                     }
                 }
                 break;
@@ -7706,6 +7679,32 @@ pub fn op_if_neg(
     Ok(InsnFunctionStepResult::Step)
 }
 
+mod cmath {
+    extern "C" {
+        pub fn exp(x: f64) -> f64;
+        pub fn log(x: f64) -> f64;
+        pub fn log10(x: f64) -> f64;
+        pub fn log2(x: f64) -> f64;
+        pub fn pow(x: f64, y: f64) -> f64;
+
+        pub fn sin(x: f64) -> f64;
+        pub fn sinh(x: f64) -> f64;
+        pub fn asin(x: f64) -> f64;
+        pub fn asinh(x: f64) -> f64;
+
+        pub fn cos(x: f64) -> f64;
+        pub fn cosh(x: f64) -> f64;
+        pub fn acos(x: f64) -> f64;
+        pub fn acosh(x: f64) -> f64;
+
+        pub fn tan(x: f64) -> f64;
+        pub fn tanh(x: f64) -> f64;
+        pub fn atan(x: f64) -> f64;
+        pub fn atanh(x: f64) -> f64;
+        pub fn atan2(x: f64, y: f64) -> f64;
+    }
+}
+
 impl Value {
     pub fn exec_lower(&self) -> Option<Self> {
         match self {
@@ -8293,28 +8292,32 @@ impl Value {
             return Value::Null;
         };
 
+        if matches! { function, MathFunc::Ln | MathFunc::Log10 | MathFunc::Log2 } && f <= 0.0 {
+            return Value::Null;
+        }
+
         let result = match function {
-            MathFunc::Acos => libm::acos(f),
-            MathFunc::Acosh => libm::acosh(f),
-            MathFunc::Asin => libm::asin(f),
-            MathFunc::Asinh => libm::asinh(f),
-            MathFunc::Atan => libm::atan(f),
-            MathFunc::Atanh => libm::atanh(f),
+            MathFunc::Acos => unsafe { cmath::acos(f) },
+            MathFunc::Acosh => unsafe { cmath::acosh(f) },
+            MathFunc::Asin => unsafe { cmath::asin(f) },
+            MathFunc::Asinh => unsafe { cmath::asinh(f) },
+            MathFunc::Atan => unsafe { cmath::atan(f) },
+            MathFunc::Atanh => unsafe { cmath::atanh(f) },
             MathFunc::Ceil | MathFunc::Ceiling => libm::ceil(f),
-            MathFunc::Cos => libm::cos(f),
-            MathFunc::Cosh => libm::cosh(f),
+            MathFunc::Cos => unsafe { cmath::cos(f) },
+            MathFunc::Cosh => unsafe { cmath::cosh(f) },
             MathFunc::Degrees => f.to_degrees(),
-            MathFunc::Exp => libm::exp(f),
+            MathFunc::Exp => unsafe { cmath::exp(f) },
             MathFunc::Floor => libm::floor(f),
-            MathFunc::Ln => libm::log(f),
-            MathFunc::Log10 => libm::log10(f),
-            MathFunc::Log2 => libm::log2(f),
+            MathFunc::Ln => unsafe { cmath::log(f) },
+            MathFunc::Log10 => unsafe { cmath::log10(f) },
+            MathFunc::Log2 => unsafe { cmath::log2(f) },
             MathFunc::Radians => f.to_radians(),
-            MathFunc::Sin => libm::sin(f),
-            MathFunc::Sinh => libm::sinh(f),
+            MathFunc::Sin => unsafe { cmath::sin(f) },
+            MathFunc::Sinh => unsafe { cmath::sinh(f) },
             MathFunc::Sqrt => libm::sqrt(f),
-            MathFunc::Tan => libm::tan(f),
-            MathFunc::Tanh => libm::tanh(f),
+            MathFunc::Tan => unsafe { cmath::tan(f) },
+            MathFunc::Tanh => unsafe { cmath::tanh(f) },
             MathFunc::Trunc => libm::trunc(f),
             _ => unreachable!("Unexpected mathematical unary function {:?}", function),
         };
@@ -8336,9 +8339,9 @@ impl Value {
         };
 
         let result = match function {
-            MathFunc::Atan2 => libm::atan2(lhs, rhs),
+            MathFunc::Atan2 => unsafe { cmath::atan2(lhs, rhs) },
             MathFunc::Mod => libm::fmod(lhs, rhs),
-            MathFunc::Pow | MathFunc::Power => libm::pow(lhs, rhs),
+            MathFunc::Pow | MathFunc::Power => unsafe { cmath::pow(lhs, rhs) },
             _ => unreachable!("Unexpected mathematical binary function {:?}", function),
         };
 

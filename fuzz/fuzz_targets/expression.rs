@@ -120,12 +120,38 @@ str_enum! {
     enum UnaryFunc {
         Ceil => "ceil",
         Floor => "floor",
+        Trunc => "trunc",
+        Radians => "radians",
+        Degrees => "degrees",
+
+        Sqrt => "sqrt",
+        Exp => "exp",
+        Ln => "ln",
+        Log10 => "log10",
+        Log2 => "log2",
+
+        Sin => "sin",
+        Sinh => "sinh",
+        Asin => "asin",
+        Asinh => "asinh",
+
+        Cos => "cos",
+        Cosh => "cosh",
+        Acos => "acos",
+        Acosh => "acosh",
+
+        Tan => "tan",
+        Tanh => "tanh",
+        Atan => "atan",
+        Atanh => "atanh",
     }
 }
 
 str_enum! {
     enum BinaryFunc {
         Power => "pow",
+        Mod => "mod",
+        Atan2 => "atan2",
     }
 }
 
