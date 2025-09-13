@@ -1,6 +1,7 @@
 /target
 /.idea
 /.vscode
+**/target
 
 *.so
 *.ipynb
