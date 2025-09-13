@@ -952,6 +952,15 @@ pub fn insn_to_row(
                 0,
                 format!("accum=r[{}]", *register),
             ),
+            Insn::AggValue { acc_reg, dest_reg, func } => (
+                "AggValue",
+                0,
+                *acc_reg as i32,
+                *dest_reg as i32,
+                Value::build_text(func.to_string()),
+                0,
+                format!("accum=r[{}] dest=r[{}]", *acc_reg, *dest_reg),
+            ),
             Insn::SorterOpen {
                 cursor_id,
                 columns,
@@ -1271,6 +1280,15 @@ pub fn insn_to_row(
                     "root iDb={root} former_root={former_root_reg} is_temp={is_temp}"
                 ),
             ),
+            Insn::ResetSorter { cursor_id } => (
+                "ResetSorter",
+                *cursor_id as i32,
+                0,
+                0,
+                Value::build_text(""),
+                0,
+                format!("cursor={cursor_id}"),
+            ),
             Insn::DropTable {
                 db,
                 _p2,
@@ -1515,6 +1533,15 @@ pub fn insn_to_row(
                 Value::build_text(""),
                 0,
                 format!("cursor={cursor_id}"),
+            ),
+            Insn::OpenDup { new_cursor_id, original_cursor_id } => (
+                "OpenDup",
+                *new_cursor_id as i32,
+                *original_cursor_id as i32,
+                0,
+                Value::build_text(""),
+                0,
+                format!("new_cursor={new_cursor_id}, original_cursor={original_cursor_id}"),
             ),
             Insn::Once {
                 target_pc_when_reentered,

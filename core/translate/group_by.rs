@@ -762,7 +762,7 @@ pub fn group_by_emit_row_phase<'a>(
     program.emit_insn(Insn::Null {
         dest: start_reg,
         dest_end: Some(
-            start_reg + t_ctx.non_aggregate_expressions.len() + plan.agg_args_count() - 1,
+            start_reg + t_ctx.non_aggregate_expressions.len() + plan.aggregates.len() - 1,
         ),
     });
 

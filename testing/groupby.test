@@ -308,3 +308,21 @@ shirt
 shorts
 sweater
 sweatshirt}
+
+# There was a bug where, while resetting accumulator registers, subsequent  registers were also reset.
+# This happened when there were more arguments than aggregate functions — the number of registers to reset
+# was calculated as the sum of the arguments, not the number of aggregates.
+# The issue affected cases where rows were pre-sorted, hence the 'GROUP BY id' test.
+do_execsql_test more_args_than_aggregates {
+  SELECT group_concat(name, ','), group_concat(name, ';'), group_concat(name, '.') FROM products GROUP BY id;
+} {hat|hat|hat
+cap|cap|cap
+shirt|shirt|shirt
+sweater|sweater|sweater
+sweatshirt|sweatshirt|sweatshirt
+shorts|shorts|shorts
+jeans|jeans|jeans
+sneakers|sneakers|sneakers
+boots|boots|boots
+coat|coat|coat
+accessories|accessories|accessories}

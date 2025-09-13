@@ -418,7 +418,7 @@ Modifiers:
 | Affinity       | Yes    |         |
 | AggFinal       | Yes    |         |
 | AggStep        | Yes    |         |
-| AggStep        | Yes    |         |
+| AggValue       | Yes    |         |
 | And            | Yes    |         |
 | AutoCommit     | Yes    |         |
 | BitAnd         | Yes    |         |
@@ -502,6 +502,7 @@ Modifiers:
 | NullRow        | Yes    |         |
 | Once           | Yes     |         |
 | OpenAutoindex  | Yes     |         |
+| OpenDup        | Yes     |         |
 | OpenEphemeral  | Yes     |         |
 | OpenPseudo     | Yes    |         |
 | OpenRead       | Yes    |         |
@@ -518,6 +519,7 @@ Modifiers:
 | RealAffinity   | Yes    |         |
 | Remainder      | Yes    |         |
 | ResetCount     | No     |         |
+| ResetSorter    | Partial| sorter cursors are not supported yet; only ephemeral tables are |
 | ResultRow      | Yes    |         |
 | Return         | Yes    |         |
 | Rewind         | Yes    |         |

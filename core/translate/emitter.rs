@@ -28,6 +28,7 @@ use crate::translate::expr::{emit_returning_results, ReturningValueRegisters};
 use crate::translate::plan::{DeletePlan, Plan, QueryDestination, Search};
 use crate::translate::result_row::try_fold_expr_to_i64;
 use crate::translate::values::emit_values;
+use crate::translate::window::{emit_window_results, init_window, WindowMetadata};
 use crate::util::exprs_are_equivalent;
 use crate::vdbe::builder::{CursorKey, CursorType, ProgramBuilder};
 use crate::vdbe::insn::{CmpInsFlags, IdxInsertFlags, InsertFlags, RegisterOrLiteral};
@@ -147,6 +148,7 @@ pub struct TranslateCtx<'a> {
     pub non_aggregate_expressions: Vec<(&'a Expr, bool)>,
     /// Cursor id for cdc table (if capture_data_changes PRAGMA is set and query can modify the data)
     pub cdc_cursor_id: Option<usize>,
+    pub meta_window: Option<WindowMetadata<'a>>,
 }
 
 impl<'a> TranslateCtx<'a> {
@@ -171,6 +173,7 @@ impl<'a> TranslateCtx<'a> {
             resolver: Resolver::new(schema, syms),
             non_aggregate_expressions: Vec::new(),
             cdc_cursor_id: None,
+            meta_window: None,
         }
     }
 }
@@ -312,6 +315,15 @@ pub fn emit_query<'a>(
         // Aggregate registers need to be NULLed at the start because the same registers might be reused on another invocation of a subquery,
         // and if they are not NULLed, the 2nd invocation of the same subquery will have values left over from the first invocation.
         t_ctx.reg_agg_start = Some(program.alloc_registers_and_init_w_null(plan.aggregates.len()));
+    } else if let Some(window) = &plan.window {
+        init_window(
+            program,
+            t_ctx,
+            window,
+            plan,
+            &plan.result_columns,
+            &plan.order_by,
+        )?;
     }
 
     let distinct_ctx = if let Distinctness::Distinct { .. } = &plan.distinctness {
@@ -381,6 +393,8 @@ pub fn emit_query<'a>(
         emit_ungrouped_aggregation(program, t_ctx, plan)?;
         // Single row result for aggregates without GROUP BY, so ORDER BY not needed
         order_by_necessary = false;
+    } else if plan.window.is_some() {
+        emit_window_results(program, t_ctx, plan)?;
     }
 
     // Process ORDER BY results if needed

@@ -401,14 +401,6 @@ pub struct ExternalAggState {
     pub argc: usize,
     pub step_fn: StepFunction,
     pub finalize_fn: FinalizeFunction,
-    pub finalized_value: Option<Value>,
-}
-
-impl ExternalAggState {
-    pub fn cache_final_value(&mut self, value: Value) -> &Value {
-        self.finalized_value = Some(value);
-        self.finalized_value.as_ref().unwrap()
-    }
 }
 
 /// Please use Display trait for all limbo output so we have single origin of truth
@@ -633,28 +625,13 @@ pub enum AggContext {
     External(ExternalAggState),
 }
 
-const NULL: Value = Value::Null;
-
 impl AggContext {
-    pub fn compute_external(&mut self) -> Result<()> {
+    pub fn compute_external(&self) -> Result<Value> {
         if let Self::External(ext_state) = self {
-            if ext_state.finalized_value.is_none() {
-                let final_value = unsafe { (ext_state.finalize_fn)(ext_state.state) };
-                ext_state.cache_final_value(Value::from_ffi(final_value)?);
-            }
-        }
-        Ok(())
-    }
-
-    pub fn final_value(&self) -> &Value {
-        match self {
-            Self::Avg(acc, _count) => acc,
-            Self::Sum(acc, _) => acc,
-            Self::Count(count) => count,
-            Self::Max(max) => max.as_ref().unwrap_or(&NULL),
-            Self::Min(min) => min.as_ref().unwrap_or(&NULL),
-            Self::GroupConcat(s) => s,
-            Self::External(ext_state) => ext_state.finalized_value.as_ref().unwrap_or(&NULL),
+            let final_value = unsafe { (ext_state.finalize_fn)(ext_state.state) };
+            Value::from_ffi(final_value)
+        } else {
+            panic!("AggContext::compute_external() expected External, found {self:?}");
         }
     }
 }
