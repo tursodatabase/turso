@@ -157,7 +157,7 @@ impl<T: Copy + std::fmt::Display> std::fmt::Display for RegisterOrLiteral<T> {
 #[derive(Description, Debug, EnumDiscriminants)]
 #[strum_discriminants(vis(pub(crate)))]
 #[strum_discriminants(derive(VariantArray, EnumCount))]
-#[strum_discriminants(repr(u8))]
+#[strum_discriminants(repr(usize))]
 #[strum_discriminants(name(InsnVariants))]
 pub enum Insn {
     /// Initialize the program state and jump to the given PC.
@@ -1107,15 +1107,16 @@ static INSN_VIRTUAL_TABLE: LazyLock<[InsnFunction; InsnVariants::COUNT]> = LazyL
     let mut result: [InsnFunction; InsnVariants::COUNT] = [execute::op_null; InsnVariants::COUNT];
 
     for variant in InsnVariants::VARIANTS {
-        result[*variant as u8 as usize] = variant.to_function();
+        result[*variant as usize] = variant.to_function();
     }
 
     result
 });
 
 impl InsnVariants {
+    #[inline(always)]
     pub(crate) fn to_function_fast(&self) -> InsnFunction {
-        INSN_VIRTUAL_TABLE[*self as u8 as usize]
+        INSN_VIRTUAL_TABLE[*self as usize]
     }
 
     pub(crate) fn to_function(&self) -> InsnFunction {
@@ -1263,6 +1264,7 @@ impl InsnVariants {
 }
 
 impl Insn {
+    #[inline(always)]
     pub fn to_function_fast(&self) -> InsnFunction {
         InsnVariants::from(self).to_function_fast()
     }
