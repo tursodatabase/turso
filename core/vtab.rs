@@ -172,11 +172,33 @@ pub enum VirtualTableCursor {
 }
 
 impl VirtualTableCursor {
-    pub(crate) fn next(&mut self) -> crate::Result<bool> {
+    pub(crate) fn next(&mut self) -> crate::Result<()> {
         match self {
-            VirtualTableCursor::Pragma(cursor) => cursor.next(),
-            VirtualTableCursor::External(cursor) => cursor.next(),
-            VirtualTableCursor::Internal(cursor) => cursor.borrow_mut().next(),
+            VirtualTableCursor::Pragma(cursor) => {
+                cursor.next()?;
+                Ok(())
+            }
+            VirtualTableCursor::External(cursor) => {
+                let rc = unsafe { (cursor.implementation.next)(cursor.cursor.as_ptr()) };
+                match rc {
+                    ResultCode::OK | ResultCode::EOF => Ok(()),
+                    _ => Err(LimboError::ExtensionError("Next failed".to_string())),
+                }
+            }
+            VirtualTableCursor::Internal(cursor) => {
+                cursor.borrow_mut().next()?;
+                Ok(())
+            }
+        }
+    }
+
+    pub(crate) fn eof(&self) -> bool {
+        match self {
+            VirtualTableCursor::Pragma(cursor) => cursor.eof(),
+            VirtualTableCursor::External(cursor) => unsafe {
+                (cursor.implementation.eof)(cursor.cursor.as_ptr())
+            },
+            VirtualTableCursor::Internal(cursor) => cursor.borrow().eof(),
         }
     }
 
@@ -202,7 +224,7 @@ impl VirtualTableCursor {
         idx_str: Option<String>,
         arg_count: usize,
         args: Vec<Value>,
-    ) -> crate::Result<bool> {
+    ) -> crate::Result<()> {
         match self {
             VirtualTableCursor::Pragma(cursor) => cursor.filter(args),
             VirtualTableCursor::External(cursor) => {
@@ -353,7 +375,7 @@ impl ExtVirtualTableCursor {
         idx_str: Option<String>,
         arg_count: usize,
         args: Vec<Value>,
-    ) -> crate::Result<bool> {
+    ) -> crate::Result<()> {
         tracing::trace!("xFilter");
         let ext_args = args.iter().map(|arg| arg.to_ffi()).collect::<Vec<_>>();
         let c_idx_str = idx_str
@@ -375,8 +397,9 @@ impl ExtVirtualTableCursor {
             }
         }
         match rc {
-            ResultCode::OK => Ok(true),
-            ResultCode::EOF => Ok(false),
+            // Per SQLite contract, xFilter should be followed by xEof; treat both OK and EOF
+            // as success and defer row-availability to eof().
+            ResultCode::OK | ResultCode::EOF => Ok(()),
             _ => Err(LimboError::ExtensionError(rc.to_string())),
         }
     }
@@ -384,15 +407,6 @@ impl ExtVirtualTableCursor {
     fn column(&self, column: usize) -> crate::Result<Value> {
         let val = unsafe { (self.implementation.column)(self.cursor.as_ptr(), column as u32) };
         Value::from_ffi(val)
-    }
-
-    fn next(&self) -> crate::Result<bool> {
-        let rc = unsafe { (self.implementation.next)(self.cursor.as_ptr()) };
-        match rc {
-            ResultCode::OK => Ok(true),
-            ResultCode::EOF => Ok(false),
-            _ => Err(LimboError::ExtensionError("Next failed".to_string())),
-        }
     }
 }
 
@@ -429,8 +443,10 @@ pub trait InternalVirtualTable: std::fmt::Debug {
 }
 
 pub trait InternalVirtualTableCursor {
-    /// next returns `Ok(true)` if there are more rows, and `Ok(false)` otherwise.
-    fn next(&mut self) -> Result<bool, LimboError>;
+    /// next advances the cursor to the next row. It should return Ok(()) if successful, or an error.
+    /// The eof method should be used to check if the cursor is at the end.
+    fn next(&mut self) -> Result<(), LimboError>;
+    fn eof(&self) -> bool;
     fn rowid(&self) -> i64;
     fn column(&self, column: usize) -> Result<Value, LimboError>;
     fn filter(
@@ -438,5 +454,5 @@ pub trait InternalVirtualTableCursor {
         args: &[Value],
         idx_str: Option<String>,
         idx_num: i32,
-    ) -> Result<bool, LimboError>;
+    ) -> Result<(), LimboError>;
 }

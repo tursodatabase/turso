@@ -14,7 +14,7 @@ use turso_ext::{
 use turso_ext::{BufferRef, Callback, VfsDerive, VfsExtension, VfsFile};
 
 register_extension! {
-    vtabs: { KVStoreVTabModule, TableStatsVtabModule },
+    vtabs: { KVStoreVTabModule, TableStatsVtabModule, OkEmptyVTabModule },
     scalars: { test_scalar },
     vfs: { TestFS },
 }
@@ -543,5 +543,63 @@ impl VTabCursor for StatsCursor {
     }
     fn rowid(&self) -> i64 {
         self.pos as i64
+    }
+}
+
+#[derive(VTabModuleDerive, Default)]
+pub struct OkEmptyVTabModule;
+
+pub struct OkEmptyTable;
+
+pub struct OkEmptyCursor {
+    at_eof: bool,
+}
+
+impl VTabModule for OkEmptyVTabModule {
+    type Table = OkEmptyTable;
+    const VTAB_KIND: VTabKind = VTabKind::VirtualTable;
+    const NAME: &'static str = "ok_empty";
+
+    fn create(_args: &[Value]) -> Result<(String, Self::Table), ResultCode> {
+        let schema = "CREATE TABLE x (value TEXT)".to_string();
+        Ok((schema, OkEmptyTable))
+    }
+}
+
+impl VTable for OkEmptyTable {
+    type Cursor = OkEmptyCursor;
+    type Error = String;
+
+    fn open(&self, _conn: Option<Arc<Connection>>) -> Result<Self::Cursor, Self::Error> {
+        Ok(OkEmptyCursor { at_eof: true })
+    }
+}
+
+impl VTabCursor for OkEmptyCursor {
+    type Error = String;
+
+    fn filter(&mut self, _args: &[Value], _idx_info: Option<(&str, i32)>) -> ResultCode {
+        self.at_eof = true;
+        ResultCode::OK
+    }
+
+    fn next(&mut self) -> ResultCode {
+        self.at_eof = true;
+        ResultCode::OK
+    }
+
+    fn eof(&self) -> bool {
+        self.at_eof
+    }
+
+    fn rowid(&self) -> i64 {
+        0
+    }
+
+    fn column(&self, idx: u32) -> Result<Value, Self::Error> {
+        match idx {
+            0 => Ok(Value::from_text("".to_string())),
+            _ => Err("Invalid column".into()),
+        }
     }
 }
