@@ -2181,7 +2181,7 @@ pub fn op_transaction(
             let actual_tx_mode = if mv_tx_mode == TransactionMode::Concurrent {
                 TransactionMode::Concurrent
             } else {
-                TransactionMode::Write
+                *tx_mode
             };
             if matches!(new_transaction_state, TransactionState::Write { .. })
                 && matches!(actual_tx_mode, TransactionMode::Write)
