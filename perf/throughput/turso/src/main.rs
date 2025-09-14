@@ -2,7 +2,6 @@ use clap::{Parser, ValueEnum};
 use std::sync::{Arc, Barrier};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
-use tokio::runtime::Runtime;
 use turso::{Builder, Database, Result};
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -65,18 +64,15 @@ async fn main() -> Result<()> {
         let db_clone = db.clone();
         let barrier = Arc::clone(&start_barrier);
 
-        let handle = tokio::task::spawn_blocking(move || {
-            let rt = Runtime::new().unwrap();
-            rt.block_on(worker_thread(
-                thread_id,
-                db_clone,
-                args.batch_size,
-                args.iterations,
-                barrier,
-                args.mode,
-                args.think,
-            ))
-        });
+        let handle = tokio::task::spawn(worker_thread(
+            thread_id,
+            db_clone,
+            args.batch_size,
+            args.iterations,
+            barrier,
+            args.mode,
+            args.think,
+        ));
 
         handles.push(handle);
     }
