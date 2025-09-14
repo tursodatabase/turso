@@ -1,6 +1,6 @@
 use clap::{Parser, ValueEnum};
-use std::sync::{Arc, Barrier};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Barrier};
 use std::time::Instant;
 use turso::{Builder, Database, Result};
 
@@ -82,7 +82,7 @@ async fn main() -> Result<()> {
         match handle.await {
             Ok(Ok(inserts)) => total_inserts += inserts,
             Ok(Err(e)) => {
-                eprintln!("Thread error: {}", e);
+                eprintln!("Thread error: {e}");
                 return Err(e);
             }
             Err(_) => {
@@ -96,9 +96,9 @@ async fn main() -> Result<()> {
     let overall_throughput = (total_inserts as f64) / overall_elapsed.as_secs_f64();
 
     println!("\n=== BENCHMARK RESULTS ===");
-    println!("Total inserts: {}", total_inserts);
+    println!("Total inserts: {total_inserts}");
     println!("Total time: {:.2}s", overall_elapsed.as_secs_f64());
-    println!("Overall throughput: {:.2} inserts/sec", overall_throughput);
+    println!("Overall throughput: {overall_throughput:.2} inserts/sec");
     println!("Threads: {}", args.threads);
     println!("Batch size: {}", args.batch_size);
     println!("Iterations per thread: {}", args.iterations);
@@ -133,7 +133,7 @@ async fn setup_database(db_path: &str, mode: TransactionMode) -> Result<Database
     )
     .await?;
 
-    println!("Database created at: {}", db_path);
+    println!("Database created at: {db_path}");
     Ok(db)
 }
 
@@ -171,7 +171,7 @@ async fn worker_thread(
                 let id = thread_id * iterations * batch_size + iteration * batch_size + i;
                 stmt.execute(turso::params::Params::Positional(vec![
                     turso::Value::Integer(id as i64),
-                    turso::Value::Text(format!("data_{}", id)),
+                    turso::Value::Text(format!("data_{id}")),
                 ]))
                 .await?;
                 total_inserts.fetch_add(1, Ordering::Relaxed);

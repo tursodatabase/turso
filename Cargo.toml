@@ -30,11 +30,11 @@ members = [
     "sync/engine",
     "sql_generation",
     "whopper",
+    "perf/throughput/turso"
 ]
 exclude = [
     "perf/latency/limbo",
     "perf/throughput/rusqlite",
-    "perf/throughput/turso"
 ]
 
 [workspace.package]
@@ -75,6 +75,7 @@ tracing = "0.1.41"
 schemars = "1.0.4"
 garde = "0.22"
 parking_lot = "0.12.4"
+tokio = { version = "1.0", default-features = false }
 
 [profile.release]
 debug = "line-tables-only"
