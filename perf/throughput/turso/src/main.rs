@@ -196,8 +196,9 @@ async fn worker_thread(
         };
     }
 
-    for tx_fut in tx_futs {
-        tx_fut.await?;
+    let results = futures::future::join_all(tx_futs).await;
+    for result in results {
+        result?;
     }
 
     let elapsed = start_time.elapsed();
