@@ -1093,7 +1093,6 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 if is_write_write_conflict(&self.txs, tx, rv) {
                     drop(row_versions);
                     drop(row_versions_opt);
-                    self.rollback_tx(tx_id, pager);
                     return Err(LimboError::WriteWriteConflict);
                 }
 
