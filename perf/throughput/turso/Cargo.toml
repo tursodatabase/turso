@@ -11,3 +11,4 @@ path = "src/main.rs"
 turso = { path = "../../../bindings/rust" }
 clap = { version = "4.0", features = ["derive"] }
 tokio = { version = "1.0", features = ["full"] }
+futures = "0.3"
