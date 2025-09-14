@@ -47,7 +47,7 @@ pub fn derive_description_from_doc(item: TokenStream) -> TokenStream {
                                 continue;
                             }
 
-                            // this is a quick fix for 
+                            // this is a quick fix for
                             if ident_str == "repr" {
                                 continue;
                             }
