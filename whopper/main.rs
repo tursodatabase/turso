@@ -33,6 +33,9 @@ struct Args {
     /// Disable creation and manipulation of indexes
     #[arg(long)]
     disable_indexes: bool,
+    /// Enable MVCC (Multi-Version Concurrency Control)
+    #[arg(long)]
+    enable_mvcc: bool,
 }
 
 struct SimulatorConfig {
@@ -105,7 +108,7 @@ fn main() -> anyhow::Result<()> {
 
     let db_path = format!("whopper-{}-{}.db", seed, std::process::id());
 
-    let db = match Database::open_file(io.clone(), &db_path, false, true) {
+    let db = match Database::open_file(io.clone(), &db_path, args.enable_mvcc, true) {
         Ok(db) => db,
         Err(e) => {
             return Err(anyhow::anyhow!("Database open failed: {}", e));
