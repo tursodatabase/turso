@@ -109,7 +109,6 @@ fn bench(c: &mut Criterion) {
                         data: record_data.clone(),
                         column_count: 1,
                     },
-                    conn.get_pager().clone(),
                 )
                 .unwrap();
             let mv_store = &db.mvcc_store;
@@ -159,7 +158,6 @@ fn bench(c: &mut Criterion) {
 
     let db = bench_db();
     let tx_id = db.mvcc_store.begin_tx(db.conn.get_pager().clone());
-    let conn = &db.conn;
     db.mvcc_store
         .insert(
             tx_id,
@@ -186,7 +184,6 @@ fn bench(c: &mut Criterion) {
                         data: record_data.clone(),
                         column_count: 1,
                     },
-                    conn.get_pager().clone(),
                 )
                 .unwrap();
         })

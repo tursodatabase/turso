@@ -4655,7 +4655,7 @@ impl BTreeCursor {
     pub fn delete(&mut self) -> Result<IOResult<()>> {
         if let Some(mv_cursor) = &self.mv_cursor {
             let rowid = mv_cursor.borrow_mut().current_row_id().unwrap();
-            mv_cursor.borrow_mut().delete(rowid, self.pager.clone())?;
+            mv_cursor.borrow_mut().delete(rowid)?;
             return Ok(IOResult::Done(()));
         }
 
