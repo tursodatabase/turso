@@ -2174,7 +2174,6 @@ pub fn op_transaction(
                     return_if_io!(mv_store.begin_exclusive_tx(pager.clone(), None))
                 }
             };
-            conn.mv_transactions.borrow_mut().push(tx_id);
             program.connection.mv_tx_id.set(Some(tx_id));
         } else if updated
             && matches!(new_transaction_state, TransactionState::Write { .. })

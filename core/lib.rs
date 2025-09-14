@@ -464,7 +464,6 @@ impl Database {
             ),
             database_schemas: RefCell::new(std::collections::HashMap::new()),
             auto_commit: Cell::new(true),
-            mv_transactions: RefCell::new(Vec::new()),
             transaction_state: Cell::new(TransactionState::None),
             last_insert_rowid: Cell::new(0),
             last_change: Cell::new(0),
@@ -944,8 +943,6 @@ pub struct Connection {
     database_schemas: RefCell<std::collections::HashMap<usize, Arc<Schema>>>,
     /// Whether to automatically commit transaction
     auto_commit: Cell<bool>,
-    /// Transactions that are in progress.
-    mv_transactions: RefCell<Vec<crate::mvcc::database::TxID>>,
     transaction_state: Cell<TransactionState>,
     last_insert_rowid: Cell<i64>,
     last_change: Cell<i64>,
