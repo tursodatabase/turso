@@ -1,7 +1,7 @@
 use clap::{Parser, ValueEnum};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use turso::{Builder, Database, Result};
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -33,6 +33,13 @@ struct Args {
         help = "Per transaction think time (ms)"
     )]
     think: u64,
+
+    #[arg(
+        long = "timeout",
+        default_value = "50",
+        help = "Busy timeout in milliseconds"
+    )]
+    timeout: u64,
 }
 
 #[tokio::main]
@@ -58,6 +65,8 @@ async fn main() -> Result<()> {
     let start_barrier = Arc::new(Barrier::new(args.threads));
     let mut handles = Vec::new();
 
+    let timeout = Duration::from_millis(args.timeout);
+
     let overall_start = Instant::now();
 
     for thread_id in 0..args.threads {
@@ -72,6 +81,7 @@ async fn main() -> Result<()> {
             barrier,
             args.mode,
             args.think,
+            timeout,
         ));
 
         handles.push(handle);
@@ -137,6 +147,7 @@ async fn setup_database(db_path: &str, mode: TransactionMode) -> Result<Database
     Ok(db)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn worker_thread(
     thread_id: usize,
     db: Database,
@@ -145,6 +156,7 @@ async fn worker_thread(
     start_barrier: Arc<Barrier>,
     mode: TransactionMode,
     think_ms: u64,
+    timeout: Duration,
 ) -> Result<u64> {
     start_barrier.wait();
 
@@ -155,7 +167,7 @@ async fn worker_thread(
 
     for iteration in 0..iterations {
         let conn = db.connect()?;
-        conn.busy_timeout(Some(std::time::Duration::from_millis(10)))?;
+        conn.busy_timeout(Some(timeout))?;
         let total_inserts = Arc::clone(&total_inserts);
         let tx_fut = async move {
             let mut stmt = conn
