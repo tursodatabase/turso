@@ -141,20 +141,28 @@ impl std::fmt::Display for Transaction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::result::Result<(), std::fmt::Error> {
         write!(
             f,
-            "{{ state: {}, id: {}, begin_ts: {}, write_set: {:?}, read_set: {:?}",
+            "{{ state: {}, id: {}, begin_ts: {}, write_set: [",
             self.state.load(),
             self.tx_id,
             self.begin_ts,
-            // FIXME: I'm sorry, we obviously shouldn't be cloning here.
-            self.write_set
-                .iter()
-                .map(|v| *v.value())
-                .collect::<Vec<RowID>>(),
-            self.read_set
-                .iter()
-                .map(|v| *v.value())
-                .collect::<Vec<RowID>>()
-        )
+        )?;
+
+        for (i, v) in self.write_set.iter().enumerate() {
+            if i > 0 {
+                write!(f, ", ")?
+            }
+            write!(f, "{:?}", *v.value())?;
+        }
+
+        write!(f, "], read_set: [")?;
+        for (i, v) in self.read_set.iter().enumerate() {
+            if i > 0 {
+                write!(f, ", ")?;
+            }
+            write!(f, "{:?}", *v.value())?;
+        }
+
+        write!(f, "] }}")
     }
 }
 
