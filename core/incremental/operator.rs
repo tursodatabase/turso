@@ -8,7 +8,7 @@ use crate::incremental::expr_compiler::CompiledExpression;
 use crate::incremental::persistence::{MinMaxPersistState, ReadRecord, RecomputeMinMax, WriteRow};
 use crate::schema::{Index, IndexColumn};
 use crate::storage::btree::BTreeCursor;
-use crate::types::{IOResult, ImmutableRecord, SeekKey, SeekOp, SeekResult, Text};
+use crate::types::{Blob, IOResult, ImmutableRecord, SeekKey, SeekOp, SeekResult, Text};
 use crate::{
     return_and_restore_if_io, return_if_io, Connection, Database, Result, SymbolTable, Value,
 };
@@ -1508,7 +1508,7 @@ impl AggregateState {
                 Value::Blob(b) => {
                     blob.push(4u8);
                     blob.extend_from_slice(&(b.len() as u32).to_le_bytes());
-                    blob.extend_from_slice(b);
+                    blob.extend_from_slice(&b.expanded());
                 }
             }
         }
@@ -1604,7 +1604,7 @@ impl AggregateState {
                     cursor += 4;
                     let bytes = blob.get(cursor..cursor + len)?;
                     cursor += len;
-                    Value::Blob(bytes.to_vec())
+                    Value::Blob(Blob::new(bytes.to_vec()))
                 }
                 _ => return None,
             };
@@ -2310,7 +2310,7 @@ mod tests {
                 if let Some(Value::Blob(blob)) = values.get(3) {
                     // Deserialize the state
                     if let Some((state, group_key)) =
-                        AggregateState::from_blob(blob, &agg.aggregates)
+                        AggregateState::from_blob(blob.value.as_slice(), &agg.aggregates)
                     {
                         // Should not have made it this far.
                         assert!(state.count != 0);

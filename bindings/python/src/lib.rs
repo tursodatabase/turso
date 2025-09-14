@@ -6,6 +6,7 @@ use std::cell::RefCell;
 use std::num::NonZeroUsize;
 use std::rc::Rc;
 use std::sync::Arc;
+use turso_core::types::Blob;
 use turso_core::Value;
 
 mod errors;
@@ -334,7 +335,9 @@ fn row_to_py(py: Python, row: &turso_core::Row) -> Result<PyObject> {
             turso_core::Value::Integer(i) => py_values.push(i.into_pyobject(py)?.into()),
             turso_core::Value::Float(f) => py_values.push(f.into_pyobject(py)?.into()),
             turso_core::Value::Text(s) => py_values.push(s.as_str().into_pyobject(py)?.into()),
-            turso_core::Value::Blob(b) => py_values.push(PyBytes::new(py, b.as_slice()).into()),
+            turso_core::Value::Blob(b) => {
+                py_values.push(PyBytes::new(py, b.value.as_slice()).into())
+            }
         }
     }
     Ok(PyTuple::new(py, &py_values)
@@ -354,7 +357,7 @@ fn py_to_db_value(obj: &Bound<PyAny>) -> Result<turso_core::Value> {
     } else if let Ok(string) = obj.extract::<String>() {
         return Ok(Value::Text(string.into()));
     } else if let Ok(bytes) = obj.downcast::<PyBytes>() {
-        return Ok(Value::Blob(bytes.as_bytes().to_vec()));
+        return Ok(Value::Blob(Blob::new(bytes.as_bytes().to_vec())));
     } else {
         return Err(PyErr::new::<ProgrammingError, _>(format!(
             "Unsupported Python type: {}",

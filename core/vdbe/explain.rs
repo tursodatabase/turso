@@ -1,6 +1,9 @@
 use turso_parser::ast::SortOrder;
 
-use crate::vdbe::{builder::CursorType, insn::RegisterOrLiteral};
+use crate::{
+    types::Blob,
+    vdbe::{builder::CursorType, insn::RegisterOrLiteral},
+};
 
 use super::{Insn, InsnReference, Program, Value};
 use crate::function::{Func, ScalarFunc};
@@ -735,7 +738,7 @@ pub fn insn_to_row(
                 0,
                 *dest as i32,
                 0,
-                Value::Blob(value.clone()),
+                Value::Blob(Blob::new(value.clone())),
                 0,
                 format!(
                     "r[{}]={} (len={})",

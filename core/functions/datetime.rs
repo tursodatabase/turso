@@ -742,6 +742,7 @@ fn format_time_duration(duration: &chrono::Duration) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::Blob;
 
     #[test]
     fn test_valid_get_date_from_time_value() {
@@ -879,7 +880,7 @@ mod tests {
             Value::Float(f64::NAN),                   // NaN
             Value::Float(f64::INFINITY),              // Infinity
             Value::Null,                              // Null value
-            Value::Blob(vec![1, 2, 3]),               // Blob (unsupported type)
+            Value::Blob(Blob::new(vec![1, 2, 3])),    // Blob (unsupported type)
             // Invalid timezone tests
             Value::build_text("2024-07-21T12:00:00+24:00"), // Invalid timezone offset (too large)
             Value::build_text("2024-07-21T12:00:00-24:00"), // Invalid timezone offset (too small)
@@ -1011,7 +1012,7 @@ mod tests {
             Value::Float(f64::NAN),                   // NaN
             Value::Float(f64::INFINITY),              // Infinity
             Value::Null,                              // Null value
-            Value::Blob(vec![1, 2, 3]),               // Blob (unsupported type)
+            Value::Blob(Blob::new(vec![1, 2, 3])),    // Blob (unsupported type)
             // Invalid timezone tests
             Value::build_text("2024-07-21T12:00:00+24:00"), // Invalid timezone offset (too large)
             Value::build_text("2024-07-21T12:00:00-24:00"), // Invalid timezone offset (too small)

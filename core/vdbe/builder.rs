@@ -12,6 +12,7 @@ use crate::{
         emitter::TransactionMode,
         plan::{ResultSetColumn, TableReferences},
     },
+    types::Blob,
     CaptureDataChangesMode, Connection, Value, VirtualTable,
 };
 
@@ -967,7 +968,7 @@ impl ProgramBuilder {
                 },
                 ast::Literal::Null => Value::Null,
                 ast::Literal::String(s) => Value::Text(sanitize_string(s).into()),
-                ast::Literal::Blob(s) => Value::Blob(
+                ast::Literal::Blob(s) => Value::Blob(Blob::new(
                     // Taken from `translate_expr`
                     s.as_bytes()
                         .chunks_exact(2)
@@ -978,7 +979,7 @@ impl ProgramBuilder {
                             u8::from_str_radix(hex_byte, 16).unwrap()
                         })
                         .collect(),
-                ),
+                )),
                 _ => break 'value None,
             })
         };

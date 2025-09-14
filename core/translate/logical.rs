@@ -9,7 +9,7 @@
 //! from SQL AST nodes.
 use crate::function::AggFunc;
 use crate::schema::{Schema, Type};
-use crate::types::Value;
+use crate::types::{Blob, Value};
 use crate::{LimboError, Result};
 use std::collections::HashMap;
 use std::fmt::{self, Display, Formatter};
@@ -1401,7 +1401,7 @@ impl<'a> LogicalPlanBuilder<'a> {
                 };
                 Ok(Value::Text(unquoted.to_string().into()))
             }
-            ast::Literal::Blob(b) => Ok(Value::Blob(b.clone().into())),
+            ast::Literal::Blob(b) => Ok(Value::Blob(Blob::new(b.clone().into()))),
             ast::Literal::CurrentDate
             | ast::Literal::CurrentTime
             | ast::Literal::CurrentTimestamp => Err(LimboError::ParseError(
