@@ -1080,6 +1080,9 @@ pub fn handle_program_error(
         _ => {
             if let Some(mv_store) = mv_store {
                 if let Some((tx_id, _)) = connection.mv_tx.get() {
+                    connection.mv_tx.set(None);
+                    connection.transaction_state.replace(TransactionState::None);
+                    connection.auto_commit.replace(true);
                     mv_store.rollback_tx(tx_id, pager.clone());
                 }
             } else {
