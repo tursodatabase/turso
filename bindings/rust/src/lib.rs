@@ -393,6 +393,16 @@ impl Connection {
 
         Ok(conn.get_auto_commit())
     }
+
+    /// Sets the max timeout for the busy handler
+    pub fn max_busy_timeout(&self, duration: std::time::Duration) -> Result<()> {
+        let conn = self
+            .inner
+            .lock()
+            .map_err(|e| Error::MutexError(e.to_string()))?;
+        conn.max_busy_timeout(duration);
+        Ok(())
+    }
 }
 
 impl Debug for Connection {
