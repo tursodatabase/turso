@@ -96,7 +96,7 @@ pub enum JumpTarget {
     AfterThisInsn,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 /// Represents a target for a jump instruction.
 /// Stores 32-bit ints to keep the enum word-sized.
 pub enum BranchOffset {
@@ -108,7 +108,6 @@ pub enum BranchOffset {
     Offset(InsnReference),
     /// A placeholder is a temporary value to satisfy the compiler.
     /// It must be set later.
-    #[default]
     Placeholder,
 }
 
