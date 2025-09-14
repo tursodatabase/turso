@@ -150,8 +150,6 @@ async fn worker_thread(
     mode: TransactionMode,
     think_ms: u64,
 ) -> Result<u64> {
-    let conn = db.connect()?;
-
     start_barrier.wait();
 
     let start_time = Instant::now();
@@ -160,7 +158,7 @@ async fn worker_thread(
     let mut tx_futs = vec![];
 
     for iteration in 0..iterations {
-        let conn = conn.clone();
+        let conn = db.connect()?;
         let total_inserts = Arc::clone(&total_inserts);
         let tx_fut = async move {
             let mut stmt = conn
