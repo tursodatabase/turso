@@ -941,8 +941,8 @@ pub fn op_open_read(
     let pager = program.get_pager_from_database_index(db);
 
     let (_, cursor_type) = program.cursor_ref.get(*cursor_id).unwrap();
-    let mv_cursor = match program.connection.mv_tx_id.get() {
-        Some(tx_id) => {
+    let mv_cursor = match program.connection.mv_tx.get() {
+        Some((tx_id, _)) => {
             let table_id = *root_page as u64;
             let mv_store = mv_store.unwrap().clone();
             let mv_cursor = Rc::new(RefCell::new(
@@ -2156,7 +2156,7 @@ pub fn op_transaction(
         // In MVCC we don't have write exclusivity, therefore we just need to start a transaction if needed.
         // Programs can run Transaction twice, first with read flag and then with write flag. So a single txid is enough
         // for both.
-        if program.connection.mv_tx_id.get().is_none() {
+        if program.connection.mv_tx.get().is_none() {
             // We allocate the first page lazily in the first transaction.
             return_if_io!(pager.maybe_allocate_page1());
             // TODO: when we fix MVCC enable schema cookie detection for reprepare statements
@@ -2174,17 +2174,24 @@ pub fn op_transaction(
                     return_if_io!(mv_store.begin_exclusive_tx(pager.clone(), None))
                 }
             };
-            program.connection.mv_tx_id.set(Some(tx_id));
-        } else if updated
-            && matches!(new_transaction_state, TransactionState::Write { .. })
-            && matches!(tx_mode, TransactionMode::Write)
-        {
-            let is_upgrade_from_read = matches!(current_state, TransactionState::Read);
-            let tx_id = program.connection.mv_tx_id.get().unwrap();
-            if is_upgrade_from_read {
-                return_if_io!(mv_store.upgrade_to_exclusive_tx(pager.clone(), Some(tx_id)));
+            program.connection.mv_tx.set(Some((tx_id, *tx_mode)));
+        } else if updated {
+            // TODO: fix tx_mode in Insn::Transaction, now each statement overrides it even if there's already a CONCURRENT Tx in progress, for example
+            let mv_tx_mode = program.connection.mv_tx.get().unwrap().1;
+            let actual_tx_mode = if mv_tx_mode == TransactionMode::Concurrent {
+                TransactionMode::Concurrent
             } else {
-                return_if_io!(mv_store.begin_exclusive_tx(pager.clone(), Some(tx_id)));
+                TransactionMode::Write
+            };
+            if matches!(new_transaction_state, TransactionState::Write { .. })
+                && matches!(actual_tx_mode, TransactionMode::Write)
+            {
+                let (tx_id, mv_tx_mode) = program.connection.mv_tx.get().unwrap();
+                if mv_tx_mode == TransactionMode::Read {
+                    return_if_io!(mv_store.upgrade_to_exclusive_tx(pager.clone(), Some(tx_id)));
+                } else {
+                    return_if_io!(mv_store.begin_exclusive_tx(pager.clone(), Some(tx_id)));
+                }
             }
         }
     } else {
@@ -2300,7 +2307,7 @@ pub fn op_auto_commit(
             conn.auto_commit.replace(*auto_commit);
         }
     } else {
-        let mvcc_tx_active = program.connection.mv_tx_id.get().is_some();
+        let mvcc_tx_active = program.connection.mv_tx.get().is_some();
         if !mvcc_tx_active {
             if !*auto_commit {
                 return Err(LimboError::TxError(
@@ -6375,8 +6382,8 @@ pub fn op_open_write(
         CursorType::BTreeIndex(index) => Some(index),
         _ => None,
     };
-    let mv_cursor = match program.connection.mv_tx_id.get() {
-        Some(tx_id) => {
+    let mv_cursor = match program.connection.mv_tx.get() {
+        Some((tx_id, _)) => {
             let table_id = root_page;
             let mv_store = mv_store.unwrap().clone();
             let mv_cursor = Rc::new(RefCell::new(
@@ -6650,7 +6657,7 @@ pub fn op_parse_schema(
                 stmt,
                 schema,
                 &conn.syms.borrow(),
-                program.connection.mv_tx_id.get(),
+                program.connection.mv_tx.get(),
                 existing_views,
             )
         })
@@ -6665,7 +6672,7 @@ pub fn op_parse_schema(
                 stmt,
                 schema,
                 &conn.syms.borrow(),
-                program.connection.mv_tx_id.get(),
+                program.connection.mv_tx.get(),
                 existing_views,
             )
         })
@@ -7121,8 +7128,8 @@ pub fn op_open_ephemeral(
             let root_page = return_if_io!(pager.btree_create(flag));
 
             let (_, cursor_type) = program.cursor_ref.get(cursor_id).unwrap();
-            let mv_cursor = match program.connection.mv_tx_id.get() {
-                Some(tx_id) => {
+            let mv_cursor = match program.connection.mv_tx.get() {
+                Some((tx_id, _)) => {
                     let table_id = root_page as u64;
                     let mv_store = mv_store.unwrap().clone();
                     let mv_cursor = Rc::new(RefCell::new(
