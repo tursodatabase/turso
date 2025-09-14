@@ -10,12 +10,6 @@
   },
   "io": {
     "enable": true,
-    "fault": {
-      "enable": true,
-      "write": true,
-      "read": true,
-      "sync": true
-    },
     "latency": {
       "enable": true,
       "latency_probability": 25,
