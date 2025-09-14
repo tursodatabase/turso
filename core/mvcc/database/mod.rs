@@ -1403,6 +1403,13 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         for ref id in write_set {
             if let Some(row_versions) = self.rows.get(id) {
                 let mut row_versions = row_versions.value().write();
+                for rv in row_versions.iter_mut() {
+                    if rv.end == Some(TxTimestampOrID::TxID(tx_id)) {
+                        // undo deletions by this transaction
+                        rv.end = None;
+                    }
+                }
+                // remove insertions by this transaction
                 row_versions.retain(|rv| rv.begin != TxTimestampOrID::TxID(tx_id));
                 if row_versions.is_empty() {
                     self.rows.remove(id);
@@ -1779,7 +1786,9 @@ fn is_end_visible(
     match row_version.end {
         Some(TxTimestampOrID::Timestamp(rv_end_ts)) => current_tx.begin_ts < rv_end_ts,
         Some(TxTimestampOrID::TxID(rv_end)) => {
-            let other_tx = txs.get(&rv_end).unwrap();
+            let other_tx = txs
+                .get(&rv_end)
+                .unwrap_or_else(|| panic!("Transaction {rv_end} not found"));
             let other_tx = other_tx.value();
             let visible = match other_tx.state.load() {
                 // V's sharp mind discovered an issue with the hekaton paper which basically states that a
