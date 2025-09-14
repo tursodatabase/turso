@@ -63,6 +63,7 @@ struct SimulatorContext {
     opts: Opts,
     stats: Stats,
     disable_indexes: bool,
+    enable_mvcc: bool,
 }
 
 #[derive(Default)]
@@ -168,6 +169,7 @@ fn main() -> anyhow::Result<()> {
         opts: Opts::default(),
         stats: Stats::default(),
         disable_indexes: args.disable_indexes,
+        enable_mvcc: args.enable_mvcc,
     };
 
     let progress_interval = config.max_steps / 10;
@@ -387,12 +389,19 @@ fn perform_work(
         FiberState::Idle => {
             let action = rng.random_range(0..100);
             if action <= 29 {
-                // Start transaction
-                // FIXME: use deferred when it's fixed!
-                if let Ok(stmt) = context.fibers[fiber_idx].connection.prepare("BEGIN") {
+                let begin_cmd = if context.enable_mvcc {
+                    match rng.random_range(0..3) {
+                        0 => "BEGIN DEFERRED",
+                        1 => "BEGIN IMMEDIATE",
+                        _ => "BEGIN CONCURRENT",
+                    }
+                } else {
+                    "BEGIN"
+                };
+                if let Ok(stmt) = context.fibers[fiber_idx].connection.prepare(begin_cmd) {
                     context.fibers[fiber_idx].statement.replace(Some(stmt));
                     context.fibers[fiber_idx].state = FiberState::InTx;
-                    trace!("{} BEGIN", fiber_idx);
+                    trace!("{} {}", fiber_idx, begin_cmd);
                 }
             } else if action == 30 {
                 // Integrity check
