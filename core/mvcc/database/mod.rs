@@ -482,6 +482,20 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     .extend(tx.write_set.iter().map(|v| *v.value()));
                 self.write_set
                     .sort_by(|a, b| a.table_id.cmp(&b.table_id).then(a.row_id.cmp(&b.row_id)));
+                if self.write_set.is_empty() {
+                    if mvcc_store.is_exclusive_tx(&self.tx_id) {
+                        mvcc_store.release_exclusive_tx(&self.tx_id);
+                        self.commit_coordinator.pager_commit_lock.unlock();
+                        // FIXME: this function isnt re-entrant
+                        self.pager
+                            .io
+                            .block(|| self.pager.end_tx(false, &self.connection))?;
+                    } else {
+                        self.pager.end_read_tx()?;
+                    }
+                    self.finalize(mvcc_store)?;
+                    return Ok(TransitionResult::Done(()));
+                }
                 self.state = CommitState::BeginPagerTxn { end_ts };
                 Ok(TransitionResult::Continue)
             }
