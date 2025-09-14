@@ -10,10 +10,8 @@ use crate::{
     translate::{collate::CollationSeq, emitter::TransactionMode},
     Value,
 };
-use std::sync::LazyLock;
 use strum::EnumCount;
-use strum::VariantArray as _;
-use strum_macros::{EnumDiscriminants, VariantArray};
+use strum_macros::{EnumDiscriminants, FromRepr, VariantArray};
 use turso_macros::Description;
 use turso_parser::ast::SortOrder;
 
@@ -154,10 +152,11 @@ impl<T: Copy + std::fmt::Display> std::fmt::Display for RegisterOrLiteral<T> {
     }
 }
 
+// There are currently 190 opcodes in sqlite
+#[repr(u8)]
 #[derive(Description, Debug, EnumDiscriminants)]
 #[strum_discriminants(vis(pub(crate)))]
-#[strum_discriminants(derive(VariantArray, EnumCount))]
-#[strum_discriminants(repr(usize))]
+#[strum_discriminants(derive(VariantArray, EnumCount, FromRepr))]
 #[strum_discriminants(name(InsnVariants))]
 pub enum Insn {
     /// Initialize the program state and jump to the given PC.
@@ -1103,23 +1102,31 @@ pub enum Insn {
     },
 }
 
-static INSN_VIRTUAL_TABLE: LazyLock<[InsnFunction; InsnVariants::COUNT]> = LazyLock::new(|| {
-    let mut result: [InsnFunction; InsnVariants::COUNT] = [execute::op_null; InsnVariants::COUNT];
+const fn get_insn_virtual_table() -> [InsnFunction; InsnVariants::COUNT] {
+    let mut result: [InsnFunction; InsnVariants::COUNT] = [execute::op_init; InsnVariants::COUNT];
 
-    for variant in InsnVariants::VARIANTS {
-        result[*variant as usize] = variant.to_function();
+    let mut insn = 0;
+    while insn < InsnVariants::COUNT {
+        result[insn] = InsnVariants::from_repr(insn as u8).unwrap().to_function();
+        insn += 1;
     }
 
     result
-});
+}
+
+static INSN_VIRTUAL_TABLE: [InsnFunction; InsnVariants::COUNT] = get_insn_virtual_table();
 
 impl InsnVariants {
+    // This function is used for testing
+    #[allow(dead_code)]
     #[inline(always)]
-    pub(crate) fn to_function_fast(&self) -> InsnFunction {
+    pub(crate) const fn to_function_fast(&self) -> InsnFunction {
         INSN_VIRTUAL_TABLE[*self as usize]
     }
 
-    pub(crate) fn to_function(&self) -> InsnFunction {
+    // This function is used for generating the virtual table.
+    // We need to keep this function to make sure we implement all opcodes
+    pub(crate) const fn to_function(&self) -> InsnFunction {
         match self {
             InsnVariants::Init { .. } => execute::op_init,
             InsnVariants::Null { .. } => execute::op_null,
@@ -1264,13 +1271,18 @@ impl InsnVariants {
 }
 
 impl Insn {
+    // SAFETY: If the enumeration specifies a primitive representation,
+    // then the discriminant may be reliably accessed via unsafe pointer casting
     #[inline(always)]
-    pub fn to_function_fast(&self) -> InsnFunction {
-        InsnVariants::from(self).to_function_fast()
+    fn discriminant(&self) -> u8 {
+        unsafe { *(self as *const Self as *const u8) }
     }
 
+    #[inline(always)]
     pub fn to_function(&self) -> InsnFunction {
-        InsnVariants::from(self).to_function()
+        // dont use this because its still using match
+        // InsnVariants::from(self).to_function_fast()
+        INSN_VIRTUAL_TABLE[self.discriminant() as usize]
     }
 }
 
@@ -1297,7 +1309,7 @@ pub enum Cookie {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use strum::VariantArray;
 
     #[test]
     fn test_make_sure_correct_insn_table() {
@@ -1306,8 +1318,8 @@ mod tests {
             let func2 = variant.to_function_fast();
             assert_eq!(
                 func1 as usize, func2 as usize,
-                "Variant {:?} does not match in fast table",
-                variant
+                "Variant {:?} does not match in fast table at index {}",
+                variant, *variant as usize
             );
         }
     }

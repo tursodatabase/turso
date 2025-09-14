@@ -46,6 +46,12 @@ pub fn derive_description_from_doc(item: TokenStream) -> TokenStream {
                             if ident_str == "strum_discriminants" {
                                 continue;
                             }
+
+                            // this is a quick fix for 
+                            if ident_str == "repr" {
+                                continue;
+                            }
+
                             if let Some(desc) = &last_seen_desc {
                                 variant_description_map.insert(ident_str.clone(), desc.clone());
                             }

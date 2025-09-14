@@ -648,7 +648,7 @@ impl Program {
             // invalidate row
             let _ = state.result_row.take();
             let (insn, _) = &self.insns[state.pc as usize];
-            let insn_function = insn.to_function_fast();
+            let insn_function = insn.to_function();
             if enable_tracing {
                 trace_insn(self, state.pc as InsnReference, insn);
             }
