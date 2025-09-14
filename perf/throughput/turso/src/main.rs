@@ -155,7 +155,7 @@ async fn worker_thread(
 
     for iteration in 0..iterations {
         let conn = db.connect()?;
-        conn.max_busy_timeout(std::time::Duration::from_millis(10))?;
+        conn.busy_timeout(Some(std::time::Duration::from_millis(10)))?;
         let total_inserts = Arc::clone(&total_inserts);
         let tx_fut = async move {
             let mut stmt = conn

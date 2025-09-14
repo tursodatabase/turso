@@ -394,13 +394,26 @@ impl Connection {
         Ok(conn.get_auto_commit())
     }
 
-    /// Sets the max timeout for the busy handler
-    pub fn max_busy_timeout(&self, duration: std::time::Duration) -> Result<()> {
+    /// Sets maximum total accumuated timeout. If the duration is None or Zero, we unset the busy handler for this Connection
+    ///
+    /// This api defers slighty from: https://www.sqlite.org/c3ref/busy_timeout.html
+    ///
+    /// Instead of sleeping for linear amount of time specified by the user,
+    /// we will sleep in phases, until the the total amount of time is reached.
+    /// This means we first sleep of 1ms, then if we still return busy, we sleep for 2 ms, and repeat until a maximum of 100 ms per phase.
+    ///
+    /// Example:
+    /// 1. Set duration to 5ms
+    /// 2. Step through query -> returns Busy -> sleep/yield for 1 ms
+    /// 3. Step through query -> returns Busy -> sleep/yield for 2 ms
+    /// 4. Step through query -> returns Busy -> sleep/yield for 2 ms (totaling 5 ms of sleep)
+    /// 5. Step through query -> returns Busy -> return Busy to user
+    pub fn busy_timeout(&self, duration: Option<std::time::Duration>) -> Result<()> {
         let conn = self
             .inner
             .lock()
             .map_err(|e| Error::MutexError(e.to_string()))?;
-        conn.max_busy_timeout(duration);
+        conn.busy_timeout(duration);
         Ok(())
     }
 }

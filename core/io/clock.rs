@@ -76,6 +76,14 @@ impl std::ops::Add<Duration> for Instant {
     }
 }
 
+impl std::ops::Sub<Duration> for Instant {
+    type Output = Instant;
+
+    fn sub(self, rhs: Duration) -> Self::Output {
+        self.checked_sub_duration(&rhs).unwrap()
+    }
+}
+
 pub trait Clock {
     fn now(&self) -> Instant;
 }
