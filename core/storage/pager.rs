@@ -1839,7 +1839,7 @@ impl Pager {
                     default_header.page_size = size;
                 }
 
-                tracing::info!(
+                tracing::debug!(
                     "allocate_page1(Start) page_size = {:?}, reserved_space = {}",
                     default_header.page_size,
                     default_header.reserved_space
