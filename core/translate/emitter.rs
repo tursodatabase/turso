@@ -110,6 +110,7 @@ impl LimitCtx {
 pub struct TranslateCtx<'a> {
     // A typical query plan is a nested loop. Each loop has its own LoopLabels (see the definition of LoopLabels for more details)
     pub labels_main_loop: Vec<LoopLabels>,
+    pub after_row_jump: Vec<Option<BranchOffset>>,
     // label for the instruction that jumps to the next phase of the query after the main loop
     // we don't know ahead of time what that is (GROUP BY, ORDER BY, etc.)
     pub label_main_loop_end: Option<BranchOffset>,
@@ -158,6 +159,7 @@ impl<'a> TranslateCtx<'a> {
     ) -> Self {
         TranslateCtx {
             labels_main_loop: (0..table_count).map(|_| LoopLabels::new(program)).collect(),
+            after_row_jump: (0..table_count).map(|_| None).collect(),
             label_main_loop_end: None,
             reg_agg_start: None,
             reg_nonagg_emit_once_flag: None,
@@ -488,10 +490,16 @@ fn emit_delete_insns(
             program.resolve_cursor_id(&CursorKey::table(table_reference.internal_id))
         }
         Operation::Search(search) => match search {
-            Search::RowidEq { .. } | Search::Seek { index: None, .. } => {
+            Search::RowidEq { .. }
+            | Search::RowidManyEq { .. }
+            | Search::Seek { index: None, .. }
+            | Search::SeekManyEq { index: None, .. } => {
                 program.resolve_cursor_id(&CursorKey::table(table_reference.internal_id))
             }
             Search::Seek {
+                index: Some(index), ..
+            }
+            | Search::SeekManyEq {
                 index: Some(index), ..
             } => program.resolve_cursor_id(&CursorKey::index(
                 table_reference.internal_id,
@@ -664,6 +672,12 @@ fn emit_delete_insns(
             target_pc: t_ctx.label_main_loop_end.unwrap(),
         })
     }
+    // If this table’s loop is driven by a SeekManyEq RHS driver, advance it.
+    if let Some(rhs_advance) = t_ctx.after_row_jump.first().and_then(|x| *x) {
+        program.emit_insn(Insn::Goto {
+            target_pc: rhs_advance,
+        });
+    }
 
     Ok(())
 }
@@ -809,8 +823,14 @@ fn emit_update_insns(
         ),
         Operation::Scan(_) => (None, table_ref.virtual_table().is_some()),
         Operation::Search(search) => match search {
-            &Search::RowidEq { .. } | Search::Seek { index: None, .. } => (None, false),
+            &Search::RowidEq { .. }
+            | Search::RowidManyEq { .. }
+            | Search::Seek { index: None, .. }
+            | Search::SeekManyEq { index: None, .. } => (None, false),
             Search::Seek {
+                index: Some(index), ..
+            }
+            | Search::SeekManyEq {
                 index: Some(index), ..
             } => (
                 Some((

@@ -39,13 +39,19 @@ pub fn emit_subqueries(
                     }
                 }
                 Operation::Search(search) => match search {
-                    Search::RowidEq { .. } | Search::Seek { index: None, .. } => {
+                    Search::RowidEq { .. }
+                    | Search::RowidManyEq { .. }
+                    | Search::Seek { index: None, .. }
+                    | Search::SeekManyEq { index: None, .. } => {
                         format!(
                             "SEARCH {} USING INTEGER PRIMARY KEY (rowid=?)",
                             table_reference.identifier
                         )
                     }
                     Search::Seek {
+                        index: Some(index), ..
+                    }
+                    | Search::SeekManyEq {
                         index: Some(index), ..
                     } => {
                         format!(
@@ -110,6 +116,7 @@ pub fn emit_subquery(
             .map(|_| LoopLabels::new(program))
             .collect(),
         label_main_loop_end: None,
+        after_row_jump: (0..plan.joined_tables().len()).map(|_| None).collect(),
         meta_group_by: None,
         meta_left_joins: (0..plan.joined_tables().len()).map(|_| None).collect(),
         meta_sort: None,

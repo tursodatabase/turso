@@ -49,6 +49,17 @@ pub struct Constraint {
     /// An estimated selectivity factor (0.0 to 1.0) indicating the fraction of rows
     /// expected to satisfy this constraint. Used for cost and cardinality estimation.
     pub selectivity: f64,
+    pub rhs: ConstraintRhs,
+}
+
+#[allow(clippy::vec_box)]
+#[derive(Debug, Clone)]
+pub enum ConstraintRhs {
+    /// Normal scalar binary RHS expression
+    Scalar(Box<ast::Expr>),
+    /// List of deduped, NULL-stripped, normalized RHS expressions
+    InList(Vec<Box<ast::Expr>>),
+    // TODO: NotInList(Vec<Box<ast::Expr>>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -58,17 +69,18 @@ pub enum BinaryExprSide {
 }
 
 impl Constraint {
-    /// Get the constraining expression, e.g. '2+3' from 't.x = 2+3'
-    pub fn get_constraining_expr(&self, where_clause: &[WhereTerm]) -> ast::Expr {
-        let (idx, side) = self.where_clause_pos;
-        let where_term = &where_clause[idx];
-        let Ok(Some((lhs, _, rhs))) = as_binary_components(&where_term.expr) else {
-            panic!("Expected a valid binary expression");
-        };
-        if side == BinaryExprSide::Lhs {
-            lhs.clone()
-        } else {
-            rhs.clone()
+    /// Borrow the scalar constraining expression, if this constraint is scalar.
+    pub fn as_scalar(&self) -> Option<&ast::Expr> {
+        match &self.rhs {
+            ConstraintRhs::Scalar(e) => Some(e),
+            _ => None,
+        }
+    }
+    /// Borrow the IN-list values, if this is an IN-list constraint.
+    pub fn as_inlist(&self) -> Option<&[Box<ast::Expr>]> {
+        match &self.rhs {
+            ConstraintRhs::InList(vs) => Some(vs.as_slice()),
+            _ => None,
         }
     }
 }
@@ -88,14 +100,13 @@ pub struct ConstraintRef {
 
 impl ConstraintRef {
     /// Convert the constraint to a column usable in a [crate::translate::plan::SeekDef::key].
-    pub fn as_seek_key_column(
-        &self,
-        constraints: &[Constraint],
-        where_clause: &[WhereTerm],
-    ) -> (ast::Expr, SortOrder) {
-        let constraint = &constraints[self.constraint_vec_pos];
-        let constraining_expr = constraint.get_constraining_expr(where_clause);
-        (constraining_expr, self.sort_order)
+    pub fn as_seek_key_column(&self, constraints: &[Constraint]) -> (ast::Expr, SortOrder) {
+        let c = &constraints[self.constraint_vec_pos];
+        let expr = match c.as_scalar() {
+            Some(e) => e.clone(),
+            None => panic!("as_seek_key_column on non-scalar constraint: {c:?}"),
+        };
+        (expr, self.sort_order)
     }
 }
 
@@ -207,6 +218,69 @@ pub fn constraints_from_where_clause(
         });
 
         for (i, term) in where_clause.iter().enumerate() {
+            if let ast::Expr::InList { lhs, rhs, not, .. } = &term.expr {
+                if *not {
+                    // TODO
+                    continue;
+                }
+                // Only consider if LHS is a column (or rowid) of this table
+                let (_tbl_id, col_pos, _is_rowid) = match &**lhs {
+                    ast::Expr::Column { table, column, .. }
+                        if *table == table_reference.internal_id =>
+                    {
+                        (*table, *column, false)
+                    }
+                    ast::Expr::RowId { table, .. }
+                        if *table == table_reference.internal_id
+                            && rowid_alias_column.is_some() =>
+                    {
+                        (*table, rowid_alias_column.unwrap(), true)
+                    }
+                    _ => {
+                        continue;
+                    }
+                };
+
+                // Normalize RHS: strip NULLs, flatten and dedup constants/params
+                let mut values = Vec::<Box<ast::Expr>>::with_capacity(rhs.len());
+                let mut seen = std::collections::HashSet::<(bool, String, Vec<u8>)>::new();
+                let col = &table_reference.table.columns()[col_pos];
+
+                for e in rhs.iter() {
+                    if matches!(&**e, ast::Expr::Literal(ast::Literal::Null)) {
+                        continue;
+                    }
+                    let key = e.to_string();
+                    if seen.insert((
+                        matches!(&**e, ast::Expr::Literal(_)),
+                        col.collation.unwrap_or_default().to_string(),
+                        key.into_bytes(),
+                    )) {
+                        values.push(e.clone());
+                    }
+                }
+                if values.is_empty() {
+                    continue;
+                }
+                let base = estimate_selectivity(col, ast::Operator::Equals);
+                let sel = (values.len() as f64 * base).min(1.0);
+                let rhs_constraint = if rhs.len().eq(&1) {
+                    ConstraintRhs::Scalar(values.into_iter().next().unwrap())
+                } else {
+                    ConstraintRhs::InList(values)
+                };
+
+                cs.constraints.push(Constraint {
+                    where_clause_pos: (i, BinaryExprSide::Rhs),
+                    operator: ast::Operator::Equals, // treat as equality multi
+                    table_col_pos: col_pos,
+                    lhs_mask: TableMask::new(),
+                    selectivity: sel,
+                    rhs: rhs_constraint,
+                });
+                continue;
+            }
+
             let Some((lhs, operator, rhs)) = as_binary_components(&term.expr)? else {
                 continue;
             };
@@ -230,6 +304,7 @@ pub fn constraints_from_where_clause(
                             table_col_pos: *column,
                             lhs_mask: table_mask_from_expr(rhs, table_references)?,
                             selectivity: estimate_selectivity(table_column, operator),
+                            rhs: ConstraintRhs::Scalar(Box::new(rhs.clone())),
                         });
                     }
                 }
@@ -246,6 +321,7 @@ pub fn constraints_from_where_clause(
                             table_col_pos: rowid_alias_column.unwrap(),
                             lhs_mask: table_mask_from_expr(rhs, table_references)?,
                             selectivity: estimate_selectivity(table_column, operator),
+                            rhs: ConstraintRhs::Scalar(Box::new(rhs.clone())),
                         });
                     }
                 }
@@ -261,6 +337,7 @@ pub fn constraints_from_where_clause(
                             table_col_pos: *column,
                             lhs_mask: table_mask_from_expr(lhs, table_references)?,
                             selectivity: estimate_selectivity(table_column, operator),
+                            rhs: ConstraintRhs::Scalar(Box::new(lhs.clone())),
                         });
                     }
                 }
@@ -274,6 +351,7 @@ pub fn constraints_from_where_clause(
                             table_col_pos: rowid_alias_column.unwrap(),
                             lhs_mask: table_mask_from_expr(lhs, table_references)?,
                             selectivity: estimate_selectivity(table_column, operator),
+                            rhs: ConstraintRhs::Scalar(Box::new(lhs.clone())),
                         });
                     }
                 }

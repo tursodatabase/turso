@@ -15,8 +15,12 @@ use crate::{
     parameters::PARAM_PREFIX,
     schema::{Index, IndexColumn, Schema, Table},
     translate::{
-        expr::walk_expr_mut, optimizer::access_method::AccessMethodParams,
-        optimizer::constraints::TableConstraints, plan::Scan, plan::TerminationKey,
+        expr::walk_expr_mut,
+        optimizer::{
+            access_method::AccessMethodParams,
+            constraints::{ConstraintRhs, TableConstraints},
+        },
+        plan::{Scan, TerminationKey},
     },
     types::SeekOp,
     LimboError, Result,
@@ -362,7 +366,6 @@ fn optimize_table_access(
                             &table_constraints.constraints,
                             usable_constraint_refs,
                             *iter_dir,
-                            where_clause,
                         )?,
                     });
                 } else {
@@ -392,37 +395,88 @@ fn optimize_table_access(
                         where_clause[constraint.where_clause_pos.0].consumed = true;
                     }
                     if let Some(index) = &index {
+                        let leading = &constraint_refs[0];
+                        let c = &constraints_per_table[table_idx].constraints
+                            [leading.constraint_vec_pos];
+
+                        if matches!(c.rhs, ConstraintRhs::InList(_)) {
+                            where_clause[c.where_clause_pos.0].consumed = true;
+
+                            // Build key_prefix from all equality constraints BEFORE the IN-column
+                            // any such equalities must occupy positions < leading.index_col_pos)
+                            let mut key_prefix = Vec::new();
+                            for cref in constraint_refs.iter() {
+                                if cref.index_col_pos == leading.index_col_pos {
+                                    break;
+                                }
+                                let cc = &constraints_per_table[table_idx].constraints
+                                    [cref.constraint_vec_pos];
+                                // only take equalities in the prefix
+                                if cc.operator != ast::Operator::Equals {
+                                    break;
+                                }
+                                key_prefix.push(cref.as_seek_key_column(
+                                    &constraints_per_table[table_idx].constraints,
+                                ));
+                                where_clause[cc.where_clause_pos.0].consumed = true;
+                            }
+
+                            let in_values = c.as_inlist().unwrap().to_vec();
+                            joined_tables[table_idx].op = Operation::Search(Search::SeekManyEq {
+                                index: Some(index.clone()),
+                                key_prefix,
+                                in_values,
+                                in_col_sort: leading.sort_order,
+                                iter_dir: *iter_dir,
+                            });
+                            continue;
+                        }
+
                         joined_tables[table_idx].op = Operation::Search(Search::Seek {
                             index: Some(index.clone()),
                             seek_def: build_seek_def_from_constraints(
                                 &constraints_per_table[table_idx].constraints,
                                 constraint_refs,
                                 *iter_dir,
-                                where_clause,
                             )?,
                         });
                         continue;
                     }
+
                     assert!(
                         constraint_refs.len() == 1,
                         "expected exactly one constraint for rowid seek, got {constraint_refs:?}"
                     );
                     let constraint = &constraints_per_table[table_idx].constraints
                         [constraint_refs[0].constraint_vec_pos];
-                    joined_tables[table_idx].op = match constraint.operator {
-                        ast::Operator::Equals => Operation::Search(Search::RowidEq {
-                            cmp_expr: constraint.get_constraining_expr(where_clause),
-                        }),
-                        _ => Operation::Search(Search::Seek {
-                            index: None,
-                            seek_def: build_seek_def_from_constraints(
-                                &constraints_per_table[table_idx].constraints,
-                                constraint_refs,
-                                *iter_dir,
-                                where_clause,
-                            )?,
-                        }),
-                    };
+
+                    match (
+                        constraint.operator,
+                        constraint.as_scalar(),
+                        constraint.as_inlist(),
+                    ) {
+                        (ast::Operator::Equals, Some(_), None) => {
+                            joined_tables[table_idx].op = Operation::Search(Search::RowidEq {
+                                cmp_expr: constraint.as_scalar().unwrap().clone(),
+                            });
+                        }
+                        (ast::Operator::Equals, None, Some(vs)) => {
+                            where_clause[constraint.where_clause_pos.0].consumed = true;
+                            joined_tables[table_idx].op = Operation::Search(Search::RowidManyEq {
+                                values: vs.to_vec(),
+                            });
+                        }
+                        _ => {
+                            joined_tables[table_idx].op = Operation::Search(Search::Seek {
+                                index: None,
+                                seek_def: build_seek_def_from_constraints(
+                                    &constraints_per_table[table_idx].constraints,
+                                    constraint_refs,
+                                    *iter_dir,
+                                )?,
+                            });
+                        }
+                    }
                 }
             }
             AccessMethodParams::VirtualTable {
@@ -493,7 +547,7 @@ fn build_vtab_scan_op(
         if usage.omit {
             where_clause[constraint.where_clause_pos.0].consumed = true;
         }
-        let expr = constraint.get_constraining_expr(where_clause);
+        let expr = constraint.as_scalar().unwrap().clone();
         constraints[zero_based_argv_index] = Some(expr);
         arg_count += 1;
     }
@@ -965,7 +1019,6 @@ pub fn build_seek_def_from_constraints(
     constraints: &[Constraint],
     constraint_refs: &[ConstraintRef],
     iter_dir: IterationDirection,
-    where_clause: &[WhereTerm],
 ) -> Result<SeekDef> {
     assert!(
         !constraint_refs.is_empty(),
@@ -974,7 +1027,7 @@ pub fn build_seek_def_from_constraints(
     // Extract the key values and operators
     let key = constraint_refs
         .iter()
-        .map(|cref| cref.as_seek_key_column(constraints, where_clause))
+        .map(|cref| cref.as_seek_key_column(constraints))
         .collect();
 
     // We know all but potentially the last term is an equality, so we can use the operator of the last term
@@ -1011,7 +1064,7 @@ pub fn build_seek_def_from_constraints(
 /// since a descending index is laid out in reverse order, the comparison operators are reversed, e.g. LT becomes GT, LE becomes GE, etc.
 /// So when you see e.g. a SeekOp::GT below for a descending index, it actually means that we are seeking the first row where the index key is LESS than the seek key.
 ///
-fn build_seek_def(
+pub fn build_seek_def(
     op: ast::Operator,
     iter_dir: IterationDirection,
     key: Vec<(ast::Expr, SortOrder)>,

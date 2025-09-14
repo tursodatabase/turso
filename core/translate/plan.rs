@@ -763,6 +763,8 @@ impl Operation {
             Operation::Scan(_) => None,
             Operation::Search(Search::RowidEq { .. }) => None,
             Operation::Search(Search::Seek { index, .. }) => index.as_ref(),
+            Operation::Search(Search::SeekManyEq { index, .. }) => index.as_ref(),
+            Operation::Search(Search::RowidManyEq { .. }) => None,
         }
     }
 
@@ -775,6 +777,13 @@ impl Operation {
                     return false;
                 };
                 index.unique && seek_def.seek.as_ref().is_some_and(|seek| seek.op.eq_only())
+            }
+            Operation::Search(Search::RowidManyEq { .. }) => false,
+            Operation::Search(Search::SeekManyEq { index, .. }) => {
+                let Some(index) = index else {
+                    return false;
+                };
+                index.unique
             }
         }
     }
@@ -1036,15 +1045,30 @@ pub enum Scan {
 
 /// An enum that represents a search operation that can be used to search for a row in a table using an index
 /// (i.e. a primary key or a secondary index)
-#[allow(clippy::enum_variant_names)]
+#[allow(clippy::enum_variant_names, clippy::vec_box)]
 #[derive(Clone, Debug)]
 pub enum Search {
     /// A rowid equality point lookup. This is a special case that uses the SeekRowid bytecode instruction and does not loop.
-    RowidEq { cmp_expr: ast::Expr },
+    RowidEq {
+        cmp_expr: ast::Expr,
+    },
+    RowidManyEq {
+        values: Vec<Box<ast::Expr>>,
+    },
     /// A search on a table btree (via `rowid`) or a secondary index search. Uses bytecode instructions like SeekGE, SeekGT etc.
     Seek {
         index: Option<Arc<Index>>,
         seek_def: SeekDef,
+    },
+    SeekManyEq {
+        index: Option<Arc<Index>>,
+        // key_prefix excludes the IN-column and holds any preceding equality keys (possibly empty)
+        key_prefix: Vec<(ast::Expr, SortOrder)>,
+        // IN values for the IN-key column (deduped, constants/params)
+        in_values: Vec<Box<ast::Expr>>,
+        // sort order of the IN column in the chosen index
+        in_col_sort: SortOrder,
+        iter_dir: IterationDirection,
     },
 }
 

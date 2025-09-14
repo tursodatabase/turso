@@ -525,8 +525,9 @@ fn count_plan_required_cursors(plan: &SelectPlan) -> usize {
         .map(|t| match &t.op {
             Operation::Scan { .. } => 1,
             Operation::Search(search) => match search {
-                Search::RowidEq { .. } => 1,
-                Search::Seek { index, .. } => 1 + index.is_some() as usize,
+                Search::RowidEq { .. }|Search::RowidManyEq{ .. } => 1,
+                Search::Seek { index, .. } |
+                Search::SeekManyEq{index, .. } => 1 + index.is_some() as usize,
             }
         } + if let Table::FromClauseSubquery(from_clause_subquery) = &t.table {
             count_plan_required_cursors(&from_clause_subquery.plan)

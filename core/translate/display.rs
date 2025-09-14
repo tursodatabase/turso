@@ -102,7 +102,10 @@ impl Display for SelectPlan {
                     writeln!(f, "{indent}SCAN {table_name}")?;
                 }
                 Operation::Search(search) => match search {
-                    Search::RowidEq { .. } | Search::Seek { index: None, .. } => {
+                    Search::RowidEq { .. }
+                    | Search::RowidManyEq { .. }
+                    | Search::Seek { index: None, .. }
+                    | Search::SeekManyEq { index: None, .. } => {
                         writeln!(
                             f,
                             "{}SEARCH {} USING INTEGER PRIMARY KEY (rowid=?)",
@@ -110,6 +113,9 @@ impl Display for SelectPlan {
                         )?;
                     }
                     Search::Seek {
+                        index: Some(index), ..
+                    }
+                    | Search::SeekManyEq {
                         index: Some(index), ..
                     } => {
                         writeln!(
@@ -144,7 +150,10 @@ impl Display for DeletePlan {
                     writeln!(f, "{indent}DELETE FROM {table_name}")?;
                 }
                 Operation::Search(search) => match search {
-                    Search::RowidEq { .. } | Search::Seek { index: None, .. } => {
+                    Search::RowidEq { .. }
+                    | Search::RowidManyEq { .. }
+                    | Search::Seek { index: None, .. }
+                    | Search::SeekManyEq { index: None, .. } => {
                         writeln!(
                             f,
                             "{}SEARCH {} USING INTEGER PRIMARY KEY (rowid=?)",
@@ -152,6 +161,9 @@ impl Display for DeletePlan {
                         )?;
                     }
                     Search::Seek {
+                        index: Some(index), ..
+                    }
+                    | Search::SeekManyEq {
                         index: Some(index), ..
                     } => {
                         writeln!(
@@ -198,7 +210,10 @@ impl fmt::Display for UpdatePlan {
                     }
                 }
                 Operation::Search(search) => match search {
-                    Search::RowidEq { .. } | Search::Seek { index: None, .. } => {
+                    Search::RowidEq { .. }
+                    | Search::RowidManyEq { .. }
+                    | Search::Seek { index: None, .. }
+                    | Search::SeekManyEq { index: None, .. } => {
                         writeln!(
                             f,
                             "{}SEARCH {} USING INTEGER PRIMARY KEY (rowid=?)",
@@ -206,6 +221,9 @@ impl fmt::Display for UpdatePlan {
                         )?;
                     }
                     Search::Seek {
+                        index: Some(index), ..
+                    }
+                    | Search::SeekManyEq {
                         index: Some(index), ..
                     } => {
                         writeln!(
