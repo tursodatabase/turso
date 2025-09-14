@@ -25,3 +25,6 @@ tracing = { workspace = true }
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
 turso_core = { path = "../core", features = ["simulator"]}
 turso_parser = { workspace = true }
+
+[features]
+checksum = ["turso_core/checksum"]

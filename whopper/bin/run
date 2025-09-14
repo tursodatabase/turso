@@ -2,6 +2,17 @@
 
 set -e
 
-cargo build -p turso_whopper
+# Check for special build time flags (e.g. `--enable-checksums`)
+FEATURES=""
+ARGS=()
+for arg in "$@"; do
+    if [[ "$arg" == "--enable-checksums" ]]; then
+        FEATURES="--features checksum"
+    else
+        ARGS+=("$arg")
+    fi
+done
 
-time RUST_BACKTRACE=full ./target/debug/turso_whopper $*
+cargo build $FEATURES -p turso_whopper
+
+time RUST_BACKTRACE=full ./target/debug/turso_whopper "${ARGS[@]}"
