@@ -1262,19 +1262,50 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     ///
     /// This is used for IMMEDIATE and EXCLUSIVE transaction types where we need
     /// to ensure exclusive write access as per SQLite semantics.
-    pub fn begin_exclusive_tx(&self, pager: Rc<Pager>) -> Result<IOResult<TxID>> {
-        let tx_id = self.get_tx_id();
+    pub fn begin_exclusive_tx(
+        &self,
+        pager: Rc<Pager>,
+        maybe_existing_tx_id: Option<TxID>,
+    ) -> Result<IOResult<TxID>> {
+        self._begin_exclusive_tx(pager, false, maybe_existing_tx_id)
+    }
+
+    /// Upgrades a read transaction to an exclusive write transaction.
+    ///
+    /// This is used for IMMEDIATE and EXCLUSIVE transaction types where we need
+    /// to ensure exclusive write access as per SQLite semantics.
+    pub fn upgrade_to_exclusive_tx(
+        &self,
+        pager: Rc<Pager>,
+        maybe_existing_tx_id: Option<TxID>,
+    ) -> Result<IOResult<TxID>> {
+        self._begin_exclusive_tx(pager, true, maybe_existing_tx_id)
+    }
+
+    /// Begins an exclusive write transaction that prevents concurrent writes.
+    ///
+    /// This is used for IMMEDIATE and EXCLUSIVE transaction types where we need
+    /// to ensure exclusive write access as per SQLite semantics.
+    fn _begin_exclusive_tx(
+        &self,
+        pager: Rc<Pager>,
+        is_upgrade_from_read: bool,
+        maybe_existing_tx_id: Option<TxID>,
+    ) -> Result<IOResult<TxID>> {
+        let tx_id = maybe_existing_tx_id.unwrap_or_else(|| self.get_tx_id());
         let begin_ts = self.get_timestamp();
 
         self.acquire_exclusive_tx(&tx_id)?;
 
         // Try to acquire the pager read lock
-        match pager.begin_read_tx()? {
-            LimboResult::Busy => {
-                self.release_exclusive_tx(&tx_id);
-                return Err(LimboError::Busy);
+        if !is_upgrade_from_read {
+            match pager.begin_read_tx()? {
+                LimboResult::Busy => {
+                    self.release_exclusive_tx(&tx_id);
+                    return Err(LimboError::Busy);
+                }
+                LimboResult::Ok => {}
             }
-            LimboResult::Ok => {}
         }
         let locked = self.commit_coordinator.pager_commit_lock.write();
         if !locked {
@@ -1287,7 +1318,9 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             LimboResult::Busy => {
                 tracing::debug!("begin_exclusive_tx: tx_id={} failed with Busy", tx_id);
                 // Failed to get pager lock - release our exclusive lock
-                panic!("begin_exclusive_tx: tx_id={tx_id} failed with Busy, this should never happen as we were able to lock mvcc exclusive write lock");
+                self.commit_coordinator.pager_commit_lock.unlock();
+                self.release_exclusive_tx(&tx_id);
+                return Err(LimboError::Busy);
             }
             LimboResult::Ok => {
                 let tx = Transaction::new(tx_id, begin_ts);
@@ -1336,7 +1369,6 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         pager: Rc<Pager>,
         connection: &Arc<Connection>,
     ) -> Result<StateMachine<CommitStateMachine<Clock>>> {
-        tracing::trace!("commit_tx(tx_id={})", tx_id);
         let state_machine: StateMachine<CommitStateMachine<Clock>> =
             StateMachine::<CommitStateMachine<Clock>>::new(CommitStateMachine::new(
                 CommitState::Initial,

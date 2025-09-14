@@ -2171,7 +2171,7 @@ pub fn op_transaction(
                     mv_store.begin_tx(pager.clone())
                 }
                 TransactionMode::Write => {
-                    return_if_io!(mv_store.begin_exclusive_tx(pager.clone()))
+                    return_if_io!(mv_store.begin_exclusive_tx(pager.clone(), None))
                 }
             };
             conn.mv_transactions.borrow_mut().push(tx_id);
@@ -2180,11 +2180,13 @@ pub fn op_transaction(
             && matches!(new_transaction_state, TransactionState::Write { .. })
             && matches!(tx_mode, TransactionMode::Write)
         {
-            // For MVCC with concurrent transactions, we don't need to upgrade to exclusive.
-            // The existing MVCC transaction can handle both reads and writes.
-            // We only upgrade to exclusive for IMMEDIATE/EXCLUSIVE transaction modes.
-            // Since we already have an MVCC transaction from BEGIN CONCURRENT,
-            // we can just continue using it for writes.
+            let is_upgrade_from_read = matches!(current_state, TransactionState::Read);
+            let tx_id = program.connection.mv_tx_id.get().unwrap();
+            if is_upgrade_from_read {
+                return_if_io!(mv_store.upgrade_to_exclusive_tx(pager.clone(), Some(tx_id)));
+            } else {
+                return_if_io!(mv_store.begin_exclusive_tx(pager.clone(), Some(tx_id)));
+            }
         }
     } else {
         if matches!(tx_mode, TransactionMode::Concurrent) {
