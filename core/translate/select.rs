@@ -487,6 +487,17 @@ fn prepare_one_select_plan(
                 key.push((o.expr, o.order.unwrap_or(ast::SortOrder::Asc)));
             }
             plan.order_by = key;
+            //If the group by has the same number of expressions as the order by, then sqlite uses the sort order of order by for group by.
+            if plan.group_by.is_some()
+                && plan.group_by.as_ref().unwrap().exprs.len() == plan.order_by.len()
+            {
+                plan.group_by.as_mut().unwrap().sort_order = Some(
+                    plan.order_by
+                        .iter()
+                        .map(|(_, sort_order)| *sort_order)
+                        .collect(),
+                );
+            }
 
             // Parse the LIMIT/OFFSET clause
             (plan.limit, plan.offset) = limit.map_or(Ok((None, None)), |mut l| {
