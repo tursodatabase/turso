@@ -472,13 +472,6 @@ impl OngoingCheckpoint {
     }
 
     #[inline]
-    fn is_final_write(&self) -> bool {
-        self.current_page as usize >= self.pages_to_checkpoint.len()
-            && self.inflight_reads.is_empty()
-            && !self.pending_writes.is_empty()
-    }
-
-    #[inline]
     /// Whether or not new reads should be issued during checkpoint processing.
     fn should_issue_reads(&self) -> bool {
         (self.current_page as usize) < self.pages_to_checkpoint.len()
@@ -1585,11 +1578,7 @@ impl Wal for WalFile {
             }
         };
 
-        let c = if db_size_on_commit.is_some() {
-            Completion::new_write_linked(cmp)
-        } else {
-            Completion::new_write(cmp)
-        };
+        let c = Completion::new_write_linked(cmp);
 
         let shared = self.get_shared();
         assert!(
@@ -1930,10 +1919,7 @@ impl WalFile {
                         let batch_map = self.ongoing_checkpoint.pending_writes.take();
                         if !batch_map.is_empty() {
                             let done_flag = self.ongoing_checkpoint.add_write();
-                            let is_final = self.ongoing_checkpoint.is_final_write();
-                            completions.extend(write_pages_vectored(
-                                pager, batch_map, done_flag, is_final,
-                            )?);
+                            completions.extend(write_pages_vectored(pager, batch_map, done_flag)?);
                         }
                     }
 
