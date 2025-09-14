@@ -30,6 +30,9 @@ struct Args {
     /// Keep mmap I/O files on disk after run
     #[arg(long)]
     keep: bool,
+    /// Disable creation and manipulation of indexes
+    #[arg(long)]
+    disable_indexes: bool,
 }
 
 struct SimulatorConfig {
@@ -56,6 +59,7 @@ struct SimulatorContext {
     indexes: Vec<String>,
     opts: Opts,
     stats: Stats,
+    disable_indexes: bool,
 }
 
 #[derive(Default)]
@@ -122,7 +126,11 @@ fn main() -> anyhow::Result<()> {
         boostrap_conn.execute(&sql)?;
     }
 
-    let indexes = create_initial_indexes(&mut rng, &tables);
+    let indexes = if args.disable_indexes {
+        Vec::new()
+    } else {
+        create_initial_indexes(&mut rng, &tables)
+    };
     for create_index in &indexes {
         let sql = create_index.to_string();
         trace!("{}", sql);
@@ -156,6 +164,7 @@ fn main() -> anyhow::Result<()> {
         indexes: indexes.iter().map(|idx| idx.index_name.clone()).collect(),
         opts: Opts::default(),
         stats: Stats::default(),
+        disable_indexes: args.disable_indexes,
     };
 
     let progress_interval = config.max_steps / 10;
@@ -446,17 +455,19 @@ fn perform_work(
                 }
                 70..=71 => {
                     // CREATE INDEX (2%)
-                    let create_index = CreateIndex::arbitrary(rng, context);
-                    let sql = create_index.to_string();
-                    if let Ok(stmt) = context.fibers[fiber_idx].connection.prepare(&sql) {
-                        context.fibers[fiber_idx].statement.replace(Some(stmt));
-                        context.indexes.push(create_index.index_name.clone());
+                    if !context.disable_indexes {
+                        let create_index = CreateIndex::arbitrary(rng, context);
+                        let sql = create_index.to_string();
+                        if let Ok(stmt) = context.fibers[fiber_idx].connection.prepare(&sql) {
+                            context.fibers[fiber_idx].statement.replace(Some(stmt));
+                            context.indexes.push(create_index.index_name.clone());
+                        }
+                        trace!("{} CREATE INDEX: {}", fiber_idx, sql);
                     }
-                    trace!("{} CREATE INDEX: {}", fiber_idx, sql);
                 }
                 72..=73 => {
                     // DROP INDEX (2%)
-                    if !context.indexes.is_empty() {
+                    if !context.disable_indexes && !context.indexes.is_empty() {
                         let index_idx = rng.random_range(0..context.indexes.len());
                         let index_name = context.indexes.remove(index_idx);
                         let drop_index = DropIndex { index_name };
