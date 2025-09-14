@@ -520,6 +520,8 @@ fn test_lost_update() {
         db.mvcc_store.update(tx3, tx3_row),
         Err(LimboError::WriteWriteConflict)
     ));
+    // hack: in the actual tursodb database we rollback the mvcc tx ourselves, so manually roll it back here
+    db.mvcc_store.rollback_tx(tx3, conn3.pager.borrow().clone());
 
     commit_tx(db.mvcc_store.clone(), &conn2, tx2).unwrap();
     assert!(matches!(
