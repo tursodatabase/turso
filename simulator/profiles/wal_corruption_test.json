@@ -1,0 +1,27 @@
+{
+  "query": {
+    "select_weight": 40,
+    "insert_weight": 40,
+    "update_weight": 10,
+    "delete_weight": 10,
+    "create_table_weight": 5,
+    "create_index_weight": 3,
+    "drop_table_weight": 2
+  },
+  "io": {
+    "enable": true,
+    "fault": {
+      "enable": true,
+      "write": true,
+      "read": true,
+      "sync": true
+    },
+    "latency": {
+      "enable": true,
+      "latency_probability": 25,
+      "min_tick": 1,
+      "max_tick": 15
+    }
+  },
+  "experimental_mvcc": false
+}
