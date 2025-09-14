@@ -189,6 +189,16 @@ pub enum Insn {
         rhs: usize,
         dest: usize,
     },
+    /// Updates the value of register dest_reg to the maximum of its current
+    /// value and the value in src_reg.
+    /// 
+    ///    - dest_reg = max(int(dest_reg), int(src_reg))
+    /// 
+    /// Both registers are converted to integers before the comparison.
+    MemMax {
+        dest_reg: usize, // P1
+        src_reg: usize,  // P2
+    },
     /// Divide lhs by rhs and store the result in a third register.
     Divide {
         lhs: usize,
@@ -1139,6 +1149,7 @@ impl Insn {
             Insn::Last { .. } => execute::op_last,
             Insn::Column { .. } => execute::op_column,
             Insn::TypeCheck { .. } => execute::op_type_check,
+            Insn::MemMax { .. } => execute::op_mem_max,
             Insn::MakeRecord { .. } => execute::op_make_record,
             Insn::ResultRow { .. } => execute::op_result_row,
             Insn::Next { .. } => execute::op_next,

@@ -1895,6 +1895,29 @@ pub fn op_make_record(
     Ok(InsnFunctionStepResult::Step)
 }
 
+pub fn op_mem_max(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Rc<Pager>,
+    mv_store: Option<&Arc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(MemMax { dest_reg, src_reg }, insn);
+
+    let dest_val = state.registers[*dest_reg].get_value();
+    let src_val = state.registers[*src_reg].get_value();
+
+    let dest_int = extract_int_value(dest_val);
+    let src_int = extract_int_value(src_val);
+
+    if dest_int < src_int {
+        state.registers[*dest_reg] = Register::Value(Value::Integer(src_int));
+    }
+
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
 pub fn op_result_row(
     program: &Program,
     state: &mut ProgramState,

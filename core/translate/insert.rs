@@ -479,41 +479,28 @@ pub fn translate_insert(
 
     program.preassign_label_to_next_insn(key_generation_label);
     if btree_table.has_autoincrement {
+        
         let (_, r_seq, _, _) = autoincrement_meta.unwrap();
         let r_max = program.alloc_register();
 
         let dummy_reg = program.alloc_register();
+
         program.emit_insn(Insn::NewRowid {
             cursor: cursor_id,
             rowid_reg: dummy_reg,
             prev_largest_reg: r_max,
         });
 
-        let r_max_is_bigger_label = program.allocate_label();
-        let continue_label = program.allocate_label();
-        program.emit_insn(Insn::Ge {
-            lhs: r_max,
-            rhs: r_seq,
-            target_pc: r_max_is_bigger_label,
-            flags: Default::default(),
-            collation: None,
-        });
+
         program.emit_insn(Insn::Copy {
             src_reg: r_seq,
             dst_reg: insertion.key_register(),
             extra_amount: 0,
         });
-        program.emit_insn(Insn::Goto {
-            target_pc: continue_label,
-        });
-
-        program.preassign_label_to_next_insn(r_max_is_bigger_label);
-        program.emit_insn(Insn::Copy {
+        program.emit_insn(Insn::MemMax {
+            dest_reg: insertion.key_register(),
             src_reg: r_max,
-            dst_reg: insertion.key_register(),
-            extra_amount: 0,
         });
-        program.preassign_label_to_next_insn(continue_label);
 
         let no_overflow_label = program.allocate_label();
         let max_i64_reg = program.alloc_register();
