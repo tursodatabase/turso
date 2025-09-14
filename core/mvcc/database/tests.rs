@@ -1381,3 +1381,30 @@ fn test_batch_writes() {
     }
     println!("start: {start} end: {end}");
 }
+
+#[test]
+fn transaction_display() {
+    let state = AtomicTransactionState::from(TransactionState::Preparing);
+    let tx_id = 42;
+    let begin_ts = 20250914;
+
+    let write_set = SkipSet::new();
+    write_set.insert(RowID::new(1, 11));
+    write_set.insert(RowID::new(1, 13));
+
+    let read_set = SkipSet::new();
+    read_set.insert(RowID::new(2, 17));
+    read_set.insert(RowID::new(2, 19));
+
+    let tx = Transaction {
+        state,
+        tx_id,
+        begin_ts,
+        write_set,
+        read_set,
+    };
+
+    let expected = "{ state: Preparing, id: 42, begin_ts: 20250914, write_set: [RowID { table_id: 1, row_id: 11 }, RowID { table_id: 1, row_id: 13 }], read_set: [RowID { table_id: 2, row_id: 17 }, RowID { table_id: 2, row_id: 19 }] }";
+    let output = format!("{tx}");
+    assert_eq!(output, expected);
+}
