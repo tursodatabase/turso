@@ -505,10 +505,10 @@ async fn test_multiple_connections_fuzz_mvcc() {
             weight_ddl: 0,
             weight_dml: 76,
             dml_gen_options: DmlGenOptions {
-                weight_insert: 34,
-                weight_delete: 33,
-                weight_select: 33,
-                weight_update: 0,
+                weight_insert: 25,
+                weight_delete: 25,
+                weight_select: 25,
+                weight_update: 25,
             },
         },
         ..FuzzOptions::default()
