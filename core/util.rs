@@ -1,6 +1,7 @@
 #![allow(unused)]
 use crate::incremental::view::IncrementalView;
 use crate::numeric::StrToF64;
+use crate::translate::emitter::TransactionMode;
 use crate::translate::expr::WalkControl;
 use crate::types::IOResult;
 use crate::{
@@ -150,10 +151,10 @@ pub fn parse_schema_rows(
     mut rows: Statement,
     schema: &mut Schema,
     syms: &SymbolTable,
-    mv_tx_id: Option<u64>,
+    mv_tx: Option<(u64, TransactionMode)>,
     mut existing_views: HashMap<String, Arc<Mutex<IncrementalView>>>,
 ) -> Result<()> {
-    rows.set_mv_tx_id(mv_tx_id);
+    rows.set_mv_tx(mv_tx);
     // TODO: if we IO, this unparsed indexes is lost. Will probably need some state between
     // IO runs
     let mut from_sql_indexes = Vec::with_capacity(10);

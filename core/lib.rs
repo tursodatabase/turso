@@ -40,7 +40,6 @@ pub mod numeric;
 #[cfg(not(feature = "fuzz"))]
 mod numeric;
 
-use crate::incremental::view::AllViewsTxState;
 use crate::storage::checksum::CHECKSUM_REQUIRED_RESERVED_BYTES;
 use crate::storage::encryption::CipherMode;
 use crate::translate::pragma::TURSO_CDC_DEFAULT_TABLE_NAME;
@@ -50,6 +49,7 @@ use crate::types::{WalFrameInfo, WalState};
 use crate::util::{OpenMode, OpenOptions};
 use crate::vdbe::metrics::ConnectionMetrics;
 use crate::vtab::VirtualTable;
+use crate::{incremental::view::AllViewsTxState, translate::emitter::TransactionMode};
 use core::str;
 pub use error::{CompletionError, LimboError};
 pub use io::clock::{Clock, Instant};
@@ -464,7 +464,6 @@ impl Database {
             ),
             database_schemas: RefCell::new(std::collections::HashMap::new()),
             auto_commit: Cell::new(true),
-            mv_transactions: RefCell::new(Vec::new()),
             transaction_state: Cell::new(TransactionState::None),
             last_insert_rowid: Cell::new(0),
             last_change: Cell::new(0),
@@ -478,7 +477,7 @@ impl Database {
             closed: Cell::new(false),
             attached_databases: RefCell::new(DatabaseCatalog::new()),
             query_only: Cell::new(false),
-            mv_tx_id: Cell::new(None),
+            mv_tx: Cell::new(None),
             view_transaction_states: AllViewsTxState::new(),
             metrics: RefCell::new(ConnectionMetrics::new()),
             is_nested_stmt: Cell::new(false),
@@ -944,8 +943,6 @@ pub struct Connection {
     database_schemas: RefCell<std::collections::HashMap<usize, Arc<Schema>>>,
     /// Whether to automatically commit transaction
     auto_commit: Cell<bool>,
-    /// Transactions that are in progress.
-    mv_transactions: RefCell<Vec<crate::mvcc::database::TxID>>,
     transaction_state: Cell<TransactionState>,
     last_insert_rowid: Cell<i64>,
     last_change: Cell<i64>,
@@ -964,7 +961,7 @@ pub struct Connection {
     /// Attached databases
     attached_databases: RefCell<DatabaseCatalog>,
     query_only: Cell<bool>,
-    pub(crate) mv_tx_id: Cell<Option<crate::mvcc::database::TxID>>,
+    pub(crate) mv_tx: Cell<Option<(crate::mvcc::database::TxID, TransactionMode)>>,
 
     /// Per-connection view transaction states for uncommitted changes. This represents
     /// one entry per view that was touched in the transaction.
@@ -2148,8 +2145,8 @@ impl Statement {
         self.program.n_change.get()
     }
 
-    pub fn set_mv_tx_id(&mut self, mv_tx_id: Option<u64>) {
-        self.program.connection.mv_tx_id.set(mv_tx_id);
+    pub fn set_mv_tx(&mut self, mv_tx: Option<(u64, TransactionMode)>) {
+        self.program.connection.mv_tx.set(mv_tx);
     }
 
     pub fn interrupt(&mut self) {

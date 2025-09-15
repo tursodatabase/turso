@@ -185,7 +185,7 @@ pub enum OperationMode {
     DELETE,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 /// Sqlite always considers Read transactions implicit
 pub enum TransactionMode {
     None,
