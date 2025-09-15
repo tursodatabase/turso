@@ -1666,7 +1666,6 @@ fn build_inlist_ephemeral(
     in_values: &[Box<Expr>],
     index_name_hint: &str,
 ) -> CursorID {
-    // Describe a 1-col ephemeral index (same shape we already use for DISTINCT, etc.).
     let idx_name = format!(
         "inlist_rhs_{}_{}",
         index_name_hint,
@@ -1681,7 +1680,7 @@ fn build_inlist_ephemeral(
             name: "in_rhs".to_string(),
             order: SortOrder::Asc,
             pos_in_table: 0,
-            collation: None, // TODO: if you track collation on the constrained column, put it here
+            collation: None,
             default: None,
         }],
         unique: false,

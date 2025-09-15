@@ -378,3 +378,39 @@ do_execsql_test_on_specific_db {:memory:} rowid-update-updates-all-indexes {
 } {2|3|1
 2|3|1
 2|3|1}
+
+# UPDATE using ROWID alias (INTEGER PRIMARY KEY) with IN-list (RowidManyEq)
+do_execsql_test_on_specific_db {:memory:} update-rowid-inlist {
+  CREATE TABLE t1(x INTEGER PRIMARY KEY, y INT);
+  INSERT INTO t1(x,y) VALUES (1,10),(2,20),(3,30),(4,40),(5,50);
+  UPDATE t1 SET y = y + 1 WHERE x IN (2,4,99,NULL,2);
+  SELECT x,y FROM t1 ORDER BY x;
+} {1|10
+2|21
+3|30
+4|41
+5|50}
+
+# UPDATE using explicit ROWID keyword (not the alias name) with IN-list
+do_execsql_test_on_specific_db {:memory:} update-explicit-rowid-inlist {
+  CREATE TABLE t3(a INT, b TEXT);       -- has an implicit rowid
+  INSERT INTO t3(a,b) VALUES (10,'b1'),(20,'b2'),(30,'b3');
+  UPDATE t3 SET b = 'X' WHERE rowid IN (1,3,NULL);
+  SELECT rowid,b FROM t3 ORDER BY rowid;
+} {1|X
+2|b2
+3|X}
+
+# UPDATE on indexed non-rowid column with IN-list
+do_execsql_test_on_specific_db {:memory:} update-indexed-col-inlist {
+  CREATE TABLE t4(a INT, b INT);        -- default rowid table, 'a' is not rowid
+  CREATE INDEX t4_a_idx ON t4(a);
+  INSERT INTO t4(a,b) VALUES (11,100),(12,200),(13,300),(14,400),(15,500);
+  UPDATE t4 SET b = b + 1000 WHERE a IN (11,13,17,NULL,11);
+  SELECT a,b FROM t4 ORDER BY a;
+} {11|1100
+12|200
+13|1300
+14|400
+15|500}
+
