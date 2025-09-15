@@ -1099,14 +1099,27 @@ impl Wal for WalFile {
             let epoch = shared_file.read().epoch.load(Ordering::Acquire);
             frame.set_wal_tag(frame_id, epoch);
         });
-        let shared = self.get_shared();
-        assert!(
-            shared.enabled.load(Ordering::Relaxed),
-            "WAL must be enabled"
-        );
-        let file = shared.file.as_ref().unwrap();
+        let file = {
+            let shared = self.get_shared();
+            assert!(
+                shared.enabled.load(Ordering::Relaxed),
+                "WAL must be enabled"
+            );
+            // important not to hold shared lock beyond this point to avoid deadlock scenario where:
+            // thread 1: takes readlock here, passes reference to shared.file to begin_read_wal_frame
+            // thread 2: tries to acquire write lock elsewhere
+            // thread 1: tries to re-acquire read lock in the completion (see 'complete' above)
+            //
+            // this causes a deadlock due to the locking policy in parking_lot:
+            // from https://docs.rs/parking_lot/latest/parking_lot/type.RwLock.html:
+            // "This lock uses a task-fair locking policy which avoids both reader and writer starvation.
+            // This means that readers trying to acquire the lock will block even if the lock is unlocked
+            // when there are writers waiting to acquire the lock.
+            // Because of this, attempts to recursively acquire a read lock within a single thread may result in a deadlock."
+            shared.file.as_ref().unwrap().clone()
+        };
         begin_read_wal_frame(
-            file,
+            &file,
             offset + WAL_FRAME_HEADER_SIZE as u64,
             buffer_pool,
             complete,
