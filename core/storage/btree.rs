@@ -4625,7 +4625,7 @@ impl BTreeCursor {
                         }
                     };
                     let row = crate::mvcc::database::Row::new(row_id, record_buf, num_columns);
-                    mv_cursor.borrow_mut().insert(row).unwrap();
+                    mv_cursor.borrow_mut().insert(row)?;
                 }
                 None => todo!("Support mvcc inserts with index btrees"),
             },
