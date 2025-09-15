@@ -114,6 +114,7 @@ pub struct TranslateCtx<'a> {
     // label for the instruction that jumps to the next phase of the query after the main loop
     // we don't know ahead of time what that is (GROUP BY, ORDER BY, etc.)
     pub label_main_loop_end: Option<BranchOffset>,
+    pub loop_body_entry: Option<BranchOffset>,
     // First register of the aggregation results
     pub reg_agg_start: Option<usize>,
     // In non-group-by statements with aggregations (e.g. SELECT foo, bar, sum(baz) FROM t),
@@ -161,6 +162,7 @@ impl<'a> TranslateCtx<'a> {
             labels_main_loop: (0..table_count).map(|_| LoopLabels::new(program)).collect(),
             after_row_jump: (0..table_count).map(|_| None).collect(),
             label_main_loop_end: None,
+            loop_body_entry: None,
             reg_agg_start: None,
             reg_nonagg_emit_once_flag: None,
             limit_ctx: None,
@@ -448,6 +450,10 @@ fn emit_program_for_delete(
         None,
     )?;
 
+    let body = t_ctx
+        .loop_body_entry
+        .expect("loop body label must be set by open_loop");
+    program.preassign_label_to_next_insn(body);
     emit_delete_insns(
         program,
         &mut t_ctx,
@@ -778,6 +784,10 @@ fn emit_program_for_update(
         temp_cursor_id,
     )?;
 
+    let body = t_ctx
+        .loop_body_entry
+        .expect("loop body label must be set by open_loop");
+    program.preassign_label_to_next_insn(body);
     // Emit update instructions
     emit_update_insns(&plan, &t_ctx, program, index_cursors, temp_cursor_id)?;
 
@@ -1396,8 +1406,14 @@ fn emit_update_insns(
             target_pc: t_ctx.label_main_loop_end.unwrap(),
         })
     }
-    // TODO(pthorpe): handle RETURNING clause
+    // If this table’s loop is driven by a SeekManyEq RHS driver, advance it.
+    if let Some(rhs_advance) = t_ctx.after_row_jump.first().and_then(|x| *x) {
+        program.emit_insn(Insn::Goto {
+            target_pc: rhs_advance,
+        });
+    }
 
+    // TODO(pthorpe): handle RETURNING clause
     if let Some(label) = check_rowid_not_exists_label {
         program.preassign_label_to_next_insn(label);
     }

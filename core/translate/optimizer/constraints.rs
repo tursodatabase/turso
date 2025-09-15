@@ -1,7 +1,7 @@
 use std::{cmp::Ordering, collections::HashMap, sync::Arc};
 
 use crate::{
-    schema::{Column, Index},
+    schema::{Column, Index, Table},
     translate::{
         expr::as_binary_components,
         plan::{JoinOrderMember, TableReferences, WhereTerm},
@@ -50,6 +50,7 @@ pub struct Constraint {
     /// expected to satisfy this constraint. Used for cost and cardinality estimation.
     pub selectivity: f64,
     pub rhs: ConstraintRhs,
+    pub is_rowid: bool,
 }
 
 #[allow(clippy::vec_box)]
@@ -218,42 +219,55 @@ pub fn constraints_from_where_clause(
         });
 
         for (i, term) in where_clause.iter().enumerate() {
-            if let ast::Expr::InList { lhs, rhs, not, .. } = &term.expr {
+            // Handle multi-value RHS (InList)
+            if let ast::Expr::InList { lhs, rhs, not } = &term.expr {
                 if *not {
                     // TODO
                     continue;
                 }
-                // Only consider if LHS is a column (or rowid) of this table
-                let (_tbl_id, col_pos, _is_rowid) = match &**lhs {
+                // Only consider if LHS is a column/rowid of this table
+                let (col_pos, is_rowid) = match &**lhs {
                     ast::Expr::Column { table, column, .. }
                         if *table == table_reference.internal_id =>
                     {
-                        (*table, *column, false)
+                        (
+                            *column,
+                            table_reference.table.columns()[*column].is_rowid_alias,
+                        )
                     }
-                    ast::Expr::RowId { table, .. }
-                        if *table == table_reference.internal_id
-                            && rowid_alias_column.is_some() =>
-                    {
-                        (*table, rowid_alias_column.unwrap(), true)
+                    ast::Expr::RowId { table, .. } if *table == table_reference.internal_id => {
+                        (rowid_alias_column.unwrap_or(0), true)
                     }
                     _ => {
                         continue;
                     }
                 };
+                let (collation_name, base_sel) = if is_rowid {
+                    // Rowid has no collation, equality on rowid is unique-ish
+                    ("".to_string(), SELECTIVITY_UNIQUE_EQUALITY)
+                } else {
+                    let col = &table_reference.table.columns()[col_pos];
+                    (
+                        col.collation.unwrap_or_default().to_string(),
+                        estimate_selectivity(col, ast::Operator::Equals),
+                    )
+                };
 
                 // Normalize RHS: strip NULLs, flatten and dedup constants/params
                 let mut values = Vec::<Box<ast::Expr>>::with_capacity(rhs.len());
                 let mut seen = std::collections::HashSet::<(bool, String, Vec<u8>)>::new();
-                let col = &table_reference.table.columns()[col_pos];
-
                 for e in rhs.iter() {
                     if matches!(&**e, ast::Expr::Literal(ast::Literal::Null)) {
+                        continue;
+                    }
+                    // don't use expressions that reference other tables
+                    if !table_mask_from_expr(e, table_references)?.is_empty() {
                         continue;
                     }
                     let key = e.to_string();
                     if seen.insert((
                         matches!(&**e, ast::Expr::Literal(_)),
-                        col.collation.unwrap_or_default().to_string(),
+                        collation_name.clone(),
                         key.into_bytes(),
                     )) {
                         values.push(e.clone());
@@ -262,9 +276,10 @@ pub fn constraints_from_where_clause(
                 if values.is_empty() {
                     continue;
                 }
-                let base = estimate_selectivity(col, ast::Operator::Equals);
-                let sel = (values.len() as f64 * base).min(1.0);
-                let rhs_constraint = if rhs.len().eq(&1) {
+                let sel = (values.len() as f64 * base_sel).min(1.0);
+
+                // if we have WHERE x IN (5), treat as scalar equality
+                let rhs_constraint = if values.len().eq(&1) {
                     ConstraintRhs::Scalar(values.into_iter().next().unwrap())
                 } else {
                     ConstraintRhs::InList(values)
@@ -277,6 +292,7 @@ pub fn constraints_from_where_clause(
                     lhs_mask: TableMask::new(),
                     selectivity: sel,
                     rhs: rhs_constraint,
+                    is_rowid,
                 });
                 continue;
             }
@@ -305,25 +321,33 @@ pub fn constraints_from_where_clause(
                             lhs_mask: table_mask_from_expr(rhs, table_references)?,
                             selectivity: estimate_selectivity(table_column, operator),
                             rhs: ConstraintRhs::Scalar(Box::new(rhs.clone())),
+                            is_rowid: table_column.is_rowid_alias,
                         });
                     }
                 }
-                ast::Expr::RowId { table, .. } => {
+                ast::Expr::RowId { table, .. } if *table == table_reference.internal_id => {
                     // A rowid alias column must exist for the 'rowid' keyword to be considered a valid reference.
                     // This should be a parse error at an earlier stage of the query compilation, but nevertheless,
                     // we check it here.
-                    if *table == table_reference.internal_id && rowid_alias_column.is_some() {
-                        let table_column =
-                            &table_reference.table.columns()[rowid_alias_column.unwrap()];
-                        cs.constraints.push(Constraint {
-                            where_clause_pos: (i, BinaryExprSide::Rhs),
-                            operator,
-                            table_col_pos: rowid_alias_column.unwrap(),
-                            lhs_mask: table_mask_from_expr(rhs, table_references)?,
-                            selectivity: estimate_selectivity(table_column, operator),
-                            rhs: ConstraintRhs::Scalar(Box::new(rhs.clone())),
-                        });
+                    if !matches!(&table_reference.table, Table::BTree(b) if b.has_rowid) {
+                        // reject if table has no rowid
+                        continue;
                     }
+                    let (table_col_pos, selectivity) = if let Some(alias_pos) = rowid_alias_column {
+                        let col = &table_reference.table.columns()[alias_pos];
+                        (alias_pos, estimate_selectivity(col, operator))
+                    } else {
+                        (0, SELECTIVITY_UNIQUE_EQUALITY)
+                    };
+                    cs.constraints.push(Constraint {
+                        where_clause_pos: (i, BinaryExprSide::Rhs),
+                        operator,
+                        is_rowid: true,
+                        table_col_pos,
+                        lhs_mask: table_mask_from_expr(rhs, table_references)?,
+                        selectivity,
+                        rhs: ConstraintRhs::Scalar(Box::new(rhs.clone())),
+                    });
                 }
                 _ => {}
             };
@@ -337,23 +361,34 @@ pub fn constraints_from_where_clause(
                             table_col_pos: *column,
                             lhs_mask: table_mask_from_expr(lhs, table_references)?,
                             selectivity: estimate_selectivity(table_column, operator),
+                            is_rowid: table_column.is_rowid_alias,
                             rhs: ConstraintRhs::Scalar(Box::new(lhs.clone())),
                         });
                     }
                 }
-                ast::Expr::RowId { table, .. } => {
-                    if *table == table_reference.internal_id && rowid_alias_column.is_some() {
-                        let table_column =
-                            &table_reference.table.columns()[rowid_alias_column.unwrap()];
-                        cs.constraints.push(Constraint {
-                            where_clause_pos: (i, BinaryExprSide::Lhs),
-                            operator: opposite_cmp_op(operator),
-                            table_col_pos: rowid_alias_column.unwrap(),
-                            lhs_mask: table_mask_from_expr(lhs, table_references)?,
-                            selectivity: estimate_selectivity(table_column, operator),
-                            rhs: ConstraintRhs::Scalar(Box::new(lhs.clone())),
-                        });
+                ast::Expr::RowId { table, .. } if *table == table_reference.internal_id => {
+                    // A rowid alias column must exist for the 'rowid' keyword to be considered a valid reference.
+                    // This should be a parse error at an earlier stage of the query compilation, but nevertheless,
+                    // we check it here.
+                    if !matches!(&table_reference.table, Table::BTree(b) if b.has_rowid) {
+                        // reject if table has no rowid
+                        continue;
                     }
+                    let (table_col_pos, selectivity) = if let Some(alias_pos) = rowid_alias_column {
+                        let col = &table_reference.table.columns()[alias_pos];
+                        (alias_pos, estimate_selectivity(col, operator))
+                    } else {
+                        (0, SELECTIVITY_UNIQUE_EQUALITY)
+                    };
+                    cs.constraints.push(Constraint {
+                        where_clause_pos: (i, BinaryExprSide::Lhs),
+                        operator,
+                        is_rowid: true,
+                        table_col_pos,
+                        lhs_mask: table_mask_from_expr(rhs, table_references)?,
+                        selectivity,
+                        rhs: ConstraintRhs::Scalar(Box::new(lhs.clone())),
+                    });
                 }
                 _ => {}
             };
@@ -372,24 +407,21 @@ pub fn constraints_from_where_clause(
 
         // For each constraint we found, add a reference to it for each index that may be able to use it.
         for (i, constraint) in cs.constraints.iter().enumerate() {
-            if rowid_alias_column == Some(constraint.table_col_pos) {
+            // Rowid constraints -> rowid candidate (index=None)
+            if constraint.is_rowid {
                 let rowid_candidate = cs
                     .candidates
                     .iter_mut()
-                    .find_map(|candidate| {
-                        if candidate.index.is_none() {
-                            Some(candidate)
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap();
+                    .find(|cand| cand.index.is_none())
+                    .expect("rowid candidate must exist");
                 rowid_candidate.refs.push(ConstraintRef {
                     constraint_vec_pos: i,
                     index_col_pos: 0,
                     sort_order: SortOrder::Asc,
                 });
+                continue;
             }
+            // Non-rowid constraints, try matching named indexes
             for index in available_indexes
                 .get(table_reference.table.get_name())
                 .unwrap_or(&Vec::new())

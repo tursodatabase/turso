@@ -6,7 +6,7 @@ use crate::{
     schema::{Affinity, Index, IndexColumn, Table},
     translate::{
         emitter::prepare_cdc_if_necessary,
-        plan::{DistinctCtx, Distinctness, Scan},
+        plan::{DistinctCtx, Distinctness, JoinedTable, Scan},
         result_row::emit_select_result,
     },
     types::SeekOp,
@@ -553,270 +553,22 @@ pub fn open_loop(
                     !matches!(table.table, Table::FromClauseSubquery(_)),
                     "Subqueries do not support index seeks"
                 );
-                match search {
-                    Search::SeekManyEq {
-                        index,
-                        key_prefix,
-                        in_values,
-                        in_col_sort: _in_col_sort,
-                        iter_dir: _,
-                    } => {
-                        let seek_idx_id = if let Some(index) = index {
-                            if index.ephemeral {
-                                let table_has_rowid = if let Table::BTree(btree) = &table.table {
-                                    btree.has_rowid
-                                } else {
-                                    false
-                                };
-                                Some(emit_autoindex(
-                                    program,
-                                    index,
-                                    table_cursor_id.expect("ephemeral index requires table cursor"),
-                                    index_cursor_id.expect("ephemeral index requires index cursor"),
-                                    table_has_rowid,
-                                )?)
-                            } else {
-                                index_cursor_id
-                            }
-                        } else {
-                            index_cursor_id
-                        };
-
-                        let is_index_cursor = seek_idx_id.is_some();
-                        let seek_cursor_id = temp_cursor_id.unwrap_or_else(|| {
-                            seek_idx_id.unwrap_or_else(|| {
-                                table_cursor_id
-                                    .expect("Either index or table cursor must be opened")
-                            })
-                        });
-
-                        // Registers: prefix + 1 slot for RHS value
-                        let key_prefix_len = key_prefix.len();
-                        let start_reg = program.alloc_registers(key_prefix_len + 1);
-
-                        for (i, (expr, _sort)) in key_prefix.iter().enumerate() {
-                            translate_expr_no_constant_opt(
-                                program,
-                                Some(table_references),
-                                expr,
-                                start_reg + i,
-                                &t_ctx.resolver,
-                                NoConstantOptReason::RegisterReuse,
-                            )?;
-                        }
-
-                        // Build RHS ephemeral once
-                        let rhs_cursor = build_inlist_ephemeral(
-                            program,
-                            t_ctx,
-                            table_references,
-                            in_values,
-                            index.as_ref().map(|i| i.name.as_str()).unwrap_or("rowid"),
-                        );
-
-                        let rhs_top = program.allocate_label();
-                        let rhs_next = program.allocate_label();
-
-                        // Rewind RHS, if empty -> loop_end
-                        program.emit_insn(Insn::Rewind {
-                            cursor_id: rhs_cursor,
-                            pc_if_empty: loop_end,
-                        });
-                        program.preassign_label_to_next_insn(rhs_top);
-
-                        program.emit_insn(Insn::Column {
-                            cursor_id: rhs_cursor,
-                            column: 0,
-                            default: None,
-                            dest: start_reg + key_prefix_len,
-                        });
-
-                        // NULL never matches; jump to advance RHS
-                        program.emit_insn(Insn::IsNull {
-                            reg: start_reg + key_prefix_len,
-                            target_pc: rhs_next,
-                        });
-
-                        program.emit_insn(Insn::SeekGE {
-                            is_index: is_index_cursor,
-                            cursor_id: seek_cursor_id,
-                            start_reg,
-                            num_regs: key_prefix_len + 1,
-                            target_pc: rhs_next, // if not found for this RHS value, advance RHS
-                            eq_only: true,
-                        });
-
-                        program.preassign_label_to_next_insn(loop_start);
-                        program.emit_insn(Insn::IdxGT {
-                            // for rowid-cursor use Gt/Ge variants; here we’re on an index cursor
-                            cursor_id: seek_cursor_id,
-                            start_reg,
-                            num_regs: key_prefix_len + 1,
-                            target_pc: rhs_next,
-                        });
-
-                        if let (Some(index_cursor_id), Some(table_cursor_id)) =
-                            (index_cursor_id, table_cursor_id)
-                        {
-                            program.emit_insn(Insn::DeferredSeek {
-                                index_cursor_id,
-                                table_cursor_id,
-                            });
-                        }
-
-                        program.emit_insn(Insn::Goto { target_pc: body });
-
-                        program.preassign_label_to_next_insn(rhs_next);
-                        program.emit_insn(Insn::Next {
-                            cursor_id: rhs_cursor,
-                            pc_if_next: rhs_top,
-                        });
-                        program.emit_insn(Insn::Goto {
-                            target_pc: loop_end,
-                        });
-                    }
-                    Search::RowidManyEq { values } => {
-                        let table_cursor_id =
-                            table_cursor_id.expect("RowidManyEq needs table cursor");
-
-                        // Build RHS ephemeral once (you already have build_inlist_ephemeral)
-                        let rhs_cursor = build_inlist_ephemeral(
-                            program,
-                            t_ctx,
-                            table_references,
-                            values,
-                            "rowid",
-                        );
-
-                        let rhs_top = program.allocate_label();
-                        let rhs_next = program.allocate_label();
-
-                        program.emit_insn(Insn::Rewind {
-                            cursor_id: rhs_cursor,
-                            pc_if_empty: loop_end,
-                        });
-                        program.preassign_label_to_next_insn(rhs_top);
-
-                        let val_reg = program.alloc_register();
-                        program.emit_insn(Insn::Column {
-                            cursor_id: rhs_cursor,
-                            column: 0,
-                            default: None,
-                            dest: val_reg,
-                        });
-                        program.emit_insn(Insn::IsNull {
-                            reg: val_reg,
-                            target_pc: rhs_next,
-                        });
-                        program.emit_insn(Insn::SeekRowid {
-                            cursor_id: table_cursor_id,
-                            src_reg: val_reg,
-                            target_pc: rhs_next, // if not found, advance RHS
-                        });
-                        // Found: execute loop body for this single row
-                        program.preassign_label_to_next_insn(loop_start);
-                        program.emit_insn(Insn::Goto { target_pc: body });
-
-                        t_ctx.after_row_jump[joined_table_index] = Some(rhs_next);
-                        // Advance RHS
-                        program.preassign_label_to_next_insn(rhs_next);
-                        program.emit_insn(Insn::Next {
-                            cursor_id: rhs_cursor,
-                            pc_if_next: rhs_top,
-                        });
-                        program.emit_insn(Insn::Goto {
-                            target_pc: loop_end,
-                        });
-                    }
-                    Search::RowidEq { cmp_expr } => {
-                        // Open the loop for the index search.
-                        // Rowid equality point lookups are handled with a SeekRowid instruction which does not loop, since it is a single row lookup.
-                        let src_reg = program.alloc_register();
-                        translate_expr(
-                            program,
-                            Some(table_references),
-                            cmp_expr,
-                            src_reg,
-                            &t_ctx.resolver,
-                        )?;
-                        program.emit_insn(Insn::SeekRowid {
-                            cursor_id: table_cursor_id
-                                .expect("Search::RowidEq requires a table cursor"),
-                            src_reg,
-                            target_pc: next,
-                        });
-                    }
-                    // Otherwise, it's an index/rowid scan, i.e. first a seek is performed and then a scan until the comparison expression is not satisfied anymore.
-                    Search::Seek { index, seek_def } => {
-                        // Figure out if we’re iterating an index or the table (rowid)
-                        let seek_idx_id = match index {
-                            Some(index) => {
-                                if index.ephemeral {
-                                    let table_has_rowid =
-                                        matches!(&table.table, Table::BTree(b) if b.has_rowid);
-                                    Some(emit_autoindex(
-                                        program,
-                                        index,
-                                        table_cursor_id
-                                            .expect("ephemeral index requires table cursor"),
-                                        index_cursor_id
-                                            .expect("ephemeral index requires index cursor"),
-                                        table_has_rowid,
-                                    )?)
-                                } else {
-                                    index_cursor_id // pre-opened by init_loop
-                                }
-                            }
-                            None => None, // rowid cursor
-                        };
-
-                        let is_index = seek_idx_id.is_some();
-                        let seek_cursor_id = temp_cursor_id.unwrap_or_else(|| {
-                            seek_idx_id.or(index_cursor_id).unwrap_or_else(|| {
-                                table_cursor_id.expect("rowid seek needs table cursor")
-                            })
-                        });
-
-                        // Build the seek key once
-                        let start_reg = program.alloc_registers(seek_def.key.len());
-
-                        // Position and set termination (these already branch differently on is_index)
-                        emit_seek(
-                            program,
-                            table_references,
-                            seek_def,
-                            t_ctx,
-                            seek_cursor_id,
-                            start_reg,
-                            loop_end,
-                            is_index,
-                        )?;
-                        emit_seek_termination(
-                            program,
-                            table_references,
-                            seek_def,
-                            t_ctx,
-                            seek_cursor_id,
-                            start_reg,
-                            loop_start,
-                            loop_end,
-                            is_index,
-                        )?;
-
-                        // Only defer-seek from index → table when we actually have an index cursor
-                        if let (Some(idx_cur), Some(tbl_cur)) =
-                            (seek_idx_id.or(index_cursor_id), table_cursor_id)
-                        {
-                            program.emit_insn(Insn::DeferredSeek {
-                                index_cursor_id: idx_cur,
-                                table_cursor_id: tbl_cur,
-                            });
-                        }
-                    }
-                }
+                emit_search(
+                    program,
+                    t_ctx,
+                    joined_table_index,
+                    search,
+                    table_references,
+                    table,
+                    table_cursor_id,
+                    index_cursor_id,
+                    temp_cursor_id,
+                )?;
             }
         }
-        program.resolve_label(body, program.offset());
+        if join_index == join_order.len() - 1 {
+            t_ctx.loop_body_entry = Some(body);
+        }
 
         // First emit outer join conditions, if any.
         emit_conditions(
@@ -861,6 +613,282 @@ pub fn open_loop(
         )?;
     }
 
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_search(
+    program: &mut ProgramBuilder,
+    t_ctx: &mut TranslateCtx,
+    joined_table_index: usize,
+    search: &Search,
+    table_references: &TableReferences,
+    table: &JoinedTable,
+    table_cursor_id: Option<CursorID>,
+    index_cursor_id: Option<CursorID>,
+    temp_cursor_id: Option<CursorID>,
+) -> Result<()> {
+    let LoopLabels {
+        loop_start,
+        loop_end,
+        body,
+        next,
+    } = *t_ctx
+        .labels_main_loop
+        .get(joined_table_index)
+        .expect("table has no loop labels");
+    match search {
+        Search::SeekManyEq {
+            index,
+            key_prefix,
+            in_values,
+            in_col_sort: _in_col_sort,
+            iter_dir: _,
+        } => {
+            let seek_idx_id = if let Some(index) = index {
+                if index.ephemeral {
+                    let table_has_rowid = if let Table::BTree(btree) = &table.table {
+                        btree.has_rowid
+                    } else {
+                        false
+                    };
+                    Some(emit_autoindex(
+                        program,
+                        index,
+                        table_cursor_id.expect("ephemeral index requires table cursor"),
+                        index_cursor_id.expect("ephemeral index requires index cursor"),
+                        table_has_rowid,
+                    )?)
+                } else {
+                    index_cursor_id
+                }
+            } else {
+                index_cursor_id
+            };
+
+            let is_index_cursor = seek_idx_id.is_some();
+            let seek_cursor_id = temp_cursor_id.unwrap_or_else(|| {
+                seek_idx_id.unwrap_or_else(|| {
+                    table_cursor_id.expect("Either index or table cursor must be opened")
+                })
+            });
+
+            // Registers: prefix + 1 slot for RHS value
+            let key_prefix_len = key_prefix.len();
+            let start_reg = program.alloc_registers(key_prefix_len + 1);
+
+            for (i, (expr, _sort)) in key_prefix.iter().enumerate() {
+                translate_expr_no_constant_opt(
+                    program,
+                    Some(table_references),
+                    expr,
+                    start_reg + i,
+                    &t_ctx.resolver,
+                    NoConstantOptReason::RegisterReuse,
+                )?;
+            }
+
+            // Build RHS ephemeral once
+            let rhs_cursor = build_inlist_ephemeral(
+                program,
+                t_ctx,
+                table_references,
+                in_values,
+                index.as_ref().map(|i| i.name.as_str()).unwrap_or("rowid"),
+            );
+
+            let rhs_top = program.allocate_label();
+            let rhs_next = program.allocate_label();
+
+            // Rewind RHS, if empty -> loop_end
+            program.emit_insn(Insn::Rewind {
+                cursor_id: rhs_cursor,
+                pc_if_empty: loop_end,
+            });
+            program.preassign_label_to_next_insn(rhs_top);
+
+            program.emit_insn(Insn::Column {
+                cursor_id: rhs_cursor,
+                column: 0,
+                default: None,
+                dest: start_reg + key_prefix_len,
+            });
+
+            // NULL never matches; jump to advance RHS
+            program.emit_insn(Insn::IsNull {
+                reg: start_reg + key_prefix_len,
+                target_pc: rhs_next,
+            });
+
+            program.emit_insn(Insn::SeekGE {
+                is_index: is_index_cursor,
+                cursor_id: seek_cursor_id,
+                start_reg,
+                num_regs: key_prefix_len + 1,
+                target_pc: rhs_next, // if not found for this RHS value, advance RHS
+                eq_only: true,
+            });
+
+            program.preassign_label_to_next_insn(loop_start);
+            program.emit_insn(Insn::IdxGT {
+                // for rowid-cursor use Gt/Ge variants; here we’re on an index cursor
+                cursor_id: seek_cursor_id,
+                start_reg,
+                num_regs: key_prefix_len + 1,
+                target_pc: rhs_next,
+            });
+
+            if let (Some(index_cursor_id), Some(table_cursor_id)) =
+                (index_cursor_id, table_cursor_id)
+            {
+                program.emit_insn(Insn::DeferredSeek {
+                    index_cursor_id,
+                    table_cursor_id,
+                });
+            }
+
+            program.emit_insn(Insn::Goto { target_pc: body });
+            t_ctx.after_row_jump[joined_table_index] = Some(rhs_next);
+
+            program.preassign_label_to_next_insn(rhs_next);
+            program.emit_insn(Insn::Next {
+                cursor_id: rhs_cursor,
+                pc_if_next: rhs_top,
+            });
+            program.emit_insn(Insn::Goto {
+                target_pc: loop_end,
+            });
+        }
+        Search::RowidManyEq { values } => {
+            let table_cursor_id = table_cursor_id.expect("RowidManyEq needs table cursor");
+
+            // Build RHS ephemeral once (you already have build_inlist_ephemeral)
+            let rhs_cursor =
+                build_inlist_ephemeral(program, t_ctx, table_references, values, "rowid");
+
+            let rhs_top = program.allocate_label();
+            let rhs_next = program.allocate_label();
+
+            program.emit_insn(Insn::Rewind {
+                cursor_id: rhs_cursor,
+                pc_if_empty: loop_end,
+            });
+            program.preassign_label_to_next_insn(rhs_top);
+
+            let val_reg = program.alloc_register();
+            program.emit_insn(Insn::Column {
+                cursor_id: rhs_cursor,
+                column: 0,
+                default: None,
+                dest: val_reg,
+            });
+            program.emit_insn(Insn::IsNull {
+                reg: val_reg,
+                target_pc: rhs_next,
+            });
+            program.emit_insn(Insn::SeekRowid {
+                cursor_id: table_cursor_id,
+                src_reg: val_reg,
+                target_pc: rhs_next, // if not found, advance RHS
+            });
+            // Found: execute loop body for this single row
+            program.preassign_label_to_next_insn(loop_start);
+            program.emit_insn(Insn::Goto { target_pc: body });
+
+            t_ctx.after_row_jump[joined_table_index] = Some(rhs_next);
+            // Advance RHS
+            program.preassign_label_to_next_insn(rhs_next);
+            program.emit_insn(Insn::Next {
+                cursor_id: rhs_cursor,
+                pc_if_next: rhs_top,
+            });
+            program.emit_insn(Insn::Goto {
+                target_pc: loop_end,
+            });
+        }
+        Search::RowidEq { cmp_expr } => {
+            // Open the loop for the index search.
+            // Rowid equality point lookups are handled with a SeekRowid instruction which does not loop, since it is a single row lookup.
+            let src_reg = program.alloc_register();
+            translate_expr(
+                program,
+                Some(table_references),
+                cmp_expr,
+                src_reg,
+                &t_ctx.resolver,
+            )?;
+            program.emit_insn(Insn::SeekRowid {
+                cursor_id: table_cursor_id.expect("Search::RowidEq requires a table cursor"),
+                src_reg,
+                target_pc: next,
+            });
+        }
+        // Otherwise, it's an index/rowid scan, i.e. first a seek is performed and then a scan until the comparison expression is not satisfied anymore.
+        Search::Seek { index, seek_def } => {
+            // Figure out if we’re iterating an index or the table (rowid)
+            let seek_idx_id = match index {
+                Some(index) => {
+                    if index.ephemeral {
+                        let table_has_rowid =
+                            matches!(&table.table, Table::BTree(b) if b.has_rowid);
+                        Some(emit_autoindex(
+                            program,
+                            index,
+                            table_cursor_id.expect("ephemeral index requires table cursor"),
+                            index_cursor_id.expect("ephemeral index requires index cursor"),
+                            table_has_rowid,
+                        )?)
+                    } else {
+                        index_cursor_id // pre-opened by init_loop
+                    }
+                }
+                None => None, // rowid cursor
+            };
+
+            let is_index = seek_idx_id.is_some();
+            let seek_cursor_id = temp_cursor_id.unwrap_or_else(|| {
+                seek_idx_id
+                    .or(index_cursor_id)
+                    .unwrap_or_else(|| table_cursor_id.expect("rowid seek needs table cursor"))
+            });
+
+            // Build the seek key once
+            let start_reg = program.alloc_registers(seek_def.key.len());
+
+            // Position and set termination (these already branch differently on is_index)
+            emit_seek(
+                program,
+                table_references,
+                seek_def,
+                t_ctx,
+                seek_cursor_id,
+                start_reg,
+                loop_end,
+                is_index,
+            )?;
+            emit_seek_termination(
+                program,
+                table_references,
+                seek_def,
+                t_ctx,
+                seek_cursor_id,
+                start_reg,
+                loop_start,
+                loop_end,
+                is_index,
+            )?;
+
+            // Only defer-seek from index -> table when we actually have an index cursor
+            if let (Some(idx_cur), Some(tbl_cur)) =
+                (seek_idx_id.or(index_cursor_id), table_cursor_id)
+            {
+                program.emit_insn(Insn::DeferredSeek {
+                    index_cursor_id: idx_cur,
+                    table_cursor_id: tbl_cur,
+                });
+            }
+        }
+    }
     Ok(())
 }
 
@@ -947,6 +975,9 @@ fn emit_loop_source(
     plan: &SelectPlan,
     emit_target: LoopEmitTarget,
 ) -> Result<()> {
+    if let Some(lbl) = t_ctx.loop_body_entry {
+        program.preassign_label_to_next_insn(lbl);
+    }
     match emit_target {
         LoopEmitTarget::GroupBy => {
             // This function either:

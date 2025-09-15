@@ -118,6 +118,7 @@ pub fn emit_subquery(
         label_main_loop_end: None,
         after_row_jump: (0..plan.joined_tables().len()).map(|_| None).collect(),
         meta_group_by: None,
+        loop_body_entry: None,
         meta_left_joins: (0..plan.joined_tables().len()).map(|_| None).collect(),
         meta_sort: None,
         reg_agg_start: None,

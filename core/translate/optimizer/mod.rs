@@ -394,11 +394,40 @@ fn optimize_table_access(
 
                         where_clause[constraint.where_clause_pos.0].consumed = true;
                     }
-                    if let Some(index) = &index {
-                        let leading = &constraint_refs[0];
-                        let c = &constraints_per_table[table_idx].constraints
-                            [leading.constraint_vec_pos];
 
+                    let leading = &constraint_refs[0];
+                    let c =
+                        &constraints_per_table[table_idx].constraints[leading.constraint_vec_pos];
+                    if c.is_rowid {
+                        match (&c.operator, &c.rhs) {
+                            (ast::Operator::Equals, ConstraintRhs::Scalar(e)) => {
+                                where_clause[c.where_clause_pos.0].consumed = true;
+                                joined_tables[table_idx].op = Operation::Search(Search::RowidEq {
+                                    cmp_expr: (*e.clone()),
+                                });
+                                continue;
+                            }
+                            (ast::Operator::Equals, ConstraintRhs::InList(vs)) => {
+                                where_clause[c.where_clause_pos.0].consumed = true;
+                                joined_tables[table_idx].op =
+                                    Operation::Search(Search::RowidManyEq { values: vs.clone() });
+                                continue;
+                            }
+                            // any non-equality rowid constraint -> range seek/scan
+                            _ => {
+                                joined_tables[table_idx].op = Operation::Search(Search::Seek {
+                                    index: None, // rowid cursor
+                                    seek_def: build_seek_def_from_constraints(
+                                        &constraints_per_table[table_idx].constraints,
+                                        constraint_refs,
+                                        *iter_dir,
+                                    )?,
+                                });
+                                continue;
+                            }
+                        }
+                    }
+                    if let Some(index) = &index {
                         if matches!(c.rhs, ConstraintRhs::InList(_)) {
                             where_clause[c.where_clause_pos.0].consumed = true;
 
@@ -456,6 +485,7 @@ fn optimize_table_access(
                         constraint.as_inlist(),
                     ) {
                         (ast::Operator::Equals, Some(_), None) => {
+                            where_clause[constraint.where_clause_pos.0].consumed = true;
                             joined_tables[table_idx].op = Operation::Search(Search::RowidEq {
                                 cmp_expr: constraint.as_scalar().unwrap().clone(),
                             });
