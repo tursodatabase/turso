@@ -637,6 +637,36 @@ async fn multiple_connections_fuzz(opts: FuzzOptions) {
             connections.push((conn, conn_id, None::<usize>)); // (connection, conn_id, current_tx_id)
         }
 
+        let is_acceptable_error = |e: &turso::Error| -> bool {
+            let e_string = e.to_string();
+            e_string.contains("is locked")
+                || e_string.contains("busy")
+                || e_string.contains("Write-write conflict")
+        };
+        let requires_rollback = |e: &turso::Error| -> bool {
+            let e_string = e.to_string();
+            e_string.contains("Write-write conflict")
+        };
+
+        let handle_error = |e: &turso::Error,
+                            tx_id: &mut Option<usize>,
+                            conn_id: usize,
+                            op_num: usize,
+                            shadow_db: &mut ShadowDb| {
+            println!("Connection {conn_id}(op={op_num}) FAILED: {e}");
+            if requires_rollback(e) {
+                if let Some(tx_id) = tx_id {
+                    println!("Connection {conn_id}(op={op_num}) rolling back transaction {tx_id}");
+                    shadow_db.rollback_transaction(*tx_id);
+                }
+                *tx_id = None;
+            }
+            if is_acceptable_error(e) {
+                return;
+            }
+            panic!("Unexpected error: {e}");
+        };
+
         // Interleave operations between all connections
         for op_num in 0..opts.operations_per_connection {
             for (conn, conn_id, current_tx_id) in &mut connections {
@@ -645,10 +675,15 @@ async fn multiple_connections_fuzz(opts: FuzzOptions) {
                     generate_operation(&mut rng, *current_tx_id, &mut shared_shadow_db);
 
                 let is_in_tx = current_tx_id.is_some();
+                let is_in_tx_str = if is_in_tx {
+                    format!("true(tx_id={:?})", current_tx_id.unwrap())
+                } else {
+                    "false".to_string()
+                };
                 let has_snapshot = current_tx_id.is_some_and(|tx_id| {
                     shared_shadow_db.transactions.get(&tx_id).unwrap().is_some()
                 });
-                println!("Connection {conn_id}(op={op_num}): {operation}, is_in_tx={is_in_tx}, has_snapshot={has_snapshot}");
+                println!("Connection {conn_id}(op={op_num}): {operation}, is_in_tx={is_in_tx_str}, has_snapshot={has_snapshot}");
 
                 match operation {
                     Operation::Begin { concurrent } => {
@@ -677,13 +712,13 @@ async fn multiple_connections_fuzz(opts: FuzzOptions) {
                                 shared_shadow_db.commit_transaction(tx_id);
                                 *current_tx_id = None;
                             }
-                            Err(e) => {
-                                println!("Connection {conn_id}(op={op_num}) FAILED: {e}");
-                                // Check if it's an acceptable error
-                                if !e.to_string().contains("database is locked") {
-                                    panic!("Unexpected error during commit: {e}");
-                                }
-                            }
+                            Err(e) => handle_error(
+                                &e,
+                                current_tx_id,
+                                *conn_id,
+                                op_num,
+                                &mut shared_shadow_db,
+                            ),
                         }
                     }
                     Operation::Rollback => {
@@ -697,15 +732,13 @@ async fn multiple_connections_fuzz(opts: FuzzOptions) {
                                     shared_shadow_db.rollback_transaction(tx_id);
                                     *current_tx_id = None;
                                 }
-                                Err(e) => {
-                                    println!("Connection {conn_id}(op={op_num}) FAILED: {e}");
-                                    // Check if it's an acceptable error
-                                    if !e.to_string().contains("Busy")
-                                        && !e.to_string().contains("database is locked")
-                                    {
-                                        panic!("Unexpected error during rollback: {e}");
-                                    }
-                                }
+                                Err(e) => handle_error(
+                                    &e,
+                                    current_tx_id,
+                                    *conn_id,
+                                    op_num,
+                                    &mut shared_shadow_db,
+                                ),
                             }
                         }
                     }
@@ -744,13 +777,13 @@ async fn multiple_connections_fuzz(opts: FuzzOptions) {
                                     next_tx_id += 1;
                                 }
                             }
-                            Err(e) => {
-                                println!("Connection {conn_id}(op={op_num}) FAILED: {e}");
-                                // Check if it's an acceptable error
-                                if !e.to_string().contains("database is locked") {
-                                    panic!("Unexpected error during insert: {e}");
-                                }
-                            }
+                            Err(e) => handle_error(
+                                &e,
+                                current_tx_id,
+                                *conn_id,
+                                op_num,
+                                &mut shared_shadow_db,
+                            ),
                         }
                     }
                     Operation::Update { id, other_columns } => {
@@ -782,13 +815,13 @@ async fn multiple_connections_fuzz(opts: FuzzOptions) {
                                     next_tx_id += 1;
                                 }
                             }
-                            Err(e) => {
-                                println!("Connection {conn_id}(op={op_num}) FAILED: {e}");
-                                // Check if it's an acceptable error
-                                if !e.to_string().contains("database is locked") {
-                                    panic!("Unexpected error during update: {e}");
-                                }
-                            }
+                            Err(e) => handle_error(
+                                &e,
+                                current_tx_id,
+                                *conn_id,
+                                op_num,
+                                &mut shared_shadow_db,
+                            ),
                         }
                     }
                     Operation::Delete { id } => {
@@ -815,13 +848,13 @@ async fn multiple_connections_fuzz(opts: FuzzOptions) {
                                     next_tx_id += 1;
                                 }
                             }
-                            Err(e) => {
-                                println!("Connection {conn_id}(op={op_num}) FAILED: {e}");
-                                // Check if it's an acceptable error
-                                if !e.to_string().contains("database is locked") {
-                                    panic!("Unexpected error during delete: {e}");
-                                }
-                            }
+                            Err(e) => handle_error(
+                                &e,
+                                current_tx_id,
+                                *conn_id,
+                                op_num,
+                                &mut shared_shadow_db,
+                            ),
                         }
                     }
                     Operation::Select => {
@@ -834,9 +867,13 @@ async fn multiple_connections_fuzz(opts: FuzzOptions) {
                         let ok = loop {
                             match rows.next().await {
                                 Err(e) => {
-                                    if !e.to_string().contains("database is locked") {
-                                        panic!("Unexpected error during select: {e}");
-                                    }
+                                    handle_error(
+                                        &e,
+                                        current_tx_id,
+                                        *conn_id,
+                                        op_num,
+                                        &mut shared_shadow_db,
+                                    );
                                     break false;
                                 }
                                 Ok(None) => {
