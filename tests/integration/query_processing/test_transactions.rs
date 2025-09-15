@@ -430,6 +430,36 @@ fn test_mvcc_concurrent_conflicting_update() {
     assert!(matches!(err, LimboError::WriteWriteConflict));
 }
 
+#[test]
+fn test_mvcc_concurrent_conflicting_update_2() {
+    let tmp_db = TempDatabase::new_with_opts(
+        "test_mvcc_concurrent_conflicting_update.db",
+        turso_core::DatabaseOpts::new().with_mvcc(true),
+    );
+    let conn1 = tmp_db.connect_limbo();
+    let conn2 = tmp_db.connect_limbo();
+
+    conn1
+        .execute("CREATE TABLE test (id INTEGER, value TEXT)")
+        .unwrap();
+
+    conn1
+        .execute("INSERT INTO test (id, value) VALUES (1, 'first'), (2, 'first')")
+        .unwrap();
+
+    conn1.execute("BEGIN CONCURRENT").unwrap();
+    conn2.execute("BEGIN CONCURRENT").unwrap();
+
+    conn1
+        .execute("UPDATE test SET value = 'second' WHERE id = 1")
+        .unwrap();
+    let err = conn2
+        .execute("UPDATE test SET value = 'third' WHERE id BETWEEN 0 AND 10")
+        .err()
+        .expect("expected error");
+    assert!(matches!(err, LimboError::WriteWriteConflict));
+}
+
 fn helper_read_all_rows(mut stmt: turso_core::Statement) -> Vec<Vec<Value>> {
     let mut ret = Vec::new();
     loop {
