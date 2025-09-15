@@ -488,6 +488,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let plan = plan.clone();
         let conn = db.lock().await.connect()?;
 
+        conn.execute("PRAGMA data_sync_retry = 1", ()).await?;
+
         // Apply each DDL statement individually
         for stmt in &plan.ddl_statements {
             if opts.verbose {
