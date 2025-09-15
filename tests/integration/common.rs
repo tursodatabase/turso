@@ -765,7 +765,6 @@ mod tests {
         for _i in 0..ITERATIONS {
             let test_case = *test_cases.choose(&mut rng).unwrap();
 
-            // Pick IN-list size: mostly small, sometimes medium
             let list_size = if rng.random_bool(0.8) {
                 rng.random_range(1..=8)
             } else {
@@ -863,6 +862,40 @@ mod tests {
         );
 
         eprintln!("All {ITERATIONS} iterations passed!");
+        Ok(())
+    }
+
+    #[test]
+    fn inlist_with_self_refs_must_match_sqlite() -> anyhow::Result<()> {
+        let db = TempDatabase::new_empty(true);
+        let conn = db.connect_limbo();
+
+        // t with 100 rows
+        let _ = limbo_exec_rows(
+            &db,
+            &conn,
+            "CREATE TABLE t(x INTEGER, y INTEGER, z INTEGER)",
+        );
+        for i in 0..100 {
+            let _ = limbo_exec_rows(
+                &db,
+                &conn,
+                &format!("INSERT INTO t VALUES({i}, {i}+1, {i}%7)"),
+            );
+        }
+
+        let q = "SELECT count(*) FROM t WHERE t.x IN (-4198864678, t.x, t.x, (t.x + t.z))";
+        // sqlite
+        let rus = rusqlite::Connection::open_in_memory().unwrap();
+        rus.execute_batch("CREATE TABLE t(x INTEGER, y INTEGER, z INTEGER);")
+            .unwrap();
+        for i in 0..100 {
+            rus.execute(&format!("INSERT INTO t VALUES({i},{i}+1,{i}%7)"), ())
+                .unwrap();
+        }
+        let sqlite_cnt = &super::sqlite_exec_rows(&rus, q)[0][0];
+        let limbo_cnt = &super::limbo_exec_rows(&db, &conn, q)[0][0];
+        assert_eq!(limbo_cnt, sqlite_cnt);
         Ok(())
     }
 }
