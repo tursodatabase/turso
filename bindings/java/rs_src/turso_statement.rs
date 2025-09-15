@@ -6,7 +6,6 @@ use jni::objects::{JByteArray, JObject, JObjectArray, JString, JValue};
 use jni::sys::{jdouble, jint, jlong};
 use jni::JNIEnv;
 use std::num::NonZero;
-use turso_core::types::Blob;
 use turso_core::{Statement, StepResult, Value};
 
 pub const STEP_RESULT_ID_ROW: i32 = 10;
@@ -116,7 +115,9 @@ fn row_to_obj_array<'local>(
                 env.new_object("java/lang/Double", "(D)V", &[JValue::Double(*f)])?
             }
             turso_core::Value::Text(s) => env.new_string(s.as_str())?.into(),
-            turso_core::Value::Blob(b) => env.byte_array_from_slice(b.value.as_slice())?.into(),
+            turso_core::Value::Blob(b) => {
+                env.byte_array_from_slice(b.to_bytes().as_slice())?.into()
+            }
         };
         if let Err(e) = env.set_object_array_element(&obj_array, i as i32, obj) {
             eprintln!("Error on parsing row: {e:?}");
@@ -265,7 +266,7 @@ pub extern "system" fn Java_tech_turso_core_TursoStatement_bindBlob<'local>(
 
     stmt.stmt.bind_at(
         NonZero::new(position as usize).unwrap(),
-        Value::Blob(Blob::new(blob)),
+        Value::Blob(blob.into()),
     );
     SQLITE_OK
 }

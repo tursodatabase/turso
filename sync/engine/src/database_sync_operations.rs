@@ -497,7 +497,7 @@ fn convert_to_args(values: Vec<turso_core::Value>) -> Vec<server_proto::Value> {
                 value: value.as_str().to_string(),
             },
             Value::Blob(blob) => server_proto::Value::Blob {
-                value: blob.value.into(),
+                value: blob.to_bytes().into(),
             },
         })
         .collect()

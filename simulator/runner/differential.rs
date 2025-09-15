@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use sql_generation::{generation::pick_index, model::table::SimValue};
-use turso_core::{Value, types::Blob};
+use turso_core::Value;
 
 use crate::{
     InteractionPlan,
@@ -79,7 +79,7 @@ fn execute_query_rusqlite(
                         rusqlite::types::Value::Integer(i) => Value::Integer(i),
                         rusqlite::types::Value::Real(f) => Value::Float(f),
                         rusqlite::types::Value::Text(s) => Value::build_text(s),
-                        rusqlite::types::Value::Blob(b) => Value::Blob(Blob::new(b)),
+                        rusqlite::types::Value::Blob(b) => Value::Blob(b.into()),
                     };
                     values.push(SimValue(value));
                 }

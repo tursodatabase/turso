@@ -11,7 +11,7 @@ use crate::storage::pager::{AtomicDbState, CreateBTreeFlags, DbState};
 use crate::storage::sqlite3_ondisk::read_varint;
 use crate::translate::collate::CollationSeq;
 use crate::types::{
-    compare_immutable, compare_records_generic, Blob, Extendable, IOCompletions, ImmutableRecord,
+    compare_immutable, compare_records_generic, Extendable, IOCompletions, ImmutableRecord,
     SeekResult, Text,
 };
 use crate::util::{normalize_ident, IOExt as _};
@@ -1697,12 +1697,11 @@ pub fn op_column(
                                     // Try to reuse the registers when allocation is not needed.
                                     match state.registers[*dest] {
                                         Register::Value(Value::Blob(ref mut existing_blob)) => {
-                                            existing_blob.value.do_extend(&buf);
+                                            existing_blob.to_bytes().do_extend(&buf);
                                         }
                                         _ => {
-                                            state.registers[*dest] = Register::Value(Value::Blob(
-                                                Blob::new(buf.to_vec()),
-                                            ));
+                                            state.registers[*dest] =
+                                                Register::Value(Value::Blob(buf.to_vec().into()));
                                         }
                                     }
                                 }
@@ -1747,7 +1746,7 @@ pub fn op_column(
                                 Value::Blob(new_blob),
                                 Register::Value(Value::Blob(existing_blob)),
                             ) => {
-                                existing_blob.value.do_extend(&new_blob.value);
+                                existing_blob.to_bytes().do_extend(&new_blob.to_bytes());
                             }
                             _ => {
                                 state.registers[*dest] = Register::Value(default.clone());
@@ -2462,7 +2461,7 @@ pub fn op_blob(
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Blob { value, dest }, insn);
-    state.registers[*dest] = Register::Value(Value::Blob(Blob::new(value.clone())));
+    state.registers[*dest] = Register::Value(Value::Blob(value.clone().into()));
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -3466,11 +3465,11 @@ pub fn op_agg_step(
             }
             #[cfg(feature = "json")]
             AggFunc::JsonGroupArray | AggFunc::JsonbGroupArray => {
-                Register::Aggregate(AggContext::GroupConcat(Value::Blob(Blob::new(vec![]))))
+                Register::Aggregate(AggContext::GroupConcat(Value::Blob(vec![].into())))
             }
             #[cfg(feature = "json")]
             AggFunc::JsonGroupObject | AggFunc::JsonbGroupObject => {
-                Register::Aggregate(AggContext::GroupConcat(Value::Blob(Blob::new(vec![]))))
+                Register::Aggregate(AggContext::GroupConcat(Value::Blob(vec![].into())))
             }
             AggFunc::External(func) => match func.as_ref() {
                 ExtFunc::Aggregate {
@@ -3676,7 +3675,8 @@ pub fn op_agg_step(
             let mut val_vec = convert_dbtype_to_raw_jsonb(value.get_value())?;
 
             match acc {
-                Value::Blob(Blob { value: vec, .. }) => {
+                Value::Blob(blob) => {
+                    let mut vec = blob.to_bytes();
                     if vec.is_empty() {
                         // bits for obj header
                         vec.push(12);
@@ -3702,7 +3702,8 @@ pub fn op_agg_step(
 
             let mut data = convert_dbtype_to_raw_jsonb(col.get_value())?;
             match acc {
-                Value::Blob(Blob { value: vec, .. }) => {
+                Value::Blob(blob) => {
+                    let mut vec = blob.to_bytes();
                     if vec.is_empty() {
                         vec.push(11);
                         vec.append(&mut data)
@@ -4297,7 +4298,7 @@ pub fn op_function(
                         Value::Text(text) => text.as_str(),
                         Value::Integer(val) => &val.to_string(),
                         Value::Float(val) => &val.to_string(),
-                        Value::Blob(blob) => &String::from_utf8_lossy(&blob.value),
+                        Value::Blob(blob) => &blob.to_string(),
                         _ => "    ",
                     },
                     // If the second argument is omitted or is NULL, then indentation is four spaces per level
@@ -4778,7 +4779,7 @@ pub fn op_function(
                     let columns_len = columns_json_array.array_len()?;
 
                     let mut record = ImmutableRecord::new(bin_record.len());
-                    record.start_serialization(&bin_record.value);
+                    record.start_serialization(&bin_record.to_bytes());
                     let mut record_cursor = RecordCursor::new();
 
                     let mut json = json::jsonb::Jsonb::make_empty_obj(columns_len);
@@ -7769,7 +7770,7 @@ impl Value {
                     return Some(Value::Null);
                 }
             }
-            Value::Blob(b) => match std::str::from_utf8(&b.value) {
+            Value::Blob(b) => match std::str::from_utf8(&b.to_bytes()) {
                 Ok(s) => {
                     if let Ok(i) = s.parse::<i64>() {
                         i as f64
@@ -7926,7 +7927,7 @@ impl Value {
 
         let mut blob: Vec<u8> = vec![0; length];
         getrandom::getrandom(&mut blob).expect("Failed to generate random blob");
-        Value::Blob(Blob::new(blob))
+        Value::Blob(blob.into())
     }
 
     pub fn exec_quote(&self) -> Self {
@@ -8001,9 +8002,9 @@ impl Value {
 
         if let (Value::Blob(blob), Value::Blob(pattern)) = (self, pattern) {
             let result = blob
-                .value
-                .windows(pattern.value.len())
-                .position(|window| window == pattern.value)
+                .to_bytes()
+                .windows(pattern.len())
+                .position(|window| window == pattern.to_bytes())
                 .map_or(0, |i| i + 1);
             return Value::Integer(result as i64);
         }
@@ -8048,7 +8049,7 @@ impl Value {
                 let text = self.to_string();
                 Value::build_text(hex::encode_upper(text))
             }
-            Value::Blob(blob_bytes) => Value::build_text(hex::encode_upper(&blob_bytes.value)),
+            Value::Blob(blob) => Value::build_text(hex::encode_upper(blob.to_bytes())),
             _ => Value::Null,
         }
     }
@@ -8058,7 +8059,7 @@ impl Value {
             Value::Null => Value::Null,
             _ => match ignored_chars {
                 None => match hex::decode(self.to_string()) {
-                    Ok(bytes) => Value::Blob(Blob::new(bytes)),
+                    Ok(bytes) => Value::Blob(bytes.into()),
                     Err(_) => Value::Null,
                 },
                 Some(ignore) => match ignore {
@@ -8070,7 +8071,7 @@ impl Value {
                             .trim_end_matches(|x| pat.contains(x))
                             .to_string();
                         match hex::decode(trimmed) {
-                            Ok(bytes) => Value::Blob(Blob::new(bytes)),
+                            Ok(bytes) => Value::Blob(bytes.into()),
                             Err(_) => Value::Null,
                         }
                     }
@@ -8199,7 +8200,7 @@ impl Value {
                 // Convert to TEXT first, then interpret as BLOB
                 // TODO: handle encoding
                 let text = self.to_string();
-                Value::Blob(Blob::new(text.into_bytes()))
+                Value::Blob(text.into_bytes().into())
             }
             // TEXT To cast a BLOB value to TEXT, the sequence of bytes that make up the BLOB is interpreted as text encoded using the database encoding.
             // Casting an INTEGER or REAL value into TEXT renders the value as if via sqlite3_snprintf() except that the resulting TEXT uses the encoding of the database connection.
@@ -8211,8 +8212,7 @@ impl Value {
             Affinity::Real => match self {
                 Value::Blob(b) => {
                     // Convert BLOB to TEXT first
-                    let text = String::from_utf8_lossy(&b.value);
-                    cast_text_to_real(&text)
+                    cast_text_to_real(&b.to_string())
                 }
                 Value::Text(t) => cast_text_to_real(t.as_str()),
                 Value::Integer(i) => Value::Float(*i as f64),
@@ -8222,8 +8222,7 @@ impl Value {
             Affinity::Integer => match self {
                 Value::Blob(b) => {
                     // Convert BLOB to TEXT first
-                    let text = String::from_utf8_lossy(&b.value);
-                    cast_text_to_integer(&text)
+                    cast_text_to_integer(&b.to_string())
                 }
                 Value::Text(t) => cast_text_to_integer(t.as_str()),
                 Value::Integer(i) => Value::Integer(*i),
@@ -8244,10 +8243,7 @@ impl Value {
                 _ => Value::Integer(0),
             },
             Affinity::Numeric => match self {
-                Value::Blob(b) => {
-                    let text = String::from_utf8_lossy(&b.value);
-                    cast_text_to_numeric(&text)
-                }
+                Value::Blob(b) => cast_text_to_numeric(&b.to_string()),
                 Value::Text(t) => cast_text_to_numeric(t.as_str()),
                 Value::Integer(i) => Value::Integer(*i),
                 Value::Float(f) => Value::Float(*f),
@@ -8453,7 +8449,7 @@ impl Value {
     pub fn exec_concat(&self, rhs: &Value) -> Value {
         if let (Value::Blob(lhs), Value::Blob(rhs)) = (self, rhs) {
             return Value::build_text(String::from_utf8_lossy(
-                &[lhs.value.as_slice(), rhs.value.as_slice()].concat(),
+                &[lhs.to_bytes().as_slice(), rhs.to_bytes().as_slice()].concat(),
             ));
         }
 
@@ -8740,7 +8736,7 @@ pub fn extract_int_value(value: &Value) -> i64 {
         }
         Value::Blob(b) => {
             // Try to parse blob as string then as integer
-            if let Ok(s) = std::str::from_utf8(&b.value) {
+            if let Ok(s) = std::str::from_utf8(&b.to_bytes()) {
                 s.parse::<i64>().unwrap_or(0)
             } else {
                 0
@@ -9169,7 +9165,7 @@ pub fn op_journal_mode(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::Value;
+    use crate::types::{Blob, Value};
 
     #[test]
     fn test_apply_numeric_affinity_partial_numbers() {
@@ -9578,7 +9574,7 @@ mod tests {
         let expected_len = Value::Integer(7);
         assert_eq!(input_float.exec_length(), expected_len);
 
-        let expected_blob = Value::Blob(Blob::new("example".as_bytes().to_vec()));
+        let expected_blob = Value::Blob("example".as_bytes().to_vec().into());
         let expected_len = Value::Integer(7);
         assert_eq!(expected_blob.exec_length(), expected_len);
     }
@@ -9616,7 +9612,7 @@ mod tests {
         let expected: Value = Value::build_text("text");
         assert_eq!(input.exec_typeof(), expected);
 
-        let input = Value::Blob(Blob::new("limbo".as_bytes().to_vec()));
+        let input = Value::Blob("limbo".as_bytes().to_vec().into());
         let expected: Value = Value::build_text("blob");
         assert_eq!(input.exec_typeof(), expected);
     }
@@ -9635,7 +9631,7 @@ mod tests {
         assert_eq!(Value::Float(23.45).exec_unicode(), Value::Integer(50));
         assert_eq!(Value::Null.exec_unicode(), Value::Null);
         assert_eq!(
-            Value::Blob(Blob::new("example".as_bytes().to_vec())).exec_unicode(),
+            Value::Blob("example".as_bytes().to_vec().into()).exec_unicode(),
             Value::Integer(101)
         );
     }
@@ -9812,7 +9808,7 @@ mod tests {
         let expected_val = Value::build_text("31322E3334");
         assert_eq!(input_float.exec_hex(), expected_val);
 
-        let input_blob = Value::Blob(Blob::new(vec![0xff]));
+        let input_blob = Value::Blob(vec![0xff].into());
         let expected_val = Value::build_text("FF");
         assert_eq!(input_blob.exec_hex(), expected_val);
     }
@@ -9820,11 +9816,11 @@ mod tests {
     #[test]
     fn test_unhex() {
         let input = Value::build_text("6f");
-        let expected = Value::Blob(Blob::new(vec![0x6f]));
+        let expected = Value::Blob(vec![0x6f].into());
         assert_eq!(input.exec_unhex(None), expected);
 
         let input = Value::build_text("6f");
-        let expected = Value::Blob(Blob::new(vec![0x6f]));
+        let expected = Value::Blob(vec![0x6f].into());
         assert_eq!(input.exec_unhex(None), expected);
 
         let input = Value::build_text("611");
@@ -9832,7 +9828,7 @@ mod tests {
         assert_eq!(input.exec_unhex(None), expected);
 
         let input = Value::build_text("");
-        let expected = Value::Blob(Blob::new(vec![]));
+        let expected = Value::Blob(vec![].into());
         assert_eq!(input.exec_unhex(None), expected);
 
         let input = Value::build_text("61x");
@@ -10210,23 +10206,23 @@ mod tests {
         let expected = Value::Integer(3);
         assert_eq!(input.exec_instr(&pattern), expected);
 
-        let input = Value::Blob(Blob::new(vec![1, 2, 3, 4, 5]));
-        let pattern = Value::Blob(Blob::new(vec![3, 4]));
+        let input = Value::Blob(vec![1, 2, 3, 4, 5].into());
+        let pattern = Value::Blob(vec![3, 4].into());
         let expected = Value::Integer(3);
         assert_eq!(input.exec_instr(&pattern), expected);
 
-        let input = Value::Blob(Blob::new(vec![1, 2, 3, 4, 5]));
-        let pattern = Value::Blob(Blob::new(vec![3, 2]));
+        let input = Value::Blob(vec![1, 2, 3, 4, 5].into());
+        let pattern = Value::Blob(vec![3, 2].into());
         let expected = Value::Integer(0);
         assert_eq!(input.exec_instr(&pattern), expected);
 
-        let input = Value::Blob(Blob::new(vec![0x61, 0x62, 0x63, 0x64, 0x65]));
+        let input = Value::Blob(vec![0x61, 0x62, 0x63, 0x64, 0x65].into());
         let pattern = Value::build_text("cd");
         let expected = Value::Integer(3);
         assert_eq!(input.exec_instr(&pattern), expected);
 
         let input = Value::build_text("abcde");
-        let pattern = Value::Blob(Blob::new(vec![0x63, 0x64]));
+        let pattern = Value::Blob(vec![0x63, 0x64].into());
         let expected = Value::Integer(3);
         assert_eq!(input.exec_instr(&pattern), expected);
     }
@@ -10277,19 +10273,19 @@ mod tests {
         let expected = Some(Value::Integer(0));
         assert_eq!(input.exec_sign(), expected);
 
-        let input = Value::Blob(Blob::new(b"abc".to_vec()));
+        let input = Value::Blob(b"abc".to_vec().into());
         let expected = Some(Value::Null);
         assert_eq!(input.exec_sign(), expected);
 
-        let input = Value::Blob(Blob::new(b"42".to_vec()));
+        let input = Value::Blob(b"42".to_vec().into());
         let expected = Some(Value::Integer(1));
         assert_eq!(input.exec_sign(), expected);
 
-        let input = Value::Blob(Blob::new(b"-42".to_vec()));
+        let input = Value::Blob(b"-42".to_vec().into());
         let expected = Some(Value::Integer(-1));
         assert_eq!(input.exec_sign(), expected);
 
-        let input = Value::Blob(Blob::new(b"0".to_vec()));
+        let input = Value::Blob(b"0".to_vec().into());
         let expected = Some(Value::Integer(0));
         assert_eq!(input.exec_sign(), expected);
 
@@ -10332,7 +10328,7 @@ mod tests {
         let expected = Value::Blob(Blob::new_zeroblob(2));
         assert_eq!(input.exec_zeroblob(), expected);
 
-        let input = Value::Blob(Blob::new(vec![1]));
+        let input = Value::Blob(vec![1].into());
         let expected = Value::Blob(Blob::new_zeroblob(0));
         assert_eq!(input.exec_zeroblob(), expected);
     }

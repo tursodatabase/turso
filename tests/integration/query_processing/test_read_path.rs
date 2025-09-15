@@ -80,7 +80,7 @@ fn test_statement_bind() -> anyhow::Result<()> {
                 }
 
                 if let turso_core::Value::Blob(b) = row.get::<&Value>(3).unwrap() {
-                    assert_eq!(b.value.as_slice(), &vec![0x1_u8, 0x2, 0x3])
+                    assert_eq!(b.to_bytes().as_slice(), &vec![0x1_u8, 0x2, 0x3])
                 }
 
                 if let turso_core::Value::Float(f) = row.get::<&Value>(4).unwrap() {

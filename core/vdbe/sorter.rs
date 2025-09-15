@@ -703,7 +703,7 @@ enum SortedChunkIOState {
 mod tests {
     use super::*;
     use crate::translate::collate::CollationSeq;
-    use crate::types::{Blob, ImmutableRecord, RefValue, Value, ValueType};
+    use crate::types::{ImmutableRecord, RefValue, Value, ValueType};
     use crate::util::IOExt;
     use crate::PlatformIO;
     use rand_chacha::{
@@ -808,7 +808,7 @@ mod tests {
                 ValueType::Blob => {
                     let mut blob = Vec::with_capacity((rng.next_u64() % 2047 + 1) as usize);
                     rng.fill_bytes(&mut blob);
-                    Value::Blob(Blob::new(blob))
+                    Value::Blob(blob.into())
                 }
                 ValueType::Null => Value::Null,
                 _ => unreachable!(),

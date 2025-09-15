@@ -1,7 +1,4 @@
-use crate::{
-    types::{Blob, Value},
-    vdbe::Register,
-};
+use crate::{types::Value, vdbe::Register};
 
 use super::{
     convert_dbtype_to_jsonb, curry_convert_dbtype_to_jsonb, json_path_from_db_value,
@@ -84,7 +81,7 @@ pub fn jsonb_remove(args: &[Register], json_cache: &JsonCacheCell) -> crate::Res
         }
     }
 
-    Ok(Value::Blob(Blob::new(json.data())))
+    Ok(Value::Blob(json.data().into()))
 }
 
 pub fn json_replace(args: &[Register], json_cache: &JsonCacheCell) -> crate::Result<Value> {
@@ -232,7 +229,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "blob is not supported!")]
     fn test_blob_not_supported() {
-        let target = Value::Blob(Blob::new(vec![1, 2, 3]));
+        let target = Value::Blob(vec![1, 2, 3].into());
         let patch = create_text("{}");
         let cache = JsonCacheCell::new();
 

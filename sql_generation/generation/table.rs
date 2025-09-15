@@ -1,6 +1,5 @@
 use indexmap::IndexSet;
 use rand::Rng;
-use turso_core::types::Blob;
 use turso_core::Value;
 
 use crate::generation::{
@@ -103,7 +102,7 @@ impl ArbitraryFrom<&ColumnType> for SimValue {
             ColumnType::Integer => Value::Integer(rng.random_range(i64::MIN..i64::MAX)),
             ColumnType::Float => Value::Float(rng.random_range(-1e10..1e10)),
             ColumnType::Text => Value::build_text(gen_random_text(rng)),
-            ColumnType::Blob => Value::Blob(Blob::new(gen_random_text(rng).as_bytes().to_vec())),
+            ColumnType::Blob => Value::Blob(gen_random_text(rng).as_bytes().to_vec().into()),
         };
         SimValue(value)
     }
@@ -159,18 +158,18 @@ impl ArbitraryFrom<&SimValue> for LTValue {
             }
             Value::Blob(b) => {
                 // Either shorten the blob, or make at least one byte smaller and mutate the rest
-                let mut b = b.clone();
+                let mut b = b.to_bytes().clone();
                 if rng.random_bool(0.01) {
-                    b.value.pop();
-                    Value::Blob(b)
+                    b.pop();
+                    Value::Blob(b.into())
                 } else {
                     let index = rng.random_range(0..b.len());
-                    b.value[index] -= 1;
+                    b[index] -= 1;
                     // Mutate the rest of the blob
-                    for val in b.value.iter_mut().skip(index + 1) {
+                    for val in b.iter_mut().skip(index + 1) {
                         *val = rng.random_range(0..=255);
                     }
-                    Value::Blob(b)
+                    Value::Blob(b.into())
                 }
             }
             _ => unreachable!(),
@@ -229,18 +228,18 @@ impl ArbitraryFrom<&SimValue> for GTValue {
             }
             Value::Blob(b) => {
                 // Either lengthen the blob, or make at least one byte smaller and mutate the rest
-                let mut b = b.clone();
+                let mut b = b.to_bytes().clone();
                 if rng.random_bool(0.01) {
-                    b.value.push(rng.random_range(0..=255));
-                    Value::Blob(b)
+                    b.push(rng.random_range(0..=255));
+                    Value::Blob(b.into())
                 } else {
                     let index = rng.random_range(0..b.len());
-                    b.value[index] += 1;
+                    b[index] += 1;
                     // Mutate the rest of the blob
-                    for val in b.value.iter_mut().skip(index + 1) {
+                    for val in b.iter_mut().skip(index + 1) {
                         *val = rng.random_range(0..=255);
                     }
-                    Value::Blob(b)
+                    Value::Blob(b.into())
                 }
             }
             _ => unreachable!(),
