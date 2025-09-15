@@ -363,13 +363,16 @@ fn test_mvcc_update_same_row_twice() {
     );
     let conn1 = tmp_db.connect_limbo();
 
-    conn1.execute("CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT)")
+    conn1
+        .execute("CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT)")
         .unwrap();
 
-    conn1.execute("INSERT INTO test (id, value) VALUES (1, 'first')")
+    conn1
+        .execute("INSERT INTO test (id, value) VALUES (1, 'first')")
         .unwrap();
 
-    conn1.execute("UPDATE test SET value = 'second' WHERE id = 1")
+    conn1
+        .execute("UPDATE test SET value = 'second' WHERE id = 1")
         .unwrap();
 
     let stmt = conn1
@@ -382,7 +385,8 @@ fn test_mvcc_update_same_row_twice() {
     };
     assert_eq!(value.as_str(), "second");
 
-    conn1.execute("UPDATE test SET value = 'third' WHERE id = 1")
+    conn1
+        .execute("UPDATE test SET value = 'third' WHERE id = 1")
         .unwrap();
 
     let stmt = conn1
@@ -409,14 +413,20 @@ fn test_mvcc_concurrent_conflicting_update() {
         .execute("CREATE TABLE test (id INTEGER, value TEXT)")
         .unwrap();
 
-    conn1.execute("INSERT INTO test (id, value) VALUES (1, 'first')")
+    conn1
+        .execute("INSERT INTO test (id, value) VALUES (1, 'first')")
         .unwrap();
 
     conn1.execute("BEGIN CONCURRENT").unwrap();
     conn2.execute("BEGIN CONCURRENT").unwrap();
 
-    conn1.execute("UPDATE test SET value = 'second' WHERE id = 1").unwrap();
-    let err = conn2.execute("UPDATE test SET value = 'third' WHERE id = 1").err().expect("expected error");
+    conn1
+        .execute("UPDATE test SET value = 'second' WHERE id = 1")
+        .unwrap();
+    let err = conn2
+        .execute("UPDATE test SET value = 'third' WHERE id = 1")
+        .err()
+        .expect("expected error");
     assert!(matches!(err, LimboError::WriteWriteConflict));
 }
 
