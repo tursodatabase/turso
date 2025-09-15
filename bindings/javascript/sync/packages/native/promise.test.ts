@@ -261,6 +261,7 @@ test('persistence-pull-push', async () => {
         const db1 = await connect({ path: path1, url: process.env.VITE_TURSO_DB_URL });
         await db1.exec(`INSERT INTO q VALUES ('k1', 'v1')`);
         await db1.exec(`INSERT INTO q VALUES ('k2', 'v2')`);
+        const stats1 = await db1.stats();
 
         const db2 = await connect({ path: path2, url: process.env.VITE_TURSO_DB_URL });
         await db2.exec(`INSERT INTO q VALUES ('k3', 'v3')`);
@@ -268,6 +269,9 @@ test('persistence-pull-push', async () => {
 
         await Promise.all([db1.push(), db2.push()]);
         await Promise.all([db1.pull(), db2.pull()]);
+        const stats2 = await db1.stats();
+        console.info(stats1, stats2);
+        expect(stats1.revision).not.toBe(stats2.revision);
 
         const rows1 = await db1.prepare('SELECT * FROM q').all();
         const rows2 = await db2.prepare('SELECT * FROM q').all();

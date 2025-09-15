@@ -253,10 +253,8 @@ impl<P: ProtocolIO> DatabaseSyncEngine<P> {
         });
         let last_push_unix_time = self.meta().last_push_unix_time;
         let revert_wal_path = &self.revert_db_wal_path;
-        let revert_wal_file = self
-            .io
-            .open_file(revert_wal_path, OpenFlags::all(), false)?;
-        let revert_wal_size = revert_wal_file.size()?;
+        let revert_wal_file = self.io.try_open(revert_wal_path)?;
+        let revert_wal_size = revert_wal_file.map(|f| f.size()).transpose()?.unwrap_or(0);
         let main_wal_frames = main_conn.wal_state()?.max_frame;
         let main_wal_size = if main_wal_frames == 0 {
             0
