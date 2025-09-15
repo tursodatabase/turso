@@ -1,7 +1,7 @@
 use crate::{
     SandboxedResult, SimulatorEnv,
     generation::{
-        plan::{Interaction, InteractionPlan, Interactions, InteractionsType},
+        plan::{InteractionPlan, InteractionType, Interactions, InteractionsType},
         property::Property,
     },
     model::Query,
@@ -25,13 +25,13 @@ impl InteractionPlan {
         {
             let mut idx = failing_execution.secondary_index;
             loop {
-                match &interactions[idx] {
-                    Interaction::Query(query) => {
+                match &interactions[idx].interaction {
+                    InteractionType::Query(query) => {
                         depending_tables = query.dependencies();
                         break;
                     }
                     // Fault does not depend on
-                    Interaction::Fault(..) => break,
+                    InteractionType::Fault(..) => break,
                     _ => {
                         // In principle we should never fail this checked_sub.
                         // But if there is a bug in how we count the secondary index
@@ -156,9 +156,9 @@ impl InteractionPlan {
         {
             let mut idx = failing_execution.secondary_index;
             loop {
-                match &interactions[idx] {
+                match &interactions[idx].interaction {
                     // Fault does not depend on
-                    Interaction::Fault(..) => break,
+                    InteractionType::Fault(..) => break,
                     _ => {
                         // In principle we should never fail this checked_sub.
                         // But if there is a bug in how we count the secondary index

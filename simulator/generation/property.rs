@@ -16,7 +16,10 @@ use turso_core::{LimboError, types};
 use turso_parser::ast::{self, Distinctness};
 
 use crate::{
-    generation::Shadow as _, model::Query, profiles::query::QueryProfile, runner::env::SimulatorEnv,
+    generation::{Shadow as _, plan::InteractionType},
+    model::Query,
+    profiles::query::QueryProfile,
+    runner::env::SimulatorEnv,
 };
 
 use super::plan::{Assertion, Interaction, InteractionStats, ResultSet};
@@ -215,12 +218,12 @@ impl Property {
     /// interactions construct a list of interactions, which is an executable representation of the property.
     /// the requirement of property -> vec<interaction> conversion emerges from the need to serialize the property,
     /// and `interaction` cannot be serialized directly.
-    pub(crate) fn interactions(&self) -> Vec<Interaction> {
+    pub(crate) fn interactions(&self, connection_index: usize) -> Vec<Interaction> {
         match self {
             Property::TableHasExpectedContent { table } => {
                 let table = table.to_string();
                 let table_name = table.clone();
-                let assumption = Interaction::Assumption(Assertion::new(
+                let assumption = InteractionType::Assumption(Assertion::new(
                     format!("table {} exists", table.clone()),
                     move |_: &Vec<ResultSet>, env: &mut SimulatorEnv| {
                         if env.tables.iter().any(|t| t.name == table_name) {
@@ -231,12 +234,12 @@ impl Property {
                     },
                 ));
 
-                let select_interaction = Interaction::Query(Query::Select(Select::simple(
+                let select_interaction = InteractionType::Query(Query::Select(Select::simple(
                     table.clone(),
                     Predicate::true_(),
                 )));
 
-                let assertion = Interaction::Assertion(Assertion::new(
+                let assertion = InteractionType::Assertion(Assertion::new(
                     format!("table {} should have the expected content", table.clone()),
                     move |stack: &Vec<ResultSet>, env| {
                         let rows = stack.last().unwrap();
@@ -269,11 +272,15 @@ impl Property {
                     },
                 ));
 
-                vec![assumption, select_interaction, assertion]
+                vec![
+                    Interaction::new(connection_index, assumption),
+                    Interaction::new(connection_index, select_interaction),
+                    Interaction::new(connection_index, assertion),
+                ]
             }
             Property::ReadYourUpdatesBack { update, select } => {
                 let table = update.table().to_string();
-                let assumption = Interaction::Assumption(Assertion::new(
+                let assumption = InteractionType::Assumption(Assertion::new(
                     format!("table {} exists", table.clone()),
                     move |_: &Vec<ResultSet>, env: &mut SimulatorEnv| {
                         if env.tables.iter().any(|t| t.name == table.clone()) {
@@ -284,14 +291,14 @@ impl Property {
                     },
                 ));
 
-                let update_interaction = Interaction::Query(Query::Update(update.clone()));
-                let select_interaction = Interaction::Query(Query::Select(select.clone()));
+                let update_interaction = InteractionType::Query(Query::Update(update.clone()));
+                let select_interaction = InteractionType::Query(Query::Select(select.clone()));
 
                 let update = update.clone();
 
                 let table = update.table().to_string();
 
-                let assertion = Interaction::Assertion(Assertion::new(
+                let assertion = InteractionType::Assertion(Assertion::new(
                     format!(
                         "updated rows should be found and have the updated values for table {}",
                         table.clone()
@@ -318,10 +325,10 @@ impl Property {
                 ));
 
                 vec![
-                    assumption,
-                    update_interaction,
-                    select_interaction,
-                    assertion,
+                    Interaction::new(connection_index, assumption),
+                    Interaction::new(connection_index, update_interaction),
+                    Interaction::new(connection_index, select_interaction),
+                    Interaction::new(connection_index, assertion),
                 ]
             }
             Property::InsertValuesSelect {
@@ -348,7 +355,7 @@ impl Property {
                 let row = values[*row_index].clone();
 
                 // Assume that the table exists
-                let assumption = Interaction::Assumption(Assertion::new(
+                let assumption = InteractionType::Assumption(Assertion::new(
                     format!("table {} exists", insert.table()),
                     {
                         let table_name = table.clone();
@@ -362,7 +369,7 @@ impl Property {
                     },
                 ));
 
-                let assertion = Interaction::Assertion(Assertion::new(
+                let assertion = InteractionType::Assertion(Assertion::new(
                     format!(
                         "row [{:?}] should be found in table {}, interactive={} commit={}, rollback={}",
                         row.iter().map(|v| v.to_string()).collect::<Vec<String>>(),
@@ -397,18 +404,29 @@ impl Property {
                 ));
 
                 let mut interactions = Vec::new();
-                interactions.push(assumption);
-                interactions.push(Interaction::Query(Query::Insert(insert.clone())));
-                interactions.extend(queries.clone().into_iter().map(Interaction::Query));
-                interactions.push(Interaction::Query(Query::Select(select.clone())));
-                interactions.push(assertion);
+                interactions.push(Interaction::new(connection_index, assumption));
+                interactions.push(Interaction::new(
+                    connection_index,
+                    InteractionType::Query(Query::Insert(insert.clone())),
+                ));
+                interactions.extend(
+                    queries
+                        .clone()
+                        .into_iter()
+                        .map(|q| Interaction::new(connection_index, InteractionType::Query(q))),
+                );
+                interactions.push(Interaction::new(
+                    connection_index,
+                    InteractionType::Query(Query::Select(select.clone())),
+                ));
+                interactions.push(Interaction::new(connection_index, assertion));
 
                 interactions
             }
             Property::DoubleCreateFailure { create, queries } => {
                 let table_name = create.table.name.clone();
 
-                let assumption = Interaction::Assumption(Assertion::new(
+                let assumption = InteractionType::Assumption(Assertion::new(
                     "Double-Create-Failure should not be called on an existing table".to_string(),
                     move |_: &Vec<ResultSet>, env: &mut SimulatorEnv| {
                         if !env.tables.iter().any(|t| t.name == table_name) {
@@ -419,12 +437,12 @@ impl Property {
                     },
                 ));
 
-                let cq1 = Interaction::Query(Query::Create(create.clone()));
-                let cq2 = Interaction::Query(Query::Create(create.clone()));
+                let cq1 = InteractionType::Query(Query::Create(create.clone()));
+                let cq2 = InteractionType::Query(Query::Create(create.clone()));
 
                 let table_name = create.table.name.clone();
 
-                let assertion = Interaction::Assertion(Assertion::new("creating two tables with the name should result in a failure for the second query"
+                let assertion = InteractionType::Assertion(Assertion::new("creating two tables with the name should result in a failure for the second query"
                                     .to_string(), move |stack: &Vec<ResultSet>, _| {
                                 let last = stack.last().unwrap();
                                 match last {
@@ -440,16 +458,21 @@ impl Property {
                             }) );
 
                 let mut interactions = Vec::new();
-                interactions.push(assumption);
-                interactions.push(cq1);
-                interactions.extend(queries.clone().into_iter().map(Interaction::Query));
-                interactions.push(cq2);
-                interactions.push(assertion);
+                interactions.push(Interaction::new(connection_index, assumption));
+                interactions.push(Interaction::new(connection_index, cq1));
+                interactions.extend(
+                    queries
+                        .clone()
+                        .into_iter()
+                        .map(|q| Interaction::new(connection_index, InteractionType::Query(q))),
+                );
+                interactions.push(Interaction::new(connection_index, cq2));
+                interactions.push(Interaction::new(connection_index, assertion));
 
                 interactions
             }
             Property::SelectLimit { select } => {
-                let assumption = Interaction::Assumption(Assertion::new(
+                let assumption = InteractionType::Assumption(Assertion::new(
                     format!(
                         "table ({}) exists",
                         select
@@ -481,7 +504,7 @@ impl Property {
                     .limit
                     .expect("Property::SelectLimit without a LIMIT clause");
 
-                let assertion = Interaction::Assertion(Assertion::new(
+                let assertion = InteractionType::Assertion(Assertion::new(
                     "select query should respect the limit clause".to_string(),
                     move |stack: &Vec<ResultSet>, _| {
                         let last = stack.last().unwrap();
@@ -503,9 +526,12 @@ impl Property {
                 ));
 
                 vec![
-                    assumption,
-                    Interaction::Query(Query::Select(select.clone())),
-                    assertion,
+                    Interaction::new(connection_index, assumption),
+                    Interaction::new(
+                        connection_index,
+                        InteractionType::Query(Query::Select(select.clone())),
+                    ),
+                    Interaction::new(connection_index, assertion),
                 ]
             }
             Property::DeleteSelect {
@@ -513,7 +539,7 @@ impl Property {
                 predicate,
                 queries,
             } => {
-                let assumption = Interaction::Assumption(Assertion::new(
+                let assumption = InteractionType::Assumption(Assertion::new(
                     format!("table {table} exists"),
                     {
                         let table = table.clone();
@@ -533,17 +559,17 @@ impl Property {
                     },
                 ));
 
-                let delete = Interaction::Query(Query::Delete(Delete {
+                let delete = InteractionType::Query(Query::Delete(Delete {
                     table: table.clone(),
                     predicate: predicate.clone(),
                 }));
 
-                let select = Interaction::Query(Query::Select(Select::simple(
+                let select = InteractionType::Query(Query::Select(Select::simple(
                     table.clone(),
                     predicate.clone(),
                 )));
 
-                let assertion = Interaction::Assertion(Assertion::new(
+                let assertion = InteractionType::Assertion(Assertion::new(
                     format!("`{select}` should return no values for table `{table}`",),
                     move |stack: &Vec<ResultSet>, _| {
                         let rows = stack.last().unwrap();
@@ -568,11 +594,16 @@ impl Property {
                 ));
 
                 let mut interactions = Vec::new();
-                interactions.push(assumption);
-                interactions.push(delete);
-                interactions.extend(queries.clone().into_iter().map(Interaction::Query));
-                interactions.push(select);
-                interactions.push(assertion);
+                interactions.push(Interaction::new(connection_index, assumption));
+                interactions.push(Interaction::new(connection_index, delete));
+                interactions.extend(
+                    queries
+                        .clone()
+                        .into_iter()
+                        .map(|q| Interaction::new(connection_index, InteractionType::Query(q))),
+                );
+                interactions.push(Interaction::new(connection_index, select));
+                interactions.push(Interaction::new(connection_index, assertion));
 
                 interactions
             }
@@ -581,7 +612,7 @@ impl Property {
                 queries,
                 select,
             } => {
-                let assumption = Interaction::Assumption(Assertion::new(
+                let assumption = InteractionType::Assumption(Assertion::new(
                     format!("table {table} exists"),
                     {
                         let table = table.clone();
@@ -603,7 +634,7 @@ impl Property {
 
                 let table_name = table.clone();
 
-                let assertion = Interaction::Assertion(Assertion::new(
+                let assertion = InteractionType::Assertion(Assertion::new(
                     format!("select query should result in an error for table '{table}'"),
                     move |stack: &Vec<ResultSet>, _| {
                         let last = stack.last().unwrap();
@@ -626,24 +657,29 @@ impl Property {
                     },
                 ));
 
-                let drop = Interaction::Query(Query::Drop(Drop {
+                let drop = InteractionType::Query(Query::Drop(Drop {
                     table: table.clone(),
                 }));
 
-                let select = Interaction::Query(Query::Select(select.clone()));
+                let select = InteractionType::Query(Query::Select(select.clone()));
 
                 let mut interactions = Vec::new();
 
-                interactions.push(assumption);
-                interactions.push(drop);
-                interactions.extend(queries.clone().into_iter().map(Interaction::Query));
-                interactions.push(select);
-                interactions.push(assertion);
+                interactions.push(Interaction::new(connection_index, assumption));
+                interactions.push(Interaction::new(connection_index, drop));
+                interactions.extend(
+                    queries
+                        .clone()
+                        .into_iter()
+                        .map(|q| Interaction::new(connection_index, InteractionType::Query(q))),
+                );
+                interactions.push(Interaction::new(connection_index, select));
+                interactions.push(Interaction::new(connection_index, assertion));
 
                 interactions
             }
             Property::SelectSelectOptimizer { table, predicate } => {
-                let assumption = Interaction::Assumption(Assertion::new(
+                let assumption = InteractionType::Assumption(Assertion::new(
                     format!("table {table} exists"),
                     {
                         let table = table.clone();
@@ -663,7 +699,7 @@ impl Property {
                     },
                 ));
 
-                let select1 = Interaction::Query(Query::Select(Select::single(
+                let select1 = InteractionType::Query(Query::Select(Select::single(
                     table.clone(),
                     vec![ResultColumn::Expr(predicate.clone())],
                     Predicate::true_(),
@@ -673,9 +709,9 @@ impl Property {
 
                 let select2_query = Query::Select(Select::simple(table.clone(), predicate.clone()));
 
-                let select2 = Interaction::Query(select2_query);
+                let select2 = InteractionType::Query(select2_query);
 
-                let assertion = Interaction::Assertion(Assertion::new(
+                let assertion = InteractionType::Assertion(Assertion::new(
                     "select queries should return the same amount of results".to_string(),
                     move |stack: &Vec<ResultSet>, _| {
                         let select_star = stack.last().unwrap();
@@ -723,16 +759,25 @@ impl Property {
                     },
                 ));
 
-                vec![assumption, select1, select2, assertion]
+                vec![
+                    Interaction::new(connection_index, assumption),
+                    Interaction::new(connection_index, select1),
+                    Interaction::new(connection_index, select2),
+                    Interaction::new(connection_index, assertion),
+                ]
             }
             Property::FsyncNoWait { query, tables } => {
-                let checks = assert_all_table_values(tables);
+                let checks = assert_all_table_values(tables, connection_index);
                 Vec::from_iter(
-                    std::iter::once(Interaction::FsyncQuery(query.clone())).chain(checks),
+                    std::iter::once(Interaction::new(
+                        connection_index,
+                        InteractionType::FsyncQuery(query.clone()),
+                    ))
+                    .chain(checks),
                 )
             }
             Property::FaultyQuery { query, tables } => {
-                let checks = assert_all_table_values(tables);
+                let checks = assert_all_table_values(tables, connection_index);
                 let query_clone = query.clone();
                 // A fault may not occur as we first signal we want a fault injected,
                 // then when IO is called the fault triggers. It may happen that a fault is injected
@@ -756,14 +801,15 @@ impl Property {
                     },
                 );
                 let first = [
-                    Interaction::FaultyQuery(query.clone()),
-                    Interaction::Assertion(assert),
+                    InteractionType::FaultyQuery(query.clone()),
+                    InteractionType::Assertion(assert),
                 ]
-                .into_iter();
+                .into_iter()
+                .map(|i| Interaction::new(connection_index, i));
                 Vec::from_iter(first.chain(checks))
             }
             Property::WhereTrueFalseNull { select, predicate } => {
-                let assumption = Interaction::Assumption(Assertion::new(
+                let assumption = InteractionType::Assumption(Assertion::new(
                     format!(
                         "tables ({}) exists",
                         select
@@ -838,11 +884,11 @@ impl Property {
                     limit: None,
                 };
 
-                let select = Interaction::Query(Query::Select(select.clone()));
-                let select_tlp = Interaction::Query(Query::Select(select_tlp));
+                let select = InteractionType::Query(Query::Select(select.clone()));
+                let select_tlp = InteractionType::Query(Query::Select(select_tlp));
 
                 // select and select_tlp should return the same rows
-                let assertion = Interaction::Assertion(Assertion::new(
+                let assertion = InteractionType::Assertion(Assertion::new(
                     "select and select_tlp should return the same rows".to_string(),
                     move |stack: &Vec<ResultSet>, _: &mut SimulatorEnv| {
                         if stack.len() < 2 {
@@ -912,7 +958,12 @@ impl Property {
                     },
                 ));
 
-                vec![assumption, select, select_tlp, assertion]
+                vec![
+                    Interaction::new(connection_index, assumption),
+                    Interaction::new(connection_index, select),
+                    Interaction::new(connection_index, select_tlp),
+                    Interaction::new(connection_index, assertion),
+                ]
             }
             Property::UNIONAllPreservesCardinality {
                 select,
@@ -924,10 +975,10 @@ impl Property {
                 let s3 = Select::compound(s1.clone(), s2.clone(), CompoundOperator::UnionAll);
 
                 vec![
-                    Interaction::Query(Query::Select(s1.clone())),
-                    Interaction::Query(Query::Select(s2.clone())),
-                    Interaction::Query(Query::Select(s3.clone())),
-                    Interaction::Assertion(Assertion::new(
+                    InteractionType::Query(Query::Select(s1.clone())),
+                    InteractionType::Query(Query::Select(s2.clone())),
+                    InteractionType::Query(Query::Select(s3.clone())),
+                    InteractionType::Assertion(Assertion::new(
                         "UNION ALL should preserve cardinality".to_string(),
                         move |stack: &Vec<ResultSet>, _: &mut SimulatorEnv| {
                             if stack.len() < 3 {
@@ -960,20 +1011,23 @@ impl Property {
                             }
                         },
                     )),
-                ]
+                ].into_iter().map(|i| Interaction::new(connection_index, i)).collect()
             }
         }
     }
 }
 
-fn assert_all_table_values(tables: &[String]) -> impl Iterator<Item = Interaction> + use<'_> {
-    tables.iter().flat_map(|table| {
-        let select = Interaction::Query(Query::Select(Select::simple(
+fn assert_all_table_values(
+    tables: &[String],
+    connection_index: usize,
+) -> impl Iterator<Item = Interaction> + use<'_> {
+    tables.iter().flat_map(move |table| {
+        let select = InteractionType::Query(Query::Select(Select::simple(
             table.clone(),
             Predicate::true_(),
         )));
 
-        let assertion = Interaction::Assertion(Assertion::new(format!("table {table} should contain all of its expected values"), {
+        let assertion = InteractionType::Assertion(Assertion::new(format!("table {table} should contain all of its expected values"), {
                 let table = table.clone();
                 move |stack: &Vec<ResultSet>, env: &mut SimulatorEnv| {
                     let table = env.tables.iter().find(|t| t.name == table).ok_or_else(|| {
@@ -1017,7 +1071,7 @@ fn assert_all_table_values(tables: &[String]) -> impl Iterator<Item = Interactio
                     }
                 }
             }));
-        [select, assertion].into_iter()
+        [select, assertion].into_iter().map(move |i| Interaction::new(connection_index, i))
     })
 }
 

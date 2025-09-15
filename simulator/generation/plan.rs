@@ -143,37 +143,26 @@ pub enum InteractionsType {
     Fault(Fault),
 }
 
-impl Shadow for InteractionsType {
+impl Shadow for Interactions {
     type Result = ();
 
     fn shadow(&self, tables: &mut SimulatorTables) {
-        match self {
-            Self::Property(property) => {
+        match &self.interactions {
+            InteractionsType::Property(property) => {
                 let initial_tables = tables.clone();
-                let mut is_error = false;
-                for interaction in property.interactions() {
-                    match interaction {
-                        Interaction::Query(query) | Interaction::FsyncQuery(query) => {
-                            if query.shadow(tables).is_err() {
-                                is_error = true;
-                            }
-                        }
-                        Interaction::FaultyQuery(..) => {}
-                        Interaction::Assertion(_) => {}
-                        Interaction::Assumption(_) => {}
-                        Interaction::Fault(_) => {}
-                    }
-                    if is_error {
+                for interaction in property.interactions(self.connection_index) {
+                    let res = interaction.shadow(tables);
+                    if res.is_err() {
                         // If any interaction fails, we reset the tables to the initial state
                         *tables = initial_tables.clone();
                         break;
                     }
                 }
             }
-            Self::Query(query) => {
+            InteractionsType::Query(query) => {
                 let _ = query.shadow(tables);
             }
-            Self::Fault(_) => {}
+            InteractionsType::Fault(_) => {}
         }
     }
 }
@@ -189,26 +178,30 @@ impl Interactions {
 
     pub(crate) fn interactions(&self) -> Vec<Interaction> {
         match &self.interactions {
-            InteractionsType::Property(property) => property.interactions(),
-            InteractionsType::Query(query) => vec![Interaction::Query(query.clone())],
-            InteractionsType::Fault(fault) => vec![Interaction::Fault(fault.clone())],
+            InteractionsType::Property(property) => property.interactions(self.connection_index),
+            InteractionsType::Query(query) => vec![Interaction::new(
+                self.connection_index,
+                InteractionType::Query(query.clone()),
+            )],
+            InteractionsType::Fault(fault) => vec![Interaction::new(
+                self.connection_index,
+                InteractionType::Fault(fault.clone()),
+            )],
         }
     }
 
     pub(crate) fn dependencies(&self) -> IndexSet<String> {
         match &self.interactions {
-            InteractionsType::Property(property) => {
-                property
-                    .interactions()
-                    .iter()
-                    .fold(IndexSet::new(), |mut acc, i| match i {
-                        Interaction::Query(q) => {
-                            acc.extend(q.dependencies());
-                            acc
-                        }
-                        _ => acc,
-                    })
-            }
+            InteractionsType::Property(property) => property
+                .interactions(self.connection_index)
+                .iter()
+                .fold(IndexSet::new(), |mut acc, i| match &i.interaction {
+                    InteractionType::Query(q) => {
+                        acc.extend(q.dependencies());
+                        acc
+                    }
+                    _ => acc,
+                }),
             InteractionsType::Query(query) => query.dependencies(),
             InteractionsType::Fault(_) => IndexSet::new(),
         }
@@ -216,18 +209,16 @@ impl Interactions {
 
     pub(crate) fn uses(&self) -> Vec<String> {
         match &self.interactions {
-            InteractionsType::Property(property) => {
-                property
-                    .interactions()
-                    .iter()
-                    .fold(vec![], |mut acc, i| match i {
-                        Interaction::Query(q) => {
-                            acc.extend(q.uses());
-                            acc
-                        }
-                        _ => acc,
-                    })
-            }
+            InteractionsType::Property(property) => property
+                .interactions(self.connection_index)
+                .iter()
+                .fold(vec![], |mut acc, i| match &i.interaction {
+                    InteractionType::Query(q) => {
+                        acc.extend(q.uses());
+                        acc
+                    }
+                    _ => acc,
+                }),
             InteractionsType::Query(query) => query.uses(),
             InteractionsType::Fault(_) => vec![],
         }
@@ -242,27 +233,8 @@ impl Display for InteractionPlan {
                 InteractionsType::Property(property) => {
                     let name = property.name();
                     writeln!(f, "-- begin testing '{name}'")?;
-                    for interaction in property.interactions() {
-                        write!(f, "\t")?;
-
-                        match interaction {
-                            Interaction::Query(query) => writeln!(f, "{query};")?,
-                            Interaction::Assumption(assumption) => {
-                                writeln!(f, "-- ASSUME {};", assumption.name)?
-                            }
-                            Interaction::Assertion(assertion) => {
-                                writeln!(f, "-- ASSERT {};", assertion.name)?
-                            }
-                            Interaction::Fault(fault) => writeln!(f, "-- FAULT '{fault}';")?,
-                            Interaction::FsyncQuery(query) => {
-                                writeln!(f, "-- FSYNC QUERY;")?;
-                                writeln!(f, "{query};")?;
-                                writeln!(f, "{query};")?
-                            }
-                            Interaction::FaultyQuery(query) => {
-                                writeln!(f, "{query}; -- FAULTY QUERY")?
-                            }
-                        }
+                    for interaction in property.interactions(interactions.connection_index) {
+                        writeln!(f, "\t{}", interaction)?;
                     }
                     writeln!(f, "-- end testing '{name}'")?;
                 }
@@ -355,7 +327,7 @@ impl Assertion {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub(crate) enum Fault {
     Disconnect,
     ReopenDatabase,
@@ -406,8 +378,8 @@ impl InteractionPlan {
         for interactions in &self.plan {
             match &interactions.interactions {
                 InteractionsType::Property(property) => {
-                    for interaction in &property.interactions() {
-                        if let Interaction::Query(query) = interaction {
+                    for interaction in &property.interactions(interactions.connection_index) {
+                        if let InteractionType::Query(query) = &interaction.interaction {
                             query_stat(query, &mut stats);
                         }
                     }
@@ -453,8 +425,37 @@ impl InteractionPlan {
     }
 }
 
-#[derive(Debug)]
-pub(crate) enum Interaction {
+#[derive(Debug, Clone)]
+pub struct Interaction {
+    pub connection_index: usize,
+    pub interaction: InteractionType,
+}
+
+impl Deref for Interaction {
+    type Target = InteractionType;
+
+    fn deref(&self) -> &Self::Target {
+        &self.interaction
+    }
+}
+
+impl DerefMut for Interaction {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.interaction
+    }
+}
+
+impl Interaction {
+    pub fn new(connection_index: usize, interaction: InteractionType) -> Self {
+        Self {
+            connection_index,
+            interaction,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum InteractionType {
     Query(Query),
     Assumption(Assertion),
     Assertion(Assertion),
@@ -465,20 +466,33 @@ pub(crate) enum Interaction {
     FaultyQuery(Query),
 }
 
+// FIXME: add the connection index here later
 impl Display for Interaction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.interaction)
+    }
+}
+
+impl Display for InteractionType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Query(query) => write!(f, "{query}"),
-            Self::Assumption(assumption) => write!(f, "ASSUME {}", assumption.name),
-            Self::Assertion(assertion) => write!(f, "ASSERT {}", assertion.name),
-            Self::Fault(fault) => write!(f, "FAULT '{fault}'"),
-            Self::FsyncQuery(query) => write!(f, "{query}"),
+            Self::Assumption(assumption) => write!(f, "-- ASSUME {};", assumption.name),
+            Self::Assertion(assertion) => {
+                write!(f, "-- ASSERT {};", assertion.name)
+            }
+            Self::Fault(fault) => write!(f, "-- FAULT '{fault}';"),
+            Self::FsyncQuery(query) => {
+                writeln!(f, "-- FSYNC QUERY;")?;
+                writeln!(f, "{query};")?;
+                write!(f, "{query};")
+            }
             Self::FaultyQuery(query) => write!(f, "{query}; -- FAULTY QUERY"),
         }
     }
 }
 
-impl Shadow for Interaction {
+impl Shadow for InteractionType {
     type Result = anyhow::Result<Vec<Vec<SimValue>>>;
     fn shadow(&self, env: &mut SimulatorTables) -> Self::Result {
         match self {
@@ -494,7 +508,7 @@ impl Shadow for Interaction {
         }
     }
 }
-impl Interaction {
+impl InteractionType {
     pub(crate) fn execute_query(&self, conn: &mut Arc<Connection>) -> ResultSet {
         if let Self::Query(query) = self {
             let query_str = query.to_string();

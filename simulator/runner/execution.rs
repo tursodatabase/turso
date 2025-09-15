@@ -6,7 +6,7 @@ use turso_core::{Connection, LimboError, Result, StepResult};
 
 use crate::generation::{
     Shadow as _,
-    plan::{Interaction, InteractionPlan, InteractionPlanState, ResultSet},
+    plan::{Interaction, InteractionPlan, InteractionPlanState, InteractionType, ResultSet},
 };
 
 use super::env::{SimConnection, SimulatorEnv};
@@ -183,8 +183,8 @@ pub(crate) fn execute_interaction(
 ) -> Result<ExecutionContinuation> {
     // Leave this empty info! here to print the span of the execution
     tracing::info!("");
-    match interaction {
-        Interaction::Query(_) => {
+    match &interaction.interaction {
+        InteractionType::Query(_) => {
             let conn = match &mut env.connections[connection_index] {
                 SimConnection::LimboConnection(conn) => conn,
                 SimConnection::SQLiteConnection(_) => unreachable!(),
@@ -198,7 +198,7 @@ pub(crate) fn execute_interaction(
             stack.push(results);
             limbo_integrity_check(conn)?;
         }
-        Interaction::FsyncQuery(query) => {
+        InteractionType::FsyncQuery(query) => {
             let conn = match &env.connections[connection_index] {
                 SimConnection::LimboConnection(conn) => conn.clone(),
                 SimConnection::SQLiteConnection(_) => unreachable!(),
@@ -211,15 +211,18 @@ pub(crate) fn execute_interaction(
             }
             stack.push(results);
 
-            let query_interaction = Interaction::Query(query.clone());
+            let query_interaction = Interaction::new(
+                interaction.connection_index,
+                InteractionType::Query(query.clone()),
+            );
 
             execute_interaction(env, connection_index, &query_interaction, stack)?;
         }
-        Interaction::Assertion(_) => {
+        InteractionType::Assertion(_) => {
             interaction.execute_assertion(stack, env)?;
             stack.clear();
         }
-        Interaction::Assumption(_) => {
+        InteractionType::Assumption(_) => {
             let assumption_result = interaction.execute_assumption(stack, env);
             stack.clear();
 
@@ -228,10 +231,10 @@ pub(crate) fn execute_interaction(
                 return Ok(ExecutionContinuation::NextProperty);
             }
         }
-        Interaction::Fault(_) => {
+        InteractionType::Fault(_) => {
             interaction.execute_fault(env, connection_index)?;
         }
-        Interaction::FaultyQuery(_) => {
+        InteractionType::FaultyQuery(_) => {
             let conn = match &env.connections[connection_index] {
                 SimConnection::LimboConnection(conn) => conn.clone(),
                 SimConnection::SQLiteConnection(_) => unreachable!(),

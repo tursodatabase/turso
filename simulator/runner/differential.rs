@@ -4,13 +4,9 @@ use sql_generation::{generation::pick_index, model::table::SimValue};
 use turso_core::Value;
 
 use crate::{
-    InteractionPlan,
     generation::{
-        Shadow as _,
-        plan::{Interaction, InteractionPlanState, ResultSet},
-    },
-    model::Query,
-    runner::execution::ExecutionContinuation,
+        plan::{Interaction, InteractionPlanState, InteractionType, ResultSet}, Shadow as _
+    }, model::Query, runner::execution::ExecutionContinuation, InteractionPlan
 };
 
 use super::{
@@ -394,8 +390,8 @@ fn execute_interaction_rusqlite(
         connection_index,
         interaction
     );
-    match interaction {
-        Interaction::Query(query) => {
+    match &interaction.interaction {
+        InteractionType::Query(query) => {
             let conn = match &mut env.connections[connection_index] {
                 SimConnection::SQLiteConnection(conn) => conn,
                 SimConnection::LimboConnection(_) => unreachable!(),
@@ -409,14 +405,14 @@ fn execute_interaction_rusqlite(
             tracing::debug!("{:?}", results);
             stack.push(results);
         }
-        Interaction::FsyncQuery(..) => {
+        InteractionType::FsyncQuery(..) => {
             unimplemented!("cannot implement fsync query in rusqlite, as we do not control IO");
         }
-        Interaction::Assertion(_) => {
+        InteractionType::Assertion(_) => {
             interaction.execute_assertion(stack, env)?;
             stack.clear();
         }
-        Interaction::Assumption(_) => {
+        InteractionType::Assumption(_) => {
             let assumption_result = interaction.execute_assumption(stack, env);
             stack.clear();
 
@@ -425,10 +421,10 @@ fn execute_interaction_rusqlite(
                 return Ok(ExecutionContinuation::NextProperty);
             }
         }
-        Interaction::Fault(_) => {
+        InteractionType::Fault(_) => {
             interaction.execute_fault(env, connection_index)?;
         }
-        Interaction::FaultyQuery(_) => {
+        InteractionType::FaultyQuery(_) => {
             unimplemented!("cannot implement faulty query in rusqlite, as we do not control IO");
         }
     }
