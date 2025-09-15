@@ -748,8 +748,8 @@ fn emit_search(
             }
 
             program.emit_insn(Insn::Goto { target_pc: body });
-            t_ctx.after_row_jump[joined_table_index] = Some(rhs_next);
 
+            // Advance RHS when cohort is exhausted:
             program.preassign_label_to_next_insn(rhs_next);
             program.emit_insn(Insn::Next {
                 cursor_id: rhs_cursor,
@@ -762,7 +762,7 @@ fn emit_search(
         Search::RowidManyEq { values } => {
             let table_cursor_id = table_cursor_id.expect("RowidManyEq needs table cursor");
 
-            // Build RHS ephemeral once (you already have build_inlist_ephemeral)
+            // Build RHS ephemeral once
             let rhs_cursor =
                 build_inlist_ephemeral(program, t_ctx, table_references, values, "rowid");
 
@@ -791,7 +791,7 @@ fn emit_search(
                 src_reg: val_reg,
                 target_pc: rhs_next, // if not found, advance RHS
             });
-            // Found: execute loop body for this single row
+
             program.preassign_label_to_next_insn(loop_start);
             program.emit_insn(Insn::Goto { target_pc: body });
 
