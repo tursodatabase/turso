@@ -146,9 +146,9 @@ impl IO for Opfs {
         if result >= 0 {
             Ok(Arc::new(OpfsFile { handle: result }))
         } else if result == -404 {
-            Err(turso_core::LimboError::InternalError(
-                "files must be created in advance for OPFS IO".to_string(),
-            ))
+            Err(turso_core::LimboError::InternalError(format!(
+                "unexpected path {path}: files must be created in advance for OPFS IO"
+            )))
         } else {
             Err(turso_core::LimboError::InternalError(format!(
                 "unexpected file lookup error: {result}"
