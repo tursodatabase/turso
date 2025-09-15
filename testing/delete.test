@@ -84,3 +84,21 @@ do_execsql_test_on_specific_db {:memory:} doubly-qualified-delete {
    delete from test where main.test.col = 2;
    select col from test;
 } {1}
+
+
+# DELETE using ROWID alias with IN-list (RowidManyEq)
+do_execsql_test_on_specific_db {:memory:} delete-rowid-inlist {
+  CREATE TABLE t2(x INTEGER PRIMARY KEY);
+  INSERT INTO t2 VALUES (1),(2),(3),(4),(5);
+  DELETE FROM t2 WHERE x IN (1,3,7,NULL);
+  SELECT x FROM t2 ORDER BY x;
+} {2 4 5}
+
+# DELETE on indexed non-rowid column with IN-list
+do_execsql_test_on_specific_db {:memory:} delete-indexed-col-inlist {
+  CREATE TABLE t5(a INT, b INT);
+  CREATE INDEX t5_a_idx ON t5(a);
+  INSERT INTO t5(a,b) VALUES (10,1),(11,2),(12,3),(13,4),(14,5),(15,6);
+  DELETE FROM t5 WHERE a IN (10,14,42,NULL);
+  SELECT a FROM t5 ORDER BY a;
+} {11 12 13 15}
