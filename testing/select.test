@@ -767,3 +767,109 @@ foreach {testname limit ans} {
   do_execsql_test limit-complex-exprs-$testname \
     "SELECT id FROM users ORDER BY id LIMIT $limit" $ans
 }
+
+do_execsql_test_on_specific_db {:memory:} delete-rowid-in-basic {
+  CREATE TABLE t (a INTEGER PRIMARY KEY, b);
+  INSERT INTO t(a,b) VALUES
+    (1,'x'),(2,'x'),(3,'x'),(4,'x'),(5,'x'),(6,'x'),
+    (7,'x'),(8,'x'),(9,'x'),(10,'x'),(11,'x'),(12,'x'),
+    (13,'x'),(14,'x'),(15,'x'),(16,'x');
+
+  -- includes a duplicate and a NULL to exercise normalization
+  DELETE FROM t WHERE rowid IN (3,6,9,12,3,NULL);
+
+  SELECT count(*) FROM t WHERE a >= 2;
+  SELECT count(*) FROM t WHERE a >= 3;
+  SELECT count(*) FROM t WHERE a >= 4;
+  SELECT count(*) FROM t WHERE a > 1;
+  SELECT count(*) FROM t WHERE a > 2;
+  SELECT count(*) FROM t WHERE a > 3;
+  SELECT count(*) FROM t WHERE a <= 3 ORDER BY a DESC;
+  SELECT count(*) FROM t WHERE a <= 4 ORDER BY a DESC;
+  SELECT count(*) FROM t WHERE a <= 5 ORDER BY a DESC;
+  SELECT count(*) FROM t WHERE a < 2  ORDER BY a DESC;
+  SELECT count(*) FROM t WHERE a < 3  ORDER BY a DESC;
+  SELECT count(*) FROM t WHERE a < 4  ORDER BY a DESC;
+} {11
+10
+10
+11
+10
+10
+2
+3
+4
+1
+2
+2}
+
+
+do_execsql_test_on_specific_db {:memory:} delete-indexed-in-basic {
+  CREATE TABLE t (a INTEGER PRIMARY KEY, b INTEGER);
+  CREATE INDEX t_b ON t(b);
+  INSERT INTO t(a,b) SELECT value, value FROM generate_series(1,16);
+
+  DELETE FROM t WHERE b IN (3,6,9,12);
+
+  SELECT count(*) FROM t WHERE b >= 2;
+  SELECT count(*) FROM t WHERE b >= 3;
+  SELECT count(*) FROM t WHERE b >= 4;
+  SELECT count(*) FROM t WHERE b > 1;
+  SELECT count(*) FROM t WHERE b > 2;
+  SELECT count(*) FROM t WHERE b > 3;
+  SELECT count(*) FROM t WHERE b <= 3 ORDER BY b DESC;
+  SELECT count(*) FROM t WHERE b <= 4 ORDER BY b DESC;
+  SELECT count(*) FROM t WHERE b <= 5 ORDER BY b DESC;
+  SELECT count(*) FROM t WHERE b < 2  ORDER BY b DESC;
+  SELECT count(*) FROM t WHERE b < 3  ORDER BY b DESC;
+  SELECT count(*) FROM t WHERE b < 4  ORDER BY b DESC;
+} {11
+10
+10
+11
+10
+10
+2
+3
+4
+1
+2
+2}
+
+do_execsql_test_on_specific_db {:memory:} delete-rowid-in-duplicates-no-double-delete {
+  CREATE TABLE t (v TEXT);
+  INSERT INTO t(rowid, v) VALUES (1,'a'),(2,'b'),(3,'c'),(4,'d'),(5,'e');
+
+  -- duplicate 2s
+  DELETE FROM t WHERE rowid IN (2,2,2,3,NULL);
+
+  SELECT count(*) FROM t;
+  SELECT group_concat(rowid, ',') FROM t ORDER BY rowid;
+} {3
+1,4,5}
+
+do_execsql_test_on_specific_db {:memory:} delete-rowid-in-null-only-noop {
+  CREATE TABLE t (v TEXT);
+  INSERT INTO t(rowid, v) VALUES (1,'a'),(2,'b'),(3,'c');
+
+  DELETE FROM t WHERE rowid IN (NULL, NULL, NULL);
+  SELECT count(*) FROM t;
+  SELECT group_concat(rowid, ',') FROM t ORDER BY rowid;
+} {3
+1,2,3}
+
+do_execsql_test_on_specific_db {:memory:} delete-indexed-in-with-nulls-and-dupes {
+  CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER, v TEXT);
+  CREATE INDEX t_k ON t(k);
+  INSERT INTO t(id,k,v) VALUES
+    (1,10,'a'),(2,11,'b'),(3,12,'c'),(4,13,'d'),(5,14,'e'),(6,15,'f');
+
+  -- includes NULLs and duplicates; should delete exactly k in {11,13,15}
+  DELETE FROM t WHERE k IN (NULL, 11, 13, 15, 11, NULL);
+
+  SELECT count(*) FROM t;                               -- 3 left
+  SELECT group_concat(id, ',') FROM t ORDER BY id;      -- ids 1,3,5
+  SELECT group_concat(k, ',')  FROM t ORDER BY id;      -- k   10,12,14
+} {3
+1,3,5
+10,12,14}
