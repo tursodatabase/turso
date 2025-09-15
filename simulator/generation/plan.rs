@@ -99,12 +99,22 @@ impl InteractionPlan {
         let _ = plan.split_off(j);
         plan
     }
+
+    pub fn interactions_list(&self) -> impl Iterator<Item = Interaction> {
+        self.plan
+            .clone()
+            .into_iter()
+            .flat_map(|interactions| interactions.interactions().into_iter())
+    }
 }
 
-pub(crate) struct InteractionPlanState {
-    pub(crate) stack: Vec<ResultSet>,
-    pub(crate) interaction_pointer: usize,
-    pub(crate) secondary_pointer: usize,
+pub struct InteractionPlanState {
+    pub interaction_pointer: usize,
+}
+
+#[derive(Debug, Default)]
+pub struct ConnectionState {
+    pub stack: Vec<ResultSet>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

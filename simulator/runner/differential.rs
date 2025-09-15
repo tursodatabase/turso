@@ -4,9 +4,13 @@ use sql_generation::{generation::pick_index, model::table::SimValue};
 use turso_core::Value;
 
 use crate::{
+    InteractionPlan,
     generation::{
-        plan::{Interaction, InteractionPlanState, InteractionType, ResultSet}, Shadow as _
-    }, model::Query, runner::execution::ExecutionContinuation, InteractionPlan
+        Shadow as _,
+        plan::{Interaction, InteractionPlanState, InteractionType, ResultSet},
+    },
+    model::Query,
+    runner::execution::ExecutionContinuation,
 };
 
 use super::{

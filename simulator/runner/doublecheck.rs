@@ -18,35 +18,29 @@ use super::{
 pub(crate) fn run_simulation(
     env: Arc<Mutex<SimulatorEnv>>,
     doublecheck_env: Arc<Mutex<SimulatorEnv>>,
-    plans: &mut [InteractionPlan],
+    plan: &mut InteractionPlan,
     last_execution: Arc<Mutex<Execution>>,
 ) -> ExecutionResult {
     tracing::info!("Executing database interaction plan...");
 
-    let mut states = plans
-        .iter()
-        .map(|_| InteractionPlanState {
-            stack: vec![],
-            interaction_pointer: 0,
-            secondary_pointer: 0,
-        })
-        .collect::<Vec<_>>();
+    let mut state = InteractionPlanState {
+        stack: vec![],
+        interaction_pointer: 0,
+        secondary_pointer: 0,
+    };
 
-    let mut doublecheck_states = plans
-        .iter()
-        .map(|_| InteractionPlanState {
-            stack: vec![],
-            interaction_pointer: 0,
-            secondary_pointer: 0,
-        })
-        .collect::<Vec<_>>();
+    let mut doublecheck_state = InteractionPlanState {
+        stack: vec![],
+        interaction_pointer: 0,
+        secondary_pointer: 0,
+    };
 
     let mut result = execute_plans(
         env.clone(),
         doublecheck_env.clone(),
-        plans,
-        &mut states,
-        &mut doublecheck_states,
+        plan,
+        &mut state,
+        &mut doublecheck_state,
         last_execution,
     );
 
@@ -85,9 +79,9 @@ pub(crate) fn run_simulation(
 pub(crate) fn execute_plans(
     env: Arc<Mutex<SimulatorEnv>>,
     doublecheck_env: Arc<Mutex<SimulatorEnv>>,
-    plans: &mut [InteractionPlan],
-    states: &mut [InteractionPlanState],
-    doublecheck_states: &mut [InteractionPlanState],
+    plans: &mut InteractionPlan,
+    states: &mut InteractionPlanState,
+    doublecheck_states: &mut InteractionPlanState,
     last_execution: Arc<Mutex<Execution>>,
 ) -> ExecutionResult {
     let mut history = ExecutionHistory::new();
@@ -99,7 +93,6 @@ pub(crate) fn execute_plans(
     for _tick in 0..env.opts.ticks {
         // Pick the connection to interact with
         let connection_index = pick_index(env.connections.len(), &mut env.rng);
-        let state = &mut states[connection_index];
 
         history.history.push(Execution::new(
             connection_index,
