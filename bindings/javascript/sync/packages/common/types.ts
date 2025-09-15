@@ -44,7 +44,13 @@ export interface DatabaseRowStatement {
     values: Array<any>
 }
 
-export type GeneratorResponse =
-    | { type: 'IO' }
-    | { type: 'Done' }
-    | { type: 'SyncEngineStats', operations: number, mainWal: number, revertWal: number, lastPullUnixTime: number, lastPushUnixTime: number | null }
+export interface SyncEngineStats {
+    operations: number;
+    mainWal: number;
+    revertWal: number;
+    lastPullUnixTime: number;
+    lastPushUnixTime: number | null;
+    revision: string | null;
+}
+
+export type GeneratorResponse = { type: 'IO' } | { type: 'Done' } | ({ type: 'SyncEngineStats' } & SyncEngineStats)
