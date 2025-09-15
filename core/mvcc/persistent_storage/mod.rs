@@ -38,7 +38,7 @@ impl Storage {
             Self::Noop => Err(LimboError::InternalError(
                 "cannot read from Noop storage".to_string(),
             )),
-            Self::LogicalLog { logical_log } => todo!(),
+            Self::LogicalLog { logical_log: _ } => todo!(),
         }
     }
 

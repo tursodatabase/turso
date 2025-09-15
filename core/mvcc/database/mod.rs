@@ -876,7 +876,6 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 if mvcc_store.storage.is_logical_log() {
                     self.commit_coordinator.pager_commit_lock.unlock();
                 }
-                self.pager.end_tx(false, &self.connection)?;
                 self.state = CommitState::CommitEnd { end_ts: *end_ts };
                 return Ok(TransitionResult::Continue);
             }
@@ -1421,13 +1420,14 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         is_upgrade_from_read: bool,
         maybe_existing_tx_id: Option<TxID>,
     ) -> Result<IOResult<TxID>> {
+        let is_logical_log = self.storage.is_logical_log();
         let tx_id = maybe_existing_tx_id.unwrap_or_else(|| self.get_tx_id());
         let begin_ts = self.get_timestamp();
 
         self.acquire_exclusive_tx(&tx_id)?;
 
         // Try to acquire the pager read lock
-        if !is_upgrade_from_read {
+        if !is_upgrade_from_read && !is_logical_log {
             pager.begin_read_tx().inspect_err(|_| {
                 self.release_exclusive_tx(&tx_id);
             })?;
@@ -1438,7 +1438,19 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             pager.end_read_tx()?;
             return Err(LimboError::Busy);
         }
+
         let header = self.get_new_transaction_database_header(&pager);
+
+        if is_logical_log {
+            let tx = Transaction::new(tx_id, begin_ts, header);
+            tracing::trace!(
+                "begin_exclusive_tx(tx_id={}) - exclusive write logical log transaction",
+                tx_id
+            );
+            tracing::debug!("begin_exclusive_tx: tx_id={} succeeded", tx_id);
+            self.txs.insert(tx_id, tx);
+            return Ok(IOResult::Done(tx_id));
+        }
         // Try to acquire the pager write lock
         let begin_w_tx_res = pager.begin_write_tx();
         if let Err(LimboError::Busy) = begin_w_tx_res {
