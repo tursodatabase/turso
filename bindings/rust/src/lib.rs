@@ -40,6 +40,7 @@ pub mod value;
 use transaction::TransactionBehavior;
 #[cfg(feature = "conn_raw_api")]
 use turso_core::types::WalFrameInfo;
+use turso_core::MvccMode;
 pub use value::Value;
 
 pub use params::params_from_iter;
@@ -82,6 +83,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub struct Builder {
     path: String,
     enable_mvcc: bool,
+    mvcc_mode: MvccMode,
     vfs: Option<String>,
 }
 
@@ -91,12 +93,14 @@ impl Builder {
         Self {
             path: path.to_string(),
             enable_mvcc: false,
+            mvcc_mode: MvccMode::Noop,
             vfs: None,
         }
     }
 
-    pub fn with_mvcc(mut self, mvcc_enabled: bool) -> Self {
+    pub fn with_mvcc(mut self, mvcc_enabled: bool, mvcc_mode: MvccMode) -> Self {
         self.enable_mvcc = mvcc_enabled;
+        self.mvcc_mode = mvcc_mode;
         self
     }
 
@@ -109,7 +113,13 @@ impl Builder {
     #[allow(unused_variables, clippy::arc_with_non_send_sync)]
     pub async fn build(self) -> Result<Database> {
         let io = self.get_io()?;
-        let db = turso_core::Database::open_file(io, self.path.as_str(), self.enable_mvcc, true)?;
+        let db = turso_core::Database::open_file(
+            io,
+            self.path.as_str(),
+            self.enable_mvcc,
+            true,
+            self.mvcc_mode,
+        )?;
         Ok(Database { inner: db })
     }
 

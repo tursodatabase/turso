@@ -99,10 +99,17 @@ use util::parse_schema_rows;
 pub use util::IOExt;
 pub use vdbe::{builder::QueryMode, explain::EXPLAIN_COLUMNS, explain::EXPLAIN_QUERY_PLAN_COLUMNS};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MvccMode {
+    Noop,
+    LogicalLog,
+}
+
 /// Configuration for database features
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DatabaseOpts {
     pub enable_mvcc: bool,
+    pub mvcc_mode: MvccMode,
     pub enable_indexes: bool,
     pub enable_views: bool,
     pub enable_strict: bool,
@@ -112,6 +119,7 @@ impl Default for DatabaseOpts {
     fn default() -> Self {
         Self {
             enable_mvcc: false,
+            mvcc_mode: MvccMode::Noop,
             enable_indexes: true,
             enable_views: false,
             enable_strict: false,
@@ -126,6 +134,11 @@ impl DatabaseOpts {
 
     pub fn with_mvcc(mut self, enable: bool) -> Self {
         self.enable_mvcc = enable;
+        self
+    }
+
+    pub fn with_mvcc_mode(mut self, mvcc_mode: MvccMode) -> Self {
+        self.mvcc_mode = mvcc_mode;
         self
     }
 
@@ -267,6 +280,7 @@ impl Database {
         path: &str,
         enable_mvcc: bool,
         enable_indexes: bool,
+        mvcc_mode: MvccMode,
     ) -> Result<Arc<Database>> {
         Self::open_file_with_flags(
             io,
@@ -274,6 +288,7 @@ impl Database {
             OpenFlags::default(),
             DatabaseOpts::new()
                 .with_mvcc(enable_mvcc)
+                .with_mvcc_mode(mvcc_mode)
                 .with_indexes(enable_indexes),
             None,
         )
@@ -393,10 +408,13 @@ impl Database {
         let shared_wal = WalFileShared::open_shared_if_exists(&io, wal_path)?;
 
         let mv_store = if opts.enable_mvcc {
-            Some(Arc::new(MvStore::new(
-                mvcc::LocalClock::new(),
-                mvcc::persistent_storage::Storage::new_noop(),
-            )))
+            let storage = match opts.mvcc_mode {
+                MvccMode::Noop => mvcc::persistent_storage::Storage::new_noop(),
+                MvccMode::LogicalLog => mvcc::persistent_storage::Storage::new_logical_log(
+                    io.open_file(&format!("{path}-lg"), OpenFlags::default(), false)?,
+                ),
+            };
+            Some(Arc::new(MvStore::new(mvcc::LocalClock::new(), storage)))
         } else {
             None
         };

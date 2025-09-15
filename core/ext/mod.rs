@@ -155,7 +155,7 @@ impl Database {
                 }
             },
         };
-        let db = Self::open_file(io.clone(), path, false, false)?;
+        let db = Self::open_file(io.clone(), path, false, false, crate::MvccMode::Noop)?;
         Ok((io, db))
     }
 

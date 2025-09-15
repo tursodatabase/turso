@@ -1018,8 +1018,11 @@ impl ProjectOperator {
         // Set up internal connection for expression evaluation
         let io = Arc::new(crate::MemoryIO::new());
         let db = Database::open_file(
-            io, ":memory:", false, // no MVCC needed for expression evaluation
+            io,
+            ":memory:",
+            false, // no MVCC needed for expression evaluation
             false, // no indexes needed
+            crate::MvccMode::Noop,
         )?;
         let internal_conn = db.connect()?;
         // Set to read-only mode and disable auto-commit since we're only evaluating expressions
@@ -1132,8 +1135,11 @@ impl ProjectOperator {
         // Set up internal connection for expression evaluation
         let io = Arc::new(crate::MemoryIO::new());
         let db = Database::open_file(
-            io, ":memory:", false, // no MVCC needed for expression evaluation
+            io,
+            ":memory:",
+            false, // no MVCC needed for expression evaluation
             false, // no indexes needed
+            crate::MvccMode::Noop,
         )?;
         let internal_conn = db.connect()?;
         // Set to read-only mode and disable auto-commit since we're only evaluating expressions

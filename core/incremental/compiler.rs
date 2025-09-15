@@ -1115,7 +1115,7 @@ impl DbspCompiler {
 
         // Create an internal connection for expression compilation
         let io = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io, ":memory:", false, false)?;
+        let db = Database::open_file(io, ":memory:", false, false, crate::MvccMode::Noop)?;
         let internal_conn = db.connect()?;
         internal_conn.query_only.set(true);
         internal_conn.auto_commit.set(false);

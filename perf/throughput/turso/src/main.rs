@@ -130,7 +130,10 @@ async fn setup_database(db_path: &str, mode: TransactionMode) -> Result<Database
     let db = match mode {
         TransactionMode::Legacy => builder.build().await?,
         TransactionMode::Mvcc | TransactionMode::Concurrent => {
-            builder.with_mvcc(true).build().await?
+            builder
+                .with_mvcc(true, turso::MvccMode::LogicalLog)
+                .build()
+                .await?
         }
     };
     let conn = db.connect()?;
