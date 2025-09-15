@@ -517,6 +517,9 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                         requires_seek: true,
                     };
                     return Ok(TransitionResult::Continue);
+                } else if mvcc_store.has_exclusive_tx() {
+                    // There is an exclusive transaction holding the write lock. We must abort.
+                    return Err(LimboError::WriteWriteConflict);
                 }
                 // Currently txns are queued without any heuristics whasoever. This is important because
                 // we need to ensure writes to disk happen sequentially.
@@ -1458,6 +1461,11 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     /// Returns true if the given transaction is the exclusive transaction.
     fn is_exclusive_tx(&self, tx_id: &TxID) -> bool {
         self.exclusive_tx.read().as_ref() == Some(tx_id)
+    }
+
+    /// Returns true if there is an exclusive transaction ongoing.
+    fn has_exclusive_tx(&self) -> bool {
+        self.exclusive_tx.read().is_some()
     }
 
     /// Acquires the exclusive transaction lock to the given transaction ID.
