@@ -3,7 +3,13 @@
   "scripts": {
     "build": "npm run build --workspaces",
     "tsc-build": "npm run tsc-build --workspaces",
-    "test": "npm run test --workspaces"
+    "test": "npm run test --workspaces",
+    "format": "biome format --write .",
+    "format:no-write": "biome format .",
+    "lint": "biome lint --write .",
+    "lint:no-write": "biome lint .",
+    "check": "biome check --write .",
+    "check:no-write": "biome check ."
   },
   "workspaces": [
     "packages/wasm-runtime",
@@ -15,5 +21,8 @@
     "sync/packages/native",
     "sync/packages/browser"
   ],
-  "version": "0.2.0-pre.3"
+  "version": "0.2.0-pre.3",
+  "devDependencies": {
+    "@biomejs/biome": "2.2.4"
+  }
 }
