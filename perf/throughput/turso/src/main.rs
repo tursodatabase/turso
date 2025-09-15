@@ -131,7 +131,7 @@ async fn setup_database(db_path: &str, mode: TransactionMode) -> Result<Database
         TransactionMode::Legacy => builder.build().await?,
         TransactionMode::Mvcc | TransactionMode::Concurrent => {
             builder
-                .with_mvcc(true, turso::MvccMode::LogicalLog)
+                .with_mvcc(true, turso::MvccMode::Noop)
                 .build()
                 .await?
         }

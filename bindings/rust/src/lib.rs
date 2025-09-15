@@ -40,7 +40,7 @@ pub mod value;
 use transaction::TransactionBehavior;
 #[cfg(feature = "conn_raw_api")]
 use turso_core::types::WalFrameInfo;
-use turso_core::MvccMode;
+pub use turso_core::MvccMode;
 pub use value::Value;
 
 pub use params::params_from_iter;
