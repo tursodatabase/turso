@@ -1,422 +1,427 @@
 import { bindParams } from "./bind.js";
 import { SqliteError } from "./sqlite-error.js";
-import { NativeDatabase, NativeStatement, STEP_IO, STEP_ROW, STEP_DONE, DatabaseOpts } from "./types.js";
+import {
+	type DatabaseOpts,
+	type NativeDatabase,
+	type NativeStatement,
+	STEP_DONE,
+	STEP_IO,
+	STEP_ROW,
+} from "./types.js";
 
 const convertibleErrorTypes = { TypeError };
 const CONVERTIBLE_ERROR_PREFIX = "[TURSO_CONVERT_TYPE]";
 
 function convertError(err) {
-  if ((err.code ?? "").startsWith(CONVERTIBLE_ERROR_PREFIX)) {
-    return createErrorByName(
-      err.code.substring(CONVERTIBLE_ERROR_PREFIX.length),
-      err.message,
-    );
-  }
+	if ((err.code ?? "").startsWith(CONVERTIBLE_ERROR_PREFIX)) {
+		return createErrorByName(
+			err.code.substring(CONVERTIBLE_ERROR_PREFIX.length),
+			err.message,
+		);
+	}
 
-  return new SqliteError(err.message, err.code, err.rawCode);
+	return new SqliteError(err.message, err.code, err.rawCode);
 }
 
 function createErrorByName(name, message) {
-  const ErrorConstructor = convertibleErrorTypes[name];
-  if (!ErrorConstructor) {
-    throw new Error(`unknown error type ${name} from Turso`);
-  }
+	const ErrorConstructor = convertibleErrorTypes[name];
+	if (!ErrorConstructor) {
+		throw new Error(`unknown error type ${name} from Turso`);
+	}
 
-  return new ErrorConstructor(message);
+	return new ErrorConstructor(message);
 }
 
 /**
  * Database represents a connection that can prepare and execute SQL statements.
  */
 class Database {
-  db: NativeDatabase;
-  memory: boolean;
-  open: boolean;
-  private _inTransaction: boolean = false;
-  /**
-   * Creates a new database connection. If the database file pointed to by `path` does not exists, it will be created.
-   *
-   * @constructor
-   * @param {string} path - Path to the database file.
-   * @param {Object} opts - Options for database behavior.
-   * @param {boolean} [opts.readonly=false] - Open the database in read-only mode.
-   * @param {boolean} [opts.fileMustExist=false] - If true, throws if database file does not exist.
-   * @param {number} [opts.timeout=0] - Timeout duration in milliseconds for database operations. Defaults to 0 (no timeout).
-   */
-  constructor(db: NativeDatabase, opts: DatabaseOpts = {}) {
-    opts.readonly = opts.readonly === undefined ? false : opts.readonly;
-    opts.fileMustExist =
-      opts.fileMustExist === undefined ? false : opts.fileMustExist;
-    opts.timeout = opts.timeout === undefined ? 0 : opts.timeout;
+	db: NativeDatabase;
+	memory: boolean;
+	open: boolean;
+	private _inTransaction: boolean = false;
+	/**
+	 * Creates a new database connection. If the database file pointed to by `path` does not exists, it will be created.
+	 *
+	 * @constructor
+	 * @param {string} path - Path to the database file.
+	 * @param {Object} opts - Options for database behavior.
+	 * @param {boolean} [opts.readonly=false] - Open the database in read-only mode.
+	 * @param {boolean} [opts.fileMustExist=false] - If true, throws if database file does not exist.
+	 * @param {number} [opts.timeout=0] - Timeout duration in milliseconds for database operations. Defaults to 0 (no timeout).
+	 */
+	constructor(db: NativeDatabase, opts: DatabaseOpts = {}) {
+		opts.readonly = opts.readonly === undefined ? false : opts.readonly;
+		opts.fileMustExist =
+			opts.fileMustExist === undefined ? false : opts.fileMustExist;
+		opts.timeout = opts.timeout === undefined ? 0 : opts.timeout;
 
-    this.initialize(db, opts.name, opts.readonly);
-  }
-  static create() {
-    return Object.create(this.prototype);
-  }
-  initialize(db: NativeDatabase, name, readonly) {
-    this.db = db;
-    this.memory = db.memory;
-    Object.defineProperties(this, {
-      inTransaction: {
-        get: () => this._inTransaction,
-      },
-      name: {
-        get() {
-          return name;
-        },
-      },
-      readonly: {
-        get() {
-          return readonly;
-        },
-      },
-      open: {
-        get() {
-          return this.db.open;
-        },
-      },
-    });
-  }
+		this.initialize(db, opts.name, opts.readonly);
+	}
+	static create() {
+		return Object.create(Database.prototype);
+	}
+	initialize(db: NativeDatabase, name, readonly) {
+		this.db = db;
+		this.memory = db.memory;
+		Object.defineProperties(this, {
+			inTransaction: {
+				get: () => this._inTransaction,
+			},
+			name: {
+				get() {
+					return name;
+				},
+			},
+			readonly: {
+				get() {
+					return readonly;
+				},
+			},
+			open: {
+				get() {
+					return this.db.open;
+				},
+			},
+		});
+	}
 
-  /**
-   * Prepares a SQL statement for execution.
-   *
-   * @param {string} sql - The SQL statement string to prepare.
-   */
-  prepare(sql) {
-    if (!this.open) {
-      throw new TypeError("The database connection is not open");
-    }
+	/**
+	 * Prepares a SQL statement for execution.
+	 *
+	 * @param {string} sql - The SQL statement string to prepare.
+	 */
+	prepare(sql) {
+		if (!this.open) {
+			throw new TypeError("The database connection is not open");
+		}
 
-    if (!sql) {
-      throw new RangeError("The supplied SQL string contains no statements");
-    }
+		if (!sql) {
+			throw new RangeError("The supplied SQL string contains no statements");
+		}
 
-    try {
-      return new Statement(this.db.prepare(sql), this);
-    } catch (err) {
-      throw convertError(err);
-    }
-  }
+		try {
+			return new Statement(this.db.prepare(sql), this);
+		} catch (err) {
+			throw convertError(err);
+		}
+	}
 
-  /**
-   * Returns a function that executes the given function in a transaction.
-   *
-   * @param {function} fn - The function to wrap in a transaction.
-   */
-  transaction(fn: (...any) => Promise<any>) {
-    if (typeof fn !== "function")
-      throw new TypeError("Expected first argument to be a function");
+	/**
+	 * Returns a function that executes the given function in a transaction.
+	 *
+	 * @param {function} fn - The function to wrap in a transaction.
+	 */
+	transaction(fn: (...any) => Promise<any>) {
+		if (typeof fn !== "function")
+			throw new TypeError("Expected first argument to be a function");
+		const wrapTxn = (mode) => {
+			return async (...bindParameters) => {
+				await this.exec("BEGIN " + mode);
+				this._inTransaction = true;
+				try {
+					const result = await fn(...bindParameters);
+					await this.exec("COMMIT");
+					this._inTransaction = false;
+					return result;
+				} catch (err) {
+					await this.exec("ROLLBACK");
+					this._inTransaction = false;
+					throw err;
+				}
+			};
+		};
+		const properties = {
+			default: { value: wrapTxn("") },
+			deferred: { value: wrapTxn("DEFERRED") },
+			immediate: { value: wrapTxn("IMMEDIATE") },
+			exclusive: { value: wrapTxn("EXCLUSIVE") },
+			database: { value: this, enumerable: true },
+		};
+		Object.defineProperties(properties.default.value, properties);
+		Object.defineProperties(properties.deferred.value, properties);
+		Object.defineProperties(properties.immediate.value, properties);
+		Object.defineProperties(properties.exclusive.value, properties);
+		return properties.default.value;
+	}
 
-    const db = this;
-    const wrapTxn = (mode) => {
-      return async (...bindParameters) => {
-        await db.exec("BEGIN " + mode);
-        db._inTransaction = true;
-        try {
-          const result = await fn(...bindParameters);
-          await db.exec("COMMIT");
-          db._inTransaction = false;
-          return result;
-        } catch (err) {
-          await db.exec("ROLLBACK");
-          db._inTransaction = false;
-          throw err;
-        }
-      };
-    };
-    const properties = {
-      default: { value: wrapTxn("") },
-      deferred: { value: wrapTxn("DEFERRED") },
-      immediate: { value: wrapTxn("IMMEDIATE") },
-      exclusive: { value: wrapTxn("EXCLUSIVE") },
-      database: { value: this, enumerable: true },
-    };
-    Object.defineProperties(properties.default.value, properties);
-    Object.defineProperties(properties.deferred.value, properties);
-    Object.defineProperties(properties.immediate.value, properties);
-    Object.defineProperties(properties.exclusive.value, properties);
-    return properties.default.value;
-  }
+	async pragma(source, options) {
+		if (options == null) options = {};
 
-  async pragma(source, options) {
-    if (options == null) options = {};
+		if (typeof source !== "string")
+			throw new TypeError("Expected first argument to be a string");
 
-    if (typeof source !== "string")
-      throw new TypeError("Expected first argument to be a string");
+		if (typeof options !== "object")
+			throw new TypeError("Expected second argument to be an options object");
 
-    if (typeof options !== "object")
-      throw new TypeError("Expected second argument to be an options object");
+		const pragma = `PRAGMA ${source}`;
 
-    const pragma = `PRAGMA ${source}`;
+		const stmt = await this.prepare(pragma);
+		const results = await stmt.all();
 
-    const stmt = await this.prepare(pragma);
-    const results = await stmt.all();
+		return results;
+	}
 
-    return results;
-  }
+	backup(filename, options) {
+		throw new Error("not implemented");
+	}
 
-  backup(filename, options) {
-    throw new Error("not implemented");
-  }
+	serialize(options) {
+		throw new Error("not implemented");
+	}
 
-  serialize(options) {
-    throw new Error("not implemented");
-  }
+	function(name, options, fn) {
+		throw new Error("not implemented");
+	}
 
-  function(name, options, fn) {
-    throw new Error("not implemented");
-  }
+	aggregate(name, options) {
+		throw new Error("not implemented");
+	}
 
-  aggregate(name, options) {
-    throw new Error("not implemented");
-  }
+	table(name, factory) {
+		throw new Error("not implemented");
+	}
 
-  table(name, factory) {
-    throw new Error("not implemented");
-  }
+	loadExtension(path) {
+		throw new Error("not implemented");
+	}
 
-  loadExtension(path) {
-    throw new Error("not implemented");
-  }
+	maxWriteReplicationIndex() {
+		throw new Error("not implemented");
+	}
 
-  maxWriteReplicationIndex() {
-    throw new Error("not implemented");
-  }
+	/**
+	 * Executes a SQL statement.
+	 *
+	 * @param {string} sql - The SQL statement string to execute.
+	 */
+	async exec(sql) {
+		if (!this.open) {
+			throw new TypeError("The database connection is not open");
+		}
 
-  /**
-   * Executes a SQL statement.
-   *
-   * @param {string} sql - The SQL statement string to execute.
-   */
-  async exec(sql) {
-    if (!this.open) {
-      throw new TypeError("The database connection is not open");
-    }
+		try {
+			await this.db.batchAsync(sql);
+		} catch (err) {
+			throw convertError(err);
+		}
+	}
 
-    try {
-      await this.db.batchAsync(sql);
-    } catch (err) {
-      throw convertError(err);
-    }
-  }
+	/**
+	 * Interrupts the database connection.
+	 */
+	interrupt() {
+		throw new Error("not implemented");
+	}
 
-  /**
-   * Interrupts the database connection.
-   */
-  interrupt() {
-    throw new Error("not implemented");
-  }
+	/**
+	 * Sets the default safe integers mode for all statements from this database.
+	 *
+	 * @param {boolean} [toggle] - Whether to use safe integers by default.
+	 */
+	defaultSafeIntegers(toggle) {
+		this.db.defaultSafeIntegers(toggle);
+	}
 
-  /**
-   * Sets the default safe integers mode for all statements from this database.
-   *
-   * @param {boolean} [toggle] - Whether to use safe integers by default.
-   */
-  defaultSafeIntegers(toggle) {
-    this.db.defaultSafeIntegers(toggle);
-  }
-
-  /**
-   * Closes the database connection.
-   */
-  async close() {
-    this.db.close();
-  }
+	/**
+	 * Closes the database connection.
+	 */
+	async close() {
+		this.db.close();
+	}
 }
 
 /**
  * Statement represents a prepared SQL statement that can be executed.
  */
 class Statement {
-  stmt: NativeStatement;
-  db: Database;
-  constructor(stmt, database) {
-    this.stmt = stmt;
-    this.db = database;
-  }
+	stmt: NativeStatement;
+	db: Database;
+	constructor(stmt, database) {
+		this.stmt = stmt;
+		this.db = database;
+	}
 
-  /**
-   * Toggle raw mode.
-   *
-   * @param raw Enable or disable raw mode. If you don't pass the parameter, raw mode is enabled.
-   */
-  raw(raw) {
-    this.stmt.raw(raw);
-    return this;
-  }
+	/**
+	 * Toggle raw mode.
+	 *
+	 * @param raw Enable or disable raw mode. If you don't pass the parameter, raw mode is enabled.
+	 */
+	raw(raw) {
+		this.stmt.raw(raw);
+		return this;
+	}
 
-  /**
-   * Toggle pluck mode.
-   *
-   * @param pluckMode Enable or disable pluck mode. If you don't pass the parameter, pluck mode is enabled.
-   */
-  pluck(pluckMode) {
-    this.stmt.pluck(pluckMode);
-    return this;
-  }
+	/**
+	 * Toggle pluck mode.
+	 *
+	 * @param pluckMode Enable or disable pluck mode. If you don't pass the parameter, pluck mode is enabled.
+	 */
+	pluck(pluckMode) {
+		this.stmt.pluck(pluckMode);
+		return this;
+	}
 
-  /**
-   * Sets safe integers mode for this statement.
-   *
-   * @param {boolean} [toggle] - Whether to use safe integers.
-   */
-  safeIntegers(toggle) {
-    this.stmt.safeIntegers(toggle);
-    return this;
-  }
+	/**
+	 * Sets safe integers mode for this statement.
+	 *
+	 * @param {boolean} [toggle] - Whether to use safe integers.
+	 */
+	safeIntegers(toggle) {
+		this.stmt.safeIntegers(toggle);
+		return this;
+	}
 
-  /**
-   * Get column information for the statement.
-   *
-   * @returns {Array} An array of column objects with name, column, table, database, and type properties.
-   */
-  columns() {
-    return this.stmt.columns();
-  }
+	/**
+	 * Get column information for the statement.
+	 *
+	 * @returns {Array} An array of column objects with name, column, table, database, and type properties.
+	 */
+	columns() {
+		return this.stmt.columns();
+	}
 
-  get source() {
-    throw new Error("not implemented");
-  }
+	get source() {
+		throw new Error("not implemented");
+	}
 
-  get reader() {
-    throw new Error("not implemented");
-  }
+	get reader() {
+		throw new Error("not implemented");
+	}
 
-  get database() {
-    return this.db;
-  }
+	get database() {
+		return this.db;
+	}
 
-  /**
-   * Executes the SQL statement and returns an info object.
-   */
-  async run(...bindParameters) {
-    const totalChangesBefore = this.db.db.totalChanges();
+	/**
+	 * Executes the SQL statement and returns an info object.
+	 */
+	async run(...bindParameters) {
+		const totalChangesBefore = this.db.db.totalChanges();
 
-    this.stmt.reset();
-    bindParams(this.stmt, bindParameters);
+		this.stmt.reset();
+		bindParams(this.stmt, bindParameters);
 
-    while (true) {
-      const stepResult = await this.stmt.stepAsync();
-      if (stepResult === STEP_IO) {
-        await this.db.db.ioLoopAsync();
-        continue;
-      }
-      if (stepResult === STEP_DONE) {
-        break;
-      }
-      if (stepResult === STEP_ROW) {
-        // For run(), we don't need the row data, just continue
-        continue;
-      }
-    }
+		while (true) {
+			const stepResult = await this.stmt.stepAsync();
+			if (stepResult === STEP_IO) {
+				await this.db.db.ioLoopAsync();
+				continue;
+			}
+			if (stepResult === STEP_DONE) {
+				break;
+			}
+			if (stepResult === STEP_ROW) {
+			}
+		}
 
-    const lastInsertRowid = this.db.db.lastInsertRowid();
-    const changes = this.db.db.totalChanges() === totalChangesBefore ? 0 : this.db.db.changes();
+		const lastInsertRowid = this.db.db.lastInsertRowid();
+		const changes =
+			this.db.db.totalChanges() === totalChangesBefore
+				? 0
+				: this.db.db.changes();
 
-    return { changes, lastInsertRowid };
-  }
+		return { changes, lastInsertRowid };
+	}
 
-  /**
-   * Executes the SQL statement and returns the first row.
-   *
-   * @param bindParameters - The bind parameters for executing the statement.
-   */
-  async get(...bindParameters) {
-    this.stmt.reset();
-    bindParams(this.stmt, bindParameters);
+	/**
+	 * Executes the SQL statement and returns the first row.
+	 *
+	 * @param bindParameters - The bind parameters for executing the statement.
+	 */
+	async get(...bindParameters) {
+		this.stmt.reset();
+		bindParams(this.stmt, bindParameters);
 
-    while (true) {
-      const stepResult = await this.stmt.stepAsync();
-      if (stepResult === STEP_IO) {
-        await this.db.db.ioLoopAsync();
-        continue;
-      }
-      if (stepResult === STEP_DONE) {
-        return undefined;
-      }
-      if (stepResult === STEP_ROW) {
-        return this.stmt.row();
-      }
-    }
-  }
+		while (true) {
+			const stepResult = await this.stmt.stepAsync();
+			if (stepResult === STEP_IO) {
+				await this.db.db.ioLoopAsync();
+				continue;
+			}
+			if (stepResult === STEP_DONE) {
+				return undefined;
+			}
+			if (stepResult === STEP_ROW) {
+				return this.stmt.row();
+			}
+		}
+	}
 
-  /**
-   * Executes the SQL statement and returns an iterator to the resulting rows.
-   *
-   * @param bindParameters - The bind parameters for executing the statement.
-   */
-  async *iterate(...bindParameters) {
-    this.stmt.reset();
-    bindParams(this.stmt, bindParameters);
+	/**
+	 * Executes the SQL statement and returns an iterator to the resulting rows.
+	 *
+	 * @param bindParameters - The bind parameters for executing the statement.
+	 */
+	async *iterate(...bindParameters) {
+		this.stmt.reset();
+		bindParams(this.stmt, bindParameters);
 
-    while (true) {
-      const stepResult = await this.stmt.stepAsync();
-      if (stepResult === STEP_IO) {
-        await this.db.db.ioLoopAsync();
-        continue;
-      }
-      if (stepResult === STEP_DONE) {
-        break;
-      }
-      if (stepResult === STEP_ROW) {
-        yield this.stmt.row();
-      }
-    }
-  }
+		while (true) {
+			const stepResult = await this.stmt.stepAsync();
+			if (stepResult === STEP_IO) {
+				await this.db.db.ioLoopAsync();
+				continue;
+			}
+			if (stepResult === STEP_DONE) {
+				break;
+			}
+			if (stepResult === STEP_ROW) {
+				yield this.stmt.row();
+			}
+		}
+	}
 
-  /**
-   * Executes the SQL statement and returns an array of the resulting rows.
-   *
-   * @param bindParameters - The bind parameters for executing the statement.
-   */
-  async all(...bindParameters) {
-    this.stmt.reset();
-    bindParams(this.stmt, bindParameters);
-    const rows: any[] = [];
+	/**
+	 * Executes the SQL statement and returns an array of the resulting rows.
+	 *
+	 * @param bindParameters - The bind parameters for executing the statement.
+	 */
+	async all(...bindParameters) {
+		this.stmt.reset();
+		bindParams(this.stmt, bindParameters);
+		const rows: any[] = [];
 
-    while (true) {
-      const stepResult = await this.stmt.stepAsync();
-      if (stepResult === STEP_IO) {
-        await this.db.db.ioLoopAsync();
-        continue;
-      }
-      if (stepResult === STEP_DONE) {
-        break;
-      }
-      if (stepResult === STEP_ROW) {
-        rows.push(this.stmt.row());
-      }
-    }
-    return rows;
-  }
+		while (true) {
+			const stepResult = await this.stmt.stepAsync();
+			if (stepResult === STEP_IO) {
+				await this.db.db.ioLoopAsync();
+				continue;
+			}
+			if (stepResult === STEP_DONE) {
+				break;
+			}
+			if (stepResult === STEP_ROW) {
+				rows.push(this.stmt.row());
+			}
+		}
+		return rows;
+	}
 
-  /**
-   * Interrupts the statement.
-   */
-  interrupt() {
-    throw new Error("not implemented");
-  }
+	/**
+	 * Interrupts the statement.
+	 */
+	interrupt() {
+		throw new Error("not implemented");
+	}
 
+	/**
+	 * Binds the given parameters to the statement _permanently_
+	 *
+	 * @param bindParameters - The bind parameters for binding the statement.
+	 * @returns this - Statement with binded parameters
+	 */
+	bind(...bindParameters) {
+		try {
+			bindParams(this.stmt, bindParameters);
+			return this;
+		} catch (err) {
+			throw convertError(err);
+		}
+	}
 
-  /**
-   * Binds the given parameters to the statement _permanently_
-   *
-   * @param bindParameters - The bind parameters for binding the statement.
-   * @returns this - Statement with binded parameters
-   */
-  bind(...bindParameters) {
-    try {
-      bindParams(this.stmt, bindParameters);
-      return this;
-    } catch (err) {
-      throw convertError(err);
-    }
-  }
-
-  close() {
-    this.stmt.finalize();
-  }
+	close() {
+		this.stmt.finalize();
+	}
 }
-export { Database, Statement }
+export { Database, Statement };

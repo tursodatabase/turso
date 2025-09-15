@@ -1,42 +1,42 @@
 {
-  "name": "@tursodatabase/wasm-runtime",
-  "version": "0.2.0-pre.3",
-  "type": "module",
-  "description": "Runtime and polyfill for wasm targets",
-  "author": {
-    "name": "LongYinan",
-    "url": "https://github.com/Brooooooklyn"
-  },
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/tursodatabase/turso"
-  },
-  "license": "MIT",
-  "files": [
-    "runtime.cjs",
-    "runtime.js",
-    "fs-proxy.js",
-    "dist/*.cjs",
-    "dist/*.js",
-    "LICENSE"
-  ],
-  "dependencies": {
-    "@emnapi/core": "^1.4.5",
-    "@emnapi/runtime": "^1.4.5",
-    "@tybys/wasm-util": "^0.10.1"
-  },
-  "scripts": {
-    "build": "echo 'nothing to build'",
-    "tsc-build": "echo 'nothing to tsc-build'",
-    "test": "echo 'nothing to test'"
-  },
-  "exports": {
-    ".": {
-      "import": "./runtime.js",
-      "require": "./runtime.cjs"
-    },
-    "./fs": {
-      "import": "./dist/fs.js"
-    }
-  }
+	"name": "@tursodatabase/wasm-runtime",
+	"version": "0.2.0-pre.3",
+	"type": "module",
+	"description": "Runtime and polyfill for wasm targets",
+	"author": {
+		"name": "LongYinan",
+		"url": "https://github.com/Brooooooklyn"
+	},
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/tursodatabase/turso"
+	},
+	"license": "MIT",
+	"files": [
+		"runtime.cjs",
+		"runtime.js",
+		"fs-proxy.js",
+		"dist/*.cjs",
+		"dist/*.js",
+		"LICENSE"
+	],
+	"dependencies": {
+		"@emnapi/core": "^1.4.5",
+		"@emnapi/runtime": "^1.4.5",
+		"@tybys/wasm-util": "^0.10.1"
+	},
+	"scripts": {
+		"build": "echo 'nothing to build'",
+		"tsc-build": "echo 'nothing to tsc-build'",
+		"test": "echo 'nothing to test'"
+	},
+	"exports": {
+		".": {
+			"import": "./runtime.js",
+			"require": "./runtime.cjs"
+		},
+		"./fs": {
+			"import": "./dist/fs.js"
+		}
+	}
 }
