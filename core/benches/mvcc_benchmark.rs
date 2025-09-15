@@ -35,7 +35,7 @@ fn bench(c: &mut Criterion) {
         let db = bench_db();
         b.to_async(FuturesExecutor).iter(|| async {
             let conn = db.conn.clone();
-            let tx_id = db.mvcc_store.begin_tx(conn.get_pager().clone());
+            let tx_id = db.mvcc_store.begin_tx(conn.get_pager().clone()).unwrap();
             db.mvcc_store
                 .rollback_tx(tx_id, conn.get_pager().clone(), &conn)
                 .unwrap();
@@ -46,7 +46,7 @@ fn bench(c: &mut Criterion) {
     group.bench_function("begin_tx + commit_tx", |b| {
         b.to_async(FuturesExecutor).iter(|| async {
             let conn = &db.conn;
-            let tx_id = db.mvcc_store.begin_tx(conn.get_pager().clone());
+            let tx_id = db.mvcc_store.begin_tx(conn.get_pager().clone()).unwrap();
             let mv_store = &db.mvcc_store;
             let mut sm = mv_store
                 .commit_tx(tx_id, conn.get_pager().clone(), conn)
@@ -67,7 +67,7 @@ fn bench(c: &mut Criterion) {
     group.bench_function("begin_tx-read-commit_tx", |b| {
         b.to_async(FuturesExecutor).iter(|| async {
             let conn = &db.conn;
-            let tx_id = db.mvcc_store.begin_tx(conn.get_pager().clone());
+            let tx_id = db.mvcc_store.begin_tx(conn.get_pager().clone()).unwrap();
             db.mvcc_store
                 .read(
                     tx_id,
@@ -99,7 +99,7 @@ fn bench(c: &mut Criterion) {
     group.bench_function("begin_tx-update-commit_tx", |b| {
         b.to_async(FuturesExecutor).iter(|| async {
             let conn = &db.conn;
-            let tx_id = db.mvcc_store.begin_tx(conn.get_pager().clone());
+            let tx_id = db.mvcc_store.begin_tx(conn.get_pager().clone()).unwrap();
             db.mvcc_store
                 .update(
                     tx_id,
@@ -130,7 +130,7 @@ fn bench(c: &mut Criterion) {
     });
 
     let db = bench_db();
-    let tx_id = db.mvcc_store.begin_tx(db.conn.get_pager().clone());
+    let tx_id = db.mvcc_store.begin_tx(db.conn.get_pager().clone()).unwrap();
     db.mvcc_store
         .insert(
             tx_id,
@@ -159,7 +159,7 @@ fn bench(c: &mut Criterion) {
     });
 
     let db = bench_db();
-    let tx_id = db.mvcc_store.begin_tx(db.conn.get_pager().clone());
+    let tx_id = db.mvcc_store.begin_tx(db.conn.get_pager().clone()).unwrap();
     db.mvcc_store
         .insert(
             tx_id,

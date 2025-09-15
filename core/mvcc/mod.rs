@@ -65,7 +65,7 @@ mod tests {
                 let conn = db.get_db().connect().unwrap();
                 let mvcc_store = db.get_db().mv_store.as_ref().unwrap().clone();
                 for _ in 0..iterations {
-                    let tx = mvcc_store.begin_tx(conn.pager.borrow().clone());
+                    let tx = mvcc_store.begin_tx(conn.pager.borrow().clone()).unwrap();
                     let id = IDS.fetch_add(1, Ordering::SeqCst);
                     let id = RowID {
                         table_id: 1,
@@ -74,7 +74,7 @@ mod tests {
                     let row = generate_simple_string_row(1, id.row_id, "Hello");
                     mvcc_store.insert(tx, row.clone()).unwrap();
                     commit_tx_no_conn(&db, tx, &conn).unwrap();
-                    let tx = mvcc_store.begin_tx(conn.pager.borrow().clone());
+                    let tx = mvcc_store.begin_tx(conn.pager.borrow().clone()).unwrap();
                     let committed_row = mvcc_store.read(tx, id).unwrap();
                     commit_tx_no_conn(&db, tx, &conn).unwrap();
                     assert_eq!(committed_row, Some(row));
@@ -86,7 +86,7 @@ mod tests {
                 let conn = db.get_db().connect().unwrap();
                 let mvcc_store = db.get_db().mv_store.as_ref().unwrap().clone();
                 for _ in 0..iterations {
-                    let tx = mvcc_store.begin_tx(conn.pager.borrow().clone());
+                    let tx = mvcc_store.begin_tx(conn.pager.borrow().clone()).unwrap();
                     let id = IDS.fetch_add(1, Ordering::SeqCst);
                     let id = RowID {
                         table_id: 1,
@@ -95,7 +95,7 @@ mod tests {
                     let row = generate_simple_string_row(1, id.row_id, "World");
                     mvcc_store.insert(tx, row.clone()).unwrap();
                     commit_tx_no_conn(&db, tx, &conn).unwrap();
-                    let tx = mvcc_store.begin_tx(conn.pager.borrow().clone());
+                    let tx = mvcc_store.begin_tx(conn.pager.borrow().clone()).unwrap();
                     let committed_row = mvcc_store.read(tx, id).unwrap();
                     commit_tx_no_conn(&db, tx, &conn).unwrap();
                     assert_eq!(committed_row, Some(row));
@@ -127,7 +127,7 @@ mod tests {
                         let dropped = mvcc_store.drop_unused_row_versions();
                         tracing::debug!("garbage collected {dropped} versions");
                     }
-                    let tx = mvcc_store.begin_tx(conn.pager.borrow().clone());
+                    let tx = mvcc_store.begin_tx(conn.pager.borrow().clone()).unwrap();
                     let id = i % 16;
                     let id = RowID {
                         table_id: 1,

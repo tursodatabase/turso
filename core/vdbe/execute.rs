@@ -2168,7 +2168,7 @@ pub fn op_transaction(
             // }
             let tx_id = match tx_mode {
                 TransactionMode::None | TransactionMode::Read | TransactionMode::Concurrent => {
-                    mv_store.begin_tx(pager.clone())
+                    mv_store.begin_tx(pager.clone())?
                 }
                 TransactionMode::Write => {
                     return_if_io!(mv_store.begin_exclusive_tx(pager.clone(), None))
