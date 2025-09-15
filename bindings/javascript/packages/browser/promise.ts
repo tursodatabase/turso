@@ -46,7 +46,7 @@ async function connect(
 	connect: any,
 	init: () => Promise<Worker>,
 ): Promise<Database> {
-	if (path == ":memory:") {
+	if (path === ":memory:") {
 		const db = await connect(path, { tracing: opts.tracing });
 		return new Database(db, null, null, opts);
 	}

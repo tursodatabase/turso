@@ -15,7 +15,7 @@ function cleanup(path) {
 	unlinkSync(`${path}-changes`);
 	try {
 		unlinkSync(`${path}-wal-revert`);
-	} catch (e) {}
+	} catch (_e) {}
 }
 
 test("select-after-push", async () => {

@@ -1,7 +1,7 @@
 import type { GeneratorResponse, ProtocolIo, RunOpts } from "./types.js";
 
-const GENERATOR_RESUME_IO = 0;
-const GENERATOR_RESUME_DONE = 1;
+const _GENERATOR_RESUME_IO = 0;
+const _GENERATOR_RESUME_DONE = 1;
 
 interface TrackPromise<T> {
 	promise: Promise<T>;
@@ -10,7 +10,9 @@ interface TrackPromise<T> {
 
 function trackPromise<T>(p: Promise<T>): TrackPromise<T> {
 	const status = { promise: null, finished: false };
-	status.promise = p.finally(() => (status.finished = true));
+	status.promise = p.finally(() => {
+		status.finished = true;
+	});
 	return status;
 }
 
@@ -21,7 +23,7 @@ function timeoutMs(ms: number): Promise<void> {
 async function process(opts: RunOpts, io: ProtocolIo, request: any) {
 	const requestType = request.request();
 	const completion = request.completion();
-	if (requestType.type == "Http") {
+	if (requestType.type === "Http") {
 		try {
 			let headers = opts.headers;
 			if (requestType.headers != null && requestType.headers.length > 0) {
@@ -49,7 +51,7 @@ async function process(opts: RunOpts, io: ProtocolIo, request: any) {
 		} catch (error) {
 			completion.poison(`fetch error: ${error}`);
 		}
-	} else if (requestType.type == "FullRead") {
+	} else if (requestType.type === "FullRead") {
 		try {
 			const metadata = await io.read(requestType.path);
 			if (metadata != null) {
@@ -59,14 +61,14 @@ async function process(opts: RunOpts, io: ProtocolIo, request: any) {
 		} catch (error) {
 			completion.poison(`metadata read error: ${error}`);
 		}
-	} else if (requestType.type == "FullWrite") {
+	} else if (requestType.type === "FullWrite") {
 		try {
 			await io.write(requestType.path, requestType.content);
 			completion.done();
 		} catch (error) {
 			completion.poison(`metadata write error: ${error}`);
 		}
-	} else if (requestType.type == "Transform") {
+	} else if (requestType.type === "Transform") {
 		if (opts.transform == null) {
 			completion.poison("transform is not set");
 			return;
@@ -76,9 +78,9 @@ async function process(opts: RunOpts, io: ProtocolIo, request: any) {
 			const result = opts.transform(mutation);
 			if (result == null) {
 				results.push({ type: "Keep" });
-			} else if (result.operation == "skip") {
+			} else if (result.operation === "skip") {
 				results.push({ type: "Skip" });
-			} else if (result.operation == "rewrite") {
+			} else if (result.operation === "rewrite") {
 				results.push({ type: "Rewrite", stmt: result.stmt });
 			} else {
 				completion.poison("unexpected transform operation");
@@ -112,10 +114,10 @@ export async function run(
 	while (true) {
 		const { type, ...rest }: GeneratorResponse =
 			await generator.resumeAsync(null);
-		if (type == "Done") {
+		if (type === "Done") {
 			return null;
 		}
-		if (type == "SyncEngineStats") {
+		if (type === "SyncEngineStats") {
 			return rest;
 		}
 		for (
@@ -127,7 +129,7 @@ export async function run(
 		}
 
 		const tasksRace =
-			tasks.length == 0
+			tasks.length === 0
 				? Promise.resolve()
 				: Promise.race([
 						timeoutMs(opts.preemptionMs),

@@ -116,7 +116,7 @@ async function connect(
 		preemptionMs: 1,
 		transform: opts.transform,
 	};
-	const isMemory = opts.path == ":memory:";
+	const isMemory = opts.path === ":memory:";
 	const io = isMemory ? memoryIO() : BrowserIo;
 
 	const worker = await init();

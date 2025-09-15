@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from "vitest";
+import { expect, test } from "vitest";
 import { connect } from "./promise-default.js";
 
 test("in-memory db", async () => {

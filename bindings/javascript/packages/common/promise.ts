@@ -117,7 +117,7 @@ class Database {
 			throw new TypeError("Expected first argument to be a function");
 		const wrapTxn = (mode) => {
 			return async (...bindParameters) => {
-				await this.exec("BEGIN " + mode);
+				await this.exec(`BEGIN ${mode}`);
 				this._inTransaction = true;
 				try {
 					const result = await fn(...bindParameters);
@@ -162,27 +162,27 @@ class Database {
 		return results;
 	}
 
-	backup(filename, options) {
+	backup(_filename, _options) {
 		throw new Error("not implemented");
 	}
 
-	serialize(options) {
+	serialize(_options) {
 		throw new Error("not implemented");
 	}
 
-	function(name, options, fn) {
+	function(_name, _options, _fn) {
 		throw new Error("not implemented");
 	}
 
-	aggregate(name, options) {
+	aggregate(_name, _options) {
 		throw new Error("not implemented");
 	}
 
-	table(name, factory) {
+	table(_name, _factory) {
 		throw new Error("not implemented");
 	}
 
-	loadExtension(path) {
+	loadExtension(_path) {
 		throw new Error("not implemented");
 	}
 

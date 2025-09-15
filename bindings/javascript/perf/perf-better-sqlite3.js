@@ -1,5 +1,5 @@
 import Database from "better-sqlite3";
-import { baseline, bench, group, run } from "mitata";
+import { bench, run } from "mitata";
 
 const db = new Database(":memory:");
 

@@ -2,7 +2,6 @@ import {
 	getDefaultContext as __emnapiGetDefaultContext,
 	instantiateNapiModule as __emnapiInstantiateNapiModule,
 	WASI as __WASI,
-	createOnMessage as __wasmCreateOnMessageForFsProxy,
 	instantiateNapiModuleSync,
 	MessageHandler,
 } from "@tursodatabase/wasm-runtime";
@@ -44,22 +43,32 @@ function panic(name): never {
 
 const MainDummyImports: BrowserImports = {
 	is_web_worker: (): boolean => false,
-	lookup_file: (ptr: number, len: number): number => {
+	lookup_file: (_ptr: number, _len: number): number => {
 		panic("lookup_file");
 	},
-	read: (handle: number, ptr: number, len: number, offset: number): number => {
+	read: (
+		_handle: number,
+		_ptr: number,
+		_len: number,
+		_offset: number,
+	): number => {
 		panic("read");
 	},
-	write: (handle: number, ptr: number, len: number, offset: number): number => {
+	write: (
+		_handle: number,
+		_ptr: number,
+		_len: number,
+		_offset: number,
+	): number => {
 		panic("write");
 	},
-	sync: (handle: number): number => {
+	sync: (_handle: number): number => {
 		panic("sync");
 	},
-	truncate: (handle: number, len: number): number => {
+	truncate: (_handle: number, _len: number): number => {
 		panic("truncate");
 	},
-	size: (handle: number): number => {
+	size: (_handle: number): number => {
 		panic("size");
 	},
 };
@@ -76,7 +85,7 @@ function workerImports(
 					getStringFromMemory(memory, ptr, len),
 				);
 				return handle == null ? -404 : handle;
-			} catch (e) {
+			} catch (_e) {
 				return -1;
 			}
 		},
@@ -92,7 +101,7 @@ function workerImports(
 					getUint8ArrayFromMemory(memory, ptr, len),
 					offset,
 				);
-			} catch (e) {
+			} catch (_e) {
 				return -1;
 			}
 		},
@@ -108,7 +117,7 @@ function workerImports(
 					getUint8ArrayFromMemory(memory, ptr, len),
 					offset,
 				);
-			} catch (e) {
+			} catch (_e) {
 				return -1;
 			}
 		},
@@ -116,7 +125,7 @@ function workerImports(
 			try {
 				opfs.sync(handle);
 				return 0;
-			} catch (e) {
+			} catch (_e) {
 				return -1;
 			}
 		},
@@ -124,14 +133,14 @@ function workerImports(
 			try {
 				opfs.truncate(handle, len);
 				return 0;
-			} catch (e) {
+			} catch (_e) {
 				return -1;
 			}
 		},
 		size: (handle: number): number => {
 			try {
 				return opfs.size(handle);
-			} catch (e) {
+			} catch (_e) {
 				return -1;
 			}
 		},
@@ -237,7 +246,7 @@ let workerRequestId = 0;
 function waitForWorkerResponse(worker: Worker, id: number): Promise<any> {
 	let waitResolve, waitReject;
 	const callback = (msg) => {
-		if (msg.data.id == id) {
+		if (msg.data.id === id) {
 			if (msg.data.error != null) {
 				waitReject(msg.data.error);
 			} else {
@@ -313,7 +322,7 @@ function setupWebWorker() {
 	});
 
 	globalThis.onmessage = async (e) => {
-		if (e.data.__turso__ == "register") {
+		if (e.data.__turso__ === "register") {
 			try {
 				await opfs.registerFile(e.data.path);
 				self.postMessage({ id: e.data.id });
@@ -321,7 +330,7 @@ function setupWebWorker() {
 				self.postMessage({ id: e.data.id, error: error });
 			}
 			return;
-		} else if (e.data.__turso__ == "unregister") {
+		} else if (e.data.__turso__ === "unregister") {
 			try {
 				await opfs.unregisterFile(e.data.path);
 				self.postMessage({ id: e.data.id });
@@ -380,13 +389,13 @@ async function setupMainThread(
 }
 
 export {
-	OpfsDirectory,
-	workerImports,
-	MainDummyImports,
-	waitForWorkerResponse,
-	registerFileAtWorker,
-	unregisterFileAtWorker,
 	isWebWorker,
-	setupWebWorker,
+	MainDummyImports,
+	OpfsDirectory,
+	registerFileAtWorker,
 	setupMainThread,
+	setupWebWorker,
+	unregisterFileAtWorker,
+	waitForWorkerResponse,
+	workerImports,
 };

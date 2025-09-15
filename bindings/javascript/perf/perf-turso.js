@@ -1,5 +1,5 @@
 import { Database } from "@tursodatabase/database/compat";
-import { baseline, bench, group, run } from "mitata";
+import { bench, run } from "mitata";
 
 const db = new Database(":memory:");
 

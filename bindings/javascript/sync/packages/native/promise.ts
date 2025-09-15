@@ -14,7 +14,7 @@ import {
 	type SyncEngineStats,
 	type SyncOpts,
 } from "@tursodatabase/sync-common";
-import { Database as NativeDB, SyncEngine } from "#index";
+import { SyncEngine } from "#index";
 
 const NodeIO: ProtocolIo = {
 	async read(path: string): Promise<Buffer | Uint8Array | null> {
@@ -117,7 +117,7 @@ async function connect(opts: SyncOpts): Promise<Database> {
 		preemptionMs: 1,
 		transform: opts.transform,
 	};
-	const io = opts.path == ":memory:" ? memoryIO() : NodeIO;
+	const io = opts.path === ":memory:" ? memoryIO() : NodeIO;
 	await run(runOpts, io, engine, engine.init());
 
 	const nativeDb = engine.open();

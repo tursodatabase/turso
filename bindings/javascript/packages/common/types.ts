@@ -9,7 +9,6 @@ export interface DatabaseOpts {
 export interface NativeDatabase {
 	memory: boolean;
 	path: string;
-	new (path: string): NativeDatabase;
 	batchSync(sql: string);
 	batchAsync(sql: string): Promise<void>;
 

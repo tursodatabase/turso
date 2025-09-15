@@ -1,8 +1,4 @@
-import {
-	isWebWorker,
-	setupMainThread,
-	setupWebWorker,
-} from "@tursodatabase/database-browser-common";
+import { setupMainThread } from "@tursodatabase/database-browser-common";
 
 export let MainWorker = null;
 

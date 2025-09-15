@@ -93,7 +93,6 @@ const encodeValue = (memfs, value, type) => {
 			view[0] = value;
 			return new Uint8Array(view.buffer);
 		}
-		case -1:
 		default:
 			throw new Error("unsupported data");
 	}
@@ -119,7 +118,7 @@ const decodeValue = (memfs, payload, type) => {
 			(_key, value) => {
 				if (typeof value === "string") {
 					const matched = value.match(/^BigInt\((-?\d+)\)$/);
-					if (matched && matched[1]) {
+					if (matched?.[1]) {
 						return BigInt(matched[1]);
 					}
 				}

@@ -2,7 +2,6 @@
 	"name": "turso-perf",
 	"type": "module",
 	"private": true,
-	"type": "module",
 	"dependencies": {
 		"better-sqlite3": "^9.5.0",
 		"@tursodatabase/database": "../packages/native",
