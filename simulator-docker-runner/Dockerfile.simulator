@@ -19,6 +19,7 @@ COPY extensions ./extensions/
 COPY macros ./macros/
 COPY sync ./sync
 COPY parser ./parser/
+COPY perf/throughput/turso ./perf/throughput/turso
 COPY vendored ./vendored/
 COPY cli ./cli/
 COPY sqlite3 ./sqlite3/
@@ -43,6 +44,7 @@ COPY --from=planner /app/vendored ./vendored/
 COPY --from=planner /app/extensions ./extensions/
 COPY --from=planner /app/macros ./macros/
 COPY --from=planner /app/parser ./parser/
+COPY --from=planner /app/perf/throughput/turso ./perf/throughput/turso
 COPY --from=planner /app/simulator ./simulator/
 COPY --from=planner /app/packages ./packages/
 COPY --from=planner /app/sql_generation ./sql_generation/
