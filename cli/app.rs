@@ -75,6 +75,8 @@ pub struct Opts {
     pub tracing_output: Option<String>,
     #[clap(long, help = "Start MCP server instead of interactive shell")]
     pub mcp: bool,
+    #[clap(long, help = "Enable experimental logical log feature")]
+    pub experimental_logical_log: bool,
 }
 
 const PROMPT: &str = "turso> ";
@@ -180,6 +182,11 @@ impl Limbo {
                 flags,
                 turso_core::DatabaseOpts::new()
                     .with_mvcc(opts.experimental_mvcc)
+                    .with_mvcc_mode(if opts.experimental_logical_log {
+                        turso_core::MvccMode::LogicalLog
+                    } else {
+                        turso_core::MvccMode::Noop
+                    })
                     .with_indexes(indexes_enabled)
                     .with_views(opts.experimental_views)
                     .with_strict(opts.experimental_strict),
