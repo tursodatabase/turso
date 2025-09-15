@@ -2,6 +2,7 @@ use std::{
     fmt::{Debug, Display},
     ops::{Deref, DerefMut},
     path::Path,
+    rc::Rc,
     sync::Arc,
     vec,
 };
@@ -322,40 +323,16 @@ impl Display for InteractionStats {
     }
 }
 
-#[derive(Debug)]
-pub(crate) enum Interaction {
-    Query(Query),
-    Assumption(Assertion),
-    Assertion(Assertion),
-    Fault(Fault),
-    /// Will attempt to run any random query. However, when the connection tries to sync it will
-    /// close all connections and reopen the database and assert that no data was lost
-    FsyncQuery(Query),
-    FaultyQuery(Query),
-}
-
-impl Display for Interaction {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Query(query) => write!(f, "{query}"),
-            Self::Assumption(assumption) => write!(f, "ASSUME {}", assumption.name),
-            Self::Assertion(assertion) => write!(f, "ASSERT {}", assertion.name),
-            Self::Fault(fault) => write!(f, "FAULT '{fault}'"),
-            Self::FsyncQuery(query) => write!(f, "{query}"),
-            Self::FaultyQuery(query) => write!(f, "{query}; -- FAULTY QUERY"),
-        }
-    }
-}
-
 type AssertionFunc = dyn Fn(&Vec<ResultSet>, &mut SimulatorEnv) -> Result<Result<(), String>>;
 
 enum AssertionAST {
     Pick(),
 }
 
-pub(crate) struct Assertion {
-    pub(crate) func: Box<AssertionFunc>,
-    pub(crate) name: String, // For display purposes in the plan
+#[derive(Clone)]
+pub struct Assertion {
+    pub func: Rc<AssertionFunc>,
+    pub name: String, // For display purposes in the plan
 }
 
 impl Debug for Assertion {
@@ -363,6 +340,18 @@ impl Debug for Assertion {
         f.debug_struct("Assertion")
             .field("name", &self.name)
             .finish()
+    }
+}
+
+impl Assertion {
+    pub fn new<F>(name: String, func: F) -> Self
+    where
+        F: Fn(&Vec<ResultSet>, &mut SimulatorEnv) -> Result<Result<(), String>> + 'static,
+    {
+        Self {
+            func: Rc::new(func),
+            name,
+        }
     }
 }
 
@@ -461,6 +450,31 @@ impl InteractionPlan {
 
         tracing::info!("Generated plan with {} interactions", plan.plan.len());
         plan
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum Interaction {
+    Query(Query),
+    Assumption(Assertion),
+    Assertion(Assertion),
+    Fault(Fault),
+    /// Will attempt to run any random query. However, when the connection tries to sync it will
+    /// close all connections and reopen the database and assert that no data was lost
+    FsyncQuery(Query),
+    FaultyQuery(Query),
+}
+
+impl Display for Interaction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Query(query) => write!(f, "{query}"),
+            Self::Assumption(assumption) => write!(f, "ASSUME {}", assumption.name),
+            Self::Assertion(assertion) => write!(f, "ASSERT {}", assertion.name),
+            Self::Fault(fault) => write!(f, "FAULT '{fault}'"),
+            Self::FsyncQuery(query) => write!(f, "{query}"),
+            Self::FaultyQuery(query) => write!(f, "{query}; -- FAULTY QUERY"),
+        }
     }
 }
 
