@@ -3542,17 +3542,20 @@ impl BTreeCursor {
                             usable_space,
                         )?;
                         let overflow_cell_count_after = parent_contents.overflow_cells.len();
-                        let divider_cell_is_overflow_cell =
-                            overflow_cell_count_after > overflow_cell_count_before;
                         #[cfg(debug_assertions)]
-                        BTreeCursor::validate_balance_non_root_divider_cell_insertion(
-                            balance_info,
-                            parent_contents,
-                            divider_cell_insert_idx_in_parent,
-                            divider_cell_is_overflow_cell,
-                            page,
-                            usable_space,
-                        );
+                        {
+                            let divider_cell_is_overflow_cell =
+                                overflow_cell_count_after > overflow_cell_count_before;
+
+                            BTreeCursor::validate_balance_non_root_divider_cell_insertion(
+                                balance_info,
+                                parent_contents,
+                                divider_cell_insert_idx_in_parent,
+                                divider_cell_is_overflow_cell,
+                                page,
+                                usable_space,
+                            );
+                        }
                     }
                     tracing::debug!(
                         "balance_non_root(parent_overflow={})",
