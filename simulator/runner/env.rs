@@ -173,6 +173,10 @@ impl SimulatorEnv {
         env.clear();
         env
     }
+
+    pub fn choose_conn(&self, rng: &mut impl Rng) -> usize {
+        rng.random_range(0..self.connections.len())
+    }
 }
 
 impl SimulatorEnv {

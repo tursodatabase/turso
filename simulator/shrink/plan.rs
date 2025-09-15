@@ -1,7 +1,7 @@
 use crate::{
     SandboxedResult, SimulatorEnv,
     generation::{
-        plan::{Interaction, InteractionPlan, Interactions},
+        plan::{Interaction, InteractionPlan, Interactions, InteractionsType},
         property::Property,
     },
     model::Query,
@@ -56,9 +56,9 @@ impl InteractionPlan {
         // Remove all properties that do not use the failing tables
         plan.plan.retain_mut(|interactions| {
             let retain = if idx == failing_execution.interaction_index {
-                if let Interactions::Property(
+                if let InteractionsType::Property(
                     Property::FsyncNoWait { tables, .. } | Property::FaultyQuery { tables, .. },
-                ) = interactions
+                ) = &mut interactions.interactions
                 {
                     tables.retain(|table| depending_tables.contains(table));
                 }
@@ -71,7 +71,7 @@ impl InteractionPlan {
 
                 if has_table {
                     // Remove the extensional parts of the properties
-                    if let Interactions::Property(p) = interactions {
+                    if let InteractionsType::Property(p) = &mut interactions.interactions {
                         match p {
                             Property::InsertValuesSelect { queries, .. }
                             | Property::DoubleCreateFailure { queries, .. }
@@ -101,14 +101,16 @@ impl InteractionPlan {
                         .iter()
                         .any(|t| depending_tables.contains(t));
                 }
-                let is_fault = matches!(interactions, Interactions::Fault(..));
+                let is_fault = matches!(interactions.interactions, InteractionsType::Fault(..));
                 is_fault
                     || (has_table
                         && !matches!(
-                            interactions,
-                            Interactions::Query(Query::Select(_))
-                                | Interactions::Property(Property::SelectLimit { .. })
-                                | Interactions::Property(Property::SelectSelectOptimizer { .. })
+                            interactions.interactions,
+                            InteractionsType::Query(Query::Select(_))
+                                | InteractionsType::Property(Property::SelectLimit { .. })
+                                | InteractionsType::Property(
+                                    Property::SelectSelectOptimizer { .. }
+                                )
                         ))
             };
             idx += 1;
@@ -178,7 +180,7 @@ impl InteractionPlan {
 
         // phase 1: shrink extensions
         for interaction in &mut plan.plan {
-            if let Interactions::Property(property) = interaction {
+            if let InteractionsType::Property(property) = &mut interaction.interactions {
                 match property {
                     Property::InsertValuesSelect { queries, .. }
                     | Property::DoubleCreateFailure { queries, .. }
@@ -187,7 +189,12 @@ impl InteractionPlan {
                         let mut temp_plan = InteractionPlan {
                             plan: queries
                                 .iter()
-                                .map(|q| Interactions::Query(q.clone()))
+                                .map(|q| {
+                                    Interactions::new(
+                                        interaction.connection_index,
+                                        InteractionsType::Query(q.clone()),
+                                    )
+                                })
                                 .collect(),
                         };
 
@@ -202,8 +209,8 @@ impl InteractionPlan {
                         *queries = temp_plan
                             .plan
                             .into_iter()
-                            .filter_map(|i| match i {
-                                Interactions::Query(q) => Some(q),
+                            .filter_map(|i| match i.interactions {
+                                InteractionsType::Query(q) => Some(q),
                                 _ => None,
                             })
                             .collect();
@@ -265,11 +272,7 @@ impl InteractionPlan {
         let last_execution = Arc::new(Mutex::new(*failing_execution));
         let result = SandboxedResult::from(
             std::panic::catch_unwind(|| {
-                run_simulation(
-                    env.clone(),
-                    &mut [test_plan.clone()],
-                    last_execution.clone(),
-                )
+                run_simulation(env.clone(), &mut test_plan.clone(), last_execution.clone())
             }),
             last_execution,
         );
