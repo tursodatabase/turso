@@ -434,6 +434,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
 
     #[tracing::instrument(fields(state = ?self.state), skip(self, mvcc_store), level = Level::DEBUG)]
     fn step(&mut self, mvcc_store: &Self::Context) -> Result<TransitionResult<Self::SMResult>> {
+        tracing::trace!("step(state={:?})", self.state);
         match &self.state {
             CommitState::Initial => {
                 let end_ts = mvcc_store.get_timestamp();
@@ -846,7 +847,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 return Ok(TransitionResult::Continue);
             }
             CommitState::BeginCommitLogicalLog { end_ts, log_record } => {
-                if mvcc_store.storage.is_logical_log() {
+                if mvcc_store.storage.is_logical_log() && !mvcc_store.is_exclusive_tx(&self.tx_id) {
                     // logical log needs to be serialized
                     let locked = self.commit_coordinator.pager_commit_lock.write();
                     if !locked {
@@ -875,6 +876,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 if mvcc_store.storage.is_logical_log() {
                     self.commit_coordinator.pager_commit_lock.unlock();
                 }
+                self.pager.end_tx(false, &self.connection)?;
                 self.state = CommitState::CommitEnd { end_ts: *end_ts };
                 return Ok(TransitionResult::Continue);
             }
@@ -892,7 +894,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 if mvcc_store.is_exclusive_tx(&self.tx_id) {
                     mvcc_store.release_exclusive_tx(&self.tx_id);
                 }
-                tracing::trace!("logged(tx_id={}, )", self.tx_id);
+                tracing::trace!("logged(tx_id={}, end_ts={})", self.tx_id, *end_ts);
                 self.finalize(mvcc_store)?;
                 Ok(TransitionResult::Done(()))
             }
