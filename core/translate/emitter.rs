@@ -179,6 +179,14 @@ impl<'a> TranslateCtx<'a> {
     }
 }
 
+pub fn maybe_jump_after_row(program: &mut ProgramBuilder, t_ctx: &TranslateCtx) {
+    if let Some(rhs_advance) = t_ctx.after_row_jump.iter().rev().flatten().copied().next() {
+        program.emit_insn(Insn::Goto {
+            target_pc: rhs_advance,
+        });
+    }
+}
+
 /// Used to distinguish database operations
 #[allow(clippy::upper_case_acronyms, dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use crate::{
     schema::{Affinity, Index, IndexColumn, Table},
     translate::{
-        emitter::prepare_cdc_if_necessary,
+        emitter::{maybe_jump_after_row, prepare_cdc_if_necessary},
         plan::{DistinctCtx, Distinctness, JoinedTable, Scan},
         result_row::emit_select_result,
     },
@@ -1054,6 +1054,7 @@ fn emit_loop_source(
                 }
                 GroupByRowSource::MainLoop { .. } => group_by_agg_phase(program, t_ctx, plan)?,
             }
+            maybe_jump_after_row(program, t_ctx);
 
             Ok(())
         }
@@ -1072,6 +1073,7 @@ fn emit_loop_source(
                 let distinct_ctx = ctx.as_ref().expect("distinct context must exist");
                 program.preassign_label_to_next_insn(distinct_ctx.label_on_conflict);
             }
+            maybe_jump_after_row(program, t_ctx);
 
             Ok(())
         }
@@ -1139,6 +1141,7 @@ fn emit_loop_source(
                 program.emit_int(1, flag);
             }
 
+            maybe_jump_after_row(program, t_ctx);
             Ok(())
         }
         LoopEmitTarget::QueryResult => {
@@ -1168,6 +1171,7 @@ fn emit_loop_source(
                 program.preassign_label_to_next_insn(distinct_ctx.label_on_conflict);
             }
 
+            maybe_jump_after_row(program, t_ctx);
             Ok(())
         }
     }
