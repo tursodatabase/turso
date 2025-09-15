@@ -858,6 +858,14 @@ do_execsql_test_on_specific_db {:memory:} delete-rowid-in-null-only-noop {
 } {3
 1,2,3}
 
+do_execsql_test_on_specific_db {:memory:} delete-rowid-expression {
+  CREATE TABLE t (v TEXT);
+  INSERT INTO t(rowid, v) VALUES (1,'a'),(2,'b'),(3,'c');
+
+  DELETE FROM t WHERE rowid IN (1, 1+2);
+  SELECT rowid FROM t;
+} {2}
+
 do_execsql_test_on_specific_db {:memory:} delete-indexed-in-with-nulls-and-dupes {
   CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER, v TEXT);
   CREATE INDEX t_k ON t(k);
