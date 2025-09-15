@@ -269,13 +269,14 @@ impl SyncEngine {
         self.run(async move |coro, sync_engine| {
             let sync_engine = try_read(sync_engine)?;
             let sync_engine = try_unwrap(&sync_engine)?;
-            let changes = sync_engine.stats(coro).await?;
+            let stats = sync_engine.stats(coro).await?;
             Ok(Some(GeneratorResponse::SyncEngineStats {
-                operations: changes.cdc_operations,
-                main_wal: changes.main_wal_size as i64,
-                revert_wal: changes.revert_wal_size as i64,
-                last_pull_unix_time: changes.last_pull_unix_time,
-                last_push_unix_time: changes.last_push_unix_time,
+                operations: stats.cdc_operations,
+                main_wal: stats.main_wal_size as i64,
+                revert_wal: stats.revert_wal_size as i64,
+                last_pull_unix_time: stats.last_pull_unix_time,
+                last_push_unix_time: stats.last_push_unix_time,
+                revision: stats.revision,
             }))
         })
     }

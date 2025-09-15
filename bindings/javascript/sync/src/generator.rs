@@ -45,6 +45,7 @@ pub enum GeneratorResponse {
         revert_wal: i64,
         last_pull_unix_time: i64,
         last_push_unix_time: Option<i64>,
+        revision: Option<String>,
     },
 }
 
