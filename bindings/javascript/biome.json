@@ -12,7 +12,8 @@
 			"!packages/native/index.js",
 			"!packages/native/index.d.ts",
 			"!sync/packages/native/index.js",
-			"!sync/packages/native/index.d.ts"
+			"!sync/packages/native/index.d.ts",
+			"!**/dist"
 		]
 	},
 	"formatter": {
