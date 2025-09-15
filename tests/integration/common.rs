@@ -334,6 +334,7 @@ pub fn run_query_core(
 
 #[cfg(test)]
 mod tests {
+    use rand::seq::IndexedRandom;
     use std::{sync::Arc, vec};
     use tempfile::{NamedTempFile, TempDir};
     use turso_core::{Database, StepResult, IO};
@@ -685,6 +686,183 @@ mod tests {
         // Verify we found all expected tables
         assert_eq!(found_tables.len(), 0, "Should find no tables in schema");
 
+        Ok(())
+    }
+    #[test]
+    fn fuzz_index_vs_scan_equivalence() -> anyhow::Result<()> {
+        use rand::{Rng, SeedableRng};
+        use rand_chacha::ChaCha8Rng;
+
+        let mut rng = if let Ok(seed_str) = std::env::var("SEED") {
+            let seed = seed_str.parse::<u64>()?;
+            eprintln!("Using seed: {seed}");
+            ChaCha8Rng::seed_from_u64(seed)
+        } else {
+            ChaCha8Rng::from_os_rng()
+        };
+
+        let schema = r#"
+        CREATE TABLE users (
+            id INTEGER PRIMARY KEY,
+            first_name TEXT,
+            last_name TEXT,
+            email TEXT,
+            phone_number TEXT,
+            address TEXT,
+            city TEXT,
+            state TEXT,
+            zipcode TEXT,
+            age INTEGER
+        )"#;
+
+        let tmp = TempDatabase::new_with_rusqlite(schema, true);
+        let conn = tmp.connect_limbo();
+
+        limbo_exec_rows(
+            &tmp,
+            &conn,
+            "CREATE TABLE products (
+            id INTEGER PRIMARY KEY,
+            name TEXT,
+            price REAL
+        )",
+        );
+        limbo_exec_rows(&tmp, &conn, "CREATE INDEX idx_users_age ON users(age);");
+
+        // Insert test data
+        for id in 1..=5_000 {
+            let age = rng.random_range(0..=110);
+            limbo_exec_rows(&tmp, &conn, &format!("INSERT INTO users VALUES({id},'f{id}','l{id}','u{id}@ex.am','555{id:04}','{id} Main St','City','ST','{id:05}',{age});"));
+        }
+
+        for id in 1..=2_000 {
+            let price = (rng.random::<f64>() * 500.0).round();
+            limbo_exec_rows(
+                &tmp,
+                &conn,
+                &format!("INSERT INTO products VALUES({id},'p{id}',{price});"),
+            );
+        }
+
+        // Test configurations
+        #[derive(Clone, Copy, Debug)]
+        enum TestCase {
+            UsersId,    // PRIMARY KEY
+            UsersRowid, // implicit rowid index
+            UsersAge,   // secondary index
+            ProductsId, // PRIMARY KEY
+        }
+
+        let test_cases = [
+            TestCase::UsersId,
+            TestCase::UsersRowid,
+            TestCase::UsersAge,
+            TestCase::ProductsId,
+        ];
+
+        const ITERATIONS: usize = 1000;
+
+        for _i in 0..ITERATIONS {
+            let test_case = *test_cases.choose(&mut rng).unwrap();
+
+            // Pick IN-list size: mostly small, sometimes medium
+            let list_size = if rng.random_bool(0.8) {
+                rng.random_range(1..=8)
+            } else {
+                rng.random_range(9..=32)
+            };
+
+            // Configure test based on case
+            let (table, col, domain) = match test_case {
+                TestCase::UsersId => ("users", "id", 1..=6_000),
+                TestCase::UsersRowid => ("users", "rowid", 1..=5_000),
+                TestCase::UsersAge => ("users", "age", 0..=120),
+                TestCase::ProductsId => ("products", "id", 1..=3_000),
+            };
+
+            // Generate unique random values from domain
+            let mut values = std::collections::BTreeSet::new();
+            while values.len() < list_size {
+                values.insert(rng.random_range(domain.clone()));
+            }
+            let values: Vec<i64> = values.into_iter().collect();
+
+            // Build IN predicate
+            let in_list = values
+                .iter()
+                .map(|v| v.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            let q_in = format!("SELECT * FROM {table} WHERE {col} IN ({in_list}) ORDER BY id");
+
+            // Build equivalent OR predicate (use +col to force scan)
+            let or_clauses = values
+                .iter()
+                .map(|v| format!("(+{col}) = {v}"))
+                .collect::<Vec<_>>()
+                .join(" OR ");
+            let q_or = format!("SELECT * FROM {table} WHERE {or_clauses} ORDER BY id");
+
+            // Execute and compare
+            let result_in = limbo_exec_rows(&tmp, &conn, &q_in);
+            let result_or = limbo_exec_rows(&tmp, &conn, &q_or);
+
+            if result_in != result_or {
+                eprintln!("MISMATCH on {test_case:?}!");
+                eprintln!("IN query:  {q_in}");
+                eprintln!("OR query:  {q_or}");
+                eprintln!("IN result: {result_in:?}");
+                eprintln!("OR result: {result_or:?}");
+                panic!("Results don't match!");
+            }
+        }
+
+        // Edge cases
+        // Duplicates in IN list shouldn't affect result
+        let q1 = "SELECT * FROM users WHERE id IN (5,5,5,10,10) ORDER BY id";
+        let q2 = "SELECT * FROM users WHERE (+id)=5 OR (+id)=5 OR (+id)=5 OR (+id)=10 OR (+id)=10 ORDER BY id";
+        assert_eq!(
+            limbo_exec_rows(&tmp, &conn, q1),
+            limbo_exec_rows(&tmp, &conn, q2),
+            "Duplicate handling failed"
+        );
+
+        // Non-existent values
+        let q3 = "SELECT * FROM products WHERE id IN (999999,888888) ORDER BY id";
+        let q4 = "SELECT * FROM products WHERE (+id)=999999 OR (+id)=888888 ORDER BY id";
+        assert_eq!(
+            limbo_exec_rows(&tmp, &conn, q3),
+            limbo_exec_rows(&tmp, &conn, q4),
+            "Non-existent values handling failed"
+        );
+
+        // Large IN list on indexed column
+        let large_values: Vec<i64> = (0..50)
+            .map(|_| rng.random_range(0..=120))
+            .collect::<std::collections::BTreeSet<_>>() // dedupe
+            .into_iter()
+            .collect();
+
+        let in_list = large_values
+            .iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let or_clauses = large_values
+            .iter()
+            .map(|v| format!("(+age) = {v}"))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+
+        let q5 = format!("SELECT * FROM users WHERE age IN ({in_list}) ORDER BY id");
+        let q6 = format!("SELECT * FROM users WHERE {or_clauses} ORDER BY id");
+        assert_eq!(
+            limbo_exec_rows(&tmp, &conn, &q5),
+            limbo_exec_rows(&tmp, &conn, &q6),
+            "Large IN list failed"
+        );
+
+        eprintln!("All {ITERATIONS} iterations passed!");
         Ok(())
     }
 }
