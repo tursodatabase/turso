@@ -44,6 +44,7 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
     let args = Args::parse();
 
     println!(
