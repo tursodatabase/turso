@@ -32,7 +32,7 @@ use crate::{
     state_machine::{StateMachine, StateTransition, TransitionResult},
     storage::sqlite3_ondisk::SmallVec,
     translate::{collate::CollationSeq, plan::TableReferences},
-    types::{BlobRef, IOCompletions, IOResult, RawSlice, TextRef},
+    types::{IOCompletions, IOResult, RawSlice, TextRef},
     vdbe::{
         execute::{
             OpColumnState, OpDeleteState, OpDeleteSubState, OpIdxInsertState, OpInsertState,
@@ -957,7 +957,7 @@ pub fn registers_to_ref_values(registers: &[Register]) -> Vec<RefValue> {
                     subtype: t.subtype,
                 }),
                 Value::Blob(b) => {
-                    RefValue::Blob(BlobRef::new(RawSlice::new(b.to_bytes().as_ptr(), b.len())))
+                    RefValue::Blob(RawSlice::new(b.to_bytes().as_ptr(), b.len()).into())
                 }
             }
         })

@@ -11,7 +11,7 @@ pub use crate::json::ops::{
     jsonb_replace,
 };
 use crate::json::path::{json_path, JsonPath, PathElement};
-use crate::types::{BlobRef, RawSlice, Text, TextRef, TextSubtype, Value, ValueType};
+use crate::types::{RawSlice, Text, TextRef, TextSubtype, Value, ValueType};
 use crate::vdbe::Register;
 use crate::{bail_constraint_error, bail_parse_error, LimboError, RefValue};
 pub use cache::JsonCacheCell;
@@ -112,9 +112,9 @@ pub fn convert_dbtype_to_jsonb(val: &Value, strict: Conv) -> crate::Result<Jsonb
             Value::Text(text) => {
                 RefValue::Text(TextRef::create_from(text.as_str().as_bytes(), text.subtype))
             }
-            Value::Blob(items) => RefValue::Blob(BlobRef::new(RawSlice::create_from(
-                items.to_bytes().as_slice(),
-            ))),
+            Value::Blob(items) => {
+                RefValue::Blob(RawSlice::create_from(items.to_bytes().as_slice()).into())
+            }
         },
         strict,
     )

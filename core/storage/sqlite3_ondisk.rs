@@ -61,7 +61,7 @@ use crate::storage::buffer_pool::BufferPool;
 use crate::storage::database::{DatabaseStorage, EncryptionOrChecksum};
 use crate::storage::pager::Pager;
 use crate::storage::wal::READMARK_NOT_USED;
-use crate::types::{BlobRef, RawSlice, RefValue, SerialType, SerialTypeKind, TextRef, TextSubtype};
+use crate::types::{RawSlice, RefValue, SerialType, SerialTypeKind, TextRef, TextSubtype};
 use crate::{
     bail_corrupt_error, turso_assert, CompletionError, File, IOContext, Result, WalFileShared,
 };
@@ -1437,14 +1437,11 @@ pub fn read_value(buf: &[u8], serial_type: SerialType) -> Result<(RefValue, usiz
                 crate::bail_corrupt_error!("Invalid Blob value");
             }
             if content_size == 0 {
-                Ok((
-                    RefValue::Blob(BlobRef::new(RawSlice::new(std::ptr::null(), 0))),
-                    0,
-                ))
+                Ok((RefValue::Blob(RawSlice::new(std::ptr::null(), 0).into()), 0))
             } else {
                 let ptr = &buf[0] as *const u8;
                 let slice = RawSlice::new(ptr, content_size);
-                Ok((RefValue::Blob(BlobRef::new(slice)), content_size))
+                Ok((RefValue::Blob(slice.into()), content_size))
             }
         }
         SerialTypeKind::Text => {

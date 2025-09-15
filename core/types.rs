@@ -295,6 +295,21 @@ impl BlobRef {
     }
 }
 
+impl From<BlobRef> for RawSlice {
+    fn from(blob_ref: BlobRef) -> Self {
+        Self::new(
+            blob_ref.value.data,
+            blob_ref.value.len + blob_ref.unalloc_bytes,
+        )
+    }
+}
+
+impl From<RawSlice> for BlobRef {
+    fn from(raw_slice: RawSlice) -> Self {
+        Self::new(raw_slice)
+    }
+}
+
 #[cfg(feature = "serde")]
 fn float_to_string<S>(float: &f64, serializer: S) -> Result<S::Ok, S::Error>
 where
@@ -1216,7 +1231,7 @@ impl ImmutableRecord {
                     let end_offset = writer.pos;
                     let len = end_offset - start_offset;
                     let ptr = unsafe { writer.buf.as_ptr().add(start_offset) };
-                    ref_values.push(RefValue::Blob(BlobRef::new(RawSlice::new(ptr, len))));
+                    ref_values.push(RefValue::Blob(RawSlice::new(ptr, len).into()));
                 }
             };
         }
@@ -2836,9 +2851,7 @@ mod tests {
                 value: RawSlice::from_slice(&text.value),
                 subtype: text.subtype,
             }),
-            Value::Blob(blob) => {
-                RefValue::Blob(BlobRef::new(RawSlice::from_slice(&blob.to_bytes())))
-            }
+            Value::Blob(blob) => RefValue::Blob(RawSlice::from_slice(&blob.to_bytes()).into()),
         }
     }
 
