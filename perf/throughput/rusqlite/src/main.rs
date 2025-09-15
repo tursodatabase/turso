@@ -2,7 +2,7 @@ use clap::Parser;
 use rusqlite::{Connection, Result};
 use std::sync::{Arc, Barrier};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 #[derive(Parser)]
 #[command(name = "write-throughput")]
@@ -73,7 +73,7 @@ fn main() -> Result<()> {
         match handle.join() {
             Ok(Ok(inserts)) => total_inserts += inserts,
             Ok(Err(e)) => {
-                eprintln!("Thread error: {}", e);
+                eprintln!("Thread error: {e}");
                 return Err(e);
             }
             Err(_) => {
@@ -87,9 +87,9 @@ fn main() -> Result<()> {
     let overall_throughput = (total_inserts as f64) / overall_elapsed.as_secs_f64();
 
     println!("\n=== BENCHMARK RESULTS ===");
-    println!("Total inserts: {}", total_inserts);
+    println!("Total inserts: {total_inserts}",);
     println!("Total time: {:.2}s", overall_elapsed.as_secs_f64());
-    println!("Overall throughput: {:.2} inserts/sec", overall_throughput);
+    println!("Overall throughput: {overall_throughput:.2} inserts/sec");
     println!("Threads: {}", args.threads);
     println!("Batch size: {}", args.batch_size);
     println!("Iterations per thread: {}", args.iterations);
@@ -116,7 +116,7 @@ fn setup_database(db_path: &str) -> Result<Connection> {
         [],
     )?;
 
-    println!("Database created at: {}", db_path);
+    println!("Database created at: {db_path}");
     Ok(conn)
 }
 
@@ -144,7 +144,7 @@ fn worker_thread(
 
         for i in 0..batch_size {
             let id = thread_id * iterations * batch_size + iteration * batch_size + i;
-            stmt.execute([&id.to_string(), &format!("data_{}", id)])?;
+            stmt.execute([&id.to_string(), &format!("data_{id}")])?;
             total_inserts += 1;
         }
         if think_ms > 0 {
