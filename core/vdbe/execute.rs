@@ -2300,7 +2300,13 @@ pub fn op_auto_commit(
     if *auto_commit != conn.auto_commit.get() {
         if *rollback {
             // TODO(pere): add rollback I/O logic once we implement rollback journal
-            return_if_io!(pager.end_tx(true, &conn));
+            if let Some(mv_store) = mv_store {
+                if let Some((tx_id, _)) = conn.mv_tx.get() {
+                    mv_store.rollback_tx(tx_id, pager.clone(), &conn)?;
+                }
+            } else {
+                return_if_io!(pager.end_tx(true, &conn));
+            }
             conn.transaction_state.replace(TransactionState::None);
             conn.auto_commit.replace(true);
         } else {
