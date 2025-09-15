@@ -8,7 +8,7 @@ use crate::incremental::expr_compiler::CompiledExpression;
 use crate::incremental::persistence::{MinMaxPersistState, ReadRecord, RecomputeMinMax, WriteRow};
 use crate::schema::{Index, IndexColumn};
 use crate::storage::btree::BTreeCursor;
-use crate::types::{Blob, IOResult, ImmutableRecord, SeekKey, SeekOp, SeekResult, Text};
+use crate::types::{IOResult, ImmutableRecord, SeekKey, SeekOp, SeekResult, Text};
 use crate::{
     return_and_restore_if_io, return_if_io, Connection, Database, Result, SymbolTable, Value,
 };

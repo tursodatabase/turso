@@ -675,7 +675,7 @@ fn to_js_value<'a>(
             // emnapi do not support Buffer
             #[cfg(feature = "browser")]
             {
-                let buffer = Uint8Array::from(b.value.as_slice());
+                let buffer = Uint8Array::from(b.to_bytes().as_slice());
                 ToNapiValue::into_unknown(buffer, env)
             }
         }
