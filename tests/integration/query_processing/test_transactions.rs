@@ -425,8 +425,7 @@ fn test_mvcc_concurrent_conflicting_update() {
         .unwrap();
     let err = conn2
         .execute("UPDATE test SET value = 'third' WHERE id = 1")
-        .err()
-        .expect("expected error");
+        .expect_err("expected error");
     assert!(matches!(err, LimboError::WriteWriteConflict));
 }
 
@@ -455,8 +454,7 @@ fn test_mvcc_concurrent_conflicting_update_2() {
         .unwrap();
     let err = conn2
         .execute("UPDATE test SET value = 'third' WHERE id BETWEEN 0 AND 10")
-        .err()
-        .expect("expected error");
+        .expect_err("expected error");
     assert!(matches!(err, LimboError::WriteWriteConflict));
 }
 
