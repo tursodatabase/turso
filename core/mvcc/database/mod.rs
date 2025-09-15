@@ -27,6 +27,8 @@ use std::ops::Bound;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use tracing::instrument;
+use tracing::Level;
 
 #[cfg(test)]
 pub mod tests;
@@ -476,13 +478,13 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                         only if TE commits.
                     """
                 */
-                tx.state.store(TransactionState::Committed(end_ts));
                 tracing::trace!("commit_tx(tx_id={})", self.tx_id);
                 self.write_set
                     .extend(tx.write_set.iter().map(|v| *v.value()));
                 self.write_set
                     .sort_by(|a, b| a.table_id.cmp(&b.table_id).then(a.row_id.cmp(&b.row_id)));
                 if self.write_set.is_empty() {
+                    tx.state.store(TransactionState::Committed(end_ts));
                     if mvcc_store.is_exclusive_tx(&self.tx_id) {
                         mvcc_store.release_exclusive_tx(&self.tx_id);
                         self.commit_coordinator.pager_commit_lock.unlock();
@@ -551,7 +553,9 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 }
                 let result = self.pager.io.block(|| self.pager.begin_write_tx())?;
                 if let crate::result::LimboResult::Busy = result {
-                    panic!("Pager write transaction busy, in mvcc this should never happen");
+                    // There is a non-CONCURRENT transaction holding the write lock. We must abort.
+                    self.commit_coordinator.pager_commit_lock.unlock();
+                    return Err(LimboError::WriteWriteConflict);
                 }
                 self.state = CommitState::WriteRow {
                     end_ts,
@@ -723,6 +727,9 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
             }
             CommitState::Commit { end_ts } => {
                 let mut log_record = LogRecord::new(end_ts);
+                let tx = mvcc_store.txs.get(&self.tx_id).unwrap();
+                let tx_unlocked = tx.value();
+                tx_unlocked.state.store(TransactionState::Committed(end_ts));
                 for id in &self.write_set {
                     if let Some(row_versions) = mvcc_store.rows.get(id) {
                         let mut row_versions = row_versions.value().write();
@@ -1285,6 +1292,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     ///
     /// This is used for IMMEDIATE and EXCLUSIVE transaction types where we need
     /// to ensure exclusive write access as per SQLite semantics.
+    #[instrument(skip_all, level = Level::DEBUG)]
     fn _begin_exclusive_tx(
         &self,
         pager: Rc<Pager>,
@@ -1319,6 +1327,12 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 // Failed to get pager lock - release our exclusive lock
                 self.commit_coordinator.pager_commit_lock.unlock();
                 self.release_exclusive_tx(&tx_id);
+                if maybe_existing_tx_id.is_none() {
+                    // If we were upgrading an existing non-CONCURRENT mvcc transaction to write, we don't end the read tx on Busy.
+                    // But if we were beginning a completely new non-CONCURRENT mvcc transaction, we do end it because the next time the connection
+                    // attempts to do something, it will open a new read tx, which will fail if we don't end this one here.
+                    pager.end_read_tx()?;
+                }
                 return Err(LimboError::Busy);
             }
             LimboResult::Ok => {
@@ -1397,7 +1411,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         let tx_unlocked = self.txs.get(&tx_id).unwrap();
         let tx = tx_unlocked.value();
         connection.mv_tx.set(None);
-        assert_eq!(tx.state, TransactionState::Active);
+        assert!(tx.state == TransactionState::Active || tx.state == TransactionState::Preparing);
         tx.state.store(TransactionState::Aborted);
         tracing::trace!("abort(tx_id={})", tx_id);
         let write_set: Vec<RowID> = tx.write_set.iter().map(|v| *v.value()).collect();
