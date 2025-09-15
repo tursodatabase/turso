@@ -36,7 +36,7 @@ struct Args {
 
     #[arg(
         long = "timeout",
-        default_value = "50",
+        default_value = "30000",
         help = "Busy timeout in milliseconds"
     )]
     timeout: u64,
