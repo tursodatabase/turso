@@ -218,7 +218,7 @@ pub fn constraints_from_where_clause(
             refs: Vec::new(),
         });
 
-        for (i, term) in where_clause.iter().enumerate() {
+        'outer: for (i, term) in where_clause.iter().enumerate() {
             // Handle multi-value RHS (InList)
             if let ast::Expr::InList { lhs, rhs, not } = &term.expr {
                 if *not {
@@ -256,13 +256,14 @@ pub fn constraints_from_where_clause(
                 // Normalize RHS: strip NULLs, flatten and dedup constants/params
                 let mut values = Vec::<Box<ast::Expr>>::with_capacity(rhs.len());
                 let mut seen = std::collections::HashSet::<(bool, String, Vec<u8>)>::new();
-                for e in rhs.iter() {
+
+                'inner: for e in rhs.iter() {
                     if matches!(&**e, ast::Expr::Literal(ast::Literal::Null)) {
-                        continue;
+                        continue 'inner;
                     }
-                    // don't use expressions that reference other tables
+                    // don't use when one of the expressions references a table
                     if !table_mask_from_expr(e, table_references)?.is_empty() {
-                        continue;
+                        continue 'outer;
                     }
                     let key = e.to_string();
                     if seen.insert((
