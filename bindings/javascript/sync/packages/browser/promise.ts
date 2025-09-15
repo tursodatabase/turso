@@ -54,7 +54,7 @@ class Database extends DatabasePromise {
             await Promise.all([
                 unregisterFileAtWorker(this.worker, this.fsPath),
                 unregisterFileAtWorker(this.worker, `${this.fsPath}-wal`),
-                unregisterFileAtWorker(this.worker, `${this.fsPath}-revert`),
+                unregisterFileAtWorker(this.worker, `${this.fsPath}-wal-revert`),
                 unregisterFileAtWorker(this.worker, `${this.fsPath}-info`),
                 unregisterFileAtWorker(this.worker, `${this.fsPath}-changes`),
             ]);
@@ -95,7 +95,7 @@ async function connect(opts: SyncOpts, connect: (any) => any, init: () => Promis
         await Promise.all([
             registerFileAtWorker(worker, opts.path),
             registerFileAtWorker(worker, `${opts.path}-wal`),
-            registerFileAtWorker(worker, `${opts.path}-revert`),
+            registerFileAtWorker(worker, `${opts.path}-wal-revert`),
             registerFileAtWorker(worker, `${opts.path}-info`),
             registerFileAtWorker(worker, `${opts.path}-changes`),
         ]);
