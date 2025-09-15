@@ -1388,17 +1388,28 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     /// # Arguments
     ///
     /// * `tx_id` - The ID of the transaction to abort.
-    pub fn rollback_tx(&self, tx_id: TxID, pager: Rc<Pager>) {
+    pub fn rollback_tx(
+        &self,
+        tx_id: TxID,
+        pager: Rc<Pager>,
+        connection: &Connection,
+    ) -> Result<()> {
         let tx_unlocked = self.txs.get(&tx_id).unwrap();
         let tx = tx_unlocked.value();
+        connection.mv_tx.set(None);
         assert_eq!(tx.state, TransactionState::Active);
         tx.state.store(TransactionState::Aborted);
         tracing::trace!("abort(tx_id={})", tx_id);
         let write_set: Vec<RowID> = tx.write_set.iter().map(|v| *v.value()).collect();
 
-        if self.is_exclusive_tx(&tx_id) {
+        let pager_rollback_done = if self.is_exclusive_tx(&tx_id) {
+            self.commit_coordinator.pager_commit_lock.unlock();
             self.release_exclusive_tx(&tx_id);
-        }
+            pager.io.block(|| pager.end_tx(true, connection))?;
+            true
+        } else {
+            false
+        };
 
         for ref id in write_set {
             if let Some(row_versions) = self.rows.get(id) {
@@ -1420,10 +1431,14 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         let tx = tx_unlocked.value();
         tx.state.store(TransactionState::Terminated);
         tracing::trace!("terminate(tx_id={})", tx_id);
-        pager.end_read_tx().unwrap();
+        if !pager_rollback_done {
+            pager.end_read_tx()?;
+        }
         // FIXME: verify that we can already remove the transaction here!
         // Maybe it's fine for snapshot isolation, but too early for serializable?
         self.txs.remove(&tx_id);
+
+        Ok(())
     }
 
     /// Returns true if the given transaction is the exclusive transaction.
