@@ -370,6 +370,16 @@ fn perform_work(
                             }
                             return Ok(());
                         }
+                        turso_core::LimboError::WriteWriteConflict => {
+                            trace!(
+                                "{} Write-write conflict, transaction automatically rolled back",
+                                fiber_idx
+                            );
+                            drop(stmt_borrow);
+                            context.fibers[fiber_idx].statement.replace(None);
+                            context.fibers[fiber_idx].state = FiberState::Idle;
+                            return Ok(());
+                        }
                         _ => {
                             return Err(e.into());
                         }
