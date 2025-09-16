@@ -36,6 +36,7 @@ pub struct DatabaseSyncEngineOpts {
     pub tables_ignore: Vec<String>,
     pub use_transform: bool,
     pub wal_pull_batch_size: u64,
+    pub long_poll_timeout: Option<std::time::Duration>,
     pub protocol_version_hint: DatabaseSyncEngineProtocolVersion,
 }
 
@@ -386,6 +387,7 @@ impl<P: ProtocolIO> DatabaseSyncEngine<P> {
             &file.value,
             &revision,
             self.opts.wal_pull_batch_size,
+            self.opts.long_poll_timeout,
         )
         .await?;
 

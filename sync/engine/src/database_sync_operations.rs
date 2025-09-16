@@ -166,6 +166,7 @@ pub async fn wal_pull_to_file<C: ProtocolIO, Ctx>(
     frames_file: &Arc<dyn turso_core::File>,
     revision: &DatabasePullRevision,
     wal_pull_batch_size: u64,
+    long_poll_timeout: Option<std::time::Duration>,
 ) -> Result<DatabasePullRevision> {
     // truncate file before pulling new data
     let c = Completion::new_trunc(move |result| {
@@ -195,7 +196,7 @@ pub async fn wal_pull_to_file<C: ProtocolIO, Ctx>(
             .await
         }
         DatabasePullRevision::V1 { revision } => {
-            wal_pull_to_file_v1(coro, client, frames_file, revision).await
+            wal_pull_to_file_v1(coro, client, frames_file, revision, long_poll_timeout).await
         }
     }
 }
@@ -206,6 +207,7 @@ pub async fn wal_pull_to_file_v1<C: ProtocolIO, Ctx>(
     client: &C,
     frames_file: &Arc<dyn turso_core::File>,
     revision: &str,
+    long_poll_timeout: Option<std::time::Duration>,
 ) -> Result<DatabasePullRevision> {
     tracing::info!("wal_pull: revision={revision}");
     let mut bytes = BytesMut::new();
@@ -214,7 +216,7 @@ pub async fn wal_pull_to_file_v1<C: ProtocolIO, Ctx>(
         encoding: PageUpdatesEncodingReq::Raw as i32,
         server_revision: String::new(),
         client_revision: revision.to_string(),
-        long_poll_timeout_ms: 0,
+        long_poll_timeout_ms: long_poll_timeout.map(|x| x.as_secs() as u32).unwrap_or(0),
         server_pages: BytesMut::new().into(),
         client_pages: BytesMut::new().into(),
     };
