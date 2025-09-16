@@ -1,3 +1,5 @@
+use indexmap::IndexSet;
+
 use crate::{
     SandboxedResult, SimulatorEnv,
     generation::{
@@ -17,15 +19,15 @@ impl InteractionPlan {
         // - Shrink to multiple values by removing random interactions
         // - Shrink properties by removing their extensions, or shrinking their values
         let mut plan = self.clone();
-        let failing_property = &self.plan[failing_execution.interaction_index];
-        let mut depending_tables = failing_property.dependencies();
+        // let failing_property = &self.plan[failing_execution.interaction_index];
+        let mut depending_tables = IndexSet::new();
 
-        let interactions = failing_property.interactions();
+        let all_interactions = self.interactions_list().collect::<Vec<_>>();
 
         {
-            let mut idx = failing_execution.secondary_index;
+            let mut idx = failing_execution.interaction_index;
             loop {
-                match &interactions[idx].interaction {
+                match &all_interactions[idx].interaction {
                     InteractionType::Query(query) => {
                         depending_tables = query.dependencies();
                         break;
@@ -46,6 +48,9 @@ impl InteractionPlan {
                 }
             }
         }
+
+        // assert we always depend on some table for now
+        assert!(!depending_tables.is_empty());
 
         let before = self.plan.len();
 
@@ -149,14 +154,12 @@ impl InteractionPlan {
         };
 
         let mut plan = self.clone();
-        let failing_property = &self.plan[failing_execution.interaction_index];
-
-        let interactions = failing_property.interactions();
+        let all_interactions = self.interactions_list().collect::<Vec<_>>();
 
         {
-            let mut idx = failing_execution.secondary_index;
+            let mut idx = failing_execution.interaction_index;
             loop {
-                match &interactions[idx].interaction {
+                match &all_interactions[idx].interaction {
                     // Fault does not depend on
                     InteractionType::Fault(..) => break,
                     _ => {
