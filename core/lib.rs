@@ -2206,6 +2206,7 @@ pub struct Statement {
     /// Flag to show if the statement was busy
     busy: bool,
     /// Busy timeout instant
+    /// We need Option here because `io.now()` is not a cheap call
     busy_timeout: Option<BusyTimeout>,
 }
 
