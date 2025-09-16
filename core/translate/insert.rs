@@ -120,7 +120,6 @@ pub fn translate_insert(
 
     let inserting_multiple_rows = match &mut body {
         InsertBody::Select(select, upsert) => {
-            upsert_opt = upsert.as_deref().cloned();
             match &mut select.body.select {
                 // TODO see how to avoid clone
                 OneSelect::Values(values_expr) if values_expr.len() <= 1 => {
@@ -149,6 +148,21 @@ pub fn translate_insert(
                         }
                         rewrite_expr(expr, &mut param_idx)?;
                     }
+                    if let Some(ref mut upsert) = upsert {
+                        if let UpsertDo::Set {
+                            ref mut sets,
+                            ref mut where_clause,
+                        } = &mut upsert.do_clause
+                        {
+                            for set in sets.iter_mut() {
+                                rewrite_expr(set.expr.as_mut(), &mut param_idx)?;
+                            }
+                            if let Some(ref mut where_expr) = where_clause {
+                                rewrite_expr(where_expr.as_mut(), &mut param_idx)?;
+                            }
+                        }
+                    }
+                    upsert_opt = upsert.as_deref().cloned();
                     values = values_expr.pop();
                     false
                 }
