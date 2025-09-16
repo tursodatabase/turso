@@ -5,7 +5,7 @@
 use crate::function::{AggFunc, Func};
 use crate::incremental::dbsp::{Delta, DeltaPair, HashableRow};
 use crate::incremental::expr_compiler::CompiledExpression;
-use crate::incremental::persistence::{ReadRecord, WriteRow};
+use crate::incremental::persistence::{MinMaxPersistState, ReadRecord, RecomputeMinMax, WriteRow};
 use crate::schema::{Index, IndexColumn};
 use crate::storage::btree::BTreeCursor;
 use crate::types::{IOResult, ImmutableRecord, SeekKey, SeekOp, SeekResult, Text};
@@ -72,24 +72,30 @@ pub fn create_dbsp_state_index(root_page: usize) -> Index {
     }
 }
 
-/// Storage key types for different operator contexts
-#[derive(Debug, Clone, Copy)]
-pub enum StorageKeyType {
-    /// For aggregate operators - uses operator_id * 2
-    Aggregate { operator_id: usize },
+/// Constants for aggregate type encoding in storage IDs (2 bits)
+pub const AGG_TYPE_REGULAR: u8 = 0b00; // COUNT/SUM/AVG
+pub const AGG_TYPE_MINMAX: u8 = 0b01; // MIN/MAX (BTree ordering gives both)
+pub const AGG_TYPE_RESERVED1: u8 = 0b10; // Reserved for future use
+pub const AGG_TYPE_RESERVED2: u8 = 0b11; // Reserved for future use
+
+/// Generate a storage ID with column index and operation type encoding
+/// Storage ID = (operator_id << 16) | (column_index << 2) | operation_type
+/// Bit layout (64-bit integer):
+/// - Bits 16-63 (48 bits): operator_id
+/// - Bits 2-15 (14 bits): column_index (supports up to 16,384 columns)
+/// - Bits 0-1 (2 bits): operation type (AGG_TYPE_REGULAR, AGG_TYPE_MINMAX, etc.)
+pub fn generate_storage_id(operator_id: usize, column_index: usize, op_type: u8) -> i64 {
+    assert!(op_type <= 3, "Invalid operation type");
+    assert!(column_index < 16384, "Column index too large");
+
+    ((operator_id as i64) << 16) | ((column_index as i64) << 2) | (op_type as i64)
 }
 
-impl StorageKeyType {
-    /// Get the unique storage ID using the same formula as before
-    /// This ensures different operators get unique IDs
-    pub fn to_storage_id(self) -> u64 {
-        match self {
-            StorageKeyType::Aggregate { operator_id } => (operator_id as u64),
-        }
-    }
-}
+// group_key_str -> (group_key, state)
+type ComputedStates = HashMap<String, (Vec<Value>, AggregateState)>;
+// group_key_str -> (column_name, value_as_hashable_row) -> accumulated_weight
+pub type MinMaxDeltas = HashMap<String, HashMap<(String, HashableRow), isize>>;
 
-type ComputedStates = HashMap<String, (Vec<Value>, AggregateState)>; // group_key_str -> (group_key, state)
 #[derive(Debug)]
 enum AggregateCommitState {
     Idle,
@@ -101,6 +107,11 @@ enum AggregateCommitState {
         computed_states: ComputedStates,
         current_idx: usize,
         write_row: WriteRow,
+        min_max_deltas: MinMaxDeltas,
+    },
+    PersistMinMax {
+        delta: Delta,
+        min_max_persist_state: MinMaxPersistState,
     },
     Done {
         delta: Delta,
@@ -132,6 +143,12 @@ pub enum EvalState {
         rowid: Option<i64>, // Rowid found by FetchKey (None if not found)
         read_record_state: Box<ReadRecord>,
     },
+    RecomputeMinMax {
+        delta: Delta,
+        existing_groups: HashMap<String, AggregateState>,
+        old_values: HashMap<String, Vec<Value>>,
+        recompute_state: Box<RecomputeMinMax>,
+    },
     Done,
 }
 
@@ -150,7 +167,7 @@ impl From<DeltaPair> for EvalState {
 }
 
 impl EvalState {
-    fn from_delta(delta: Delta) -> Self {
+    pub fn from_delta(delta: Delta) -> Self {
         Self::Init {
             deltas: delta.into(),
         }
@@ -211,20 +228,30 @@ impl EvalState {
                     old_values,
                 } => {
                     if *current_idx >= groups_to_read.len() {
-                        // All groups processed, compute final output
-                        let result =
-                            operator.merge_delta_with_existing(delta, existing_groups, old_values);
-                        *self = EvalState::Done;
-                        return Ok(IOResult::Done(result));
+                        // All groups have been fetched, move to RecomputeMinMax
+                        // Extract MIN/MAX deltas from the input delta
+                        let min_max_deltas = operator.extract_min_max_deltas(delta);
+
+                        let recompute_state = Box::new(RecomputeMinMax::new(
+                            min_max_deltas,
+                            existing_groups,
+                            operator,
+                        ));
+
+                        *self = EvalState::RecomputeMinMax {
+                            delta: std::mem::take(delta),
+                            existing_groups: std::mem::take(existing_groups),
+                            old_values: std::mem::take(old_values),
+                            recompute_state,
+                        };
                     } else {
                         // Get the current group to read
                         let (group_key_str, _group_key) = &groups_to_read[*current_idx];
 
                         // Build the key for the index: (operator_id, zset_id, element_id)
-                        let storage_key = StorageKeyType::Aggregate {
-                            operator_id: operator.operator_id,
-                        };
-                        let operator_storage_id = storage_key.to_storage_id() as i64;
+                        // For regular aggregates, use column_index=0 and AGG_TYPE_REGULAR
+                        let operator_storage_id =
+                            generate_storage_id(operator.operator_id, 0, AGG_TYPE_REGULAR);
                         let zset_id = operator.generate_group_rowid(group_key_str);
                         let element_id = 0i64; // Always 0 for aggregators
 
@@ -248,8 +275,7 @@ impl EvalState {
                         let rowid = if matches!(seek_result, SeekResult::Found) {
                             // Found in index, get the table rowid
                             // The btree code handles extracting the rowid from the index record for has_rowid indexes
-                            let rowid = return_if_io!(cursors.index_cursor.rowid());
-                            rowid
+                            return_if_io!(cursors.index_cursor.rowid())
                         } else {
                             // Not found in index, no existing state
                             None
@@ -314,6 +340,24 @@ impl EvalState {
                         old_values: taken_old_values,
                     };
                     *self = next_state;
+                }
+                EvalState::RecomputeMinMax {
+                    delta,
+                    existing_groups,
+                    old_values,
+                    recompute_state,
+                } => {
+                    if operator.has_min_max() {
+                        // Process MIN/MAX recomputation - this will update existing_groups with correct MIN/MAX
+                        return_if_io!(recompute_state.process(existing_groups, operator, cursors));
+                    }
+
+                    // Now compute final output with updated MIN/MAX values
+                    let (output_delta, computed_states) =
+                        operator.merge_delta_with_existing(delta, existing_groups, old_values);
+
+                    *self = EvalState::Done;
+                    return Ok(IOResult::Done((output_delta, computed_states)));
                 }
                 EvalState::Done => {
                     return Ok(IOResult::Done((Delta::new(), HashMap::new())));
@@ -609,7 +653,8 @@ pub enum AggregateFunction {
     Count,
     Sum(String),
     Avg(String),
-    // MIN and MAX are not supported - see comment in compiler.rs for explanation
+    Min(String),
+    Max(String),
 }
 
 impl Display for AggregateFunction {
@@ -618,6 +663,8 @@ impl Display for AggregateFunction {
             AggregateFunction::Count => write!(f, "COUNT(*)"),
             AggregateFunction::Sum(col) => write!(f, "SUM({col})"),
             AggregateFunction::Avg(col) => write!(f, "AVG({col})"),
+            AggregateFunction::Min(col) => write!(f, "MIN({col})"),
+            AggregateFunction::Max(col) => write!(f, "MAX({col})"),
         }
     }
 }
@@ -641,8 +688,8 @@ impl AggregateFunction {
                     AggFunc::Count | AggFunc::Count0 => Some(AggregateFunction::Count),
                     AggFunc::Sum => input_column.map(AggregateFunction::Sum),
                     AggFunc::Avg => input_column.map(AggregateFunction::Avg),
-                    // MIN and MAX are not supported in incremental views - see compiler.rs
-                    AggFunc::Min | AggFunc::Max => None,
+                    AggFunc::Min => input_column.map(AggregateFunction::Min),
+                    AggFunc::Max => input_column.map(AggregateFunction::Max),
                     _ => None, // Other aggregate functions not yet supported in DBSP
                 }
             }
@@ -1337,19 +1384,32 @@ impl IncrementalOperator for ProjectOperator {
 /// Aggregate operator - performs incremental aggregation with GROUP BY
 /// Maintains running totals/counts that are updated incrementally
 ///
+/// Information about a column that has MIN/MAX aggregations
+#[derive(Debug, Clone)]
+pub struct AggColumnInfo {
+    /// Index used for storage key generation
+    pub index: usize,
+    /// Whether this column has a MIN aggregate
+    pub has_min: bool,
+    /// Whether this column has a MAX aggregate
+    pub has_max: bool,
+}
+
 /// Note that the AggregateOperator essentially implements a ZSet, even
 /// though the ZSet structure is never used explicitly. The on-disk btree
 /// plays the role of the set!
 #[derive(Debug)]
 pub struct AggregateOperator {
     // Unique operator ID for indexing in persistent storage
-    operator_id: usize,
+    pub operator_id: usize,
     // GROUP BY columns
     group_by: Vec<String>,
-    // Aggregate functions to compute
-    aggregates: Vec<AggregateFunction>,
+    // Aggregate functions to compute (including MIN/MAX)
+    pub aggregates: Vec<AggregateFunction>,
     // Column names from input
     pub input_column_names: Vec<String>,
+    // Map from column name to aggregate info for quick lookup
+    pub column_min_max: HashMap<String, AggColumnInfo>,
     tracker: Option<Arc<Mutex<ComputationTracker>>>,
 
     // State machine for commit operation
@@ -1357,7 +1417,7 @@ pub struct AggregateOperator {
 }
 
 /// State for a single group's aggregates
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct AggregateState {
     // For COUNT: just the count
     count: i64,
@@ -1365,17 +1425,51 @@ pub struct AggregateState {
     sums: HashMap<String, f64>,
     // For AVG: column_name -> (sum, count) for computing average
     avgs: HashMap<String, (f64, i64)>,
-    // MIN/MAX are not supported - they require O(n) storage overhead for handling deletions
-    // correctly. See comment in apply_delta() for details.
+    // For MIN: column_name -> minimum value
+    pub mins: HashMap<String, Value>,
+    // For MAX: column_name -> maximum value
+    pub maxs: HashMap<String, Value>,
+}
+
+/// Serialize a Value using SQLite's serial type format
+/// This is used for MIN/MAX values that need to be stored in a compact, sortable format
+pub fn serialize_value(value: &Value, blob: &mut Vec<u8>) {
+    let serial_type = crate::types::SerialType::from(value);
+    let serial_type_u64: u64 = serial_type.into();
+    crate::storage::sqlite3_ondisk::write_varint_to_vec(serial_type_u64, blob);
+    value.serialize_serial(blob);
+}
+
+/// Deserialize a Value using SQLite's serial type format
+/// Returns the deserialized value and the number of bytes consumed
+pub fn deserialize_value(blob: &[u8]) -> Option<(Value, usize)> {
+    let mut cursor = 0;
+
+    // Read the serial type
+    let (serial_type, varint_size) = crate::storage::sqlite3_ondisk::read_varint(blob).ok()?;
+    cursor += varint_size;
+
+    let serial_type_obj = crate::types::SerialType::try_from(serial_type).ok()?;
+    let expected_size = serial_type_obj.size();
+
+    // Read the value
+    let (value, actual_size) =
+        crate::storage::sqlite3_ondisk::read_value(&blob[cursor..], serial_type_obj).ok()?;
+
+    // Verify that the actual size matches what we expected from the serial type
+    if actual_size != expected_size {
+        return None; // Data corruption - size mismatch
+    }
+
+    cursor += actual_size;
+
+    // Convert RefValue to Value
+    Some((value.to_owned(), cursor))
 }
 
 impl AggregateState {
-    fn new() -> Self {
-        Self {
-            count: 0,
-            sums: HashMap::new(),
-            avgs: HashMap::new(),
-        }
+    pub fn new() -> Self {
+        Self::default()
     }
 
     // Serialize the aggregate state to a binary blob including group key values
@@ -1436,6 +1530,24 @@ impl AggregateState {
                 }
                 AggregateFunction::Count => {
                     // Count is already written above
+                }
+                AggregateFunction::Min(col_name) => {
+                    // Write whether we have a MIN value (1 byte)
+                    if let Some(min_val) = self.mins.get(col_name) {
+                        blob.push(1u8); // Has value
+                        serialize_value(min_val, &mut blob);
+                    } else {
+                        blob.push(0u8); // No value
+                    }
+                }
+                AggregateFunction::Max(col_name) => {
+                    // Write whether we have a MAX value (1 byte)
+                    if let Some(max_val) = self.maxs.get(col_name) {
+                        blob.push(1u8); // Has value
+                        serialize_value(max_val, &mut blob);
+                    } else {
+                        blob.push(0u8); // No value
+                    }
                 }
             }
         }
@@ -1524,6 +1636,28 @@ impl AggregateState {
                 AggregateFunction::Count => {
                     // Count was already read above
                 }
+                AggregateFunction::Min(col_name) => {
+                    // Read whether we have a MIN value
+                    let has_value = *blob.get(cursor)?;
+                    cursor += 1;
+
+                    if has_value == 1 {
+                        let (min_value, bytes_consumed) = deserialize_value(&blob[cursor..])?;
+                        cursor += bytes_consumed;
+                        state.mins.insert(col_name.clone(), min_value);
+                    }
+                }
+                AggregateFunction::Max(col_name) => {
+                    // Read whether we have a MAX value
+                    let has_value = *blob.get(cursor)?;
+                    cursor += 1;
+
+                    if has_value == 1 {
+                        let (max_value, bytes_consumed) = deserialize_value(&blob[cursor..])?;
+                        cursor += bytes_consumed;
+                        state.maxs.insert(col_name.clone(), max_value);
+                    }
+                }
             }
         }
 
@@ -1575,12 +1709,38 @@ impl AggregateState {
                         }
                     }
                 }
+                AggregateFunction::Min(_col_name) | AggregateFunction::Max(_col_name) => {
+                    // MIN/MAX cannot be handled incrementally in apply_delta because:
+                    //
+                    // 1. For insertions: We can't just keep the minimum/maximum value.
+                    //    We need to track ALL values to handle future deletions correctly.
+                    //
+                    // 2. For deletions (retractions): If we delete the current MIN/MAX,
+                    //    we need to find the next best value, which requires knowing all
+                    //    other values in the group.
+                    //
+                    // Example: Consider MIN(price) with values [10, 20, 30]
+                    // - Current MIN = 10
+                    // - Delete 10 (weight = -1)
+                    // - New MIN should be 20, but we can't determine this without
+                    //   having tracked all values [20, 30]
+                    //
+                    // Therefore, MIN/MAX processing is handled separately:
+                    // - All input values are persisted to the index via persist_min_max()
+                    // - When aggregates have MIN/MAX, we unconditionally transition to
+                    //   the RecomputeMinMax state machine (see EvalState::RecomputeMinMax)
+                    // - RecomputeMinMax checks if the current MIN/MAX was deleted, and if so,
+                    //   scans the index to find the new MIN/MAX from remaining values
+                    //
+                    // This ensures correctness for incremental computation at the cost of
+                    // additional I/O for MIN/MAX operations.
+                }
             }
         }
     }
 
     /// Convert aggregate state to output values
-    fn to_values(&self, aggregates: &[AggregateFunction]) -> Vec<Value> {
+    pub fn to_values(&self, aggregates: &[AggregateFunction]) -> Vec<Value> {
         let mut result = Vec::new();
 
         for agg in aggregates {
@@ -1608,6 +1768,14 @@ impl AggregateState {
                         result.push(Value::Null);
                     }
                 }
+                AggregateFunction::Min(col_name) => {
+                    // Return the MIN value from our state
+                    result.push(self.mins.get(col_name).cloned().unwrap_or(Value::Null));
+                }
+                AggregateFunction::Max(col_name) => {
+                    // Return the MAX value from our state
+                    result.push(self.maxs.get(col_name).cloned().unwrap_or(Value::Null));
+                }
             }
         }
 
@@ -1622,14 +1790,63 @@ impl AggregateOperator {
         aggregates: Vec<AggregateFunction>,
         input_column_names: Vec<String>,
     ) -> Self {
+        // Build map of column names to their MIN/MAX info with indices
+        let mut column_min_max = HashMap::new();
+        let mut column_indices = HashMap::new();
+        let mut current_index = 0;
+
+        // First pass: assign indices to unique MIN/MAX columns
+        for agg in &aggregates {
+            match agg {
+                AggregateFunction::Min(col) | AggregateFunction::Max(col) => {
+                    column_indices.entry(col.clone()).or_insert_with(|| {
+                        let idx = current_index;
+                        current_index += 1;
+                        idx
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        // Second pass: build the column info map
+        for agg in &aggregates {
+            match agg {
+                AggregateFunction::Min(col) => {
+                    let index = *column_indices.get(col).unwrap();
+                    let entry = column_min_max.entry(col.clone()).or_insert(AggColumnInfo {
+                        index,
+                        has_min: false,
+                        has_max: false,
+                    });
+                    entry.has_min = true;
+                }
+                AggregateFunction::Max(col) => {
+                    let index = *column_indices.get(col).unwrap();
+                    let entry = column_min_max.entry(col.clone()).or_insert(AggColumnInfo {
+                        index,
+                        has_min: false,
+                        has_max: false,
+                    });
+                    entry.has_max = true;
+                }
+                _ => {}
+            }
+        }
+
         Self {
             operator_id,
             group_by,
             aggregates,
             input_column_names,
+            column_min_max,
             tracker: None,
             commit_state: AggregateCommitState::Idle,
         }
+    }
+
+    pub fn has_min_max(&self) -> bool {
+        !self.column_min_max.is_empty()
     }
 
     fn eval_internal(
@@ -1662,7 +1879,9 @@ impl AggregateOperator {
                 }
                 state.advance(groups_to_read);
             }
-            EvalState::FetchKey { .. } | EvalState::FetchData { .. } => {
+            EvalState::FetchKey { .. }
+            | EvalState::FetchData { .. }
+            | EvalState::RecomputeMinMax { .. } => {
                 // Already in progress, continue processing on process_delta below.
             }
             EvalState::Done => {
@@ -1694,9 +1913,7 @@ impl AggregateOperator {
             let group_key = self.extract_group_key(&row.values);
             let group_key_str = Self::group_key_to_string(&group_key);
 
-            let state = existing_groups
-                .entry(group_key_str.clone())
-                .or_insert_with(AggregateState::new);
+            let state = existing_groups.entry(group_key_str.clone()).or_default();
 
             temp_keys.insert(group_key_str.clone(), group_key.clone());
 
@@ -1730,13 +1947,56 @@ impl AggregateOperator {
             if state.count > 0 {
                 // Build output row: group_by columns + aggregate values
                 let mut output_values = group_key.clone();
-                output_values.extend(state.to_values(&self.aggregates));
+                let aggregate_values = state.to_values(&self.aggregates);
+                output_values.extend(aggregate_values);
 
-                let output_row = HashableRow::new(result_key, output_values);
+                let output_row = HashableRow::new(result_key, output_values.clone());
                 output_delta.changes.push((output_row, 1));
             }
         }
         (output_delta, final_states)
+    }
+
+    /// Extract MIN/MAX values from delta changes for persistence to index
+    fn extract_min_max_deltas(&self, delta: &Delta) -> MinMaxDeltas {
+        let mut min_max_deltas: MinMaxDeltas = HashMap::new();
+
+        for (row, weight) in &delta.changes {
+            let group_key = self.extract_group_key(&row.values);
+            let group_key_str = Self::group_key_to_string(&group_key);
+
+            for agg in &self.aggregates {
+                match agg {
+                    AggregateFunction::Min(col_name) | AggregateFunction::Max(col_name) => {
+                        if let Some(idx) =
+                            self.input_column_names.iter().position(|c| c == col_name)
+                        {
+                            if let Some(val) = row.values.get(idx) {
+                                // Skip NULL values - they don't participate in MIN/MAX
+                                if val == &Value::Null {
+                                    continue;
+                                }
+                                // Create a HashableRow with just this value
+                                // Use 0 as rowid since we only care about the value for comparison
+                                let hashable_value = HashableRow::new(0, vec![val.clone()]);
+                                let key = (col_name.clone(), hashable_value);
+
+                                let group_entry =
+                                    min_max_deltas.entry(group_key_str.clone()).or_default();
+
+                                let value_entry = group_entry.entry(key).or_insert(0);
+
+                                // Accumulate the weight
+                                *value_entry += weight;
+                            }
+                        }
+                    }
+                    _ => {} // Ignore non-MIN/MAX aggregates
+                }
+            }
+        }
+
+        min_max_deltas
     }
 
     pub fn set_tracker(&mut self, tracker: Arc<Mutex<ComputationTracker>>) {
@@ -1746,7 +2006,7 @@ impl AggregateOperator {
     /// Generate a rowid for a group
     /// For no GROUP BY: always returns 0
     /// For GROUP BY: returns a hash of the group key string
-    fn generate_group_rowid(&self, group_key_str: &str) -> i64 {
+    pub fn generate_group_rowid(&self, group_key_str: &str) -> i64 {
         if self.group_by.is_empty() {
             0
         } else {
@@ -1764,7 +2024,7 @@ impl AggregateOperator {
     }
 
     /// Extract group key values from a row
-    fn extract_group_key(&self, values: &[Value]) -> Vec<Value> {
+    pub fn extract_group_key(&self, values: &[Value]) -> Vec<Value> {
         let mut key = Vec::new();
 
         for group_col in &self.group_by {
@@ -1783,7 +2043,7 @@ impl AggregateOperator {
     }
 
     /// Convert group key to string for indexing (since Value doesn't implement Hash)
-    fn group_key_to_string(key: &[Value]) -> String {
+    pub fn group_key_to_string(key: &[Value]) -> String {
         key.iter()
             .map(|v| format!("{v:?}"))
             .collect::<Vec<_>>()
@@ -1816,7 +2076,7 @@ impl IncrementalOperator for AggregateOperator {
 
     fn commit(
         &mut self,
-        deltas: DeltaPair,
+        mut deltas: DeltaPair,
         cursors: &mut DbspStateCursors,
     ) -> Result<IOResult<Delta>> {
         // Aggregate operator only uses left delta, right must be empty
@@ -1824,7 +2084,7 @@ impl IncrementalOperator for AggregateOperator {
             deltas.right.is_empty(),
             "AggregateOperator expects right delta to be empty in commit"
         );
-        let delta = deltas.left;
+        let delta = std::mem::take(&mut deltas.left);
         loop {
             // Note: because we std::mem::replace here (without it, the borrow checker goes nuts,
             // because we call self.eval_interval, which requires a mutable borrow), we have to
@@ -1840,16 +2100,27 @@ impl IncrementalOperator for AggregateOperator {
                     self.commit_state = AggregateCommitState::Eval { eval_state };
                 }
                 AggregateCommitState::Eval { ref mut eval_state } => {
+                    // Extract input delta before eval for MIN/MAX processing
+                    let input_delta = eval_state.extract_delta();
+
+                    // Extract MIN/MAX deltas before any I/O operations
+                    let min_max_deltas = self.extract_min_max_deltas(&input_delta);
+
+                    // Create a new eval state with the same delta
+                    *eval_state = EvalState::from_delta(input_delta.clone());
+
                     let (output_delta, computed_states) = return_and_restore_if_io!(
                         &mut self.commit_state,
                         state,
                         self.eval_internal(eval_state, cursors)
                     );
+
                     self.commit_state = AggregateCommitState::PersistDelta {
                         delta: output_delta,
                         computed_states,
                         current_idx: 0,
                         write_row: WriteRow::new(),
+                        min_max_deltas, // Store for later use
                     };
                 }
                 AggregateCommitState::PersistDelta {
@@ -1857,21 +2128,23 @@ impl IncrementalOperator for AggregateOperator {
                     computed_states,
                     current_idx,
                     write_row,
+                    min_max_deltas,
                 } => {
                     let states_vec: Vec<_> = computed_states.iter().collect();
 
                     if *current_idx >= states_vec.len() {
-                        self.commit_state = AggregateCommitState::Done {
+                        // Use the min_max_deltas we extracted earlier from the input delta
+                        self.commit_state = AggregateCommitState::PersistMinMax {
                             delta: delta.clone(),
+                            min_max_persist_state: MinMaxPersistState::new(min_max_deltas.clone()),
                         };
                     } else {
                         let (group_key_str, (group_key, agg_state)) = states_vec[*current_idx];
 
                         // Build the key components for the new table structure
-                        let storage_key = StorageKeyType::Aggregate {
-                            operator_id: self.operator_id,
-                        };
-                        let operator_storage_id = storage_key.to_storage_id() as i64;
+                        // For regular aggregates, use column_index=0 and AGG_TYPE_REGULAR
+                        let operator_storage_id =
+                            generate_storage_id(self.operator_id, 0, AGG_TYPE_REGULAR);
                         let zset_id = self.generate_group_rowid(group_key_str);
                         let element_id = 0i64;
 
@@ -1907,13 +2180,38 @@ impl IncrementalOperator for AggregateOperator {
 
                         let delta = std::mem::take(delta);
                         let computed_states = std::mem::take(computed_states);
+                        let min_max_deltas = std::mem::take(min_max_deltas);
 
                         self.commit_state = AggregateCommitState::PersistDelta {
                             delta,
                             computed_states,
                             current_idx: *current_idx + 1,
                             write_row: WriteRow::new(), // Reset for next write
+                            min_max_deltas,
                         };
+                    }
+                }
+                AggregateCommitState::PersistMinMax {
+                    delta,
+                    min_max_persist_state,
+                } => {
+                    if !self.has_min_max() {
+                        let delta = std::mem::take(delta);
+                        self.commit_state = AggregateCommitState::Done { delta };
+                    } else {
+                        return_and_restore_if_io!(
+                            &mut self.commit_state,
+                            state,
+                            min_max_persist_state.persist_min_max(
+                                self.operator_id,
+                                &self.column_min_max,
+                                cursors,
+                                |group_key_str| self.generate_group_rowid(group_key_str)
+                            )
+                        );
+
+                        let delta = std::mem::take(delta);
+                        self.commit_state = AggregateCommitState::Done { delta };
                     }
                 }
                 AggregateCommitState::Done { delta } => {
@@ -1999,10 +2297,8 @@ mod tests {
 
             // Parse the 5-column structure: operator_id, zset_id, element_id, value, weight
             if let Some(Value::Integer(op_id)) = values.first() {
-                let storage_key = StorageKeyType::Aggregate {
-                    operator_id: agg.operator_id,
-                };
-                let expected_op_id = storage_key.to_storage_id() as i64;
+                // For regular aggregates, use column_index=0 and AGG_TYPE_REGULAR
+                let expected_op_id = generate_storage_id(agg.operator_id, 0, AGG_TYPE_REGULAR);
 
                 // Skip if not our operator
                 if *op_id != expected_op_id {
@@ -3642,5 +3938,963 @@ mod tests {
             .find(|(row, _)| row.values[0] == Value::Text("X".into()))
             .unwrap();
         assert_eq!(x.0.values[1], Value::Integer(2));
+    }
+
+    #[test]
+    fn test_min_max_basic() {
+        // Test basic MIN/MAX functionality
+        let (pager, table_root_page_id, index_root_page_id) = create_test_pager();
+        let table_cursor = BTreeCursor::new_table(None, pager.clone(), table_root_page_id, 5);
+        let index_def = create_dbsp_state_index(index_root_page_id);
+        let index_cursor =
+            BTreeCursor::new_index(None, pager.clone(), index_root_page_id, &index_def, 4);
+        let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
+
+        let mut agg = AggregateOperator::new(
+            1,      // operator_id
+            vec![], // No GROUP BY
+            vec![
+                AggregateFunction::Min("price".to_string()),
+                AggregateFunction::Max("price".to_string()),
+            ],
+            vec!["id".to_string(), "name".to_string(), "price".to_string()],
+        );
+
+        // Initial data
+        let mut initial_delta = Delta::new();
+        initial_delta.insert(
+            1,
+            vec![
+                Value::Integer(1),
+                Value::Text("Apple".into()),
+                Value::Float(1.50),
+            ],
+        );
+        initial_delta.insert(
+            2,
+            vec![
+                Value::Integer(2),
+                Value::Text("Banana".into()),
+                Value::Float(0.75),
+            ],
+        );
+        initial_delta.insert(
+            3,
+            vec![
+                Value::Integer(3),
+                Value::Text("Orange".into()),
+                Value::Float(2.00),
+            ],
+        );
+        initial_delta.insert(
+            4,
+            vec![
+                Value::Integer(4),
+                Value::Text("Grape".into()),
+                Value::Float(3.50),
+            ],
+        );
+
+        let result = pager
+            .io
+            .block(|| agg.commit((&initial_delta).into(), &mut cursors))
+            .unwrap();
+
+        // Verify MIN and MAX
+        assert_eq!(result.changes.len(), 1);
+        let (row, weight) = &result.changes[0];
+        assert_eq!(*weight, 1);
+        assert_eq!(row.values[0], Value::Float(0.75)); // MIN
+        assert_eq!(row.values[1], Value::Float(3.50)); // MAX
+    }
+
+    #[test]
+    fn test_min_max_deletion_updates_min() {
+        // Test that deleting the MIN value updates to the next lowest
+        let (pager, table_root_page_id, index_root_page_id) = create_test_pager();
+        let table_cursor = BTreeCursor::new_table(None, pager.clone(), table_root_page_id, 5);
+        let index_def = create_dbsp_state_index(index_root_page_id);
+        let index_cursor =
+            BTreeCursor::new_index(None, pager.clone(), index_root_page_id, &index_def, 4);
+        let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
+
+        let mut agg = AggregateOperator::new(
+            1,      // operator_id
+            vec![], // No GROUP BY
+            vec![
+                AggregateFunction::Min("price".to_string()),
+                AggregateFunction::Max("price".to_string()),
+            ],
+            vec!["id".to_string(), "name".to_string(), "price".to_string()],
+        );
+
+        // Initial data
+        let mut initial_delta = Delta::new();
+        initial_delta.insert(
+            1,
+            vec![
+                Value::Integer(1),
+                Value::Text("Apple".into()),
+                Value::Float(1.50),
+            ],
+        );
+        initial_delta.insert(
+            2,
+            vec![
+                Value::Integer(2),
+                Value::Text("Banana".into()),
+                Value::Float(0.75),
+            ],
+        );
+        initial_delta.insert(
+            3,
+            vec![
+                Value::Integer(3),
+                Value::Text("Orange".into()),
+                Value::Float(2.00),
+            ],
+        );
+        initial_delta.insert(
+            4,
+            vec![
+                Value::Integer(4),
+                Value::Text("Grape".into()),
+                Value::Float(3.50),
+            ],
+        );
+
+        pager
+            .io
+            .block(|| agg.commit((&initial_delta).into(), &mut cursors))
+            .unwrap();
+
+        // Delete the MIN value (Banana at 0.75)
+        let mut delete_delta = Delta::new();
+        delete_delta.delete(
+            2,
+            vec![
+                Value::Integer(2),
+                Value::Text("Banana".into()),
+                Value::Float(0.75),
+            ],
+        );
+
+        let result = pager
+            .io
+            .block(|| agg.commit((&delete_delta).into(), &mut cursors))
+            .unwrap();
+
+        // Should emit retraction of old values and new values
+        assert_eq!(result.changes.len(), 2);
+
+        // Find the retraction (weight = -1)
+        let retraction = result.changes.iter().find(|(_, w)| *w == -1).unwrap();
+        assert_eq!(retraction.0.values[0], Value::Float(0.75)); // Old MIN
+        assert_eq!(retraction.0.values[1], Value::Float(3.50)); // Old MAX
+
+        // Find the new values (weight = 1)
+        let new_values = result.changes.iter().find(|(_, w)| *w == 1).unwrap();
+        assert_eq!(new_values.0.values[0], Value::Float(1.50)); // New MIN (Apple)
+        assert_eq!(new_values.0.values[1], Value::Float(3.50)); // MAX unchanged
+    }
+
+    #[test]
+    fn test_min_max_deletion_updates_max() {
+        // Test that deleting the MAX value updates to the next highest
+        let (pager, table_root_page_id, index_root_page_id) = create_test_pager();
+        let table_cursor = BTreeCursor::new_table(None, pager.clone(), table_root_page_id, 5);
+        let index_def = create_dbsp_state_index(index_root_page_id);
+        let index_cursor =
+            BTreeCursor::new_index(None, pager.clone(), index_root_page_id, &index_def, 4);
+        let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
+
+        let mut agg = AggregateOperator::new(
+            1,      // operator_id
+            vec![], // No GROUP BY
+            vec![
+                AggregateFunction::Min("price".to_string()),
+                AggregateFunction::Max("price".to_string()),
+            ],
+            vec!["id".to_string(), "name".to_string(), "price".to_string()],
+        );
+
+        // Initial data
+        let mut initial_delta = Delta::new();
+        initial_delta.insert(
+            1,
+            vec![
+                Value::Integer(1),
+                Value::Text("Apple".into()),
+                Value::Float(1.50),
+            ],
+        );
+        initial_delta.insert(
+            2,
+            vec![
+                Value::Integer(2),
+                Value::Text("Banana".into()),
+                Value::Float(0.75),
+            ],
+        );
+        initial_delta.insert(
+            3,
+            vec![
+                Value::Integer(3),
+                Value::Text("Orange".into()),
+                Value::Float(2.00),
+            ],
+        );
+        initial_delta.insert(
+            4,
+            vec![
+                Value::Integer(4),
+                Value::Text("Grape".into()),
+                Value::Float(3.50),
+            ],
+        );
+
+        pager
+            .io
+            .block(|| agg.commit((&initial_delta).into(), &mut cursors))
+            .unwrap();
+
+        // Delete the MAX value (Grape at 3.50)
+        let mut delete_delta = Delta::new();
+        delete_delta.delete(
+            4,
+            vec![
+                Value::Integer(4),
+                Value::Text("Grape".into()),
+                Value::Float(3.50),
+            ],
+        );
+
+        let result = pager
+            .io
+            .block(|| agg.commit((&delete_delta).into(), &mut cursors))
+            .unwrap();
+
+        // Should emit retraction of old values and new values
+        assert_eq!(result.changes.len(), 2);
+
+        // Find the retraction (weight = -1)
+        let retraction = result.changes.iter().find(|(_, w)| *w == -1).unwrap();
+        assert_eq!(retraction.0.values[0], Value::Float(0.75)); // Old MIN
+        assert_eq!(retraction.0.values[1], Value::Float(3.50)); // Old MAX
+
+        // Find the new values (weight = 1)
+        let new_values = result.changes.iter().find(|(_, w)| *w == 1).unwrap();
+        assert_eq!(new_values.0.values[0], Value::Float(0.75)); // MIN unchanged
+        assert_eq!(new_values.0.values[1], Value::Float(2.00)); // New MAX (Orange)
+    }
+
+    #[test]
+    fn test_min_max_insertion_updates_min() {
+        // Test that inserting a new MIN value updates the aggregate
+        let (pager, table_root_page_id, index_root_page_id) = create_test_pager();
+        let table_cursor = BTreeCursor::new_table(None, pager.clone(), table_root_page_id, 5);
+        let index_def = create_dbsp_state_index(index_root_page_id);
+        let index_cursor =
+            BTreeCursor::new_index(None, pager.clone(), index_root_page_id, &index_def, 4);
+        let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
+
+        let mut agg = AggregateOperator::new(
+            1,      // operator_id
+            vec![], // No GROUP BY
+            vec![
+                AggregateFunction::Min("price".to_string()),
+                AggregateFunction::Max("price".to_string()),
+            ],
+            vec!["id".to_string(), "name".to_string(), "price".to_string()],
+        );
+
+        // Initial data
+        let mut initial_delta = Delta::new();
+        initial_delta.insert(
+            1,
+            vec![
+                Value::Integer(1),
+                Value::Text("Apple".into()),
+                Value::Float(1.50),
+            ],
+        );
+        initial_delta.insert(
+            2,
+            vec![
+                Value::Integer(2),
+                Value::Text("Orange".into()),
+                Value::Float(2.00),
+            ],
+        );
+        initial_delta.insert(
+            3,
+            vec![
+                Value::Integer(3),
+                Value::Text("Grape".into()),
+                Value::Float(3.50),
+            ],
+        );
+
+        pager
+            .io
+            .block(|| agg.commit((&initial_delta).into(), &mut cursors))
+            .unwrap();
+
+        // Insert a new MIN value
+        let mut insert_delta = Delta::new();
+        insert_delta.insert(
+            4,
+            vec![
+                Value::Integer(4),
+                Value::Text("Lemon".into()),
+                Value::Float(0.50),
+            ],
+        );
+
+        let result = pager
+            .io
+            .block(|| agg.commit((&insert_delta).into(), &mut cursors))
+            .unwrap();
+
+        // Should emit retraction of old values and new values
+        assert_eq!(result.changes.len(), 2);
+
+        // Find the retraction (weight = -1)
+        let retraction = result.changes.iter().find(|(_, w)| *w == -1).unwrap();
+        assert_eq!(retraction.0.values[0], Value::Float(1.50)); // Old MIN
+        assert_eq!(retraction.0.values[1], Value::Float(3.50)); // Old MAX
+
+        // Find the new values (weight = 1)
+        let new_values = result.changes.iter().find(|(_, w)| *w == 1).unwrap();
+        assert_eq!(new_values.0.values[0], Value::Float(0.50)); // New MIN (Lemon)
+        assert_eq!(new_values.0.values[1], Value::Float(3.50)); // MAX unchanged
+    }
+
+    #[test]
+    fn test_min_max_insertion_updates_max() {
+        // Test that inserting a new MAX value updates the aggregate
+        let (pager, table_root_page_id, index_root_page_id) = create_test_pager();
+        let table_cursor = BTreeCursor::new_table(None, pager.clone(), table_root_page_id, 5);
+        let index_def = create_dbsp_state_index(index_root_page_id);
+        let index_cursor =
+            BTreeCursor::new_index(None, pager.clone(), index_root_page_id, &index_def, 4);
+        let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
+
+        let mut agg = AggregateOperator::new(
+            1,      // operator_id
+            vec![], // No GROUP BY
+            vec![
+                AggregateFunction::Min("price".to_string()),
+                AggregateFunction::Max("price".to_string()),
+            ],
+            vec!["id".to_string(), "name".to_string(), "price".to_string()],
+        );
+
+        // Initial data
+        let mut initial_delta = Delta::new();
+        initial_delta.insert(
+            1,
+            vec![
+                Value::Integer(1),
+                Value::Text("Apple".into()),
+                Value::Float(1.50),
+            ],
+        );
+        initial_delta.insert(
+            2,
+            vec![
+                Value::Integer(2),
+                Value::Text("Orange".into()),
+                Value::Float(2.00),
+            ],
+        );
+        initial_delta.insert(
+            3,
+            vec![
+                Value::Integer(3),
+                Value::Text("Grape".into()),
+                Value::Float(3.50),
+            ],
+        );
+
+        pager
+            .io
+            .block(|| agg.commit((&initial_delta).into(), &mut cursors))
+            .unwrap();
+
+        // Insert a new MAX value
+        let mut insert_delta = Delta::new();
+        insert_delta.insert(
+            4,
+            vec![
+                Value::Integer(4),
+                Value::Text("Melon".into()),
+                Value::Float(5.00),
+            ],
+        );
+
+        let result = pager
+            .io
+            .block(|| agg.commit((&insert_delta).into(), &mut cursors))
+            .unwrap();
+
+        // Should emit retraction of old values and new values
+        assert_eq!(result.changes.len(), 2);
+
+        // Find the retraction (weight = -1)
+        let retraction = result.changes.iter().find(|(_, w)| *w == -1).unwrap();
+        assert_eq!(retraction.0.values[0], Value::Float(1.50)); // Old MIN
+        assert_eq!(retraction.0.values[1], Value::Float(3.50)); // Old MAX
+
+        // Find the new values (weight = 1)
+        let new_values = result.changes.iter().find(|(_, w)| *w == 1).unwrap();
+        assert_eq!(new_values.0.values[0], Value::Float(1.50)); // MIN unchanged
+        assert_eq!(new_values.0.values[1], Value::Float(5.00)); // New MAX (Melon)
+    }
+
+    #[test]
+    fn test_min_max_update_changes_min() {
+        // Test that updating a row to become the new MIN updates the aggregate
+        let (pager, table_root_page_id, index_root_page_id) = create_test_pager();
+        let table_cursor = BTreeCursor::new_table(None, pager.clone(), table_root_page_id, 5);
+        let index_def = create_dbsp_state_index(index_root_page_id);
+        let index_cursor =
+            BTreeCursor::new_index(None, pager.clone(), index_root_page_id, &index_def, 4);
+        let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
+
+        let mut agg = AggregateOperator::new(
+            1,      // operator_id
+            vec![], // No GROUP BY
+            vec![
+                AggregateFunction::Min("price".to_string()),
+                AggregateFunction::Max("price".to_string()),
+            ],
+            vec!["id".to_string(), "name".to_string(), "price".to_string()],
+        );
+
+        // Initial data
+        let mut initial_delta = Delta::new();
+        initial_delta.insert(
+            1,
+            vec![
+                Value::Integer(1),
+                Value::Text("Apple".into()),
+                Value::Float(1.50),
+            ],
+        );
+        initial_delta.insert(
+            2,
+            vec![
+                Value::Integer(2),
+                Value::Text("Orange".into()),
+                Value::Float(2.00),
+            ],
+        );
+        initial_delta.insert(
+            3,
+            vec![
+                Value::Integer(3),
+                Value::Text("Grape".into()),
+                Value::Float(3.50),
+            ],
+        );
+
+        pager
+            .io
+            .block(|| agg.commit((&initial_delta).into(), &mut cursors))
+            .unwrap();
+
+        // Update Orange price to be the new MIN (update = delete + insert)
+        let mut update_delta = Delta::new();
+        update_delta.delete(
+            2,
+            vec![
+                Value::Integer(2),
+                Value::Text("Orange".into()),
+                Value::Float(2.00),
+            ],
+        );
+        update_delta.insert(
+            2,
+            vec![
+                Value::Integer(2),
+                Value::Text("Orange".into()),
+                Value::Float(0.25),
+            ],
+        );
+
+        let result = pager
+            .io
+            .block(|| agg.commit((&update_delta).into(), &mut cursors))
+            .unwrap();
+
+        // Should emit retraction of old values and new values
+        assert_eq!(result.changes.len(), 2);
+
+        // Find the retraction (weight = -1)
+        let retraction = result.changes.iter().find(|(_, w)| *w == -1).unwrap();
+        assert_eq!(retraction.0.values[0], Value::Float(1.50)); // Old MIN
+        assert_eq!(retraction.0.values[1], Value::Float(3.50)); // Old MAX
+
+        // Find the new values (weight = 1)
+        let new_values = result.changes.iter().find(|(_, w)| *w == 1).unwrap();
+        assert_eq!(new_values.0.values[0], Value::Float(0.25)); // New MIN (updated Orange)
+        assert_eq!(new_values.0.values[1], Value::Float(3.50)); // MAX unchanged
+    }
+
+    #[test]
+    fn test_min_max_with_group_by() {
+        // Test MIN/MAX with GROUP BY
+        let (pager, table_root_page_id, index_root_page_id) = create_test_pager();
+        let table_cursor = BTreeCursor::new_table(None, pager.clone(), table_root_page_id, 5);
+        let index_def = create_dbsp_state_index(index_root_page_id);
+        let index_cursor =
+            BTreeCursor::new_index(None, pager.clone(), index_root_page_id, &index_def, 4);
+        let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
+
+        let mut agg = AggregateOperator::new(
+            1,                            // operator_id
+            vec!["category".to_string()], // GROUP BY category
+            vec![
+                AggregateFunction::Min("price".to_string()),
+                AggregateFunction::Max("price".to_string()),
+            ],
+            vec![
+                "id".to_string(),
+                "category".to_string(),
+                "name".to_string(),
+                "price".to_string(),
+            ],
+        );
+
+        // Initial data with two categories
+        let mut initial_delta = Delta::new();
+        initial_delta.insert(
+            1,
+            vec![
+                Value::Integer(1),
+                Value::Text("fruit".into()),
+                Value::Text("Apple".into()),
+                Value::Float(1.50),
+            ],
+        );
+        initial_delta.insert(
+            2,
+            vec![
+                Value::Integer(2),
+                Value::Text("fruit".into()),
+                Value::Text("Banana".into()),
+                Value::Float(0.75),
+            ],
+        );
+        initial_delta.insert(
+            3,
+            vec![
+                Value::Integer(3),
+                Value::Text("fruit".into()),
+                Value::Text("Orange".into()),
+                Value::Float(2.00),
+            ],
+        );
+        initial_delta.insert(
+            4,
+            vec![
+                Value::Integer(4),
+                Value::Text("veggie".into()),
+                Value::Text("Carrot".into()),
+                Value::Float(0.50),
+            ],
+        );
+        initial_delta.insert(
+            5,
+            vec![
+                Value::Integer(5),
+                Value::Text("veggie".into()),
+                Value::Text("Lettuce".into()),
+                Value::Float(1.25),
+            ],
+        );
+
+        let result = pager
+            .io
+            .block(|| agg.commit((&initial_delta).into(), &mut cursors))
+            .unwrap();
+
+        // Should have two groups
+        assert_eq!(result.changes.len(), 2);
+
+        // Find fruit group
+        let fruit = result
+            .changes
+            .iter()
+            .find(|(row, _)| row.values[0] == Value::Text("fruit".into()))
+            .unwrap();
+        assert_eq!(fruit.1, 1); // weight
+        assert_eq!(fruit.0.values[1], Value::Float(0.75)); // MIN (Banana)
+        assert_eq!(fruit.0.values[2], Value::Float(2.00)); // MAX (Orange)
+
+        // Find veggie group
+        let veggie = result
+            .changes
+            .iter()
+            .find(|(row, _)| row.values[0] == Value::Text("veggie".into()))
+            .unwrap();
+        assert_eq!(veggie.1, 1); // weight
+        assert_eq!(veggie.0.values[1], Value::Float(0.50)); // MIN (Carrot)
+        assert_eq!(veggie.0.values[2], Value::Float(1.25)); // MAX (Lettuce)
+    }
+
+    #[test]
+    fn test_min_max_with_nulls() {
+        // Test that NULL values are ignored in MIN/MAX
+        let (pager, table_root_page_id, index_root_page_id) = create_test_pager();
+        let table_cursor = BTreeCursor::new_table(None, pager.clone(), table_root_page_id, 5);
+        let index_def = create_dbsp_state_index(index_root_page_id);
+        let index_cursor =
+            BTreeCursor::new_index(None, pager.clone(), index_root_page_id, &index_def, 4);
+        let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
+
+        let mut agg = AggregateOperator::new(
+            1,      // operator_id
+            vec![], // No GROUP BY
+            vec![
+                AggregateFunction::Min("price".to_string()),
+                AggregateFunction::Max("price".to_string()),
+            ],
+            vec!["id".to_string(), "name".to_string(), "price".to_string()],
+        );
+
+        // Initial data with NULL values
+        let mut initial_delta = Delta::new();
+        initial_delta.insert(
+            1,
+            vec![
+                Value::Integer(1),
+                Value::Text("Apple".into()),
+                Value::Float(1.50),
+            ],
+        );
+        initial_delta.insert(
+            2,
+            vec![
+                Value::Integer(2),
+                Value::Text("Unknown1".into()),
+                Value::Null,
+            ],
+        );
+        initial_delta.insert(
+            3,
+            vec![
+                Value::Integer(3),
+                Value::Text("Orange".into()),
+                Value::Float(2.00),
+            ],
+        );
+        initial_delta.insert(
+            4,
+            vec![
+                Value::Integer(4),
+                Value::Text("Unknown2".into()),
+                Value::Null,
+            ],
+        );
+        initial_delta.insert(
+            5,
+            vec![
+                Value::Integer(5),
+                Value::Text("Grape".into()),
+                Value::Float(3.50),
+            ],
+        );
+
+        let result = pager
+            .io
+            .block(|| agg.commit((&initial_delta).into(), &mut cursors))
+            .unwrap();
+
+        // Verify MIN and MAX ignore NULLs
+        assert_eq!(result.changes.len(), 1);
+        let (row, weight) = &result.changes[0];
+        assert_eq!(*weight, 1);
+        assert_eq!(row.values[0], Value::Float(1.50)); // MIN (Apple, ignoring NULLs)
+        assert_eq!(row.values[1], Value::Float(3.50)); // MAX (Grape, ignoring NULLs)
+    }
+
+    #[test]
+    fn test_min_max_integer_values() {
+        // Test MIN/MAX with integer values instead of floats
+        let (pager, table_root_page_id, index_root_page_id) = create_test_pager();
+        let table_cursor = BTreeCursor::new_table(None, pager.clone(), table_root_page_id, 5);
+        let index_def = create_dbsp_state_index(index_root_page_id);
+        let index_cursor =
+            BTreeCursor::new_index(None, pager.clone(), index_root_page_id, &index_def, 4);
+        let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
+
+        let mut agg = AggregateOperator::new(
+            1,      // operator_id
+            vec![], // No GROUP BY
+            vec![
+                AggregateFunction::Min("score".to_string()),
+                AggregateFunction::Max("score".to_string()),
+            ],
+            vec!["id".to_string(), "name".to_string(), "score".to_string()],
+        );
+
+        // Initial data with integer scores
+        let mut initial_delta = Delta::new();
+        initial_delta.insert(
+            1,
+            vec![
+                Value::Integer(1),
+                Value::Text("Alice".into()),
+                Value::Integer(85),
+            ],
+        );
+        initial_delta.insert(
+            2,
+            vec![
+                Value::Integer(2),
+                Value::Text("Bob".into()),
+                Value::Integer(92),
+            ],
+        );
+        initial_delta.insert(
+            3,
+            vec![
+                Value::Integer(3),
+                Value::Text("Carol".into()),
+                Value::Integer(78),
+            ],
+        );
+        initial_delta.insert(
+            4,
+            vec![
+                Value::Integer(4),
+                Value::Text("Dave".into()),
+                Value::Integer(95),
+            ],
+        );
+
+        let result = pager
+            .io
+            .block(|| agg.commit((&initial_delta).into(), &mut cursors))
+            .unwrap();
+
+        // Verify MIN and MAX with integers
+        assert_eq!(result.changes.len(), 1);
+        let (row, weight) = &result.changes[0];
+        assert_eq!(*weight, 1);
+        assert_eq!(row.values[0], Value::Integer(78)); // MIN (Carol)
+        assert_eq!(row.values[1], Value::Integer(95)); // MAX (Dave)
+    }
+
+    #[test]
+    fn test_min_max_text_values() {
+        // Test MIN/MAX with text values (alphabetical ordering)
+        let (pager, table_root_page_id, index_root_page_id) = create_test_pager();
+        let table_cursor = BTreeCursor::new_table(None, pager.clone(), table_root_page_id, 5);
+        let index_def = create_dbsp_state_index(index_root_page_id);
+        let index_cursor =
+            BTreeCursor::new_index(None, pager.clone(), index_root_page_id, &index_def, 4);
+        let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
+
+        let mut agg = AggregateOperator::new(
+            1,      // operator_id
+            vec![], // No GROUP BY
+            vec![
+                AggregateFunction::Min("name".to_string()),
+                AggregateFunction::Max("name".to_string()),
+            ],
+            vec!["id".to_string(), "name".to_string()],
+        );
+
+        // Initial data with text values
+        let mut initial_delta = Delta::new();
+        initial_delta.insert(1, vec![Value::Integer(1), Value::Text("Charlie".into())]);
+        initial_delta.insert(2, vec![Value::Integer(2), Value::Text("Alice".into())]);
+        initial_delta.insert(3, vec![Value::Integer(3), Value::Text("Bob".into())]);
+        initial_delta.insert(4, vec![Value::Integer(4), Value::Text("David".into())]);
+
+        let result = pager
+            .io
+            .block(|| agg.commit((&initial_delta).into(), &mut cursors))
+            .unwrap();
+
+        // Verify MIN and MAX with text (alphabetical)
+        assert_eq!(result.changes.len(), 1);
+        let (row, weight) = &result.changes[0];
+        assert_eq!(*weight, 1);
+        assert_eq!(row.values[0], Value::Text("Alice".into())); // MIN alphabetically
+        assert_eq!(row.values[1], Value::Text("David".into())); // MAX alphabetically
+    }
+
+    #[test]
+    fn test_min_max_with_other_aggregates() {
+        let (pager, table_root_page_id, index_root_page_id) = create_test_pager();
+        let table_cursor = BTreeCursor::new_table(None, pager.clone(), table_root_page_id, 5);
+        let index_def = create_dbsp_state_index(index_root_page_id);
+        let index_cursor =
+            BTreeCursor::new_index(None, pager.clone(), index_root_page_id, &index_def, 4);
+        let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
+
+        let mut agg = AggregateOperator::new(
+            1,      // operator_id
+            vec![], // No GROUP BY
+            vec![
+                AggregateFunction::Count,
+                AggregateFunction::Sum("value".to_string()),
+                AggregateFunction::Min("value".to_string()),
+                AggregateFunction::Max("value".to_string()),
+                AggregateFunction::Avg("value".to_string()),
+            ],
+            vec!["id".to_string(), "value".to_string()],
+        );
+
+        // Initial data
+        let mut delta = Delta::new();
+        delta.insert(1, vec![Value::Integer(1), Value::Integer(10)]);
+        delta.insert(2, vec![Value::Integer(2), Value::Integer(5)]);
+        delta.insert(3, vec![Value::Integer(3), Value::Integer(15)]);
+        delta.insert(4, vec![Value::Integer(4), Value::Integer(20)]);
+
+        let result = pager
+            .io
+            .block(|| agg.commit((&delta).into(), &mut cursors))
+            .unwrap();
+
+        assert_eq!(result.changes.len(), 1);
+        let (row, weight) = &result.changes[0];
+        assert_eq!(*weight, 1);
+        assert_eq!(row.values[0], Value::Integer(4)); // COUNT
+        assert_eq!(row.values[1], Value::Integer(50)); // SUM
+        assert_eq!(row.values[2], Value::Integer(5)); // MIN
+        assert_eq!(row.values[3], Value::Integer(20)); // MAX
+        assert_eq!(row.values[4], Value::Float(12.5)); // AVG (50/4)
+
+        // Delete the MIN value
+        let mut delta2 = Delta::new();
+        delta2.delete(2, vec![Value::Integer(2), Value::Integer(5)]);
+
+        let result2 = pager
+            .io
+            .block(|| agg.commit((&delta2).into(), &mut cursors))
+            .unwrap();
+
+        assert_eq!(result2.changes.len(), 2);
+        let (row_del, weight_del) = &result2.changes[0];
+        assert_eq!(*weight_del, -1);
+        assert_eq!(row_del.values[0], Value::Integer(4)); // Old COUNT
+        assert_eq!(row_del.values[1], Value::Integer(50)); // Old SUM
+        assert_eq!(row_del.values[2], Value::Integer(5)); // Old MIN
+        assert_eq!(row_del.values[3], Value::Integer(20)); // Old MAX
+        assert_eq!(row_del.values[4], Value::Float(12.5)); // Old AVG
+
+        let (row_ins, weight_ins) = &result2.changes[1];
+        assert_eq!(*weight_ins, 1);
+        assert_eq!(row_ins.values[0], Value::Integer(3)); // New COUNT
+        assert_eq!(row_ins.values[1], Value::Integer(45)); // New SUM
+        assert_eq!(row_ins.values[2], Value::Integer(10)); // New MIN
+        assert_eq!(row_ins.values[3], Value::Integer(20)); // MAX unchanged
+        assert_eq!(row_ins.values[4], Value::Float(15.0)); // New AVG (45/3)
+
+        // Now delete the MAX value
+        let mut delta3 = Delta::new();
+        delta3.delete(4, vec![Value::Integer(4), Value::Integer(20)]);
+
+        let result3 = pager
+            .io
+            .block(|| agg.commit((&delta3).into(), &mut cursors))
+            .unwrap();
+
+        assert_eq!(result3.changes.len(), 2);
+        let (row_del2, weight_del2) = &result3.changes[0];
+        assert_eq!(*weight_del2, -1);
+        assert_eq!(row_del2.values[3], Value::Integer(20)); // Old MAX
+
+        let (row_ins2, weight_ins2) = &result3.changes[1];
+        assert_eq!(*weight_ins2, 1);
+        assert_eq!(row_ins2.values[0], Value::Integer(2)); // COUNT
+        assert_eq!(row_ins2.values[1], Value::Integer(25)); // SUM
+        assert_eq!(row_ins2.values[2], Value::Integer(10)); // MIN unchanged
+        assert_eq!(row_ins2.values[3], Value::Integer(15)); // New MAX
+        assert_eq!(row_ins2.values[4], Value::Float(12.5)); // AVG (25/2)
+    }
+
+    #[test]
+    fn test_min_max_multiple_columns() {
+        let (pager, table_root_page_id, index_root_page_id) = create_test_pager();
+        let table_cursor = BTreeCursor::new_table(None, pager.clone(), table_root_page_id, 5);
+        let index_def = create_dbsp_state_index(index_root_page_id);
+        let index_cursor =
+            BTreeCursor::new_index(None, pager.clone(), index_root_page_id, &index_def, 4);
+        let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
+
+        let mut agg = AggregateOperator::new(
+            1,      // operator_id
+            vec![], // No GROUP BY
+            vec![
+                AggregateFunction::Min("col1".to_string()),
+                AggregateFunction::Max("col2".to_string()),
+                AggregateFunction::Min("col3".to_string()),
+            ],
+            vec!["col1".to_string(), "col2".to_string(), "col3".to_string()],
+        );
+
+        // Initial data
+        let mut delta = Delta::new();
+        delta.insert(
+            1,
+            vec![
+                Value::Integer(10),
+                Value::Integer(100),
+                Value::Integer(1000),
+            ],
+        );
+        delta.insert(
+            2,
+            vec![Value::Integer(5), Value::Integer(200), Value::Integer(2000)],
+        );
+        delta.insert(
+            3,
+            vec![Value::Integer(15), Value::Integer(150), Value::Integer(500)],
+        );
+
+        let result = pager
+            .io
+            .block(|| agg.commit((&delta).into(), &mut cursors))
+            .unwrap();
+
+        assert_eq!(result.changes.len(), 1);
+        let (row, weight) = &result.changes[0];
+        assert_eq!(*weight, 1);
+        assert_eq!(row.values[0], Value::Integer(5)); // MIN(col1)
+        assert_eq!(row.values[1], Value::Integer(200)); // MAX(col2)
+        assert_eq!(row.values[2], Value::Integer(500)); // MIN(col3)
+
+        // Delete the row with MIN(col1) and MAX(col2)
+        let mut delta2 = Delta::new();
+        delta2.delete(
+            2,
+            vec![Value::Integer(5), Value::Integer(200), Value::Integer(2000)],
+        );
+
+        let result2 = pager
+            .io
+            .block(|| agg.commit((&delta2).into(), &mut cursors))
+            .unwrap();
+
+        assert_eq!(result2.changes.len(), 2);
+        // Should emit delete of old state and insert of new state
+        let (row_del, weight_del) = &result2.changes[0];
+        assert_eq!(*weight_del, -1);
+        assert_eq!(row_del.values[0], Value::Integer(5)); // Old MIN(col1)
+        assert_eq!(row_del.values[1], Value::Integer(200)); // Old MAX(col2)
+        assert_eq!(row_del.values[2], Value::Integer(500)); // Old MIN(col3)
+
+        let (row_ins, weight_ins) = &result2.changes[1];
+        assert_eq!(*weight_ins, 1);
+        assert_eq!(row_ins.values[0], Value::Integer(10)); // New MIN(col1)
+        assert_eq!(row_ins.values[1], Value::Integer(150)); // New MAX(col2)
+        assert_eq!(row_ins.values[2], Value::Integer(500)); // MIN(col3) unchanged
     }
 }

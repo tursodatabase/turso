@@ -751,7 +751,7 @@ impl DbspCircuit {
                         .ok_or_else(|| LimboError::ParseError("Node not found".to_string()))?;
 
                     let output_delta =
-                        return_if_io!(node.process_node(eval_state, commit_operators, cursors,));
+                        return_if_io!(node.process_node(eval_state, commit_operators, cursors));
                     return Ok(IOResult::Done(output_delta));
                 }
             }
@@ -939,9 +939,9 @@ impl DbspCompiler {
                         use crate::function::AggFunc;
                         use crate::incremental::operator::AggregateFunction;
 
-                        let agg_fn = match fun {
+                        match fun {
                             AggFunc::Count | AggFunc::Count0 => {
-                                AggregateFunction::Count
+                                aggregate_functions.push(AggregateFunction::Count);
                             }
                             AggFunc::Sum => {
                                 if args.is_empty() {
@@ -949,7 +949,7 @@ impl DbspCompiler {
                                 }
                                 // Extract column name from the argument
                                 if let LogicalExpr::Column(col) = &args[0] {
-                                    AggregateFunction::Sum(col.name.clone())
+                                    aggregate_functions.push(AggregateFunction::Sum(col.name.clone()));
                                 } else {
                                     return Err(LimboError::ParseError(
                                         "Only column references are supported in aggregate functions for incremental views".to_string()
@@ -961,36 +961,43 @@ impl DbspCompiler {
                                     return Err(LimboError::ParseError("AVG requires an argument".to_string()));
                                 }
                                 if let LogicalExpr::Column(col) = &args[0] {
-                                    AggregateFunction::Avg(col.name.clone())
+                                    aggregate_functions.push(AggregateFunction::Avg(col.name.clone()));
                                 } else {
                                     return Err(LimboError::ParseError(
                                         "Only column references are supported in aggregate functions for incremental views".to_string()
                                     ));
                                 }
                             }
-                            // MIN and MAX are not supported in incremental views due to storage overhead.
-                            // To correctly handle deletions, these operators would need to track all values
-                            // in each group, resulting in O(n) storage overhead. This is prohibitive for
-                            // large datasets. Alternative approaches like maintaining sorted indexes still
-                            // require O(n) storage. Until a more efficient solution is found, MIN/MAX
-                            // aggregations are not supported in materialized views.
                             AggFunc::Min => {
-                                return Err(LimboError::ParseError(
-                                    "MIN aggregation is not supported in incremental materialized views due to O(n) storage overhead required for handling deletions".to_string()
-                                ));
+                                if args.is_empty() {
+                                    return Err(LimboError::ParseError("MIN requires an argument".to_string()));
+                                }
+                                if let LogicalExpr::Column(col) = &args[0] {
+                                    aggregate_functions.push(AggregateFunction::Min(col.name.clone()));
+                                } else {
+                                    return Err(LimboError::ParseError(
+                                        "Only column references are supported in MIN for incremental views".to_string()
+                                    ));
+                                }
                             }
                             AggFunc::Max => {
-                                return Err(LimboError::ParseError(
-                                    "MAX aggregation is not supported in incremental materialized views due to O(n) storage overhead required for handling deletions".to_string()
-                                ));
+                                if args.is_empty() {
+                                    return Err(LimboError::ParseError("MAX requires an argument".to_string()));
+                                }
+                                if let LogicalExpr::Column(col) = &args[0] {
+                                    aggregate_functions.push(AggregateFunction::Max(col.name.clone()));
+                                } else {
+                                    return Err(LimboError::ParseError(
+                                        "Only column references are supported in MAX for incremental views".to_string()
+                                    ));
+                                }
                             }
                             _ => {
                                 return Err(LimboError::ParseError(
                                     format!("Unsupported aggregate function in DBSP compiler: {fun:?}")
                                 ));
                             }
-                        };
-                        aggregate_functions.push(agg_fn);
+                        }
                     } else {
                         return Err(LimboError::ParseError(
                             "Expected aggregate function in aggregate expressions".to_string()
@@ -998,19 +1005,17 @@ impl DbspCompiler {
                     }
                 }
 
-                // Create the AggregateOperator with a unique operator_id
-                // Use the next_node_id as the operator_id to ensure uniqueness
                 let operator_id = self.circuit.next_id;
+
                 use crate::incremental::operator::AggregateOperator;
                 let executable: Box<dyn IncrementalOperator> = Box::new(AggregateOperator::new(
-                    operator_id,  // Use next_node_id as operator_id
-                    group_by_columns,
+                    operator_id,
+                    group_by_columns.clone(),
                     aggregate_functions.clone(),
-                    input_column_names,
+                    input_column_names.clone(),
                 ));
 
-                // Create aggregate node
-                let node_id = self.circuit.add_node(
+                let result_node_id = self.circuit.add_node(
                     DbspOperator::Aggregate {
                         group_exprs: dbsp_group_exprs,
                         aggr_exprs: aggregate_functions,
@@ -1019,7 +1024,8 @@ impl DbspCompiler {
                     vec![input_id],
                     executable,
                 );
-                Ok(node_id)
+
+                Ok(result_node_id)
             }
             LogicalPlan::TableScan(scan) => {
                 // Create input node with InputOperator for uniform handling
