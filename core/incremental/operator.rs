@@ -2240,14 +2240,14 @@ mod tests {
     use crate::storage::pager::CreateBTreeFlags;
     use crate::types::Text;
     use crate::util::IOExt;
-    use crate::Value;
     use crate::{Database, MemoryIO, IO};
+    use crate::{MvccMode, Value};
     use std::sync::{Arc, Mutex};
 
     /// Create a test pager for operator tests with both table and index
     fn create_test_pager() -> (std::sync::Arc<crate::Pager>, usize, usize) {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io.clone(), ":memory:", false, false).unwrap();
+        let db = Database::open_file(io.clone(), ":memory:", false, false, MvccMode::Noop).unwrap();
         let conn = db.connect().unwrap();
 
         let pager = conn.pager.borrow().clone();

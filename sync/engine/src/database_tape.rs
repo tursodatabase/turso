@@ -673,6 +673,7 @@ mod tests {
     use std::sync::Arc;
 
     use tempfile::NamedTempFile;
+    use turso::MvccMode;
 
     use crate::{
         database_tape::{
@@ -687,7 +688,9 @@ mod tests {
         let db_path1 = temp_file1.path().to_str().unwrap();
 
         let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
-        let db1 = turso_core::Database::open_file(io.clone(), db_path1, false, false).unwrap();
+        let db1 =
+            turso_core::Database::open_file(io.clone(), db_path1, false, false, MvccMode::Noop)
+                .unwrap();
         let db1 = Arc::new(DatabaseTape::new(db1));
         let mut gen = genawaiter::sync::Gen::new({
             let db1 = db1.clone();
@@ -717,7 +720,9 @@ mod tests {
         let db_path1 = temp_file1.path().to_str().unwrap();
 
         let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
-        let db1 = turso_core::Database::open_file(io.clone(), db_path1, false, false).unwrap();
+        let db1 =
+            turso_core::Database::open_file(io.clone(), db_path1, false, false, MvccMode::Noop)
+                .unwrap();
         let db1 = Arc::new(DatabaseTape::new(db1));
 
         let mut gen = genawaiter::sync::Gen::new({
@@ -785,10 +790,14 @@ mod tests {
         let db_path2 = temp_file2.path().to_str().unwrap();
 
         let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
-        let db1 = turso_core::Database::open_file(io.clone(), db_path1, false, false).unwrap();
+        let db1 =
+            turso_core::Database::open_file(io.clone(), db_path1, false, false, MvccMode::Noop)
+                .unwrap();
         let db1 = Arc::new(DatabaseTape::new(db1));
 
-        let db2 = turso_core::Database::open_file(io.clone(), db_path2, false, false).unwrap();
+        let db2 =
+            turso_core::Database::open_file(io.clone(), db_path2, false, false, MvccMode::Noop)
+                .unwrap();
         let db2 = Arc::new(DatabaseTape::new(db2));
 
         let mut gen = genawaiter::sync::Gen::new({
@@ -864,10 +873,14 @@ mod tests {
         let db_path2 = temp_file2.path().to_str().unwrap();
 
         let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
-        let db1 = turso_core::Database::open_file(io.clone(), db_path1, false, false).unwrap();
+        let db1 =
+            turso_core::Database::open_file(io.clone(), db_path1, false, false, MvccMode::Noop)
+                .unwrap();
         let db1 = Arc::new(DatabaseTape::new(db1));
 
-        let db2 = turso_core::Database::open_file(io.clone(), db_path2, false, false).unwrap();
+        let db2 =
+            turso_core::Database::open_file(io.clone(), db_path2, false, false, MvccMode::Noop)
+                .unwrap();
         let db2 = Arc::new(DatabaseTape::new(db2));
 
         let mut gen = genawaiter::sync::Gen::new({
@@ -937,10 +950,14 @@ mod tests {
         let db_path2 = temp_file2.path().to_str().unwrap();
 
         let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
-        let db1 = turso_core::Database::open_file(io.clone(), db_path1, false, true).unwrap();
+        let db1 =
+            turso_core::Database::open_file(io.clone(), db_path1, false, true, MvccMode::Noop)
+                .unwrap();
         let db1 = Arc::new(DatabaseTape::new(db1));
 
-        let db2 = turso_core::Database::open_file(io.clone(), db_path2, false, true).unwrap();
+        let db2 =
+            turso_core::Database::open_file(io.clone(), db_path2, false, true, MvccMode::Noop)
+                .unwrap();
         let db2 = Arc::new(DatabaseTape::new(db2));
 
         let mut gen = genawaiter::sync::Gen::new({
@@ -1002,13 +1019,19 @@ mod tests {
 
         let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
 
-        let db1 = turso_core::Database::open_file(io.clone(), db_path1, false, true).unwrap();
+        let db1 =
+            turso_core::Database::open_file(io.clone(), db_path1, false, true, MvccMode::Noop)
+                .unwrap();
         let db1 = Arc::new(DatabaseTape::new(db1));
 
-        let db2 = turso_core::Database::open_file(io.clone(), db_path2, false, true).unwrap();
+        let db2 =
+            turso_core::Database::open_file(io.clone(), db_path2, false, true, MvccMode::Noop)
+                .unwrap();
         let db2 = Arc::new(DatabaseTape::new(db2));
 
-        let db3 = turso_core::Database::open_file(io.clone(), db_path3, false, true).unwrap();
+        let db3 =
+            turso_core::Database::open_file(io.clone(), db_path3, false, true, MvccMode::Noop)
+                .unwrap();
         let db3 = Arc::new(DatabaseTape::new(db3));
 
         let mut gen = genawaiter::sync::Gen::new({
@@ -1131,10 +1154,14 @@ mod tests {
 
         let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
 
-        let db1 = turso_core::Database::open_file(io.clone(), db_path1, false, true).unwrap();
+        let db1 =
+            turso_core::Database::open_file(io.clone(), db_path1, false, true, MvccMode::Noop)
+                .unwrap();
         let db1 = Arc::new(DatabaseTape::new(db1));
 
-        let db2 = turso_core::Database::open_file(io.clone(), db_path2, false, true).unwrap();
+        let db2 =
+            turso_core::Database::open_file(io.clone(), db_path2, false, true, MvccMode::Noop)
+                .unwrap();
         let db2 = Arc::new(DatabaseTape::new(db2));
 
         let mut gen = genawaiter::sync::Gen::new({
@@ -1215,10 +1242,14 @@ mod tests {
 
         let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
 
-        let db1 = turso_core::Database::open_file(io.clone(), db_path1, false, true).unwrap();
+        let db1 =
+            turso_core::Database::open_file(io.clone(), db_path1, false, true, MvccMode::Noop)
+                .unwrap();
         let db1 = Arc::new(DatabaseTape::new(db1));
 
-        let db2 = turso_core::Database::open_file(io.clone(), db_path2, false, true).unwrap();
+        let db2 =
+            turso_core::Database::open_file(io.clone(), db_path2, false, true, MvccMode::Noop)
+                .unwrap();
         let db2 = Arc::new(DatabaseTape::new(db2));
 
         let mut gen = genawaiter::sync::Gen::new({
@@ -1291,13 +1322,19 @@ mod tests {
 
         let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
 
-        let db1 = turso_core::Database::open_file(io.clone(), db_path1, false, true).unwrap();
+        let db1 =
+            turso_core::Database::open_file(io.clone(), db_path1, false, true, MvccMode::Noop)
+                .unwrap();
         let db1 = Arc::new(DatabaseTape::new(db1));
 
-        let db2 = turso_core::Database::open_file(io.clone(), db_path2, false, true).unwrap();
+        let db2 =
+            turso_core::Database::open_file(io.clone(), db_path2, false, true, MvccMode::Noop)
+                .unwrap();
         let db2 = Arc::new(DatabaseTape::new(db2));
 
-        let db3 = turso_core::Database::open_file(io.clone(), db_path3, false, true).unwrap();
+        let db3 =
+            turso_core::Database::open_file(io.clone(), db_path3, false, true, MvccMode::Noop)
+                .unwrap();
         let db3 = Arc::new(DatabaseTape::new(db3));
 
         let mut gen = genawaiter::sync::Gen::new({

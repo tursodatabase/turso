@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, SamplingMode};
 use pprof::criterion::{Output, PProfProfiler};
-use turso_core::{Database, PlatformIO};
+use turso_core::{Database, MvccMode, PlatformIO};
 
 const TPC_H_PATH: &str = "../perf/tpc-h/TPC-H.db";
 
@@ -30,7 +30,7 @@ fn bench_tpc_h_queries(criterion: &mut Criterion) {
 
     #[allow(clippy::arc_with_non_send_sync)]
     let io = Arc::new(PlatformIO::new().unwrap());
-    let db = Database::open_file(io.clone(), TPC_H_PATH, false, true).unwrap();
+    let db = Database::open_file(io.clone(), TPC_H_PATH, false, true, MvccMode::Noop).unwrap();
     let limbo_conn = db.connect().unwrap();
 
     let queries = [

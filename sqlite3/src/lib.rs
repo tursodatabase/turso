@@ -151,7 +151,13 @@ pub unsafe extern "C" fn sqlite3_open(
             Err(_) => return SQLITE_CANTOPEN,
         },
     };
-    match turso_core::Database::open_file(io.clone(), filename_str, false, false) {
+    match turso_core::Database::open_file(
+        io.clone(),
+        filename_str,
+        false,
+        false,
+        turso_core::MvccMode::Noop,
+    ) {
         Ok(db) => {
             let conn = db.connect().unwrap();
             let filename = match filename_str {

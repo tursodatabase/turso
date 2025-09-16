@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tempfile::TempDir;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+use turso::MvccMode;
 use turso_core::{Connection, Database, Row, StepResult, IO};
 
 #[allow(dead_code)]
@@ -122,6 +123,7 @@ impl TempDatabase {
             self.path.to_str().unwrap(),
             false,
             enable_indexes,
+            MvccMode::Noop,
         )
         .unwrap()
     }
@@ -340,6 +342,7 @@ pub fn run_query_core(
 mod tests {
     use std::{sync::Arc, vec};
     use tempfile::{NamedTempFile, TempDir};
+    use turso::MvccMode;
     use turso_core::{Database, StepResult, IO};
 
     use crate::common::do_flush;
@@ -635,7 +638,7 @@ mod tests {
         // Open database
         #[allow(clippy::arc_with_non_send_sync)]
         let io: Arc<dyn IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
-        let db = Database::open_file(io, &db_path, false, false)?;
+        let db = Database::open_file(io, &db_path, false, false, MvccMode::Noop)?;
 
         const NUM_CONNECTIONS: usize = 5;
         let mut connections = Vec::new();

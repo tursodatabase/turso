@@ -19,7 +19,7 @@ pub(crate) struct MvccTestDb {
 impl MvccTestDb {
     pub fn new() -> Self {
         let io = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io.clone(), ":memory:", true, true).unwrap();
+        let db = Database::open_file(io.clone(), ":memory:", true, true, MvccMode::Noop).unwrap();
         let conn = db.connect().unwrap();
         let mvcc_store = db.mv_store.as_ref().unwrap().clone();
         Self {
@@ -33,7 +33,7 @@ impl MvccTestDb {
 impl MvccTestDbNoConn {
     pub fn new() -> Self {
         let io = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io.clone(), ":memory:", true, true).unwrap();
+        let db = Database::open_file(io.clone(), ":memory:", true, true, MvccMode::Noop).unwrap();
         Self {
             db: Some(db),
             path: None,
@@ -50,8 +50,14 @@ impl MvccTestDbNoConn {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let io = Arc::new(PlatformIO::new().unwrap());
         println!("path: {}", path.as_os_str().to_str().unwrap());
-        let db = Database::open_file(io.clone(), path.as_os_str().to_str().unwrap(), true, true)
-            .unwrap();
+        let db = Database::open_file(
+            io.clone(),
+            path.as_os_str().to_str().unwrap(),
+            true,
+            true,
+            MvccMode::Noop,
+        )
+        .unwrap();
         Self {
             db: Some(db),
             path: Some(path.to_str().unwrap().to_string()),
@@ -63,7 +69,7 @@ impl MvccTestDbNoConn {
     pub fn restart(&mut self) {
         let io = Arc::new(PlatformIO::new().unwrap());
         let path = self.path.as_ref().unwrap();
-        let db = Database::open_file(io.clone(), path, true, true).unwrap();
+        let db = Database::open_file(io.clone(), path, true, true, MvccMode::Noop).unwrap();
         self.db.replace(db);
     }
 
@@ -727,10 +733,10 @@ fn test_future_row() {
 use crate::mvcc::cursor::MvccLazyCursor;
 use crate::mvcc::database::{MvStore, Row, RowID};
 use crate::types::Text;
-use crate::RefValue;
 use crate::Value;
 use crate::{Database, StepResult};
 use crate::{MemoryIO, Statement};
+use crate::{MvccMode, RefValue};
 
 // Simple atomic clock implementation for testing
 

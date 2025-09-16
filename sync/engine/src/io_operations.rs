@@ -23,7 +23,9 @@ pub trait IoOperations {
 impl IoOperations for Arc<dyn turso_core::IO> {
     fn open_tape(&self, path: &str, capture: bool) -> Result<DatabaseTape> {
         let io = self.clone();
-        let clean = turso_core::Database::open_file(io, path, false, true).unwrap();
+        let clean =
+            turso_core::Database::open_file(io, path, false, true, turso_core::MvccMode::Noop)
+                .unwrap();
         let opts = DatabaseTapeOpts {
             cdc_table: None,
             cdc_mode: Some(if capture { "full" } else { "off" }.to_string()),

@@ -1318,7 +1318,8 @@ mod tests {
     use crate::translate::logical::LogicalPlanBuilder;
     use crate::translate::logical::LogicalSchema;
     use crate::util::IOExt;
-    use crate::{Database, MemoryIO, Pager, IO};
+    use crate::{Database, MemoryIO, MvccMode, Pager, IO};
+    use std::rc::Rc;
     use std::sync::Arc;
     use turso_parser::ast;
     use turso_parser::parser::Parser;
@@ -1416,7 +1417,7 @@ mod tests {
 
     fn setup_btree_for_circuit() -> (Arc<Pager>, usize, usize, usize) {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io.clone(), ":memory:", false, false).unwrap();
+        let db = Database::open_file(io.clone(), ":memory:", false, false, MvccMode::Noop).unwrap();
         let conn = db.connect().unwrap();
         let pager = conn.pager.borrow().clone();
 

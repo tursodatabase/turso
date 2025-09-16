@@ -811,6 +811,7 @@ fn reopen_database(env: &mut SimulatorEnv) {
                 env.get_db_path().to_str().expect("path should be 'to_str'"),
                 false,
                 true,
+                turso_core::MvccMode::Noop,
             ) {
                 Ok(db) => db,
                 Err(e) => {

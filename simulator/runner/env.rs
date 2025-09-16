@@ -9,7 +9,7 @@ use garde::Validate;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use sql_generation::model::table::Table;
-use turso_core::Database;
+use turso_core::{Database, MvccMode};
 
 use crate::profiles::Profile;
 use crate::runner::SimIO;
@@ -141,6 +141,7 @@ impl SimulatorEnv {
             db_path.to_str().unwrap(),
             self.profile.experimental_mvcc,
             self.profile.query.gen_opts.indexes,
+            MvccMode::Noop,
         ) {
             Ok(db) => db,
             Err(e) => {
@@ -271,6 +272,7 @@ impl SimulatorEnv {
             db_path.to_str().unwrap(),
             profile.experimental_mvcc,
             profile.query.gen_opts.indexes,
+            MvccMode::Noop,
         ) {
             Ok(db) => db,
             Err(e) => {
