@@ -874,6 +874,9 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
             }
             CommitState::EndCommitLogicalLog { end_ts } => {
                 if mvcc_store.storage.is_logical_log() {
+                    let tx = mvcc_store.txs.get(&self.tx_id).unwrap();
+                    let tx_unlocked = tx.value();
+                    self.header.write().replace(*tx_unlocked.header.borrow());
                     self.commit_coordinator.pager_commit_lock.unlock();
                 }
                 self.state = CommitState::CommitEnd { end_ts: *end_ts };
