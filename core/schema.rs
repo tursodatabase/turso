@@ -295,10 +295,10 @@ impl Schema {
     pub fn make_from_btree(
         &mut self,
         mv_cursor: Option<Rc<RefCell<MvCursor>>>,
-        pager: Rc<Pager>,
+        pager: Arc<Pager>,
         syms: &SymbolTable,
     ) -> Result<()> {
-        let mut cursor = BTreeCursor::new_table(mv_cursor, pager.clone(), 1, 10);
+        let mut cursor = BTreeCursor::new_table(mv_cursor, Arc::clone(&pager), 1, 10);
 
         let mut from_sql_indexes = Vec::with_capacity(10);
         let mut automatic_indices: HashMap<String, Vec<(String, usize)>> =

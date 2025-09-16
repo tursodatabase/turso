@@ -21,7 +21,6 @@ use crate::Pager;
 use crate::{return_and_restore_if_io, return_if_io, LimboError, Result};
 use std::collections::HashMap;
 use std::fmt::{self, Display, Formatter};
-use std::rc::Rc;
 use std::sync::Arc;
 
 // The state table has 5 columns: operator_id, zset_id, element_id, value, weight
@@ -435,7 +434,7 @@ impl DbspCircuit {
     pub fn run_circuit(
         &mut self,
         execute_state: &mut ExecuteState,
-        pager: &Rc<Pager>,
+        pager: &Arc<Pager>,
         state_cursors: &mut DbspStateCursors,
         commit_operators: bool,
     ) -> Result<IOResult<Delta>> {
@@ -462,7 +461,7 @@ impl DbspCircuit {
     /// * `execute_state` - State machine containing input deltas and tracking execution progress
     pub fn execute(
         &mut self,
-        pager: Rc<Pager>,
+        pager: Arc<Pager>,
         execute_state: &mut ExecuteState,
     ) -> Result<IOResult<Delta>> {
         if let Some(root_id) = self.root {
@@ -499,7 +498,7 @@ impl DbspCircuit {
     pub fn commit(
         &mut self,
         input_data: HashMap<String, Delta>,
-        pager: Rc<Pager>,
+        pager: Arc<Pager>,
     ) -> Result<IOResult<Delta>> {
         // No root means nothing to commit
         if self.root.is_none() {
@@ -643,7 +642,7 @@ impl DbspCircuit {
     fn execute_node(
         &mut self,
         node_id: usize,
-        pager: Rc<Pager>,
+        pager: Arc<Pager>,
         execute_state: &mut ExecuteState,
         commit_operators: bool,
         cursors: &mut DbspStateCursors,
@@ -1320,7 +1319,6 @@ mod tests {
     use crate::translate::logical::LogicalSchema;
     use crate::util::IOExt;
     use crate::{Database, MemoryIO, Pager, IO};
-    use std::rc::Rc;
     use std::sync::Arc;
     use turso_parser::ast;
     use turso_parser::parser::Parser;
@@ -1416,7 +1414,7 @@ mod tests {
         }};
     }
 
-    fn setup_btree_for_circuit() -> (Rc<Pager>, usize, usize, usize) {
+    fn setup_btree_for_circuit() -> (Arc<Pager>, usize, usize, usize) {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db = Database::open_file(io.clone(), ":memory:", false, false).unwrap();
         let conn = db.connect().unwrap();
@@ -1579,7 +1577,7 @@ mod tests {
     fn test_execute(
         circuit: &mut DbspCircuit,
         inputs: HashMap<String, Delta>,
-        pager: Rc<Pager>,
+        pager: Arc<Pager>,
     ) -> Result<Delta> {
         let mut execute_state = ExecuteState::Init {
             input_data: DeltaSet::from_map(inputs),
@@ -1593,7 +1591,7 @@ mod tests {
     // Helper to get the committed BTree state from main_data_root
     // This reads the actual persisted data from the BTree
     #[cfg(test)]
-    fn get_current_state(pager: Rc<Pager>, circuit: &DbspCircuit) -> Result<Delta> {
+    fn get_current_state(pager: Arc<Pager>, circuit: &DbspCircuit) -> Result<Delta> {
         let mut delta = Delta::new();
 
         let main_data_root = circuit.main_data_root;

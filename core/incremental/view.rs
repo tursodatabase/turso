@@ -384,7 +384,7 @@ impl IncrementalView {
     pub fn execute_with_uncommitted(
         &mut self,
         uncommitted: DeltaSet,
-        pager: Rc<Pager>,
+        pager: Arc<Pager>,
         execute_state: &mut crate::incremental::compiler::ExecuteState,
     ) -> crate::Result<crate::types::IOResult<Delta>> {
         // Initialize execute_state with the input data
@@ -560,7 +560,7 @@ impl IncrementalView {
     pub fn populate_from_table(
         &mut self,
         conn: &std::sync::Arc<crate::Connection>,
-        pager: &std::rc::Rc<crate::Pager>,
+        pager: &std::sync::Arc<crate::Pager>,
         _btree_cursor: &mut BTreeCursor,
     ) -> crate::Result<IOResult<()>> {
         // If already populated, return immediately
@@ -835,7 +835,7 @@ impl IncrementalView {
     pub fn merge_delta(
         &mut self,
         delta_set: DeltaSet,
-        pager: std::rc::Rc<crate::Pager>,
+        pager: std::sync::Arc<crate::Pager>,
     ) -> crate::Result<IOResult<()>> {
         // Early return if all deltas are empty
         if delta_set.is_empty() {

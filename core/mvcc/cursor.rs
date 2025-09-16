@@ -5,7 +5,6 @@ use crate::Result;
 use crate::{Pager, Value};
 use std::fmt::Debug;
 use std::ops::Bound;
-use std::rc::Rc;
 use std::sync::Arc;
 
 #[derive(Debug, Copy, Clone)]
@@ -30,7 +29,7 @@ impl<Clock: LogicalClock> MvccLazyCursor<Clock> {
         db: Arc<MvStore<Clock>>,
         tx_id: u64,
         table_id: u64,
-        pager: Rc<Pager>,
+        pager: Arc<Pager>,
     ) -> Result<MvccLazyCursor<Clock>> {
         db.maybe_initialize_table(table_id, pager)?;
         let cursor = Self {

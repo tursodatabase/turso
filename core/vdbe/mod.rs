@@ -61,7 +61,7 @@ use execute::{
 
 use explain::{insn_to_row_with_comment, EXPLAIN_COLUMNS, EXPLAIN_QUERY_PLAN_COLUMNS};
 use regex::Regex;
-use std::{cell::Cell, collections::HashMap, num::NonZero, rc::Rc, sync::Arc};
+use std::{cell::Cell, collections::HashMap, num::NonZero, sync::Arc};
 use tracing::{instrument, Level};
 
 /// State machine for committing view deltas with I/O handling
@@ -492,7 +492,7 @@ pub struct Program {
 }
 
 impl Program {
-    fn get_pager_from_database_index(&self, idx: &usize) -> Rc<Pager> {
+    fn get_pager_from_database_index(&self, idx: &usize) -> Arc<Pager> {
         self.connection.get_pager_from_database_index(idx)
     }
 
@@ -500,7 +500,7 @@ impl Program {
         &self,
         state: &mut ProgramState,
         mv_store: Option<Arc<MvStore>>,
-        pager: Rc<Pager>,
+        pager: Arc<Pager>,
         query_mode: QueryMode,
     ) -> Result<StepResult> {
         match query_mode {
@@ -514,7 +514,7 @@ impl Program {
         &self,
         state: &mut ProgramState,
         _mv_store: Option<Arc<MvStore>>,
-        pager: Rc<Pager>,
+        pager: Arc<Pager>,
     ) -> Result<StepResult> {
         debug_assert!(state.column_count() == EXPLAIN_COLUMNS.len());
         if self.connection.closed.get() {
@@ -568,7 +568,7 @@ impl Program {
         &self,
         state: &mut ProgramState,
         _mv_store: Option<Arc<MvStore>>,
-        pager: Rc<Pager>,
+        pager: Arc<Pager>,
     ) -> Result<StepResult> {
         debug_assert!(state.column_count() == EXPLAIN_QUERY_PLAN_COLUMNS.len());
         loop {
@@ -616,7 +616,7 @@ impl Program {
         &self,
         state: &mut ProgramState,
         mv_store: Option<Arc<MvStore>>,
-        pager: Rc<Pager>,
+        pager: Arc<Pager>,
     ) -> Result<StepResult> {
         let enable_tracing = tracing::enabled!(tracing::Level::TRACE);
         loop {
@@ -692,7 +692,7 @@ impl Program {
         &self,
         state: &mut ProgramState,
         rollback: bool,
-        pager: &Rc<Pager>,
+        pager: &Arc<Pager>,
     ) -> Result<IOResult<()>> {
         use crate::types::IOResult;
 
@@ -792,7 +792,7 @@ impl Program {
 
     pub fn commit_txn(
         &self,
-        pager: Rc<Pager>,
+        pager: Arc<Pager>,
         program_state: &mut ProgramState,
         mv_store: Option<&Arc<MvStore>>,
         rollback: bool,
@@ -895,7 +895,7 @@ impl Program {
     #[instrument(skip(self, pager, connection), level = Level::DEBUG)]
     fn step_end_write_txn(
         &self,
-        pager: &Rc<Pager>,
+        pager: &Arc<Pager>,
         commit_state: &mut CommitState,
         connection: &Connection,
         rollback: bool,
@@ -1061,7 +1061,7 @@ impl Row {
 
 /// Handle a program error by rolling back the transaction
 pub fn handle_program_error(
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     connection: &Connection,
     err: &LimboError,
     mv_store: Option<&Arc<MvStore>>,
