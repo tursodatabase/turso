@@ -1,14 +1,14 @@
 use rand::seq::IndexedRandom;
 use rand::Rng;
 use rand_chacha::{rand_core::SeedableRng, ChaCha8Rng};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use turso::{Builder, Value};
 
 // In-memory representation of the database state
 #[derive(Debug, Clone, PartialEq)]
 struct DbRow {
     id: i64,
-    other_columns: HashMap<String, Value>,
+    other_columns: BTreeMap<String, Value>,
 }
 
 impl std::fmt::Display for DbRow {
@@ -33,9 +33,9 @@ impl std::fmt::Display for DbRow {
 #[derive(Debug, Clone)]
 struct TransactionState {
     // The schema this transaction can see (snapshot)
-    schema: HashMap<String, TableSchema>,
+    schema: BTreeMap<String, TableSchema>,
     // The rows this transaction can see (snapshot)
-    visible_rows: HashMap<i64, DbRow>,
+    visible_rows: BTreeMap<i64, DbRow>,
     // Pending changes in this transaction
     pending_changes: Vec<Operation>,
 }
@@ -55,23 +55,23 @@ struct TableSchema {
 #[derive(Debug)]
 struct ShadowDb {
     // Schema
-    schema: HashMap<String, TableSchema>,
+    schema: BTreeMap<String, TableSchema>,
     // Committed state (what's actually in the database)
-    committed_rows: HashMap<i64, DbRow>,
+    committed_rows: BTreeMap<i64, DbRow>,
     // Transaction states
-    transactions: HashMap<usize, Option<TransactionState>>,
+    transactions: BTreeMap<usize, Option<TransactionState>>,
     query_gen_options: QueryGenOptions,
 }
 
 impl ShadowDb {
     fn new(
-        initial_schema: HashMap<String, TableSchema>,
+        initial_schema: BTreeMap<String, TableSchema>,
         query_gen_options: QueryGenOptions,
     ) -> Self {
         Self {
             schema: initial_schema,
-            committed_rows: HashMap::new(),
-            transactions: HashMap::new(),
+            committed_rows: BTreeMap::new(),
+            transactions: BTreeMap::new(),
             query_gen_options,
         }
     }
@@ -190,7 +190,7 @@ impl ShadowDb {
         &mut self,
         tx_id: usize,
         id: i64,
-        other_columns: HashMap<String, Value>,
+        other_columns: BTreeMap<String, Value>,
     ) -> Result<(), String> {
         if let Some(tx_state) = self.transactions.get_mut(&tx_id) {
             // Check if row exists in visible state
@@ -217,7 +217,7 @@ impl ShadowDb {
         &mut self,
         tx_id: usize,
         id: i64,
-        other_columns: HashMap<String, Value>,
+        other_columns: BTreeMap<String, Value>,
     ) -> Result<(), String> {
         if let Some(tx_state) = self.transactions.get_mut(&tx_id) {
             // Check if row exists in visible state
@@ -400,11 +400,11 @@ enum Operation {
     Rollback,
     Insert {
         id: i64,
-        other_columns: HashMap<String, Value>,
+        other_columns: BTreeMap<String, Value>,
     },
     Update {
         id: i64,
-        other_columns: HashMap<String, Value>,
+        other_columns: BTreeMap<String, Value>,
     },
     Delete {
         id: i64,
@@ -600,7 +600,7 @@ async fn multiple_connections_fuzz(opts: FuzzOptions) {
             .unwrap();
 
         // SHARED shadow database for all connections
-        let mut schema = HashMap::new();
+        let mut schema = BTreeMap::new();
         schema.insert(
             "test_table".to_string(),
             TableSchema {
@@ -883,7 +883,7 @@ async fn multiple_connections_fuzz(opts: FuzzOptions) {
                                     let Value::Integer(id) = row.get_value(0).unwrap() else {
                                         panic!("Unexpected value for id: {:?}", row.get_value(0));
                                     };
-                                    let mut other_columns = HashMap::new();
+                                    let mut other_columns = BTreeMap::new();
                                     for i in 1..columns.len() {
                                         let column = columns.get(i).unwrap();
                                         let value = row.get_value(i).unwrap();
@@ -1171,13 +1171,13 @@ fn generate_operation(
 fn generate_data_operation(
     rng: &mut ChaCha8Rng,
     visible_rows: &[DbRow],
-    schema: &HashMap<String, TableSchema>,
+    schema: &BTreeMap<String, TableSchema>,
     dml_gen_options: &DmlGenOptions,
 ) -> Operation {
     let table_schema = schema.get("test_table").unwrap();
     let generate_insert_operation = |rng: &mut ChaCha8Rng| {
         let id = rng.random_range(1..i64::MAX);
-        let mut other_columns = HashMap::new();
+        let mut other_columns = BTreeMap::new();
         for column in table_schema.columns.iter() {
             if column.name == "id" {
                 continue;
@@ -1224,7 +1224,7 @@ fn generate_data_operation(
             }
             let id = visible_rows.choose(rng).unwrap().id;
             let col_name_to_update = columns_no_id.choose(rng).unwrap().name.clone();
-            let mut other_columns = HashMap::new();
+            let mut other_columns = BTreeMap::new();
             other_columns.insert(
                 col_name_to_update.clone(),
                 match columns_no_id
