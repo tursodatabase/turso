@@ -36,6 +36,7 @@ export interface SyncOpts {
     encryptionKey?: string;
     tablesIgnore?: string[],
     transform?: Transform,
+    longPollTimeoutMs?: number,
     tracing?: string,
 }
 

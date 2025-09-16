@@ -83,7 +83,8 @@ async function connect(opts: SyncOpts): Promise<Database> {
         tablesIgnore: opts.tablesIgnore,
         useTransform: opts.transform != null,
         tracing: opts.tracing,
-        protocolVersion: 1
+        longPollTimeoutMs: opts.longPollTimeoutMs,
+        protocolVersion: 1,
     });
     const runOpts: RunOpts = {
         url: opts.url,

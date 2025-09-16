@@ -228,6 +228,7 @@ export interface SyncEngineOpts {
   path: string
   clientName?: string
   walPullBatchSize?: number
+  longPollTimeoutMs?: number
   tracing?: string
   tablesIgnore?: Array<string>
   useTransform: boolean
