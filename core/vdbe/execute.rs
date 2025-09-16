@@ -1697,7 +1697,7 @@ pub fn op_column(
                                     // Try to reuse the registers when allocation is not needed.
                                     match state.registers[*dest] {
                                         Register::Value(Value::Blob(ref mut existing_blob)) => {
-                                            existing_blob.to_bytes().do_extend(&buf);
+                                            existing_blob.overwrite_with(buf);
                                         }
                                         _ => {
                                             state.registers[*dest] =

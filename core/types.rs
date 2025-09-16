@@ -233,6 +233,12 @@ impl Blob {
         }
     }
 
+    pub fn overwrite_with(&mut self, data: &[u8]) {
+        self.value.clear();
+        self.value.extend_from_slice(data);
+        self.unalloc_bytes = 0;
+    }
+
     pub fn len(&self) -> usize {
         self.value.len() + self.unalloc_bytes
     }
