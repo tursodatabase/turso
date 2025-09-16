@@ -1399,7 +1399,10 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
         // TODO: we need to tie a pager's read transaction to a transaction ID, so that future refactors to read
         // pages from WAL/DB read from a consistent state to maintiain snapshot isolation.
-        pager.begin_read_tx()?;
+        let result = pager.begin_read_tx()?;
+        if let crate::result::LimboResult::Busy = result {
+            return Err(LimboError::Busy);
+        }
         Ok(tx_id)
     }
 
