@@ -563,6 +563,22 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                         })?;
                     }
                 }
+                // We started a pager read transaction at the beginning of the MV transaction, because
+                // any reads we do from the database file and WAL must uphold snapshot isolation.
+                // However, now we must end and immediately restart the read transaction before committing.
+                // This is because other transactions may have committed writes to the DB file or WAL,
+                // and our pager must read in those changes when applying our writes; otherwise we would overwrite
+                // the changes from the previous committed transactions.
+                //
+                // Note that this would be incredibly unsafe in the regular transaction model, but in MVCC we trust
+                // the MV-store to uphold the guarantee that no write-write conflicts happened.
+                self.pager.end_read_tx().expect("end_read_tx cannot fail");
+                let result = self.pager.begin_read_tx()?;
+                if let crate::result::LimboResult::Busy = result {
+                    // We cannot obtain a WAL read lock due to contention, so we must abort.
+                    self.commit_coordinator.pager_commit_lock.unlock();
+                    return Err(LimboError::WriteWriteConflict);
+                }
                 let result = self.pager.io.block(|| self.pager.begin_write_tx())?;
                 if let crate::result::LimboResult::Busy = result {
                     // There is a non-CONCURRENT transaction holding the write lock. We must abort.
