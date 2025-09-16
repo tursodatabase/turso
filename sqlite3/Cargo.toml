@@ -22,15 +22,15 @@ doc = false
 crate-type = ["lib", "cdylib", "staticlib"]
 
 [dependencies]
-env_logger = { version = "0.11.3", default-features = false }
+env_logger = { workspace = true, default-features = false }
 libc = "0.2.169"
-turso_core = { path = "../core", features = ["conn_raw_api"] }
-tracing = "0.1.41"
-tracing-appender = "0.2.3"
-tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
+turso_core = { workspace = true, features = ["conn_raw_api"] }
+tracing = { workspace = true }
+tracing-appender = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
 
 [dev-dependencies]
-tempfile = "3.8.0"
+tempfile = { workspace = true }
 
 [package.metadata.capi.header]
 name = "sqlite3.h"

@@ -9,4 +9,4 @@ path = "src/main.rs"
 
 [dependencies]
 rusqlite = { workspace = true }
-clap = { version = "4.0", features = ["derive"] }
+clap = { workspace = true, features = ["derive"] }

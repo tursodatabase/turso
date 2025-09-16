@@ -14,7 +14,7 @@ crate-type = ["cdylib", "lib"]
 static= [ "turso_ext/static" ]
 
 [dependencies]
-env_logger = "0.11.6"
+env_logger = { workspace = true }
 lazy_static = "1.5.0"
 turso_ext = { workspace = true, features = ["static", "vfs"] }
 log = "0.4.26"
