@@ -408,7 +408,7 @@ impl Connection {
     /// 3. Step through query -> returns Busy -> sleep/yield for 2 ms
     /// 4. Step through query -> returns Busy -> sleep/yield for 2 ms (totaling 5 ms of sleep)
     /// 5. Step through query -> returns Busy -> return Busy to user
-    pub fn busy_timeout(&self, duration: Option<std::time::Duration>) -> Result<()> {
+    pub fn busy_timeout(&self, duration: std::time::Duration) -> Result<()> {
         let conn = self
             .inner
             .lock()
