@@ -118,7 +118,9 @@ pub fn translate_insert(
     let mut values: Option<Vec<Box<Expr>>> = None;
     let mut upsert_opt: Option<Upsert> = None;
 
-    let inserting_multiple_rows = match &mut body {
+    let mut param_idx = 1;
+    let inserting_multiple_rows;
+    match &mut body {
         InsertBody::Select(select, upsert) => {
             match &mut select.body.select {
                 // TODO see how to avoid clone
@@ -126,7 +128,6 @@ pub fn translate_insert(
                     if values_expr.is_empty() {
                         crate::bail_parse_error!("no values to insert");
                     }
-                    let mut param_idx = 1;
                     for expr in values_expr.iter_mut().flat_map(|v| v.iter_mut()) {
                         match expr.as_mut() {
                             Expr::Id(name) => {
@@ -148,28 +149,28 @@ pub fn translate_insert(
                         }
                         rewrite_expr(expr, &mut param_idx)?;
                     }
-                    if let Some(ref mut upsert) = upsert {
-                        if let UpsertDo::Set {
-                            ref mut sets,
-                            ref mut where_clause,
-                        } = &mut upsert.do_clause
-                        {
-                            for set in sets.iter_mut() {
-                                rewrite_expr(set.expr.as_mut(), &mut param_idx)?;
-                            }
-                            if let Some(ref mut where_expr) = where_clause {
-                                rewrite_expr(where_expr.as_mut(), &mut param_idx)?;
-                            }
-                        }
-                    }
-                    upsert_opt = upsert.as_deref().cloned();
                     values = values_expr.pop();
-                    false
+                    inserting_multiple_rows = false;
                 }
-                _ => true,
+                _ => inserting_multiple_rows = true,
             }
+            if let Some(ref mut upsert) = upsert {
+                if let UpsertDo::Set {
+                    ref mut sets,
+                    ref mut where_clause,
+                } = &mut upsert.do_clause
+                {
+                    for set in sets.iter_mut() {
+                        rewrite_expr(set.expr.as_mut(), &mut param_idx)?;
+                    }
+                    if let Some(ref mut where_expr) = where_clause {
+                        rewrite_expr(where_expr.as_mut(), &mut param_idx)?;
+                    }
+                }
+            }
+            upsert_opt = upsert.as_deref().cloned();
         }
-        InsertBody::DefaultValues => false,
+        InsertBody::DefaultValues => inserting_multiple_rows = false,
     };
 
     let halt_label = program.allocate_label();
