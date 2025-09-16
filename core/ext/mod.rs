@@ -219,7 +219,7 @@ impl Connection {
     ///```
     pub unsafe fn _build_turso_ext(&self) -> ExtensionApi {
         let schema_mutex_ptr =
-            &self._db.schema as *const Mutex<Arc<Schema>> as *mut Mutex<Arc<Schema>>;
+            &self.db.schema as *const Mutex<Arc<Schema>> as *mut Mutex<Arc<Schema>>;
         let ctx = ExtensionCtx {
             syms: self.syms.data_ptr(),
             schema: schema_mutex_ptr as *mut c_void,

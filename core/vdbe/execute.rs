@@ -2189,14 +2189,13 @@ pub fn op_transaction_inner(
         },
         insn
     );
-
     let pager = program.get_pager_from_database_index(db);
     loop {
         match state.op_transaction_state {
             OpTransactionState::Start => {
                 let conn = program.connection.clone();
                 let write = matches!(tx_mode, TransactionMode::Write);
-                if write && conn._db.open_flags.contains(OpenFlags::ReadOnly) {
+                if write && conn.db.open_flags.contains(OpenFlags::ReadOnly) {
                     return Err(LimboError::ReadOnly);
                 }
 
@@ -7219,7 +7218,7 @@ pub fn op_open_ephemeral(
                 db_file_io = io;
             }
 
-            let buffer_pool = program.connection._db.buffer_pool.clone();
+            let buffer_pool = program.connection.db.buffer_pool.clone();
             let page_cache = Arc::new(RwLock::new(PageCache::default()));
 
             let pager = Arc::new(Pager::new(
