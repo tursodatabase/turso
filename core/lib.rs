@@ -2206,7 +2206,7 @@ pub struct Statement {
     /// Flag to show if the statement was busy
     busy: bool,
     /// Busy timeout instant
-    busy_timeout: BusyTimeout,
+    busy_timeout: Option<BusyTimeout>,
 }
 
 impl Statement {
@@ -2223,7 +2223,6 @@ impl Statement {
             QueryMode::ExplainQueryPlan => (EXPLAIN_QUERY_PLAN_COLUMNS.len(), 0),
         };
         let state = vdbe::ProgramState::new(max_registers, cursor_count);
-        let now = pager.io.now();
         Self {
             program,
             state,
@@ -2232,7 +2231,7 @@ impl Statement {
             accesses_db,
             query_mode,
             busy: false,
-            busy_timeout: BusyTimeout::new(now),
+            busy_timeout: None,
         }
     }
     pub fn get_query_mode(&self) -> QueryMode {
@@ -2252,9 +2251,11 @@ impl Statement {
     }
 
     pub fn step(&mut self) -> Result<StepResult> {
-        if self.pager.io.now() < self.busy_timeout.timeout {
-            // Yield the query as the timeout has not been reached yet
-            return Ok(StepResult::IO);
+        if let Some(busy_timeout) = self.busy_timeout.as_ref() {
+            if self.pager.io.now() < busy_timeout.timeout {
+                // Yield the query as the timeout has not been reached yet
+                return Ok(StepResult::IO);
+            }
         }
 
         let mut res = if !self.accesses_db {
@@ -2300,11 +2301,20 @@ impl Statement {
 
         if matches!(res, Ok(StepResult::Busy)) {
             let now = self.pager.io.now();
-            self.busy_timeout
-                .busy_callback(now, self.program.connection.busy_timeout.get());
-            if now < self.busy_timeout.timeout {
-                // Yield instead of busy, as now we will try to wait for the timeout
-                // before continuing execution
+            let max_duration = self.program.connection.busy_timeout.get();
+            self.busy_timeout = match self.busy_timeout.take() {
+                None => {
+                    let mut result = BusyTimeout::new(now);
+                    result.busy_callback(now, max_duration);
+                    Some(result)
+                }
+                Some(mut bt) => {
+                    bt.busy_callback(now, max_duration);
+                    Some(bt)
+                }
+            };
+
+            if now < self.busy_timeout.as_ref().unwrap().timeout {
                 res = Ok(StepResult::IO);
             }
         }
@@ -2479,7 +2489,7 @@ impl Statement {
     pub fn _reset(&mut self, max_registers: Option<usize>, max_cursors: Option<usize>) {
         self.state.reset(max_registers, max_cursors);
         self.busy = false;
-        self.busy_timeout = BusyTimeout::new(self.pager.io.now());
+        self.busy_timeout = None;
     }
 
     pub fn row(&self) -> Option<&Row> {
