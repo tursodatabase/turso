@@ -165,6 +165,10 @@ pub struct Page {
     pub inner: UnsafeCell<PageInner>,
 }
 
+// SAFETY: Page cache access guarantees that `Page` is thread-safe.
+unsafe impl Send for Page {}
+unsafe impl Sync for Page {}
+
 // Concurrency control of pages will be handled by the pager, we won't wrap Page with RwLock
 // because that is bad bad.
 pub type PageRef = Arc<Page>;
