@@ -12,6 +12,7 @@ use crate::storage::sqlite3_ondisk::DatabaseHeader;
 use crate::storage::wal::TursoRwLock;
 use crate::types::IOResult;
 use crate::types::ImmutableRecord;
+use crate::types::SeekResult;
 use crate::Completion;
 use crate::IOExt;
 use crate::LimboError;
@@ -562,6 +563,22 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                         })?;
                     }
                 }
+                // We started a pager read transaction at the beginning of the MV transaction, because
+                // any reads we do from the database file and WAL must uphold snapshot isolation.
+                // However, now we must end and immediately restart the read transaction before committing.
+                // This is because other transactions may have committed writes to the DB file or WAL,
+                // and our pager must read in those changes when applying our writes; otherwise we would overwrite
+                // the changes from the previous committed transactions.
+                //
+                // Note that this would be incredibly unsafe in the regular transaction model, but in MVCC we trust
+                // the MV-store to uphold the guarantee that no write-write conflicts happened.
+                self.pager.end_read_tx().expect("end_read_tx cannot fail");
+                let result = self.pager.begin_read_tx()?;
+                if let crate::result::LimboResult::Busy = result {
+                    // We cannot obtain a WAL read lock due to contention, so we must abort.
+                    self.commit_coordinator.pager_commit_lock.unlock();
+                    return Err(LimboError::WriteWriteConflict);
+                }
                 let result = self.pager.io.block(|| self.pager.begin_write_tx())?;
                 if let crate::result::LimboResult::Busy = result {
                     // There is a non-CONCURRENT transaction holding the write lock. We must abort.
@@ -587,8 +604,10 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 let id = &self.write_set[write_set_index];
                 if let Some(row_versions) = mvcc_store.rows.get(id) {
                     let row_versions = row_versions.value().read();
-                    // Find rows that were written by this transaction
-                    for row_version in row_versions.iter() {
+                    // Find rows that were written by this transaction.
+                    // Hekaton uses oldest-to-newest order for row versions, so we reverse iterate to find the newest one
+                    // this transaction changed.
+                    for row_version in row_versions.iter().rev() {
                         if let TxTimestampOrID::TxID(row_tx_id) = row_version.begin {
                             if row_tx_id == self.tx_id {
                                 let cursor = if let Some(cursor) = self.cursors.get(&id.table_id) {
@@ -913,7 +932,13 @@ impl StateTransition for DeleteRowStateMachine {
                     .write()
                     .seek(seek_key, SeekOp::GE { eq_only: true })?
                 {
-                    IOResult::Done(_) => {
+                    IOResult::Done(seek_res) => {
+                        if seek_res == SeekResult::NotFound {
+                            crate::bail_corrupt_error!(
+                                "MVCC delete: rowid {} not found",
+                                self.rowid.row_id
+                            );
+                        }
                         self.state = DeleteRowState::Delete;
                         Ok(TransitionResult::Continue)
                     }
@@ -1602,8 +1627,8 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         // we can either switch to a tree-like structure, or at least use partition_point()
         // which performs a binary search for the insertion point.
         let mut position = 0_usize;
-        for (i, v) in versions.iter().rev().enumerate() {
-            if self.get_begin_timestamp(&v.begin) < self.get_begin_timestamp(&row_version.begin) {
+        for (i, v) in versions.iter().enumerate().rev() {
+            if self.get_begin_timestamp(&v.begin) <= self.get_begin_timestamp(&row_version.begin) {
                 position = i + 1;
                 break;
             }
