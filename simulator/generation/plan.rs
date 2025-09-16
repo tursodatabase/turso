@@ -108,11 +108,12 @@ impl InteractionPlan {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct InteractionPlanState {
     pub interaction_pointer: usize,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct ConnectionState {
     pub stack: Vec<ResultSet>,
 }
