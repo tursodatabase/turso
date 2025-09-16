@@ -3,7 +3,7 @@
 // Based on Feldera DBSP design but adapted for Turso's architecture
 
 pub use crate::incremental::aggregate_operator::{
-    AggregateEvalState, AggregateFunction, AggregateOperator, AggregateState,
+    AggregateEvalState, AggregateFunction, AggregateState,
 };
 pub use crate::incremental::filter_operator::{FilterOperator, FilterPredicate};
 pub use crate::incremental::input_operator::InputOperator;
@@ -251,7 +251,7 @@ pub trait IncrementalOperator: Debug {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::incremental::aggregate_operator::AGG_TYPE_REGULAR;
+    use crate::incremental::aggregate_operator::{AggregateOperator, AGG_TYPE_REGULAR};
     use crate::incremental::dbsp::HashableRow;
     use crate::storage::pager::CreateBTreeFlags;
     use crate::types::Text;
@@ -395,9 +395,9 @@ mod tests {
 
         // Create an aggregate operator for SUM(age) with no GROUP BY
         let mut agg = AggregateOperator::new(
-            1,      // operator_id for testing
-            vec![], // No GROUP BY
-            vec![AggregateFunction::Sum("age".to_string())],
+            1,                               // operator_id for testing
+            vec![],                          // No GROUP BY
+            vec![AggregateFunction::Sum(2)], // age is at index 2
             vec!["id".to_string(), "name".to_string(), "age".to_string()],
         );
 
@@ -514,9 +514,9 @@ mod tests {
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         let mut agg = AggregateOperator::new(
-            1,                        // operator_id for testing
-            vec!["team".to_string()], // GROUP BY team
-            vec![AggregateFunction::Sum("score".to_string())],
+            1,                               // operator_id for testing
+            vec![1],                         // GROUP BY team (index 1)
+            vec![AggregateFunction::Sum(3)], // score is at index 3
             vec![
                 "id".to_string(),
                 "team".to_string(),
@@ -666,8 +666,8 @@ mod tests {
 
         // Create COUNT(*) GROUP BY category
         let mut agg = AggregateOperator::new(
-            1, // operator_id for testing
-            vec!["category".to_string()],
+            1,       // operator_id for testing
+            vec![1], // category is at index 1
             vec![AggregateFunction::Count],
             vec![
                 "item_id".to_string(),
@@ -746,9 +746,9 @@ mod tests {
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         let mut agg = AggregateOperator::new(
-            1, // operator_id for testing
-            vec!["product".to_string()],
-            vec![AggregateFunction::Sum("amount".to_string())],
+            1,                               // operator_id for testing
+            vec![1],                         // product is at index 1
+            vec![AggregateFunction::Sum(2)], // amount is at index 2
             vec![
                 "sale_id".to_string(),
                 "product".to_string(),
@@ -843,11 +843,11 @@ mod tests {
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         let mut agg = AggregateOperator::new(
-            1, // operator_id for testing
-            vec!["user_id".to_string()],
+            1,       // operator_id for testing
+            vec![1], // user_id is at index 1
             vec![
                 AggregateFunction::Count,
-                AggregateFunction::Sum("amount".to_string()),
+                AggregateFunction::Sum(2), // amount is at index 2
             ],
             vec![
                 "order_id".to_string(),
@@ -935,9 +935,9 @@ mod tests {
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         let mut agg = AggregateOperator::new(
-            1, // operator_id for testing
-            vec!["category".to_string()],
-            vec![AggregateFunction::Avg("value".to_string())],
+            1,                               // operator_id for testing
+            vec![1],                         // category is at index 1
+            vec![AggregateFunction::Avg(2)], // value is at index 2
             vec![
                 "id".to_string(),
                 "category".to_string(),
@@ -1035,11 +1035,11 @@ mod tests {
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         let mut agg = AggregateOperator::new(
-            1, // operator_id for testing
-            vec!["category".to_string()],
+            1,       // operator_id for testing
+            vec![1], // category is at index 1
             vec![
                 AggregateFunction::Count,
-                AggregateFunction::Sum("value".to_string()),
+                AggregateFunction::Sum(2), // value is at index 2
             ],
             vec![
                 "id".to_string(),
@@ -1108,7 +1108,7 @@ mod tests {
     #[test]
     fn test_count_aggregation_with_deletions() {
         let aggregates = vec![AggregateFunction::Count];
-        let group_by = vec!["category".to_string()];
+        let group_by = vec![0]; // category is at index 0
         let input_columns = vec!["category".to_string(), "value".to_string()];
 
         // Create a persistent pager for the test
@@ -1197,8 +1197,8 @@ mod tests {
 
     #[test]
     fn test_sum_aggregation_with_deletions() {
-        let aggregates = vec![AggregateFunction::Sum("value".to_string())];
-        let group_by = vec!["category".to_string()];
+        let aggregates = vec![AggregateFunction::Sum(1)]; // value is at index 1
+        let group_by = vec![0]; // category is at index 0
         let input_columns = vec!["category".to_string(), "value".to_string()];
 
         // Create a persistent pager for the test
@@ -1281,8 +1281,8 @@ mod tests {
 
     #[test]
     fn test_avg_aggregation_with_deletions() {
-        let aggregates = vec![AggregateFunction::Avg("value".to_string())];
-        let group_by = vec!["category".to_string()];
+        let aggregates = vec![AggregateFunction::Avg(1)]; // value is at index 1
+        let group_by = vec![0]; // category is at index 0
         let input_columns = vec!["category".to_string(), "value".to_string()];
 
         // Create a persistent pager for the test
@@ -1348,10 +1348,10 @@ mod tests {
         // Test COUNT, SUM, and AVG together
         let aggregates = vec![
             AggregateFunction::Count,
-            AggregateFunction::Sum("value".to_string()),
-            AggregateFunction::Avg("value".to_string()),
+            AggregateFunction::Sum(1), // value is at index 1
+            AggregateFunction::Avg(1), // value is at index 1
         ];
-        let group_by = vec!["category".to_string()];
+        let group_by = vec![0]; // category is at index 0
         let input_columns = vec!["category".to_string(), "value".to_string()];
 
         // Create a persistent pager for the test
@@ -1607,11 +1607,11 @@ mod tests {
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         let mut agg = AggregateOperator::new(
-            1, // operator_id for testing
-            vec!["category".to_string()],
+            1,       // operator_id for testing
+            vec![1], // category is at index 1
             vec![
                 AggregateFunction::Count,
-                AggregateFunction::Sum("amount".to_string()),
+                AggregateFunction::Sum(2), // amount is at index 2
             ],
             vec![
                 "id".to_string(),
@@ -1781,7 +1781,7 @@ mod tests {
             vec![], // No GROUP BY
             vec![
                 AggregateFunction::Count,
-                AggregateFunction::Sum("value".to_string()),
+                AggregateFunction::Sum(1), // value is at index 1
             ],
             vec!["id".to_string(), "value".to_string()],
         );
@@ -1859,8 +1859,8 @@ mod tests {
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         let mut agg = AggregateOperator::new(
-            1, // operator_id for testing
-            vec!["type".to_string()],
+            1,       // operator_id for testing
+            vec![1], // type is at index 1
             vec![AggregateFunction::Count],
             vec!["id".to_string(), "type".to_string()],
         );
@@ -1976,8 +1976,8 @@ mod tests {
             1,      // operator_id
             vec![], // No GROUP BY
             vec![
-                AggregateFunction::Min("price".to_string()),
-                AggregateFunction::Max("price".to_string()),
+                AggregateFunction::Min(2), // price is at index 2
+                AggregateFunction::Max(2), // price is at index 2
             ],
             vec!["id".to_string(), "name".to_string(), "price".to_string()],
         );
@@ -2044,8 +2044,8 @@ mod tests {
             1,      // operator_id
             vec![], // No GROUP BY
             vec![
-                AggregateFunction::Min("price".to_string()),
-                AggregateFunction::Max("price".to_string()),
+                AggregateFunction::Min(2), // price is at index 2
+                AggregateFunction::Max(2), // price is at index 2
             ],
             vec!["id".to_string(), "name".to_string(), "price".to_string()],
         );
@@ -2134,8 +2134,8 @@ mod tests {
             1,      // operator_id
             vec![], // No GROUP BY
             vec![
-                AggregateFunction::Min("price".to_string()),
-                AggregateFunction::Max("price".to_string()),
+                AggregateFunction::Min(2), // price is at index 2
+                AggregateFunction::Max(2), // price is at index 2
             ],
             vec!["id".to_string(), "name".to_string(), "price".to_string()],
         );
@@ -2224,8 +2224,8 @@ mod tests {
             1,      // operator_id
             vec![], // No GROUP BY
             vec![
-                AggregateFunction::Min("price".to_string()),
-                AggregateFunction::Max("price".to_string()),
+                AggregateFunction::Min(2), // price is at index 2
+                AggregateFunction::Max(2), // price is at index 2
             ],
             vec!["id".to_string(), "name".to_string(), "price".to_string()],
         );
@@ -2306,8 +2306,8 @@ mod tests {
             1,      // operator_id
             vec![], // No GROUP BY
             vec![
-                AggregateFunction::Min("price".to_string()),
-                AggregateFunction::Max("price".to_string()),
+                AggregateFunction::Min(2), // price is at index 2
+                AggregateFunction::Max(2), // price is at index 2
             ],
             vec!["id".to_string(), "name".to_string(), "price".to_string()],
         );
@@ -2388,8 +2388,8 @@ mod tests {
             1,      // operator_id
             vec![], // No GROUP BY
             vec![
-                AggregateFunction::Min("price".to_string()),
-                AggregateFunction::Max("price".to_string()),
+                AggregateFunction::Min(2), // price is at index 2
+                AggregateFunction::Max(2), // price is at index 2
             ],
             vec!["id".to_string(), "name".to_string(), "price".to_string()],
         );
@@ -2475,11 +2475,11 @@ mod tests {
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         let mut agg = AggregateOperator::new(
-            1,                            // operator_id
-            vec!["category".to_string()], // GROUP BY category
+            1,       // operator_id
+            vec![1], // GROUP BY category (index 1)
             vec![
-                AggregateFunction::Min("price".to_string()),
-                AggregateFunction::Max("price".to_string()),
+                AggregateFunction::Min(3), // price is at index 3
+                AggregateFunction::Max(3), // price is at index 3
             ],
             vec![
                 "id".to_string(),
@@ -2580,8 +2580,8 @@ mod tests {
             1,      // operator_id
             vec![], // No GROUP BY
             vec![
-                AggregateFunction::Min("price".to_string()),
-                AggregateFunction::Max("price".to_string()),
+                AggregateFunction::Min(2), // price is at index 2
+                AggregateFunction::Max(2), // price is at index 2
             ],
             vec!["id".to_string(), "name".to_string(), "price".to_string()],
         );
@@ -2656,8 +2656,8 @@ mod tests {
             1,      // operator_id
             vec![], // No GROUP BY
             vec![
-                AggregateFunction::Min("score".to_string()),
-                AggregateFunction::Max("score".to_string()),
+                AggregateFunction::Min(2), // score is at index 2
+                AggregateFunction::Max(2), // score is at index 2
             ],
             vec!["id".to_string(), "name".to_string(), "score".to_string()],
         );
@@ -2724,8 +2724,8 @@ mod tests {
             1,      // operator_id
             vec![], // No GROUP BY
             vec![
-                AggregateFunction::Min("name".to_string()),
-                AggregateFunction::Max("name".to_string()),
+                AggregateFunction::Min(1), // name is at index 1
+                AggregateFunction::Max(1), // name is at index 1
             ],
             vec!["id".to_string(), "name".to_string()],
         );
@@ -2764,10 +2764,10 @@ mod tests {
             vec![], // No GROUP BY
             vec![
                 AggregateFunction::Count,
-                AggregateFunction::Sum("value".to_string()),
-                AggregateFunction::Min("value".to_string()),
-                AggregateFunction::Max("value".to_string()),
-                AggregateFunction::Avg("value".to_string()),
+                AggregateFunction::Sum(1), // value is at index 1
+                AggregateFunction::Min(1), // value is at index 1
+                AggregateFunction::Max(1), // value is at index 1
+                AggregateFunction::Avg(1), // value is at index 1
             ],
             vec!["id".to_string(), "value".to_string()],
         );
@@ -2855,9 +2855,9 @@ mod tests {
             1,      // operator_id
             vec![], // No GROUP BY
             vec![
-                AggregateFunction::Min("col1".to_string()),
-                AggregateFunction::Max("col2".to_string()),
-                AggregateFunction::Min("col3".to_string()),
+                AggregateFunction::Min(0), // col1 is at index 0
+                AggregateFunction::Max(1), // col2 is at index 1
+                AggregateFunction::Min(2), // col3 is at index 2
             ],
             vec!["col1".to_string(), "col2".to_string(), "col3".to_string()],
         );

@@ -19,26 +19,35 @@ use turso_parser::ast;
 
 /// Result type for preprocessing aggregate expressions
 type PreprocessAggregateResult = (
-    bool,                // needs_pre_projection
-    Vec<LogicalExpr>,    // pre_projection_exprs
-    Vec<(String, Type)>, // pre_projection_schema
-    Vec<LogicalExpr>,    // modified_aggr_exprs
+    bool,             // needs_pre_projection
+    Vec<LogicalExpr>, // pre_projection_exprs
+    Vec<ColumnInfo>,  // pre_projection_schema
+    Vec<LogicalExpr>, // modified_aggr_exprs
 );
 
 /// Result type for parsing join conditions
 type JoinConditionsResult = (Vec<(LogicalExpr, LogicalExpr)>, Option<LogicalExpr>);
 
+/// Information about a column in a logical schema
+#[derive(Debug, Clone, PartialEq)]
+pub struct ColumnInfo {
+    pub name: String,
+    pub ty: Type,
+    pub database: Option<String>,
+    pub table: Option<String>,
+    pub table_alias: Option<String>,
+}
+
 /// Schema information for logical plan nodes
 #[derive(Debug, Clone, PartialEq)]
 pub struct LogicalSchema {
-    /// Column names and types
-    pub columns: Vec<(String, Type)>,
+    pub columns: Vec<ColumnInfo>,
 }
 /// A reference to a schema that can be shared between nodes
 pub type SchemaRef = Arc<LogicalSchema>;
 
 impl LogicalSchema {
-    pub fn new(columns: Vec<(String, Type)>) -> Self {
+    pub fn new(columns: Vec<ColumnInfo>) -> Self {
         Self { columns }
     }
 
@@ -52,11 +61,42 @@ impl LogicalSchema {
         self.columns.len()
     }
 
-    pub fn find_column(&self, name: &str) -> Option<(usize, &Type)> {
-        self.columns
-            .iter()
-            .position(|(n, _)| n == name)
-            .map(|idx| (idx, &self.columns[idx].1))
+    pub fn find_column(&self, name: &str, table: Option<&str>) -> Option<(usize, &ColumnInfo)> {
+        if let Some(table_ref) = table {
+            // Check if it's a database.table format
+            if table_ref.contains('.') {
+                let parts: Vec<&str> = table_ref.splitn(2, '.').collect();
+                if parts.len() == 2 {
+                    let db = parts[0];
+                    let tbl = parts[1];
+                    return self
+                        .columns
+                        .iter()
+                        .position(|c| {
+                            c.name == name
+                                && c.database.as_deref() == Some(db)
+                                && c.table.as_deref() == Some(tbl)
+                        })
+                        .map(|idx| (idx, &self.columns[idx]));
+                }
+            }
+
+            // Try to match against table alias first, then table name
+            self.columns
+                .iter()
+                .position(|c| {
+                    c.name == name
+                        && (c.table_alias.as_deref() == Some(table_ref)
+                            || c.table.as_deref() == Some(table_ref))
+                })
+                .map(|idx| (idx, &self.columns[idx]))
+        } else {
+            // Unqualified lookup - just match by name
+            self.columns
+                .iter()
+                .position(|c| c.name == name)
+                .map(|idx| (idx, &self.columns[idx]))
+        }
     }
 }
 
@@ -548,14 +588,14 @@ impl<'a> LogicalPlanBuilder<'a> {
                 }
 
                 // Regular table scan
-                let table_schema = self.get_table_schema(&table_name)?;
                 let table_alias = alias.as_ref().map(|a| match a {
                     ast::As::As(name) => Self::name_to_string(name),
                     ast::As::Elided(name) => Self::name_to_string(name),
                 });
+                let table_schema = self.get_table_schema(&table_name, table_alias.as_deref())?;
                 Ok(LogicalPlan::TableScan(TableScan {
                     table_name,
-                    alias: table_alias,
+                    alias: table_alias.clone(),
                     schema: table_schema,
                     projection: None,
                 }))
@@ -751,14 +791,14 @@ impl<'a> LogicalPlanBuilder<'a> {
             let _left_idx = left_schema
                 .columns
                 .iter()
-                .position(|(n, _)| n == &name)
+                .position(|col| col.name == name)
                 .ok_or_else(|| {
                     LimboError::ParseError(format!("Column {name} not found in left table"))
                 })?;
             let _right_idx = right_schema
                 .columns
                 .iter()
-                .position(|(n, _)| n == &name)
+                .position(|col| col.name == name)
                 .ok_or_else(|| {
                     LimboError::ParseError(format!("Column {name} not found in right table"))
                 })?;
@@ -790,9 +830,13 @@ impl<'a> LogicalPlanBuilder<'a> {
 
         // Find common column names
         let mut common_columns = Vec::new();
-        for (left_name, _) in &left_schema.columns {
-            if right_schema.columns.iter().any(|(n, _)| n == left_name) {
-                common_columns.push(ast::Name::Ident(left_name.clone()));
+        for left_col in &left_schema.columns {
+            if right_schema
+                .columns
+                .iter()
+                .any(|col| col.name == left_col.name)
+            {
+                common_columns.push(ast::Name::Ident(left_col.name.clone()));
             }
         }
 
@@ -833,10 +877,18 @@ impl<'a> LogicalPlanBuilder<'a> {
         let left_schema = left.schema();
         let right_schema = right.schema();
 
-        // For now, simply concatenate the schemas
-        // In a real implementation, we'd handle column name conflicts and nullable columns
-        let mut columns = left_schema.columns.clone();
-        columns.extend(right_schema.columns.clone());
+        // Concatenate the schemas, preserving all column information
+        let mut columns = Vec::new();
+
+        // Keep all columns from left with their table info
+        for col in &left_schema.columns {
+            columns.push(col.clone());
+        }
+
+        // Keep all columns from right with their table info
+        for col in &right_schema.columns {
+            columns.push(col.clone());
+        }
 
         Ok(Arc::new(LogicalSchema::new(columns)))
     }
@@ -870,7 +922,13 @@ impl<'a> LogicalPlanBuilder<'a> {
                     };
                     let col_type = Self::infer_expr_type(&logical_expr, input_schema)?;
 
-                    schema_columns.push((col_name.clone(), col_type));
+                    schema_columns.push(ColumnInfo {
+                        name: col_name.clone(),
+                        ty: col_type,
+                        database: None,
+                        table: None,
+                        table_alias: None,
+                    });
 
                     if let Some(as_alias) = alias {
                         let alias_name = match as_alias {
@@ -886,21 +944,21 @@ impl<'a> LogicalPlanBuilder<'a> {
                 }
                 ast::ResultColumn::Star => {
                     // Expand * to all columns
-                    for (name, typ) in &input_schema.columns {
-                        proj_exprs.push(LogicalExpr::Column(Column::new(name.clone())));
-                        schema_columns.push((name.clone(), *typ));
+                    for col in &input_schema.columns {
+                        proj_exprs.push(LogicalExpr::Column(Column::new(col.name.clone())));
+                        schema_columns.push(col.clone());
                     }
                 }
                 ast::ResultColumn::TableStar(table) => {
                     // Expand table.* to all columns from that table
                     let table_name = Self::name_to_string(table);
-                    for (name, typ) in &input_schema.columns {
+                    for col in &input_schema.columns {
                         // Simple check - would need proper table tracking in real implementation
                         proj_exprs.push(LogicalExpr::Column(Column::with_table(
-                            name.clone(),
+                            col.name.clone(),
                             table_name.clone(),
                         )));
-                        schema_columns.push((name.clone(), *typ));
+                        schema_columns.push(col.clone());
                     }
                 }
             }
@@ -938,7 +996,13 @@ impl<'a> LogicalPlanBuilder<'a> {
             if let LogicalExpr::Column(col) = expr {
                 pre_projection_exprs.push(expr.clone());
                 let col_type = Self::infer_expr_type(expr, input_schema)?;
-                pre_projection_schema.push((col.name.clone(), col_type));
+                pre_projection_schema.push(ColumnInfo {
+                    name: col.name.clone(),
+                    ty: col_type,
+                    database: None,
+                    table: col.table.clone(),
+                    table_alias: None,
+                });
             } else {
                 // Complex group by expression - project it
                 needs_pre_projection = true;
@@ -946,7 +1010,13 @@ impl<'a> LogicalPlanBuilder<'a> {
                 projected_col_counter += 1;
                 pre_projection_exprs.push(expr.clone());
                 let col_type = Self::infer_expr_type(expr, input_schema)?;
-                pre_projection_schema.push((proj_col_name.clone(), col_type));
+                pre_projection_schema.push(ColumnInfo {
+                    name: proj_col_name.clone(),
+                    ty: col_type,
+                    database: None,
+                    table: None,
+                    table_alias: None,
+                });
             }
         }
 
@@ -970,7 +1040,13 @@ impl<'a> LogicalPlanBuilder<'a> {
                                 pre_projection_exprs.push(arg.clone());
                                 let col_type = Self::infer_expr_type(arg, input_schema)?;
                                 if let LogicalExpr::Column(col) = arg {
-                                    pre_projection_schema.push((col.name.clone(), col_type));
+                                    pre_projection_schema.push(ColumnInfo {
+                                        name: col.name.clone(),
+                                        ty: col_type,
+                                        database: None,
+                                        table: col.table.clone(),
+                                        table_alias: None,
+                                    });
                                 }
                             }
                         }
@@ -983,7 +1059,13 @@ impl<'a> LogicalPlanBuilder<'a> {
                             // Add the expression to the pre-projection
                             pre_projection_exprs.push(arg.clone());
                             let col_type = Self::infer_expr_type(arg, input_schema)?;
-                            pre_projection_schema.push((proj_col_name.clone(), col_type));
+                            pre_projection_schema.push(ColumnInfo {
+                                name: proj_col_name.clone(),
+                                ty: col_type,
+                                database: None,
+                                table: None,
+                                table_alias: None,
+                            });
 
                             // In the aggregate, reference the projected column
                             modified_args.push(LogicalExpr::Column(Column::new(proj_col_name)));
@@ -1057,15 +1139,39 @@ impl<'a> LogicalPlanBuilder<'a> {
         // First, add GROUP BY columns to the aggregate output schema
         // These are always part of the aggregate operator's output
         for group_expr in &group_exprs {
-            let col_name = match group_expr {
-                LogicalExpr::Column(col) => col.name.clone(),
+            match group_expr {
+                LogicalExpr::Column(col) => {
+                    // For column references in GROUP BY, preserve the original column info
+                    if let Some((_, col_info)) =
+                        input_schema.find_column(&col.name, col.table.as_deref())
+                    {
+                        // Preserve the column with all its table information
+                        aggregate_schema_columns.push(col_info.clone());
+                    } else {
+                        // Fallback if column not found (shouldn't happen)
+                        let col_type = Self::infer_expr_type(group_expr, input_schema)?;
+                        aggregate_schema_columns.push(ColumnInfo {
+                            name: col.name.clone(),
+                            ty: col_type,
+                            database: None,
+                            table: col.table.clone(),
+                            table_alias: None,
+                        });
+                    }
+                }
                 _ => {
                     // For complex GROUP BY expressions, generate a name
-                    format!("__group_{}", aggregate_schema_columns.len())
+                    let col_name = format!("__group_{}", aggregate_schema_columns.len());
+                    let col_type = Self::infer_expr_type(group_expr, input_schema)?;
+                    aggregate_schema_columns.push(ColumnInfo {
+                        name: col_name,
+                        ty: col_type,
+                        database: None,
+                        table: None,
+                        table_alias: None,
+                    });
                 }
-            };
-            let col_type = Self::infer_expr_type(group_expr, input_schema)?;
-            aggregate_schema_columns.push((col_name, col_type));
+            }
         }
 
         // Track aggregates we've already seen to avoid duplicates
@@ -1098,7 +1204,13 @@ impl<'a> LogicalPlanBuilder<'a> {
                         } else {
                             // New aggregate - add it
                             let col_type = Self::infer_expr_type(&logical_expr, input_schema)?;
-                            aggregate_schema_columns.push((col_name.clone(), col_type));
+                            aggregate_schema_columns.push(ColumnInfo {
+                                name: col_name.clone(),
+                                ty: col_type,
+                                database: None,
+                                table: None,
+                                table_alias: None,
+                            });
                             aggr_exprs.push(logical_expr);
                             aggregate_map.insert(agg_key, col_name.clone());
                             col_name.clone()
@@ -1122,7 +1234,13 @@ impl<'a> LogicalPlanBuilder<'a> {
                         // Add only new aggregates
                         for (agg_expr, agg_name) in extracted_aggs {
                             let agg_type = Self::infer_expr_type(&agg_expr, input_schema)?;
-                            aggregate_schema_columns.push((agg_name, agg_type));
+                            aggregate_schema_columns.push(ColumnInfo {
+                                name: agg_name,
+                                ty: agg_type,
+                                database: None,
+                                table: None,
+                                table_alias: None,
+                            });
                             aggr_exprs.push(agg_expr);
                         }
 
@@ -1197,7 +1315,13 @@ impl<'a> LogicalPlanBuilder<'a> {
             // For type inference, we need the aggregate schema for column references
             let aggregate_schema = LogicalSchema::new(aggregate_schema_columns.clone());
             let col_type = Self::infer_expr_type(expr, &Arc::new(aggregate_schema))?;
-            projection_schema_columns.push((col_name, col_type));
+            projection_schema_columns.push(ColumnInfo {
+                name: col_name,
+                ty: col_type,
+                database: None,
+                table: None,
+                table_alias: None,
+            });
         }
 
         // Create the input plan (with pre-projection if needed)
@@ -1220,11 +1344,11 @@ impl<'a> LogicalPlanBuilder<'a> {
 
         // Check if we need the outer projection
         // We need a projection if:
-        // 1. Any expression is more complex than a simple column reference (e.g., abs(sum(id)))
-        // 2. We're selecting a different set of columns than what the aggregate outputs
-        // 3. Columns are renamed or reordered
+        // 1. We have expressions that compute new values (e.g., SUM(x) * 2)
+        // 2. We're selecting a different set of columns than GROUP BY + aggregates
+        // 3. We're reordering columns from their natural aggregate output order
         let needs_outer_projection = {
-            // Check if any expression is more complex than a simple column reference
+            // Check for complex expressions
             let has_complex_exprs = projection_exprs
                 .iter()
                 .any(|expr| !matches!(expr, LogicalExpr::Column(_)));
@@ -1232,17 +1356,29 @@ impl<'a> LogicalPlanBuilder<'a> {
             if has_complex_exprs {
                 true
             } else {
-                // All are simple columns - check if we're selecting exactly what the aggregate outputs
-                // The projection might be selecting a subset (e.g., only aggregates without group columns)
-                // or reordering columns, or using different names
+                // Check if we're selecting exactly what aggregate outputs in the same order
+                // The aggregate outputs: all GROUP BY columns, then all aggregate expressions
+                // The projection might select a subset or reorder these
 
-                // For now, keep it simple: if schemas don't match exactly, we need projection
-                // This handles all cases: subset selection, reordering, renaming
-                projection_schema_columns != aggregate_schema_columns
+                if projection_exprs.len() != aggregate_schema_columns.len() {
+                    // Different number of columns
+                    true
+                } else {
+                    // Check if columns match in order and name
+                    !projection_exprs.iter().zip(&aggregate_schema_columns).all(
+                        |(expr, agg_col)| {
+                            if let LogicalExpr::Column(col) = expr {
+                                col.name == agg_col.name
+                            } else {
+                                false
+                            }
+                        },
+                    )
+                }
             }
         };
 
-        // Create the aggregate node
+        // Create the aggregate node with its natural schema
         let aggregate_plan = LogicalPlan::Aggregate(Aggregate {
             input: aggregate_input,
             group_expr: group_exprs,
@@ -1257,7 +1393,7 @@ impl<'a> LogicalPlanBuilder<'a> {
                 schema: Arc::new(LogicalSchema::new(projection_schema_columns)),
             }))
         } else {
-            // No projection needed - the aggregate output is exactly what we want
+            // No projection needed - aggregate output matches what we want
             Ok(aggregate_plan)
         }
     }
@@ -1275,7 +1411,13 @@ impl<'a> LogicalPlanBuilder<'a> {
         // Infer schema from first row
         let mut schema_columns = Vec::new();
         for (i, _) in values[0].iter().enumerate() {
-            schema_columns.push((format!("column{}", i + 1), Type::Text));
+            schema_columns.push(ColumnInfo {
+                name: format!("column{}", i + 1),
+                ty: Type::Text,
+                database: None,
+                table: None,
+                table_alias: None,
+            });
         }
 
         for row in values {
@@ -2003,17 +2145,31 @@ impl<'a> LogicalPlanBuilder<'a> {
     }
 
     // Get table schema
-    fn get_table_schema(&self, table_name: &str) -> Result<SchemaRef> {
+    fn get_table_schema(&self, table_name: &str, alias: Option<&str>) -> Result<SchemaRef> {
         // Look up table in schema
         let table = self
             .schema
             .get_table(table_name)
             .ok_or_else(|| LimboError::ParseError(format!("Table '{table_name}' not found")))?;
 
+        // Parse table_name which might be "db.table" for attached databases
+        let (database, actual_table) = if table_name.contains('.') {
+            let parts: Vec<&str> = table_name.splitn(2, '.').collect();
+            (Some(parts[0].to_string()), parts[1].to_string())
+        } else {
+            (None, table_name.to_string())
+        };
+
         let mut columns = Vec::new();
         for col in table.columns() {
             if let Some(ref name) = col.name {
-                columns.push((name.clone(), col.ty));
+                columns.push(ColumnInfo {
+                    name: name.clone(),
+                    ty: col.ty,
+                    database: database.clone(),
+                    table: Some(actual_table.clone()),
+                    table_alias: alias.map(|s| s.to_string()),
+                });
             }
         }
 
@@ -2024,8 +2180,8 @@ impl<'a> LogicalPlanBuilder<'a> {
     fn infer_expr_type(expr: &LogicalExpr, schema: &SchemaRef) -> Result<Type> {
         match expr {
             LogicalExpr::Column(col) => {
-                if let Some((_, typ)) = schema.find_column(&col.name) {
-                    Ok(*typ)
+                if let Some((_, col_info)) = schema.find_column(&col.name, col.table.as_deref()) {
+                    Ok(col_info.ty)
                 } else {
                     Ok(Type::Text)
                 }

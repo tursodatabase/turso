@@ -9,12 +9,12 @@ use crate::incremental::dbsp::{Delta, DeltaPair};
 use crate::incremental::expr_compiler::CompiledExpression;
 use crate::incremental::operator::{
     create_dbsp_state_index, DbspStateCursors, EvalState, FilterOperator, FilterPredicate,
-    IncrementalOperator, InputOperator, ProjectOperator,
+    IncrementalOperator, InputOperator, JoinOperator, JoinType, ProjectOperator,
 };
 use crate::storage::btree::{BTreeCursor, BTreeKey};
 // Note: logical module must be made pub(crate) in translate/mod.rs
 use crate::translate::logical::{
-    BinaryOperator, LogicalExpr, LogicalPlan, LogicalSchema, SchemaRef,
+    BinaryOperator, JoinType as LogicalJoinType, LogicalExpr, LogicalPlan, LogicalSchema, SchemaRef,
 };
 use crate::types::{IOResult, ImmutableRecord, SeekKey, SeekOp, SeekResult, Value};
 use crate::Pager;
@@ -286,6 +286,12 @@ pub enum DbspOperator {
     Aggregate {
         group_exprs: Vec<DbspExpr>,
         aggr_exprs: Vec<crate::incremental::operator::AggregateFunction>,
+        schema: SchemaRef,
+    },
+    /// Join operator (⋈) - joins two relations
+    Join {
+        join_type: JoinType,
+        on_exprs: Vec<(DbspExpr, DbspExpr)>,
         schema: SchemaRef,
     },
     /// Input operator - source of data
@@ -789,6 +795,13 @@ impl DbspCircuit {
                         "{indent}Aggregate[{node_id}]: GROUP BY {group_exprs:?}, AGGR {aggr_exprs:?}"
                     )?;
                 }
+                DbspOperator::Join {
+                    join_type,
+                    on_exprs,
+                    ..
+                } => {
+                    writeln!(f, "{indent}Join[{node_id}]: {join_type:?} ON {on_exprs:?}")?;
+                }
                 DbspOperator::Input { name, .. } => {
                     writeln!(f, "{indent}Input[{node_id}]: {name}")?;
                 }
@@ -841,7 +854,7 @@ impl DbspCompiler {
                 // Get input column names for the ProjectOperator
                 let input_schema = proj.input.schema();
                 let input_column_names: Vec<String> = input_schema.columns.iter()
-                    .map(|(name, _)| name.clone())
+                    .map(|col| col.name.clone())
                     .collect();
 
                 // Convert logical expressions to DBSP expressions
@@ -853,14 +866,14 @@ impl DbspCompiler {
                 let mut compiled_exprs = Vec::new();
                 let mut aliases = Vec::new();
                 for expr in &proj.exprs {
-                    let (compiled, alias) = Self::compile_expression(expr, &input_column_names)?;
+                    let (compiled, alias) = Self::compile_expression(expr, input_schema)?;
                     compiled_exprs.push(compiled);
                     aliases.push(alias);
                 }
 
                 // Get output column names from the projection schema
                 let output_column_names: Vec<String> = proj.schema.columns.iter()
-                    .map(|(name, _)| name.clone())
+                    .map(|col| col.name.clone())
                     .collect();
 
                 // Create the ProjectOperator
@@ -885,7 +898,7 @@ impl DbspCompiler {
                 // Get column names from input schema
                 let input_schema = filter.input.schema();
                 let column_names: Vec<String> = input_schema.columns.iter()
-                    .map(|(name, _)| name.clone())
+                    .map(|col| col.name.clone())
                     .collect();
 
                 // Convert predicate to DBSP expression
@@ -913,16 +926,21 @@ impl DbspCompiler {
                 // Get input column names
                 let input_schema = agg.input.schema();
                 let input_column_names: Vec<String> = input_schema.columns.iter()
-                    .map(|(name, _)| name.clone())
+                    .map(|col| col.name.clone())
                     .collect();
 
-                // Compile group by expressions to column names
-                let mut group_by_columns = Vec::new();
+                // Compile group by expressions to column indices
+                let mut group_by_indices = Vec::new();
                 let mut dbsp_group_exprs = Vec::new();
                 for expr in &agg.group_expr {
                     // For now, only support simple column references in GROUP BY
                     if let LogicalExpr::Column(col) = expr {
-                        group_by_columns.push(col.name.clone());
+                        // Find the column index in the input schema using qualified lookup
+                        let (col_idx, _) = input_schema.find_column(&col.name, col.table.as_deref())
+                            .ok_or_else(|| LimboError::ParseError(
+                                format!("GROUP BY column '{}' not found in input", col.name)
+                            ))?;
+                        group_by_indices.push(col_idx);
                         dbsp_group_exprs.push(DbspExpr::Column(col.name.clone()));
                     } else {
                         return Err(LimboError::ParseError(
@@ -936,7 +954,7 @@ impl DbspCompiler {
                 for expr in &agg.aggr_expr {
                     if let LogicalExpr::AggregateFunction { fun, args, .. } = expr {
                         use crate::function::AggFunc;
-                        use crate::incremental::operator::AggregateFunction;
+                        use crate::incremental::aggregate_operator::AggregateFunction;
 
                         match fun {
                             AggFunc::Count | AggFunc::Count0 => {
@@ -946,9 +964,13 @@ impl DbspCompiler {
                                 if args.is_empty() {
                                     return Err(LimboError::ParseError("SUM requires an argument".to_string()));
                                 }
-                                // Extract column name from the argument
+                                // Extract column index from the argument
                                 if let LogicalExpr::Column(col) = &args[0] {
-                                    aggregate_functions.push(AggregateFunction::Sum(col.name.clone()));
+                                    let (col_idx, _) = input_schema.find_column(&col.name, col.table.as_deref())
+                                        .ok_or_else(|| LimboError::ParseError(
+                                            format!("SUM column '{}' not found in input", col.name)
+                                        ))?;
+                                    aggregate_functions.push(AggregateFunction::Sum(col_idx));
                                 } else {
                                     return Err(LimboError::ParseError(
                                         "Only column references are supported in aggregate functions for incremental views".to_string()
@@ -960,7 +982,11 @@ impl DbspCompiler {
                                     return Err(LimboError::ParseError("AVG requires an argument".to_string()));
                                 }
                                 if let LogicalExpr::Column(col) = &args[0] {
-                                    aggregate_functions.push(AggregateFunction::Avg(col.name.clone()));
+                                    let (col_idx, _) = input_schema.find_column(&col.name, col.table.as_deref())
+                                        .ok_or_else(|| LimboError::ParseError(
+                                            format!("AVG column '{}' not found in input", col.name)
+                                        ))?;
+                                    aggregate_functions.push(AggregateFunction::Avg(col_idx));
                                 } else {
                                     return Err(LimboError::ParseError(
                                         "Only column references are supported in aggregate functions for incremental views".to_string()
@@ -972,7 +998,11 @@ impl DbspCompiler {
                                     return Err(LimboError::ParseError("MIN requires an argument".to_string()));
                                 }
                                 if let LogicalExpr::Column(col) = &args[0] {
-                                    aggregate_functions.push(AggregateFunction::Min(col.name.clone()));
+                                    let (col_idx, _) = input_schema.find_column(&col.name, col.table.as_deref())
+                                        .ok_or_else(|| LimboError::ParseError(
+                                            format!("MIN column '{}' not found in input", col.name)
+                                        ))?;
+                                    aggregate_functions.push(AggregateFunction::Min(col_idx));
                                 } else {
                                     return Err(LimboError::ParseError(
                                         "Only column references are supported in MIN for incremental views".to_string()
@@ -984,7 +1014,11 @@ impl DbspCompiler {
                                     return Err(LimboError::ParseError("MAX requires an argument".to_string()));
                                 }
                                 if let LogicalExpr::Column(col) = &args[0] {
-                                    aggregate_functions.push(AggregateFunction::Max(col.name.clone()));
+                                    let (col_idx, _) = input_schema.find_column(&col.name, col.table.as_deref())
+                                        .ok_or_else(|| LimboError::ParseError(
+                                            format!("MAX column '{}' not found in input", col.name)
+                                        ))?;
+                                    aggregate_functions.push(AggregateFunction::Max(col_idx));
                                 } else {
                                     return Err(LimboError::ParseError(
                                         "Only column references are supported in MAX for incremental views".to_string()
@@ -1006,10 +1040,10 @@ impl DbspCompiler {
 
                 let operator_id = self.circuit.next_id;
 
-                use crate::incremental::operator::AggregateOperator;
+                use crate::incremental::aggregate_operator::AggregateOperator;
                 let executable: Box<dyn IncrementalOperator> = Box::new(AggregateOperator::new(
                     operator_id,
-                    group_by_columns.clone(),
+                    group_by_indices.clone(),
                     aggregate_functions.clone(),
                     input_column_names.clone(),
                 ));
@@ -1025,6 +1059,90 @@ impl DbspCompiler {
                 );
 
                 Ok(result_node_id)
+            }
+            LogicalPlan::Join(join) => {
+                // Compile left and right inputs
+                let left_id = self.compile_plan(&join.left)?;
+                let right_id = self.compile_plan(&join.right)?;
+
+                // Get schemas from inputs
+                let left_schema = join.left.schema();
+                let right_schema = join.right.schema();
+
+                // Get column names from left and right
+                let left_columns: Vec<String> = left_schema.columns.iter()
+                    .map(|col| col.name.clone())
+                    .collect();
+                let right_columns: Vec<String> = right_schema.columns.iter()
+                    .map(|col| col.name.clone())
+                    .collect();
+
+                // Extract join key indices from join conditions
+                // For now, we only support equijoin conditions
+                let mut left_key_indices = Vec::new();
+                let mut right_key_indices = Vec::new();
+                let mut dbsp_on_exprs = Vec::new();
+
+                for (left_expr, right_expr) in &join.on {
+                    // Extract column indices from join expressions
+                    // We expect simple column references in join conditions
+                    if let (LogicalExpr::Column(left_col), LogicalExpr::Column(right_col)) = (left_expr, right_expr) {
+                        // Find indices in respective schemas using qualified lookup
+                        let (left_idx, _) = left_schema.find_column(&left_col.name, left_col.table.as_deref())
+                            .ok_or_else(|| LimboError::ParseError(
+                                format!("Join column '{}' not found in left input", left_col.name)
+                            ))?;
+                        let (right_idx, _) = right_schema.find_column(&right_col.name, right_col.table.as_deref())
+                            .ok_or_else(|| LimboError::ParseError(
+                                format!("Join column '{}' not found in right input", right_col.name)
+                            ))?;
+
+                        left_key_indices.push(left_idx);
+                        right_key_indices.push(right_idx);
+
+                        // Convert to DBSP expressions
+                        dbsp_on_exprs.push((
+                            DbspExpr::Column(left_col.name.clone()),
+                            DbspExpr::Column(right_col.name.clone())
+                        ));
+                    } else {
+                        return Err(LimboError::ParseError(
+                            "Only simple column references are supported in join conditions for incremental views".to_string()
+                        ));
+                    }
+                }
+
+                // Convert logical join type to operator join type
+                let operator_join_type = match join.join_type {
+                    LogicalJoinType::Inner => JoinType::Inner,
+                    LogicalJoinType::Left => JoinType::Left,
+                    LogicalJoinType::Right => JoinType::Right,
+                    LogicalJoinType::Full => JoinType::Full,
+                    LogicalJoinType::Cross => JoinType::Cross,
+                };
+
+                // Create JoinOperator
+                let operator_id = self.circuit.next_id;
+                let executable: Box<dyn IncrementalOperator> = Box::new(JoinOperator::new(
+                    operator_id,
+                    operator_join_type.clone(),
+                    left_key_indices,
+                    right_key_indices,
+                    left_columns,
+                    right_columns,
+                )?);
+
+                // Create join node
+                let node_id = self.circuit.add_node(
+                    DbspOperator::Join {
+                        join_type: operator_join_type,
+                        on_exprs: dbsp_on_exprs,
+                        schema: join.schema.clone(),
+                    },
+                    vec![left_id, right_id],
+                    executable,
+                );
+                Ok(node_id)
             }
             LogicalPlan::TableScan(scan) => {
                 // Create input node with InputOperator for uniform handling
@@ -1042,7 +1160,7 @@ impl DbspCompiler {
                 Ok(node_id)
             }
             _ => Err(LimboError::ParseError(
-                format!("Unsupported operator in DBSP compiler: only Filter, Projection and Aggregate are supported, got: {:?}",
+                format!("Unsupported operator in DBSP compiler: only Filter, Projection, Join and Aggregate are supported, got: {:?}",
                     match plan {
                         LogicalPlan::Sort(_) => "Sort",
                         LogicalPlan::Limit(_) => "Limit",
@@ -1095,17 +1213,24 @@ impl DbspCompiler {
     /// Compile a logical expression to a CompiledExpression and optional alias
     fn compile_expression(
         expr: &LogicalExpr,
-        input_column_names: &[String],
+        input_schema: &LogicalSchema,
     ) -> Result<(CompiledExpression, Option<String>)> {
         // Check for alias first
         if let LogicalExpr::Alias { expr, alias } = expr {
             // For aliases, compile the underlying expression and return with alias
-            let (compiled, _) = Self::compile_expression(expr, input_column_names)?;
+            let (compiled, _) = Self::compile_expression(expr, input_schema)?;
             return Ok((compiled, Some(alias.clone())));
         }
 
-        // Convert LogicalExpr to AST Expr
-        let ast_expr = Self::logical_to_ast_expr(expr)?;
+        // Convert LogicalExpr to AST Expr with proper column resolution
+        let ast_expr = Self::logical_to_ast_expr_with_schema(expr, input_schema)?;
+
+        // Extract column names from schema for CompiledExpression::compile
+        let input_column_names: Vec<String> = input_schema
+            .columns
+            .iter()
+            .map(|col| col.name.clone())
+            .collect();
 
         // For all expressions (simple or complex), use CompiledExpression::compile
         // This handles both trivial cases and complex VDBE compilation
@@ -1129,7 +1254,7 @@ impl DbspCompiler {
         // Compile the expression using the existing CompiledExpression::compile
         let compiled = CompiledExpression::compile(
             &ast_expr,
-            input_column_names,
+            &input_column_names,
             &schema,
             &temp_syms,
             internal_conn,
@@ -1138,12 +1263,27 @@ impl DbspCompiler {
         Ok((compiled, None))
     }
 
-    /// Convert LogicalExpr to AST Expr
-    fn logical_to_ast_expr(expr: &LogicalExpr) -> Result<turso_parser::ast::Expr> {
+    /// Convert LogicalExpr to AST Expr with qualified column resolution
+    fn logical_to_ast_expr_with_schema(
+        expr: &LogicalExpr,
+        schema: &LogicalSchema,
+    ) -> Result<turso_parser::ast::Expr> {
         use turso_parser::ast;
 
         match expr {
-            LogicalExpr::Column(col) => Ok(ast::Expr::Id(ast::Name::Ident(col.name.clone()))),
+            LogicalExpr::Column(col) => {
+                // Find the column index using qualified lookup
+                let (idx, _) = schema
+                    .find_column(&col.name, col.table.as_deref())
+                    .ok_or_else(|| {
+                        LimboError::ParseError(format!(
+                            "Column '{}' with table {:?} not found in schema",
+                            col.name, col.table
+                        ))
+                    })?;
+                // Return a Register expression with the correct index
+                Ok(ast::Expr::Register(idx))
+            }
             LogicalExpr::Literal(val) => {
                 let lit = match val {
                     Value::Integer(i) => ast::Literal::Numeric(i.to_string()),
@@ -1155,8 +1295,8 @@ impl DbspCompiler {
                 Ok(ast::Expr::Literal(lit))
             }
             LogicalExpr::BinaryExpr { left, op, right } => {
-                let left_expr = Self::logical_to_ast_expr(left)?;
-                let right_expr = Self::logical_to_ast_expr(right)?;
+                let left_expr = Self::logical_to_ast_expr_with_schema(left, schema)?;
+                let right_expr = Self::logical_to_ast_expr_with_schema(right, schema)?;
                 Ok(ast::Expr::Binary(
                     Box::new(left_expr),
                     *op,
@@ -1164,7 +1304,10 @@ impl DbspCompiler {
                 ))
             }
             LogicalExpr::ScalarFunction { fun, args } => {
-                let ast_args: Result<Vec<_>> = args.iter().map(Self::logical_to_ast_expr).collect();
+                let ast_args: Result<Vec<_>> = args
+                    .iter()
+                    .map(|arg| Self::logical_to_ast_expr_with_schema(arg, schema))
+                    .collect();
                 let ast_args: Vec<Box<ast::Expr>> = ast_args?.into_iter().map(Box::new).collect();
                 Ok(ast::Expr::FunctionCall {
                     name: ast::Name::Ident(fun.clone()),
@@ -1179,7 +1322,7 @@ impl DbspCompiler {
             }
             LogicalExpr::Alias { expr, .. } => {
                 // For conversion to AST, ignore the alias and convert the inner expression
-                Self::logical_to_ast_expr(expr)
+                Self::logical_to_ast_expr_with_schema(expr, schema)
             }
             LogicalExpr::AggregateFunction {
                 fun,
@@ -1187,7 +1330,10 @@ impl DbspCompiler {
                 distinct,
             } => {
                 // Convert aggregate function to AST
-                let ast_args: Result<Vec<_>> = args.iter().map(Self::logical_to_ast_expr).collect();
+                let ast_args: Result<Vec<_>> = args
+                    .iter()
+                    .map(|arg| Self::logical_to_ast_expr_with_schema(arg, schema))
+                    .collect();
                 let ast_args: Vec<Box<ast::Expr>> = ast_args?.into_iter().map(Box::new).collect();
 
                 // Get the function name based on the aggregate type
@@ -1315,8 +1461,7 @@ mod tests {
     use crate::incremental::operator::{FilterOperator, FilterPredicate};
     use crate::schema::{BTreeTable, Column as SchemaColumn, Schema, Type};
     use crate::storage::pager::CreateBTreeFlags;
-    use crate::translate::logical::LogicalPlanBuilder;
-    use crate::translate::logical::LogicalSchema;
+    use crate::translate::logical::{ColumnInfo, LogicalPlanBuilder, LogicalSchema};
     use crate::util::IOExt;
     use crate::{Database, MemoryIO, Pager, IO};
     use std::sync::Arc;
@@ -1374,6 +1519,270 @@ mod tests {
                 unique_sets: vec![],
             };
             schema.add_btree_table(Arc::new(users_table));
+
+            // Add products table for join tests
+            let products_table = BTreeTable {
+                name: "products".to_string(),
+                root_page: 3,
+                primary_key_columns: vec![(
+                    "product_id".to_string(),
+                    turso_parser::ast::SortOrder::Asc,
+                )],
+                columns: vec![
+                    SchemaColumn {
+                        name: Some("product_id".to_string()),
+                        ty: Type::Integer,
+                        ty_str: "INTEGER".to_string(),
+                        primary_key: true,
+                        is_rowid_alias: true,
+                        notnull: true,
+                        default: None,
+                        unique: false,
+                        collation: None,
+                        hidden: false,
+                    },
+                    SchemaColumn {
+                        name: Some("product_name".to_string()),
+                        ty: Type::Text,
+                        ty_str: "TEXT".to_string(),
+                        primary_key: false,
+                        is_rowid_alias: false,
+                        notnull: false,
+                        default: None,
+                        unique: false,
+                        collation: None,
+                        hidden: false,
+                    },
+                    SchemaColumn {
+                        name: Some("price".to_string()),
+                        ty: Type::Integer,
+                        ty_str: "INTEGER".to_string(),
+                        primary_key: false,
+                        is_rowid_alias: false,
+                        notnull: false,
+                        default: None,
+                        unique: false,
+                        collation: None,
+                        hidden: false,
+                    },
+                ],
+                has_rowid: true,
+                is_strict: false,
+                unique_sets: vec![],
+            };
+            schema.add_btree_table(Arc::new(products_table));
+
+            // Add orders table for join tests
+            let orders_table = BTreeTable {
+                name: "orders".to_string(),
+                root_page: 4,
+                primary_key_columns: vec![(
+                    "order_id".to_string(),
+                    turso_parser::ast::SortOrder::Asc,
+                )],
+                columns: vec![
+                    SchemaColumn {
+                        name: Some("order_id".to_string()),
+                        ty: Type::Integer,
+                        ty_str: "INTEGER".to_string(),
+                        primary_key: true,
+                        is_rowid_alias: true,
+                        notnull: true,
+                        default: None,
+                        unique: false,
+                        collation: None,
+                        hidden: false,
+                    },
+                    SchemaColumn {
+                        name: Some("user_id".to_string()),
+                        ty: Type::Integer,
+                        ty_str: "INTEGER".to_string(),
+                        primary_key: false,
+                        is_rowid_alias: false,
+                        notnull: false,
+                        default: None,
+                        unique: false,
+                        collation: None,
+                        hidden: false,
+                    },
+                    SchemaColumn {
+                        name: Some("product_id".to_string()),
+                        ty: Type::Integer,
+                        ty_str: "INTEGER".to_string(),
+                        primary_key: false,
+                        is_rowid_alias: false,
+                        notnull: false,
+                        default: None,
+                        unique: false,
+                        collation: None,
+                        hidden: false,
+                    },
+                    SchemaColumn {
+                        name: Some("quantity".to_string()),
+                        ty: Type::Integer,
+                        ty_str: "INTEGER".to_string(),
+                        primary_key: false,
+                        is_rowid_alias: false,
+                        notnull: false,
+                        default: None,
+                        unique: false,
+                        collation: None,
+                        hidden: false,
+                    },
+                ],
+                has_rowid: true,
+                is_strict: false,
+                unique_sets: vec![],
+            };
+            schema.add_btree_table(Arc::new(orders_table));
+
+            // Add customers table with id and name for testing column ambiguity
+            let customers_table = BTreeTable {
+                name: "customers".to_string(),
+                root_page: 6,
+                primary_key_columns: vec![("id".to_string(), turso_parser::ast::SortOrder::Asc)],
+                columns: vec![
+                    SchemaColumn {
+                        name: Some("id".to_string()),
+                        ty: Type::Integer,
+                        ty_str: "INTEGER".to_string(),
+                        primary_key: true,
+                        is_rowid_alias: true,
+                        notnull: true,
+                        default: None,
+                        unique: false,
+                        collation: None,
+                        hidden: false,
+                    },
+                    SchemaColumn {
+                        name: Some("name".to_string()),
+                        ty: Type::Text,
+                        ty_str: "TEXT".to_string(),
+                        primary_key: false,
+                        is_rowid_alias: false,
+                        notnull: false,
+                        default: None,
+                        unique: false,
+                        collation: None,
+                        hidden: false,
+                    },
+                ],
+                has_rowid: true,
+                is_strict: false,
+                unique_sets: vec![],
+            };
+            schema.add_btree_table(Arc::new(customers_table));
+
+            // Add purchases table (junction table for three-way join)
+            let purchases_table = BTreeTable {
+                name: "purchases".to_string(),
+                root_page: 7,
+                primary_key_columns: vec![("id".to_string(), turso_parser::ast::SortOrder::Asc)],
+                columns: vec![
+                    SchemaColumn {
+                        name: Some("id".to_string()),
+                        ty: Type::Integer,
+                        ty_str: "INTEGER".to_string(),
+                        primary_key: true,
+                        is_rowid_alias: true,
+                        notnull: true,
+                        default: None,
+                        unique: false,
+                        collation: None,
+                        hidden: false,
+                    },
+                    SchemaColumn {
+                        name: Some("customer_id".to_string()),
+                        ty: Type::Integer,
+                        ty_str: "INTEGER".to_string(),
+                        primary_key: false,
+                        is_rowid_alias: false,
+                        notnull: false,
+                        default: None,
+                        unique: false,
+                        collation: None,
+                        hidden: false,
+                    },
+                    SchemaColumn {
+                        name: Some("vendor_id".to_string()),
+                        ty: Type::Integer,
+                        ty_str: "INTEGER".to_string(),
+                        primary_key: false,
+                        is_rowid_alias: false,
+                        notnull: false,
+                        default: None,
+                        unique: false,
+                        collation: None,
+                        hidden: false,
+                    },
+                    SchemaColumn {
+                        name: Some("quantity".to_string()),
+                        ty: Type::Integer,
+                        ty_str: "INTEGER".to_string(),
+                        primary_key: false,
+                        is_rowid_alias: false,
+                        notnull: false,
+                        default: None,
+                        unique: false,
+                        collation: None,
+                        hidden: false,
+                    },
+                ],
+                has_rowid: true,
+                is_strict: false,
+                unique_sets: vec![],
+            };
+            schema.add_btree_table(Arc::new(purchases_table));
+
+            // Add vendors table with id, name, and price (ambiguous columns with customers)
+            let vendors_table = BTreeTable {
+                name: "vendors".to_string(),
+                root_page: 8,
+                primary_key_columns: vec![("id".to_string(), turso_parser::ast::SortOrder::Asc)],
+                columns: vec![
+                    SchemaColumn {
+                        name: Some("id".to_string()),
+                        ty: Type::Integer,
+                        ty_str: "INTEGER".to_string(),
+                        primary_key: true,
+                        is_rowid_alias: true,
+                        notnull: true,
+                        default: None,
+                        unique: false,
+                        collation: None,
+                        hidden: false,
+                    },
+                    SchemaColumn {
+                        name: Some("name".to_string()),
+                        ty: Type::Text,
+                        ty_str: "TEXT".to_string(),
+                        primary_key: false,
+                        is_rowid_alias: false,
+                        notnull: false,
+                        default: None,
+                        unique: false,
+                        collation: None,
+                        hidden: false,
+                    },
+                    SchemaColumn {
+                        name: Some("price".to_string()),
+                        ty: Type::Integer,
+                        ty_str: "INTEGER".to_string(),
+                        primary_key: false,
+                        is_rowid_alias: false,
+                        notnull: false,
+                        default: None,
+                        unique: false,
+                        collation: None,
+                        hidden: false,
+                    },
+                ],
+                has_rowid: true,
+                is_strict: false,
+                unique_sets: vec![],
+            };
+            schema.add_btree_table(Arc::new(vendors_table));
+
             let sales_table = BTreeTable {
                 name: "sales".to_string(),
                 root_page: 2,
@@ -3342,8 +3751,20 @@ mod tests {
 
         // Create a simple filter node
         let schema = Arc::new(LogicalSchema::new(vec![
-            ("id".to_string(), Type::Integer),
-            ("value".to_string(), Type::Integer),
+            ColumnInfo {
+                name: "id".to_string(),
+                ty: Type::Integer,
+                database: None,
+                table: None,
+                table_alias: None,
+            },
+            ColumnInfo {
+                name: "value".to_string(),
+                ty: Type::Integer,
+                database: None,
+                table: None,
+                table_alias: None,
+            },
         ]));
 
         // First create an input node with InputOperator
@@ -3484,6 +3905,769 @@ mod tests {
             consolidated.len(),
             1,
             "Row should still exist with multiplicity 1"
+        );
+    }
+
+    #[test]
+    fn test_join_with_aggregation() {
+        // Test join followed by aggregation - verifying actual output
+        let (mut circuit, pager) = compile_sql!(
+            "SELECT u.name, SUM(o.quantity) as total_quantity
+             FROM users u
+             JOIN orders o ON u.id = o.user_id
+             GROUP BY u.name"
+        );
+
+        // Create test data for users
+        let mut users_delta = Delta::new();
+        users_delta.insert(
+            1,
+            vec![
+                Value::Integer(1),
+                Value::Text("Alice".into()),
+                Value::Integer(30),
+            ],
+        );
+        users_delta.insert(
+            2,
+            vec![
+                Value::Integer(2),
+                Value::Text("Bob".into()),
+                Value::Integer(25),
+            ],
+        );
+
+        // Create test data for orders (order_id, user_id, product_id, quantity)
+        let mut orders_delta = Delta::new();
+        orders_delta.insert(
+            1,
+            vec![
+                Value::Integer(1),
+                Value::Integer(1),
+                Value::Integer(101),
+                Value::Integer(5),
+            ],
+        ); // Alice: 5
+        orders_delta.insert(
+            2,
+            vec![
+                Value::Integer(2),
+                Value::Integer(1),
+                Value::Integer(102),
+                Value::Integer(3),
+            ],
+        ); // Alice: 3
+        orders_delta.insert(
+            3,
+            vec![
+                Value::Integer(3),
+                Value::Integer(2),
+                Value::Integer(101),
+                Value::Integer(7),
+            ],
+        ); // Bob: 7
+        orders_delta.insert(
+            4,
+            vec![
+                Value::Integer(4),
+                Value::Integer(1),
+                Value::Integer(103),
+                Value::Integer(2),
+            ],
+        ); // Alice: 2
+
+        let inputs = HashMap::from([
+            ("users".to_string(), users_delta),
+            ("orders".to_string(), orders_delta),
+        ]);
+
+        let result = test_execute(&mut circuit, inputs.clone(), pager.clone()).unwrap();
+
+        // Should have 2 results: Alice with total 10, Bob with total 7
+        assert_eq!(
+            result.len(),
+            2,
+            "Should have aggregated results for Alice and Bob"
+        );
+
+        // Check the results
+        let mut results_map: HashMap<String, i64> = HashMap::new();
+        for (row, weight) in result.changes {
+            assert_eq!(weight, 1);
+            assert_eq!(row.values.len(), 2); // name and total_quantity
+
+            if let (Value::Text(name), Value::Integer(total)) = (&row.values[0], &row.values[1]) {
+                results_map.insert(name.to_string(), *total);
+            } else {
+                panic!("Unexpected value types in result");
+            }
+        }
+
+        assert_eq!(
+            results_map.get("Alice"),
+            Some(&10),
+            "Alice should have total quantity 10"
+        );
+        assert_eq!(
+            results_map.get("Bob"),
+            Some(&7),
+            "Bob should have total quantity 7"
+        );
+    }
+
+    #[test]
+    fn test_join_aggregate_with_filter() {
+        // Test complex query with join, filter, and aggregation - verifying output
+        let (mut circuit, pager) = compile_sql!(
+            "SELECT u.name, SUM(o.quantity) as total
+             FROM users u
+             JOIN orders o ON u.id = o.user_id
+             WHERE u.age > 18
+             GROUP BY u.name"
+        );
+
+        // Create test data for users
+        let mut users_delta = Delta::new();
+        users_delta.insert(
+            1,
+            vec![
+                Value::Integer(1),
+                Value::Text("Alice".into()),
+                Value::Integer(30),
+            ],
+        ); // age > 18
+        users_delta.insert(
+            2,
+            vec![
+                Value::Integer(2),
+                Value::Text("Bob".into()),
+                Value::Integer(17),
+            ],
+        ); // age <= 18
+        users_delta.insert(
+            3,
+            vec![
+                Value::Integer(3),
+                Value::Text("Charlie".into()),
+                Value::Integer(25),
+            ],
+        ); // age > 18
+
+        // Create test data for orders (order_id, user_id, product_id, quantity)
+        let mut orders_delta = Delta::new();
+        orders_delta.insert(
+            1,
+            vec![
+                Value::Integer(1),
+                Value::Integer(1),
+                Value::Integer(101),
+                Value::Integer(5),
+            ],
+        ); // Alice: 5
+        orders_delta.insert(
+            2,
+            vec![
+                Value::Integer(2),
+                Value::Integer(2),
+                Value::Integer(102),
+                Value::Integer(10),
+            ],
+        ); // Bob: 10 (should be filtered)
+        orders_delta.insert(
+            3,
+            vec![
+                Value::Integer(3),
+                Value::Integer(3),
+                Value::Integer(101),
+                Value::Integer(7),
+            ],
+        ); // Charlie: 7
+        orders_delta.insert(
+            4,
+            vec![
+                Value::Integer(4),
+                Value::Integer(1),
+                Value::Integer(103),
+                Value::Integer(3),
+            ],
+        ); // Alice: 3
+
+        let inputs = HashMap::from([
+            ("users".to_string(), users_delta),
+            ("orders".to_string(), orders_delta),
+        ]);
+
+        let result = test_execute(&mut circuit, inputs.clone(), pager.clone()).unwrap();
+
+        // Should only have results for Alice and Charlie (Bob filtered out due to age <= 18)
+        assert_eq!(
+            result.len(),
+            2,
+            "Should only have results for users with age > 18"
+        );
+
+        // Check the results
+        let mut results_map: HashMap<String, i64> = HashMap::new();
+        for (row, weight) in result.changes {
+            assert_eq!(weight, 1);
+            assert_eq!(row.values.len(), 2); // name and total
+
+            if let (Value::Text(name), Value::Integer(total)) = (&row.values[0], &row.values[1]) {
+                results_map.insert(name.to_string(), *total);
+            }
+        }
+
+        assert_eq!(
+            results_map.get("Alice"),
+            Some(&8),
+            "Alice should have total 8"
+        );
+        assert_eq!(
+            results_map.get("Charlie"),
+            Some(&7),
+            "Charlie should have total 7"
+        );
+        assert_eq!(results_map.get("Bob"), None, "Bob should be filtered out");
+    }
+
+    #[test]
+    fn test_three_way_join_execution() {
+        // Test executing a 3-way join with aggregation
+        let (mut circuit, pager) = compile_sql!(
+            "SELECT u.name, p.product_name, SUM(o.quantity) as total
+             FROM users u
+             JOIN orders o ON u.id = o.user_id
+             JOIN products p ON o.product_id = p.product_id
+             GROUP BY u.name, p.product_name"
+        );
+
+        // Create test data for users
+        let mut users_delta = Delta::new();
+        users_delta.insert(
+            1,
+            vec![
+                Value::Integer(1),
+                Value::Text("Alice".into()),
+                Value::Integer(25),
+            ],
+        );
+        users_delta.insert(
+            2,
+            vec![
+                Value::Integer(2),
+                Value::Text("Bob".into()),
+                Value::Integer(30),
+            ],
+        );
+
+        // Create test data for products
+        let mut products_delta = Delta::new();
+        products_delta.insert(
+            100,
+            vec![
+                Value::Integer(100),
+                Value::Text("Widget".into()),
+                Value::Integer(50),
+            ],
+        );
+        products_delta.insert(
+            101,
+            vec![
+                Value::Integer(101),
+                Value::Text("Gadget".into()),
+                Value::Integer(75),
+            ],
+        );
+        products_delta.insert(
+            102,
+            vec![
+                Value::Integer(102),
+                Value::Text("Doohickey".into()),
+                Value::Integer(25),
+            ],
+        );
+
+        // Create test data for orders joining users and products
+        let mut orders_delta = Delta::new();
+        // Alice orders 5 Widgets
+        orders_delta.insert(
+            1,
+            vec![
+                Value::Integer(1),
+                Value::Integer(1),
+                Value::Integer(100),
+                Value::Integer(5),
+            ],
+        );
+        // Alice orders 3 Gadgets
+        orders_delta.insert(
+            2,
+            vec![
+                Value::Integer(2),
+                Value::Integer(1),
+                Value::Integer(101),
+                Value::Integer(3),
+            ],
+        );
+        // Bob orders 7 Widgets
+        orders_delta.insert(
+            3,
+            vec![
+                Value::Integer(3),
+                Value::Integer(2),
+                Value::Integer(100),
+                Value::Integer(7),
+            ],
+        );
+        // Bob orders 2 Doohickeys
+        orders_delta.insert(
+            4,
+            vec![
+                Value::Integer(4),
+                Value::Integer(2),
+                Value::Integer(102),
+                Value::Integer(2),
+            ],
+        );
+        // Alice orders 4 more Widgets
+        orders_delta.insert(
+            5,
+            vec![
+                Value::Integer(5),
+                Value::Integer(1),
+                Value::Integer(100),
+                Value::Integer(4),
+            ],
+        );
+
+        let mut inputs = HashMap::new();
+        inputs.insert("users".to_string(), users_delta);
+        inputs.insert("products".to_string(), products_delta);
+        inputs.insert("orders".to_string(), orders_delta);
+
+        // Execute the 3-way join with aggregation
+        let result = test_execute(&mut circuit, inputs.clone(), pager.clone()).unwrap();
+
+        // We should get aggregated results for each user-product combination
+        // Expected results:
+        // - Alice, Widget: 9 (5 + 4)
+        // - Alice, Gadget: 3
+        // - Bob, Widget: 7
+        // - Bob, Doohickey: 2
+        assert_eq!(result.len(), 4, "Should have 4 aggregated results");
+
+        // Verify aggregation results
+        let mut found_results = std::collections::HashSet::new();
+        for (row, weight) in result.changes.iter() {
+            assert_eq!(*weight, 1);
+            // Row should have name, product_name, and sum columns
+            assert_eq!(row.values.len(), 3);
+
+            if let (Value::Text(name), Value::Text(product), Value::Integer(total)) =
+                (&row.values[0], &row.values[1], &row.values[2])
+            {
+                let key = format!("{}-{}", name.as_ref(), product.as_ref());
+                found_results.insert(key.clone());
+
+                match key.as_str() {
+                    "Alice-Widget" => {
+                        assert_eq!(*total, 9, "Alice should have ordered 9 Widgets total")
+                    }
+                    "Alice-Gadget" => assert_eq!(*total, 3, "Alice should have ordered 3 Gadgets"),
+                    "Bob-Widget" => assert_eq!(*total, 7, "Bob should have ordered 7 Widgets"),
+                    "Bob-Doohickey" => {
+                        assert_eq!(*total, 2, "Bob should have ordered 2 Doohickeys")
+                    }
+                    _ => panic!("Unexpected result: {key}"),
+                }
+            } else {
+                panic!("Unexpected value types in result");
+            }
+        }
+
+        // Ensure we found all expected combinations
+        assert!(found_results.contains("Alice-Widget"));
+        assert!(found_results.contains("Alice-Gadget"));
+        assert!(found_results.contains("Bob-Widget"));
+        assert!(found_results.contains("Bob-Doohickey"));
+    }
+
+    #[test]
+    fn test_join_execution() {
+        let (mut circuit, pager) = compile_sql!(
+            "SELECT u.name, o.quantity FROM users u JOIN orders o ON u.id = o.user_id"
+        );
+
+        // Create test data for users
+        let mut users_delta = Delta::new();
+        users_delta.insert(
+            1,
+            vec![
+                Value::Integer(1),
+                Value::Text("Alice".into()),
+                Value::Integer(25),
+            ],
+        );
+        users_delta.insert(
+            2,
+            vec![
+                Value::Integer(2),
+                Value::Text("Bob".into()),
+                Value::Integer(30),
+            ],
+        );
+
+        // Create test data for orders
+        let mut orders_delta = Delta::new();
+        orders_delta.insert(
+            1,
+            vec![
+                Value::Integer(1),
+                Value::Integer(1),
+                Value::Integer(100),
+                Value::Integer(5),
+            ],
+        );
+        orders_delta.insert(
+            2,
+            vec![
+                Value::Integer(2),
+                Value::Integer(1),
+                Value::Integer(101),
+                Value::Integer(3),
+            ],
+        );
+        orders_delta.insert(
+            3,
+            vec![
+                Value::Integer(3),
+                Value::Integer(2),
+                Value::Integer(102),
+                Value::Integer(7),
+            ],
+        );
+
+        let mut inputs = HashMap::new();
+        inputs.insert("users".to_string(), users_delta);
+        inputs.insert("orders".to_string(), orders_delta);
+
+        // Execute the join
+        let result = test_execute(&mut circuit, inputs.clone(), pager.clone()).unwrap();
+
+        // We should get 3 results (2 orders for Alice, 1 for Bob)
+        assert_eq!(result.len(), 3, "Should have 3 join results");
+
+        // Verify the join results contain the correct data
+        let results: Vec<_> = result.changes.iter().collect();
+
+        // Check that we have the expected joined rows
+        for (row, weight) in results {
+            assert_eq!(*weight, 1); // All weights should be 1 for insertions
+                                    // Row should have name and quantity columns
+            assert_eq!(row.values.len(), 2);
+        }
+    }
+
+    #[test]
+    fn test_three_way_join_with_column_ambiguity() {
+        // Test three-way join with aggregation where multiple tables have columns with the same name
+        // Ensures that column references are correctly resolved to their respective tables
+        // Tables: customers(id, name), purchases(id, customer_id, vendor_id, quantity), vendors(id, name, price)
+        // Note: both customers and vendors have 'id' and 'name' columns which can cause ambiguity
+
+        let sql = "SELECT c.name as customer_name, v.name as vendor_name,
+                          SUM(p.quantity) as total_quantity,
+                          SUM(p.quantity * v.price) as total_value
+                   FROM customers c
+                   JOIN purchases p ON c.id = p.customer_id
+                   JOIN vendors v ON p.vendor_id = v.id
+                   GROUP BY c.name, v.name";
+
+        let (mut circuit, pager) = compile_sql!(sql);
+
+        // Create test data for customers (id, name)
+        let mut customers_delta = Delta::new();
+        customers_delta.insert(1, vec![Value::Integer(1), Value::Text("Alice".into())]);
+        customers_delta.insert(2, vec![Value::Integer(2), Value::Text("Bob".into())]);
+
+        // Create test data for vendors (id, name, price)
+        let mut vendors_delta = Delta::new();
+        vendors_delta.insert(
+            1,
+            vec![
+                Value::Integer(1),
+                Value::Text("Widget Co".into()),
+                Value::Integer(10),
+            ],
+        );
+        vendors_delta.insert(
+            2,
+            vec![
+                Value::Integer(2),
+                Value::Text("Gadget Inc".into()),
+                Value::Integer(20),
+            ],
+        );
+
+        // Create test data for purchases (id, customer_id, vendor_id, quantity)
+        let mut purchases_delta = Delta::new();
+        // Alice purchases 5 units from Widget Co
+        purchases_delta.insert(
+            1,
+            vec![
+                Value::Integer(1),
+                Value::Integer(1), // customer_id: Alice
+                Value::Integer(1), // vendor_id: Widget Co
+                Value::Integer(5),
+            ],
+        );
+        // Alice purchases 3 units from Gadget Inc
+        purchases_delta.insert(
+            2,
+            vec![
+                Value::Integer(2),
+                Value::Integer(1), // customer_id: Alice
+                Value::Integer(2), // vendor_id: Gadget Inc
+                Value::Integer(3),
+            ],
+        );
+        // Bob purchases 2 units from Widget Co
+        purchases_delta.insert(
+            3,
+            vec![
+                Value::Integer(3),
+                Value::Integer(2), // customer_id: Bob
+                Value::Integer(1), // vendor_id: Widget Co
+                Value::Integer(2),
+            ],
+        );
+        // Alice purchases 4 more units from Widget Co
+        purchases_delta.insert(
+            4,
+            vec![
+                Value::Integer(4),
+                Value::Integer(1), // customer_id: Alice
+                Value::Integer(1), // vendor_id: Widget Co
+                Value::Integer(4),
+            ],
+        );
+
+        let inputs = HashMap::from([
+            ("customers".to_string(), customers_delta),
+            ("purchases".to_string(), purchases_delta),
+            ("vendors".to_string(), vendors_delta),
+        ]);
+
+        let result = test_execute(&mut circuit, inputs.clone(), pager.clone()).unwrap();
+
+        // Expected results:
+        // Alice|Gadget Inc|3|60    (3 units * 20 price = 60)
+        // Alice|Widget Co|9|90     (9 units * 10 price = 90)
+        // Bob|Widget Co|2|20       (2 units * 10 price = 20)
+
+        assert_eq!(result.len(), 3, "Should have 3 aggregated results");
+
+        // Sort results for consistent testing
+        let mut results: Vec<_> = result.changes.into_iter().collect();
+        results.sort_by(|a, b| {
+            let a_cust = &a.0.values[0];
+            let a_vend = &a.0.values[1];
+            let b_cust = &b.0.values[0];
+            let b_vend = &b.0.values[1];
+            (a_cust, a_vend).cmp(&(b_cust, b_vend))
+        });
+
+        // Verify Alice's Gadget Inc purchases
+        assert_eq!(results[0].0.values[0], Value::Text("Alice".into()));
+        assert_eq!(results[0].0.values[1], Value::Text("Gadget Inc".into()));
+        assert_eq!(results[0].0.values[2], Value::Integer(3)); // total_quantity
+        assert_eq!(results[0].0.values[3], Value::Integer(60)); // total_value
+
+        // Verify Alice's Widget Co purchases
+        assert_eq!(results[1].0.values[0], Value::Text("Alice".into()));
+        assert_eq!(results[1].0.values[1], Value::Text("Widget Co".into()));
+        assert_eq!(results[1].0.values[2], Value::Integer(9)); // total_quantity
+        assert_eq!(results[1].0.values[3], Value::Integer(90)); // total_value
+
+        // Verify Bob's Widget Co purchases
+        assert_eq!(results[2].0.values[0], Value::Text("Bob".into()));
+        assert_eq!(results[2].0.values[1], Value::Text("Widget Co".into()));
+        assert_eq!(results[2].0.values[2], Value::Integer(2)); // total_quantity
+        assert_eq!(results[2].0.values[3], Value::Integer(20)); // total_value
+    }
+
+    #[test]
+    fn test_join_with_aggregate_execution() {
+        let (mut circuit, pager) = compile_sql!(
+            "SELECT u.name, SUM(o.quantity) as total_quantity
+             FROM users u
+             JOIN orders o ON u.id = o.user_id
+             GROUP BY u.name"
+        );
+
+        // Create test data for users
+        let mut users_delta = Delta::new();
+        users_delta.insert(
+            1,
+            vec![
+                Value::Integer(1),
+                Value::Text("Alice".into()),
+                Value::Integer(25),
+            ],
+        );
+        users_delta.insert(
+            2,
+            vec![
+                Value::Integer(2),
+                Value::Text("Bob".into()),
+                Value::Integer(30),
+            ],
+        );
+
+        // Create test data for orders
+        let mut orders_delta = Delta::new();
+        orders_delta.insert(
+            1,
+            vec![
+                Value::Integer(1),
+                Value::Integer(1),
+                Value::Integer(100),
+                Value::Integer(5),
+            ],
+        );
+        orders_delta.insert(
+            2,
+            vec![
+                Value::Integer(2),
+                Value::Integer(1),
+                Value::Integer(101),
+                Value::Integer(3),
+            ],
+        );
+        orders_delta.insert(
+            3,
+            vec![
+                Value::Integer(3),
+                Value::Integer(2),
+                Value::Integer(102),
+                Value::Integer(7),
+            ],
+        );
+
+        let mut inputs = HashMap::new();
+        inputs.insert("users".to_string(), users_delta);
+        inputs.insert("orders".to_string(), orders_delta);
+
+        // Execute the join with aggregation
+        let result = test_execute(&mut circuit, inputs.clone(), pager.clone()).unwrap();
+
+        // We should get 2 aggregated results (one for Alice, one for Bob)
+        assert_eq!(result.len(), 2, "Should have 2 aggregated results");
+
+        // Verify aggregation results
+        for (row, weight) in result.changes.iter() {
+            assert_eq!(*weight, 1);
+            // Row should have name and sum columns
+            assert_eq!(row.values.len(), 2);
+
+            // Check the aggregated values
+            if let Value::Text(name) = &row.values[0] {
+                if name.as_ref() == "Alice" {
+                    // Alice should have total quantity of 8 (5 + 3)
+                    assert_eq!(row.values[1], Value::Integer(8));
+                } else if name.as_ref() == "Bob" {
+                    // Bob should have total quantity of 7
+                    assert_eq!(row.values[1], Value::Integer(7));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_filter_with_qualified_columns_in_join() {
+        // Test that filters correctly handle qualified column names in joins
+        // when multiple tables have columns with the SAME names.
+        // Both users and sales tables have an 'id' column which can be ambiguous.
+
+        let (mut circuit, pager) = compile_sql!(
+            "SELECT users.id, users.name, sales.id, sales.amount
+             FROM users
+             JOIN sales ON users.id = sales.customer_id
+             WHERE users.id > 1 AND sales.id < 100"
+        );
+
+        // Create test data
+        let mut users_delta = Delta::new();
+        let mut sales_delta = Delta::new();
+
+        // Users data: (id, name, age)
+        users_delta.insert(
+            1,
+            vec![
+                Value::Integer(1),
+                Value::Text("Alice".into()),
+                Value::Integer(30),
+            ],
+        ); // id = 1
+        users_delta.insert(
+            2,
+            vec![
+                Value::Integer(2),
+                Value::Text("Bob".into()),
+                Value::Integer(25),
+            ],
+        ); // id = 2
+        users_delta.insert(
+            3,
+            vec![
+                Value::Integer(3),
+                Value::Text("Charlie".into()),
+                Value::Integer(35),
+            ],
+        ); // id = 3
+
+        // Sales data: (id, customer_id, amount)
+        sales_delta.insert(
+            50,
+            vec![Value::Integer(50), Value::Integer(1), Value::Integer(100)],
+        ); // sales.id = 50, customer_id = 1
+        sales_delta.insert(
+            99,
+            vec![Value::Integer(99), Value::Integer(2), Value::Integer(200)],
+        ); // sales.id = 99, customer_id = 2
+        sales_delta.insert(
+            150,
+            vec![Value::Integer(150), Value::Integer(3), Value::Integer(300)],
+        ); // sales.id = 150, customer_id = 3
+
+        let mut inputs = HashMap::new();
+        inputs.insert("users".to_string(), users_delta);
+        inputs.insert("sales".to_string(), sales_delta);
+
+        let result = test_execute(&mut circuit, inputs.clone(), pager.clone()).unwrap();
+
+        // Should only get row with Bob (users.id=2, sales.id=99):
+        // - users.id=2 (> 1) AND sales.id=99 (< 100) ✓
+        // Alice excluded: users.id=1 (NOT > 1)
+        // Charlie excluded: sales.id=150 (NOT < 100)
+        assert_eq!(result.len(), 1, "Should have 1 filtered result");
+
+        let (row, weight) = &result.changes[0];
+        assert_eq!(*weight, 1);
+        assert_eq!(row.values.len(), 4, "Should have 4 columns");
+
+        // Verify the filter correctly used qualified columns
+        assert_eq!(row.values[0], Value::Integer(2), "users.id should be 2");
+        assert_eq!(
+            row.values[1],
+            Value::Text("Bob".into()),
+            "users.name should be Bob"
+        );
+        assert_eq!(row.values[2], Value::Integer(99), "sales.id should be 99");
+        assert_eq!(
+            row.values[3],
+            Value::Integer(200),
+            "sales.amount should be 200"
         );
     }
 }

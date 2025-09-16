@@ -19,20 +19,20 @@ pub const AGG_TYPE_MINMAX: u8 = 0b01; // MIN/MAX (BTree ordering gives both)
 #[derive(Debug, Clone, PartialEq)]
 pub enum AggregateFunction {
     Count,
-    Sum(String),
-    Avg(String),
-    Min(String),
-    Max(String),
+    Sum(usize), // Column index
+    Avg(usize), // Column index
+    Min(usize), // Column index
+    Max(usize), // Column index
 }
 
 impl Display for AggregateFunction {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             AggregateFunction::Count => write!(f, "COUNT(*)"),
-            AggregateFunction::Sum(col) => write!(f, "SUM({col})"),
-            AggregateFunction::Avg(col) => write!(f, "AVG({col})"),
-            AggregateFunction::Min(col) => write!(f, "MIN({col})"),
-            AggregateFunction::Max(col) => write!(f, "MAX({col})"),
+            AggregateFunction::Sum(idx) => write!(f, "SUM(col{idx})"),
+            AggregateFunction::Avg(idx) => write!(f, "AVG(col{idx})"),
+            AggregateFunction::Min(idx) => write!(f, "MIN(col{idx})"),
+            AggregateFunction::Max(idx) => write!(f, "MAX(col{idx})"),
         }
     }
 }
@@ -48,16 +48,16 @@ impl AggregateFunction {
     /// Returns None if the function is not a supported aggregate
     pub fn from_sql_function(
         func: &crate::function::Func,
-        input_column: Option<String>,
+        input_column_idx: Option<usize>,
     ) -> Option<Self> {
         match func {
             Func::Agg(agg_func) => {
                 match agg_func {
                     AggFunc::Count | AggFunc::Count0 => Some(AggregateFunction::Count),
-                    AggFunc::Sum => input_column.map(AggregateFunction::Sum),
-                    AggFunc::Avg => input_column.map(AggregateFunction::Avg),
-                    AggFunc::Min => input_column.map(AggregateFunction::Min),
-                    AggFunc::Max => input_column.map(AggregateFunction::Max),
+                    AggFunc::Sum => input_column_idx.map(AggregateFunction::Sum),
+                    AggFunc::Avg => input_column_idx.map(AggregateFunction::Avg),
+                    AggFunc::Min => input_column_idx.map(AggregateFunction::Min),
+                    AggFunc::Max => input_column_idx.map(AggregateFunction::Max),
                     _ => None, // Other aggregate functions not yet supported in DBSP
                 }
             }
@@ -115,8 +115,8 @@ pub fn deserialize_value(blob: &[u8]) -> Option<(Value, usize)> {
 
 // group_key_str -> (group_key, state)
 type ComputedStates = HashMap<String, (Vec<Value>, AggregateState)>;
-// group_key_str -> (column_name, value_as_hashable_row) -> accumulated_weight
-pub type MinMaxDeltas = HashMap<String, HashMap<(String, HashableRow), isize>>;
+// group_key_str -> (column_index, value_as_hashable_row) -> accumulated_weight
+pub type MinMaxDeltas = HashMap<String, HashMap<(usize, HashableRow), isize>>;
 
 #[derive(Debug)]
 enum AggregateCommitState {
@@ -178,14 +178,14 @@ pub enum AggregateEvalState {
 pub struct AggregateOperator {
     // Unique operator ID for indexing in persistent storage
     pub operator_id: usize,
-    // GROUP BY columns
-    group_by: Vec<String>,
+    // GROUP BY column indices
+    group_by: Vec<usize>,
     // Aggregate functions to compute (including MIN/MAX)
     pub aggregates: Vec<AggregateFunction>,
     // Column names from input
     pub input_column_names: Vec<String>,
-    // Map from column name to aggregate info for quick lookup
-    pub column_min_max: HashMap<String, AggColumnInfo>,
+    // Map from column index to aggregate info for quick lookup
+    pub column_min_max: HashMap<usize, AggColumnInfo>,
     tracker: Option<Arc<Mutex<ComputationTracker>>>,
 
     // State machine for commit operation
@@ -197,14 +197,14 @@ pub struct AggregateOperator {
 pub struct AggregateState {
     // For COUNT: just the count
     pub count: i64,
-    // For SUM: column_name -> sum value
-    sums: HashMap<String, f64>,
-    // For AVG: column_name -> (sum, count) for computing average
-    avgs: HashMap<String, (f64, i64)>,
-    // For MIN: column_name -> minimum value
-    pub mins: HashMap<String, Value>,
-    // For MAX: column_name -> maximum value
-    pub maxs: HashMap<String, Value>,
+    // For SUM: column_index -> sum value
+    sums: HashMap<usize, f64>,
+    // For AVG: column_index -> (sum, count) for computing average
+    avgs: HashMap<usize, (f64, i64)>,
+    // For MIN: column_index -> minimum value
+    pub mins: HashMap<usize, Value>,
+    // For MAX: column_index -> maximum value
+    pub maxs: HashMap<usize, Value>,
 }
 
 impl AggregateEvalState {
@@ -520,14 +520,14 @@ impl AggregateState {
                 AggregateFunction::Sum(col_name) => {
                     let sum = f64::from_le_bytes(blob.get(cursor..cursor + 8)?.try_into().ok()?);
                     cursor += 8;
-                    state.sums.insert(col_name.clone(), sum);
+                    state.sums.insert(*col_name, sum);
                 }
                 AggregateFunction::Avg(col_name) => {
                     let sum = f64::from_le_bytes(blob.get(cursor..cursor + 8)?.try_into().ok()?);
                     cursor += 8;
                     let count = i64::from_le_bytes(blob.get(cursor..cursor + 8)?.try_into().ok()?);
                     cursor += 8;
-                    state.avgs.insert(col_name.clone(), (sum, count));
+                    state.avgs.insert(*col_name, (sum, count));
                 }
                 AggregateFunction::Count => {
                     // Count was already read above
@@ -540,7 +540,7 @@ impl AggregateState {
                     if has_value == 1 {
                         let (min_value, bytes_consumed) = deserialize_value(&blob[cursor..])?;
                         cursor += bytes_consumed;
-                        state.mins.insert(col_name.clone(), min_value);
+                        state.mins.insert(*col_name, min_value);
                     }
                 }
                 AggregateFunction::Max(col_name) => {
@@ -551,7 +551,7 @@ impl AggregateState {
                     if has_value == 1 {
                         let (max_value, bytes_consumed) = deserialize_value(&blob[cursor..])?;
                         cursor += bytes_consumed;
-                        state.maxs.insert(col_name.clone(), max_value);
+                        state.maxs.insert(*col_name, max_value);
                     }
                 }
             }
@@ -566,7 +566,7 @@ impl AggregateState {
         values: &[Value],
         weight: isize,
         aggregates: &[AggregateFunction],
-        column_names: &[String],
+        _column_names: &[String], // No longer needed
     ) {
         // Update COUNT
         self.count += weight as i64;
@@ -577,32 +577,26 @@ impl AggregateState {
                 AggregateFunction::Count => {
                     // Already handled above
                 }
-                AggregateFunction::Sum(col_name) => {
-                    if let Some(idx) = column_names.iter().position(|c| c == col_name) {
-                        if let Some(val) = values.get(idx) {
-                            let num_val = match val {
-                                Value::Integer(i) => *i as f64,
-                                Value::Float(f) => *f,
-                                _ => 0.0,
-                            };
-                            *self.sums.entry(col_name.clone()).or_insert(0.0) +=
-                                num_val * weight as f64;
-                        }
+                AggregateFunction::Sum(col_idx) => {
+                    if let Some(val) = values.get(*col_idx) {
+                        let num_val = match val {
+                            Value::Integer(i) => *i as f64,
+                            Value::Float(f) => *f,
+                            _ => 0.0,
+                        };
+                        *self.sums.entry(*col_idx).or_insert(0.0) += num_val * weight as f64;
                     }
                 }
-                AggregateFunction::Avg(col_name) => {
-                    if let Some(idx) = column_names.iter().position(|c| c == col_name) {
-                        if let Some(val) = values.get(idx) {
-                            let num_val = match val {
-                                Value::Integer(i) => *i as f64,
-                                Value::Float(f) => *f,
-                                _ => 0.0,
-                            };
-                            let (sum, count) =
-                                self.avgs.entry(col_name.clone()).or_insert((0.0, 0));
-                            *sum += num_val * weight as f64;
-                            *count += weight as i64;
-                        }
+                AggregateFunction::Avg(col_idx) => {
+                    if let Some(val) = values.get(*col_idx) {
+                        let num_val = match val {
+                            Value::Integer(i) => *i as f64,
+                            Value::Float(f) => *f,
+                            _ => 0.0,
+                        };
+                        let (sum, count) = self.avgs.entry(*col_idx).or_insert((0.0, 0));
+                        *sum += num_val * weight as f64;
+                        *count += weight as i64;
                     }
                 }
                 AggregateFunction::Min(_col_name) | AggregateFunction::Max(_col_name) => {
@@ -644,8 +638,8 @@ impl AggregateState {
                 AggregateFunction::Count => {
                     result.push(Value::Integer(self.count));
                 }
-                AggregateFunction::Sum(col_name) => {
-                    let sum = self.sums.get(col_name).copied().unwrap_or(0.0);
+                AggregateFunction::Sum(col_idx) => {
+                    let sum = self.sums.get(col_idx).copied().unwrap_or(0.0);
                     // Return as integer if it's a whole number, otherwise as float
                     if sum.fract() == 0.0 {
                         result.push(Value::Integer(sum as i64));
@@ -653,8 +647,8 @@ impl AggregateState {
                         result.push(Value::Float(sum));
                     }
                 }
-                AggregateFunction::Avg(col_name) => {
-                    if let Some((sum, count)) = self.avgs.get(col_name) {
+                AggregateFunction::Avg(col_idx) => {
+                    if let Some((sum, count)) = self.avgs.get(col_idx) {
                         if *count > 0 {
                             result.push(Value::Float(sum / *count as f64));
                         } else {
@@ -664,13 +658,13 @@ impl AggregateState {
                         result.push(Value::Null);
                     }
                 }
-                AggregateFunction::Min(col_name) => {
+                AggregateFunction::Min(col_idx) => {
                     // Return the MIN value from our state
-                    result.push(self.mins.get(col_name).cloned().unwrap_or(Value::Null));
+                    result.push(self.mins.get(col_idx).cloned().unwrap_or(Value::Null));
                 }
-                AggregateFunction::Max(col_name) => {
+                AggregateFunction::Max(col_idx) => {
                     // Return the MAX value from our state
-                    result.push(self.maxs.get(col_name).cloned().unwrap_or(Value::Null));
+                    result.push(self.maxs.get(col_idx).cloned().unwrap_or(Value::Null));
                 }
             }
         }
@@ -682,20 +676,20 @@ impl AggregateState {
 impl AggregateOperator {
     pub fn new(
         operator_id: usize,
-        group_by: Vec<String>,
+        group_by: Vec<usize>,
         aggregates: Vec<AggregateFunction>,
         input_column_names: Vec<String>,
     ) -> Self {
-        // Build map of column names to their MIN/MAX info with indices
+        // Build map of column indices to their MIN/MAX info
         let mut column_min_max = HashMap::new();
-        let mut column_indices = HashMap::new();
+        let mut storage_indices = HashMap::new();
         let mut current_index = 0;
 
-        // First pass: assign indices to unique MIN/MAX columns
+        // First pass: assign storage indices to unique MIN/MAX columns
         for agg in &aggregates {
             match agg {
-                AggregateFunction::Min(col) | AggregateFunction::Max(col) => {
-                    column_indices.entry(col.clone()).or_insert_with(|| {
+                AggregateFunction::Min(col_idx) | AggregateFunction::Max(col_idx) => {
+                    storage_indices.entry(*col_idx).or_insert_with(|| {
                         let idx = current_index;
                         current_index += 1;
                         idx
@@ -708,19 +702,19 @@ impl AggregateOperator {
         // Second pass: build the column info map
         for agg in &aggregates {
             match agg {
-                AggregateFunction::Min(col) => {
-                    let index = *column_indices.get(col).unwrap();
-                    let entry = column_min_max.entry(col.clone()).or_insert(AggColumnInfo {
-                        index,
+                AggregateFunction::Min(col_idx) => {
+                    let storage_index = *storage_indices.get(col_idx).unwrap();
+                    let entry = column_min_max.entry(*col_idx).or_insert(AggColumnInfo {
+                        index: storage_index,
                         has_min: false,
                         has_max: false,
                     });
                     entry.has_min = true;
                 }
-                AggregateFunction::Max(col) => {
-                    let index = *column_indices.get(col).unwrap();
-                    let entry = column_min_max.entry(col.clone()).or_insert(AggColumnInfo {
-                        index,
+                AggregateFunction::Max(col_idx) => {
+                    let storage_index = *storage_indices.get(col_idx).unwrap();
+                    let entry = column_min_max.entry(*col_idx).or_insert(AggColumnInfo {
+                        index: storage_index,
                         has_min: false,
                         has_max: false,
                     });
@@ -876,28 +870,24 @@ impl AggregateOperator {
 
             for agg in &self.aggregates {
                 match agg {
-                    AggregateFunction::Min(col_name) | AggregateFunction::Max(col_name) => {
-                        if let Some(idx) =
-                            self.input_column_names.iter().position(|c| c == col_name)
-                        {
-                            if let Some(val) = row.values.get(idx) {
-                                // Skip NULL values - they don't participate in MIN/MAX
-                                if val == &Value::Null {
-                                    continue;
-                                }
-                                // Create a HashableRow with just this value
-                                // Use 0 as rowid since we only care about the value for comparison
-                                let hashable_value = HashableRow::new(0, vec![val.clone()]);
-                                let key = (col_name.clone(), hashable_value);
-
-                                let group_entry =
-                                    min_max_deltas.entry(group_key_str.clone()).or_default();
-
-                                let value_entry = group_entry.entry(key).or_insert(0);
-
-                                // Accumulate the weight
-                                *value_entry += weight;
+                    AggregateFunction::Min(col_idx) | AggregateFunction::Max(col_idx) => {
+                        if let Some(val) = row.values.get(*col_idx) {
+                            // Skip NULL values - they don't participate in MIN/MAX
+                            if val == &Value::Null {
+                                continue;
                             }
+                            // Create a HashableRow with just this value
+                            // Use 0 as rowid since we only care about the value for comparison
+                            let hashable_value = HashableRow::new(0, vec![val.clone()]);
+                            let key = (*col_idx, hashable_value);
+
+                            let group_entry =
+                                min_max_deltas.entry(group_key_str.clone()).or_default();
+
+                            let value_entry = group_entry.entry(key).or_insert(0);
+
+                            // Accumulate the weight
+                            *value_entry += weight;
                         }
                     }
                     _ => {} // Ignore non-MIN/MAX aggregates
@@ -929,13 +919,9 @@ impl AggregateOperator {
     pub fn extract_group_key(&self, values: &[Value]) -> Vec<Value> {
         let mut key = Vec::new();
 
-        for group_col in &self.group_by {
-            if let Some(idx) = self.input_column_names.iter().position(|c| c == group_col) {
-                if let Some(val) = values.get(idx) {
-                    key.push(val.clone());
-                } else {
-                    key.push(Value::Null);
-                }
+        for &idx in &self.group_by {
+            if let Some(val) = values.get(idx) {
+                key.push(val.clone());
             } else {
                 key.push(Value::Null);
             }
@@ -1124,13 +1110,13 @@ pub enum RecomputeMinMax {
         /// Current column being processed
         current_column_idx: usize,
         /// Columns to process (combined MIN and MAX)
-        columns_to_process: Vec<(String, String, bool)>, // (group_key, column_name, is_min)
+        columns_to_process: Vec<(String, usize, bool)>, // (group_key, column_name, is_min)
         /// MIN/MAX deltas for checking values and weights
         min_max_deltas: MinMaxDeltas,
     },
     Scan {
         /// Columns still to process
-        columns_to_process: Vec<(String, String, bool)>,
+        columns_to_process: Vec<(String, usize, bool)>,
         /// Current index in columns_to_process (will resume from here)
         current_column_idx: usize,
         /// MIN/MAX deltas for checking values and weights
@@ -1138,7 +1124,7 @@ pub enum RecomputeMinMax {
         /// Current group key being processed
         group_key: String,
         /// Current column name being processed
-        column_name: String,
+        column_name: usize,
         /// Whether we're looking for MIN (true) or MAX (false)
         is_min: bool,
         /// The scan state machine for finding the new MIN/MAX
@@ -1153,7 +1139,7 @@ impl RecomputeMinMax {
         existing_groups: &HashMap<String, AggregateState>,
         operator: &AggregateOperator,
     ) -> Self {
-        let mut groups_to_check: HashSet<(String, String, bool)> = HashSet::new();
+        let mut groups_to_check: HashSet<(String, usize, bool)> = HashSet::new();
 
         // Remember the min_max_deltas are essentially just the only column that is affected by
         // this min/max, in delta (actually ZSet - consolidated delta) format. This makes it easier
@@ -1173,21 +1159,13 @@ impl RecomputeMinMax {
                         // Check for MIN
                         if let Some(current_min) = state.mins.get(col_name) {
                             if current_min == value {
-                                groups_to_check.insert((
-                                    group_key_str.clone(),
-                                    col_name.clone(),
-                                    true,
-                                ));
+                                groups_to_check.insert((group_key_str.clone(), *col_name, true));
                             }
                         }
                         // Check for MAX
                         if let Some(current_max) = state.maxs.get(col_name) {
                             if current_max == value {
-                                groups_to_check.insert((
-                                    group_key_str.clone(),
-                                    col_name.clone(),
-                                    false,
-                                ));
+                                groups_to_check.insert((group_key_str.clone(), *col_name, false));
                             }
                         }
                     }
@@ -1196,14 +1174,10 @@ impl RecomputeMinMax {
                     // about this if this is a new record being inserted
                     if let Some(info) = col_info {
                         if info.has_min {
-                            groups_to_check.insert((group_key_str.clone(), col_name.clone(), true));
+                            groups_to_check.insert((group_key_str.clone(), *col_name, true));
                         }
                         if info.has_max {
-                            groups_to_check.insert((
-                                group_key_str.clone(),
-                                col_name.clone(),
-                                false,
-                            ));
+                            groups_to_check.insert((group_key_str.clone(), *col_name, false));
                         }
                     }
                 }
@@ -1245,12 +1219,13 @@ impl RecomputeMinMax {
                     let (group_key, column_name, is_min) =
                         columns_to_process[*current_column_idx].clone();
 
-                    // Get column index from pre-computed info
-                    let column_index = operator
+                    // Column name is already the index
+                    // Get the storage index from column_min_max map
+                    let column_info = operator
                         .column_min_max
                         .get(&column_name)
-                        .map(|info| info.index)
-                        .unwrap(); // Should always exist since we're processing known columns
+                        .expect("Column should exist in column_min_max map");
+                    let storage_index = column_info.index;
 
                     // Get current value from existing state
                     let current_value = existing_groups.get(&group_key).and_then(|state| {
@@ -1263,7 +1238,7 @@ impl RecomputeMinMax {
 
                     // Create storage keys for index lookup
                     let storage_id =
-                        generate_storage_id(operator.operator_id, column_index, AGG_TYPE_MINMAX);
+                        generate_storage_id(operator.operator_id, storage_index, AGG_TYPE_MINMAX);
                     let zset_id = operator.generate_group_rowid(&group_key);
 
                     // Get the values for this group from min_max_deltas
@@ -1276,7 +1251,7 @@ impl RecomputeMinMax {
                         Box::new(ScanState::new_for_min(
                             current_value,
                             group_key.clone(),
-                            column_name.clone(),
+                            column_name,
                             storage_id,
                             zset_id,
                             group_values,
@@ -1285,7 +1260,7 @@ impl RecomputeMinMax {
                         Box::new(ScanState::new_for_max(
                             current_value,
                             group_key.clone(),
-                            column_name.clone(),
+                            column_name,
                             storage_id,
                             zset_id,
                             group_values,
@@ -1319,12 +1294,12 @@ impl RecomputeMinMax {
 
                     if *is_min {
                         if let Some(min_val) = new_value {
-                            state.mins.insert(column_name.clone(), min_val);
+                            state.mins.insert(*column_name, min_val);
                         } else {
                             state.mins.remove(column_name);
                         }
                     } else if let Some(max_val) = new_value {
-                        state.maxs.insert(column_name.clone(), max_val);
+                        state.maxs.insert(*column_name, max_val);
                     } else {
                         state.maxs.remove(column_name);
                     }
@@ -1355,13 +1330,13 @@ pub enum ScanState {
         /// Group key being processed
         group_key: String,
         /// Column name being processed
-        column_name: String,
+        column_name: usize,
         /// Storage ID for the index seek
         storage_id: i64,
         /// ZSet ID for the group
         zset_id: i64,
         /// Group values from MinMaxDeltas: (column_name, HashableRow) -> weight
-        group_values: HashMap<(String, HashableRow), isize>,
+        group_values: HashMap<(usize, HashableRow), isize>,
         /// Whether we're looking for MIN (true) or MAX (false)
         is_min: bool,
     },
@@ -1371,13 +1346,13 @@ pub enum ScanState {
         /// Group key being processed
         group_key: String,
         /// Column name being processed
-        column_name: String,
+        column_name: usize,
         /// Storage ID for the index seek
         storage_id: i64,
         /// ZSet ID for the group
         zset_id: i64,
         /// Group values from MinMaxDeltas: (column_name, HashableRow) -> weight
-        group_values: HashMap<(String, HashableRow), isize>,
+        group_values: HashMap<(usize, HashableRow), isize>,
         /// Whether we're looking for MIN (true) or MAX (false)
         is_min: bool,
     },
@@ -1391,10 +1366,10 @@ impl ScanState {
     pub fn new_for_min(
         current_min: Option<Value>,
         group_key: String,
-        column_name: String,
+        column_name: usize,
         storage_id: i64,
         zset_id: i64,
-        group_values: HashMap<(String, HashableRow), isize>,
+        group_values: HashMap<(usize, HashableRow), isize>,
     ) -> Self {
         Self::CheckCandidate {
             candidate: current_min,
@@ -1460,10 +1435,10 @@ impl ScanState {
     pub fn new_for_max(
         current_max: Option<Value>,
         group_key: String,
-        column_name: String,
+        column_name: usize,
         storage_id: i64,
         zset_id: i64,
-        group_values: HashMap<(String, HashableRow), isize>,
+        group_values: HashMap<(usize, HashableRow), isize>,
     ) -> Self {
         Self::CheckCandidate {
             candidate: current_max,
@@ -1496,7 +1471,7 @@ impl ScanState {
                         // Check if the candidate is retracted (weight <= 0)
                         // Create a HashableRow to look up the weight
                         let hashable_cand = HashableRow::new(0, vec![cand_val.clone()]);
-                        let key = (column_name.clone(), hashable_cand);
+                        let key = (*column_name, hashable_cand);
                         let is_retracted =
                             group_values.get(&key).is_some_and(|weight| *weight <= 0);
 
@@ -1633,7 +1608,7 @@ pub enum MinMaxPersistState {
         group_idx: usize,
         value_idx: usize,
         value: Value,
-        column_name: String,
+        column_name: usize,
         weight: isize,
         write_row: WriteRow,
     },
@@ -1652,7 +1627,7 @@ impl MinMaxPersistState {
     pub fn persist_min_max(
         &mut self,
         operator_id: usize,
-        column_min_max: &HashMap<String, AggColumnInfo>,
+        column_min_max: &HashMap<usize, AggColumnInfo>,
         cursors: &mut DbspStateCursors,
         generate_group_rowid: impl Fn(&str) -> i64,
     ) -> Result<IOResult<()>> {
@@ -1699,7 +1674,7 @@ impl MinMaxPersistState {
 
                     // Process current value and extract what we need before taking ownership
                     let ((column_name, hashable_row), weight) = values_vec[*value_idx];
-                    let column_name = column_name.clone();
+                    let column_name = *column_name;
                     let value = hashable_row.values[0].clone(); // Extract the Value from HashableRow
                     let weight = *weight;
 
@@ -1731,9 +1706,9 @@ impl MinMaxPersistState {
 
                     let group_key_str = &group_keys[*group_idx];
 
-                    // Get the column index from the pre-computed map
+                    // Get the column info from the pre-computed map
                     let column_info = column_min_max
-                        .get(&*column_name)
+                        .get(column_name)
                         .expect("Column should exist in column_min_max map");
                     let column_index = column_info.index;
 
