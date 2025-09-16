@@ -835,8 +835,10 @@ impl Wal for WalFile {
         // WAL and fetch pages directly from the DB file.  We do this
         // by taking read‑lock 0, and capturing the latest state.
         if shared_max == nbackfills {
+            tracing::debug!("begin_read_tx: WAL is already fully back‑filled into the main DB image, shared_max={}, nbackfills={}", shared_max, nbackfills);
             let lock_0_idx = 0;
             if !self.get_shared().read_locks[lock_0_idx].read() {
+                tracing::debug!("begin_read_tx: read lock 0 is already held, returning Busy");
                 return Err(LimboError::Busy);
             }
             // we need to keep self.max_frame set to the appropriate
