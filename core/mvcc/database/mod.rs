@@ -12,6 +12,7 @@ use crate::storage::sqlite3_ondisk::DatabaseHeader;
 use crate::storage::wal::TursoRwLock;
 use crate::types::IOResult;
 use crate::types::ImmutableRecord;
+use crate::types::SeekResult;
 use crate::Completion;
 use crate::IOExt;
 use crate::LimboError;
@@ -913,7 +914,13 @@ impl StateTransition for DeleteRowStateMachine {
                     .write()
                     .seek(seek_key, SeekOp::GE { eq_only: true })?
                 {
-                    IOResult::Done(_) => {
+                    IOResult::Done(seek_res) => {
+                        if seek_res == SeekResult::NotFound {
+                            crate::bail_corrupt_error!(
+                                "MVCC delete: rowid {} not found",
+                                self.rowid.row_id
+                            );
+                        }
                         self.state = DeleteRowState::Delete;
                         Ok(TransitionResult::Continue)
                     }
