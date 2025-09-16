@@ -588,8 +588,10 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 let id = &self.write_set[write_set_index];
                 if let Some(row_versions) = mvcc_store.rows.get(id) {
                     let row_versions = row_versions.value().read();
-                    // Find rows that were written by this transaction
-                    for row_version in row_versions.iter() {
+                    // Find rows that were written by this transaction.
+                    // Hekaton uses oldest-to-newest order for row versions, so we reverse iterate to find the newest one
+                    // this transaction changed.
+                    for row_version in row_versions.iter().rev() {
                         if let TxTimestampOrID::TxID(row_tx_id) = row_version.begin {
                             if row_tx_id == self.tx_id {
                                 let cursor = if let Some(cursor) = self.cursors.get(&id.table_id) {
