@@ -950,10 +950,7 @@ pub unsafe extern "C" fn sqlite3_column_blob(
         None => return std::ptr::null(),
     };
     match row.get::<&Value>(idx as usize) {
-        Ok(turso_core::Value::Blob(blob)) => {
-            let bytes = blob.to_bytes();
-            bytes.as_ptr() as *const ffi::c_void
-        }
+        Ok(turso_core::Value::Blob(blob)) => blob.as_bytes().as_ptr() as *const ffi::c_void,
         _ => std::ptr::null(),
     }
 }

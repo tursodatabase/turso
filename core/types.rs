@@ -256,6 +256,20 @@ impl Blob {
         }
         self.value.clone()
     }
+
+    pub fn as_bytes(&self) -> &Vec<u8> {
+        if self.unalloc_bytes > 0 {
+            panic!("Cannot get reference to an unexpanded zeroblob");
+        }
+        &self.value
+    }
+
+    pub fn as_bytes_mut(&mut self) -> &mut Vec<u8> {
+        if self.unalloc_bytes > 0 {
+            panic!("Cannot get mutable reference to an unexpanded zeroblob");
+        }
+        &mut self.value
+    }
 }
 
 impl Display for Blob {
@@ -436,24 +450,14 @@ impl Value {
 
     pub fn as_blob(&self) -> &Vec<u8> {
         match self {
-            Value::Blob(b) => {
-                if b.unalloc_bytes > 0 {
-                    panic!("as_blob called on unexpanded zeroblob");
-                }
-                &b.value
-            }
+            Value::Blob(b) => b.as_bytes(),
             _ => panic!("as_blob must be called only for Value::Blob"),
         }
     }
 
     pub fn as_blob_mut(&mut self) -> &mut Vec<u8> {
         match self {
-            Value::Blob(b) => {
-                if b.unalloc_bytes > 0 {
-                    panic!("as_blob_mut called on unexpanded zeroblob");
-                }
-                &mut b.value
-            }
+            Value::Blob(b) => b.as_bytes_mut(),
             _ => panic!("as_blob must be called only for Value::Blob"),
         }
     }
@@ -1250,24 +1254,14 @@ impl ImmutableRecord {
 
     pub fn as_blob(&self) -> &Vec<u8> {
         match &self.payload {
-            Value::Blob(b) => {
-                if b.unalloc_bytes > 0 {
-                    panic!("as_blob called on unexpanded zeroblob");
-                }
-                &b.value
-            }
+            Value::Blob(b) => b.as_bytes(),
             _ => panic!("payload must be a blob"),
         }
     }
 
     pub fn as_blob_mut(&mut self) -> &mut Vec<u8> {
         match &mut self.payload {
-            Value::Blob(b) => {
-                if b.unalloc_bytes > 0 {
-                    panic!("as_blob_mut called on unexpanded zeroblob");
-                }
-                &mut b.value
-            }
+            Value::Blob(b) => b.as_bytes_mut(),
             _ => panic!("payload must be a blob"),
         }
     }
@@ -2857,7 +2851,10 @@ mod tests {
                 value: RawSlice::from_slice(&text.value),
                 subtype: text.subtype,
             }),
-            Value::Blob(blob) => RefValue::Blob(RawSlice::from_slice(&blob.to_bytes()).into()),
+            Value::Blob(blob) => RefValue::Blob(BlobRef {
+                value: RawSlice::from_slice(&blob.value),
+                unalloc_bytes: blob.unalloc_bytes,
+            }),
         }
     }
 
