@@ -1114,17 +1114,17 @@ const fn get_insn_virtual_table() -> [InsnFunction; InsnVariants::COUNT] {
     result
 }
 
-static INSN_VIRTUAL_TABLE: [InsnFunction; InsnVariants::COUNT] = get_insn_virtual_table();
+static INSN_VTABLE: [InsnFunction; InsnVariants::COUNT] = get_insn_virtual_table();
 
 impl InsnVariants {
     // This function is used for testing
     #[allow(dead_code)]
     #[inline(always)]
     pub(crate) const fn to_function_fast(self) -> InsnFunction {
-        INSN_VIRTUAL_TABLE[self as usize]
+        INSN_VTABLE[self as usize]
     }
 
-    // This function is used for generating the virtual table.
+    // This function is used for generating `INSN_VTABLE`.
     // We need to keep this function to make sure we implement all opcodes
     pub(crate) const fn to_function(self) -> InsnFunction {
         match self {
@@ -1278,7 +1278,7 @@ impl Insn {
     pub fn to_function(&self) -> InsnFunction {
         // dont use this because its still using match
         // InsnVariants::from(self).to_function_fast()
-        INSN_VIRTUAL_TABLE[self.discriminant() as usize]
+        INSN_VTABLE[self.discriminant() as usize]
     }
 }
 
