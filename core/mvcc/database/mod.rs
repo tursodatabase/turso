@@ -390,7 +390,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
     type Context = MvStore<Clock>;
     type SMResult = ();
 
-    #[tracing::instrument(fields(state = ?self.state), skip(self, mvcc_store))]
+    #[tracing::instrument(fields(state = ?self.state), skip(self, mvcc_store), level = Level::DEBUG)]
     fn step(&mut self, mvcc_store: &Self::Context) -> Result<TransitionResult<Self::SMResult>> {
         match self.state {
             CommitState::Initial => {
@@ -810,7 +810,7 @@ impl StateTransition for WriteRowStateMachine {
     type Context = ();
     type SMResult = ();
 
-    #[tracing::instrument(fields(state = ?self.state), skip(self, _context))]
+    #[tracing::instrument(fields(state = ?self.state), skip(self, _context), level = Level::DEBUG)]
     fn step(&mut self, _context: &Self::Context) -> Result<TransitionResult<Self::SMResult>> {
         use crate::types::{IOResult, SeekKey, SeekOp};
 
