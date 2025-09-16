@@ -46,14 +46,20 @@ impl<Clock: LogicalClock> MvccLazyCursor<Clock> {
     /// Sets the cursor to the inserted row.
     pub fn insert(&mut self, row: Row) -> Result<()> {
         self.current_pos = CursorPosition::Loaded(row.id);
-        self.db.insert(self.tx_id, row).inspect_err(|_| {
-            self.current_pos = CursorPosition::BeforeFirst;
-        })?;
+        if self.db.read(self.tx_id, row.id)?.is_some() {
+            self.db.update(self.tx_id, row).inspect_err(|_| {
+                self.current_pos = CursorPosition::BeforeFirst;
+            })?;
+        } else {
+            self.db.insert(self.tx_id, row).inspect_err(|_| {
+                self.current_pos = CursorPosition::BeforeFirst;
+            })?;
+        }
         Ok(())
     }
 
-    pub fn delete(&mut self, rowid: RowID, pager: Rc<Pager>) -> Result<()> {
-        self.db.delete(self.tx_id, rowid, pager)?;
+    pub fn delete(&mut self, rowid: RowID) -> Result<()> {
+        self.db.delete(self.tx_id, rowid)?;
         Ok(())
     }
 

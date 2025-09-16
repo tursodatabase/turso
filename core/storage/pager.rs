@@ -552,13 +552,8 @@ enum AllocatePage1State {
 #[derive(Debug, Clone)]
 enum FreePageState {
     Start,
-    AddToTrunk {
-        page: Arc<Page>,
-        trunk_page: Option<Arc<Page>>,
-    },
-    NewTrunk {
-        page: Arc<Page>,
-    },
+    AddToTrunk { page: Arc<Page> },
+    NewTrunk { page: Arc<Page> },
 }
 
 impl Pager {
@@ -1741,25 +1736,19 @@ impl Pager {
                     let trunk_page_id = header.freelist_trunk_page.get();
 
                     if trunk_page_id != 0 {
-                        *state = FreePageState::AddToTrunk {
-                            page,
-                            trunk_page: None,
-                        };
+                        *state = FreePageState::AddToTrunk { page };
                     } else {
                         *state = FreePageState::NewTrunk { page };
                     }
                 }
-                FreePageState::AddToTrunk { page, trunk_page } => {
+                FreePageState::AddToTrunk { page } => {
                     let trunk_page_id = header.freelist_trunk_page.get();
-                    if trunk_page.is_none() {
-                        // Add as leaf to current trunk
-                        let (page, c) = self.read_page(trunk_page_id as usize)?;
-                        trunk_page.replace(page);
-                        if let Some(c) = c {
+                    let (trunk_page, c) = self.read_page(trunk_page_id as usize)?;
+                    if let Some(c) = c {
+                        if !c.is_completed() {
                             io_yield_one!(c);
                         }
                     }
-                    let trunk_page = trunk_page.as_ref().unwrap();
                     turso_assert!(trunk_page.is_loaded(), "trunk_page should be loaded");
 
                     let trunk_page_contents = trunk_page.get_contents();
@@ -1775,7 +1764,7 @@ impl Pager {
                             trunk_page.get().id == trunk_page_id as usize,
                             "trunk page has unexpected id"
                         );
-                        self.add_dirty(trunk_page);
+                        self.add_dirty(&trunk_page);
 
                         trunk_page_contents.write_u32_no_offset(
                             TRUNK_PAGE_LEAF_COUNT_OFFSET,

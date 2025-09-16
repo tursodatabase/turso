@@ -8,15 +8,15 @@
 use crate::incremental::dbsp::{Delta, DeltaPair};
 use crate::incremental::expr_compiler::CompiledExpression;
 use crate::incremental::operator::{
-    EvalState, FilterOperator, FilterPredicate, IncrementalOperator, InputOperator, ProjectOperator,
+    create_dbsp_state_index, DbspStateCursors, EvalState, FilterOperator, FilterPredicate,
+    IncrementalOperator, InputOperator, ProjectOperator,
 };
-use crate::incremental::persistence::WriteRow;
-use crate::storage::btree::BTreeCursor;
+use crate::storage::btree::{BTreeCursor, BTreeKey};
 // Note: logical module must be made pub(crate) in translate/mod.rs
 use crate::translate::logical::{
     BinaryOperator, LogicalExpr, LogicalPlan, LogicalSchema, SchemaRef,
 };
-use crate::types::{IOResult, SeekKey, Value};
+use crate::types::{IOResult, ImmutableRecord, SeekKey, SeekOp, SeekResult, Value};
 use crate::Pager;
 use crate::{return_and_restore_if_io, return_if_io, LimboError, Result};
 use std::collections::HashMap;
@@ -24,8 +24,120 @@ use std::fmt::{self, Display, Formatter};
 use std::rc::Rc;
 use std::sync::Arc;
 
-// The state table is always a key-value store with 3 columns: key, state, and weight.
-const OPERATOR_COLUMNS: usize = 3;
+// The state table has 5 columns: operator_id, zset_id, element_id, value, weight
+const OPERATOR_COLUMNS: usize = 5;
+
+/// State machine for writing rows to simple materialized views (table-only, no index)
+#[derive(Debug, Default)]
+pub enum WriteRowView {
+    #[default]
+    GetRecord,
+    Delete,
+    Insert {
+        final_weight: isize,
+    },
+    Done,
+}
+
+impl WriteRowView {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Write a row with weight management for table-only storage.
+    ///
+    /// # Arguments
+    /// * `cursor` - BTree cursor for the storage
+    /// * `key` - The key to seek (TableRowId)
+    /// * `build_record` - Function that builds the record values to insert.
+    ///   Takes the final_weight and returns the complete record values.
+    /// * `weight` - The weight delta to apply
+    pub fn write_row(
+        &mut self,
+        cursor: &mut BTreeCursor,
+        key: SeekKey,
+        build_record: impl Fn(isize) -> Vec<Value>,
+        weight: isize,
+    ) -> Result<IOResult<()>> {
+        loop {
+            match self {
+                WriteRowView::GetRecord => {
+                    let res = return_if_io!(cursor.seek(key.clone(), SeekOp::GE { eq_only: true }));
+                    if !matches!(res, SeekResult::Found) {
+                        *self = WriteRowView::Insert {
+                            final_weight: weight,
+                        };
+                    } else {
+                        let existing_record = return_if_io!(cursor.record());
+                        let r = existing_record.ok_or_else(|| {
+                            LimboError::InternalError(format!(
+                                "Found key {key:?} in storage but could not read record"
+                            ))
+                        })?;
+                        let values = r.get_values();
+
+                        // Weight is always the last value
+                        let existing_weight = match values.last() {
+                            Some(val) => match val.to_owned() {
+                                Value::Integer(w) => w as isize,
+                                _ => {
+                                    return Err(LimboError::InternalError(format!(
+                                        "Invalid weight value in storage for key {key:?}"
+                                    )))
+                                }
+                            },
+                            None => {
+                                return Err(LimboError::InternalError(format!(
+                                    "No weight value found in storage for key {key:?}"
+                                )))
+                            }
+                        };
+
+                        let final_weight = existing_weight + weight;
+                        if final_weight <= 0 {
+                            *self = WriteRowView::Delete
+                        } else {
+                            *self = WriteRowView::Insert { final_weight }
+                        }
+                    }
+                }
+                WriteRowView::Delete => {
+                    // Mark as Done before delete to avoid retry on I/O
+                    *self = WriteRowView::Done;
+                    return_if_io!(cursor.delete());
+                }
+                WriteRowView::Insert { final_weight } => {
+                    return_if_io!(cursor.seek(key.clone(), SeekOp::GE { eq_only: true }));
+
+                    // Extract the row ID from the key
+                    let key_i64 = match key {
+                        SeekKey::TableRowId(id) => id,
+                        _ => {
+                            return Err(LimboError::InternalError(
+                                "Expected TableRowId for storage".to_string(),
+                            ))
+                        }
+                    };
+
+                    // Build the record values using the provided function
+                    let record_values = build_record(*final_weight);
+
+                    // Create an ImmutableRecord from the values
+                    let immutable_record =
+                        ImmutableRecord::from_values(&record_values, record_values.len());
+                    let btree_key = BTreeKey::new_table_rowid(key_i64, Some(&immutable_record));
+
+                    // Mark as Done before insert to avoid retry on I/O
+                    *self = WriteRowView::Done;
+                    return_if_io!(cursor.insert(&btree_key));
+                }
+                WriteRowView::Done => {
+                    return Ok(IOResult::Done(()));
+                }
+            }
+        }
+    }
+}
 
 /// State machine for commit operations
 pub enum CommitState {
@@ -36,8 +148,8 @@ pub enum CommitState {
     CommitOperators {
         /// Execute state for running the circuit
         execute_state: Box<ExecuteState>,
-        /// Persistent cursor for operator state btree (internal_state_root)
-        state_cursor: Box<BTreeCursor>,
+        /// Persistent cursors for operator state (table and index)
+        state_cursors: Box<DbspStateCursors>,
     },
 
     /// Updating the materialized view with the delta
@@ -47,7 +159,7 @@ pub enum CommitState {
         /// Current index in delta.changes being processed
         current_index: usize,
         /// State for writing individual rows
-        write_row_state: WriteRow,
+        write_row_state: WriteRowView,
         /// Cursor for view data btree - created fresh for each row
         view_cursor: Box<BTreeCursor>,
     },
@@ -60,7 +172,8 @@ impl std::fmt::Debug for CommitState {
             Self::CommitOperators { execute_state, .. } => f
                 .debug_struct("CommitOperators")
                 .field("execute_state", execute_state)
-                .field("has_state_cursor", &true)
+                .field("has_state_table_cursor", &true)
+                .field("has_state_index_cursor", &true)
                 .finish(),
             Self::UpdateView {
                 delta,
@@ -221,24 +334,12 @@ impl std::fmt::Debug for DbspNode {
 impl DbspNode {
     fn process_node(
         &mut self,
-        pager: Rc<Pager>,
         eval_state: &mut EvalState,
-        root_page: usize,
         commit_operators: bool,
-        state_cursor: Option<&mut Box<BTreeCursor>>,
+        cursors: &mut DbspStateCursors,
     ) -> Result<IOResult<Delta>> {
         // Process delta using the executable operator
         let op = &mut self.executable;
-
-        // Use provided cursor or create a local one
-        let mut local_cursor;
-        let cursor = if let Some(cursor) = state_cursor {
-            cursor.as_mut()
-        } else {
-            // Create a local cursor if none was provided
-            local_cursor = BTreeCursor::new_table(None, pager.clone(), root_page, OPERATOR_COLUMNS);
-            &mut local_cursor
-        };
 
         let state = if commit_operators {
             // Clone the deltas from eval_state - don't extract them
@@ -247,12 +348,12 @@ impl DbspNode {
                 EvalState::Init { deltas } => deltas.clone(),
                 _ => panic!("commit can only be called when eval_state is in Init state"),
             };
-            let result = return_if_io!(op.commit(deltas, cursor));
+            let result = return_if_io!(op.commit(deltas, cursors));
             // After successful commit, move state to Done
             *eval_state = EvalState::Done;
             result
         } else {
-            return_if_io!(op.eval(eval_state, cursor))
+            return_if_io!(op.eval(eval_state, cursors))
         };
         Ok(IOResult::Done(state))
     }
@@ -275,14 +376,20 @@ pub struct DbspCircuit {
 
     /// Root page for the main materialized view data
     pub(super) main_data_root: usize,
-    /// Root page for internal DBSP state
+    /// Root page for internal DBSP state table
     pub(super) internal_state_root: usize,
+    /// Root page for the DBSP state table's primary key index
+    pub(super) internal_state_index_root: usize,
 }
 
 impl DbspCircuit {
     /// Create a new empty circuit with initial empty schema
     /// The actual output schema will be set when the root node is established
-    pub fn new(main_data_root: usize, internal_state_root: usize) -> Self {
+    pub fn new(
+        main_data_root: usize,
+        internal_state_root: usize,
+        internal_state_index_root: usize,
+    ) -> Self {
         // Start with an empty schema - will be updated when root is set
         let empty_schema = Arc::new(LogicalSchema::new(vec![]));
         Self {
@@ -293,6 +400,7 @@ impl DbspCircuit {
             commit_state: CommitState::Init,
             main_data_root,
             internal_state_root,
+            internal_state_index_root,
         }
     }
 
@@ -326,18 +434,18 @@ impl DbspCircuit {
 
     pub fn run_circuit(
         &mut self,
-        pager: Rc<Pager>,
         execute_state: &mut ExecuteState,
+        pager: &Rc<Pager>,
+        state_cursors: &mut DbspStateCursors,
         commit_operators: bool,
-        state_cursor: &mut Box<BTreeCursor>,
     ) -> Result<IOResult<Delta>> {
         if let Some(root_id) = self.root {
             self.execute_node(
                 root_id,
-                pager,
+                pager.clone(),
                 execute_state,
                 commit_operators,
-                Some(state_cursor),
+                state_cursors,
             )
         } else {
             Err(LimboError::ParseError(
@@ -358,7 +466,23 @@ impl DbspCircuit {
         execute_state: &mut ExecuteState,
     ) -> Result<IOResult<Delta>> {
         if let Some(root_id) = self.root {
-            self.execute_node(root_id, pager, execute_state, false, None)
+            // Create temporary cursors for execute (non-commit) operations
+            let table_cursor = BTreeCursor::new_table(
+                None,
+                pager.clone(),
+                self.internal_state_root,
+                OPERATOR_COLUMNS,
+            );
+            let index_def = create_dbsp_state_index(self.internal_state_index_root);
+            let index_cursor = BTreeCursor::new_index(
+                None,
+                pager.clone(),
+                self.internal_state_index_root,
+                &index_def,
+                3,
+            );
+            let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
+            self.execute_node(root_id, pager, execute_state, false, &mut cursors)
         } else {
             Err(LimboError::ParseError(
                 "Circuit has no root node".to_string(),
@@ -398,29 +522,42 @@ impl DbspCircuit {
             let mut state = std::mem::replace(&mut self.commit_state, CommitState::Init);
             match &mut state {
                 CommitState::Init => {
-                    // Create state cursor when entering CommitOperators state
-                    let state_cursor = Box::new(BTreeCursor::new_table(
+                    // Create state cursors when entering CommitOperators state
+                    let state_table_cursor = BTreeCursor::new_table(
                         None,
                         pager.clone(),
                         self.internal_state_root,
                         OPERATOR_COLUMNS,
+                    );
+                    let index_def = create_dbsp_state_index(self.internal_state_index_root);
+                    let state_index_cursor = BTreeCursor::new_index(
+                        None,
+                        pager.clone(),
+                        self.internal_state_index_root,
+                        &index_def,
+                        3, // Index on first 3 columns
+                    );
+
+                    let state_cursors = Box::new(DbspStateCursors::new(
+                        state_table_cursor,
+                        state_index_cursor,
                     ));
 
                     self.commit_state = CommitState::CommitOperators {
                         execute_state: Box::new(ExecuteState::Init {
                             input_data: input_delta_set.clone(),
                         }),
-                        state_cursor,
+                        state_cursors,
                     };
                 }
                 CommitState::CommitOperators {
                     ref mut execute_state,
-                    ref mut state_cursor,
+                    ref mut state_cursors,
                 } => {
                     let delta = return_and_restore_if_io!(
                         &mut self.commit_state,
                         state,
-                        self.run_circuit(pager.clone(), execute_state, true, state_cursor)
+                        self.run_circuit(execute_state, &pager, state_cursors, true,)
                     );
 
                     // Create view cursor when entering UpdateView state
@@ -434,7 +571,7 @@ impl DbspCircuit {
                     self.commit_state = CommitState::UpdateView {
                         delta,
                         current_index: 0,
-                        write_row_state: WriteRow::new(),
+                        write_row_state: WriteRowView::new(),
                         view_cursor,
                     };
                 }
@@ -453,7 +590,7 @@ impl DbspCircuit {
 
                         // If we're starting a new row (GetRecord state), we need a fresh cursor
                         // due to btree cursor state machine limitations
-                        if matches!(write_row_state, WriteRow::GetRecord) {
+                        if matches!(write_row_state, WriteRowView::GetRecord) {
                             *view_cursor = Box::new(BTreeCursor::new_table(
                                 None,
                                 pager.clone(),
@@ -493,7 +630,7 @@ impl DbspCircuit {
                         self.commit_state = CommitState::UpdateView {
                             delta,
                             current_index: *current_index + 1,
-                            write_row_state: WriteRow::new(),
+                            write_row_state: WriteRowView::new(),
                             view_cursor,
                         };
                     }
@@ -509,7 +646,7 @@ impl DbspCircuit {
         pager: Rc<Pager>,
         execute_state: &mut ExecuteState,
         commit_operators: bool,
-        state_cursor: Option<&mut Box<BTreeCursor>>,
+        cursors: &mut DbspStateCursors,
     ) -> Result<IOResult<Delta>> {
         loop {
             match execute_state {
@@ -577,12 +714,30 @@ impl DbspCircuit {
                         // Get the (node_id, state) pair for the current index
                         let (input_node_id, input_state) = &mut input_states[*current_index];
 
+                        // Create temporary cursors for the recursive call
+                        let temp_table_cursor = BTreeCursor::new_table(
+                            None,
+                            pager.clone(),
+                            self.internal_state_root,
+                            OPERATOR_COLUMNS,
+                        );
+                        let index_def = create_dbsp_state_index(self.internal_state_index_root);
+                        let temp_index_cursor = BTreeCursor::new_index(
+                            None,
+                            pager.clone(),
+                            self.internal_state_index_root,
+                            &index_def,
+                            3,
+                        );
+                        let mut temp_cursors =
+                            DbspStateCursors::new(temp_table_cursor, temp_index_cursor);
+
                         let delta = return_if_io!(self.execute_node(
                             *input_node_id,
                             pager.clone(),
                             input_state,
                             commit_operators,
-                            None // Input nodes don't need state cursor
+                            &mut temp_cursors
                         ));
                         input_deltas.push(delta);
                         *current_index += 1;
@@ -595,13 +750,8 @@ impl DbspCircuit {
                         .get_mut(&node_id)
                         .ok_or_else(|| LimboError::ParseError("Node not found".to_string()))?;
 
-                    let output_delta = return_if_io!(node.process_node(
-                        pager.clone(),
-                        eval_state,
-                        self.internal_state_root,
-                        commit_operators,
-                        state_cursor,
-                    ));
+                    let output_delta =
+                        return_if_io!(node.process_node(eval_state, commit_operators, cursors));
                     return Ok(IOResult::Done(output_delta));
                 }
             }
@@ -660,9 +810,17 @@ pub struct DbspCompiler {
 
 impl DbspCompiler {
     /// Create a new DBSP compiler
-    pub fn new(main_data_root: usize, internal_state_root: usize) -> Self {
+    pub fn new(
+        main_data_root: usize,
+        internal_state_root: usize,
+        internal_state_index_root: usize,
+    ) -> Self {
         Self {
-            circuit: DbspCircuit::new(main_data_root, internal_state_root),
+            circuit: DbspCircuit::new(
+                main_data_root,
+                internal_state_root,
+                internal_state_index_root,
+            ),
         }
     }
 
@@ -781,9 +939,9 @@ impl DbspCompiler {
                         use crate::function::AggFunc;
                         use crate::incremental::operator::AggregateFunction;
 
-                        let agg_fn = match fun {
+                        match fun {
                             AggFunc::Count | AggFunc::Count0 => {
-                                AggregateFunction::Count
+                                aggregate_functions.push(AggregateFunction::Count);
                             }
                             AggFunc::Sum => {
                                 if args.is_empty() {
@@ -791,7 +949,7 @@ impl DbspCompiler {
                                 }
                                 // Extract column name from the argument
                                 if let LogicalExpr::Column(col) = &args[0] {
-                                    AggregateFunction::Sum(col.name.clone())
+                                    aggregate_functions.push(AggregateFunction::Sum(col.name.clone()));
                                 } else {
                                     return Err(LimboError::ParseError(
                                         "Only column references are supported in aggregate functions for incremental views".to_string()
@@ -803,36 +961,43 @@ impl DbspCompiler {
                                     return Err(LimboError::ParseError("AVG requires an argument".to_string()));
                                 }
                                 if let LogicalExpr::Column(col) = &args[0] {
-                                    AggregateFunction::Avg(col.name.clone())
+                                    aggregate_functions.push(AggregateFunction::Avg(col.name.clone()));
                                 } else {
                                     return Err(LimboError::ParseError(
                                         "Only column references are supported in aggregate functions for incremental views".to_string()
                                     ));
                                 }
                             }
-                            // MIN and MAX are not supported in incremental views due to storage overhead.
-                            // To correctly handle deletions, these operators would need to track all values
-                            // in each group, resulting in O(n) storage overhead. This is prohibitive for
-                            // large datasets. Alternative approaches like maintaining sorted indexes still
-                            // require O(n) storage. Until a more efficient solution is found, MIN/MAX
-                            // aggregations are not supported in materialized views.
                             AggFunc::Min => {
-                                return Err(LimboError::ParseError(
-                                    "MIN aggregation is not supported in incremental materialized views due to O(n) storage overhead required for handling deletions".to_string()
-                                ));
+                                if args.is_empty() {
+                                    return Err(LimboError::ParseError("MIN requires an argument".to_string()));
+                                }
+                                if let LogicalExpr::Column(col) = &args[0] {
+                                    aggregate_functions.push(AggregateFunction::Min(col.name.clone()));
+                                } else {
+                                    return Err(LimboError::ParseError(
+                                        "Only column references are supported in MIN for incremental views".to_string()
+                                    ));
+                                }
                             }
                             AggFunc::Max => {
-                                return Err(LimboError::ParseError(
-                                    "MAX aggregation is not supported in incremental materialized views due to O(n) storage overhead required for handling deletions".to_string()
-                                ));
+                                if args.is_empty() {
+                                    return Err(LimboError::ParseError("MAX requires an argument".to_string()));
+                                }
+                                if let LogicalExpr::Column(col) = &args[0] {
+                                    aggregate_functions.push(AggregateFunction::Max(col.name.clone()));
+                                } else {
+                                    return Err(LimboError::ParseError(
+                                        "Only column references are supported in MAX for incremental views".to_string()
+                                    ));
+                                }
                             }
                             _ => {
                                 return Err(LimboError::ParseError(
                                     format!("Unsupported aggregate function in DBSP compiler: {fun:?}")
                                 ));
                             }
-                        };
-                        aggregate_functions.push(agg_fn);
+                        }
                     } else {
                         return Err(LimboError::ParseError(
                             "Expected aggregate function in aggregate expressions".to_string()
@@ -840,19 +1005,17 @@ impl DbspCompiler {
                     }
                 }
 
-                // Create the AggregateOperator with a unique operator_id
-                // Use the next_node_id as the operator_id to ensure uniqueness
                 let operator_id = self.circuit.next_id;
+
                 use crate::incremental::operator::AggregateOperator;
                 let executable: Box<dyn IncrementalOperator> = Box::new(AggregateOperator::new(
-                    operator_id,  // Use next_node_id as operator_id
-                    group_by_columns,
+                    operator_id,
+                    group_by_columns.clone(),
                     aggregate_functions.clone(),
-                    input_column_names,
+                    input_column_names.clone(),
                 ));
 
-                // Create aggregate node
-                let node_id = self.circuit.add_node(
+                let result_node_id = self.circuit.add_node(
                     DbspOperator::Aggregate {
                         group_exprs: dbsp_group_exprs,
                         aggr_exprs: aggregate_functions,
@@ -861,7 +1024,8 @@ impl DbspCompiler {
                     vec![input_id],
                     executable,
                 );
-                Ok(node_id)
+
+                Ok(result_node_id)
             }
             LogicalPlan::TableScan(scan) => {
                 // Create input node with InputOperator for uniform handling
@@ -1252,7 +1416,7 @@ mod tests {
         }};
     }
 
-    fn setup_btree_for_circuit() -> (Rc<Pager>, usize, usize) {
+    fn setup_btree_for_circuit() -> (Rc<Pager>, usize, usize, usize) {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db = Database::open_file(io.clone(), ":memory:", false, false).unwrap();
         let conn = db.connect().unwrap();
@@ -1270,13 +1434,24 @@ mod tests {
             .block(|| pager.btree_create(&CreateBTreeFlags::new_table()))
             .unwrap() as usize;
 
-        (pager, main_root_page, dbsp_state_page)
+        let dbsp_state_index_page = pager
+            .io
+            .block(|| pager.btree_create(&CreateBTreeFlags::new_index()))
+            .unwrap() as usize;
+
+        (
+            pager,
+            main_root_page,
+            dbsp_state_page,
+            dbsp_state_index_page,
+        )
     }
 
     // Macro to compile SQL to DBSP circuit
     macro_rules! compile_sql {
         ($sql:expr) => {{
-            let (pager, main_root_page, dbsp_state_page) = setup_btree_for_circuit();
+            let (pager, main_root_page, dbsp_state_page, dbsp_state_index_page) =
+                setup_btree_for_circuit();
             let schema = test_schema!();
             let mut parser = Parser::new($sql.as_bytes());
             let cmd = parser
@@ -1289,7 +1464,7 @@ mod tests {
                     let mut builder = LogicalPlanBuilder::new(&schema);
                     let logical_plan = builder.build_statement(&stmt).unwrap();
                     (
-                        DbspCompiler::new(main_root_page, dbsp_state_page)
+                        DbspCompiler::new(main_root_page, dbsp_state_page, dbsp_state_index_page)
                             .compile(&logical_plan)
                             .unwrap(),
                         pager,
@@ -3162,10 +3337,10 @@ mod tests {
 
     #[test]
     fn test_circuit_rowid_update_consolidation() {
-        let (pager, p1, p2) = setup_btree_for_circuit();
+        let (pager, p1, p2, p3) = setup_btree_for_circuit();
 
         // Test that circuit properly consolidates state when rowid changes
-        let mut circuit = DbspCircuit::new(p1, p2);
+        let mut circuit = DbspCircuit::new(p1, p2, p3);
 
         // Create a simple filter node
         let schema = Arc::new(LogicalSchema::new(vec![

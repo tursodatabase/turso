@@ -355,6 +355,109 @@ fn test_mvcc_concurrent_insert_basic() {
     );
 }
 
+#[test]
+fn test_mvcc_update_same_row_twice() {
+    let tmp_db = TempDatabase::new_with_opts(
+        "test_mvcc_update_same_row_twice.db",
+        turso_core::DatabaseOpts::new().with_mvcc(true),
+    );
+    let conn1 = tmp_db.connect_limbo();
+
+    conn1
+        .execute("CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT)")
+        .unwrap();
+
+    conn1
+        .execute("INSERT INTO test (id, value) VALUES (1, 'first')")
+        .unwrap();
+
+    conn1
+        .execute("UPDATE test SET value = 'second' WHERE id = 1")
+        .unwrap();
+
+    let stmt = conn1
+        .query("SELECT value FROM test WHERE id = 1")
+        .unwrap()
+        .unwrap();
+    let row = helper_read_single_row(stmt);
+    let Value::Text(value) = &row[0] else {
+        panic!("expected text value");
+    };
+    assert_eq!(value.as_str(), "second");
+
+    conn1
+        .execute("UPDATE test SET value = 'third' WHERE id = 1")
+        .unwrap();
+
+    let stmt = conn1
+        .query("SELECT value FROM test WHERE id = 1")
+        .unwrap()
+        .unwrap();
+    let row = helper_read_single_row(stmt);
+    let Value::Text(value) = &row[0] else {
+        panic!("expected text value");
+    };
+    assert_eq!(value.as_str(), "third");
+}
+
+#[test]
+fn test_mvcc_concurrent_conflicting_update() {
+    let tmp_db = TempDatabase::new_with_opts(
+        "test_mvcc_concurrent_conflicting_update.db",
+        turso_core::DatabaseOpts::new().with_mvcc(true),
+    );
+    let conn1 = tmp_db.connect_limbo();
+    let conn2 = tmp_db.connect_limbo();
+
+    conn1
+        .execute("CREATE TABLE test (id INTEGER, value TEXT)")
+        .unwrap();
+
+    conn1
+        .execute("INSERT INTO test (id, value) VALUES (1, 'first')")
+        .unwrap();
+
+    conn1.execute("BEGIN CONCURRENT").unwrap();
+    conn2.execute("BEGIN CONCURRENT").unwrap();
+
+    conn1
+        .execute("UPDATE test SET value = 'second' WHERE id = 1")
+        .unwrap();
+    let err = conn2
+        .execute("UPDATE test SET value = 'third' WHERE id = 1")
+        .expect_err("expected error");
+    assert!(matches!(err, LimboError::WriteWriteConflict));
+}
+
+#[test]
+fn test_mvcc_concurrent_conflicting_update_2() {
+    let tmp_db = TempDatabase::new_with_opts(
+        "test_mvcc_concurrent_conflicting_update.db",
+        turso_core::DatabaseOpts::new().with_mvcc(true),
+    );
+    let conn1 = tmp_db.connect_limbo();
+    let conn2 = tmp_db.connect_limbo();
+
+    conn1
+        .execute("CREATE TABLE test (id INTEGER, value TEXT)")
+        .unwrap();
+
+    conn1
+        .execute("INSERT INTO test (id, value) VALUES (1, 'first'), (2, 'first')")
+        .unwrap();
+
+    conn1.execute("BEGIN CONCURRENT").unwrap();
+    conn2.execute("BEGIN CONCURRENT").unwrap();
+
+    conn1
+        .execute("UPDATE test SET value = 'second' WHERE id = 1")
+        .unwrap();
+    let err = conn2
+        .execute("UPDATE test SET value = 'third' WHERE id BETWEEN 0 AND 10")
+        .expect_err("expected error");
+    assert!(matches!(err, LimboError::WriteWriteConflict));
+}
+
 fn helper_read_all_rows(mut stmt: turso_core::Statement) -> Vec<Vec<Value>> {
     let mut ret = Vec::new();
     loop {

@@ -2,7 +2,7 @@ use crate::schema::{Schema, DBSP_TABLE_PREFIX};
 use crate::storage::pager::CreateBTreeFlags;
 use crate::translate::emitter::Resolver;
 use crate::translate::schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
-use crate::util::normalize_ident;
+use crate::util::{normalize_ident, PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX};
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{CmpInsFlags, Cookie, Insn, RegisterOrLiteral};
 use crate::{Connection, Result, SymbolTable};
@@ -141,7 +141,20 @@ pub fn translate_create_materialized_view(
 
     // Add the DBSP state table to sqlite_master (required for materialized views)
     let dbsp_table_name = format!("{DBSP_TABLE_PREFIX}{normalized_view_name}");
-    let dbsp_sql = format!("CREATE TABLE {dbsp_table_name} (key INTEGER PRIMARY KEY, state BLOB)");
+    // The element_id column uses SQLite's dynamic typing system to store different value types:
+    // - For hash-based operators (joins, filters): stores INTEGER hash values or rowids
+    // - For future MIN/MAX operators: stores the actual values being compared (INTEGER, REAL, TEXT, BLOB)
+    // SQLite's type affinity and sorting rules ensure correct ordering within each operator's data
+    let dbsp_sql = format!(
+        "CREATE TABLE {dbsp_table_name} (\
+         operator_id INTEGER NOT NULL, \
+         zset_id INTEGER NOT NULL, \
+         element_id NOT NULL, \
+         value BLOB, \
+         weight INTEGER NOT NULL, \
+         PRIMARY KEY (operator_id, zset_id, element_id)\
+        )"
+    );
 
     emit_schema_entry(
         &mut program,
@@ -155,11 +168,37 @@ pub fn translate_create_materialized_view(
         Some(dbsp_sql),
     )?;
 
+    // Create automatic primary key index for the DBSP table
+    // Since the table has PRIMARY KEY (operator_id, zset_id, element_id), we need an index
+    let dbsp_index_root_reg = program.alloc_register();
+    program.emit_insn(Insn::CreateBtree {
+        db: 0,
+        root: dbsp_index_root_reg,
+        flags: CreateBTreeFlags::new_index(),
+    });
+
+    // Register the index in sqlite_schema
+    let dbsp_index_name = format!(
+        "{}{}_1",
+        PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX, &dbsp_table_name
+    );
+    emit_schema_entry(
+        &mut program,
+        &resolver,
+        sqlite_schema_cursor_id,
+        None, // cdc_table_cursor_id
+        SchemaEntryType::Index,
+        &dbsp_index_name,
+        &dbsp_table_name,
+        dbsp_index_root_reg,
+        None, // Automatic indexes don't store SQL
+    )?;
+
     // Parse schema to load the new view and DBSP state table
     program.emit_insn(Insn::ParseSchema {
         db: sqlite_schema_cursor_id,
         where_clause: Some(format!(
-            "name = '{normalized_view_name}' OR name = '{dbsp_table_name}'"
+            "name = '{normalized_view_name}' OR name = '{dbsp_table_name}' OR name = '{dbsp_index_name}'"
         )),
     });
 

@@ -2157,7 +2157,7 @@ impl BTreeCursor {
         (cmp, found)
     }
 
-    #[instrument(skip_all, level = Level::INFO)]
+    #[instrument(skip_all, level = Level::DEBUG)]
     pub fn move_to(&mut self, key: SeekKey<'_>, cmp: SeekOp) -> Result<IOResult<()>> {
         turso_assert!(
             self.mv_cursor.is_none(),
@@ -3542,17 +3542,20 @@ impl BTreeCursor {
                             usable_space,
                         )?;
                         let overflow_cell_count_after = parent_contents.overflow_cells.len();
-                        let divider_cell_is_overflow_cell =
-                            overflow_cell_count_after > overflow_cell_count_before;
                         #[cfg(debug_assertions)]
-                        BTreeCursor::validate_balance_non_root_divider_cell_insertion(
-                            balance_info,
-                            parent_contents,
-                            divider_cell_insert_idx_in_parent,
-                            divider_cell_is_overflow_cell,
-                            page,
-                            usable_space,
-                        );
+                        {
+                            let divider_cell_is_overflow_cell =
+                                overflow_cell_count_after > overflow_cell_count_before;
+
+                            BTreeCursor::validate_balance_non_root_divider_cell_insertion(
+                                balance_info,
+                                parent_contents,
+                                divider_cell_insert_idx_in_parent,
+                                divider_cell_is_overflow_cell,
+                                page,
+                                usable_space,
+                            );
+                        }
                     }
                     tracing::debug!(
                         "balance_non_root(parent_overflow={})",
@@ -4625,7 +4628,7 @@ impl BTreeCursor {
                         }
                     };
                     let row = crate::mvcc::database::Row::new(row_id, record_buf, num_columns);
-                    mv_cursor.borrow_mut().insert(row).unwrap();
+                    mv_cursor.borrow_mut().insert(row)?;
                 }
                 None => todo!("Support mvcc inserts with index btrees"),
             },
@@ -4655,7 +4658,7 @@ impl BTreeCursor {
     pub fn delete(&mut self) -> Result<IOResult<()>> {
         if let Some(mv_cursor) = &self.mv_cursor {
             let rowid = mv_cursor.borrow_mut().current_row_id().unwrap();
-            mv_cursor.borrow_mut().delete(rowid, self.pager.clone())?;
+            mv_cursor.borrow_mut().delete(rowid)?;
             return Ok(IOResult::Done(()));
         }
 

@@ -1,6 +1,7 @@
 #![allow(unused)]
 use crate::incremental::view::IncrementalView;
 use crate::numeric::StrToF64;
+use crate::translate::emitter::TransactionMode;
 use crate::translate::expr::WalkControl;
 use crate::types::IOResult;
 use crate::{
@@ -150,10 +151,10 @@ pub fn parse_schema_rows(
     mut rows: Statement,
     schema: &mut Schema,
     syms: &SymbolTable,
-    mv_tx_id: Option<u64>,
+    mv_tx: Option<(u64, TransactionMode)>,
     mut existing_views: HashMap<String, Arc<Mutex<IncrementalView>>>,
 ) -> Result<()> {
-    rows.set_mv_tx_id(mv_tx_id);
+    rows.set_mv_tx(mv_tx);
     // TODO: if we IO, this unparsed indexes is lost. Will probably need some state between
     // IO runs
     let mut from_sql_indexes = Vec::with_capacity(10);
@@ -161,6 +162,9 @@ pub fn parse_schema_rows(
 
     // Store DBSP state table root pages: view_name -> dbsp_state_root_page
     let mut dbsp_state_roots: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    // Store DBSP state table index root pages: view_name -> dbsp_state_index_root_page
+    let mut dbsp_state_index_roots: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
     // Store materialized view info (SQL and root page) for later creation
     let mut materialized_view_info: std::collections::HashMap<String, (String, usize)> =
@@ -184,8 +188,9 @@ pub fn parse_schema_rows(
                     &mut from_sql_indexes,
                     &mut automatic_indices,
                     &mut dbsp_state_roots,
+                    &mut dbsp_state_index_roots,
                     &mut materialized_view_info,
-                )?;
+                )?
             }
             StepResult::IO => {
                 // TODO: How do we ensure that the I/O we submitted to
@@ -199,7 +204,11 @@ pub fn parse_schema_rows(
     }
 
     schema.populate_indices(from_sql_indexes, automatic_indices)?;
-    schema.populate_materialized_views(materialized_view_info, dbsp_state_roots)?;
+    schema.populate_materialized_views(
+        materialized_view_info,
+        dbsp_state_roots,
+        dbsp_state_index_roots,
+    )?;
 
     Ok(())
 }

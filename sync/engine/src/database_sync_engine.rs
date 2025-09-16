@@ -246,12 +246,17 @@ impl<P: ProtocolIO> DatabaseSyncEngine<P> {
         let main_conn = connect_untracked(&self.main_tape)?;
         let change_id = self.meta().last_pushed_change_id_hint;
         let last_pull_unix_time = self.meta().last_pull_unix_time;
+        let revision = self.meta().synced_revision.clone().map(|x| match x {
+            DatabasePullRevision::Legacy {
+                generation,
+                synced_frame_no,
+            } => format!("generation={generation},synced_frame_no={synced_frame_no:?}"),
+            DatabasePullRevision::V1 { revision } => revision,
+        });
         let last_push_unix_time = self.meta().last_push_unix_time;
         let revert_wal_path = &self.revert_db_wal_path;
-        let revert_wal_file = self
-            .io
-            .open_file(revert_wal_path, OpenFlags::all(), false)?;
-        let revert_wal_size = revert_wal_file.size()?;
+        let revert_wal_file = self.io.try_open(revert_wal_path)?;
+        let revert_wal_size = revert_wal_file.map(|f| f.size()).transpose()?.unwrap_or(0);
         let main_wal_frames = main_conn.wal_state()?.max_frame;
         let main_wal_size = if main_wal_frames == 0 {
             0
@@ -264,6 +269,7 @@ impl<P: ProtocolIO> DatabaseSyncEngine<P> {
             revert_wal_size,
             last_pull_unix_time,
             last_push_unix_time,
+            revision,
         })
     }
 
@@ -416,7 +422,6 @@ impl<P: ProtocolIO> DatabaseSyncEngine<P> {
         &mut self,
         coro: &Coro<Ctx>,
         remote_changes: DbChangesStatus,
-        now: turso_core::Instant,
     ) -> Result<()> {
         assert!(remote_changes.file_slot.is_some(), "file_slot must be set");
         let changes_file = remote_changes.file_slot.as_ref().unwrap().value.clone();
@@ -436,7 +441,7 @@ impl<P: ProtocolIO> DatabaseSyncEngine<P> {
             m.revert_since_wal_watermark = revert_since_wal_watermark;
             m.synced_revision = Some(remote_changes.revision);
             m.last_pushed_change_id_hint = 0;
-            m.last_pull_unix_time = now.secs;
+            m.last_pull_unix_time = remote_changes.time.secs;
         })
         .await?;
         Ok(())
@@ -656,13 +661,12 @@ impl<P: ProtocolIO> DatabaseSyncEngine<P> {
     }
 
     pub async fn pull_changes_from_remote<Ctx>(&mut self, coro: &Coro<Ctx>) -> Result<()> {
-        let now = self.io.now();
         let changes = self.wait_changes_from_remote(coro).await?;
         if changes.file_slot.is_some() {
-            self.apply_changes_from_remote(coro, changes, now).await?;
+            self.apply_changes_from_remote(coro, changes).await?;
         } else {
             self.update_meta(coro, |m| {
-                m.last_pull_unix_time = now.secs;
+                m.last_pull_unix_time = changes.time.secs;
             })
             .await?;
         }

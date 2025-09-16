@@ -40,7 +40,6 @@ pub mod numeric;
 #[cfg(not(feature = "fuzz"))]
 mod numeric;
 
-use crate::incremental::view::AllViewsTxState;
 use crate::storage::checksum::CHECKSUM_REQUIRED_RESERVED_BYTES;
 use crate::storage::encryption::CipherMode;
 use crate::translate::pragma::TURSO_CDC_DEFAULT_TABLE_NAME;
@@ -50,6 +49,7 @@ use crate::types::{WalFrameInfo, WalState};
 use crate::util::{OpenMode, OpenOptions};
 use crate::vdbe::metrics::ConnectionMetrics;
 use crate::vtab::VirtualTable;
+use crate::{incremental::view::AllViewsTxState, translate::emitter::TransactionMode};
 use core::str;
 pub use error::{CompletionError, LimboError};
 pub use io::clock::{Clock, Instant};
@@ -75,6 +75,7 @@ use std::{
         atomic::{AtomicUsize, Ordering},
         Arc, LazyLock, Mutex, Weak,
     },
+    time::Duration,
 };
 #[cfg(feature = "fs")]
 use storage::database::DatabaseFile;
@@ -497,7 +498,6 @@ impl Database {
             ),
             database_schemas: RefCell::new(std::collections::HashMap::new()),
             auto_commit: Cell::new(true),
-            mv_transactions: RefCell::new(Vec::new()),
             transaction_state: Cell::new(TransactionState::None),
             last_insert_rowid: Cell::new(0),
             last_change: Cell::new(0),
@@ -511,7 +511,7 @@ impl Database {
             closed: Cell::new(false),
             attached_databases: RefCell::new(DatabaseCatalog::new()),
             query_only: Cell::new(false),
-            mv_tx_id: Cell::new(None),
+            mv_tx: Cell::new(None),
             view_transaction_states: AllViewsTxState::new(),
             metrics: RefCell::new(ConnectionMetrics::new()),
             is_nested_stmt: Cell::new(false),
@@ -519,6 +519,7 @@ impl Database {
             encryption_cipher_mode: Cell::new(None),
             sync_mode: Cell::new(SyncMode::Full),
             data_sync_retry: Cell::new(false),
+            busy_timeout: Cell::new(None),
         });
         self.n_connections
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -978,8 +979,6 @@ pub struct Connection {
     database_schemas: RefCell<std::collections::HashMap<usize, Arc<Schema>>>,
     /// Whether to automatically commit transaction
     auto_commit: Cell<bool>,
-    /// Transactions that are in progress.
-    mv_transactions: RefCell<Vec<crate::mvcc::database::TxID>>,
     transaction_state: Cell<TransactionState>,
     last_insert_rowid: Cell<i64>,
     last_change: Cell<i64>,
@@ -998,7 +997,7 @@ pub struct Connection {
     /// Attached databases
     attached_databases: RefCell<DatabaseCatalog>,
     query_only: Cell<bool>,
-    pub(crate) mv_tx_id: Cell<Option<crate::mvcc::database::TxID>>,
+    pub(crate) mv_tx: Cell<Option<(crate::mvcc::database::TxID, TransactionMode)>>,
 
     /// Per-connection view transaction states for uncommitted changes. This represents
     /// one entry per view that was touched in the transaction.
@@ -1012,6 +1011,8 @@ pub struct Connection {
     encryption_cipher_mode: Cell<Option<CipherMode>>,
     sync_mode: Cell<SyncMode>,
     data_sync_retry: Cell<bool>,
+    /// User defined max accumulated Busy timeout duration
+    busy_timeout: Cell<Option<std::time::Duration>>,
 }
 
 impl Drop for Connection {
@@ -2158,6 +2159,83 @@ impl Connection {
         }
         pager.set_encryption_context(cipher_mode, key)
     }
+
+    /// Sets maximum total accumuated timeout. If the duration is None or Zero, we unset the busy handler for this Connection
+    ///
+    /// This api defers slighty from: https://www.sqlite.org/c3ref/busy_timeout.html
+    ///
+    /// Instead of sleeping for linear amount of time specified by the user,
+    /// we will sleep in phases, until the the total amount of time is reached.
+    /// This means we first sleep of 1ms, then if we still return busy, we sleep for 2 ms, and repeat until a maximum of 100 ms per phase.
+    ///
+    /// Example:
+    /// 1. Set duration to 5ms
+    /// 2. Step through query -> returns Busy -> sleep/yield for 1 ms
+    /// 3. Step through query -> returns Busy -> sleep/yield for 2 ms
+    /// 4. Step through query -> returns Busy -> sleep/yield for 2 ms (totaling 5 ms of sleep)
+    /// 5. Step through query -> returns Busy -> return Busy to user
+    ///
+    /// This slight api change demonstrated a better throughtput in `perf/throughput/turso` benchmark
+    pub fn busy_timeout(&self, mut duration: Option<std::time::Duration>) {
+        duration = duration.filter(|duration| !duration.is_zero());
+        self.busy_timeout.set(duration);
+    }
+}
+
+#[derive(Debug, Default)]
+struct BusyTimeout {
+    /// Busy timeout instant
+    timeout: Option<Instant>,
+    /// Max duration of timeout set by Connection
+    max_duration: Duration,
+    /// Accumulated duration for busy timeout
+    ///
+    /// It will be decremented until it reaches 0, then after that no timeout will be emitted
+    accum_duration: Duration,
+    iteration: usize,
+}
+
+impl BusyTimeout {
+    const DELAYS: [std::time::Duration; 12] = [
+        Duration::from_millis(1),
+        Duration::from_millis(2),
+        Duration::from_millis(5),
+        Duration::from_millis(10),
+        Duration::from_millis(15),
+        Duration::from_millis(20),
+        Duration::from_millis(25),
+        Duration::from_millis(25),
+        Duration::from_millis(25),
+        Duration::from_millis(50),
+        Duration::from_millis(50),
+        Duration::from_millis(100),
+    ];
+
+    pub fn new(duration: std::time::Duration) -> Self {
+        Self {
+            timeout: None,
+            max_duration: duration,
+            iteration: 0,
+            accum_duration: duration,
+        }
+    }
+
+    pub fn initiate_timeout(&mut self, now: Instant) {
+        self.timeout = Self::DELAYS.get(self.iteration).and_then(|delay| {
+            if self.accum_duration.is_zero() {
+                None
+            } else {
+                let new_timeout = now + (*delay).min(self.accum_duration);
+                self.accum_duration = self.accum_duration.saturating_sub(*delay);
+                Some(new_timeout)
+            }
+        });
+        self.iteration = if self.iteration < Self::DELAYS.len() - 1 {
+            self.iteration + 1
+        } else {
+            self.iteration
+        };
+    }
 }
 
 pub struct Statement {
@@ -2173,6 +2251,8 @@ pub struct Statement {
     query_mode: QueryMode,
     /// Flag to show if the statement was busy
     busy: bool,
+    /// Busy timeout instant
+    busy_timeout: Option<BusyTimeout>,
 }
 
 impl Statement {
@@ -2197,6 +2277,7 @@ impl Statement {
             accesses_db,
             query_mode,
             busy: false,
+            busy_timeout: None,
         }
     }
     pub fn get_query_mode(&self) -> QueryMode {
@@ -2207,8 +2288,8 @@ impl Statement {
         self.program.n_change.get()
     }
 
-    pub fn set_mv_tx_id(&mut self, mv_tx_id: Option<u64>) {
-        self.program.connection.mv_tx_id.set(mv_tx_id);
+    pub fn set_mv_tx(&mut self, mv_tx: Option<(u64, TransactionMode)>) {
+        self.program.connection.mv_tx.set(mv_tx);
     }
 
     pub fn interrupt(&mut self) {
@@ -2216,7 +2297,19 @@ impl Statement {
     }
 
     pub fn step(&mut self) -> Result<StepResult> {
-        let res = if !self.accesses_db {
+        if let Some(busy_timeout) = self.busy_timeout.as_mut() {
+            if let Some(timeout) = busy_timeout.timeout {
+                let now = self.pager.io.now();
+
+                if now < timeout {
+                    // Yield the query as the timeout has not been reached yet
+                    return Ok(StepResult::IO);
+                }
+                // Timeout ended now continue to query execution
+            }
+        }
+
+        let mut res = if !self.accesses_db {
             self.program.step(
                 &mut self.state,
                 self.mv_store.clone(),
@@ -2255,6 +2348,18 @@ impl Statement {
             self.busy = false;
         } else {
             self.busy = true;
+        }
+
+        if matches!(res, Ok(StepResult::Busy)) {
+            self.check_if_busy_handler_set();
+            if let Some(busy_timeout) = self.busy_timeout.as_mut() {
+                busy_timeout.initiate_timeout(self.pager.io.now());
+                if busy_timeout.timeout.is_some() {
+                    // Yield instead of busy, as now we will try to wait for the timeout
+                    // before continuing execution
+                    res = Ok(StepResult::IO);
+                }
+            }
         }
 
         res
@@ -2427,6 +2532,7 @@ impl Statement {
     pub fn _reset(&mut self, max_registers: Option<usize>, max_cursors: Option<usize>) {
         self.state.reset(max_registers, max_cursors);
         self.busy = false;
+        self.check_if_busy_handler_set();
     }
 
     pub fn row(&self) -> Option<&Row> {
@@ -2439,6 +2545,30 @@ impl Statement {
 
     pub fn is_busy(&self) -> bool {
         self.busy
+    }
+
+    /// Checks if the busy handler is set in the connection and sets the handler if needed
+    fn check_if_busy_handler_set(&mut self) {
+        let conn_busy_timeout = self
+            .program
+            .connection
+            .busy_timeout
+            .get()
+            .map(BusyTimeout::new);
+        if self.busy_timeout.is_none() {
+            self.busy_timeout = conn_busy_timeout;
+            return;
+        }
+        if let Some(conn_busy_timeout) = conn_busy_timeout {
+            let busy_timeout = self
+                .busy_timeout
+                .as_mut()
+                .expect("busy timeout was checked for None above");
+            // User changed max duration, so clear previous handler and set a new one
+            if busy_timeout.max_duration != conn_busy_timeout.max_duration {
+                *busy_timeout = conn_busy_timeout;
+            }
+        }
     }
 }
 

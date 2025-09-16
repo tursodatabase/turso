@@ -927,7 +927,7 @@ pub fn begin_read_page(
     db_file.read_page(page_idx, io_ctx, c)
 }
 
-#[instrument(skip_all, level = Level::INFO)]
+#[instrument(skip_all, level = Level::DEBUG)]
 pub fn finish_read_page(page_idx: usize, buffer_ref: Arc<Buffer>, page: PageRef) {
     tracing::trace!("finish_read_page(page_idx = {page_idx})");
     let pos = if page_idx == DatabaseHeader::PAGE_ID {
