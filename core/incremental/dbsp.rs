@@ -75,6 +75,10 @@ impl HashableRow {
 
         hasher.finish()
     }
+
+    pub fn cached_hash(&self) -> u64 {
+        self.cached_hash
+    }
 }
 
 impl Hash for HashableRow {
@@ -168,7 +172,7 @@ impl Delta {
 }
 
 /// A pair of deltas for operators that process two inputs
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct DeltaPair {
     pub left: Delta,
     pub right: Delta,
