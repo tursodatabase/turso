@@ -7,9 +7,9 @@ use notify::{EventKind, RecursiveMode, Watcher};
 use rand::prelude::*;
 use runner::bugbase::{Bug, BugBase, LoadedBug};
 use runner::cli::{SimulatorCLI, SimulatorCommand};
+use runner::differential;
 use runner::env::SimulatorEnv;
 use runner::execution::{Execution, ExecutionHistory, ExecutionResult, execute_interactions};
-use runner::{differential, watch};
 use std::any::Any;
 use std::backtrace::Backtrace;
 use std::fs::OpenOptions;
@@ -168,7 +168,7 @@ fn watch_mode(env: SimulatorEnv) -> notify::Result<()> {
     // below will be monitored for changes.
     watcher.watch(&env.get_plan_path(), RecursiveMode::NonRecursive)?;
     // Block forever, printing out events as they come in
-    let last_execution = Arc::new(Mutex::new(Execution::new(0, 0, 0)));
+    let last_execution = Arc::new(Mutex::new(Execution::new(0, 0)));
     for res in rx {
         match res {
             Ok(event) => {
@@ -179,8 +179,7 @@ fn watch_mode(env: SimulatorEnv) -> notify::Result<()> {
                     let result = SandboxedResult::from(
                         std::panic::catch_unwind(move || {
                             let mut env = env;
-                            let plan: Vec<Vec<Interaction>> =
-                                InteractionPlan::compute_via_diff(&env.get_plan_path());
+                            let plan = InteractionPlan::compute_via_diff(&env.get_plan_path());
                             tracing::error!("plan_len: {}", plan.len());
                             env.clear();
 
@@ -191,7 +190,7 @@ fn watch_mode(env: SimulatorEnv) -> notify::Result<()> {
                             // });
 
                             let env = Arc::new(Mutex::new(env.clone_without_connections()));
-                            watch::run_simulation(env, &mut [plan], last_execution_.clone())
+                            run_simulation_default(env, plan, last_execution_.clone())
                         }),
                         last_execution.clone(),
                     );
@@ -236,11 +235,12 @@ fn run_simulator(
         tracing::error!("captured backtrace:\n{}", bt);
     }));
 
-    let last_execution = Arc::new(Mutex::new(Execution::new(0, 0, 0)));
+    let last_execution = Arc::new(Mutex::new(Execution::new(0, 0)));
     let env = Arc::new(Mutex::new(env));
     let result = SandboxedResult::from(
         std::panic::catch_unwind(|| {
-            run_simulation(env.clone(), &mut plan.clone(), last_execution.clone())
+            let interactions = plan.interactions_list().collect::<Vec<_>>();
+            run_simulation(env.clone(), interactions, last_execution.clone())
         }),
         last_execution.clone(),
     );
@@ -270,10 +270,8 @@ fn run_simulator(
                 for execution in history.history.iter() {
                     writeln!(
                         f,
-                        "{} {} {}",
-                        execution.connection_index,
-                        execution.interaction_index,
-                        execution.secondary_index
+                        "{} {}",
+                        execution.connection_index, execution.interaction_index,
                     )
                     .unwrap();
                 }
@@ -308,17 +306,15 @@ fn run_simulator(
                 let env = Arc::new(Mutex::new(env));
                 let shrunk = SandboxedResult::from(
                     std::panic::catch_unwind(|| {
-                        run_simulation(
-                            env.clone(),
-                            &mut shrunk_plan.clone(),
-                            last_execution.clone(),
-                        )
+                        let interactions = shrunk_plan.interactions_list().collect::<Vec<_>>();
+
+                        run_simulation(env.clone(), interactions, last_execution.clone())
                     }),
                     last_execution,
                 );
                 (shrunk_plan, shrunk)
             } else {
-                (plan, result.clone())
+                (plan.clone(), result.clone())
             };
 
             match (&shrunk, &result) {
@@ -541,7 +537,7 @@ fn setup_simulation(
 
 fn run_simulation(
     env: Arc<Mutex<SimulatorEnv>>,
-    plan: &mut InteractionPlan,
+    plan: Vec<Interaction>,
     last_execution: Arc<Mutex<Execution>>,
 ) -> ExecutionResult {
     let simulation_type = {
@@ -574,7 +570,7 @@ fn run_simulation(
 
 fn run_simulation_default(
     env: Arc<Mutex<SimulatorEnv>>,
-    plan: &mut InteractionPlan,
+    plan: Vec<Interaction>,
     last_execution: Arc<Mutex<Execution>>,
 ) -> ExecutionResult {
     tracing::info!("Executing database interaction plan...");
@@ -592,11 +588,9 @@ fn run_simulation_default(
         interaction_pointer: 0,
     };
 
-    let interactions = plan.interactions_list().collect::<Vec<_>>();
-
     let mut result = execute_interactions(
         env.clone(),
-        interactions,
+        plan,
         &mut state,
         &mut conn_states,
         last_execution,

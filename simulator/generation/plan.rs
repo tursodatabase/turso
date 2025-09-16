@@ -42,7 +42,7 @@ impl InteractionPlan {
     /// delete interactions from the human readable file, and this function uses the JSON file as
     /// a baseline to detect with interactions were deleted and constructs the plan from the
     /// remaining interactions.
-    pub(crate) fn compute_via_diff(plan_path: &Path) -> Vec<Vec<Interaction>> {
+    pub(crate) fn compute_via_diff(plan_path: &Path) -> Vec<Interaction> {
         let interactions = std::fs::read_to_string(plan_path).unwrap();
         let interactions = interactions.lines().collect::<Vec<_>>();
 
@@ -97,7 +97,7 @@ impl InteractionPlan {
             }
         }
         let _ = plan.split_off(j);
-        plan
+        plan.into_iter().flatten().collect()
     }
 
     pub fn interactions_list(&self) -> impl Iterator<Item = Interaction> {

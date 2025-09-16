@@ -275,7 +275,9 @@ impl InteractionPlan {
         let last_execution = Arc::new(Mutex::new(*failing_execution));
         let result = SandboxedResult::from(
             std::panic::catch_unwind(|| {
-                run_simulation(env.clone(), &mut test_plan.clone(), last_execution.clone())
+                let interactions = test_plan.interactions_list().collect::<Vec<_>>();
+
+                run_simulation(env.clone(), interactions, last_execution.clone())
             }),
             last_execution,
         );
