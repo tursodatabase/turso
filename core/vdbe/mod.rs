@@ -1076,7 +1076,7 @@ pub fn handle_program_error(
         // Table locked errors, e.g. trying to checkpoint in an interactive transaction, do not cause a rollback.
         LimboError::TableLocked => {}
         // Busy errors do not cause a rollback.
-        LimboError::Busy => {}
+        LimboError::Busy | LimboError::WriteWriteConflict => {}
         _ => {
             if let Some(mv_store) = mv_store {
                 if let Some((tx_id, _)) = connection.mv_tx.get() {
