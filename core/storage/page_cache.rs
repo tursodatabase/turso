@@ -1324,7 +1324,6 @@ mod tests {
                     // Insert operation
                     let id_page = rng.next_u64() % max_pages;
                     let key = PageCacheKey::new(id_page as usize);
-                    #[allow(clippy::arc_with_non_send_sync)]
                     let page = Arc::new(Page::new(id_page as usize));
 
                     if cache.peek(&key, false).is_some() {

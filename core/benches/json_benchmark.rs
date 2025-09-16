@@ -20,7 +20,6 @@ fn bench(criterion: &mut Criterion) {
     // Flag to disable rusqlite benchmarks if needed
     let enable_rusqlite = std::env::var("DISABLE_RUSQLITE_BENCHMARK").is_err();
 
-    #[allow(clippy::arc_with_non_send_sync)]
     let io = Arc::new(PlatformIO::new().unwrap());
     let db = Database::open_file(io.clone(), "../testing/testing.db", false, false).unwrap();
     let limbo_conn = db.connect().unwrap();
@@ -488,7 +487,6 @@ fn bench_sequential_jsonb(criterion: &mut Criterion) {
     // Flag to disable rusqlite benchmarks if needed
     let enable_rusqlite = std::env::var("DISABLE_RUSQLITE_BENCHMARK").is_err();
 
-    #[allow(clippy::arc_with_non_send_sync)]
     let io = Arc::new(PlatformIO::new().unwrap());
     let db = Database::open_file(io.clone(), "../testing/testing.db", false, false).unwrap();
     let limbo_conn = db.connect().unwrap();
@@ -644,7 +642,6 @@ fn bench_sequential_jsonb(criterion: &mut Criterion) {
 fn bench_json_patch(criterion: &mut Criterion) {
     let enable_rusqlite = std::env::var("DISABLE_RUSQLITE_BENCHMARK").is_err();
 
-    #[allow(clippy::arc_with_non_send_sync)]
     let io = Arc::new(PlatformIO::new().unwrap());
     let db = Database::open_file(io.clone(), "../testing/testing.db", false, false).unwrap();
     let limbo_conn = db.connect().unwrap();

@@ -7735,7 +7735,6 @@ mod tests {
 
     use super::{btree_init_page, defragment_page, drop_cell, insert_into_cell};
 
-    #[allow(clippy::arc_with_non_send_sync)]
     fn get_page(id: usize) -> Arc<Page> {
         let page = Arc::new(Page::new(id));
 
@@ -7746,7 +7745,6 @@ mod tests {
         page
     }
 
-    #[allow(clippy::arc_with_non_send_sync)]
     fn get_database() -> Arc<Database> {
         let mut path = TempDir::new().unwrap().keep();
         path.push("test.db");
@@ -8057,7 +8055,6 @@ mod tests {
     }
 
     fn empty_btree() -> (Arc<Pager>, usize, Arc<Database>, Arc<Connection>) {
-        #[allow(clippy::arc_with_non_send_sync)]
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db = Database::open_file(io.clone(), ":memory:", false, false).unwrap();
         let conn = db.connect().unwrap();
@@ -8072,7 +8069,6 @@ mod tests {
 
     #[test]
     fn btree_with_virtual_page_1() -> Result<()> {
-        #[allow(clippy::arc_with_non_send_sync)]
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db = Database::open_file(io.clone(), ":memory:", false, false).unwrap();
         let conn = db.connect().unwrap();
@@ -8966,7 +8962,6 @@ mod tests {
         btree_insert_fuzz_run(2, 5_000, |rng| (rng.next_u32() % 32 * 1024) as usize);
     }
 
-    #[allow(clippy::arc_with_non_send_sync)]
     fn setup_test_env(database_size: u32) -> Arc<Pager> {
         let page_size = 512;
 
@@ -9033,7 +9028,6 @@ mod tests {
         // Setup overflow pages (2, 3, 4) with linking
         let mut current_page = 2u32;
         while current_page <= 4 {
-            #[allow(clippy::arc_with_non_send_sync)]
             let buf = Arc::new(Buffer::new_temporary(
                 pager
                     .io

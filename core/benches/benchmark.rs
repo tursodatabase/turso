@@ -22,7 +22,6 @@ fn bench_open(criterion: &mut Criterion) {
     let enable_rusqlite = std::env::var("DISABLE_RUSQLITE_BENCHMARK").is_err();
 
     if !std::fs::exists("../testing/schema_5k.db").unwrap() {
-        #[allow(clippy::arc_with_non_send_sync)]
         let io = Arc::new(PlatformIO::new().unwrap());
         let db = Database::open_file(io.clone(), "../testing/schema_5k.db", false, false).unwrap();
         let conn = db.connect().unwrap();
@@ -38,7 +37,6 @@ fn bench_open(criterion: &mut Criterion) {
 
     group.bench_function(BenchmarkId::new("limbo_schema", ""), |b| {
         b.iter(|| {
-            #[allow(clippy::arc_with_non_send_sync)]
             let io = Arc::new(PlatformIO::new().unwrap());
             let db =
                 Database::open_file(io.clone(), "../testing/schema_5k.db", false, false).unwrap();
@@ -65,7 +63,6 @@ fn bench_alter(criterion: &mut Criterion) {
     let enable_rusqlite = std::env::var("DISABLE_RUSQLITE_BENCHMARK").is_err();
 
     if !std::fs::exists("../testing/schema_5k.db").unwrap() {
-        #[allow(clippy::arc_with_non_send_sync)]
         let io = Arc::new(PlatformIO::new().unwrap());
         let db = Database::open_file(io.clone(), "../testing/schema_5k.db", false, false).unwrap();
         let conn = db.connect().unwrap();
@@ -80,7 +77,6 @@ fn bench_alter(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("`ALTER TABLE _ RENAME TO _`");
 
     group.bench_function(BenchmarkId::new("limbo_rename_table", ""), |b| {
-        #[allow(clippy::arc_with_non_send_sync)]
         let io = Arc::new(PlatformIO::new().unwrap());
         let db = Database::open_file(io.clone(), "../testing/schema_5k.db", false, false).unwrap();
         let conn = db.connect().unwrap();
@@ -125,7 +121,6 @@ fn bench_alter(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("`ALTER TABLE _ RENAME COLUMN _ TO _`");
 
     group.bench_function(BenchmarkId::new("limbo_rename_column", ""), |b| {
-        #[allow(clippy::arc_with_non_send_sync)]
         let io = Arc::new(PlatformIO::new().unwrap());
         let db = Database::open_file(io.clone(), "../testing/schema_5k.db", false, false).unwrap();
         let conn = db.connect().unwrap();
@@ -171,7 +166,6 @@ fn bench_alter(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("`ALTER TABLE _ ADD COLUMN _`");
 
     group.bench_function(BenchmarkId::new("limbo_add_column", ""), |b| {
-        #[allow(clippy::arc_with_non_send_sync)]
         let io = Arc::new(PlatformIO::new().unwrap());
         let db = Database::open_file(io.clone(), "../testing/schema_5k.db", false, false).unwrap();
         let conn = db.connect().unwrap();
@@ -216,7 +210,6 @@ fn bench_alter(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("`ALTER TABLE _ DROP COLUMN _`");
 
     group.bench_function(BenchmarkId::new("limbo_drop_column", ""), |b| {
-        #[allow(clippy::arc_with_non_send_sync)]
         let io = Arc::new(PlatformIO::new().unwrap());
         let db = Database::open_file(io.clone(), "../testing/schema_5k.db", false, false).unwrap();
         let conn = db.connect().unwrap();
@@ -264,7 +257,6 @@ fn bench_prepare_query(criterion: &mut Criterion) {
     // The rusqlite benchmark crashes on Mac M1 when using the flamegraph features
     let enable_rusqlite = std::env::var("DISABLE_RUSQLITE_BENCHMARK").is_err();
 
-    #[allow(clippy::arc_with_non_send_sync)]
     let io = Arc::new(PlatformIO::new().unwrap());
     let db = Database::open_file(io.clone(), "../testing/testing.db", false, false).unwrap();
     let limbo_conn = db.connect().unwrap();
@@ -343,7 +335,6 @@ fn bench_execute_select_rows(criterion: &mut Criterion) {
     // The rusqlite benchmark crashes on Mac M1 when using the flamegraph features
     let enable_rusqlite = std::env::var("DISABLE_RUSQLITE_BENCHMARK").is_err();
 
-    #[allow(clippy::arc_with_non_send_sync)]
     let io = Arc::new(PlatformIO::new().unwrap());
     let db = Database::open_file(io.clone(), "../testing/testing.db", false, false).unwrap();
     let limbo_conn = db.connect().unwrap();
@@ -411,7 +402,6 @@ fn bench_execute_select_1(criterion: &mut Criterion) {
     // The rusqlite benchmark crashes on Mac M1 when using the flamegraph features
     let enable_rusqlite = std::env::var("DISABLE_RUSQLITE_BENCHMARK").is_err();
 
-    #[allow(clippy::arc_with_non_send_sync)]
     let io = Arc::new(PlatformIO::new().unwrap());
     let db = Database::open_file(io.clone(), "../testing/testing.db", false, false).unwrap();
     let limbo_conn = db.connect().unwrap();
@@ -463,7 +453,6 @@ fn bench_execute_select_count(criterion: &mut Criterion) {
     // The rusqlite benchmark crashes on Mac M1 when using the flamegraph features
     let enable_rusqlite = std::env::var("DISABLE_RUSQLITE_BENCHMARK").is_err();
 
-    #[allow(clippy::arc_with_non_send_sync)]
     let io = Arc::new(PlatformIO::new().unwrap());
     let db = Database::open_file(io.clone(), "../testing/testing.db", false, false).unwrap();
     let limbo_conn = db.connect().unwrap();
@@ -521,7 +510,6 @@ fn bench_insert_rows(criterion: &mut Criterion) {
         let temp_dir = tempfile::tempdir().unwrap();
         let db_path = temp_dir.path().join("bench.db");
 
-        #[allow(clippy::arc_with_non_send_sync)]
         let io = Arc::new(PlatformIO::new().unwrap());
         let db = Database::open_file(io.clone(), db_path.to_str().unwrap(), false, false).unwrap();
         let limbo_conn = db.connect().unwrap();
@@ -643,7 +631,6 @@ fn bench_limbo(
         inserts: Vec<String>,
         current_statement: Option<turso_core::Statement>,
     }
-    #[allow(clippy::arc_with_non_send_sync)]
     let io = Arc::new(PlatformIO::new().unwrap());
     let temp_dir = tempfile::tempdir().unwrap();
     let path = temp_dir.path().join("bench.db");
@@ -726,7 +713,6 @@ fn bench_limbo_mvcc(
         current_statement: Option<turso_core::Statement>,
         current_insert: Option<String>,
     }
-    #[allow(clippy::arc_with_non_send_sync)]
     let io = Arc::new(PlatformIO::new().unwrap());
     let temp_dir = tempfile::tempdir().unwrap();
     let path = temp_dir.path().join("bench.db");
