@@ -2204,7 +2204,7 @@ pub fn op_transaction(
                 !conn.is_nested_stmt.get(),
                 "nested stmt should not begin a new read transaction"
             );
-            let res = pager.begin_read_tx()?;
+            pager.begin_read_tx()?;
         }
 
         if updated && matches!(new_transaction_state, TransactionState::Write { .. }) {
