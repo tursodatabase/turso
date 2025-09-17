@@ -15,10 +15,9 @@ use crate::{
     Result, TransactionState,
 };
 use parking_lot::RwLock;
-use std::cell::{Cell, RefCell, UnsafeCell};
+use std::cell::{Cell, UnsafeCell};
 use std::collections::HashSet;
 use std::hash;
-use std::rc::Rc;
 use std::sync::atomic::{
     AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
 };
@@ -487,7 +486,7 @@ pub struct Pager {
     pub db_file: Arc<dyn DatabaseStorage>,
     /// The write-ahead log (WAL) for the database.
     /// in-memory databases, ephemeral tables and ephemeral indexes do not have a WAL.
-    pub(crate) wal: Option<Rc<RefCell<dyn Wal>>>,
+    pub(crate) wal: Option<Arc<RwLock<dyn Wal>>>,
     /// A page cache for the database.
     page_cache: Arc<RwLock<PageCache>>,
     /// Buffer pool for temporary data storage.
@@ -582,7 +581,7 @@ enum FreePageState {
 impl Pager {
     pub fn new(
         db_file: Arc<dyn DatabaseStorage>,
-        wal: Option<Rc<RefCell<dyn Wal>>>,
+        wal: Option<Arc<RwLock<dyn Wal>>>,
         io: Arc<dyn crate::io::IO>,
         page_cache: Arc<RwLock<PageCache>>,
         buffer_pool: Arc<BufferPool>,
@@ -648,7 +647,7 @@ impl Pager {
         Ok(IOResult::Done(clamped_max))
     }
 
-    pub fn set_wal(&mut self, wal: Rc<RefCell<dyn Wal>>) {
+    pub fn set_wal(&mut self, wal: Arc<RwLock<dyn Wal>>) {
         self.wal = Some(wal);
     }
 
@@ -1050,7 +1049,7 @@ impl Pager {
         let Some(wal) = self.wal.as_ref() else {
             return Ok(());
         };
-        let changed = wal.borrow_mut().begin_read_tx()?;
+        let changed = wal.write().begin_read_tx()?;
         if changed {
             // Someone else changed the database -> assume our page cache is invalid (this is default SQLite behavior, we can probably do better with more granular invalidation)
             self.clear_page_cache();
@@ -1091,7 +1090,7 @@ impl Pager {
         let Some(wal) = self.wal.as_ref() else {
             return Ok(IOResult::Done(()));
         };
-        Ok(IOResult::Done(wal.borrow_mut().begin_write_tx()?))
+        Ok(IOResult::Done(wal.write().begin_write_tx()?))
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
@@ -1116,9 +1115,9 @@ impl Pager {
         tracing::trace!("end_tx(schema_did_change={})", schema_did_change);
         if rollback {
             if is_write {
-                wal.borrow().end_write_tx();
+                wal.read().end_write_tx();
             }
-            wal.borrow().end_read_tx();
+            wal.read().end_read_tx();
             self.rollback(schema_did_change, connection, is_write)?;
             return Ok(IOResult::Done(PagerCommitResult::Rollback));
         }
@@ -1127,11 +1126,11 @@ impl Pager {
             connection.get_sync_mode(),
             connection.get_data_sync_retry()
         ));
-        wal.borrow().end_write_tx();
-        wal.borrow().end_read_tx();
+        wal.read().end_write_tx();
+        wal.read().end_read_tx();
 
         if schema_did_change {
-            let schema = connection.schema.borrow().clone();
+            let schema = connection.schema.read().clone();
             connection._db.update_schema_if_newer(schema)?;
         }
         Ok(IOResult::Done(commit_status))
@@ -1142,7 +1141,7 @@ impl Pager {
         let Some(wal) = self.wal.as_ref() else {
             return Ok(());
         };
-        wal.borrow().end_read_tx();
+        wal.read().end_read_tx();
         Ok(())
     }
 
@@ -1168,9 +1167,9 @@ impl Pager {
             return Ok((page, c));
         };
 
-        if let Some(frame_id) = wal.borrow().find_frame(page_idx as u64, frame_watermark)? {
+        if let Some(frame_id) = wal.read().find_frame(page_idx as u64, frame_watermark)? {
             let c = wal
-                .borrow()
+                .read()
                 .read_frame(frame_id, page.clone(), self.buffer_pool.clone())?;
             // TODO(pere) should probably first insert to page cache, and if successful,
             // read frame or page
@@ -1297,8 +1296,8 @@ impl Pager {
             ));
         };
         Ok(WalState {
-            checkpoint_seq_no: wal.borrow().get_checkpoint_seq(),
-            max_frame: wal.borrow().get_max_frame(),
+            checkpoint_seq_no: wal.read().get_checkpoint_seq(),
+            max_frame: wal.read().get_max_frame(),
         })
     }
 
@@ -1335,7 +1334,7 @@ impl Pager {
             };
             pages.push(page);
             if pages.len() == IOV_MAX {
-                match wal.borrow_mut().append_frames_vectored(
+                match wal.write().append_frames_vectored(
                     std::mem::replace(
                         &mut pages,
                         Vec::with_capacity(std::cmp::min(IOV_MAX, dirty_pages.len() - idx)),
@@ -1354,7 +1353,7 @@ impl Pager {
         }
         if !pages.is_empty() {
             match wal
-                .borrow_mut()
+                .write()
                 .append_frames_vectored(pages, page_sz, commit_frame)
             {
                 Ok(c) => completions.push(c),
@@ -1434,7 +1433,7 @@ impl Pager {
                             } else {
                                 None
                             };
-                            let r = wal.borrow_mut().append_frames_vectored(
+                            let r = wal.write().append_frames_vectored(
                                 std::mem::take(&mut pages),
                                 page_sz,
                                 commit_flag,
@@ -1466,7 +1465,7 @@ impl Pager {
                 }
                 CommitState::SyncWal => {
                     self.commit_info.state.set(CommitState::AfterSyncWal);
-                    let sync_result = wal.borrow_mut().sync();
+                    let sync_result = wal.write().sync();
                     let c = match sync_result {
                         Ok(c) => c,
                         Err(e) if !data_sync_retry => {
@@ -1479,8 +1478,8 @@ impl Pager {
                     }
                 }
                 CommitState::AfterSyncWal => {
-                    turso_assert!(!wal.borrow().is_syncing(), "wal should have synced");
-                    if wal_auto_checkpoint_disabled || !wal.borrow().should_checkpoint() {
+                    turso_assert!(!wal.read().is_syncing(), "wal should have synced");
+                    if wal_auto_checkpoint_disabled || !wal.read().should_checkpoint() {
                         self.commit_info.state.set(CommitState::Start);
                         break PagerCommitResult::WalWritten;
                     }
@@ -1529,13 +1528,13 @@ impl Pager {
                 .unwrap()
                 .as_millis()
         );
-        wal.borrow_mut().finish_append_frames_commit()?;
+        wal.write().finish_append_frames_commit()?;
         Ok(IOResult::Done(res))
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn wal_changed_pages_after(&self, frame_watermark: u64) -> Result<Vec<u32>> {
-        let wal = self.wal.as_ref().unwrap().borrow();
+        let wal = self.wal.as_ref().unwrap().read();
         wal.changed_pages_after(frame_watermark)
     }
 
@@ -1546,7 +1545,7 @@ impl Pager {
                 "wal_get_frame() called on database without WAL".to_string(),
             ));
         };
-        let wal = wal.borrow();
+        let wal = wal.read();
         wal.read_frame_raw(frame_no, frame)
     }
 
@@ -1560,7 +1559,7 @@ impl Pager {
         let (header, raw_page) = parse_wal_frame_header(frame);
 
         {
-            let mut wal = wal.borrow_mut();
+            let mut wal = wal.write();
             wal.write_frame_raw(
                 self.buffer_pool.clone(),
                 frame_no,
@@ -1614,7 +1613,7 @@ impl Pager {
             trace!(?state);
             match state {
                 CheckpointState::Checkpoint => {
-                    let res = return_if_io!(wal.borrow_mut().checkpoint(
+                    let res = return_if_io!(wal.write().checkpoint(
                         self,
                         CheckpointMode::Passive {
                             upper_bound_inclusive: None
@@ -1672,7 +1671,7 @@ impl Pager {
                     "checkpoint_shutdown() called on database without WAL".to_string(),
                 ));
             };
-            let mut wal = wal.borrow_mut();
+            let mut wal = wal.write();
             // fsync the wal syncronously before beginning checkpoint
             let c = wal.sync()?;
             self.io.wait_for_completion(c)?;
@@ -1704,7 +1703,7 @@ impl Pager {
             ));
         };
 
-        let mut checkpoint_result = self.io.block(|| wal.borrow_mut().checkpoint(self, mode))?;
+        let mut checkpoint_result = self.io.block(|| wal.write().checkpoint(self, mode))?;
 
         'ensure_sync: {
             if checkpoint_result.num_backfilled != 0 {
@@ -2218,11 +2217,11 @@ impl Pager {
         }
         self.reset_internal_states();
         if schema_did_change {
-            connection.schema.replace(connection._db.clone_schema()?);
+            *connection.schema.write() = connection._db.clone_schema()?;
         }
         if is_write {
             if let Some(wal) = self.wal.as_ref() {
-                wal.borrow_mut().rollback()?;
+                wal.write().rollback()?;
             }
         }
 
@@ -2276,7 +2275,7 @@ impl Pager {
         let Some(wal) = self.wal.as_ref() else {
             return Ok(());
         };
-        wal.borrow_mut().set_io_context(self.io_ctx.read().clone());
+        wal.write().set_io_context(self.io_ctx.read().clone());
         Ok(())
     }
 
@@ -2286,7 +2285,7 @@ impl Pager {
             io_ctx.reset_checksum();
         }
         let Some(wal) = self.wal.as_ref() else { return };
-        wal.borrow_mut().set_io_context(self.io_ctx.read().clone())
+        wal.write().set_io_context(self.io_ctx.read().clone())
     }
 
     pub fn set_reserved_space_bytes(&self, value: u8) {
@@ -2583,7 +2582,7 @@ mod ptrmap_tests {
         let buffer_pool = BufferPool::begin_init(&io, (sz * page_size) as usize);
         let page_cache = Arc::new(RwLock::new(PageCache::new(sz as usize)));
 
-        let wal = Rc::new(RefCell::new(WalFile::new(
+        let wal = Arc::new(RwLock::new(WalFile::new(
             io.clone(),
             WalFileShared::new_shared(
                 io.open_file("test.db-wal", OpenFlags::Create, false)

@@ -1171,7 +1171,7 @@ impl ProjectOperator {
 
         for col in &self.columns {
             // Use the internal connection's pager for expression evaluation
-            let internal_pager = self.internal_conn.pager.borrow().clone();
+            let internal_pager = self.internal_conn.pager.read().clone();
 
             // Execute the compiled expression (handles both columns and complex expressions)
             let result = col
@@ -2244,7 +2244,7 @@ mod tests {
         let db = Database::open_file(io.clone(), ":memory:", false, false).unwrap();
         let conn = db.connect().unwrap();
 
-        let pager = conn.pager.borrow().clone();
+        let pager = conn.pager.read().clone();
 
         // Allocate page 1 first (database header)
         let _ = pager.io.block(|| pager.allocate_page1());
