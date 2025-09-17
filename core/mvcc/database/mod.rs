@@ -1426,7 +1426,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         Ok(tx_id)
     }
 
-    fn get_new_transaction_database_header(&self, pager: &Rc<Pager>) -> DatabaseHeader {
+    fn get_new_transaction_database_header(&self, pager: &Arc<Pager>) -> DatabaseHeader {
         if self.global_header.read().is_none() {
             pager.io.block(|| pager.maybe_allocate_page1()).unwrap();
             let header = pager

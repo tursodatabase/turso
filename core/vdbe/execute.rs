@@ -9255,7 +9255,7 @@ pub fn op_journal_mode(
 }
 
 fn with_header<T, F>(
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
     program: &Program,
     f: F,
@@ -9272,7 +9272,7 @@ where
 }
 
 fn with_header_mut<T, F>(
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
     program: &Program,
     f: F,
