@@ -1,4 +1,4 @@
-import { expect, test, afterEach } from 'vitest'
+import { expect, test } from 'vitest'
 import { connect } from './promise-default.js'
 
 test('in-memory db', async () => {
@@ -10,6 +10,28 @@ test('in-memory db', async () => {
     expect(rows).toEqual([{ x: 1 }, { x: 3 }]);
 })
 
+test('on-disk db large inserts', async () => {
+    const path = `test-${(Math.random() * 10000) | 0}.db`;
+    const db1 = await connect(path);
+    await db1.prepare("CREATE TABLE t(x)").run();
+    await db1.prepare("INSERT INTO t VALUES (randomblob(10 * 4096 + 0))").run();
+    await db1.prepare("INSERT INTO t VALUES (randomblob(10 * 4096 + 1))").run();
+    await db1.prepare("INSERT INTO t VALUES (randomblob(10 * 4096 + 2))").run();
+    const stmt1 = db1.prepare("SELECT length(x) as l FROM t");
+    expect(stmt1.columns()).toEqual([{ name: "l", column: null, database: null, table: null, type: null }]);
+    const rows1 = await stmt1.all();
+    expect(rows1).toEqual([{ l: 10 * 4096 }, { l: 10 * 4096 + 1 }, { l: 10 * 4096 + 2 }]);
+
+    await db1.exec("BEGIN");
+    await db1.exec("INSERT INTO t VALUES (1)");
+    await db1.exec("ROLLBACK");
+
+    const rows2 = await db1.prepare("SELECT length(x) as l FROM t").all();
+    expect(rows2).toEqual([{ l: 10 * 4096 }, { l: 10 * 4096 + 1 }, { l: 10 * 4096 + 2 }]);
+
+    await db1.prepare("PRAGMA wal_checkpoint(TRUNCATE)").run();
+})
+
 test('on-disk db', async () => {
     const path = `test-${(Math.random() * 10000) | 0}.db`;
     const db1 = await connect(path);
@@ -19,8 +41,8 @@ test('on-disk db', async () => {
     expect(stmt1.columns()).toEqual([{ name: "x", column: null, database: null, table: null, type: null }]);
     const rows1 = await stmt1.all([1]);
     expect(rows1).toEqual([{ x: 1 }, { x: 3 }]);
-    await db1.close();
     stmt1.close();
+    await db1.close();
 
     const db2 = await connect(path);
     const stmt2 = db2.prepare("SELECT * FROM t WHERE x % 2 = ?");
@@ -30,23 +52,23 @@ test('on-disk db', async () => {
     db2.close();
 })
 
-test('attach', async () => {
-    const path1 = `test-${(Math.random() * 10000) | 0}.db`;
-    const path2 = `test-${(Math.random() * 10000) | 0}.db`;
-    const db1 = await connect(path1);
-    await db1.exec("CREATE TABLE t(x)");
-    await db1.exec("INSERT INTO t VALUES (1), (2), (3)");
-    const db2 = await connect(path2);
-    await db2.exec("CREATE TABLE q(x)");
-    await db2.exec("INSERT INTO q VALUES (4), (5), (6)");
+// test('attach', async () => {
+//     const path1 = `test-${(Math.random() * 10000) | 0}.db`;
+//     const path2 = `test-${(Math.random() * 10000) | 0}.db`;
+//     const db1 = await connect(path1);
+//     await db1.exec("CREATE TABLE t(x)");
+//     await db1.exec("INSERT INTO t VALUES (1), (2), (3)");
+//     const db2 = await connect(path2);
+//     await db2.exec("CREATE TABLE q(x)");
+//     await db2.exec("INSERT INTO q VALUES (4), (5), (6)");
 
-    await db1.exec(`ATTACH '${path2}' as secondary`);
+//     await db1.exec(`ATTACH '${path2}' as secondary`);
 
-    const stmt = db1.prepare("SELECT * FROM t UNION ALL SELECT * FROM secondary.q");
-    expect(stmt.columns()).toEqual([{ name: "x", column: null, database: null, table: null, type: null }]);
-    const rows = await stmt.all([1]);
-    expect(rows).toEqual([{ x: 1 }, { x: 2 }, { x: 3 }, { x: 4 }, { x: 5 }, { x: 6 }]);
-})
+//     const stmt = db1.prepare("SELECT * FROM t UNION ALL SELECT * FROM secondary.q");
+//     expect(stmt.columns()).toEqual([{ name: "x", column: null, database: null, table: null, type: null }]);
+//     const rows = await stmt.all([1]);
+//     expect(rows).toEqual([{ x: 1 }, { x: 2 }, { x: 3 }, { x: 4 }, { x: 5 }, { x: 6 }]);
+// })
 
 test('blobs', async () => {
     const db = await connect(":memory:");

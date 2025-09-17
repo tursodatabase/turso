@@ -10,8 +10,10 @@
 //! - Iterating through query results
 //! - Managing the I/O event loop
 
-#[cfg(feature = "browser")]
+// #[cfg(feature = "browser")]
 pub mod browser;
+// #[cfg(feature = "browser")]
+use crate::browser::opfs;
 
 use napi::bindgen_prelude::*;
 use napi::{Env, Task};
@@ -76,10 +78,6 @@ pub(crate) fn init_tracing(level_filter: Option<String>) {
 }
 
 pub enum DbTask {
-    Batch {
-        conn: Arc<turso_core::Connection>,
-        sql: String,
-    },
     Step {
         stmt: Arc<RefCell<Option<turso_core::Statement>>>,
     },
@@ -93,10 +91,6 @@ impl Task for DbTask {
 
     fn compute(&mut self) -> Result<Self::Output> {
         match self {
-            DbTask::Batch { conn, sql } => {
-                batch_sync(conn, sql)?;
-                Ok(0)
-            }
             DbTask::Step { stmt } => step_sync(stmt),
         }
     }
@@ -107,18 +101,9 @@ impl Task for DbTask {
 }
 
 #[napi(object)]
+#[derive(Clone)]
 pub struct DatabaseOpts {
     pub tracing: Option<String>,
-}
-
-fn batch_sync(conn: &Arc<turso_core::Connection>, sql: &str) -> napi::Result<()> {
-    conn.prepare_execute_batch(sql).map_err(|e| {
-        Error::new(
-            Status::GenericFailure,
-            format!("Failed to execute batch: {e}"),
-        )
-    })?;
-    Ok(())
 }
 
 fn step_sync(stmt: &Arc<RefCell<Option<turso_core::Statement>>>) -> napi::Result<u32> {
@@ -152,21 +137,38 @@ impl Database {
     /// # Arguments
     /// * `path` - The path to the database file.
     #[napi(constructor)]
+    pub fn new_napi(path: String, opts: Option<DatabaseOpts>) -> Result<Self> {
+        Self::new(path, opts)
+    }
+
     pub fn new(path: String, opts: Option<DatabaseOpts>) -> Result<Self> {
-        if let Some(opts) = opts {
-            init_tracing(opts.tracing);
-        }
         let io: Arc<dyn turso_core::IO> = if is_memory(&path) {
             Arc::new(turso_core::MemoryIO::new())
         } else {
-            Arc::new(turso_core::PlatformIO::new().map_err(|e| {
-                Error::new(Status::GenericFailure, format!("Failed to create IO: {e}"))
-            })?)
+            #[cfg(not(feature = "browser"))]
+            {
+                Arc::new(turso_core::PlatformIO::new().map_err(|e| {
+                    Error::new(Status::GenericFailure, format!("Failed to create IO: {e}"))
+                })?)
+            }
+            #[cfg(feature = "browser")]
+            {
+                return Err(napi::Error::new(
+                    napi::Status::GenericFailure,
+                    "FS-backed db must be initialized through connectDbAsync function in the browser",
+                ));
+            }
         };
+        Self::new_io(path, io, opts)
+    }
 
-        #[cfg(feature = "browser")]
-        if !is_memory(&path) {
-            return Err(Error::new(Status::GenericFailure, "sync constructor is not supported for FS-backed databases in the WASM. Use async connect(...) method instead".to_string()));
+    pub fn new_io(
+        path: String,
+        io: Arc<dyn turso_core::IO>,
+        opts: Option<DatabaseOpts>,
+    ) -> Result<Self> {
+        if let Some(opts) = opts {
+            init_tracing(opts.tracing);
         }
 
         let file = io
@@ -231,33 +233,6 @@ impl Database {
     #[napi(getter)]
     pub fn open(&self) -> bool {
         self.is_open.get()
-    }
-
-    /// Executes a batch of SQL statements on main thread
-    ///
-    /// # Arguments
-    ///
-    /// * `sql` - The SQL statements to execute.
-    ///
-    /// # Returns
-    #[napi]
-    pub fn batch_sync(&self, sql: String) -> Result<()> {
-        batch_sync(&self.conn()?, &sql)
-    }
-
-    /// Executes a batch of SQL statements outside of main thread
-    ///
-    /// # Arguments
-    ///
-    /// * `sql` - The SQL statements to execute.
-    ///
-    /// # Returns
-    #[napi(ts_return_type = "Promise<void>")]
-    pub fn batch_async(&self, sql: String) -> Result<AsyncTask<DbTask>> {
-        Ok(AsyncTask::new(DbTask::Batch {
-            conn: self.conn()?.clone(),
-            sql,
-        }))
     }
 
     /// Prepares a statement for execution.
@@ -325,8 +300,8 @@ impl Database {
     #[napi]
     pub fn close(&mut self) -> Result<()> {
         self.is_open.set(false);
-        let _ = self._db.take();
         let _ = self.conn.take().unwrap();
+        let _ = self._db.take();
         Ok(())
     }
 

@@ -196,7 +196,12 @@ class Database {
     }
 
     try {
-      await this.db.batchAsync(sql);
+      const stmt = this.prepare(sql);
+      try {
+        await stmt.run();
+      } finally {
+        stmt.close();
+      }
     } catch (err) {
       throw convertError(err);
     }
@@ -298,7 +303,7 @@ class Statement {
     bindParams(this.stmt, bindParameters);
 
     while (true) {
-      const stepResult = await this.stmt.stepAsync();
+      const stepResult = this.stmt.stepSync();
       if (stepResult === STEP_IO) {
         await this.db.db.ioLoopAsync();
         continue;
@@ -328,7 +333,7 @@ class Statement {
     bindParams(this.stmt, bindParameters);
 
     while (true) {
-      const stepResult = await this.stmt.stepAsync();
+      const stepResult = this.stmt.stepSync();
       if (stepResult === STEP_IO) {
         await this.db.db.ioLoopAsync();
         continue;
@@ -352,7 +357,7 @@ class Statement {
     bindParams(this.stmt, bindParameters);
 
     while (true) {
-      const stepResult = await this.stmt.stepAsync();
+      const stepResult = this.stmt.stepSync();
       if (stepResult === STEP_IO) {
         await this.db.db.ioLoopAsync();
         continue;
@@ -377,7 +382,7 @@ class Statement {
     const rows: any[] = [];
 
     while (true) {
-      const stepResult = await this.stmt.stepAsync();
+      const stepResult = this.stmt.stepSync();
       if (stepResult === STEP_IO) {
         await this.db.db.ioLoopAsync();
         continue;

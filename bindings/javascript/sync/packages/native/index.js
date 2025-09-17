@@ -508,9 +508,12 @@ if (!nativeBinding) {
   throw new Error(`Failed to load native binding`)
 }
 
-const { Database, Statement, GeneratorHolder, JsDataCompletion, JsProtocolIo, JsProtocolRequestBytes, SyncEngine, DatabaseChangeTypeJs, SyncEngineProtocolVersion } = nativeBinding
+const { Database, Opfs, OpfsFile, Statement, initThreadPool, GeneratorHolder, JsDataCompletion, JsProtocolIo, JsProtocolRequestBytes, SyncEngine, DatabaseChangeTypeJs, SyncEngineProtocolVersion } = nativeBinding
 export { Database }
+export { Opfs }
+export { OpfsFile }
 export { Statement }
+export { initThreadPool }
 export { GeneratorHolder }
 export { JsDataCompletion }
 export { JsProtocolIo }

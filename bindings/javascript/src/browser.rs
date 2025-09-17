@@ -1,10 +1,10 @@
-use std::sync::Arc;
+use std::{cell::RefCell, collections::HashMap, sync::Arc};
 
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
-use turso_core::{storage::database::DatabaseFile, Clock, File, Instant, IO};
+use turso_core::{Clock, Completion, File, Instant, MemoryIO, IO};
 
-use crate::{init_tracing, is_memory, Database, DatabaseOpts};
+use crate::{is_memory, Database, DatabaseOpts};
 
 pub struct NoopTask;
 
@@ -29,11 +29,11 @@ pub fn init_thread_pool() -> napi::Result<AsyncTask<NoopTask>> {
 pub struct ConnectTask {
     path: String,
     io: Arc<dyn turso_core::IO>,
+    opts: Option<DatabaseOpts>,
 }
 
 pub struct ConnectResult {
-    db: Arc<turso_core::Database>,
-    conn: Arc<turso_core::Connection>,
+    db: Database,
 }
 
 unsafe impl Send for ConnectResult {}
@@ -43,73 +43,98 @@ impl Task for ConnectTask {
     type JsValue = Database;
 
     fn compute(&mut self) -> Result<Self::Output> {
-        let file = self
-            .io
-            .open_file(&self.path, turso_core::OpenFlags::Create, false)
-            .map_err(|e| Error::new(Status::GenericFailure, format!("Failed to open file: {e}")))?;
-
-        let db_file = Arc::new(DatabaseFile::new(file));
-        let db = turso_core::Database::open(self.io.clone(), &self.path, db_file, false, true)
-            .map_err(|e| {
-                Error::new(
-                    Status::GenericFailure,
-                    format!("Failed to open database: {e}"),
-                )
-            })?;
-
-        let conn = db
-            .connect()
-            .map_err(|e| Error::new(Status::GenericFailure, format!("Failed to connect: {e}")))?;
-
-        Ok(ConnectResult { db, conn })
+        let db = Database::new_io(self.path.clone(), self.io.clone(), self.opts.clone())?;
+        Ok(ConnectResult { db })
     }
 
     fn resolve(&mut self, _: Env, result: Self::Output) -> Result<Self::JsValue> {
-        Ok(Database::create(
-            Some(result.db),
-            self.io.clone(),
-            result.conn,
-            self.path.clone(),
-        ))
+        Ok(result.db)
     }
 }
 
 #[napi]
-// we offload connect to the web-worker because:
-// 1. browser main-thread do not support Atomic.wait operations
-// 2. turso-db use blocking IO [io.wait_for_completion(c)] in few places during initialization path
-//
-// so, we offload connect to the worker thread
-pub fn connect(path: String, opts: Option<DatabaseOpts>) -> Result<AsyncTask<ConnectTask>> {
-    if let Some(opts) = opts {
-        init_tracing(opts.tracing);
-    }
-    let task = if is_memory(&path) {
-        ConnectTask {
-            io: Arc::new(turso_core::MemoryIO::new()),
-            path,
-        }
-    } else {
-        let io = Arc::new(Opfs::new()?);
-        ConnectTask { io, path }
-    };
-    Ok(AsyncTask::new(task))
-}
-#[napi]
 #[derive(Clone)]
-pub struct Opfs;
+pub struct Opfs {
+    inner: Arc<OpfsInner>,
+}
+
+pub struct OpfsInner {
+    completion_no: RefCell<u32>,
+    completions: RefCell<HashMap<u32, Completion>>,
+}
+
+thread_local! {
+    static OPFS: Arc<Opfs> = Arc::new(Opfs::new());
+}
 
 #[napi]
 #[derive(Clone)]
 struct OpfsFile {
     handle: i32,
+    opfs: Opfs,
+}
+
+// unsafe impl Send for OpfsFile {}
+// unsafe impl Sync for OpfsFile {}
+
+unsafe impl Send for Opfs {}
+unsafe impl Sync for Opfs {}
+
+#[napi]
+// we offload connect to the web-worker because
+// turso-db use blocking IO [io.wait_for_completion(c)] in few places during initialization path
+pub fn connect_db_async(
+    path: String,
+    opts: Option<DatabaseOpts>,
+) -> Result<AsyncTask<ConnectTask>> {
+    let io: Arc<dyn turso_core::IO> = if is_memory(&path) {
+        Arc::new(MemoryIO::new())
+    } else {
+        // we must create OPFS IO on the main thread
+        opfs()
+    };
+    let task = ConnectTask { path, io, opts };
+    Ok(AsyncTask::new(task))
 }
 
 #[napi]
+pub fn complete_opfs(completion_no: u32, result: i32) {
+    OPFS.with(|opfs| opfs.complete(completion_no, result))
+}
+
+pub fn opfs() -> Arc<Opfs> {
+    OPFS.with(|opfs| opfs.clone())
+}
+
 impl Opfs {
-    #[napi(constructor)]
-    pub fn new() -> napi::Result<Self> {
-        Ok(Self)
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(OpfsInner {
+                completion_no: RefCell::new(0),
+                completions: RefCell::new(HashMap::new()),
+            }),
+        }
+    }
+
+    pub fn complete(&self, completion_no: u32, result: i32) {
+        let completion = {
+            let mut completions = self.inner.completions.borrow_mut();
+            completions.remove(&completion_no).unwrap()
+        };
+        completion.complete(result);
+    }
+
+    fn register_completion(&self, c: Completion) -> u32 {
+        let inner = &self.inner;
+        *inner.completion_no.borrow_mut() += 1;
+        let completion_no = *inner.completion_no.borrow();
+        tracing::debug!(
+            "register completion: {} {:?}",
+            completion_no,
+            Arc::as_ptr(inner)
+        );
+        inner.completions.borrow_mut().insert(completion_no, c);
+        completion_no
     }
 }
 
@@ -127,6 +152,13 @@ extern "C" {
     fn sync(handle: i32) -> i32;
     fn truncate(handle: i32, length: usize) -> i32;
     fn size(handle: i32) -> i32;
+
+    fn write_async(handle: i32, buffer: *const u8, buffer_len: usize, offset: i32, c: u32);
+    fn sync_async(handle: i32, c: u32);
+    fn read_async(handle: i32, buffer: *mut u8, buffer_len: usize, offset: i32, c: u32);
+    fn truncate_async(handle: i32, length: usize, c: u32);
+    // fn size_async(handle: i32) -> i32;
+
     fn is_web_worker() -> bool;
 }
 
@@ -144,7 +176,12 @@ impl IO for Opfs {
         tracing::info!("open_file: {}", path);
         let result = unsafe { lookup_file(path.as_ptr(), path.len()) };
         if result >= 0 {
-            Ok(Arc::new(OpfsFile { handle: result }))
+            Ok(Arc::new(OpfsFile {
+                handle: result,
+                opfs: Opfs {
+                    inner: self.inner.clone(),
+                },
+            }))
         } else if result == -404 {
             Err(turso_core::LimboError::InternalError(format!(
                 "unexpected path {path}: files must be created in advance for OPFS IO"
@@ -175,17 +212,32 @@ impl File for OpfsFile {
         pos: u64,
         c: turso_core::Completion,
     ) -> turso_core::Result<turso_core::Completion> {
-        assert!(
-            is_web_worker_safe(),
-            "opfs must be used only from web worker for now"
+        let web_worker = is_web_worker_safe();
+        tracing::debug!(
+            "pread({}, is_web_worker={}): pos={}",
+            self.handle,
+            web_worker,
+            pos
         );
-        tracing::debug!("pread({}): pos={}", self.handle, pos);
         let handle = self.handle;
         let read_c = c.as_read();
         let buffer = read_c.buf_arc();
         let buffer = buffer.as_mut_slice();
-        let result = unsafe { read(handle, buffer.as_mut_ptr(), buffer.len(), pos as i32) };
-        c.complete(result as i32);
+        if web_worker {
+            let result = unsafe { read(handle, buffer.as_mut_ptr(), buffer.len(), pos as i32) };
+            c.complete(result as i32);
+        } else {
+            let completion_no = self.opfs.register_completion(c.clone());
+            unsafe {
+                read_async(
+                    handle,
+                    buffer.as_mut_ptr(),
+                    buffer.len(),
+                    pos as i32,
+                    completion_no,
+                )
+            };
+        }
         Ok(c)
     }
 
@@ -195,27 +247,44 @@ impl File for OpfsFile {
         buffer: Arc<turso_core::Buffer>,
         c: turso_core::Completion,
     ) -> turso_core::Result<turso_core::Completion> {
-        assert!(
-            is_web_worker_safe(),
-            "opfs must be used only from web worker for now"
+        let web_worker = is_web_worker_safe();
+        tracing::debug!(
+            "pwrite({}, is_web_worker={}): pos={}",
+            self.handle,
+            web_worker,
+            pos
         );
-        tracing::debug!("pwrite({}): pos={}", self.handle, pos);
         let handle = self.handle;
         let buffer = buffer.as_slice();
-        let result = unsafe { write(handle, buffer.as_ptr(), buffer.len(), pos as i32) };
-        c.complete(result as i32);
+        if web_worker {
+            let result = unsafe { write(handle, buffer.as_ptr(), buffer.len(), pos as i32) };
+            c.complete(result as i32);
+        } else {
+            let completion_no = self.opfs.register_completion(c.clone());
+            unsafe {
+                write_async(
+                    handle,
+                    buffer.as_ptr(),
+                    buffer.len(),
+                    pos as i32,
+                    completion_no,
+                )
+            };
+        }
         Ok(c)
     }
 
     fn sync(&self, c: turso_core::Completion) -> turso_core::Result<turso_core::Completion> {
-        assert!(
-            is_web_worker_safe(),
-            "opfs must be used only from web worker for now"
-        );
-        tracing::debug!("sync({})", self.handle);
+        let web_worker = is_web_worker_safe();
+        tracing::debug!("sync({}, is_web_worker={})", self.handle, web_worker);
         let handle = self.handle;
-        let result = unsafe { sync(handle) };
-        c.complete(result as i32);
+        if web_worker {
+            let result = unsafe { sync(handle) };
+            c.complete(result as i32);
+        } else {
+            let completion_no = self.opfs.register_completion(c.clone());
+            unsafe { sync_async(handle, completion_no) };
+        }
         Ok(c)
     }
 
@@ -224,14 +293,21 @@ impl File for OpfsFile {
         len: u64,
         c: turso_core::Completion,
     ) -> turso_core::Result<turso_core::Completion> {
-        assert!(
-            is_web_worker_safe(),
-            "opfs must be used only from web worker for now"
+        let web_worker = is_web_worker_safe();
+        tracing::debug!(
+            "truncate({}, is_web_worker={}): len={}",
+            self.handle,
+            web_worker,
+            len
         );
-        tracing::debug!("truncate({}): len={}", self.handle, len);
         let handle = self.handle;
-        let result = unsafe { truncate(handle, len as usize) };
-        c.complete(result as i32);
+        if web_worker {
+            let result = unsafe { truncate(handle, len as usize) };
+            c.complete(result as i32);
+        } else {
+            let completion_no = self.opfs.register_completion(c.clone());
+            unsafe { truncate_async(handle, len as usize, completion_no) };
+        }
         Ok(c)
     }
 
