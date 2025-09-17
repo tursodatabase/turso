@@ -7271,8 +7271,8 @@ pub fn op_open_dup(
     // a separate database file).
     let pager = &original_cursor.pager;
 
-    let mv_cursor = match program.connection.mv_tx_id.get() {
-        Some(tx_id) => {
+    let mv_cursor = match program.connection.mv_tx.get() {
+        Some((tx_id, _)) => {
             let table_id = root_page as u64;
             let mv_store = mv_store.unwrap().clone();
             let mv_cursor = Rc::new(RefCell::new(MvCursor::new(
