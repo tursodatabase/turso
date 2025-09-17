@@ -672,6 +672,15 @@ pub enum Insn {
         func: AggFunc,
     },
 
+    /// Similar to AggFinal, but instead of writing the result back into the
+    /// accumulator register, it stores the result in a separate destination
+    /// register.
+    AggValue {
+        acc_reg: usize,
+        dest_reg: usize,
+        func: AggFunc,
+    },
+
     /// Open a sorter.
     SorterOpen {
         cursor_id: CursorID,                   // P1
@@ -840,6 +849,18 @@ pub enum Insn {
         is_temp: usize,
     },
 
+    /// Deletes all contents from the ephemeral table that the cursor points to.
+    ///
+    /// In Turso, we do not currently distinguish strictly between ephemeral
+    /// and standard tables at the type level. Therefore, it is the caller’s
+    /// responsibility to ensure that `ResetSorter` is applied only to ephemeral
+    /// tables.
+    ///
+    /// SQLite also supports sorter cursors, but this is not yet implemented in Turso.
+    ResetSorter {
+        cursor_id: CursorID,
+    },
+
     ///  Drop a table
     DropTable {
         ///  The database within which this b-tree needs to be dropped (P1).
@@ -992,6 +1013,17 @@ pub enum Insn {
     /// Works the same as OpenEphemeral, name just distinguishes its use; used for transient indexes in joins.
     OpenAutoindex {
         cursor_id: usize,
+    },
+    /// Opens a new cursor that points to the same table as the original.
+    /// In SQLite, this is restricted to cursors opened by `OpenEphemeral`
+    /// (i.e., ephemeral tables), and only ephemeral cursors may be duplicated.
+    /// In Turso, we currently do not strictly distinguish between ephemeral
+    /// and standard tables at the type level. Therefore, it is the caller’s
+    /// responsibility to ensure that `OpenDup` is applied only to ephemeral
+    /// cursors.
+    OpenDup {
+        new_cursor_id: CursorID,
+        original_cursor_id: CursorID,
     },
     /// Fall through to the next instruction on the first invocation, otherwise jump to target_pc
     Once {
@@ -1171,7 +1203,7 @@ impl Insn {
             Insn::IdxLT { .. } => execute::op_idx_lt,
             Insn::DecrJumpZero { .. } => execute::op_decr_jump_zero,
             Insn::AggStep { .. } => execute::op_agg_step,
-            Insn::AggFinal { .. } => execute::op_agg_final,
+            Insn::AggFinal { .. } | Insn::AggValue { .. } => execute::op_agg_final,
             Insn::SorterOpen { .. } => execute::op_sorter_open,
             Insn::SorterInsert { .. } => execute::op_sorter_insert,
             Insn::SorterSort { .. } => execute::op_sorter_sort,
@@ -1196,6 +1228,7 @@ impl Insn {
             Insn::Copy { .. } => execute::op_copy,
             Insn::CreateBtree { .. } => execute::op_create_btree,
             Insn::Destroy { .. } => execute::op_destroy,
+            Insn::ResetSorter { .. } => execute::op_reset_sorter,
 
             Insn::DropTable { .. } => execute::op_drop_table,
             Insn::DropView { .. } => execute::op_drop_view,
@@ -1218,6 +1251,7 @@ impl Insn {
             Insn::ReadCookie { .. } => execute::op_read_cookie,
             Insn::SetCookie { .. } => execute::op_set_cookie,
             Insn::OpenEphemeral { .. } | Insn::OpenAutoindex { .. } => execute::op_open_ephemeral,
+            Insn::OpenDup { .. } => execute::op_open_dup,
             Insn::Once { .. } => execute::op_once,
             Insn::Found { .. } | Insn::NotFound { .. } => execute::op_found,
             Insn::Affinity { .. } => execute::op_affinity,

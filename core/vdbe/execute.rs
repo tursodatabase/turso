@@ -3482,7 +3482,6 @@ pub fn op_agg_step(
                     argc: *argc,
                     step_fn: *step,
                     finalize_fn: *finalize,
-                    finalized_value: None,
                 })),
                 _ => unreachable!("scalar function called in aggregate context"),
             },
@@ -3749,18 +3748,26 @@ pub fn op_agg_final(
     pager: &Rc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
-    load_insn!(AggFinal { register, func }, insn);
-    match state.registers[*register].borrow_mut() {
+    let (acc_reg, dest_reg, func) = match insn {
+        Insn::AggFinal { register, func } => (*register, *register, func),
+        Insn::AggValue {
+            acc_reg,
+            dest_reg,
+            func,
+        } => (*acc_reg, *dest_reg, func),
+        _ => unreachable!("unexpected Insn {:?}", insn),
+    };
+    match &state.registers[acc_reg] {
         Register::Aggregate(agg) => match func {
             AggFunc::Avg => {
-                let AggContext::Avg(acc, count) = agg.borrow_mut() else {
+                let AggContext::Avg(acc, count) = agg else {
                     unreachable!();
                 };
-                *acc /= count.clone();
-                state.registers[*register] = Register::Value(acc.clone());
+                let acc = acc.clone() / count.clone();
+                state.registers[dest_reg] = Register::Value(acc);
             }
             AggFunc::Sum => {
-                let AggContext::Sum(acc, sum_state) = agg.borrow_mut() else {
+                let AggContext::Sum(acc, sum_state) = agg else {
                     unreachable!();
                 };
                 let value = match acc {
@@ -3773,10 +3780,10 @@ pub fn op_agg_final(
                     }
                     _ => Value::Float(acc.as_float() + sum_state.r_err),
                 };
-                state.registers[*register] = Register::Value(value);
+                state.registers[dest_reg] = Register::Value(value);
             }
             AggFunc::Total => {
-                let AggContext::Sum(acc, _) = agg.borrow_mut() else {
+                let AggContext::Sum(acc, _) = agg else {
                     unreachable!();
                 };
                 let value = match acc {
@@ -3785,89 +3792,86 @@ pub fn op_agg_final(
                     Value::Float(f) => Value::Float(*f),
                     _ => unreachable!(),
                 };
-                state.registers[*register] = Register::Value(value);
+                state.registers[dest_reg] = Register::Value(value);
             }
             AggFunc::Count | AggFunc::Count0 => {
-                let AggContext::Count(count) = agg.borrow_mut() else {
+                let AggContext::Count(count) = agg else {
                     unreachable!();
                 };
-                state.registers[*register] = Register::Value(count.clone());
+                state.registers[dest_reg] = Register::Value(count.clone());
             }
             AggFunc::Max => {
-                let AggContext::Max(acc) = agg.borrow_mut() else {
+                let AggContext::Max(acc) = agg else {
                     unreachable!();
                 };
                 match acc {
-                    Some(value) => state.registers[*register] = Register::Value(value.clone()),
-                    None => state.registers[*register] = Register::Value(Value::Null),
+                    Some(value) => state.registers[dest_reg] = Register::Value(value.clone()),
+                    None => state.registers[dest_reg] = Register::Value(Value::Null),
                 }
             }
             AggFunc::Min => {
-                let AggContext::Min(acc) = agg.borrow_mut() else {
+                let AggContext::Min(acc) = agg else {
                     unreachable!();
                 };
                 match acc {
-                    Some(value) => state.registers[*register] = Register::Value(value.clone()),
-                    None => state.registers[*register] = Register::Value(Value::Null),
+                    Some(value) => state.registers[dest_reg] = Register::Value(value.clone()),
+                    None => state.registers[dest_reg] = Register::Value(Value::Null),
                 }
             }
             AggFunc::GroupConcat | AggFunc::StringAgg => {
-                let AggContext::GroupConcat(acc) = agg.borrow_mut() else {
+                let AggContext::GroupConcat(acc) = agg else {
                     unreachable!();
                 };
-                state.registers[*register] = Register::Value(acc.clone());
+                state.registers[dest_reg] = Register::Value(acc.clone());
             }
             #[cfg(feature = "json")]
             AggFunc::JsonGroupObject => {
-                let AggContext::GroupConcat(acc) = agg.borrow_mut() else {
+                let AggContext::GroupConcat(acc) = agg else {
                     unreachable!();
                 };
                 let data = acc.to_blob().expect("Should be blob");
-                state.registers[*register] = Register::Value(json_from_raw_bytes_agg(data, false)?);
+                state.registers[dest_reg] = Register::Value(json_from_raw_bytes_agg(data, false)?);
             }
             #[cfg(feature = "json")]
             AggFunc::JsonbGroupObject => {
-                let AggContext::GroupConcat(acc) = agg.borrow_mut() else {
+                let AggContext::GroupConcat(acc) = agg else {
                     unreachable!();
                 };
                 let data = acc.to_blob().expect("Should be blob");
-                state.registers[*register] = Register::Value(json_from_raw_bytes_agg(data, true)?);
+                state.registers[dest_reg] = Register::Value(json_from_raw_bytes_agg(data, true)?);
             }
             #[cfg(feature = "json")]
             AggFunc::JsonGroupArray => {
-                let AggContext::GroupConcat(acc) = agg.borrow_mut() else {
+                let AggContext::GroupConcat(acc) = agg else {
                     unreachable!();
                 };
                 let data = acc.to_blob().expect("Should be blob");
-                state.registers[*register] = Register::Value(json_from_raw_bytes_agg(data, false)?);
+                state.registers[dest_reg] = Register::Value(json_from_raw_bytes_agg(data, false)?);
             }
             #[cfg(feature = "json")]
             AggFunc::JsonbGroupArray => {
-                let AggContext::GroupConcat(acc) = agg.borrow_mut() else {
+                let AggContext::GroupConcat(acc) = agg else {
                     unreachable!();
                 };
                 let data = acc.to_blob().expect("Should be blob");
-                state.registers[*register] = Register::Value(json_from_raw_bytes_agg(data, true)?);
+                state.registers[dest_reg] = Register::Value(json_from_raw_bytes_agg(data, true)?);
             }
             AggFunc::External(_) => {
-                agg.compute_external()?;
                 let AggContext::External(agg_state) = agg else {
                     unreachable!();
                 };
-                match &agg_state.finalized_value {
-                    Some(value) => state.registers[*register] = Register::Value(value.clone()),
-                    None => state.registers[*register] = Register::Value(Value::Null),
-                }
+                let value = agg.compute_external()?;
+                state.registers[dest_reg] = Register::Value(value)
             }
         },
         Register::Value(Value::Null) => {
             // when the set is empty
             match func {
                 AggFunc::Total => {
-                    state.registers[*register] = Register::Value(Value::Float(0.0));
+                    state.registers[dest_reg] = Register::Value(Value::Float(0.0));
                 }
                 AggFunc::Count | AggFunc::Count0 => {
-                    state.registers[*register] = Register::Value(Value::Integer(0));
+                    state.registers[dest_reg] = Register::Value(Value::Integer(0));
                 }
                 _ => {}
             }
@@ -6514,6 +6518,33 @@ pub fn op_destroy(
     Ok(InsnFunctionStepResult::Step)
 }
 
+pub fn op_reset_sorter(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Rc<Pager>,
+    mv_store: Option<&Arc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(ResetSorter { cursor_id }, insn);
+
+    let (_, cursor_type) = program.cursor_ref.get(*cursor_id).unwrap();
+    let cursor = state.get_cursor(*cursor_id);
+
+    match cursor_type {
+        CursorType::BTreeTable(table) => {
+            let cursor = cursor.as_btree_mut();
+            return_if_io!(cursor.clear_btree());
+        }
+        CursorType::Sorter => {
+            unimplemented!("ResetSorter is not supported for sorter cursors yet")
+        }
+        _ => panic!("ResetSorter is not supported for {cursor_type:?}"),
+    }
+
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
 pub fn op_drop_table(
     program: &Program,
     state: &mut ProgramState,
@@ -7213,6 +7244,69 @@ pub fn op_open_ephemeral(
         }
     }
 
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_open_dup(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Rc<Pager>,
+    mv_store: Option<&Arc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        OpenDup {
+            new_cursor_id,
+            original_cursor_id,
+        },
+        insn
+    );
+
+    let original_cursor = state.get_cursor(*original_cursor_id);
+    let original_cursor = original_cursor.as_btree_mut();
+
+    let root_page = original_cursor.root_page();
+    // We use the pager from the original cursor instead of the one attached to
+    // the connection because each ephemeral table creates its own pager (and
+    // a separate database file).
+    let pager = &original_cursor.pager;
+
+    let mv_cursor = match program.connection.mv_tx_id.get() {
+        Some(tx_id) => {
+            let table_id = root_page as u64;
+            let mv_store = mv_store.unwrap().clone();
+            let mv_cursor = Rc::new(RefCell::new(MvCursor::new(
+                mv_store,
+                tx_id,
+                table_id,
+                pager.clone(),
+            )?));
+            Some(mv_cursor)
+        }
+        None => None,
+    };
+
+    let (_, cursor_type) = program.cursor_ref.get(*original_cursor_id).unwrap();
+    match cursor_type {
+        CursorType::BTreeTable(table) => {
+            let cursor =
+                BTreeCursor::new_table(mv_cursor, pager.clone(), root_page, table.columns.len());
+            let cursors = &mut state.cursors;
+            cursors
+                .get_mut(*new_cursor_id)
+                .unwrap()
+                .replace(Cursor::new_btree(cursor));
+        }
+        CursorType::BTreeIndex(table) => {
+            // In principle, we could implement OpenDup for BTreeIndex,
+            // but doing so now would create dead code since we have no use case,
+            // and it wouldn't be possible to test it.
+            unimplemented!("OpenDup is not supported for BTreeIndex yet")
+        }
+        _ => panic!("OpenDup is not supported for {cursor_type:?}"),
+    }
+
+    state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
 
