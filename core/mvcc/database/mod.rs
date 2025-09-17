@@ -1868,6 +1868,11 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         Ok(())
     }
 
+    // Mark table as loaded
+    pub fn mark_table_as_loaded(&self, table_id: u64) {
+        self.loaded_tables.write().insert(table_id);
+    }
+
     /// Scans the table and inserts the rows into the database.
     ///
     /// This is initialization step for a table, where we still don't have any rows so we need to insert them if there are.

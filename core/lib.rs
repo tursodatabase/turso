@@ -1180,7 +1180,14 @@ impl Connection {
         let stmt = self.prepare("SELECT * FROM sqlite_schema")?;
 
         // TODO: This function below is synchronous, make it async
-        parse_schema_rows(stmt, &mut fresh, &self.syms.read(), None, existing_views)?;
+        parse_schema_rows(
+            stmt,
+            &mut fresh,
+            &self.syms.read(),
+            None,
+            existing_views,
+            self._db.mv_store.as_ref(),
+        )?;
 
         tracing::debug!(
             "reparse_schema: schema_version={}, tables={:?}",
@@ -1791,9 +1798,14 @@ impl Connection {
         let syms = self.syms.read();
         self.with_schema_mut(|schema| {
             let existing_views = schema.incremental_views.clone();
-            if let Err(LimboError::ExtensionError(e)) =
-                parse_schema_rows(rows, schema, &syms, None, existing_views)
-            {
+            if let Err(LimboError::ExtensionError(e)) = parse_schema_rows(
+                rows,
+                schema,
+                &syms,
+                None,
+                existing_views,
+                self._db.mv_store.as_ref(),
+            ) {
                 // this means that a vtab exists and we no longer have the module loaded. we print
                 // a warning to the user to load the module
                 eprintln!("Warning: {e}");
