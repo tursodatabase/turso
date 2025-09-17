@@ -517,7 +517,7 @@ pub struct Pager {
     reserved_space: AtomicU16,
     free_page_state: RwLock<FreePageState>,
     /// Maximum number of pages allowed in the database. Default is 1073741823 (SQLite default).
-    max_page_count: Cell<u32>,
+    max_page_count: AtomicU32,
     #[cfg(not(feature = "omit_autovacuum"))]
     /// State machine for [Pager::ptrmap_get]
     ptrmap_get_state: RefCell<PtrMapGetState>,
@@ -618,7 +618,7 @@ impl Pager {
             reserved_space: AtomicU16::new(RESERVED_SPACE_NOT_SET),
             free_page_state: RwLock::new(FreePageState::Start),
             allocate_page_state: RwLock::new(AllocatePageState::Start),
-            max_page_count: Cell::new(DEFAULT_MAX_PAGE_COUNT),
+            max_page_count: AtomicU32::new(DEFAULT_MAX_PAGE_COUNT),
             #[cfg(not(feature = "omit_autovacuum"))]
             ptrmap_get_state: RefCell::new(PtrMapGetState::Start),
             #[cfg(not(feature = "omit_autovacuum"))]
@@ -632,7 +632,7 @@ impl Pager {
 
     /// Get the maximum page count for this database
     pub fn get_max_page_count(&self) -> u32 {
-        self.max_page_count.get()
+        self.max_page_count.load(Ordering::SeqCst)
     }
 
     /// Set the maximum page count for this database
@@ -644,7 +644,7 @@ impl Pager {
 
         // Clamp new_max to be at least the current database size
         let clamped_max = std::cmp::max(new_max, current_page_count);
-        self.max_page_count.set(clamped_max);
+        self.max_page_count.store(clamped_max, Ordering::SeqCst);
         Ok(IOResult::Done(clamped_max))
     }
 
