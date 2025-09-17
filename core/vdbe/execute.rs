@@ -8,7 +8,7 @@ use crate::storage::btree::{
 use crate::storage::database::DatabaseFile;
 use crate::storage::page_cache::PageCache;
 use crate::storage::pager::{AtomicDbState, CreateBTreeFlags, DbState};
-use crate::storage::sqlite3_ondisk::read_varint;
+use crate::storage::sqlite3_ondisk::{read_varint, PageSize};
 use crate::translate::collate::CollationSeq;
 use crate::types::{
     compare_immutable, compare_records_generic, Extendable, IOCompletions, ImmutableRecord,
@@ -3998,7 +3998,11 @@ pub fn op_sorter_open(
         insn
     );
     // be careful here - we must not use any async operations after pager.with_header because this op-code has no proper state-machine
-    let page_size = return_if_io!(pager.with_header(|header| header.page_size));
+    let page_size = match pager.with_header(|header| header.page_size) {
+        Ok(IOResult::Done(page_size)) => page_size,
+        Err(_) => PageSize::default(),
+        Ok(IOResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(io)),
+    };
     let page_size = page_size.get() as usize;
 
     let cache_size = program.connection.get_cache_size();
