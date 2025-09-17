@@ -211,6 +211,125 @@ impl TextRef {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct Blob {
+    pub value: Vec<u8>,
+    pub unalloc_bytes: usize,
+}
+
+impl Blob {
+    pub fn new(value: Vec<u8>) -> Self {
+        Self {
+            value,
+            unalloc_bytes: 0,
+        }
+    }
+
+    pub fn new_zeroblob(len: usize) -> Self {
+        Self {
+            value: Vec::new(),
+            unalloc_bytes: len,
+        }
+    }
+
+    pub fn overwrite_with(&mut self, data: &[u8]) {
+        self.value.clear();
+        self.value.extend_from_slice(data);
+        self.unalloc_bytes = 0;
+    }
+
+    pub fn len(&self) -> usize {
+        self.value.len() + self.unalloc_bytes
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    // Converts Blob to a vec of bytes and expands it to full length in case it's a zeroblob
+    pub fn to_bytes(&self) -> Vec<u8> {
+        if self.unalloc_bytes > 0 {
+            let mut value = self.value.clone();
+            value.resize(value.len() + self.unalloc_bytes, 0);
+            return value;
+        }
+        self.value.clone()
+    }
+
+    pub fn as_bytes(&self) -> &Vec<u8> {
+        if self.unalloc_bytes > 0 {
+            panic!("Cannot get reference to an unexpanded zeroblob");
+        }
+        &self.value
+    }
+
+    pub fn as_bytes_mut(&mut self) -> &mut Vec<u8> {
+        if self.unalloc_bytes > 0 {
+            panic!("Cannot get mutable reference to an unexpanded zeroblob");
+        }
+        &mut self.value
+    }
+}
+
+impl Display for Blob {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", String::from_utf8_lossy(&self.to_bytes()))
+    }
+}
+
+impl From<Vec<u8>> for Blob {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self::new(bytes)
+    }
+}
+
+impl From<Blob> for Vec<u8> {
+    fn from(val: Blob) -> Self {
+        val.to_bytes()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BlobRef {
+    pub value: RawSlice,
+    pub unalloc_bytes: usize,
+}
+
+impl BlobRef {
+    pub fn new(value: RawSlice) -> Self {
+        Self {
+            value,
+            unalloc_bytes: 0,
+        }
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Self {
+        Self {
+            value: RawSlice {
+                data: bytes.as_ptr(),
+                len: bytes.len(),
+            },
+            unalloc_bytes: 0,
+        }
+    }
+}
+
+impl From<BlobRef> for RawSlice {
+    fn from(blob_ref: BlobRef) -> Self {
+        Self::new(
+            blob_ref.value.data,
+            blob_ref.value.len + blob_ref.unalloc_bytes,
+        )
+    }
+}
+
+impl From<RawSlice> for BlobRef {
+    fn from(raw_slice: RawSlice) -> Self {
+        Self::new(raw_slice)
+    }
+}
+
 #[cfg(feature = "serde")]
 fn float_to_string<S>(float: &f64, serializer: S) -> Result<S::Ok, S::Error>
 where
@@ -246,7 +365,7 @@ pub enum Value {
     )]
     Float(f64),
     Text(Text),
-    Blob(Vec<u8>),
+    Blob(Blob),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -261,7 +380,7 @@ pub enum RefValue {
     Integer(i64),
     Float(f64),
     Text(TextRef),
-    Blob(RawSlice),
+    Blob(BlobRef),
 }
 
 impl Debug for RefValue {
@@ -280,15 +399,22 @@ impl Debug for RefValue {
                     .field("truncated", &(text.len() > max_len))
                     .finish()
             }
-            RefValue::Blob(raw_slice) => {
+            RefValue::Blob(blob_ref) => {
                 // truncate blob_slice to at most 32 bytes
-                let blob = raw_slice.to_slice();
+                let blob = blob_ref.value.to_slice();
                 let max_len = blob.len().min(32);
-                f.debug_struct("Blob")
+                let mut debug_struct = f.debug_struct("Blob");
+
+                debug_struct
                     .field("data", &&blob[0..max_len])
                     // Indicates to the developer debugging that the data is truncated for printing
-                    .field("truncated", &(blob.len() > max_len))
-                    .finish()
+                    .field("truncated", &(blob.len() > max_len));
+
+                if blob_ref.unalloc_bytes > 0 {
+                    debug_struct.field("unallocated", &blob_ref.unalloc_bytes);
+                }
+
+                debug_struct.finish()
             }
         }
     }
@@ -300,15 +426,19 @@ impl Value {
         Self::Text(Text::new(text.as_ref()))
     }
 
+    pub fn build_zeroblob(len: usize) -> Self {
+        Value::Blob(Blob::new_zeroblob(len))
+    }
+
     pub fn to_blob(&self) -> Option<&[u8]> {
         match self {
-            Self::Blob(blob) => Some(blob),
+            Self::Blob(blob) => Some(blob.value.as_ref()),
             _ => None,
         }
     }
 
     pub fn from_blob(data: Vec<u8>) -> Self {
-        Value::Blob(data)
+        Value::Blob(data.into())
     }
 
     pub fn to_text(&self) -> Option<&str> {
@@ -320,17 +450,18 @@ impl Value {
 
     pub fn as_blob(&self) -> &Vec<u8> {
         match self {
-            Value::Blob(b) => b,
+            Value::Blob(b) => b.as_bytes(),
             _ => panic!("as_blob must be called only for Value::Blob"),
         }
     }
 
     pub fn as_blob_mut(&mut self) -> &mut Vec<u8> {
         match self {
-            Value::Blob(b) => b,
+            Value::Blob(b) => b.as_bytes_mut(),
             _ => panic!("as_blob must be called only for Value::Blob"),
         }
     }
+
     pub fn as_float(&self) -> f64 {
         match self {
             Value::Float(f) => *f,
@@ -383,8 +514,8 @@ impl Value {
             }
             Value::Float(f) => out.extend_from_slice(&f.to_be_bytes()),
             Value::Text(t) => out.extend_from_slice(&t.value),
-            Value::Blob(b) => out.extend_from_slice(b),
-        };
+            Value::Blob(b) => out.extend_from_slice(&b.to_bytes()),
+        }
     }
 
     pub fn cast_text(&self) -> Option<String> {
@@ -424,7 +555,7 @@ impl Display for Value {
             Self::Text(s) => {
                 write!(f, "{}", s.as_str())
             }
-            Self::Blob(b) => write!(f, "{}", String::from_utf8_lossy(b)),
+            Self::Blob(b) => write!(f, "{}", String::from_utf8_lossy(&b.to_bytes())),
         }
     }
 }
@@ -436,7 +567,7 @@ impl Value {
             Self::Integer(i) => ExtValue::from_integer(*i),
             Self::Float(fl) => ExtValue::from_float(*fl),
             Self::Text(text) => ExtValue::from_text(text.as_str().to_string()),
-            Self::Blob(blob) => ExtValue::from_blob(blob.to_vec()),
+            Self::Blob(blob) => ExtValue::from_blob(blob.to_bytes()),
         }
     }
 
@@ -469,7 +600,7 @@ impl Value {
                 let Some(blob) = v.to_blob() else {
                     return Ok(Value::Null);
                 };
-                Ok(Value::Blob(blob))
+                Ok(Value::Blob(blob.into()))
             }
             ExtValueType::Error => {
                 let Some(err) = v.to_error_details() else {
@@ -536,7 +667,7 @@ impl FromValue for Vec<u8> {
     fn from_sql(val: Value) -> Result<Self> {
         match val {
             Value::Null => Err(LimboError::NullValue),
-            Value::Blob(blob) => Ok(blob),
+            Value::Blob(blob) => Ok(blob.to_bytes()),
             _ => unreachable!("invalid value type"),
         }
     }
@@ -547,7 +678,10 @@ impl<const N: usize> FromValue for [u8; N] {
     fn from_sql(val: Value) -> Result<Self> {
         match val {
             Value::Null => Err(LimboError::NullValue),
-            Value::Blob(blob) => blob.try_into().map_err(|_| LimboError::InvalidBlobSize(N)),
+            Value::Blob(blob) => blob
+                .to_bytes()
+                .try_into()
+                .map_err(|_| LimboError::InvalidBlobSize(N)),
             _ => unreachable!("invalid value type"),
         }
     }
@@ -882,11 +1016,11 @@ pub struct ImmutableRecord {
 impl std::fmt::Debug for ImmutableRecord {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.payload {
-            Value::Blob(bytes) => {
-                let preview = if bytes.len() > 20 {
-                    format!("{:?} ... ({} bytes total)", &bytes[..20], bytes.len())
+            Value::Blob(b) => {
+                let preview = if b.len() > 20 {
+                    format!("{:?} ... ({} bytes total)", &b.to_bytes()[..20], b.len())
                 } else {
-                    format!("{bytes:?}")
+                    format!("{:?}", b.to_bytes())
                 };
                 write!(f, "ImmutableRecord {{ payload: {preview} }}")
             }
@@ -974,13 +1108,13 @@ impl<'a> AppendWriter<'a> {
 impl ImmutableRecord {
     pub fn new(payload_capacity: usize) -> Self {
         Self {
-            payload: Value::Blob(Vec::with_capacity(payload_capacity)),
+            payload: Value::Blob(Vec::with_capacity(payload_capacity).into()),
         }
     }
 
     pub fn from_bin_record(payload: Vec<u8>) -> Self {
         Self {
-            payload: Value::Blob(payload),
+            payload: Value::Blob(payload.into()),
         }
     }
 
@@ -1080,31 +1214,31 @@ impl ImmutableRecord {
                     ref_values.push(value);
                 }
                 Value::Blob(b) => {
-                    writer.extend_from_slice(b);
+                    writer.extend_from_slice(&b.to_bytes());
                     let end_offset = writer.pos;
                     let len = end_offset - start_offset;
                     let ptr = unsafe { writer.buf.as_ptr().add(start_offset) };
-                    ref_values.push(RefValue::Blob(RawSlice::new(ptr, len)));
+                    ref_values.push(RefValue::Blob(RawSlice::new(ptr, len).into()));
                 }
             };
         }
 
         writer.assert_finish_capacity();
         Self {
-            payload: Value::Blob(buf),
+            payload: Value::Blob(buf.into()),
         }
     }
 
     pub fn as_blob(&self) -> &Vec<u8> {
         match &self.payload {
-            Value::Blob(b) => b,
+            Value::Blob(b) => b.as_bytes(),
             _ => panic!("payload must be a blob"),
         }
     }
 
     pub fn as_blob_mut(&mut self) -> &mut Vec<u8> {
         match &mut self.payload {
-            Value::Blob(b) => b,
+            Value::Blob(b) => b.as_bytes_mut(),
             _ => panic!("payload must be a blob"),
         }
     }
@@ -1469,7 +1603,7 @@ impl RefValue {
                     .unwrap()
                     .to_string(),
             ),
-            Self::Blob(blob) => ExtValue::from_blob(blob.to_slice().to_vec()),
+            Self::Blob(blob) => ExtValue::from_blob(blob.value.to_slice().to_vec()),
         }
     }
 
@@ -1482,12 +1616,19 @@ impl RefValue {
                 value: text_ref.value.to_slice().to_vec(),
                 subtype: text_ref.subtype,
             }),
-            RefValue::Blob(b) => Value::Blob(b.to_slice().to_vec()),
+            RefValue::Blob(blob_ref) => Value::Blob(Blob {
+                value: blob_ref.value.to_slice().to_vec(),
+                unalloc_bytes: blob_ref.unalloc_bytes,
+            }),
         }
     }
-    pub fn to_blob(&self) -> Option<&[u8]> {
+
+    pub fn to_blob(&self) -> Option<Blob> {
         match self {
-            Self::Blob(blob) => Some(blob.to_slice()),
+            Self::Blob(blob_ref) => Some(Blob {
+                value: blob_ref.value.to_slice().to_vec(),
+                unalloc_bytes: blob_ref.unalloc_bytes,
+            }),
             _ => None,
         }
     }
@@ -1500,7 +1641,7 @@ impl Display for RefValue {
             Self::Integer(i) => write!(f, "{i}"),
             Self::Float(fl) => write!(f, "{fl:?}"),
             Self::Text(s) => write!(f, "{}", s.as_str()),
-            Self::Blob(b) => write!(f, "{}", String::from_utf8_lossy(b.to_slice())),
+            Self::Blob(b) => write!(f, "{}", String::from_utf8_lossy(b.value.to_slice())),
         }
     }
 }
@@ -1542,9 +1683,10 @@ impl PartialOrd<RefValue> for RefValue {
             (Self::Text(_), Self::Blob(_)) => Some(std::cmp::Ordering::Less),
             (Self::Blob(_), Self::Text(_)) => Some(std::cmp::Ordering::Greater),
 
-            (Self::Blob(blob_left), Self::Blob(blob_right)) => {
-                blob_left.to_slice().partial_cmp(blob_right.to_slice())
-            }
+            (Self::Blob(blob_left), Self::Blob(blob_right)) => blob_left
+                .value
+                .to_slice()
+                .partial_cmp(blob_right.value.to_slice()),
             (Self::Null, Self::Null) => Some(std::cmp::Ordering::Equal),
             (Self::Null, _) => Some(std::cmp::Ordering::Less),
             (_, Self::Null) => Some(std::cmp::Ordering::Greater),
@@ -2202,7 +2344,7 @@ impl From<&Value> for SerialType {
             },
             Value::Float(_) => SerialType::f64(),
             Value::Text(t) => SerialType::text(t.value.len() as u64),
-            Value::Blob(b) => SerialType::blob(b.len() as u64),
+            Value::Blob(b) => SerialType::blob((b.len()) as u64),
         }
     }
 }
@@ -2294,7 +2436,9 @@ impl Record {
                 }
                 Value::Float(f) => buf.extend_from_slice(&f.to_be_bytes()),
                 Value::Text(t) => buf.extend_from_slice(&t.value),
-                Value::Blob(b) => buf.extend_from_slice(b),
+                Value::Blob(b) => {
+                    buf.extend_from_slice(&b.to_bytes());
+                }
             };
         }
 
@@ -2684,7 +2828,10 @@ mod tests {
                 value: RawSlice::from_slice(&text.value),
                 subtype: text.subtype,
             }),
-            Value::Blob(blob) => RefValue::Blob(RawSlice::from_slice(blob)),
+            Value::Blob(blob) => RefValue::Blob(BlobRef {
+                value: RawSlice::from_slice(&blob.value),
+                unalloc_bytes: blob.unalloc_bytes,
+            }),
         }
     }
 
@@ -2962,7 +3109,7 @@ mod tests {
             ),
             (
                 vec![Value::Null],
-                vec![RefValue::Blob(RawSlice::from_slice(b"blob"))],
+                vec![RefValue::Blob(BlobRef::from_bytes(b"blob"))],
                 "null_vs_blob",
             ),
             // Numbers vs Text/Blob
@@ -2978,18 +3125,18 @@ mod tests {
             ),
             (
                 vec![Value::Integer(42)],
-                vec![RefValue::Blob(RawSlice::from_slice(b"blob"))],
+                vec![RefValue::Blob(BlobRef::from_bytes(b"blob"))],
                 "integer_vs_blob",
             ),
             (
                 vec![Value::Float(64.4)],
-                vec![RefValue::Blob(RawSlice::from_slice(b"blob"))],
+                vec![RefValue::Blob(BlobRef::from_bytes(b"blob"))],
                 "float_vs_blob",
             ),
             // Text vs Blob
             (
                 vec![Value::Text(Text::new("hello"))],
-                vec![RefValue::Blob(RawSlice::from_slice(b"blob"))],
+                vec![RefValue::Blob(BlobRef::from_bytes(b"blob"))],
                 "text_vs_blob",
             ),
             // Integer vs Float (affinity conversion)
@@ -3088,8 +3235,8 @@ mod tests {
                 "large_field_count",
             ),
             (
-                vec![Value::Blob(vec![1, 2, 3])],
-                vec![RefValue::Blob(RawSlice::from_slice(&[1, 2, 3]))],
+                vec![Value::Blob(vec![1, 2, 3].into())],
+                vec![RefValue::Blob(BlobRef::from_bytes(&[1, 2, 3]))],
                 "blob_first_field",
             ),
             (
@@ -3182,7 +3329,7 @@ mod tests {
             RecordCompare::Generic
         ));
 
-        let blob_values = vec![RefValue::Blob(RawSlice::from_slice(&[1, 2, 3]))];
+        let blob_values = vec![RefValue::Blob(BlobRef::from_bytes(&[1, 2, 3]))];
         assert!(matches!(
             find_compare(&blob_values, &index_info_small),
             RecordCompare::Generic
@@ -3197,7 +3344,7 @@ mod tests {
             Value::Float(64.4),
             Value::Null,
             Value::Integer(1000000),
-            Value::Blob(vec![1, 2, 3, 4, 5]),
+            Value::Blob(vec![1, 2, 3, 4, 5].into()),
         ];
 
         let registers: Vec<Register> = values.iter().cloned().map(Register::Value).collect();
@@ -3448,7 +3595,7 @@ mod tests {
     #[test]
     fn test_serialize_blob() {
         let blob = vec![1, 2, 3, 4, 5];
-        let record = Record::new(vec![Value::Blob(blob.clone())]);
+        let record = Record::new(vec![Value::Blob(blob.clone().into())]);
         let mut buf = Vec::new();
         record.serialize(&mut buf);
 

@@ -79,8 +79,8 @@ fn test_statement_bind() -> anyhow::Result<()> {
                     assert_eq!(*i, 42)
                 }
 
-                if let turso_core::Value::Blob(v) = row.get::<&Value>(3).unwrap() {
-                    assert_eq!(v.as_slice(), &vec![0x1_u8, 0x2, 0x3])
+                if let turso_core::Value::Blob(b) = row.get::<&Value>(3).unwrap() {
+                    assert_eq!(b.to_bytes().as_slice(), &vec![0x1_u8, 0x2, 0x3])
                 }
 
                 if let turso_core::Value::Float(f) = row.get::<&Value>(4).unwrap() {

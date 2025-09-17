@@ -977,7 +977,8 @@ impl ProgramBuilder {
                             let hex_byte = std::str::from_utf8(pair).unwrap();
                             u8::from_str_radix(hex_byte, 16).unwrap()
                         })
-                        .collect(),
+                        .collect::<Vec<u8>>()
+                        .into(),
                 ),
                 _ => break 'value None,
             })

@@ -818,6 +818,27 @@ pub unsafe extern "C" fn sqlite3_bind_blob(
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn sqlite3_bind_zeroblob(
+    stmt: *mut sqlite3_stmt,
+    idx: ffi::c_int,
+    len: ffi::c_int,
+) -> ffi::c_int {
+    if stmt.is_null() {
+        return SQLITE_MISUSE;
+    }
+    if idx <= 0 {
+        return SQLITE_RANGE;
+    }
+
+    let stmt_ref = &mut *stmt;
+    stmt_ref
+        .stmt
+        .bind_zeroblob_at(NonZero::new_unchecked(idx as usize), len.max(0) as usize);
+
+    SQLITE_OK
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn sqlite3_clear_bindings(stmt: *mut sqlite3_stmt) -> ffi::c_int {
     if stmt.is_null() {
         return SQLITE_MISUSE;
@@ -929,7 +950,7 @@ pub unsafe extern "C" fn sqlite3_column_blob(
         None => return std::ptr::null(),
     };
     match row.get::<&Value>(idx as usize) {
-        Ok(turso_core::Value::Blob(blob)) => blob.as_ptr() as *const ffi::c_void,
+        Ok(turso_core::Value::Blob(blob)) => blob.as_bytes().as_ptr() as *const ffi::c_void,
         _ => std::ptr::null(),
     }
 }
@@ -1000,7 +1021,10 @@ pub unsafe extern "C" fn sqlite3_value_blob(value: *mut ffi::c_void) -> *const f
     let value = value as *mut turso_core::Value;
     let value = &*value;
     match value {
-        turso_core::Value::Blob(blob) => blob.as_ptr() as *const ffi::c_void,
+        turso_core::Value::Blob(blob) => {
+            let bytes = blob.to_bytes();
+            bytes.as_ptr() as *const ffi::c_void
+        }
         _ => std::ptr::null(),
     }
 }

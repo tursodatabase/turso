@@ -102,7 +102,7 @@ impl ArbitraryFrom<&ColumnType> for SimValue {
             ColumnType::Integer => Value::Integer(rng.random_range(i64::MIN..i64::MAX)),
             ColumnType::Float => Value::Float(rng.random_range(-1e10..1e10)),
             ColumnType::Text => Value::build_text(gen_random_text(rng)),
-            ColumnType::Blob => Value::Blob(gen_random_text(rng).as_bytes().to_vec()),
+            ColumnType::Blob => Value::Blob(gen_random_text(rng).as_bytes().to_vec().into()),
         };
         SimValue(value)
     }
@@ -158,10 +158,10 @@ impl ArbitraryFrom<&SimValue> for LTValue {
             }
             Value::Blob(b) => {
                 // Either shorten the blob, or make at least one byte smaller and mutate the rest
-                let mut b = b.clone();
+                let mut b = b.to_bytes().clone();
                 if rng.random_bool(0.01) {
                     b.pop();
-                    Value::Blob(b)
+                    Value::Blob(b.into())
                 } else {
                     let index = rng.random_range(0..b.len());
                     b[index] -= 1;
@@ -169,7 +169,7 @@ impl ArbitraryFrom<&SimValue> for LTValue {
                     for val in b.iter_mut().skip(index + 1) {
                         *val = rng.random_range(0..=255);
                     }
-                    Value::Blob(b)
+                    Value::Blob(b.into())
                 }
             }
             _ => unreachable!(),
@@ -228,10 +228,10 @@ impl ArbitraryFrom<&SimValue> for GTValue {
             }
             Value::Blob(b) => {
                 // Either lengthen the blob, or make at least one byte smaller and mutate the rest
-                let mut b = b.clone();
+                let mut b = b.to_bytes().clone();
                 if rng.random_bool(0.01) {
                     b.push(rng.random_range(0..=255));
-                    Value::Blob(b)
+                    Value::Blob(b.into())
                 } else {
                     let index = rng.random_range(0..b.len());
                     b[index] += 1;
@@ -239,7 +239,7 @@ impl ArbitraryFrom<&SimValue> for GTValue {
                     for val in b.iter_mut().skip(index + 1) {
                         *val = rng.random_range(0..=255);
                     }
-                    Value::Blob(b)
+                    Value::Blob(b.into())
                 }
             }
             _ => unreachable!(),

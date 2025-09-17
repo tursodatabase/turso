@@ -79,7 +79,7 @@ fn execute_query_rusqlite(
                         rusqlite::types::Value::Integer(i) => Value::Integer(i),
                         rusqlite::types::Value::Real(f) => Value::Float(f),
                         rusqlite::types::Value::Text(s) => Value::build_text(s),
-                        rusqlite::types::Value::Blob(b) => Value::Blob(b),
+                        rusqlite::types::Value::Blob(b) => Value::Blob(b.into()),
                     };
                     values.push(SimValue(value));
                 }

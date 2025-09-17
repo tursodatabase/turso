@@ -1558,7 +1558,8 @@ fn print_row(row: &[SimValue]) -> String {
             types::Value::Text(t) => t.to_string(),
             types::Value::Blob(b) => format!(
                 "X'{}'",
-                b.iter()
+                b.to_bytes()
+                    .iter()
                     .fold(String::new(), |acc, b| acc + &format!("{b:02X}"))
             ),
         })

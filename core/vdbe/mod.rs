@@ -956,7 +956,9 @@ pub fn registers_to_ref_values(registers: &[Register]) -> Vec<RefValue> {
                     value: RawSlice::new(t.value.as_ptr(), t.value.len()),
                     subtype: t.subtype,
                 }),
-                Value::Blob(b) => RefValue::Blob(RawSlice::new(b.as_ptr(), b.len())),
+                Value::Blob(b) => {
+                    RefValue::Blob(RawSlice::new(b.to_bytes().as_ptr(), b.len()).into())
+                }
             }
         })
         .collect()

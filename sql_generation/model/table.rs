@@ -1,7 +1,10 @@
 use std::{fmt::Display, hash::Hash, ops::Deref};
 
 use serde::{Deserialize, Serialize};
-use turso_core::{numeric::Numeric, types};
+use turso_core::{
+    numeric::Numeric,
+    types::{self},
+};
 use turso_parser::ast;
 
 use crate::model::query::predicate::Predicate;
@@ -155,7 +158,7 @@ impl Display for SimValue {
             types::Value::Integer(i) => write!(f, "{i}"),
             types::Value::Float(fl) => write!(f, "{fl}"),
             value @ types::Value::Text(..) => write!(f, "'{value}'"),
-            types::Value::Blob(b) => write!(f, "{}", to_sqlite_blob(b)),
+            types::Value::Blob(b) => write!(f, "{}", to_sqlite_blob(&b.to_bytes())),
         }
     }
 }
@@ -317,7 +320,8 @@ impl From<&ast::Literal> for SimValue {
                         let hex_byte = std::str::from_utf8(pair).unwrap();
                         u8::from_str_radix(hex_byte, 16).unwrap()
                     })
-                    .collect(),
+                    .collect::<Vec<u8>>()
+                    .into(),
             ),
             ast::Literal::Keyword(keyword) => match keyword.to_uppercase().as_str() {
                 "TRUE" => types::Value::Integer(1),
@@ -344,7 +348,7 @@ impl From<&SimValue> for ast::Literal {
             types::Value::Integer(i) => Self::Numeric(i.to_string()),
             types::Value::Float(f) => Self::Numeric(f.to_string()),
             text @ types::Value::Text(..) => Self::String(escape_singlequotes(&text.to_string())),
-            types::Value::Blob(blob) => Self::Blob(hex::encode(blob)),
+            types::Value::Blob(blob) => Self::Blob(hex::encode(blob.to_bytes())),
         }
     }
 }

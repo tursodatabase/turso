@@ -75,7 +75,7 @@ impl Row {
             turso_core::Value::Null => Ok(Value::Null),
             turso_core::Value::Float(f) => Ok(Value::Real(*f)),
             turso_core::Value::Text(text) => Ok(Value::Text(text.to_string())),
-            turso_core::Value::Blob(items) => Ok(Value::Blob(items.to_vec())),
+            turso_core::Value::Blob(blob) => Ok(Value::Blob(blob.to_bytes())),
         }
     }
 
