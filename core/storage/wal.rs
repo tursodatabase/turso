@@ -265,18 +265,16 @@ pub trait Wal: Debug {
         page: &[u8],
     ) -> Result<()>;
 
-    /// Write a frame to the WAL.
-    /// db_size is the database size in pages after the transaction finishes.
-    /// db_size > 0    -> last frame written in transaction
-    /// db_size == 0   -> non-last frame written in transaction
-    /// write_counter is the counter we use to track when the I/O operation starts and completes
-    fn append_frame(
-        &mut self,
-        page: PageRef,
-        page_size: PageSize,
-        db_size: u32,
-    ) -> Result<Completion>;
+    /// Prepare WAL header for the future append
+    /// Most of the time this method will return Ok(None)
+    fn prepare_wal_start(&mut self, page_sz: PageSize) -> Result<Option<Completion>>;
 
+    fn prepare_wal_finish(&mut self) -> Result<Completion>;
+
+    /// Write a bunch of frames to the WAL.
+    /// db_size is the database size in pages after the transaction finishes.
+    /// db_size is set  -> last frame written in transaction
+    /// db_size is none -> non-last frame written in transaction
     fn append_frames_vectored(
         &mut self,
         pages: Vec<PageRef>,
@@ -1288,90 +1286,6 @@ impl Wal for WalFile {
         Ok(())
     }
 
-    /// Write a frame to the WAL.
-    #[instrument(skip_all, level = Level::DEBUG)]
-    fn append_frame(
-        &mut self,
-        page: PageRef,
-        page_size: PageSize,
-        db_size: u32,
-    ) -> Result<Completion> {
-        self.ensure_header_if_needed(page_size)?;
-        let shared_page_size = {
-            let shared = self.get_shared();
-            let page_size = shared.wal_header.lock().page_size;
-            page_size
-        };
-        turso_assert!(
-            shared_page_size == page_size.get(),
-            "page size mismatch - tried to change page size after WAL header was already initialized: shared.page_size={shared_page_size}, page_size={}",
-            page_size.get()
-        );
-        let page_id = page.get().id;
-        let frame_id = self.max_frame + 1;
-        let offset = self.frame_offset(frame_id);
-        tracing::debug!(frame_id, offset, page_id);
-        let (c, checksums) = {
-            let shared = self.get_shared();
-            let shared_file = self.shared.clone();
-            let header = shared.wal_header.lock();
-            let checksums = self.last_checksum;
-            let page_content = page.get_contents();
-            let page_buf = page_content.as_ptr();
-
-            let io_ctx = self.io_ctx.borrow();
-            let encrypted_data;
-            let data_to_write = match &io_ctx.encryption_or_checksum() {
-                EncryptionOrChecksum::Encryption(ctx) => {
-                    encrypted_data = ctx.encrypt_page(page_buf, page_id)?;
-                    encrypted_data.as_slice()
-                }
-                EncryptionOrChecksum::Checksum(ctx) => {
-                    ctx.add_checksum_to_page(page_buf, page_id)?;
-                    page_buf
-                }
-                EncryptionOrChecksum::None => page_buf,
-            };
-
-            let (frame_checksums, frame_bytes) = prepare_wal_frame(
-                &self.buffer_pool,
-                &header,
-                checksums,
-                header.page_size,
-                page_id as u32,
-                db_size,
-                data_to_write,
-            );
-
-            let c = Completion::new_write({
-                let frame_bytes = frame_bytes.clone();
-                move |res: Result<i32, CompletionError>| {
-                    let Ok(bytes_written) = res else {
-                        return;
-                    };
-                    let frame_len = frame_bytes.len();
-                    turso_assert!(
-                        bytes_written == frame_len as i32,
-                        "wrote({bytes_written}) != expected({frame_len})"
-                    );
-
-                    page.clear_dirty();
-                    let seq = shared_file.read().epoch.load(Ordering::Acquire);
-                    page.set_wal_tag(frame_id, seq);
-                }
-            });
-            assert!(
-                shared.enabled.load(Ordering::Relaxed),
-                "WAL must be enabled"
-            );
-            let file = shared.file.as_ref().unwrap();
-            let result = file.pwrite(offset, frame_bytes.clone(), c)?;
-            (result, frame_checksums)
-        };
-        self.complete_append_frame(page_id as u64, frame_id, checksums);
-        Ok(c)
-    }
-
     #[instrument(skip_all, level = Level::DEBUG)]
     fn should_checkpoint(&self) -> bool {
         let shared = self.get_shared();
@@ -1485,6 +1399,24 @@ impl Wal for WalFile {
         Ok(pages)
     }
 
+    fn prepare_wal_start(&mut self, page_sz: PageSize) -> Result<Option<Completion>> {
+        self.ensure_header_if_needed(page_sz)
+    }
+
+    fn prepare_wal_finish(&mut self) -> Result<Completion> {
+        let shared = self.get_shared();
+        assert!(
+            shared.enabled.load(Ordering::Relaxed),
+            "WAL must be enabled"
+        );
+        let file = shared.file.as_ref().unwrap();
+        let shared = self.shared.clone();
+        let c = file.sync(Completion::new_sync(move |_| {
+            shared.read().initialized.store(true, Ordering::Release);
+        }))?;
+        Ok(c)
+    }
+
     /// Use pwritev to append many frames to the log at once
     fn append_frames_vectored(
         &mut self,
@@ -1496,7 +1428,10 @@ impl Wal for WalFile {
             pages.len() <= IOV_MAX,
             "we limit number of iovecs to IOV_MAX"
         );
-        self.ensure_header_if_needed(page_sz)?;
+        turso_assert!(
+            self.get_shared().is_initialized()?,
+            "WAL must be prepared with prepare_append method"
+        );
 
         let (header, shared_page_size, epoch) = {
             let shared = self.get_shared();
@@ -1708,9 +1643,9 @@ impl WalFile {
 
     /// the WAL file has been truncated and we are writing the first
     /// frame since then. We need to ensure that the header is initialized.
-    fn ensure_header_if_needed(&mut self, page_size: PageSize) -> Result<()> {
+    fn ensure_header_if_needed(&mut self, page_size: PageSize) -> Result<Option<Completion>> {
         if self.get_shared().is_initialized()? {
-            return Ok(());
+            return Ok(None);
         }
         tracing::debug!("ensure_header_if_needed");
         self.last_checksum = {
@@ -1749,15 +1684,8 @@ impl WalFile {
             "WAL must be enabled"
         );
         let file = shared.file.as_ref().unwrap();
-        self.io
-            .wait_for_completion(sqlite3_ondisk::begin_write_wal_header(
-                file,
-                &shared.wal_header.lock(),
-            )?)?;
-        self.io
-            .wait_for_completion(file.sync(Completion::new_sync(|_| {}))?)?;
-        shared.initialized.store(true, Ordering::Release);
-        Ok(())
+        let c = sqlite3_ondisk::begin_write_wal_header(file, &shared.wal_header.lock())?;
+        Ok(Some(c))
     }
 
     fn checkpoint_inner(

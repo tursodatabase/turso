@@ -316,6 +316,10 @@ impl Page {
 #[derive(Clone, Copy, Debug)]
 /// The state of the current pager cache commit.
 enum CommitState {
+    /// Prepare WAL header for commit if needed
+    PrepareWal,
+    /// Sync WAL header after prepare
+    PrepareWalSync,
     /// Appends all frames to the WAL.
     Start,
     /// Fsync the on-disk WAL.
@@ -581,7 +585,7 @@ impl Pager {
             commit_info: CommitInfo {
                 result: RefCell::new(None),
                 completions: RefCell::new(Vec::new()),
-                state: CommitState::Start.into(),
+                state: CommitState::PrepareWal.into(),
                 time: now.into(),
             },
             syncing: Rc::new(Cell::new(false)),
@@ -1258,6 +1262,13 @@ impl Pager {
         let mut completions: Vec<Completion> = Vec::new();
         let mut pages = Vec::with_capacity(len);
         let page_sz = self.page_size.get().unwrap_or_default();
+
+        if let Some(c) = wal.borrow_mut().prepare_wal_start(page_sz)? {
+            self.io.wait_for_completion(c)?;
+            let c = wal.borrow_mut().prepare_wal_finish()?;
+            self.io.wait_for_completion(c)?;
+        }
+
         let commit_frame = None; // cacheflush only so we are not setting a commit frame here
         for (idx, page_id) in dirty_pages.iter().enumerate() {
             let page = {
@@ -1325,6 +1336,25 @@ impl Pager {
             let state = self.commit_info.state.get();
             trace!(?state);
             match state {
+                CommitState::PrepareWal => {
+                    let page_sz = self.page_size.get().expect("page size not set");
+                    let c = wal.borrow_mut().prepare_wal_start(page_sz)?;
+                    let Some(c) = c else {
+                        self.commit_info.state.set(CommitState::Start);
+                        continue;
+                    };
+                    self.commit_info.state.set(CommitState::PrepareWalSync);
+                    if !c.is_completed() {
+                        io_yield_one!(c);
+                    }
+                }
+                CommitState::PrepareWalSync => {
+                    let c = wal.borrow_mut().prepare_wal_finish()?;
+                    self.commit_info.state.set(CommitState::Start);
+                    if !c.is_completed() {
+                        io_yield_one!(c);
+                    }
+                }
                 CommitState::Start => {
                     let now = self.io.now();
                     self.commit_info.time.set(now);
