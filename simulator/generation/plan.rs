@@ -211,7 +211,7 @@ impl Interactions {
             )],
             InteractionsType::Fault(fault) => vec![Interaction::new(
                 self.connection_index,
-                InteractionType::Fault(fault.clone()),
+                InteractionType::Fault(*fault),
             )],
         }
     }
@@ -260,7 +260,7 @@ impl Display for InteractionPlan {
                     let name = property.name();
                     writeln!(f, "-- begin testing '{name}'")?;
                     for interaction in property.interactions(interactions.connection_index) {
-                        writeln!(f, "\t{}", interaction)?;
+                        writeln!(f, "\t{interaction}")?;
                     }
                     writeln!(f, "-- end testing '{name}'")?;
                 }
@@ -916,7 +916,7 @@ fn random_fault<R: rand::Rng>(rng: &mut R, env: &SimulatorEnv) -> Interactions {
     } else {
         vec![Fault::Disconnect, Fault::ReopenDatabase]
     };
-    let fault = faults[rng.random_range(0..faults.len())].clone();
+    let fault = faults[rng.random_range(0..faults.len())];
     Interactions::new(env.choose_conn(rng), InteractionsType::Fault(fault))
 }
 
