@@ -143,10 +143,12 @@ pub fn translate_create_table(
 
     // If we need an automatic index, add its entry to sqlite_schema
     if let Some(index_regs) = index_regs {
-        for (_idx, index_reg) in index_regs.into_iter().enumerate() {
-            let index_name = String::from(PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX)
-                + &normalize_ident(tbl_name.name.as_str())
-                + stringify!(_idx + 1);
+        for (idx, index_reg) in index_regs.into_iter().enumerate() {
+            let index_name = format!(
+                "{PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX}{}_{}",
+                tbl_name.name.as_str(),
+                idx + 1
+            );
             emit_schema_entry(
                 &mut program,
                 &resolver,
