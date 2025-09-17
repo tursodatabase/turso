@@ -515,7 +515,7 @@ pub struct Pager {
     /// to change it.
     pub(crate) page_size: AtomicU32,
     reserved_space: AtomicU16,
-    free_page_state: RefCell<FreePageState>,
+    free_page_state: RwLock<FreePageState>,
     /// Maximum number of pages allowed in the database. Default is 1073741823 (SQLite default).
     max_page_count: Cell<u32>,
     #[cfg(not(feature = "omit_autovacuum"))]
@@ -616,7 +616,7 @@ impl Pager {
             allocate_page1_state,
             page_size: AtomicU32::new(0), // 0 means not set
             reserved_space: AtomicU16::new(RESERVED_SPACE_NOT_SET),
-            free_page_state: RefCell::new(FreePageState::Start),
+            free_page_state: RwLock::new(FreePageState::Start),
             allocate_page_state: RwLock::new(AllocatePageState::Start),
             max_page_count: Cell::new(DEFAULT_MAX_PAGE_COUNT),
             #[cfg(not(feature = "omit_autovacuum"))]
@@ -1771,7 +1771,7 @@ impl Pager {
         let header_ref = self.io.block(|| HeaderRefMut::from_pager(self))?;
         let header = header_ref.borrow_mut();
 
-        let mut state = self.free_page_state.borrow_mut();
+        let mut state = self.free_page_state.write();
         tracing::debug!(?state);
         loop {
             match &mut *state {
@@ -2237,7 +2237,7 @@ impl Pager {
         self.commit_info.state.set(CommitState::Start);
         self.commit_info.time.set(self.io.now());
         *self.allocate_page_state.write() = AllocatePageState::Start;
-        self.free_page_state.replace(FreePageState::Start);
+        *self.free_page_state.write() = FreePageState::Start;
         #[cfg(not(feature = "omit_autovacuum"))]
         {
             self.ptrmap_get_state.replace(PtrMapGetState::Start);
