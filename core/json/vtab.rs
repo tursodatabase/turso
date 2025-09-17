@@ -134,7 +134,7 @@ enum IteratorState {
 
 pub struct JsonEachCursor {
     rowid: i64,
-    no_more_rows: bool,
+    has_row: bool,
     json: Jsonb,
     root_path: Option<String>,
     iterator_state: IteratorState,
@@ -145,7 +145,7 @@ impl Default for JsonEachCursor {
     fn default() -> Self {
         Self {
             rowid: 0,
-            no_more_rows: false,
+            has_row: false,
             json: Jsonb::new(0, None),
             root_path: None,
             iterator_state: IteratorState::None,
@@ -160,9 +160,10 @@ impl InternalVirtualTableCursor for JsonEachCursor {
         args: &[Value],
         _idx_str: Option<String>,
         _idx_num: i32,
-    ) -> Result<bool, LimboError> {
+    ) -> Result<(), LimboError> {
         if args.is_empty() {
-            return Ok(false);
+            self.has_row = false;
+            return Ok(());
         }
         if args.len() != 1 && args.len() != 2 {
             return Err(LimboError::InvalidArgument(
@@ -183,7 +184,8 @@ impl InternalVirtualTableCursor for JsonEachCursor {
             self.json = if let Some(json) = navigate_to_path(&mut jsonb, &args[1])? {
                 json
             } else {
-                return Ok(false);
+                self.has_row = false;
+                return Ok(());
             };
         }
         let json_element_type = self.json.element_type()?;
@@ -217,20 +219,19 @@ impl InternalVirtualTableCursor for JsonEachCursor {
             }
         };
 
-        self.next()
+        self.next()?;
+        Ok(())
     }
 
-    fn next(&mut self) -> Result<bool, LimboError> {
+    fn next(&mut self) -> Result<(), LimboError> {
         self.rowid += 1;
-        if self.no_more_rows {
-            return Ok(false);
-        }
 
         match &self.iterator_state {
             IteratorState::Array(state) => {
                 let Some(((idx, jsonb), new_state)) = self.json.array_iterator_next(state) else {
-                    self.no_more_rows = true;
-                    return Ok(false);
+                    self.iterator_state = IteratorState::None;
+                    self.has_row = false;
+                    return Ok(());
                 };
                 self.iterator_state = IteratorState::Array(new_state);
                 self.columns = Columns::new(
@@ -238,30 +239,40 @@ impl InternalVirtualTableCursor for JsonEachCursor {
                     jsonb,
                     self.root_path.clone(),
                 );
+                self.has_row = true;
             }
             IteratorState::Object(state) => {
                 let Some(((_idx, key, value), new_state)): Option<(
                     (usize, Jsonb, Jsonb),
                     ObjectIteratorState,
                 )> = self.json.object_iterator_next(state) else {
-                    self.no_more_rows = true;
-                    return Ok(false);
+                    self.iterator_state = IteratorState::None;
+                    self.has_row = false;
+                    return Ok(());
                 };
 
                 self.iterator_state = IteratorState::Object(new_state);
                 let key = key.to_string();
                 self.columns =
                     Columns::new(columns::Key::String(key), value, self.root_path.clone());
+                self.has_row = true;
             }
             IteratorState::Primitive => {
                 let json = std::mem::replace(&mut self.json, Jsonb::new(0, None));
                 self.columns = Columns::new_from_primitive(json, self.root_path.clone());
-                self.no_more_rows = true;
+                self.iterator_state = IteratorState::None;
+                self.has_row = true;
             }
-            IteratorState::None => unreachable!(),
+            IteratorState::None => {
+                self.has_row = false;
+            }
         };
 
-        Ok(true)
+        Ok(())
+    }
+
+    fn eof(&self) -> bool {
+        !self.has_row
     }
 
     fn rowid(&self) -> i64 {
