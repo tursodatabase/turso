@@ -149,7 +149,7 @@ pub fn translate_create_table(
             let index_name = format!(
                 "{}{}_{}",
                 PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX,
-                tbl_name.name.as_str(),
+                normalize_ident(tbl_name.name.as_str()),
                 idx + 1
             );
             emit_schema_entry(
