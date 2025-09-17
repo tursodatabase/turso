@@ -1,6 +1,5 @@
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::persistent_storage::Storage;
-use crate::result::LimboResult;
 use crate::return_if_io;
 use crate::state_machine::StateMachine;
 use crate::state_machine::StateTransition;
@@ -573,18 +572,20 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 // Note that this would be incredibly unsafe in the regular transaction model, but in MVCC we trust
                 // the MV-store to uphold the guarantee that no write-write conflicts happened.
                 self.pager.end_read_tx().expect("end_read_tx cannot fail");
-                let result = self.pager.begin_read_tx()?;
-                if let crate::result::LimboResult::Busy = result {
+                let result = self.pager.begin_read_tx();
+                if let Err(LimboError::Busy) = result {
                     // We cannot obtain a WAL read lock due to contention, so we must abort.
                     self.commit_coordinator.pager_commit_lock.unlock();
                     return Err(LimboError::WriteWriteConflict);
                 }
-                let result = self.pager.io.block(|| self.pager.begin_write_tx())?;
-                if let crate::result::LimboResult::Busy = result {
+                result?;
+                let result = self.pager.io.block(|| self.pager.begin_write_tx());
+                if let Err(LimboError::Busy) = result {
                     // There is a non-CONCURRENT transaction holding the write lock. We must abort.
                     self.commit_coordinator.pager_commit_lock.unlock();
                     return Err(LimboError::WriteWriteConflict);
                 }
+                result?;
                 self.state = CommitState::WriteRow {
                     end_ts,
                     write_set_index: 0,
@@ -1342,13 +1343,9 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
         // Try to acquire the pager read lock
         if !is_upgrade_from_read {
-            match pager.begin_read_tx()? {
-                LimboResult::Busy => {
-                    self.release_exclusive_tx(&tx_id);
-                    return Err(LimboError::Busy);
-                }
-                LimboResult::Ok => {}
-            }
+            pager.begin_read_tx().inspect_err(|_| {
+                self.release_exclusive_tx(&tx_id);
+            })?;
         }
         let locked = self.commit_coordinator.pager_commit_lock.write();
         if !locked {
@@ -1357,30 +1354,28 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             return Err(LimboError::Busy);
         }
         // Try to acquire the pager write lock
-        match return_if_io!(pager.begin_write_tx()) {
-            LimboResult::Busy => {
-                tracing::debug!("begin_exclusive_tx: tx_id={} failed with Busy", tx_id);
-                // Failed to get pager lock - release our exclusive lock
-                self.commit_coordinator.pager_commit_lock.unlock();
-                self.release_exclusive_tx(&tx_id);
-                if maybe_existing_tx_id.is_none() {
-                    // If we were upgrading an existing non-CONCURRENT mvcc transaction to write, we don't end the read tx on Busy.
-                    // But if we were beginning a completely new non-CONCURRENT mvcc transaction, we do end it because the next time the connection
-                    // attempts to do something, it will open a new read tx, which will fail if we don't end this one here.
-                    pager.end_read_tx()?;
-                }
-                return Err(LimboError::Busy);
+        let begin_w_tx_res = pager.begin_write_tx();
+        if let Err(LimboError::Busy) = begin_w_tx_res {
+            tracing::debug!("begin_exclusive_tx: tx_id={} failed with Busy", tx_id);
+            // Failed to get pager lock - release our exclusive lock
+            self.commit_coordinator.pager_commit_lock.unlock();
+            self.release_exclusive_tx(&tx_id);
+            if maybe_existing_tx_id.is_none() {
+                // If we were upgrading an existing non-CONCURRENT mvcc transaction to write, we don't end the read tx on Busy.
+                // But if we were beginning a completely new non-CONCURRENT mvcc transaction, we do end it because the next time the connection
+                // attempts to do something, it will open a new read tx, which will fail if we don't end this one here.
+                pager.end_read_tx()?;
             }
-            LimboResult::Ok => {
-                let tx = Transaction::new(tx_id, begin_ts);
-                tracing::trace!(
-                    "begin_exclusive_tx(tx_id={}) - exclusive write transaction",
-                    tx_id
-                );
-                tracing::debug!("begin_exclusive_tx: tx_id={} succeeded", tx_id);
-                self.txs.insert(tx_id, tx);
-            }
+            return Err(LimboError::Busy);
         }
+        return_if_io!(begin_w_tx_res);
+        let tx = Transaction::new(tx_id, begin_ts);
+        tracing::trace!(
+            "begin_exclusive_tx(tx_id={}) - exclusive write transaction",
+            tx_id
+        );
+        tracing::debug!("begin_exclusive_tx: tx_id={} succeeded", tx_id);
+        self.txs.insert(tx_id, tx);
 
         Ok(IOResult::Done(tx_id))
     }
@@ -1399,10 +1394,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
         // TODO: we need to tie a pager's read transaction to a transaction ID, so that future refactors to read
         // pages from WAL/DB read from a consistent state to maintiain snapshot isolation.
-        let result = pager.begin_read_tx()?;
-        if let crate::result::LimboResult::Busy = result {
-            return Err(LimboError::Busy);
-        }
+        pager.begin_read_tx()?;
         Ok(tx_id)
     }
 

@@ -17,7 +17,6 @@ use super::pager::{PageRef, Pager};
 use super::sqlite3_ondisk::{self, checksum_wal, WalHeader, WAL_MAGIC_BE, WAL_MAGIC_LE};
 use crate::fast_lock::SpinLock;
 use crate::io::{clock, File, IO};
-use crate::result::LimboResult;
 use crate::storage::database::EncryptionOrChecksum;
 use crate::storage::sqlite3_ondisk::{
     begin_read_wal_frame, begin_read_wal_frame_raw, finish_read_page, prepare_wal_frame,
@@ -226,10 +225,11 @@ impl TursoRwLock {
 /// Write-ahead log (WAL).
 pub trait Wal: Debug {
     /// Begin a read transaction.
-    fn begin_read_tx(&mut self) -> Result<(LimboResult, bool)>;
+    /// Returns whether the database state has changed since the last read transaction.
+    fn begin_read_tx(&mut self) -> Result<bool>;
 
     /// Begin a write transaction.
-    fn begin_write_tx(&mut self) -> Result<LimboResult>;
+    fn begin_write_tx(&mut self) -> Result<()>;
 
     /// End a read transaction.
     fn end_read_tx(&self);
@@ -807,10 +807,11 @@ impl Drop for CheckpointLocks {
 impl Wal for WalFile {
     /// Begin a read transaction. The caller must ensure that there is not already
     /// an ongoing read transaction.
+    /// Returns whether the database state has changed since the last read transaction.
     /// sqlite/src/wal.c 3023
     /// assert(pWal->readLock < 0); /* Not currently locked */
     #[instrument(skip_all, level = Level::DEBUG)]
-    fn begin_read_tx(&mut self) -> Result<(LimboResult, bool)> {
+    fn begin_read_tx(&mut self) -> Result<bool> {
         turso_assert!(
             self.max_frame_read_lock_index.get().eq(&NO_LOCK_HELD),
             "cannot start a new read tx without ending an existing one, lock_value={}, expected={}",
@@ -836,7 +837,7 @@ impl Wal for WalFile {
         if shared_max == nbackfills {
             let lock_0_idx = 0;
             if !self.get_shared().read_locks[lock_0_idx].read() {
-                return Ok((LimboResult::Busy, db_changed));
+                return Err(LimboError::Busy);
             }
             // we need to keep self.max_frame set to the appropriate
             // max frame in the wal at the time this transaction starts.
@@ -844,7 +845,7 @@ impl Wal for WalFile {
             self.max_frame_read_lock_index.set(lock_0_idx);
             self.min_frame = nbackfills + 1;
             self.last_checksum = last_checksum;
-            return Ok((LimboResult::Ok, db_changed));
+            return Ok(db_changed);
         }
 
         // If we get this far, it means that the reader will want to use
@@ -886,7 +887,7 @@ impl Wal for WalFile {
         if best_idx == -1 || best_mark != shared_max as u32 {
             // If we cannot find a valid slot or the highest readmark has a stale max frame, we must return busy;
             // otherwise we would not see some committed changes.
-            return Ok((LimboResult::Busy, db_changed));
+            return Err(LimboError::Busy);
         }
 
         // Now take a shared read on that slot, and if we are successful,
@@ -895,7 +896,7 @@ impl Wal for WalFile {
             let shared = self.get_shared();
             if !shared.read_locks[best_idx as usize].read() {
                 // TODO: we should retry here instead of always returning Busy
-                return Ok((LimboResult::Busy, db_changed));
+                return Err(LimboError::Busy);
             }
             let checkpoint_seq = shared.wal_header.lock().checkpoint_seq;
             (
@@ -926,7 +927,6 @@ impl Wal for WalFile {
         // file that has not yet been checkpointed. This client will not need
         // to read any frames earlier than minFrame from the wal file - they
         // can be safely read directly from the database file.
-        self.min_frame = nb2 + 1;
         if mx2 != shared_max
             || nb2 != nbackfills
             || cksm2 != last_checksum
@@ -934,6 +934,7 @@ impl Wal for WalFile {
         {
             return Err(LimboError::Busy);
         }
+        self.min_frame = nb2 + 1;
         self.max_frame = best_mark as u64;
         self.max_frame_read_lock_index.set(best_idx as usize);
         tracing::debug!(
@@ -943,7 +944,7 @@ impl Wal for WalFile {
             best_idx,
             shared_max
         );
-        Ok((LimboResult::Ok, db_changed))
+        Ok(db_changed)
     }
 
     /// End a read transaction.
@@ -962,7 +963,7 @@ impl Wal for WalFile {
 
     /// Begin a write transaction
     #[instrument(skip_all, level = Level::DEBUG)]
-    fn begin_write_tx(&mut self) -> Result<LimboResult> {
+    fn begin_write_tx(&mut self) -> Result<()> {
         let shared = self.get_shared_mut();
         // sqlite/src/wal.c 3702
         // Cannot start a write transaction without first holding a read
@@ -974,7 +975,7 @@ impl Wal for WalFile {
             "must have a read transaction to begin a write transaction"
         );
         if !shared.write_lock.write() {
-            return Ok(LimboResult::Busy);
+            return Err(LimboError::Busy);
         }
         let (shared_max, nbackfills, last_checksum) = (
             shared.max_frame.load(Ordering::Acquire),
@@ -986,13 +987,13 @@ impl Wal for WalFile {
             drop(shared);
             self.last_checksum = last_checksum;
             self.min_frame = nbackfills + 1;
-            return Ok(LimboResult::Ok);
+            return Ok(());
         }
 
         // Snapshot is stale, give up and let caller retry from scratch
         tracing::debug!("unable to upgrade transaction from read to write: snapshot is stale, give up and let caller retry from scratch, self.max_frame={}, shared_max={}", self.max_frame, shared_max);
         shared.write_lock.unlock();
-        Ok(LimboResult::Busy)
+        Err(LimboError::Busy)
     }
 
     /// End a write transaction
@@ -2446,7 +2447,6 @@ impl WalFileShared {
 #[cfg(test)]
 pub mod test {
     use crate::{
-        result::LimboResult,
         storage::{
             sqlite3_ondisk::{self, WAL_HEADER_SIZE},
             wal::READMARK_NOT_USED,
@@ -2710,7 +2710,7 @@ pub mod test {
         let readmark = {
             let pager = conn2.pager.borrow_mut();
             let mut wal2 = pager.wal.as_ref().unwrap().borrow_mut();
-            assert!(matches!(wal2.begin_read_tx().unwrap().0, LimboResult::Ok));
+            wal2.begin_read_tx().unwrap();
             wal2.get_max_frame()
         };
 
@@ -2892,7 +2892,7 @@ pub mod test {
         let r1_max_frame = {
             let pager = conn_r1.pager.borrow_mut();
             let mut wal = pager.wal.as_ref().unwrap().borrow_mut();
-            assert!(matches!(wal.begin_read_tx().unwrap().0, LimboResult::Ok));
+            wal.begin_read_tx().unwrap();
             wal.get_max_frame()
         };
         bulk_inserts(&conn_writer, 5, 10);
@@ -2901,7 +2901,7 @@ pub mod test {
         let r2_max_frame = {
             let pager = conn_r2.pager.borrow_mut();
             let mut wal = pager.wal.as_ref().unwrap().borrow_mut();
-            assert!(matches!(wal.begin_read_tx().unwrap().0, LimboResult::Ok));
+            wal.begin_read_tx().unwrap();
             wal.get_max_frame()
         };
 
@@ -2992,8 +2992,7 @@ pub mod test {
             let pager = conn2.pager.borrow_mut();
             let mut wal = pager.wal.as_ref().unwrap().borrow_mut();
             let _ = wal.begin_read_tx().unwrap();
-            let res = wal.begin_write_tx().unwrap();
-            assert!(matches!(res, LimboResult::Ok), "result: {res:?}");
+            wal.begin_write_tx().unwrap();
         }
 
         // should fail because writer lock is held
@@ -3325,8 +3324,7 @@ pub mod test {
         {
             let pager = conn2.pager.borrow_mut();
             let mut wal = pager.wal.as_ref().unwrap().borrow_mut();
-            let (res, _) = wal.begin_read_tx().unwrap();
-            assert!(matches!(res, LimboResult::Ok));
+            wal.begin_read_tx().unwrap();
         }
         // Make changes using conn1
         bulk_inserts(&conn1, 5, 5);
@@ -3337,15 +3335,14 @@ pub mod test {
             wal.begin_write_tx()
         };
         // Should get Busy due to stale snapshot
-        assert!(matches!(result.unwrap(), LimboResult::Busy));
+        assert!(matches!(result, Err(LimboError::Busy)));
 
         // End read transaction and start a fresh one
         {
             let pager = conn2.pager.borrow();
             let mut wal = pager.wal.as_ref().unwrap().borrow_mut();
             wal.end_read_tx();
-            let (res, _) = wal.begin_read_tx().unwrap();
-            assert!(matches!(res, LimboResult::Ok));
+            wal.begin_read_tx().unwrap();
         }
         // Now write transaction should work
         let result = {
@@ -3353,7 +3350,7 @@ pub mod test {
             let mut wal = pager.wal.as_ref().unwrap().borrow_mut();
             wal.begin_write_tx()
         };
-        assert!(matches!(result.unwrap(), LimboResult::Ok));
+        assert!(matches!(result, Ok(())));
     }
 
     #[test]
@@ -3383,8 +3380,7 @@ pub mod test {
         {
             let pager = conn2.pager.borrow_mut();
             let mut wal = pager.wal.as_ref().unwrap().borrow_mut();
-            let (res, _) = wal.begin_read_tx().unwrap();
-            assert!(matches!(res, LimboResult::Ok));
+            wal.begin_read_tx().unwrap();
         }
         // should use slot 0, as everything is backfilled
         assert!(check_read_lock_slot(&conn2, 0));
@@ -3476,8 +3472,7 @@ pub mod test {
         {
             let pager = reader.pager.borrow_mut();
             let mut wal = pager.wal.as_ref().unwrap().borrow_mut();
-            let (res, _) = wal.begin_read_tx().unwrap();
-            assert!(matches!(res, LimboResult::Ok));
+            wal.begin_read_tx().unwrap();
         }
         let r_snapshot = {
             let pager = reader.pager.borrow();
