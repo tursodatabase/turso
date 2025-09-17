@@ -3926,14 +3926,13 @@ pub fn op_sorter_open(
         },
         insn
     );
-    let cache_size = program.connection.get_cache_size();
-    // Set the buffer size threshold to be roughly the same as the limit configured for the page-cache.
-    let page_size = pager
-        .io
-        .block(|| pager.with_header(|header| header.page_size))
-        .unwrap_or_default()
-        .get() as usize;
+    // be careful here - we must not use any async operations after pager.with_header because this op-code has no proper state-machine
+    let page_size = return_if_io!(pager.with_header(|header| header.page_size));
+    let page_size = page_size.get() as usize;
 
+    let cache_size = program.connection.get_cache_size();
+
+    // Set the buffer size threshold to be roughly the same as the limit configured for the page-cache.
     let max_buffer_size_bytes = if cache_size < 0 {
         (cache_size.abs() * 1024) as usize
     } else {
