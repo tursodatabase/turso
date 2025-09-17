@@ -19,7 +19,7 @@ use std::cell::{Cell, RefCell, UnsafeCell};
 use std::collections::HashSet;
 use std::hash;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tracing::{instrument, trace, Level};
 
@@ -248,7 +248,7 @@ impl Page {
 
     /// Increment the pin count by 1. A pin count >0 means the page is pinned and not eligible for eviction from the page cache.
     pub fn pin(&self) {
-        self.get().pin_count.fetch_add(1, Ordering::Relaxed);
+        self.get().pin_count.fetch_add(1, Ordering::SeqCst);
     }
 
     /// Decrement the pin count by 1. If the count reaches 0, the page is no longer
@@ -481,7 +481,7 @@ pub struct Pager {
 
     commit_info: CommitInfo,
     checkpoint_state: RwLock<CheckpointState>,
-    syncing: Rc<Cell<bool>>,
+    syncing: Arc<AtomicBool>,
     auto_vacuum_mode: Cell<AutoVacuumMode>,
     /// 0 -> Database is empty,
     /// 1 -> Database is being initialized,
@@ -592,7 +592,7 @@ impl Pager {
                 state: CommitState::PrepareWal.into(),
                 time: now.into(),
             },
-            syncing: Rc::new(Cell::new(false)),
+            syncing: Arc::new(AtomicBool::new(false)),
             checkpoint_state: RwLock::new(CheckpointState::Checkpoint),
             buffer_pool,
             auto_vacuum_mode: Cell::new(AutoVacuumMode::None),
@@ -1635,7 +1635,10 @@ impl Pager {
                     io_yield_one!(c);
                 }
                 CheckpointState::CheckpointDone { res } => {
-                    turso_assert!(!self.syncing.get(), "syncing should be done");
+                    turso_assert!(
+                        !self.syncing.load(Ordering::SeqCst),
+                        "syncing should be done"
+                    );
                     *self.checkpoint_state.write() = CheckpointState::Checkpoint;
                     return Ok(IOResult::Done(res));
                 }
@@ -2254,7 +2257,7 @@ impl Pager {
 
     fn reset_internal_states(&self) {
         *self.checkpoint_state.write() = CheckpointState::Checkpoint;
-        self.syncing.replace(false);
+        self.syncing.store(false, Ordering::SeqCst);
         self.commit_info.state.set(CommitState::PrepareWal);
         self.commit_info.time.set(self.io.now());
         self.allocate_page_state.replace(AllocatePageState::Start);
