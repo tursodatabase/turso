@@ -1,5 +1,4 @@
 use std::ops::Range;
-use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::ast;
@@ -324,7 +323,7 @@ fn create_table_body_to_str(tbl_name: &ast::QualifiedName, body: &ast::CreateTab
     sql
 }
 
-fn create_vtable_body_to_str(vtab: &ast::CreateVirtualTable, module: Rc<VTabImpl>) -> String {
+fn create_vtable_body_to_str(vtab: &ast::CreateVirtualTable, module: Arc<VTabImpl>) -> String {
     let args = vtab
         .args
         .iter()
