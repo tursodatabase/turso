@@ -45,6 +45,13 @@ impl Storage {
     pub fn is_logical_log(&self) -> bool {
         matches!(self, Self::LogicalLog { .. })
     }
+
+    pub fn sync(&self) -> Result<IOResult<()>> {
+        match self {
+            Self::Noop => Ok(IOResult::Done(())),
+            Self::LogicalLog { logical_log } => logical_log.borrow_mut().sync(),
+        }
+    }
 }
 
 impl Debug for Storage {

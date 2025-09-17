@@ -293,6 +293,9 @@ pub enum CommitState {
     EndCommitLogicalLog {
         end_ts: u64,
     },
+    SyncLogicalLog {
+        end_ts: u64,
+    },
     CommitEnd {
         end_ts: u64,
     },
@@ -857,7 +860,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     }
                 }
                 let result = mvcc_store.storage.log_tx(log_record)?;
-                self.state = CommitState::EndCommitLogicalLog { end_ts: *end_ts };
+                self.state = CommitState::SyncLogicalLog { end_ts: *end_ts };
                 match result {
                     IOResult::Done(_) => {}
                     IOResult::IO(io) => {
@@ -868,6 +871,16 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                         if !io.finished() {
                             return Ok(TransitionResult::Io(io));
                         }
+                    }
+                }
+                return Ok(TransitionResult::Continue);
+            }
+            CommitState::SyncLogicalLog { end_ts } => {
+                let result = mvcc_store.storage.sync()?;
+                self.state = CommitState::EndCommitLogicalLog { end_ts: *end_ts };
+                if let IOResult::IO(io) = result {
+                    if !io.finished() {
+                        return Ok(TransitionResult::Io(io));
                     }
                 }
                 return Ok(TransitionResult::Continue);

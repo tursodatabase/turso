@@ -22,7 +22,6 @@ impl LogicalLog {
     pub fn log_tx(&mut self, tx: &LogRecord) -> Result<IOResult<()>> {
         let mut buffer = Vec::new();
         buffer.extend_from_slice(&tx.tx_timestamp.to_be_bytes());
-        buffer.extend_from_slice(&tx.tx_timestamp.to_be_bytes());
         tx.row_versions.iter().for_each(|row_version| {
             let data = &row_version.row.data;
             buffer.extend_from_slice(&row_version.row.id.table_id.to_be_bytes());
@@ -56,5 +55,13 @@ impl LogicalLog {
 
     pub fn read_tx_log(&self) -> Result<Vec<LogRecord>> {
         todo!()
+    }
+
+    pub fn sync(&mut self) -> Result<IOResult<()>> {
+        let completion = Completion::new_sync(move |_| {
+            tracing::debug!("logical_log_sync finish");
+        });
+        let c = self.file.sync(completion)?;
+        Ok(IOResult::IO(IOCompletions::Single(c)))
     }
 }
