@@ -1675,15 +1675,20 @@ impl Pager {
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
-    pub fn wal_checkpoint(&self, mode: CheckpointMode) -> Result<CheckpointResult> {
+    pub fn wal_checkpoint_start(&self, mode: CheckpointMode) -> Result<IOResult<CheckpointResult>> {
         let Some(wal) = self.wal.as_ref() else {
             return Err(LimboError::InternalError(
                 "wal_checkpoint() called on database without WAL".to_string(),
             ));
         };
 
-        let mut checkpoint_result = self.io.block(|| wal.borrow_mut().checkpoint(self, mode))?;
+        wal.borrow_mut().checkpoint(self, mode)
+    }
 
+    pub fn wal_checkpoint_finish(
+        &self,
+        checkpoint_result: &mut CheckpointResult,
+    ) -> Result<IOResult<()>> {
         'ensure_sync: {
             if checkpoint_result.num_backfilled != 0 {
                 if checkpoint_result.everything_backfilled() {
@@ -1694,27 +1699,35 @@ impl Pager {
                     let page_size = self.page_size.get().unwrap_or_default();
                     let expected = (db_size * page_size.get()) as u64;
                     if expected < self.db_file.size()? {
-                        self.io.wait_for_completion(self.db_file.truncate(
-                            expected as usize,
-                            Completion::new_trunc(move |_| {
-                                tracing::trace!(
-                                    "Database file truncated to expected size: {} bytes",
-                                    expected
-                                );
-                            }),
-                        )?)?;
-                        self.io
-                            .wait_for_completion(self.db_file.sync(Completion::new_sync(
-                                move |_| {
-                                    tracing::trace!("Database file syncd after truncation");
-                                },
-                            ))?)?;
+                        if !checkpoint_result.db_truncate_sent {
+                            let c = self.db_file.truncate(
+                                expected as usize,
+                                Completion::new_trunc(move |_| {
+                                    tracing::trace!(
+                                        "Database file truncated to expected size: {} bytes",
+                                        expected
+                                    );
+                                }),
+                            )?;
+                            checkpoint_result.db_truncate_sent = true;
+                            io_yield_one!(c);
+                        }
+                        if !checkpoint_result.db_sync_sent {
+                            let c = self.db_file.sync(Completion::new_sync(move |_| {
+                                tracing::trace!("Database file syncd after truncation");
+                            }))?;
+                            checkpoint_result.db_sync_sent = true;
+                            io_yield_one!(c);
+                        }
                         break 'ensure_sync;
                     }
                 }
-                // if we backfilled at all, we have to sync the db-file here
-                self.io
-                    .wait_for_completion(self.db_file.sync(Completion::new_sync(move |_| {}))?)?;
+                if !checkpoint_result.db_sync_sent {
+                    // if we backfilled at all, we have to sync the db-file here
+                    let c = self.db_file.sync(Completion::new_sync(move |_| {}))?;
+                    checkpoint_result.db_sync_sent = true;
+                    io_yield_one!(c);
+                }
             }
         }
         checkpoint_result.release_guard();
@@ -1723,7 +1736,14 @@ impl Pager {
             .write()
             .clear()
             .map_err(|e| LimboError::InternalError(format!("Failed to clear page cache: {e:?}")))?;
-        Ok(checkpoint_result)
+        Ok(IOResult::Done(()))
+    }
+
+    #[instrument(skip_all, level = Level::DEBUG)]
+    pub fn wal_checkpoint(&self, mode: CheckpointMode) -> Result<CheckpointResult> {
+        let mut result = self.io.block(|| self.wal_checkpoint_start(mode))?;
+        self.io.block(|| self.wal_checkpoint_finish(&mut result))?;
+        Ok(result)
     }
 
     pub fn freepage_list(&self) -> u32 {
