@@ -357,7 +357,7 @@ pub fn op_checkpoint_inner(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -2346,11 +2346,9 @@ pub fn op_transaction_inner(
             // begin_write_tx that happens, but not begin_read_tx
             // TODO: this is a hack to make the pager run the IO loop
             OpTransactionState::CheckSchemaCookie => {
-                let res = pager
-                    .io
-                    .block(|| pager.with_header(|header| header.schema_cookie.get()));
+                let res = pager.with_header(|header| header.schema_cookie.get());
                 match res {
-                    Ok(header_schema_cookie) => {
+                    Ok(IOResult::Done(header_schema_cookie)) => {
                         if header_schema_cookie != *schema_cookie {
                             tracing::debug!(
                                 "schema changed, force reprepare: {} != {}",
@@ -2360,6 +2358,7 @@ pub fn op_transaction_inner(
                             return Err(LimboError::SchemaUpdated);
                         }
                     }
+                    Ok(IOResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(io)),
                     // This means we are starting a read_tx and we do not have a page 1 yet, so we just continue execution
                     Err(LimboError::Page1NotAlloc) => {}
                     Err(err) => {
@@ -2368,7 +2367,7 @@ pub fn op_transaction_inner(
                 }
 
                 state.pc += 1;
-                Ok(InsnFunctionStepResult::Step)
+                return Ok(InsnFunctionStepResult::Step);
             }
         }
     }
