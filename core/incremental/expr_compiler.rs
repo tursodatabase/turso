@@ -434,11 +434,6 @@ impl CompiledExpression {
                                 "Expression evaluation was interrupted".to_string(),
                             ));
                         }
-                        crate::vdbe::execute::InsnFunctionStepResult::Busy => {
-                            return Err(crate::LimboError::InternalError(
-                                "Expression evaluation encountered busy state".to_string(),
-                            ));
-                        }
                         crate::vdbe::execute::InsnFunctionStepResult::Step => {
                             pc = state.pc as usize;
                         }

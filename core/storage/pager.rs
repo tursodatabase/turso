@@ -1,4 +1,3 @@
-use crate::result::LimboResult;
 use crate::storage::wal::IOV_MAX;
 use crate::storage::{
     buffer_pool::BufferPool,
@@ -981,16 +980,16 @@ impl Pager {
 
     #[inline(always)]
     #[instrument(skip_all, level = Level::DEBUG)]
-    pub fn begin_read_tx(&self) -> Result<LimboResult> {
+    pub fn begin_read_tx(&self) -> Result<()> {
         let Some(wal) = self.wal.as_ref() else {
-            return Ok(LimboResult::Ok);
+            return Ok(());
         };
-        let (result, changed) = wal.borrow_mut().begin_read_tx()?;
+        let changed = wal.borrow_mut().begin_read_tx()?;
         if changed {
             // Someone else changed the database -> assume our page cache is invalid (this is default SQLite behavior, we can probably do better with more granular invalidation)
             self.clear_page_cache();
         }
-        Ok(result)
+        Ok(())
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
@@ -1019,12 +1018,12 @@ impl Pager {
 
     #[inline(always)]
     #[instrument(skip_all, level = Level::DEBUG)]
-    pub fn begin_write_tx(&self) -> Result<IOResult<LimboResult>> {
+    pub fn begin_write_tx(&self) -> Result<IOResult<()>> {
         // TODO(Diego): The only possibly allocate page1 here is because OpenEphemeral needs a write transaction
         // we should have a unique API to begin transactions, something like sqlite3BtreeBeginTrans
         return_if_io!(self.maybe_allocate_page1());
         let Some(wal) = self.wal.as_ref() else {
-            return Ok(IOResult::Done(LimboResult::Ok));
+            return Ok(IOResult::Done(()));
         };
         Ok(IOResult::Done(wal.borrow_mut().begin_write_tx()?))
     }

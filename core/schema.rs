@@ -12,7 +12,6 @@ pub struct View {
 /// Type alias for regular views collection
 pub type ViewsMap = HashMap<String, View>;
 
-use crate::result::LimboResult;
 use crate::storage::btree::BTreeCursor;
 use crate::translate::collate::CollationSeq;
 use crate::translate::plan::SelectPlan;
@@ -311,9 +310,7 @@ impl Schema {
         // Store materialized view info (SQL and root page) for later creation
         let mut materialized_view_info: HashMap<String, (String, usize)> = HashMap::new();
 
-        if matches!(pager.begin_read_tx()?, LimboResult::Busy) {
-            return Err(LimboError::Busy);
-        }
+        pager.begin_read_tx()?;
 
         pager.io.block(|| cursor.rewind())?;
 

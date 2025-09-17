@@ -495,7 +495,7 @@ async fn test_multiple_connections_fuzz() {
 async fn test_multiple_connections_fuzz_mvcc() {
     let mvcc_fuzz_options = FuzzOptions {
         mvcc_enabled: true,
-        max_num_connections: 2,
+        max_num_connections: 8,
         query_gen_options: QueryGenOptions {
             weight_begin_deferred: 8,
             weight_begin_concurrent: 8,
@@ -687,17 +687,27 @@ async fn multiple_connections_fuzz(opts: FuzzOptions) {
 
                 match operation {
                     Operation::Begin { concurrent } => {
-                        shared_shadow_db.begin_transaction(next_tx_id, false);
-                        if concurrent {
-                            // in tursodb, BEGIN CONCURRENT immediately starts a transaction.
-                            shared_shadow_db.take_snapshot_if_not_exists(next_tx_id);
-                        }
-                        *current_tx_id = Some(next_tx_id);
-                        next_tx_id += 1;
-
                         let query = operation.to_string();
 
-                        conn.execute(query.as_str(), ()).await.unwrap();
+                        let result = conn.execute(query.as_str(), ()).await;
+                        match result {
+                            Ok(_) => {
+                                shared_shadow_db.begin_transaction(next_tx_id, false);
+                                if concurrent {
+                                    // in tursodb, BEGIN CONCURRENT immediately starts a transaction.
+                                    shared_shadow_db.take_snapshot_if_not_exists(next_tx_id);
+                                }
+                                *current_tx_id = Some(next_tx_id);
+                                next_tx_id += 1;
+                            }
+                            Err(e) => handle_error(
+                                &e,
+                                current_tx_id,
+                                *conn_id,
+                                op_num,
+                                &mut shared_shadow_db,
+                            ),
+                        }
                     }
                     Operation::Commit => {
                         let Some(tx_id) = *current_tx_id else {

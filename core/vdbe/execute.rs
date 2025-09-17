@@ -42,7 +42,7 @@ use std::{
 };
 use turso_macros::match_ignore_ascii_case;
 
-use crate::{pseudo::PseudoCursor, result::LimboResult};
+use crate::pseudo::PseudoCursor;
 
 use crate::{
     schema::{affinity, Affinity},
@@ -159,7 +159,6 @@ pub enum InsnFunctionStepResult {
     IO(IOCompletions),
     Row,
     Interrupt,
-    Busy,
     Step,
 }
 
@@ -2202,9 +2201,7 @@ pub fn op_transaction(
                 !conn.is_nested_stmt.get(),
                 "nested stmt should not begin a new read transaction"
             );
-            if let LimboResult::Busy = pager.begin_read_tx()? {
-                return Ok(InsnFunctionStepResult::Busy);
-            }
+            pager.begin_read_tx()?;
         }
 
         if updated && matches!(new_transaction_state, TransactionState::Write { .. }) {
@@ -2212,29 +2209,26 @@ pub fn op_transaction(
                 !conn.is_nested_stmt.get(),
                 "nested stmt should not begin a new write transaction"
             );
-            match pager.begin_write_tx()? {
-                IOResult::Done(r) => {
-                    if let LimboResult::Busy = r {
-                        // We failed to upgrade to write transaction so put the transaction into its original state.
-                        // That is, if the transaction had not started, end the read transaction so that next time we
-                        // start a new one.
-                        if matches!(current_state, TransactionState::None) {
-                            pager.end_read_tx()?;
-                            conn.transaction_state.replace(TransactionState::None);
-                        }
-                        assert_eq!(conn.transaction_state.get(), current_state);
-                        return Ok(InsnFunctionStepResult::Busy);
-                    }
+            let begin_w_tx_res = pager.begin_write_tx();
+            if let Err(LimboError::Busy) = begin_w_tx_res {
+                // We failed to upgrade to write transaction so put the transaction into its original state.
+                // That is, if the transaction had not started, end the read transaction so that next time we
+                // start a new one.
+                if matches!(current_state, TransactionState::None) {
+                    pager.end_read_tx()?;
+                    conn.transaction_state.replace(TransactionState::None);
                 }
-                IOResult::IO(io) => {
-                    // set the transaction state to pending so we don't have to
-                    // end the read transaction.
-                    program
-                        .connection
-                        .transaction_state
-                        .replace(TransactionState::PendingUpgrade);
-                    return Ok(InsnFunctionStepResult::IO(io));
-                }
+                assert_eq!(conn.transaction_state.get(), current_state);
+                return Err(LimboError::Busy);
+            }
+            if let IOResult::IO(io) = begin_w_tx_res? {
+                // set the transaction state to pending so we don't have to
+                // end the read transaction.
+                program
+                    .connection
+                    .transaction_state
+                    .replace(TransactionState::PendingUpgrade);
+                return Ok(InsnFunctionStepResult::IO(io));
             }
         }
     }
