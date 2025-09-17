@@ -1001,7 +1001,7 @@ pub fn write_pages_vectored(
         return Ok(Vec::new());
     }
 
-    let page_sz = pager.page_size.get().expect("page size is not set").get() as usize;
+    let page_sz = pager.get_page_size_unchecked().get() as usize;
     // Count expected number of runs to create the atomic counter we need to track each batch
     let mut run_count = 0;
     let mut prev_id = None;

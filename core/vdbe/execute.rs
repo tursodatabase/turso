@@ -7130,7 +7130,7 @@ pub fn op_open_ephemeral(
                 .block(|| pager.with_header(|header| header.page_size))
                 .unwrap_or_default();
 
-            pager.page_size.set(Some(page_size));
+            pager.set_page_size(page_size);
 
             state.op_open_ephemeral_state = OpOpenEphemeralState::StartingTxn { pager };
         }
