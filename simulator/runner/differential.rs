@@ -55,13 +55,14 @@ pub(crate) fn execute_interactions(
     last_execution: Arc<Mutex<Execution>>,
 ) -> ExecutionResult {
     let mut history = ExecutionHistory::new();
-    let now = std::time::Instant::now();
 
     let mut env = env.lock().unwrap();
     let mut rusqlite_env = rusqlite_env.lock().unwrap();
 
     env.tables.clear();
     rusqlite_env.tables.clear();
+
+    let now = std::time::Instant::now();
 
     for _tick in 0..env.opts.ticks {
         if state.interaction_pointer >= interactions.len() {
@@ -95,7 +96,7 @@ pub(crate) fn execute_interactions(
 
         // second execute rusqlite
         let rusqlite_res = super::execution::execute_plan(
-            &mut env,
+            &mut rusqlite_env,
             interaction,
             rusqlite_conn_state,
             &mut rusqlite_state,
@@ -110,6 +111,8 @@ pub(crate) fn execute_interactions(
         ) {
             return ExecutionResult::new(history, Some(err));
         }
+
+        state.interaction_pointer += 1;
 
         // Check if the maximum time for the simulation has been reached
         if now.elapsed().as_secs() >= env.opts.max_time_simulation as u64 {
