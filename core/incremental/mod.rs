@@ -6,4 +6,5 @@ pub mod filter_operator;
 pub mod input_operator;
 pub mod operator;
 pub mod persistence;
+pub mod project_operator;
 pub mod view;
