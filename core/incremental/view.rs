@@ -108,7 +108,7 @@ impl ViewTransactionState {
 /// Provides interior mutability for the map of view states
 #[derive(Debug, Clone, Default)]
 pub struct AllViewsTxState {
-    states: Rc<RefCell<HashMap<String, Rc<ViewTransactionState>>>>,
+    states: Rc<RefCell<HashMap<String, Arc<ViewTransactionState>>>>,
 }
 
 impl AllViewsTxState {
@@ -120,16 +120,16 @@ impl AllViewsTxState {
     }
 
     /// Get or create a transaction state for a view
-    pub fn get_or_create(&self, view_name: &str) -> Rc<ViewTransactionState> {
+    pub fn get_or_create(&self, view_name: &str) -> Arc<ViewTransactionState> {
         let mut states = self.states.borrow_mut();
         states
             .entry(view_name.to_string())
-            .or_insert_with(|| Rc::new(ViewTransactionState::new()))
+            .or_insert_with(|| Arc::new(ViewTransactionState::new()))
             .clone()
     }
 
     /// Get a transaction state for a view if it exists
-    pub fn get(&self, view_name: &str) -> Option<Rc<ViewTransactionState>> {
+    pub fn get(&self, view_name: &str) -> Option<Arc<ViewTransactionState>> {
         self.states.borrow().get(view_name).cloned()
     }
 
