@@ -2,6 +2,7 @@ use clap::{Parser, ValueEnum};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
+use tracing_subscriber::EnvFilter;
 use turso::{Builder, Database, Result};
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -9,6 +10,7 @@ enum TransactionMode {
     Legacy,
     Mvcc,
     Concurrent,
+    LogicalLog,
 }
 
 #[derive(Parser)]
@@ -44,7 +46,11 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let _ = tracing_subscriber::fmt::try_init();
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .with_ansi(false)
+        .with_thread_ids(true)
+        .init();
     let args = Args::parse();
 
     println!(
@@ -135,6 +141,12 @@ async fn setup_database(db_path: &str, mode: TransactionMode) -> Result<Database
                 .build()
                 .await?
         }
+        TransactionMode::LogicalLog => {
+            builder
+                .with_mvcc(true, turso::MvccMode::LogicalLog)
+                .build()
+                .await?
+        }
     };
     let conn = db.connect()?;
 
@@ -180,7 +192,7 @@ async fn worker_thread(
 
             let begin_stmt = match mode {
                 TransactionMode::Legacy | TransactionMode::Mvcc => "BEGIN",
-                TransactionMode::Concurrent => "BEGIN CONCURRENT",
+                TransactionMode::Concurrent | TransactionMode::LogicalLog => "BEGIN CONCURRENT",
             };
             conn.execute(begin_stmt, ()).await?;
 
