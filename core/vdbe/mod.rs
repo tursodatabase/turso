@@ -37,6 +37,7 @@ use crate::{
         execute::{
             OpColumnState, OpDeleteState, OpDeleteSubState, OpIdxInsertState, OpInsertState,
             OpInsertSubState, OpNewRowidState, OpNoConflictState, OpRowIdState, OpSeekState,
+            OpTransactionState,
         },
         metrics::StatementMetrics,
     },
@@ -290,6 +291,7 @@ pub struct ProgramState {
     current_collation: Option<CollationSeq>,
     op_column_state: OpColumnState,
     op_row_id_state: OpRowIdState,
+    op_transaction_state: OpTransactionState,
     /// State machine for committing view deltas with I/O handling
     view_delta_state: ViewDeltaCommitState,
 }
@@ -333,6 +335,7 @@ impl ProgramState {
             current_collation: None,
             op_column_state: OpColumnState::Start,
             op_row_id_state: OpRowIdState::Start,
+            op_transaction_state: OpTransactionState::Start,
             view_delta_state: ViewDeltaCommitState::NotStarted,
         }
     }
