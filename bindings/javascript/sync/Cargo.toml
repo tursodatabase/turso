@@ -18,6 +18,7 @@ turso_core = { workspace = true }
 turso_node = { workspace = true }
 genawaiter = { version = "0.99.1", default-features = false }
 tracing-subscriber = { workspace = true }
+tracing.workspace = true
 
 [build-dependencies]
 napi-build = "2.2.3"

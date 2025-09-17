@@ -19,45 +19,13 @@ use turso_sync_engine::{
 };
 
 use crate::{
-    generator::{GeneratorHolder, GeneratorResponse},
+    generator::{GeneratorHolder, GeneratorResponse, SyncEngineChanges},
     js_protocol_io::{JsProtocolIo, JsProtocolRequestBytes},
 };
 
 #[napi(object)]
 pub struct DatabaseOpts {
     pub path: String,
-}
-
-pub struct SyncEngineGuard {
-    inner: Arc<RwLock<Option<DatabaseSyncEngine<JsProtocolIo>>>>,
-    wait_lock: Mutex<()>,
-    push_lock: Mutex<()>,
-    pull_lock: Mutex<()>,
-    checkpoint_lock: Mutex<()>,
-}
-
-impl SyncEngineGuard {
-    fn checkpoint_lock(&self) -> (MutexGuard<'_, ()>, MutexGuard<'_, ()>, MutexGuard<'_, ()>) {
-        let push = self.push_lock.lock().unwrap();
-        let pull = self.pull_lock.lock().unwrap();
-        let checkpoint = self.checkpoint_lock.lock().unwrap();
-        (push, pull, checkpoint)
-    }
-    fn pull_lock(&self) -> (MutexGuard<'_, ()>, MutexGuard<'_, ()>, MutexGuard<'_, ()>) {
-        let wait = self.wait_lock.lock().unwrap();
-        let push = self.push_lock.lock().unwrap();
-        let pull = self.pull_lock.lock().unwrap();
-        (wait, push, pull)
-    }
-    fn push_lock(&self) -> MutexGuard<'_, ()> {
-        let push = self.push_lock.lock().unwrap();
-        push
-    }
-    fn wait_lock(&self) -> (MutexGuard<'_, ()>, MutexGuard<'_, ()>) {
-        let wait = self.wait_lock.lock().unwrap();
-        let pull = self.pull_lock.lock().unwrap();
-        (wait, pull)
-    }
 }
 
 #[napi]
@@ -71,7 +39,7 @@ pub struct SyncEngine {
     use_transform: bool,
     io: Option<Arc<dyn turso_core::IO>>,
     protocol: Option<Arc<JsProtocolIo>>,
-    sync_engine: Arc<SyncEngineGuard>,
+    sync_engine: Arc<RwLock<Option<DatabaseSyncEngine<JsProtocolIo>>>>,
     opened: Arc<Mutex<Option<turso_node::Database>>>,
 }
 
@@ -214,13 +182,7 @@ impl SyncEngine {
             tables_ignore: opts.tables_ignore.unwrap_or_default(),
             use_transform: opts.use_transform,
             #[allow(clippy::arc_with_non_send_sync)]
-            sync_engine: Arc::new(SyncEngineGuard {
-                inner: Arc::new(RwLock::new(None)),
-                wait_lock: Mutex::new(()),
-                push_lock: Mutex::new(()),
-                pull_lock: Mutex::new(()),
-                checkpoint_lock: Mutex::new(()),
-            }),
+            sync_engine: Arc::new(RwLock::new(None)),
             io: Some(io),
             protocol: Some(Arc::new(JsProtocolIo::default())),
             #[allow(clippy::arc_with_non_send_sync)]
@@ -257,7 +219,7 @@ impl SyncEngine {
             let connection = initialized.connect_rw(&coro).await?;
             let db = turso_node::Database::create(None, io.clone(), connection, path);
 
-            *sync_engine.inner.write().unwrap() = Some(initialized);
+            *sync_engine.write().unwrap() = Some(initialized);
             *opened.lock().unwrap() = Some(db);
             Ok(())
         });
@@ -289,21 +251,9 @@ impl SyncEngine {
     }
 
     #[napi]
-    pub fn sync(&self) -> GeneratorHolder {
-        self.run(async move |coro, guard| {
-            let _lock = guard.pull_lock();
-            let sync_engine = try_read(&guard.inner)?;
-            let sync_engine = try_unwrap(&sync_engine)?;
-            sync_engine.sync(coro).await?;
-            Ok(None)
-        })
-    }
-
-    #[napi]
     pub fn push(&self) -> GeneratorHolder {
         self.run(async move |coro, guard| {
-            let _lock = guard.push_lock();
-            let sync_engine = try_read(&guard.inner)?;
+            let sync_engine = try_read(&guard)?;
             let sync_engine = try_unwrap(&sync_engine)?;
             sync_engine.push_changes_to_remote(coro).await?;
             Ok(None)
@@ -313,7 +263,7 @@ impl SyncEngine {
     #[napi]
     pub fn stats(&self) -> GeneratorHolder {
         self.run(async move |coro, guard| {
-            let sync_engine = try_read(&guard.inner)?;
+            let sync_engine = try_read(&guard)?;
             let sync_engine = try_unwrap(&sync_engine)?;
             let stats = sync_engine.stats(coro).await?;
             Ok(Some(GeneratorResponse::SyncEngineStats {
@@ -328,16 +278,25 @@ impl SyncEngine {
     }
 
     #[napi]
-    pub fn pull(&self) -> GeneratorHolder {
+    pub fn wait(&self) -> GeneratorHolder {
         self.run(async move |coro, guard| {
-            let sync_engine = try_read(&guard.inner)?;
+            let sync_engine = try_read(&guard)?;
             let sync_engine = try_unwrap(&sync_engine)?;
-            let changes = {
-                let _lock = guard.wait_lock();
-                sync_engine.wait_changes_from_remote(coro).await?
-            };
-            let _lock = guard.pull_lock();
-            sync_engine.apply_changes_from_remote(coro, changes).await?;
+            Ok(Some(GeneratorResponse::SyncEngineChanges {
+                changes: SyncEngineChanges {
+                    status: Box::new(Some(sync_engine.wait_changes_from_remote(coro).await?)),
+                },
+            }))
+        })
+    }
+
+    #[napi]
+    pub fn apply(&self, changes: &mut SyncEngineChanges) -> GeneratorHolder {
+        let status = changes.status.take().unwrap();
+        self.run(async move |coro, guard| {
+            let sync_engine = try_read(&guard)?;
+            let sync_engine = try_unwrap(&sync_engine)?;
+            sync_engine.apply_changes_from_remote(coro, status).await?;
             Ok(None)
         })
     }
@@ -345,8 +304,7 @@ impl SyncEngine {
     #[napi]
     pub fn checkpoint(&self) -> GeneratorHolder {
         self.run(async move |coro, guard| {
-            let _lock = guard.checkpoint_lock();
-            let sync_engine = try_read(&guard.inner)?;
+            let sync_engine = try_read(&guard)?;
             let sync_engine = try_unwrap(&sync_engine)?;
             sync_engine.checkpoint(coro).await?;
             Ok(None)
@@ -367,7 +325,7 @@ impl SyncEngine {
 
     #[napi]
     pub fn close(&mut self) {
-        let _ = self.sync_engine.inner.write().unwrap().take();
+        let _ = self.sync_engine.write().unwrap().take();
         let _ = self.opened.lock().unwrap().take().unwrap();
         let _ = self.io.take();
         let _ = self.protocol.take();
@@ -396,7 +354,7 @@ impl SyncEngine {
         &self,
         f: impl AsyncFnOnce(
                 &Coro<()>,
-                &Arc<SyncEngineGuard>,
+                &Arc<RwLock<Option<DatabaseSyncEngine<JsProtocolIo>>>>,
             ) -> turso_sync_engine::Result<Option<GeneratorResponse>>
             + 'static,
     ) -> GeneratorHolder {

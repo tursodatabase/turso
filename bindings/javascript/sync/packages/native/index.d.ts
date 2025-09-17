@@ -174,13 +174,17 @@ export declare class SyncEngine {
   /** Runs the I/O loop asynchronously, returning a Promise. */
   ioLoopAsync(): Promise<void>
   protocolIo(): JsProtocolRequestBytes | null
-  sync(): GeneratorHolder
   push(): GeneratorHolder
   stats(): GeneratorHolder
-  pull(): GeneratorHolder
+  wait(): GeneratorHolder
+  apply(changes: SyncEngineChanges): GeneratorHolder
   checkpoint(): GeneratorHolder
   open(): Database
   close(): void
+}
+
+export declare class SyncEngineChanges {
+
 }
 
 export declare const enum DatabaseChangeTypeJs {
@@ -217,6 +221,7 @@ export type GeneratorResponse =
   | { type: 'IO' }
   | { type: 'Done' }
   | { type: 'SyncEngineStats', operations: number, mainWal: number, revertWal: number, lastPullUnixTime: number, lastPushUnixTime?: number, revision?: string }
+  | { type: 'SyncEngineChanges', changes: SyncEngineChanges }
 
 export type JsProtocolRequest =
   | { type: 'Http', method: string, path: string, body?: Array<number>, headers: Array<[string, string]> }

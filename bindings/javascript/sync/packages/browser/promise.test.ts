@@ -260,6 +260,105 @@ test('persistence-pull-push', async () => {
     expect(rows2.sort(localeCompare)).toEqual(expected.sort(localeCompare))
 })
 
+test('pull-push-concurrent', async () => {
+    {
+        const db = await connect({ path: ':memory:', url: process.env.VITE_TURSO_DB_URL, longPollTimeoutMs: 5000 });
+        await db.exec("CREATE TABLE IF NOT EXISTS q(x TEXT PRIMARY KEY, y)");
+        await db.exec("DELETE FROM q");
+        await db.push();
+        await db.close();
+    }
+    let pullResolve = null;
+    const pullFinish = new Promise(resolve => pullResolve = resolve);
+    let pushResolve = null;
+    const pushFinish = new Promise(resolve => pushResolve = resolve);
+    let stopPull = false;
+    let stopPush = false;
+    const db = await connect({ path: ':memory:', url: process.env.VITE_TURSO_DB_URL });
+    let pull = async () => {
+        try {
+            await db.pull();
+        } catch (e) {
+            console.error('pull', e);
+        } finally {
+            if (!stopPull) {
+                setTimeout(pull, 0);
+            } else {
+                pullResolve()
+            }
+        }
+    }
+    let push = async () => {
+        try {
+            if ((await db.stats()).operations > 0) {
+                await db.push();
+            }
+        } catch (e) {
+            console.error('push', e);
+        } finally {
+            if (!stopPush) {
+                setTimeout(push, 0);
+            } else {
+                pushResolve();
+            }
+        }
+    }
+    setTimeout(pull, 0);
+    setTimeout(push, 0);
+    for (let i = 0; i < 1000; i++) {
+        await db.exec(`INSERT INTO q VALUES ('k${i}', 'v${i}')`);
+    }
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    stopPush = true;
+    await pushFinish;
+    stopPull = true;
+    await pullFinish;
+    console.info(await db.stats());
+})
+
+test('concurrent-updates', async () => {
+    {
+        const db = await connect({ path: ':memory:', url: process.env.VITE_TURSO_DB_URL, longPollTimeoutMs: 5000 });
+        await db.exec("CREATE TABLE IF NOT EXISTS q(x TEXT PRIMARY KEY, y)");
+        await db.exec("DELETE FROM q");
+        await db.push();
+        await db.close();
+    }
+    const db1 = await connect({ path: ':memory:', url: process.env.VITE_TURSO_DB_URL });
+    const db2 = await connect({ path: ':memory:', url: process.env.VITE_TURSO_DB_URL });
+    async function pull(db) {
+        try {
+            await db.pull();
+        } catch (e) {
+            // ignore
+        } finally {
+            setTimeout(async () => await pull(db), 0);
+        }
+    }
+    async function push(db) {
+        try {
+            await db.push();
+        } catch (e) {
+            // ignore
+        } finally {
+            setTimeout(async () => await push(db), 0);
+        }
+    }
+    setTimeout(async () => await pull(db1), 0)
+    setTimeout(async () => await pull(db2), 0)
+    setTimeout(async () => await push(db1), 0)
+    setTimeout(async () => await push(db2), 0)
+    for (let i = 0; i < 1000; i++) {
+        try {
+            await db1.exec(`INSERT INTO q VALUES ('1', 0) ON CONFLICT DO UPDATE SET y = randomblob(128)`);
+            await db2.exec(`INSERT INTO q VALUES ('2', 0) ON CONFLICT DO UPDATE SET y = randomblob(128)`);
+        } catch (e) {
+            // ignore
+        }
+        await new Promise(resolve => setTimeout(resolve, 1));
+    }
+})
+
 test('transform', async () => {
     {
         const db = await connect({

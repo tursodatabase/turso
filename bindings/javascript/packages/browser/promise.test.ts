@@ -52,6 +52,7 @@ test('on-disk db', async () => {
     db2.close();
 })
 
+// attach is not supported in browser for now
 // test('attach', async () => {
 //     const path1 = `test-${(Math.random() * 10000) | 0}.db`;
 //     const path2 = `test-${(Math.random() * 10000) | 0}.db`;

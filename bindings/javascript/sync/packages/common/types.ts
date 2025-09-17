@@ -54,4 +54,4 @@ export interface SyncEngineStats {
     revision: string | null;
 }
 
-export type GeneratorResponse = { type: 'IO' } | { type: 'Done' } | ({ type: 'SyncEngineStats' } & SyncEngineStats)
+export type GeneratorResponse = { type: 'IO' } | { type: 'Done' } | ({ type: 'SyncEngineStats' } & SyncEngineStats) | { type: 'SyncEngineChanges', changes: any }
