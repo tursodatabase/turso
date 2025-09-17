@@ -1,5 +1,4 @@
 #![allow(unused_variables, dead_code)]
-use crate::storage::sqlite3_ondisk::DatabaseHeader;
 use crate::{LimboError, Result};
 use aegis::aegis128l::Aegis128L;
 use aegis::aegis128x2::Aegis128X2;
@@ -426,6 +425,7 @@ impl EncryptionContext {
 
     #[cfg(feature = "encryption")]
     pub fn encrypt_page(&self, page: &[u8], page_id: usize) -> Result<Vec<u8>> {
+        use crate::storage::sqlite3_ondisk::DatabaseHeader;
         tracing::debug!("encrypting page {}", page_id);
         assert_eq!(
             page.len(),
@@ -473,6 +473,7 @@ impl EncryptionContext {
 
     #[cfg(feature = "encryption")]
     pub fn decrypt_page(&self, encrypted_page: &[u8], page_id: usize) -> Result<Vec<u8>> {
+        use crate::storage::sqlite3_ondisk::DatabaseHeader;
         tracing::debug!("decrypting page {}", page_id);
         assert_eq!(
             encrypted_page.len(),
