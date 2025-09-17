@@ -1068,7 +1068,9 @@ pub fn parse_pragma_bool(expr: &Expr) -> Result<bool> {
 pub fn extract_column_name_from_expr(expr: impl AsRef<ast::Expr>) -> Option<String> {
     match expr.as_ref() {
         ast::Expr::Id(name) => Some(name.as_str().to_string()),
-        ast::Expr::Qualified(_, name) => Some(name.as_str().to_string()),
+        ast::Expr::DoublyQualified(_, _, name) | ast::Expr::Qualified(_, name) => {
+            Some(normalize_ident(name.as_str()))
+        }
         _ => None,
     }
 }
