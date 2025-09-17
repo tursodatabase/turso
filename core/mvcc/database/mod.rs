@@ -546,7 +546,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     )));
                 }
                 {
-                    let mut wal = self.pager.wal.as_ref().unwrap().borrow_mut();
+                    let mut wal = self.pager.wal.as_ref().unwrap().write();
                     // we need to update the max frame to the latest shared max frame in order to avoid snapshot staleness
                     wal.update_max_frame();
                 }

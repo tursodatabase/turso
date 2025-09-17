@@ -66,11 +66,9 @@ use crate::{
     bail_corrupt_error, turso_assert, CompletionError, File, IOContext, Result, WalFileShared,
 };
 use parking_lot::RwLock;
-use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap};
 use std::mem::MaybeUninit;
 use std::pin::Pin;
-use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -977,7 +975,7 @@ pub fn begin_write_btree_page(pager: &Pager, page: &PageRef) -> Result<Completio
         })
     };
     let c = Completion::new_write(write_complete);
-    let io_ctx = &pager.io_ctx.borrow();
+    let io_ctx = &pager.io_ctx.read();
     page_source.write_page(page_id, buffer.clone(), io_ctx, c)
 }
 
@@ -1003,7 +1001,7 @@ pub fn write_pages_vectored(
         return Ok(Vec::new());
     }
 
-    let page_sz = pager.page_size.get().expect("page size is not set").get() as usize;
+    let page_sz = pager.get_page_size_unchecked().get() as usize;
     // Count expected number of runs to create the atomic counter we need to track each batch
     let mut run_count = 0;
     let mut prev_id = None;
@@ -1071,7 +1069,7 @@ pub fn write_pages_vectored(
             };
 
             // Submit write operation for this run
-            let io_ctx = &pager.io_ctx.borrow();
+            let io_ctx = &pager.io_ctx.read();
             match pager.db_file.write_pages(
                 start_id,
                 page_sz,
@@ -1103,12 +1101,12 @@ pub fn write_pages_vectored(
 #[instrument(skip_all, level = Level::DEBUG)]
 pub fn begin_sync(
     db_file: Arc<dyn DatabaseStorage>,
-    syncing: Rc<Cell<bool>>,
+    syncing: Arc<AtomicBool>,
 ) -> Result<Completion> {
-    assert!(!syncing.get());
-    syncing.set(true);
+    assert!(!syncing.load(Ordering::Relaxed));
+    syncing.store(true, Ordering::Relaxed);
     let completion = Completion::new_sync(move |_| {
-        syncing.set(false);
+        syncing.store(false, Ordering::Relaxed);
     });
     #[allow(clippy::arc_with_non_send_sync)]
     db_file.sync(completion)
