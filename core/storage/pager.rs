@@ -321,7 +321,7 @@ enum CommitState {
     /// Sync WAL header after prepare
     PrepareWalSync,
     /// Appends all frames to the WAL.
-    Start,
+    PrepareFrames,
     /// Fsync the on-disk WAL.
     SyncWal,
     /// Checkpoint the WAL to the database file (if needed).
@@ -1263,7 +1263,8 @@ impl Pager {
         let mut pages = Vec::with_capacity(len);
         let page_sz = self.page_size.get().unwrap_or_default();
 
-        if let Some(c) = wal.borrow_mut().prepare_wal_start(page_sz)? {
+        let prepare = wal.borrow_mut().prepare_wal_start(page_sz)?;
+        if let Some(c) = prepare {
             self.io.wait_for_completion(c)?;
             let c = wal.borrow_mut().prepare_wal_finish()?;
             self.io.wait_for_completion(c)?;
@@ -1340,7 +1341,7 @@ impl Pager {
                     let page_sz = self.page_size.get().expect("page size not set");
                     let c = wal.borrow_mut().prepare_wal_start(page_sz)?;
                     let Some(c) = c else {
-                        self.commit_info.state.set(CommitState::Start);
+                        self.commit_info.state.set(CommitState::PrepareFrames);
                         continue;
                     };
                     self.commit_info.state.set(CommitState::PrepareWalSync);
@@ -1350,12 +1351,12 @@ impl Pager {
                 }
                 CommitState::PrepareWalSync => {
                     let c = wal.borrow_mut().prepare_wal_finish()?;
-                    self.commit_info.state.set(CommitState::Start);
+                    self.commit_info.state.set(CommitState::PrepareFrames);
                     if !c.is_completed() {
                         io_yield_one!(c);
                     }
                 }
-                CommitState::Start => {
+                CommitState::PrepareFrames => {
                     let now = self.io.now();
                     self.commit_info.time.set(now);
                     let db_size_after = {
@@ -1503,7 +1504,7 @@ impl Pager {
                     let mut completions = self.commit_info.completions.borrow_mut();
                     if completions.iter().all(|c| c.is_completed()) {
                         completions.clear();
-                        self.commit_info.state.set(CommitState::Start);
+                        self.commit_info.state.set(CommitState::PrepareWal);
                         wal.borrow_mut().finish_append_frames_commit()?;
                         let result = self.commit_info.result.borrow_mut().take();
                         return Ok(IOResult::Done(result.expect("commit result should be set")));
@@ -2229,7 +2230,7 @@ impl Pager {
     fn reset_internal_states(&self) {
         *self.checkpoint_state.write() = CheckpointState::Checkpoint;
         self.syncing.replace(false);
-        self.commit_info.state.set(CommitState::Start);
+        self.commit_info.state.set(CommitState::PrepareWal);
         self.commit_info.time.set(self.io.now());
         self.allocate_page_state.replace(AllocatePageState::Start);
         self.free_page_state.replace(FreePageState::Start);

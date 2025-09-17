@@ -1936,7 +1936,9 @@ impl WalFile {
                     if mode.require_all_backfilled() && !checkpoint_result.everything_backfilled() {
                         return Err(LimboError::Busy);
                     }
-                    self.restart_log_if_needed(mode)?;
+                    if mode.should_restart_log() {
+                        self.restart_log(mode)?;
+                    }
                     self.ongoing_checkpoint.state = CheckpointState::Truncate {
                         checkpoint_result: Some(checkpoint_result),
                         truncate_sent: false,
@@ -1944,7 +1946,12 @@ impl WalFile {
                     };
                 }
                 CheckpointState::Truncate { .. } => {
-                    return_if_io!(self.truncate_log_if_needed(mode));
+                    if matches!(mode, CheckpointMode::Truncate { .. }) {
+                        return_if_io!(self.truncate_log());
+                    }
+                    if mode.should_restart_log() {
+                        Self::unlock(&self.shared, None);
+                    }
                     let mut checkpoint_result = {
                         let CheckpointState::Truncate {
                             checkpoint_result, ..
@@ -2051,10 +2058,11 @@ impl WalFile {
 
     /// Called once the entire WAL has been back‑filled in RESTART or TRUNCATE mode.
     /// Must be invoked while writer and checkpoint locks are still held.
-    fn restart_log_if_needed(&mut self, mode: CheckpointMode) -> Result<()> {
-        if !mode.should_restart_log() {
-            return Ok(());
-        }
+    fn restart_log(&mut self, mode: CheckpointMode) -> Result<()> {
+        turso_assert!(
+            mode.should_restart_log(),
+            "CheckpointMode must be Restart or Truncate"
+        );
         turso_assert!(
             matches!(self.checkpoint_guard, Some(CheckpointLocks::Writer { .. })),
             "We must hold writer and checkpoint locks to restart the log, found: {:?}",
@@ -2089,11 +2097,7 @@ impl WalFile {
         Ok(())
     }
 
-    fn truncate_log_if_needed(&mut self, mode: CheckpointMode) -> Result<IOResult<()>> {
-        if !matches!(mode, CheckpointMode::Truncate { .. }) {
-            Self::unlock(&self.shared, None);
-            return Ok(IOResult::Done(()));
-        }
+    fn truncate_log(&mut self) -> Result<IOResult<()>> {
         let file = {
             let shared = self.get_shared();
             assert!(
@@ -2143,8 +2147,6 @@ impl WalFile {
                 .inspect_err(|e| Self::unlock(&self.shared, Some(e)))?;
             *sync_sent = true;
             io_yield_one!(c);
-        } else {
-            Self::unlock(&self.shared, None);
         }
         Ok(IOResult::Done(()))
     }
