@@ -239,7 +239,7 @@ fn run_simulator(
     let env = Arc::new(Mutex::new(env));
     let result = SandboxedResult::from(
         std::panic::catch_unwind(|| {
-            let interactions = plan.interactions_list().collect::<Vec<_>>();
+            let interactions = plan.interactions_list();
             run_simulation(env.clone(), interactions, last_execution.clone())
         }),
         last_execution.clone(),
@@ -306,7 +306,7 @@ fn run_simulator(
                 let env = Arc::new(Mutex::new(env));
                 let shrunk = SandboxedResult::from(
                     std::panic::catch_unwind(|| {
-                        let interactions = shrunk_plan.interactions_list().collect::<Vec<_>>();
+                        let interactions = shrunk_plan.interactions_list();
 
                         run_simulation(env.clone(), interactions, last_execution.clone())
                     }),

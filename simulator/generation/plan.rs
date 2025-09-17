@@ -100,11 +100,26 @@ impl InteractionPlan {
         plan.into_iter().flatten().collect()
     }
 
-    pub fn interactions_list(&self) -> impl Iterator<Item = Interaction> {
+    pub fn interactions_list(&self) -> Vec<Interaction> {
         self.plan
             .clone()
             .into_iter()
             .flat_map(|interactions| interactions.interactions().into_iter())
+            .collect()
+    }
+
+    pub fn interactions_list_with_secondary_index(&self) -> Vec<(usize, Interaction)> {
+        self.plan
+            .clone()
+            .into_iter()
+            .enumerate()
+            .flat_map(|(idx, interactions)| {
+                interactions
+                    .interactions()
+                    .into_iter()
+                    .map(move |interaction| (idx, interaction))
+            })
+            .collect()
     }
 }
 

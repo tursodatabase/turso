@@ -22,12 +22,18 @@ impl InteractionPlan {
         // let failing_property = &self.plan[failing_execution.interaction_index];
         let mut depending_tables = IndexSet::new();
 
-        let all_interactions = self.interactions_list().collect::<Vec<_>>();
+        let all_interactions = self.interactions_list_with_secondary_index();
+        // Index of the parent property where the interaction originated from
+        let secondary_interactions_index = all_interactions[failing_execution.interaction_index].0;
 
         {
             let mut idx = failing_execution.interaction_index;
             loop {
-                match &all_interactions[idx].interaction {
+                if all_interactions[idx].0 != secondary_interactions_index {
+                    // Stop when we reach a different property
+                    break;
+                }
+                match &all_interactions[idx].1.interaction {
                     InteractionType::Query(query) => {
                         depending_tables = query.dependencies();
                         break;
@@ -55,12 +61,12 @@ impl InteractionPlan {
         let before = self.plan.len();
 
         // Remove all properties after the failing one
-        plan.plan.truncate(failing_execution.interaction_index + 1);
+        plan.plan.truncate(secondary_interactions_index + 1);
 
         let mut idx = 0;
         // Remove all properties that do not use the failing tables
         plan.plan.retain_mut(|interactions| {
-            let retain = if idx == failing_execution.interaction_index {
+            let retain = if idx == secondary_interactions_index {
                 if let InteractionsType::Property(
                     Property::FsyncNoWait { tables, .. } | Property::FaultyQuery { tables, .. },
                 ) = &mut interactions.interactions
@@ -154,12 +160,17 @@ impl InteractionPlan {
         };
 
         let mut plan = self.clone();
-        let all_interactions = self.interactions_list().collect::<Vec<_>>();
+        let all_interactions = self.interactions_list_with_secondary_index();
+        let secondary_interactions_index = all_interactions[failing_execution.interaction_index].0;
 
         {
             let mut idx = failing_execution.interaction_index;
             loop {
-                match &all_interactions[idx].interaction {
+                if all_interactions[idx].0 != secondary_interactions_index {
+                    // Stop when we reach a different property
+                    break;
+                }
+                match &all_interactions[idx].1.interaction {
                     // Fault does not depend on
                     InteractionType::Fault(..) => break,
                     _ => {
@@ -179,7 +190,7 @@ impl InteractionPlan {
 
         let before = self.plan.len();
 
-        plan.plan.truncate(failing_execution.interaction_index + 1);
+        plan.plan.truncate(secondary_interactions_index + 1);
 
         // phase 1: shrink extensions
         for interaction in &mut plan.plan {
@@ -206,6 +217,7 @@ impl InteractionPlan {
                             failing_execution,
                             result,
                             env.clone(),
+                            secondary_interactions_index,
                         );
                         //temp_plan = Self::shrink_queries(temp_plan, failing_execution, result, env);
 
@@ -231,7 +243,13 @@ impl InteractionPlan {
         }
 
         // phase 2: shrink the entire plan
-        plan = Self::iterative_shrink(plan, failing_execution, result, env);
+        plan = Self::iterative_shrink(
+            plan,
+            failing_execution,
+            result,
+            env,
+            secondary_interactions_index,
+        );
 
         let after = plan.plan.len();
 
@@ -250,9 +268,10 @@ impl InteractionPlan {
         failing_execution: &Execution,
         old_result: &SandboxedResult,
         env: Arc<Mutex<SimulatorEnv>>,
+        secondary_interaction_index: usize,
     ) -> InteractionPlan {
         for i in (0..plan.plan.len()).rev() {
-            if i == failing_execution.interaction_index {
+            if i == secondary_interaction_index {
                 continue;
             }
             let mut test_plan = plan.clone();
@@ -275,7 +294,7 @@ impl InteractionPlan {
         let last_execution = Arc::new(Mutex::new(*failing_execution));
         let result = SandboxedResult::from(
             std::panic::catch_unwind(|| {
-                let interactions = test_plan.interactions_list().collect::<Vec<_>>();
+                let interactions = test_plan.interactions_list();
 
                 run_simulation(env.clone(), interactions, last_execution.clone())
             }),
