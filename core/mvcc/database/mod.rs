@@ -1448,7 +1448,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     }
 
     pub fn get_transaction_database_header(&self, tx_id: &TxID) -> DatabaseHeader {
-        let tx = self.txs.get(tx_id).unwrap();
+        let tx = self.txs.get(tx_id).expect("transaction not found when trying to get header");
         let header = tx.value();
         let header = header.header.borrow();
         tracing::debug!("get_transaction_database_header read: header={:?}", header);
