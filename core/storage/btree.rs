@@ -38,6 +38,7 @@ use super::{
         write_varint_to_vec, IndexInteriorCell, IndexLeafCell, OverflowCell, MINIMUM_CELL_SIZE,
     },
 };
+use parking_lot::RwLock;
 use std::{
     cell::{Cell, Ref, RefCell},
     cmp::{Ordering, Reverse},
@@ -45,7 +46,6 @@ use std::{
     fmt::Debug,
     ops::DerefMut,
     pin::Pin,
-    rc::Rc,
     sync::Arc,
 };
 
@@ -479,7 +479,7 @@ pub enum CursorSeekState {
 
 pub struct BTreeCursor {
     /// The multi-version cursor that is used to read and write to the database file.
-    mv_cursor: Option<Rc<RefCell<MvCursor>>>,
+    mv_cursor: Option<Arc<RwLock<MvCursor>>>,
     /// The pager that is used to read and write to the database file.
     pub pager: Arc<Pager>,
     /// Cached value of the usable space of a BTree page, since it is very expensive to call in a hot loop via pager.usable_space().
@@ -583,7 +583,7 @@ impl BTreeNodeState {
 
 impl BTreeCursor {
     pub fn new(
-        mv_cursor: Option<Rc<RefCell<MvCursor>>>,
+        mv_cursor: Option<Arc<RwLock<MvCursor>>>,
         pager: Arc<Pager>,
         root_page: usize,
         num_columns: usize,
@@ -634,7 +634,7 @@ impl BTreeCursor {
     }
 
     pub fn new_table(
-        mv_cursor: Option<Rc<RefCell<MvCursor>>>,
+        mv_cursor: Option<Arc<RwLock<MvCursor>>>,
         pager: Arc<Pager>,
         root_page: usize,
         num_columns: usize,
@@ -643,7 +643,7 @@ impl BTreeCursor {
     }
 
     pub fn new_index(
-        mv_cursor: Option<Rc<RefCell<MvCursor>>>,
+        mv_cursor: Option<Arc<RwLock<MvCursor>>>,
         pager: Arc<Pager>,
         root_page: usize,
         index: &Index,
@@ -690,7 +690,7 @@ impl BTreeCursor {
             match state {
                 EmptyTableState::Start => {
                     if let Some(mv_cursor) = &self.mv_cursor {
-                        let mv_cursor = mv_cursor.borrow();
+                        let mv_cursor = mv_cursor.read();
                         return Ok(IOResult::Done(mv_cursor.is_empty()));
                     }
                     let (page, c) = self.pager.read_page(self.root_page)?;
@@ -1219,7 +1219,7 @@ impl BTreeCursor {
     #[instrument(skip(self), level = Level::DEBUG, name = "next")]
     pub fn get_next_record(&mut self) -> Result<IOResult<bool>> {
         if let Some(mv_cursor) = &self.mv_cursor {
-            let mut mv_cursor = mv_cursor.borrow_mut();
+            let mut mv_cursor = mv_cursor.write();
             mv_cursor.forward();
             let rowid = mv_cursor.current_row_id();
             match rowid {
@@ -4387,7 +4387,7 @@ impl BTreeCursor {
                 RewindState::Start => {
                     self.rewind_state = RewindState::NextRecord;
                     if let Some(mv_cursor) = &self.mv_cursor {
-                        let mut mv_cursor = mv_cursor.borrow_mut();
+                        let mut mv_cursor = mv_cursor.write();
                         mv_cursor.rewind();
                     } else {
                         let c = self.move_to_root()?;
@@ -4484,7 +4484,7 @@ impl BTreeCursor {
     #[instrument(skip(self), level = Level::DEBUG)]
     pub fn rowid(&self) -> Result<IOResult<Option<i64>>> {
         if let Some(mv_cursor) = &self.mv_cursor {
-            let mut mv_cursor = mv_cursor.borrow_mut();
+            let mut mv_cursor = mv_cursor.write();
             let Some(rowid) = mv_cursor.current_row_id() else {
                 return Ok(IOResult::Done(None));
             };
@@ -4513,7 +4513,7 @@ impl BTreeCursor {
     #[instrument(skip(self, key), level = Level::DEBUG)]
     pub fn seek(&mut self, key: SeekKey<'_>, op: SeekOp) -> Result<IOResult<SeekResult>> {
         if let Some(mv_cursor) = &self.mv_cursor {
-            let mut mv_cursor = mv_cursor.borrow_mut();
+            let mut mv_cursor = mv_cursor.write();
             return mv_cursor.seek(key, op);
         }
         self.skip_advance.set(false);
@@ -4551,7 +4551,7 @@ impl BTreeCursor {
             return Ok(IOResult::Done(Some(record_ref)));
         }
         if let Some(mv_cursor) = &self.mv_cursor {
-            let mut mv_cursor = mv_cursor.borrow_mut();
+            let mut mv_cursor = mv_cursor.write();
             let Some(row) = mv_cursor.current_row()? else {
                 return Ok(IOResult::Done(None));
             };
@@ -4628,7 +4628,7 @@ impl BTreeCursor {
                         }
                     };
                     let row = crate::mvcc::database::Row::new(row_id, record_buf, num_columns);
-                    mv_cursor.borrow_mut().insert(row)?;
+                    mv_cursor.write().insert(row)?;
                 }
                 None => todo!("Support mvcc inserts with index btrees"),
             },
@@ -4657,8 +4657,8 @@ impl BTreeCursor {
     #[instrument(skip(self), level = Level::DEBUG)]
     pub fn delete(&mut self) -> Result<IOResult<()>> {
         if let Some(mv_cursor) = &self.mv_cursor {
-            let rowid = mv_cursor.borrow_mut().current_row_id().unwrap();
-            mv_cursor.borrow_mut().delete(rowid)?;
+            let rowid = mv_cursor.write().current_row_id().unwrap();
+            mv_cursor.write().delete(rowid)?;
             return Ok(IOResult::Done(()));
         }
 
@@ -5647,7 +5647,7 @@ impl BTreeCursor {
             .do_allocate_page(page_type, offset, BtreePageAllocMode::Any)
     }
 
-    pub fn get_mvcc_cursor(&self) -> Rc<RefCell<MvCursor>> {
+    pub fn get_mvcc_cursor(&self) -> Arc<RwLock<MvCursor>> {
         self.mv_cursor.as_ref().unwrap().clone()
     }
 }
