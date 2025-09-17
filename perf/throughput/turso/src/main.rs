@@ -13,6 +13,11 @@ enum TransactionMode {
     LogicalLog,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum IoOption {
+    IoUring,
+}
+
 #[derive(Parser)]
 #[command(name = "write-throughput")]
 #[command(about = "Write throughput benchmark using turso")]
@@ -42,6 +47,9 @@ struct Args {
         help = "Busy timeout in milliseconds"
     )]
     timeout: u64,
+
+    #[arg(long = "io", help = "IO backend")]
+    io: Option<IoOption>,
 }
 
 #[tokio::main]
@@ -67,7 +75,7 @@ async fn main() -> Result<()> {
         std::fs::remove_file(wal_path).expect("Failed to remove existing database");
     }
 
-    let db = setup_database(db_path, args.mode).await?;
+    let db = setup_database(db_path, args.mode, args.io).await?;
 
     let start_barrier = Arc::new(Barrier::new(args.threads));
     let mut handles = Vec::new();
@@ -131,8 +139,20 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn setup_database(db_path: &str, mode: TransactionMode) -> Result<Database> {
+async fn setup_database(
+    db_path: &str,
+    mode: TransactionMode,
+    io: Option<IoOption>,
+) -> Result<Database> {
     let builder = Builder::new_local(db_path);
+
+    let builder = if let Some(io) = io {
+        match io {
+            IoOption::IoUring => builder.with_io("io_uring".to_string()),
+        }
+    } else {
+        builder
+    };
     let db = match mode {
         TransactionMode::Legacy => builder.build().await?,
         TransactionMode::Mvcc | TransactionMode::Concurrent => {
