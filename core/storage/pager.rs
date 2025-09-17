@@ -19,7 +19,7 @@ use std::cell::{Cell, RefCell, UnsafeCell};
 use std::collections::HashSet;
 use std::hash;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tracing::{instrument, trace, Level};
 
@@ -377,6 +377,27 @@ pub enum AutoVacuumMode {
     Incremental,
 }
 
+impl From<AutoVacuumMode> for u8 {
+    fn from(mode: AutoVacuumMode) -> u8 {
+        match mode {
+            AutoVacuumMode::None => 0,
+            AutoVacuumMode::Full => 1,
+            AutoVacuumMode::Incremental => 2,
+        }
+    }
+}
+
+impl From<u8> for AutoVacuumMode {
+    fn from(value: u8) -> AutoVacuumMode {
+        match value {
+            0 => AutoVacuumMode::None,
+            1 => AutoVacuumMode::Full,
+            2 => AutoVacuumMode::Incremental,
+            _ => unreachable!("Invalid AutoVacuumMode value: {}", value),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(usize)]
 pub enum DbState {
@@ -482,7 +503,7 @@ pub struct Pager {
     commit_info: CommitInfo,
     checkpoint_state: RwLock<CheckpointState>,
     syncing: Arc<AtomicBool>,
-    auto_vacuum_mode: Cell<AutoVacuumMode>,
+    auto_vacuum_mode: AtomicU8,
     /// 0 -> Database is empty,
     /// 1 -> Database is being initialized,
     /// 2 -> Database is initialized and ready for use.
@@ -595,7 +616,7 @@ impl Pager {
             syncing: Arc::new(AtomicBool::new(false)),
             checkpoint_state: RwLock::new(CheckpointState::Checkpoint),
             buffer_pool,
-            auto_vacuum_mode: Cell::new(AutoVacuumMode::None),
+            auto_vacuum_mode: AtomicU8::new(AutoVacuumMode::None.into()),
             db_state,
             init_lock,
             allocate_page1_state,
@@ -638,11 +659,11 @@ impl Pager {
     }
 
     pub fn get_auto_vacuum_mode(&self) -> AutoVacuumMode {
-        self.auto_vacuum_mode.get()
+        self.auto_vacuum_mode.load(Ordering::SeqCst).into()
     }
 
     pub fn set_auto_vacuum_mode(&self, mode: AutoVacuumMode) {
-        self.auto_vacuum_mode.set(mode);
+        self.auto_vacuum_mode.store(mode.into(), Ordering::SeqCst);
     }
 
     /// Retrieves the pointer map entry for a given database page.
@@ -858,7 +879,8 @@ impl Pager {
         //  If autovacuum is enabled, we need to allocate a new page number that is greater than the largest root page number
         #[cfg(not(feature = "omit_autovacuum"))]
         {
-            let auto_vacuum_mode = self.auto_vacuum_mode.get();
+            let auto_vacuum_mode =
+                AutoVacuumMode::from(self.auto_vacuum_mode.load(Ordering::SeqCst));
             match auto_vacuum_mode {
                 AutoVacuumMode::None => {
                     let page =
@@ -2013,8 +2035,10 @@ impl Pager {
                         //  If the following conditions are met, allocate a pointer map page, add to cache and increment the database size
                         //  - autovacuum is enabled
                         //  - the last page is a pointer map page
-                        if matches!(self.auto_vacuum_mode.get(), AutoVacuumMode::Full)
-                            && is_ptrmap_page(new_db_size + 1, header.page_size.get() as usize)
+                        if matches!(
+                            AutoVacuumMode::from(self.auto_vacuum_mode.load(Ordering::SeqCst)),
+                            AutoVacuumMode::Full
+                        ) && is_ptrmap_page(new_db_size + 1, header.page_size.get() as usize)
                         {
                             // we will allocate a ptrmap page, so increment size
                             new_db_size += 1;
