@@ -1,4 +1,3 @@
-use std::ops::Range;
 use std::sync::Arc;
 
 use crate::ast;
@@ -105,16 +104,15 @@ pub fn translate_create_table(
     // https://github.com/sqlite/sqlite/blob/95f6df5b8d55e67d1e34d2bff217305a2f21b1fb/src/build.c#L2856-L2871
     // https://github.com/sqlite/sqlite/blob/95f6df5b8d55e67d1e34d2bff217305a2f21b1fb/src/build.c#L1334C5-L1336C65
 
-    let index_regs =
-        check_automatic_pk_index_required(&body, &mut program, tbl_name.name.as_str())?;
+    let index_regs = collect_autoindexes(&body, &mut program, tbl_name.name.as_str())?;
     if let Some(index_regs) = index_regs.as_ref() {
         if !schema.indexes_enabled() {
             bail_parse_error!("Constraints UNIQUE and PRIMARY KEY (unless INTEGER PRIMARY KEY) on table are not supported without indexes");
         }
-        for index_reg in index_regs.clone() {
+        for index_reg in index_regs.iter() {
             program.emit_insn(Insn::CreateBtree {
                 db: 0,
-                root: index_reg,
+                root: *index_reg,
                 flags: CreateBTreeFlags::new_index(),
             });
         }
@@ -145,13 +143,10 @@ pub fn translate_create_table(
 
     // If we need an automatic index, add its entry to sqlite_schema
     if let Some(index_regs) = index_regs {
-        for (idx, index_reg) in index_regs.into_iter().enumerate() {
-            let index_name = format!(
-                "{}{}_{}",
-                PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX,
-                normalize_ident(tbl_name.name.as_str()),
-                idx + 1
-            );
+        for (_idx, index_reg) in index_regs.into_iter().enumerate() {
+            let index_name = String::from(PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX)
+                + &normalize_ident(tbl_name.name.as_str())
+                + stringify!(_idx + 1);
             emit_schema_entry(
                 &mut program,
                 &resolver,
@@ -296,17 +291,42 @@ pub fn emit_schema_entry(
 ///   In this case, the PRIMARY KEY column becomes an alias for the rowid.
 ///
 /// Otherwise, an automatic PRIMARY KEY index is required.
-fn check_automatic_pk_index_required(
+fn collect_autoindexes(
     body: &ast::CreateTableBody,
     program: &mut ProgramBuilder,
     tbl_name: &str,
-) -> Result<Option<Range<usize>>> {
-    let table = create_table(tbl_name, body, 0)?; // abusing create_table() to avoid code duplication; we don't care about the root page here
-    if table.unique_sets.is_empty() {
-        return Ok(None);
+) -> Result<Option<Vec<usize>>> {
+    let table = create_table(tbl_name, body, 0)?;
+
+    let mut regs: Vec<usize> = Vec::new();
+
+    // include UNIQUE singles, include PK single only if not rowid alias
+    for us in table.unique_sets.iter().filter(|us| us.columns.len() == 1) {
+        let (col_name, _sort) = us.columns.first().unwrap();
+        let Some((_pos, col)) = table.get_column(col_name) else {
+            bail_parse_error!("Column {col_name} not found in table {}", table.name);
+        };
+
+        let needs_index = if us.is_primary_key {
+            !(col.primary_key && col.is_rowid_alias)
+        } else {
+            // UNIQUE single needs an index
+            true
+        };
+
+        if needs_index {
+            regs.push(program.alloc_register());
+        }
     }
-    let start_reg = program.alloc_registers(table.unique_sets.len());
-    Ok(Some(start_reg..start_reg + table.unique_sets.len()))
+
+    for _us in table.unique_sets.iter().filter(|us| us.columns.len() > 1) {
+        regs.push(program.alloc_register());
+    }
+    if regs.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(regs))
+    }
 }
 
 fn create_table_body_to_str(tbl_name: &ast::QualifiedName, body: &ast::CreateTableBody) -> String {
