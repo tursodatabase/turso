@@ -2,6 +2,8 @@
 // Operator DAG for DBSP-style incremental computation
 // Based on Feldera DBSP design but adapted for Turso's architecture
 
+pub use crate::incremental::input_operator::InputOperator;
+
 use crate::function::{AggFunc, Func};
 use crate::incremental::dbsp::{Delta, DeltaPair, HashableRow};
 use crate::incremental::expr_compiler::CompiledExpression;
@@ -1017,65 +1019,6 @@ pub trait IncrementalOperator: Debug {
 
     /// Set computation tracker
     fn set_tracker(&mut self, tracker: Arc<Mutex<ComputationTracker>>);
-}
-
-/// Input operator - passes through input data unchanged
-/// This operator is used for input nodes in the circuit to provide a uniform interface
-#[derive(Debug)]
-pub struct InputOperator {
-    name: String,
-}
-
-impl InputOperator {
-    pub fn new(name: String) -> Self {
-        Self { name }
-    }
-
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-}
-
-impl IncrementalOperator for InputOperator {
-    fn eval(
-        &mut self,
-        state: &mut EvalState,
-        _cursors: &mut DbspStateCursors,
-    ) -> Result<IOResult<Delta>> {
-        match state {
-            EvalState::Init { deltas } => {
-                // Input operators only use left_delta, right_delta must be empty
-                assert!(
-                    deltas.right.is_empty(),
-                    "InputOperator expects right_delta to be empty"
-                );
-                let output = std::mem::take(&mut deltas.left);
-                *state = EvalState::Done;
-                Ok(IOResult::Done(output))
-            }
-            _ => unreachable!(
-                "InputOperator doesn't execute the state machine. Should be in Init state"
-            ),
-        }
-    }
-
-    fn commit(
-        &mut self,
-        deltas: DeltaPair,
-        _cursors: &mut DbspStateCursors,
-    ) -> Result<IOResult<Delta>> {
-        // Input operator only uses left delta, right must be empty
-        assert!(
-            deltas.right.is_empty(),
-            "InputOperator expects right delta to be empty in commit"
-        );
-        // Input operator passes through the delta unchanged during commit
-        Ok(IOResult::Done(deltas.left))
-    }
-
-    fn set_tracker(&mut self, _tracker: Arc<Mutex<ComputationTracker>>) {
-        // Input operator doesn't need tracking
-    }
 }
 
 /// Filter operator - filters rows based on predicate
