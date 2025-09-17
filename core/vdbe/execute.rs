@@ -57,7 +57,7 @@ use crate::{
     },
     util::{
         cast_real_to_integer, cast_text_to_integer, cast_text_to_numeric, cast_text_to_real,
-        checked_cast_text_to_numeric, parse_schema_rows, RoundToPrecision,
+        checked_cast_text_to_numeric, parse_schema_rows,
     },
     vdbe::{
         builder::CursorType,
@@ -4496,7 +4496,11 @@ pub fn op_function(
             }
             ScalarFunc::Unhex => {
                 let reg_value = &state.registers[*start_reg];
-                let ignored_chars = state.registers.get(*start_reg + 1);
+                let ignored_chars = if func.arg_count == 2 {
+                    state.registers.get(*start_reg + 1)
+                } else {
+                    None
+                };
                 let result = reg_value
                     .get_value()
                     .exec_unhex(ignored_chars.map(|x| x.get_value()));
@@ -7717,10 +7721,8 @@ mod cmath {
 
 impl Value {
     pub fn exec_lower(&self) -> Option<Self> {
-        match self {
-            Value::Text(t) => Some(Value::build_text(t.as_str().to_lowercase())),
-            t => Some(t.to_owned()),
-        }
+        self.cast_text()
+            .map(|s| Value::build_text(s.to_ascii_lowercase()))
     }
 
     pub fn exec_length(&self) -> Self {
@@ -7749,49 +7751,20 @@ impl Value {
     }
 
     pub fn exec_upper(&self) -> Option<Self> {
-        match self {
-            Value::Text(t) => Some(Value::build_text(t.as_str().to_uppercase())),
-            t => Some(t.to_owned()),
-        }
+        self.cast_text()
+            .map(|s| Value::build_text(s.to_ascii_uppercase()))
     }
 
     pub fn exec_sign(&self) -> Option<Value> {
-        let num = match self {
-            Value::Integer(i) => *i as f64,
-            Value::Float(f) => *f,
-            Value::Text(s) => {
-                if let Ok(i) = s.as_str().parse::<i64>() {
-                    i as f64
-                } else if let Ok(f) = s.as_str().parse::<f64>() {
-                    f
-                } else {
-                    return Some(Value::Null);
-                }
-            }
-            Value::Blob(b) => match std::str::from_utf8(b) {
-                Ok(s) => {
-                    if let Ok(i) = s.parse::<i64>() {
-                        i as f64
-                    } else if let Ok(f) = s.parse::<f64>() {
-                        f
-                    } else {
-                        return Some(Value::Null);
-                    }
-                }
-                Err(_) => return Some(Value::Null),
-            },
-            _ => return Some(Value::Null),
-        };
+        let v = Numeric::from_value_strict(self).try_into_f64()?;
 
-        let sign = if num > 0.0 {
+        Some(Value::Integer(if v > 0.0 {
             1
-        } else if num < 0.0 {
+        } else if v < 0.0 {
             -1
         } else {
             0
-        };
-
-        Some(Value::Integer(sign))
+        }))
     }
 
     /// Generates the Soundex code for a given word
@@ -7886,25 +7859,24 @@ impl Value {
     }
 
     pub fn exec_abs(&self) -> Result<Self> {
-        match self {
-            Value::Integer(x) => {
-                match i64::checked_abs(*x) {
-                    Some(y) => Ok(Value::Integer(y)),
-                    // Special case: if we do the abs of "-9223372036854775808", it causes overflow.
-                    // return IntegerOverflow error
-                    None => Err(LimboError::IntegerOverflow),
-                }
+        Ok(match self {
+            Value::Null => Value::Null,
+            Value::Integer(v) => {
+                Value::Integer(v.checked_abs().ok_or(LimboError::IntegerOverflow)?)
             }
-            Value::Float(x) => {
-                if x < &0.0 {
-                    Ok(Value::Float(-x))
-                } else {
-                    Ok(Value::Float(*x))
-                }
+            Value::Float(non_nan) => Value::Float(non_nan.abs()),
+            _ => {
+                let s = match self {
+                    Value::Text(text) => text.to_string(),
+                    Value::Blob(blob) => String::from_utf8_lossy(blob).to_string(),
+                    _ => unreachable!(),
+                };
+
+                crate::numeric::str_to_f64(s)
+                    .map(|v| Value::Float(f64::from(v).abs()))
+                    .unwrap_or(Value::Float(0.0))
             }
-            Value::Null => Ok(Value::Null),
-            _ => Ok(Value::Float(0.0)),
-        }
+        })
     }
 
     pub fn exec_random() -> Self {
@@ -8047,7 +8019,7 @@ impl Value {
                 Value::build_text(hex::encode_upper(text))
             }
             Value::Blob(blob_bytes) => Value::build_text(hex::encode_upper(blob_bytes)),
-            _ => Value::Null,
+            Value::Null => Value::build_text(""),
         }
     }
 
@@ -8055,9 +8027,12 @@ impl Value {
         match self {
             Value::Null => Value::Null,
             _ => match ignored_chars {
-                None => match hex::decode(self.to_string()) {
-                    Ok(bytes) => Value::Blob(bytes),
-                    Err(_) => Value::Null,
+                None => match self
+                    .cast_text()
+                    .map(|s| hex::decode(&s[0..s.find('\0').unwrap_or(s.len())]))
+                {
+                    Some(Ok(bytes)) => Value::Blob(bytes),
+                    _ => Value::Null,
                 },
                 Some(ignore) => match ignore {
                     Value::Text(_) => {
@@ -8069,7 +8044,7 @@ impl Value {
                             .to_string();
                         match hex::decode(trimmed) {
                             Ok(bytes) => Value::Blob(bytes),
-                            Err(_) => Value::Null,
+                            _ => Value::Null,
                         }
                     }
                     _ => Value::Null,
@@ -8092,36 +8067,30 @@ impl Value {
         }
     }
 
-    fn _to_float(&self) -> f64 {
-        match self {
-            Value::Text(x) => match cast_text_to_numeric(x.as_str()) {
-                Value::Integer(i) => i as f64,
-                Value::Float(f) => f,
-                _ => unreachable!(),
-            },
-            Value::Integer(x) => *x as f64,
-            Value::Float(x) => *x,
-            _ => 0.0,
-        }
-    }
-
     pub fn exec_round(&self, precision: Option<&Value>) -> Value {
-        let reg = self._to_float();
-        let round = |reg: f64, f: f64| {
-            let precision = if f < 1.0 { 0.0 } else { f };
-            Value::Float(reg.round_to_precision(precision as i32))
+        let Some(f) = Numeric::from(self).try_into_f64() else {
+            return Value::Null;
         };
-        match precision {
-            Some(Value::Text(x)) => match cast_text_to_numeric(x.as_str()) {
-                Value::Integer(i) => round(reg, i as f64),
-                Value::Float(f) => round(reg, f),
-                _ => unreachable!(),
-            },
-            Some(Value::Integer(i)) => round(reg, *i as f64),
-            Some(Value::Float(f)) => round(reg, *f),
-            None => round(reg, 0.0),
-            _ => Value::Null,
+
+        let precision = match precision.map(|v| Numeric::from(v).try_into_f64()) {
+            None => 0.0,
+            Some(Some(v)) => v,
+            Some(None) => return Value::Null,
+        };
+
+        if !(-4503599627370496.0..=4503599627370496.0).contains(&f) {
+            return Value::Float(f);
         }
+
+        let precision = if precision < 1.0 { 0.0 } else { precision };
+        let precision = precision.clamp(0.0, 30.0) as usize;
+
+        if precision == 0 {
+            return Value::Float(((f + if f < 0.0 { -0.5 } else { 0.5 }) as i64) as f64);
+        }
+
+        let factor = 10f64.powi(precision as _);
+        Value::Float((f * factor).round() / factor)
     }
 
     // Implements TRIM pattern matching.
