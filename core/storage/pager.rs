@@ -320,8 +320,12 @@ enum CommitState {
     PrepareWal,
     /// Sync WAL header after prepare
     PrepareWalSync,
+    /// Get DB size (mostly from page cache - but in rare cases we can read it from disk)
+    GetDbSize,
     /// Appends all frames to the WAL.
-    PrepareFrames,
+    PrepareFrames {
+        db_size: u32,
+    },
     /// Fsync the on-disk WAL.
     SyncWal,
     /// Checkpoint the WAL to the database file (if needed).
@@ -1361,7 +1365,7 @@ impl Pager {
                     let page_sz = self.page_size.get().expect("page size not set");
                     let c = wal.borrow_mut().prepare_wal_start(page_sz)?;
                     let Some(c) = c else {
-                        self.commit_info.state.set(CommitState::PrepareFrames);
+                        self.commit_info.state.set(CommitState::GetDbSize);
                         continue;
                     };
                     self.commit_info.state.set(CommitState::PrepareWalSync);
@@ -1371,19 +1375,20 @@ impl Pager {
                 }
                 CommitState::PrepareWalSync => {
                     let c = wal.borrow_mut().prepare_wal_finish()?;
-                    self.commit_info.state.set(CommitState::PrepareFrames);
+                    self.commit_info.state.set(CommitState::GetDbSize);
                     if !c.is_completed() {
                         io_yield_one!(c);
                     }
                 }
-                CommitState::PrepareFrames => {
+                CommitState::GetDbSize => {
+                    let db_size = return_if_io!(self.with_header(|header| header.database_size));
+                    self.commit_info.state.set(CommitState::PrepareFrames {
+                        db_size: db_size.get(),
+                    });
+                }
+                CommitState::PrepareFrames { db_size } => {
                     let now = self.io.now();
                     self.commit_info.time.set(now);
-                    let db_size_after = {
-                        self.io
-                            .block(|| self.with_header(|header| header.database_size))?
-                            .get()
-                    };
 
                     let dirty_ids: Vec<usize> = self.dirty_pages.read().iter().copied().collect();
                     if dirty_ids.is_empty() {
@@ -1415,7 +1420,7 @@ impl Pager {
                         if end_of_chunk {
                             let commit_flag = if i == total - 1 {
                                 // Only the commit frame (final) frame carries the db_size
-                                Some(db_size_after)
+                                Some(db_size)
                             } else {
                                 None
                             };
