@@ -966,8 +966,10 @@ impl InteractionType {
             }
             let mut rows = rows.unwrap().unwrap();
             let mut out = Vec::new();
-            let mut current_prob = 0.05;
-            let mut incr = 0.001;
+
+            let fault_profile = &env.profile.io.fault;
+            let mut current_prob = fault_profile.prob;
+            let mut incr = 0.01;
             loop {
                 let syncing = env.io.syncing();
                 let inject_fault = env.rng.random_bool(current_prob);
