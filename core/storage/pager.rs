@@ -19,7 +19,7 @@ use std::cell::{Cell, RefCell, UnsafeCell};
 use std::collections::HashSet;
 use std::hash;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tracing::{instrument, trace, Level};
 
@@ -474,7 +474,7 @@ pub struct Pager {
 
     commit_info: CommitInfo,
     checkpoint_state: RwLock<CheckpointState>,
-    syncing: Rc<Cell<bool>>,
+    syncing: Arc<AtomicBool>,
     auto_vacuum_mode: Cell<AutoVacuumMode>,
     /// 0 -> Database is empty,
     /// 1 -> Database is being initialized,
@@ -583,7 +583,7 @@ impl Pager {
                 state: CommitState::Start.into(),
                 time: now.into(),
             },
-            syncing: Rc::new(Cell::new(false)),
+            syncing: Arc::new(AtomicBool::new(false)),
             checkpoint_state: RwLock::new(CheckpointState::Checkpoint),
             buffer_pool,
             auto_vacuum_mode: Cell::new(AutoVacuumMode::None),
@@ -1445,7 +1445,10 @@ impl Pager {
                     }
                 }
                 CommitState::AfterSyncDbFile => {
-                    turso_assert!(!self.syncing.get(), "should have finished syncing");
+                    turso_assert!(
+                        !self.syncing.load(Ordering::Relaxed),
+                        "should have finished syncing"
+                    );
                     self.commit_info.state.set(CommitState::Start);
                     break PagerCommitResult::Checkpointed(checkpoint_result);
                 }
@@ -1559,7 +1562,10 @@ impl Pager {
                     io_yield_one!(c);
                 }
                 CheckpointState::CheckpointDone { res } => {
-                    turso_assert!(!self.syncing.get(), "syncing should be done");
+                    turso_assert!(
+                        !self.syncing.load(Ordering::Relaxed),
+                        "syncing should be done"
+                    );
                     *self.checkpoint_state.write() = CheckpointState::Checkpoint;
                     return Ok(IOResult::Done(res));
                 }
@@ -2158,7 +2164,7 @@ impl Pager {
 
     fn reset_internal_states(&self) {
         *self.checkpoint_state.write() = CheckpointState::Checkpoint;
-        self.syncing.replace(false);
+        self.syncing.store(false, Ordering::Relaxed);
         self.commit_info.state.set(CommitState::Start);
         self.commit_info.time.set(self.io.now());
         self.allocate_page_state.replace(AllocatePageState::Start);
