@@ -2161,6 +2161,12 @@ impl BusyTimeout {
         }
     }
 
+    pub fn reset(&mut self) {
+        self.timeout = None;
+        self.accum_duration = self.max_duration;
+        self.iteration = 0;
+    }
+
     pub fn initiate_timeout(&mut self, now: Instant) {
         self.timeout = Self::DELAYS.get(self.iteration).and_then(|delay| {
             if self.accum_duration.is_zero() {
@@ -2473,6 +2479,9 @@ impl Statement {
     pub fn _reset(&mut self, max_registers: Option<usize>, max_cursors: Option<usize>) {
         self.state.reset(max_registers, max_cursors);
         self.busy = false;
+        if let Some(busy_timeout) = self.busy_timeout.as_mut() {
+            busy_timeout.reset();
+        }
         self.check_if_busy_handler_set();
     }
 
@@ -2496,18 +2505,19 @@ impl Statement {
             .busy_timeout
             .get()
             .map(BusyTimeout::new);
-        if self.busy_timeout.is_none() {
-            self.busy_timeout = conn_busy_timeout;
-            return;
-        }
-        if let Some(conn_busy_timeout) = conn_busy_timeout {
-            let busy_timeout = self
-                .busy_timeout
-                .as_mut()
-                .expect("busy timeout was checked for None above");
-            // User changed max duration, so clear previous handler and set a new one
-            if busy_timeout.max_duration != conn_busy_timeout.max_duration {
-                *busy_timeout = conn_busy_timeout;
+        match conn_busy_timeout {
+            Some(conn_busy_timeout) => {
+                if let Some(busy_timeout) = self.busy_timeout.as_mut() {
+                    // User changed max duration, so clear previous handler and set a new one
+                    if busy_timeout.max_duration != conn_busy_timeout.max_duration {
+                        *busy_timeout = conn_busy_timeout;
+                    }
+                } else {
+                    self.busy_timeout = Some(conn_busy_timeout);
+                }
+            }
+            None => {
+                self.busy_timeout = None;
             }
         }
     }
