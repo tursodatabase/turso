@@ -14,7 +14,7 @@ use crate::types::{
     compare_immutable, compare_records_generic, Extendable, IOCompletions, ImmutableRecord,
     SeekResult, Text,
 };
-use crate::util::{normalize_ident, IOExt as _};
+use crate::util::normalize_ident;
 use crate::vdbe::insn::InsertFlags;
 use crate::vdbe::registers_to_ref_values;
 use crate::vector::{vector_concat, vector_slice};
