@@ -61,7 +61,7 @@ use execute::{
 
 use explain::{insn_to_row_with_comment, EXPLAIN_COLUMNS, EXPLAIN_QUERY_PLAN_COLUMNS};
 use regex::Regex;
-use std::{cell::Cell, collections::HashMap, num::NonZero, rc::Rc, sync::Arc};
+use std::{cell::Cell, collections::HashMap, num::NonZero, sync::Arc};
 use tracing::{instrument, Level};
 
 /// State machine for committing view deltas with I/O handling
@@ -494,7 +494,7 @@ pub struct Program {
 }
 
 impl Program {
-    fn get_pager_from_database_index(&self, idx: &usize) -> Rc<Pager> {
+    fn get_pager_from_database_index(&self, idx: &usize) -> Arc<Pager> {
         self.connection.get_pager_from_database_index(idx)
     }
 
@@ -502,7 +502,7 @@ impl Program {
         &self,
         state: &mut ProgramState,
         mv_store: Option<Arc<MvStore>>,
-        pager: Rc<Pager>,
+        pager: Arc<Pager>,
         query_mode: QueryMode,
     ) -> Result<StepResult> {
         match query_mode {
@@ -516,7 +516,7 @@ impl Program {
         &self,
         state: &mut ProgramState,
         _mv_store: Option<Arc<MvStore>>,
-        pager: Rc<Pager>,
+        pager: Arc<Pager>,
     ) -> Result<StepResult> {
         debug_assert!(state.column_count() == EXPLAIN_COLUMNS.len());
         if self.connection.closed.get() {
@@ -570,7 +570,7 @@ impl Program {
         &self,
         state: &mut ProgramState,
         _mv_store: Option<Arc<MvStore>>,
-        pager: Rc<Pager>,
+        pager: Arc<Pager>,
     ) -> Result<StepResult> {
         debug_assert!(state.column_count() == EXPLAIN_QUERY_PLAN_COLUMNS.len());
         loop {
@@ -618,7 +618,7 @@ impl Program {
         &self,
         state: &mut ProgramState,
         mv_store: Option<Arc<MvStore>>,
-        pager: Rc<Pager>,
+        pager: Arc<Pager>,
     ) -> Result<StepResult> {
         let enable_tracing = tracing::enabled!(tracing::Level::TRACE);
         loop {
@@ -695,7 +695,7 @@ impl Program {
         &self,
         state: &mut ProgramState,
         rollback: bool,
-        pager: &Rc<Pager>,
+        pager: &Arc<Pager>,
     ) -> Result<IOResult<()>> {
         use crate::types::IOResult;
 
@@ -795,7 +795,7 @@ impl Program {
 
     pub fn commit_txn(
         &self,
-        pager: Rc<Pager>,
+        pager: Arc<Pager>,
         program_state: &mut ProgramState,
         mv_store: Option<&Arc<MvStore>>,
         rollback: bool,
@@ -823,17 +823,11 @@ impl Program {
             let auto_commit = conn.auto_commit.get();
             if auto_commit {
                 // FIXME: we don't want to commit stuff from other programs.
-                let mut mv_transactions = conn.mv_transactions.borrow_mut();
                 if matches!(program_state.commit_state, CommitState::Ready) {
-                    assert!(
-                        mv_transactions.len() <= 1,
-                        "for now we only support one mv transaction in single connection, {mv_transactions:?}",
-                    );
-                    if mv_transactions.is_empty() {
+                    let Some((tx_id, _)) = conn.mv_tx.get() else {
                         return Ok(IOResult::Done(()));
-                    }
-                    let tx_id = mv_transactions.first().unwrap();
-                    let state_machine = mv_store.commit_tx(*tx_id, pager.clone(), &conn).unwrap();
+                    };
+                    let state_machine = mv_store.commit_tx(tx_id, pager.clone(), &conn).unwrap();
                     program_state.commit_state = CommitState::CommitingMvcc { state_machine };
                 }
                 let CommitState::CommitingMvcc { state_machine } = &mut program_state.commit_state
@@ -843,10 +837,9 @@ impl Program {
                 match self.step_end_mvcc_txn(state_machine, mv_store)? {
                     IOResult::Done(_) => {
                         assert!(state_machine.is_finalized());
-                        conn.mv_tx_id.set(None);
+                        conn.mv_tx.set(None);
                         conn.transaction_state.replace(TransactionState::None);
                         program_state.commit_state = CommitState::Ready;
-                        mv_transactions.clear();
                         return Ok(IOResult::Done(()));
                     }
                     IOResult::IO(io) => {
@@ -905,7 +898,7 @@ impl Program {
     #[instrument(skip(self, pager, connection), level = Level::DEBUG)]
     fn step_end_write_txn(
         &self,
-        pager: &Rc<Pager>,
+        pager: &Arc<Pager>,
         commit_state: &mut CommitState,
         connection: &Connection,
         rollback: bool,
@@ -1071,7 +1064,7 @@ impl Row {
 
 /// Handle a program error by rolling back the transaction
 pub fn handle_program_error(
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     connection: &Connection,
     err: &LimboError,
     mv_store: Option<&Arc<MvStore>>,
@@ -1085,10 +1078,14 @@ pub fn handle_program_error(
         LimboError::TxError(_) => {}
         // Table locked errors, e.g. trying to checkpoint in an interactive transaction, do not cause a rollback.
         LimboError::TableLocked => {}
+        // Busy errors do not cause a rollback.
+        LimboError::Busy => {}
         _ => {
             if let Some(mv_store) = mv_store {
-                if let Some(tx_id) = connection.mv_tx_id.get() {
-                    mv_store.rollback_tx(tx_id, pager.clone());
+                if let Some((tx_id, _)) = connection.mv_tx.get() {
+                    connection.transaction_state.replace(TransactionState::None);
+                    connection.auto_commit.replace(true);
+                    mv_store.rollback_tx(tx_id, pager.clone(), connection)?;
                 }
             } else {
                 pager

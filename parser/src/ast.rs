@@ -1318,6 +1318,8 @@ pub enum PragmaName {
     #[strum(serialize = "cipher")]
     #[cfg_attr(feature = "serde", serde(rename = "cipher"))]
     EncryptionCipher,
+    /// Control fsync error retry behavior (0 = off/panic, 1 = on/retry)
+    DataSyncRetry,
     /// List databases
     DatabaseList,
     /// Encoding - only support utf8

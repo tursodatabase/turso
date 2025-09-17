@@ -481,7 +481,7 @@ pub struct BTreeCursor {
     /// The multi-version cursor that is used to read and write to the database file.
     mv_cursor: Option<Rc<RefCell<MvCursor>>>,
     /// The pager that is used to read and write to the database file.
-    pager: Rc<Pager>,
+    pub pager: Arc<Pager>,
     /// Cached value of the usable space of a BTree page, since it is very expensive to call in a hot loop via pager.usable_space().
     /// This is OK to cache because both 'PRAGMA page_size' and '.filectrl reserve_bytes' only have an effect on:
     /// 1. an uninitialized database,
@@ -584,7 +584,7 @@ impl BTreeNodeState {
 impl BTreeCursor {
     pub fn new(
         mv_cursor: Option<Rc<RefCell<MvCursor>>>,
-        pager: Rc<Pager>,
+        pager: Arc<Pager>,
         root_page: usize,
         num_columns: usize,
     ) -> Self {
@@ -635,7 +635,7 @@ impl BTreeCursor {
 
     pub fn new_table(
         mv_cursor: Option<Rc<RefCell<MvCursor>>>,
-        pager: Rc<Pager>,
+        pager: Arc<Pager>,
         root_page: usize,
         num_columns: usize,
     ) -> Self {
@@ -644,7 +644,7 @@ impl BTreeCursor {
 
     pub fn new_index(
         mv_cursor: Option<Rc<RefCell<MvCursor>>>,
-        pager: Rc<Pager>,
+        pager: Arc<Pager>,
         root_page: usize,
         index: &Index,
         num_columns: usize,
@@ -2157,7 +2157,7 @@ impl BTreeCursor {
         (cmp, found)
     }
 
-    #[instrument(skip_all, level = Level::INFO)]
+    #[instrument(skip_all, level = Level::DEBUG)]
     pub fn move_to(&mut self, key: SeekKey<'_>, cmp: SeekOp) -> Result<IOResult<()>> {
         turso_assert!(
             self.mv_cursor.is_none(),
@@ -3542,17 +3542,20 @@ impl BTreeCursor {
                             usable_space,
                         )?;
                         let overflow_cell_count_after = parent_contents.overflow_cells.len();
-                        let divider_cell_is_overflow_cell =
-                            overflow_cell_count_after > overflow_cell_count_before;
                         #[cfg(debug_assertions)]
-                        BTreeCursor::validate_balance_non_root_divider_cell_insertion(
-                            balance_info,
-                            parent_contents,
-                            divider_cell_insert_idx_in_parent,
-                            divider_cell_is_overflow_cell,
-                            page,
-                            usable_space,
-                        );
+                        {
+                            let divider_cell_is_overflow_cell =
+                                overflow_cell_count_after > overflow_cell_count_before;
+
+                            BTreeCursor::validate_balance_non_root_divider_cell_insertion(
+                                balance_info,
+                                parent_contents,
+                                divider_cell_insert_idx_in_parent,
+                                divider_cell_is_overflow_cell,
+                                page,
+                                usable_space,
+                            );
+                        }
                     }
                     tracing::debug!(
                         "balance_non_root(parent_overflow={})",
@@ -4625,7 +4628,7 @@ impl BTreeCursor {
                         }
                     };
                     let row = crate::mvcc::database::Row::new(row_id, record_buf, num_columns);
-                    mv_cursor.borrow_mut().insert(row).unwrap();
+                    mv_cursor.borrow_mut().insert(row)?;
                 }
                 None => todo!("Support mvcc inserts with index btrees"),
             },
@@ -4655,7 +4658,7 @@ impl BTreeCursor {
     pub fn delete(&mut self) -> Result<IOResult<()>> {
         if let Some(mv_cursor) = &self.mv_cursor {
             let rowid = mv_cursor.borrow_mut().current_row_id().unwrap();
-            mv_cursor.borrow_mut().delete(rowid, self.pager.clone())?;
+            mv_cursor.borrow_mut().delete(rowid)?;
             return Ok(IOResult::Done(()));
         }
 
@@ -5124,9 +5127,31 @@ impl BTreeCursor {
         }
     }
 
-    /// Destroys a B-tree by freeing all its pages in an iterative depth-first order.
+    /// Deletes all content from the B-Tree but preserves the root page.
+    ///
+    /// Unlike [`btree_destroy`], which frees all pages including the root,
+    /// this method only clears the tree’s contents. The root page remains
+    /// allocated and is reset to an empty leaf page.
+    pub fn clear_btree(&mut self) -> Result<IOResult<Option<usize>>> {
+        self.destroy_btree_contents(true)
+    }
+
+    /// Destroys the entire B-Tree, including the root page.
+    ///
+    /// All pages belonging to the tree are freed, leaving no trace of the B-Tree.
+    /// Use this when the structure itself is no longer needed.
+    ///
+    /// For cases where the B-Tree should remain allocated but emptied, see [`btree_clear`].
+    #[instrument(skip(self), level = Level::DEBUG)]
+    pub fn btree_destroy(&mut self) -> Result<IOResult<Option<usize>>> {
+        self.destroy_btree_contents(false)
+    }
+
+    /// Deletes all contents of the B-tree by freeing all its pages in an iterative depth-first order.
     /// This ensures child pages are freed before their parents
     /// Uses a state machine to keep track of the operation to ensure IO doesn't cause repeated traversals
+    ///
+    /// Depending on the caller, the root page may either be freed as well or left allocated but emptied.
     ///
     /// # Example
     /// For a B-tree with this structure (where 4' is an overflow page):
@@ -5139,8 +5164,7 @@ impl BTreeCursor {
     /// ```
     ///
     /// The destruction order would be: [4',4,5,2,6,7,3,1]
-    #[instrument(skip(self), level = Level::DEBUG)]
-    pub fn btree_destroy(&mut self) -> Result<IOResult<Option<usize>>> {
+    fn destroy_btree_contents(&mut self, keep_root: bool) -> Result<IOResult<Option<usize>>> {
         if let CursorState::None = &self.state {
             let c = self.move_to_root()?;
             self.state = CursorState::Destroy(DestroyInfo {
@@ -5302,9 +5326,9 @@ impl BTreeCursor {
                     let page = self.stack.top();
                     let page_id = page.get().id;
 
-                    return_if_io!(self.pager.free_page(Some(page), page_id));
-
                     if self.stack.has_parent() {
+                        return_if_io!(self.pager.free_page(Some(page), page_id));
+
                         self.stack.pop();
                         let destroy_info = self
                             .state
@@ -5312,6 +5336,12 @@ impl BTreeCursor {
                             .expect("unable to get a mut reference to destroy state in cursor");
                         destroy_info.state = DestroyState::ProcessPage;
                     } else {
+                        if keep_root {
+                            self.clear_root(&page);
+                        } else {
+                            return_if_io!(self.pager.free_page(Some(page), page_id));
+                        }
+
                         self.state = CursorState::None;
                         //  TODO: For now, no-op the result return None always. This will change once [AUTO_VACUUM](https://www.sqlite.org/lang_vacuum.html) is introduced
                         //  At that point, the last root page(call this x) will be moved into the position of the root page of this table and the value returned will be x
@@ -5320,6 +5350,19 @@ impl BTreeCursor {
                 }
             }
         }
+    }
+
+    fn clear_root(&mut self, root_page: &PageRef) {
+        let page_ref = root_page.get();
+        let contents = page_ref.contents.as_ref().unwrap();
+
+        let page_type = match contents.page_type() {
+            PageType::TableLeaf | PageType::TableInterior => PageType::TableLeaf,
+            PageType::IndexLeaf | PageType::IndexInterior => PageType::IndexLeaf,
+        };
+
+        self.pager.add_dirty(root_page);
+        btree_init_page(root_page, page_type, 0, self.pager.usable_space());
     }
 
     pub fn table_id(&self) -> usize {
@@ -5789,7 +5832,7 @@ impl std::fmt::Debug for IntegrityCheckState {
 pub fn integrity_check(
     state: &mut IntegrityCheckState,
     errors: &mut Vec<IntegrityCheckError>,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
 ) -> Result<IOResult<()>> {
     loop {
         let Some(IntegrityCheckPageEntry {
@@ -6065,7 +6108,7 @@ pub fn integrity_check(
 }
 
 pub fn btree_read_page(
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     page_idx: usize,
 ) -> Result<(Arc<Page>, Option<Completion>)> {
     pager.read_page(page_idx)
@@ -6506,7 +6549,12 @@ fn find_free_slot(
 pub fn btree_init_page(page: &PageRef, page_type: PageType, offset: usize, usable_space: usize) {
     // setup btree page
     let contents = page.get_contents();
-    tracing::debug!("btree_init_page(id={}, offset={})", page.get().id, offset);
+    tracing::debug!(
+        "btree_init_page(id={}, offset={}, usable_space={})",
+        page.get().id,
+        offset,
+        usable_space
+    );
     contents.offset = offset;
     let id = page_type as u8;
     contents.write_page_type(id);
@@ -7428,7 +7476,7 @@ fn fill_cell_payload(
     cell_idx: usize,
     record: &ImmutableRecord,
     usable_space: usize,
-    pager: Rc<Pager>,
+    pager: Arc<Pager>,
     fill_cell_payload_state: &mut FillCellPayloadState,
 ) -> Result<IOResult<()>> {
     let overflow_page_pointer_size = 4;
@@ -7751,6 +7799,36 @@ mod tests {
         payload
     }
 
+    fn insert_record(
+        cursor: &mut BTreeCursor,
+        pager: &Arc<Pager>,
+        rowid: i64,
+        val: Value,
+    ) -> Result<(), LimboError> {
+        let regs = &[Register::Value(val)];
+        let record = ImmutableRecord::from_registers(regs, regs.len());
+
+        run_until_done(
+            || {
+                let key = SeekKey::TableRowId(rowid);
+                cursor.seek(key, SeekOp::GE { eq_only: true })
+            },
+            pager.deref(),
+        )?;
+        run_until_done(
+            || cursor.insert(&BTreeKey::new_table_rowid(rowid, Some(&record))),
+            pager.deref(),
+        )?;
+        Ok(())
+    }
+
+    fn assert_btree_empty(cursor: &mut BTreeCursor, pager: &Pager) -> Result<()> {
+        let _c = cursor.move_to_root()?;
+        let empty = !run_until_done(|| cursor.next(), pager)?;
+        assert!(empty, "expected B-tree to be empty");
+        Ok(())
+    }
+
     #[test]
     fn test_insert_cell() {
         let db = get_database();
@@ -7810,7 +7888,7 @@ mod tests {
         }
     }
 
-    fn validate_btree(pager: Rc<Pager>, page_idx: usize) -> (usize, bool) {
+    fn validate_btree(pager: Arc<Pager>, page_idx: usize) -> (usize, bool) {
         let num_columns = 5;
         let cursor = BTreeCursor::new_table(None, pager.clone(), page_idx, num_columns);
         let (page, _c) = cursor.read_page(page_idx).unwrap();
@@ -7920,7 +7998,7 @@ mod tests {
         (depth.unwrap(), valid)
     }
 
-    fn format_btree(pager: Rc<Pager>, page_idx: usize, depth: usize) -> String {
+    fn format_btree(pager: Arc<Pager>, page_idx: usize, depth: usize) -> String {
         let num_columns = 5;
 
         let cursor = BTreeCursor::new_table(None, pager.clone(), page_idx, num_columns);
@@ -7978,7 +8056,7 @@ mod tests {
         }
     }
 
-    fn empty_btree() -> (Rc<Pager>, usize, Arc<Database>, Arc<Connection>) {
+    fn empty_btree() -> (Arc<Pager>, usize, Arc<Database>, Arc<Connection>) {
         #[allow(clippy::arc_with_non_send_sync)]
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db = Database::open_file(io.clone(), ":memory:", false, false).unwrap();
@@ -7988,7 +8066,7 @@ mod tests {
         // FIXME: handle page cache is full
         let _ = run_until_done(|| pager.allocate_page1(), &pager);
         let page2 = run_until_done(|| pager.allocate_page(), &pager).unwrap();
-        btree_init_page(&page2, PageType::TableLeaf, 0, 4096);
+        btree_init_page(&page2, PageType::TableLeaf, 0, pager.usable_space());
         (pager, page2.get().id, db, conn)
     }
 
@@ -8661,7 +8739,7 @@ mod tests {
     }
 
     fn validate_expected_keys(
-        pager: &Rc<Pager>,
+        pager: &Arc<Pager>,
         cursor: &mut BTreeCursor,
         expected_keys: &[Vec<u8>],
         seed: u64,
@@ -8889,7 +8967,7 @@ mod tests {
     }
 
     #[allow(clippy::arc_with_non_send_sync)]
-    fn setup_test_env(database_size: u32) -> Rc<Pager> {
+    fn setup_test_env(database_size: u32) -> Arc<Pager> {
         let page_size = 512;
 
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
@@ -8907,7 +8985,7 @@ mod tests {
             buffer_pool.clone(),
         )));
 
-        let pager = Rc::new(
+        let pager = Arc::new(
             Pager::new(
                 db_file,
                 Some(wal),
@@ -9191,6 +9269,162 @@ mod tests {
         assert_eq!(pages_freed, 3, "should free 3 pages (root + 2 leaves)");
 
         Ok(())
+    }
+
+    #[test]
+    pub fn test_clear_btree_with_single_page() -> Result<()> {
+        let (pager, root_page, _, _) = empty_btree();
+        let num_columns = 5;
+        let record_count = 10;
+
+        let mut cursor = BTreeCursor::new_table(None, pager.clone(), root_page, num_columns);
+
+        for rowid in 1..=record_count {
+            insert_record(&mut cursor, &pager, rowid, Value::Integer(rowid))?;
+        }
+
+        let page_count = pager
+            .io
+            .block(|| pager.with_header(|header| header.database_size.get()))?;
+        assert_eq!(
+            page_count, 2,
+            "expected two pages (header + root), got {page_count}"
+        );
+
+        run_until_done(|| cursor.clear_btree(), &pager)?;
+
+        assert_btree_empty(&mut cursor, pager.deref())
+    }
+
+    #[test]
+    pub fn test_clear_btree_with_multiple_pages() -> Result<()> {
+        let (pager, root_page, _, _) = empty_btree();
+        let num_columns = 5;
+        let record_count = 1000;
+
+        let mut cursor = BTreeCursor::new_table(None, pager.clone(), root_page, num_columns);
+
+        for rowid in 1..=record_count {
+            insert_record(&mut cursor, &pager, rowid, Value::Integer(rowid))?;
+        }
+
+        // Ensure enough records were created so the tree spans multiple pages.
+        let page_count = pager
+            .io
+            .block(|| pager.with_header(|header| header.database_size.get()))?;
+        assert!(
+            page_count > 2,
+            "expected more pages than just header + root, got {page_count}"
+        );
+
+        run_until_done(|| cursor.clear_btree(), &pager)?;
+
+        assert_btree_empty(&mut cursor, pager.deref())
+    }
+
+    #[test]
+    pub fn test_clear_btree_reinsertion() -> Result<()> {
+        let (pager, root_page, _, _) = empty_btree();
+        let num_columns = 5;
+        let record_count = 1000;
+
+        let mut cursor = BTreeCursor::new_table(None, pager.clone(), root_page, num_columns);
+
+        for rowid in 1..=record_count {
+            insert_record(&mut cursor, &pager, rowid, Value::Integer(rowid))?;
+        }
+
+        run_until_done(|| cursor.clear_btree(), &pager)?;
+
+        // Reinsert into cleared B-tree to ensure it’s still functional
+        for rowid in 1..=record_count {
+            insert_record(&mut cursor, &pager, rowid, Value::Integer(rowid))?;
+        }
+
+        if let (_, false) = validate_btree(pager.clone(), root_page) {
+            panic!("Invalid B-tree after reinsertion");
+        }
+
+        let _c = cursor.move_to_root()?;
+        for i in 1..=record_count {
+            let exists = run_until_done(|| cursor.next(), &pager)?;
+            assert!(exists, "Record {i} not found");
+
+            let record = run_until_done(|| cursor.record(), &pager)?;
+            let value = record.unwrap().get_value(0)?;
+            assert_eq!(
+                value,
+                RefValue::Integer(i),
+                "Unexpected value for record {i}",
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    pub fn test_clear_btree_multiple_cursors() -> Result<()> {
+        let (pager, root_page, _, _) = empty_btree();
+        let num_columns = 5;
+        let record_count = 1000;
+
+        let mut cursor1 = BTreeCursor::new_table(None, pager.clone(), root_page, num_columns);
+        let mut cursor2 = BTreeCursor::new_table(None, pager.clone(), root_page, num_columns);
+
+        // Use cursor1 to insert records
+        for rowid in 1..=record_count {
+            insert_record(&mut cursor1, &pager, rowid, Value::Integer(rowid))?;
+        }
+
+        // Use cursor1 to clear the btree
+        run_until_done(|| cursor1.clear_btree(), &pager)?;
+
+        // Verify that cursor2 works correctly
+        assert_btree_empty(&mut cursor2, pager.deref())?;
+
+        // Insert using cursor2
+        insert_record(&mut cursor1, &pager, 1, Value::Integer(123))?;
+
+        if let (_, false) = validate_btree(pager.clone(), root_page) {
+            panic!("Invalid B-tree after insertion");
+        }
+
+        let key = Value::Integer(1);
+        let exists = run_until_done(|| cursor2.exists(&key), pager.deref())?;
+        assert!(exists, "key not found {key}");
+
+        Ok(())
+    }
+
+    #[test]
+    pub fn test_clear_btree_with_overflow_pages() -> Result<()> {
+        let (pager, root_page, _, _) = empty_btree();
+        let num_columns = 5;
+        let record_count = 100;
+
+        let mut cursor = BTreeCursor::new_table(None, pager.clone(), root_page, num_columns);
+
+        let initial_page_count = pager
+            .io
+            .block(|| pager.with_header(|header| header.database_size.get()))?;
+
+        for rowid in 1..=record_count {
+            let large_blob = vec![b'A'; 8192];
+            insert_record(&mut cursor, &pager, rowid, Value::Blob(large_blob))?;
+        }
+
+        let page_count_after_inserts = pager
+            .io
+            .block(|| pager.with_header(|header| header.database_size.get()))?;
+        let created_pages = page_count_after_inserts - initial_page_count;
+        assert!(
+            created_pages > record_count as u32,
+            "expected more pages to be created than records, got {created_pages}"
+        );
+
+        run_until_done(|| cursor.clear_btree(), &pager)?;
+
+        assert_btree_empty(&mut cursor, pager.deref())
     }
 
     #[test]
@@ -10253,7 +10487,7 @@ mod tests {
         }
     }
 
-    fn insert_cell(cell_idx: u64, size: u16, page: PageRef, pager: Rc<Pager>) {
+    fn insert_cell(cell_idx: u64, size: u16, page: PageRef, pager: Arc<Pager>) {
         let mut payload = Vec::new();
         let regs = &[Register::Value(Value::Blob(vec![0; size as usize]))];
         let record = ImmutableRecord::from_registers(regs, regs.len());

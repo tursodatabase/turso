@@ -30,6 +30,12 @@ struct Args {
     /// Keep mmap I/O files on disk after run
     #[arg(long)]
     keep: bool,
+    /// Disable creation and manipulation of indexes
+    #[arg(long)]
+    disable_indexes: bool,
+    /// Enable MVCC (Multi-Version Concurrency Control)
+    #[arg(long)]
+    enable_mvcc: bool,
 }
 
 struct SimulatorConfig {
@@ -56,6 +62,8 @@ struct SimulatorContext {
     indexes: Vec<String>,
     opts: Opts,
     stats: Stats,
+    disable_indexes: bool,
+    enable_mvcc: bool,
 }
 
 #[derive(Default)]
@@ -101,7 +109,7 @@ fn main() -> anyhow::Result<()> {
 
     let db_path = format!("whopper-{}-{}.db", seed, std::process::id());
 
-    let db = match Database::open_file(io.clone(), &db_path, false, true) {
+    let db = match Database::open_file(io.clone(), &db_path, args.enable_mvcc, true) {
         Ok(db) => db,
         Err(e) => {
             return Err(anyhow::anyhow!("Database open failed: {}", e));
@@ -122,7 +130,11 @@ fn main() -> anyhow::Result<()> {
         boostrap_conn.execute(&sql)?;
     }
 
-    let indexes = create_initial_indexes(&mut rng, &tables);
+    let indexes = if args.disable_indexes {
+        Vec::new()
+    } else {
+        create_initial_indexes(&mut rng, &tables)
+    };
     for create_index in &indexes {
         let sql = create_index.to_string();
         trace!("{}", sql);
@@ -156,6 +168,8 @@ fn main() -> anyhow::Result<()> {
         indexes: indexes.iter().map(|idx| idx.index_name.clone()).collect(),
         opts: Opts::default(),
         stats: Stats::default(),
+        disable_indexes: args.disable_indexes,
+        enable_mvcc: args.enable_mvcc,
     };
 
     let progress_interval = config.max_steps / 10;
@@ -356,6 +370,16 @@ fn perform_work(
                             }
                             return Ok(());
                         }
+                        turso_core::LimboError::WriteWriteConflict => {
+                            trace!(
+                                "{} Write-write conflict, transaction automatically rolled back",
+                                fiber_idx
+                            );
+                            drop(stmt_borrow);
+                            context.fibers[fiber_idx].statement.replace(None);
+                            context.fibers[fiber_idx].state = FiberState::Idle;
+                            return Ok(());
+                        }
                         _ => {
                             return Err(e.into());
                         }
@@ -375,12 +399,19 @@ fn perform_work(
         FiberState::Idle => {
             let action = rng.random_range(0..100);
             if action <= 29 {
-                // Start transaction
-                // FIXME: use deferred when it's fixed!
-                if let Ok(stmt) = context.fibers[fiber_idx].connection.prepare("BEGIN") {
+                let begin_cmd = if context.enable_mvcc {
+                    match rng.random_range(0..3) {
+                        0 => "BEGIN DEFERRED",
+                        1 => "BEGIN IMMEDIATE",
+                        _ => "BEGIN CONCURRENT",
+                    }
+                } else {
+                    "BEGIN"
+                };
+                if let Ok(stmt) = context.fibers[fiber_idx].connection.prepare(begin_cmd) {
                     context.fibers[fiber_idx].statement.replace(Some(stmt));
                     context.fibers[fiber_idx].state = FiberState::InTx;
-                    trace!("{} BEGIN", fiber_idx);
+                    trace!("{} {}", fiber_idx, begin_cmd);
                 }
             } else if action == 30 {
                 // Integrity check
@@ -446,17 +477,19 @@ fn perform_work(
                 }
                 70..=71 => {
                     // CREATE INDEX (2%)
-                    let create_index = CreateIndex::arbitrary(rng, context);
-                    let sql = create_index.to_string();
-                    if let Ok(stmt) = context.fibers[fiber_idx].connection.prepare(&sql) {
-                        context.fibers[fiber_idx].statement.replace(Some(stmt));
-                        context.indexes.push(create_index.index_name.clone());
+                    if !context.disable_indexes {
+                        let create_index = CreateIndex::arbitrary(rng, context);
+                        let sql = create_index.to_string();
+                        if let Ok(stmt) = context.fibers[fiber_idx].connection.prepare(&sql) {
+                            context.fibers[fiber_idx].statement.replace(Some(stmt));
+                            context.indexes.push(create_index.index_name.clone());
+                        }
+                        trace!("{} CREATE INDEX: {}", fiber_idx, sql);
                     }
-                    trace!("{} CREATE INDEX: {}", fiber_idx, sql);
                 }
                 72..=73 => {
                     // DROP INDEX (2%)
-                    if !context.indexes.is_empty() {
+                    if !context.disable_indexes && !context.indexes.is_empty() {
                         let index_idx = rng.random_range(0..context.indexes.len());
                         let index_name = context.indexes.remove(index_idx);
                         let drop_index = DropIndex { index_name };

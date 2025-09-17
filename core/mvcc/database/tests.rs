@@ -95,7 +95,10 @@ pub(crate) fn generate_simple_string_row(table_id: u64, id: i64, data: &str) -> 
 fn test_insert_read() {
     let db = MvccTestDb::new();
 
-    let tx1 = db.mvcc_store.begin_tx(db.conn.pager.borrow().clone());
+    let tx1 = db
+        .mvcc_store
+        .begin_tx(db.conn.pager.borrow().clone())
+        .unwrap();
     let tx1_row = generate_simple_string_row(1, 1, "Hello");
     db.mvcc_store.insert(tx1, tx1_row.clone()).unwrap();
     let row = db
@@ -112,7 +115,10 @@ fn test_insert_read() {
     assert_eq!(tx1_row, row);
     commit_tx(db.mvcc_store.clone(), &db.conn, tx1).unwrap();
 
-    let tx2 = db.mvcc_store.begin_tx(db.conn.pager.borrow().clone());
+    let tx2 = db
+        .mvcc_store
+        .begin_tx(db.conn.pager.borrow().clone())
+        .unwrap();
     let row = db
         .mvcc_store
         .read(
@@ -130,7 +136,10 @@ fn test_insert_read() {
 #[test]
 fn test_read_nonexistent() {
     let db = MvccTestDb::new();
-    let tx = db.mvcc_store.begin_tx(db.conn.pager.borrow().clone());
+    let tx = db
+        .mvcc_store
+        .begin_tx(db.conn.pager.borrow().clone())
+        .unwrap();
     let row = db.mvcc_store.read(
         tx,
         RowID {
@@ -145,7 +154,10 @@ fn test_read_nonexistent() {
 fn test_delete() {
     let db = MvccTestDb::new();
 
-    let tx1 = db.mvcc_store.begin_tx(db.conn.pager.borrow().clone());
+    let tx1 = db
+        .mvcc_store
+        .begin_tx(db.conn.pager.borrow().clone())
+        .unwrap();
     let tx1_row = generate_simple_string_row(1, 1, "Hello");
     db.mvcc_store.insert(tx1, tx1_row.clone()).unwrap();
     let row = db
@@ -167,7 +179,6 @@ fn test_delete() {
                 table_id: 1,
                 row_id: 1,
             },
-            db.conn.pager.borrow().clone(),
         )
         .unwrap();
     let row = db
@@ -183,7 +194,10 @@ fn test_delete() {
     assert!(row.is_none());
     commit_tx(db.mvcc_store.clone(), &db.conn, tx1).unwrap();
 
-    let tx2 = db.mvcc_store.begin_tx(db.conn.pager.borrow().clone());
+    let tx2 = db
+        .mvcc_store
+        .begin_tx(db.conn.pager.borrow().clone())
+        .unwrap();
     let row = db
         .mvcc_store
         .read(
@@ -200,7 +214,10 @@ fn test_delete() {
 #[test]
 fn test_delete_nonexistent() {
     let db = MvccTestDb::new();
-    let tx = db.mvcc_store.begin_tx(db.conn.pager.borrow().clone());
+    let tx = db
+        .mvcc_store
+        .begin_tx(db.conn.pager.borrow().clone())
+        .unwrap();
     assert!(!db
         .mvcc_store
         .delete(
@@ -209,7 +226,6 @@ fn test_delete_nonexistent() {
                 table_id: 1,
                 row_id: 1
             },
-            db.conn.pager.borrow().clone(),
         )
         .unwrap());
 }
@@ -217,7 +233,10 @@ fn test_delete_nonexistent() {
 #[test]
 fn test_commit() {
     let db = MvccTestDb::new();
-    let tx1 = db.mvcc_store.begin_tx(db.conn.pager.borrow().clone());
+    let tx1 = db
+        .mvcc_store
+        .begin_tx(db.conn.pager.borrow().clone())
+        .unwrap();
     let tx1_row = generate_simple_string_row(1, 1, "Hello");
     db.mvcc_store.insert(tx1, tx1_row.clone()).unwrap();
     let row = db
@@ -233,9 +252,7 @@ fn test_commit() {
         .unwrap();
     assert_eq!(tx1_row, row);
     let tx1_updated_row = generate_simple_string_row(1, 1, "World");
-    db.mvcc_store
-        .update(tx1, tx1_updated_row.clone(), db.conn.pager.borrow().clone())
-        .unwrap();
+    db.mvcc_store.update(tx1, tx1_updated_row.clone()).unwrap();
     let row = db
         .mvcc_store
         .read(
@@ -250,7 +267,10 @@ fn test_commit() {
     assert_eq!(tx1_updated_row, row);
     commit_tx(db.mvcc_store.clone(), &db.conn, tx1).unwrap();
 
-    let tx2 = db.mvcc_store.begin_tx(db.conn.pager.borrow().clone());
+    let tx2 = db
+        .mvcc_store
+        .begin_tx(db.conn.pager.borrow().clone())
+        .unwrap();
     let row = db
         .mvcc_store
         .read(
@@ -270,7 +290,10 @@ fn test_commit() {
 #[test]
 fn test_rollback() {
     let db = MvccTestDb::new();
-    let tx1 = db.mvcc_store.begin_tx(db.conn.pager.borrow().clone());
+    let tx1 = db
+        .mvcc_store
+        .begin_tx(db.conn.pager.borrow().clone())
+        .unwrap();
     let row1 = generate_simple_string_row(1, 1, "Hello");
     db.mvcc_store.insert(tx1, row1.clone()).unwrap();
     let row2 = db
@@ -286,9 +309,7 @@ fn test_rollback() {
         .unwrap();
     assert_eq!(row1, row2);
     let row3 = generate_simple_string_row(1, 1, "World");
-    db.mvcc_store
-        .update(tx1, row3.clone(), db.conn.pager.borrow().clone())
-        .unwrap();
+    db.mvcc_store.update(tx1, row3.clone()).unwrap();
     let row4 = db
         .mvcc_store
         .read(
@@ -302,8 +323,12 @@ fn test_rollback() {
         .unwrap();
     assert_eq!(row3, row4);
     db.mvcc_store
-        .rollback_tx(tx1, db.conn.pager.borrow().clone());
-    let tx2 = db.mvcc_store.begin_tx(db.conn.pager.borrow().clone());
+        .rollback_tx(tx1, db.conn.pager.borrow().clone(), &db.conn)
+        .unwrap();
+    let tx2 = db
+        .mvcc_store
+        .begin_tx(db.conn.pager.borrow().clone())
+        .unwrap();
     let row5 = db
         .mvcc_store
         .read(
@@ -322,7 +347,10 @@ fn test_dirty_write() {
     let db = MvccTestDb::new();
 
     // T1 inserts a row with ID 1, but does not commit.
-    let tx1 = db.mvcc_store.begin_tx(db.conn.pager.borrow().clone());
+    let tx1 = db
+        .mvcc_store
+        .begin_tx(db.conn.pager.borrow().clone())
+        .unwrap();
     let tx1_row = generate_simple_string_row(1, 1, "Hello");
     db.mvcc_store.insert(tx1, tx1_row.clone()).unwrap();
     let row = db
@@ -340,12 +368,12 @@ fn test_dirty_write() {
 
     let conn2 = db.db.connect().unwrap();
     // T2 attempts to delete row with ID 1, but fails because T1 has not committed.
-    let tx2 = db.mvcc_store.begin_tx(conn2.pager.borrow().clone());
-    let tx2_row = generate_simple_string_row(1, 1, "World");
-    assert!(!db
+    let tx2 = db
         .mvcc_store
-        .update(tx2, tx2_row, conn2.pager.borrow().clone())
-        .unwrap());
+        .begin_tx(conn2.pager.borrow().clone())
+        .unwrap();
+    let tx2_row = generate_simple_string_row(1, 1, "World");
+    assert!(!db.mvcc_store.update(tx2, tx2_row).unwrap());
 
     let row = db
         .mvcc_store
@@ -366,13 +394,19 @@ fn test_dirty_read() {
     let db = MvccTestDb::new();
 
     // T1 inserts a row with ID 1, but does not commit.
-    let tx1 = db.mvcc_store.begin_tx(db.conn.pager.borrow().clone());
+    let tx1 = db
+        .mvcc_store
+        .begin_tx(db.conn.pager.borrow().clone())
+        .unwrap();
     let row1 = generate_simple_string_row(1, 1, "Hello");
     db.mvcc_store.insert(tx1, row1).unwrap();
 
     // T2 attempts to read row with ID 1, but doesn't see one because T1 has not committed.
     let conn2 = db.db.connect().unwrap();
-    let tx2 = db.mvcc_store.begin_tx(conn2.pager.borrow().clone());
+    let tx2 = db
+        .mvcc_store
+        .begin_tx(conn2.pager.borrow().clone())
+        .unwrap();
     let row2 = db
         .mvcc_store
         .read(
@@ -391,14 +425,20 @@ fn test_dirty_read_deleted() {
     let db = MvccTestDb::new();
 
     // T1 inserts a row with ID 1 and commits.
-    let tx1 = db.mvcc_store.begin_tx(db.conn.pager.borrow().clone());
+    let tx1 = db
+        .mvcc_store
+        .begin_tx(db.conn.pager.borrow().clone())
+        .unwrap();
     let tx1_row = generate_simple_string_row(1, 1, "Hello");
     db.mvcc_store.insert(tx1, tx1_row.clone()).unwrap();
     commit_tx(db.mvcc_store.clone(), &db.conn, tx1).unwrap();
 
     // T2 deletes row with ID 1, but does not commit.
     let conn2 = db.db.connect().unwrap();
-    let tx2 = db.mvcc_store.begin_tx(conn2.pager.borrow().clone());
+    let tx2 = db
+        .mvcc_store
+        .begin_tx(conn2.pager.borrow().clone())
+        .unwrap();
     assert!(db
         .mvcc_store
         .delete(
@@ -407,13 +447,15 @@ fn test_dirty_read_deleted() {
                 table_id: 1,
                 row_id: 1
             },
-            conn2.pager.borrow().clone(),
         )
         .unwrap());
 
     // T3 reads row with ID 1, but doesn't see the delete because T2 hasn't committed.
     let conn3 = db.db.connect().unwrap();
-    let tx3 = db.mvcc_store.begin_tx(conn3.pager.borrow().clone());
+    let tx3 = db
+        .mvcc_store
+        .begin_tx(conn3.pager.borrow().clone())
+        .unwrap();
     let row = db
         .mvcc_store
         .read(
@@ -433,7 +475,10 @@ fn test_fuzzy_read() {
     let db = MvccTestDb::new();
 
     // T1 inserts a row with ID 1 and commits.
-    let tx1 = db.mvcc_store.begin_tx(db.conn.pager.borrow().clone());
+    let tx1 = db
+        .mvcc_store
+        .begin_tx(db.conn.pager.borrow().clone())
+        .unwrap();
     let tx1_row = generate_simple_string_row(1, 1, "First");
     db.mvcc_store.insert(tx1, tx1_row.clone()).unwrap();
     let row = db
@@ -452,7 +497,10 @@ fn test_fuzzy_read() {
 
     // T2 reads the row with ID 1 within an active transaction.
     let conn2 = db.db.connect().unwrap();
-    let tx2 = db.mvcc_store.begin_tx(conn2.pager.borrow().clone());
+    let tx2 = db
+        .mvcc_store
+        .begin_tx(conn2.pager.borrow().clone())
+        .unwrap();
     let row = db
         .mvcc_store
         .read(
@@ -468,11 +516,12 @@ fn test_fuzzy_read() {
 
     // T3 updates the row and commits.
     let conn3 = db.db.connect().unwrap();
-    let tx3 = db.mvcc_store.begin_tx(conn3.pager.borrow().clone());
-    let tx3_row = generate_simple_string_row(1, 1, "Second");
-    db.mvcc_store
-        .update(tx3, tx3_row, conn3.pager.borrow().clone())
+    let tx3 = db
+        .mvcc_store
+        .begin_tx(conn3.pager.borrow().clone())
         .unwrap();
+    let tx3_row = generate_simple_string_row(1, 1, "Second");
+    db.mvcc_store.update(tx3, tx3_row).unwrap();
     commit_tx(db.mvcc_store.clone(), &conn3, tx3).unwrap();
 
     // T2 still reads the same version of the row as before.
@@ -492,9 +541,7 @@ fn test_fuzzy_read() {
     // T2 tries to update the row, but fails because T3 has already committed an update to the row,
     // so T2 trying to write would violate snapshot isolation if it succeeded.
     let tx2_newrow = generate_simple_string_row(1, 1, "Third");
-    let update_result = db
-        .mvcc_store
-        .update(tx2, tx2_newrow, conn2.pager.borrow().clone());
+    let update_result = db.mvcc_store.update(tx2, tx2_newrow);
     assert!(matches!(update_result, Err(LimboError::WriteWriteConflict)));
 }
 
@@ -503,7 +550,10 @@ fn test_lost_update() {
     let db = MvccTestDb::new();
 
     // T1 inserts a row with ID 1 and commits.
-    let tx1 = db.mvcc_store.begin_tx(db.conn.pager.borrow().clone());
+    let tx1 = db
+        .mvcc_store
+        .begin_tx(db.conn.pager.borrow().clone())
+        .unwrap();
     let tx1_row = generate_simple_string_row(1, 1, "Hello");
     db.mvcc_store.insert(tx1, tx1_row.clone()).unwrap();
     let row = db
@@ -522,22 +572,28 @@ fn test_lost_update() {
 
     // T2 attempts to update row ID 1 within an active transaction.
     let conn2 = db.db.connect().unwrap();
-    let tx2 = db.mvcc_store.begin_tx(conn2.pager.borrow().clone());
-    let tx2_row = generate_simple_string_row(1, 1, "World");
-    assert!(db
+    let tx2 = db
         .mvcc_store
-        .update(tx2, tx2_row.clone(), conn2.pager.borrow().clone())
-        .unwrap());
+        .begin_tx(conn2.pager.borrow().clone())
+        .unwrap();
+    let tx2_row = generate_simple_string_row(1, 1, "World");
+    assert!(db.mvcc_store.update(tx2, tx2_row.clone()).unwrap());
 
     // T3 also attempts to update row ID 1 within an active transaction.
     let conn3 = db.db.connect().unwrap();
-    let tx3 = db.mvcc_store.begin_tx(conn3.pager.borrow().clone());
+    let tx3 = db
+        .mvcc_store
+        .begin_tx(conn3.pager.borrow().clone())
+        .unwrap();
     let tx3_row = generate_simple_string_row(1, 1, "Hello, world!");
     assert!(matches!(
-        db.mvcc_store
-            .update(tx3, tx3_row, conn3.pager.borrow().clone(),),
+        db.mvcc_store.update(tx3, tx3_row),
         Err(LimboError::WriteWriteConflict)
     ));
+    // hack: in the actual tursodb database we rollback the mvcc tx ourselves, so manually roll it back here
+    db.mvcc_store
+        .rollback_tx(tx3, conn3.pager.borrow().clone(), &conn3)
+        .unwrap();
 
     commit_tx(db.mvcc_store.clone(), &conn2, tx2).unwrap();
     assert!(matches!(
@@ -546,7 +602,10 @@ fn test_lost_update() {
     ));
 
     let conn4 = db.db.connect().unwrap();
-    let tx4 = db.mvcc_store.begin_tx(conn4.pager.borrow().clone());
+    let tx4 = db
+        .mvcc_store
+        .begin_tx(conn4.pager.borrow().clone())
+        .unwrap();
     let row = db
         .mvcc_store
         .read(
@@ -568,19 +627,22 @@ fn test_committed_visibility() {
     let db = MvccTestDb::new();
 
     // let's add $10 to my account since I like money
-    let tx1 = db.mvcc_store.begin_tx(db.conn.pager.borrow().clone());
+    let tx1 = db
+        .mvcc_store
+        .begin_tx(db.conn.pager.borrow().clone())
+        .unwrap();
     let tx1_row = generate_simple_string_row(1, 1, "10");
     db.mvcc_store.insert(tx1, tx1_row.clone()).unwrap();
     commit_tx(db.mvcc_store.clone(), &db.conn, tx1).unwrap();
 
     // but I like more money, so let me try adding $10 more
     let conn2 = db.db.connect().unwrap();
-    let tx2 = db.mvcc_store.begin_tx(conn2.pager.borrow().clone());
-    let tx2_row = generate_simple_string_row(1, 1, "20");
-    assert!(db
+    let tx2 = db
         .mvcc_store
-        .update(tx2, tx2_row.clone(), conn2.pager.borrow().clone())
-        .unwrap());
+        .begin_tx(conn2.pager.borrow().clone())
+        .unwrap();
+    let tx2_row = generate_simple_string_row(1, 1, "20");
+    assert!(db.mvcc_store.update(tx2, tx2_row.clone()).unwrap());
     let row = db
         .mvcc_store
         .read(
@@ -596,7 +658,10 @@ fn test_committed_visibility() {
 
     // can I check how much money I have?
     let conn3 = db.db.connect().unwrap();
-    let tx3 = db.mvcc_store.begin_tx(conn3.pager.borrow().clone());
+    let tx3 = db
+        .mvcc_store
+        .begin_tx(conn3.pager.borrow().clone())
+        .unwrap();
     let row = db
         .mvcc_store
         .read(
@@ -616,10 +681,16 @@ fn test_committed_visibility() {
 fn test_future_row() {
     let db = MvccTestDb::new();
 
-    let tx1 = db.mvcc_store.begin_tx(db.conn.pager.borrow().clone());
+    let tx1 = db
+        .mvcc_store
+        .begin_tx(db.conn.pager.borrow().clone())
+        .unwrap();
 
     let conn2 = db.db.connect().unwrap();
-    let tx2 = db.mvcc_store.begin_tx(conn2.pager.borrow().clone());
+    let tx2 = db
+        .mvcc_store
+        .begin_tx(conn2.pager.borrow().clone())
+        .unwrap();
     let tx2_row = generate_simple_string_row(1, 1, "Hello");
     db.mvcc_store.insert(tx2, tx2_row).unwrap();
 
@@ -663,7 +734,10 @@ use crate::{MemoryIO, Statement};
 
 fn setup_test_db() -> (MvccTestDb, u64) {
     let db = MvccTestDb::new();
-    let tx_id = db.mvcc_store.begin_tx(db.conn.pager.borrow().clone());
+    let tx_id = db
+        .mvcc_store
+        .begin_tx(db.conn.pager.borrow().clone())
+        .unwrap();
 
     let table_id = 1;
     let test_rows = [
@@ -683,13 +757,19 @@ fn setup_test_db() -> (MvccTestDb, u64) {
 
     commit_tx(db.mvcc_store.clone(), &db.conn, tx_id).unwrap();
 
-    let tx_id = db.mvcc_store.begin_tx(db.conn.pager.borrow().clone());
+    let tx_id = db
+        .mvcc_store
+        .begin_tx(db.conn.pager.borrow().clone())
+        .unwrap();
     (db, tx_id)
 }
 
 fn setup_lazy_db(initial_keys: &[i64]) -> (MvccTestDb, u64) {
     let db = MvccTestDb::new();
-    let tx_id = db.mvcc_store.begin_tx(db.conn.pager.borrow().clone());
+    let tx_id = db
+        .mvcc_store
+        .begin_tx(db.conn.pager.borrow().clone())
+        .unwrap();
 
     let table_id = 1;
     for i in initial_keys {
@@ -702,7 +782,10 @@ fn setup_lazy_db(initial_keys: &[i64]) -> (MvccTestDb, u64) {
 
     commit_tx(db.mvcc_store.clone(), &db.conn, tx_id).unwrap();
 
-    let tx_id = db.mvcc_store.begin_tx(db.conn.pager.borrow().clone());
+    let tx_id = db
+        .mvcc_store
+        .begin_tx(db.conn.pager.borrow().clone())
+        .unwrap();
     (db, tx_id)
 }
 
@@ -866,10 +949,13 @@ fn test_cursor_with_empty_table() {
     {
         // FIXME: force page 1 initialization
         let pager = db.conn.pager.borrow().clone();
-        let tx_id = db.mvcc_store.begin_tx(pager.clone());
+        let tx_id = db.mvcc_store.begin_tx(pager.clone()).unwrap();
         commit_tx(db.mvcc_store.clone(), &db.conn, tx_id).unwrap();
     }
-    let tx_id = db.mvcc_store.begin_tx(db.conn.pager.borrow().clone());
+    let tx_id = db
+        .mvcc_store
+        .begin_tx(db.conn.pager.borrow().clone())
+        .unwrap();
     let table_id = 1; // Empty table
 
     // Test LazyScanCursor with empty table
@@ -1092,7 +1178,7 @@ fn test_restart() {
     {
         let conn = db.connect();
         let mvcc_store = db.get_mvcc_store();
-        let tx_id = mvcc_store.begin_tx(conn.pager.borrow().clone());
+        let tx_id = mvcc_store.begin_tx(conn.pager.borrow().clone()).unwrap();
         let row = generate_simple_string_row(1, 1, "foo");
 
         mvcc_store.insert(tx_id, row).unwrap();
@@ -1104,13 +1190,13 @@ fn test_restart() {
     {
         let conn = db.connect();
         let mvcc_store = db.get_mvcc_store();
-        let tx_id = mvcc_store.begin_tx(conn.pager.borrow().clone());
+        let tx_id = mvcc_store.begin_tx(conn.pager.borrow().clone()).unwrap();
         let row = generate_simple_string_row(1, 2, "bar");
 
         mvcc_store.insert(tx_id, row).unwrap();
         commit_tx(mvcc_store.clone(), &conn, tx_id).unwrap();
 
-        let tx_id = mvcc_store.begin_tx(conn.pager.borrow().clone());
+        let tx_id = mvcc_store.begin_tx(conn.pager.borrow().clone()).unwrap();
         let row = mvcc_store.read(tx_id, RowID::new(1, 2)).unwrap().unwrap();
         let record = get_record_value(&row);
         match record.get_value(0).unwrap() {
@@ -1380,4 +1466,31 @@ fn test_batch_writes() {
         }
     }
     println!("start: {start} end: {end}");
+}
+
+#[test]
+fn transaction_display() {
+    let state = AtomicTransactionState::from(TransactionState::Preparing);
+    let tx_id = 42;
+    let begin_ts = 20250914;
+
+    let write_set = SkipSet::new();
+    write_set.insert(RowID::new(1, 11));
+    write_set.insert(RowID::new(1, 13));
+
+    let read_set = SkipSet::new();
+    read_set.insert(RowID::new(2, 17));
+    read_set.insert(RowID::new(2, 19));
+
+    let tx = Transaction {
+        state,
+        tx_id,
+        begin_ts,
+        write_set,
+        read_set,
+    };
+
+    let expected = "{ state: Preparing, id: 42, begin_ts: 20250914, write_set: [RowID { table_id: 1, row_id: 11 }, RowID { table_id: 1, row_id: 13 }], read_set: [RowID { table_id: 2, row_id: 17 }, RowID { table_id: 2, row_id: 19 }] }";
+    let output = format!("{tx}");
+    assert_eq!(output, expected);
 }

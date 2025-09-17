@@ -16,7 +16,7 @@ use crate::{
     Result, TransactionState,
 };
 use parking_lot::RwLock;
-use std::cell::{Cell, OnceCell, RefCell, UnsafeCell};
+use std::cell::{Cell, RefCell, UnsafeCell};
 use std::collections::HashSet;
 use std::hash;
 use std::rc::Rc;
@@ -43,7 +43,7 @@ impl HeaderRef {
     pub fn from_pager(pager: &Pager) -> Result<IOResult<Self>> {
         loop {
             let state = pager.header_ref_state.borrow().clone();
-            tracing::trace!(?state);
+            tracing::trace!("HeaderRef::from_pager - {:?}", state);
             match state {
                 HeaderRefState::Start => {
                     if !pager.db_state.is_initialized() {
@@ -491,7 +491,7 @@ pub struct Pager {
     /// `usable_space` calls. TODO: Invalidate reserved_space when we add the functionality
     /// to change it.
     pub(crate) page_size: Cell<Option<PageSize>>,
-    reserved_space: OnceCell<u8>,
+    reserved_space: Cell<Option<u8>>,
     free_page_state: RefCell<FreePageState>,
     /// Maximum number of pages allowed in the database. Default is 1073741823 (SQLite default).
     max_page_count: Cell<u32>,
@@ -552,13 +552,8 @@ enum AllocatePage1State {
 #[derive(Debug, Clone)]
 enum FreePageState {
     Start,
-    AddToTrunk {
-        page: Arc<Page>,
-        trunk_page: Option<Arc<Page>>,
-    },
-    NewTrunk {
-        page: Arc<Page>,
-    },
+    AddToTrunk { page: Arc<Page> },
+    NewTrunk { page: Arc<Page> },
 }
 
 impl Pager {
@@ -597,7 +592,7 @@ impl Pager {
             init_lock,
             allocate_page1_state,
             page_size: Cell::new(None),
-            reserved_space: OnceCell::new(),
+            reserved_space: Cell::new(None),
             free_page_state: RefCell::new(FreePageState::Start),
             allocate_page_state: RefCell::new(AllocatePageState::Start),
             max_page_count: Cell::new(DEFAULT_MAX_PAGE_COUNT),
@@ -969,7 +964,7 @@ impl Pager {
                 .unwrap_or_default()
         });
 
-        let reserved_space = *self.reserved_space.get_or_init(|| {
+        let reserved_space = *self.reserved_space.get().get_or_insert_with(|| {
             self.io
                 .block(|| self.with_header(|header| header.reserved_space))
                 .unwrap_or_default()
@@ -1064,7 +1059,8 @@ impl Pager {
         }
         let commit_status = return_if_io!(self.commit_dirty_pages(
             connection.wal_auto_checkpoint_disabled.get(),
-            connection.get_sync_mode()
+            connection.get_sync_mode(),
+            connection.get_data_sync_retry()
         ));
         wal.borrow().end_write_tx();
         wal.borrow().end_read_tx();
@@ -1317,6 +1313,7 @@ impl Pager {
         &self,
         wal_auto_checkpoint_disabled: bool,
         sync_mode: crate::SyncMode,
+        data_sync_retry: bool,
     ) -> Result<IOResult<PagerCommitResult>> {
         let Some(wal) = self.wal.as_ref() else {
             return Err(LimboError::InternalError(
@@ -1348,9 +1345,9 @@ impl Pager {
                     let mut pages: Vec<PageRef> = Vec::with_capacity(dirty_ids.len().min(IOV_MAX));
                     let total = dirty_ids.len();
 
+                    let mut cache = self.page_cache.write();
                     for (i, page_id) in dirty_ids.into_iter().enumerate() {
                         let page = {
-                            let mut cache = self.page_cache.write();
                             let page_key = PageCacheKey::new(page_id);
                             let page = cache.get(&page_key)?.expect(
                                 "dirty list contained a page that cache dropped (page={page_id})",
@@ -1404,7 +1401,14 @@ impl Pager {
                 }
                 CommitState::SyncWal => {
                     self.commit_info.state.set(CommitState::AfterSyncWal);
-                    let c = wal.borrow_mut().sync()?;
+                    let sync_result = wal.borrow_mut().sync();
+                    let c = match sync_result {
+                        Ok(c) => c,
+                        Err(e) if !data_sync_retry => {
+                            panic!("fsync error (data_sync_retry=off): {e:?}");
+                        }
+                        Err(e) => return Err(e),
+                    };
                     if !c.is_completed() {
                         io_yield_one!(c);
                     }
@@ -1427,7 +1431,15 @@ impl Pager {
                     }
                 }
                 CommitState::SyncDbFile => {
-                    let c = sqlite3_ondisk::begin_sync(self.db_file.clone(), self.syncing.clone())?;
+                    let sync_result =
+                        sqlite3_ondisk::begin_sync(self.db_file.clone(), self.syncing.clone());
+                    let c = match sync_result {
+                        Ok(c) => c,
+                        Err(e) if !data_sync_retry => {
+                            panic!("fsync error on database file (data_sync_retry=off): {e:?}");
+                        }
+                        Err(e) => return Err(e),
+                    };
                     self.commit_info.state.set(CommitState::AfterSyncDbFile);
                     if !c.is_completed() {
                         io_yield_one!(c);
@@ -1724,25 +1736,19 @@ impl Pager {
                     let trunk_page_id = header.freelist_trunk_page.get();
 
                     if trunk_page_id != 0 {
-                        *state = FreePageState::AddToTrunk {
-                            page,
-                            trunk_page: None,
-                        };
+                        *state = FreePageState::AddToTrunk { page };
                     } else {
                         *state = FreePageState::NewTrunk { page };
                     }
                 }
-                FreePageState::AddToTrunk { page, trunk_page } => {
+                FreePageState::AddToTrunk { page } => {
                     let trunk_page_id = header.freelist_trunk_page.get();
-                    if trunk_page.is_none() {
-                        // Add as leaf to current trunk
-                        let (page, c) = self.read_page(trunk_page_id as usize)?;
-                        trunk_page.replace(page);
-                        if let Some(c) = c {
+                    let (trunk_page, c) = self.read_page(trunk_page_id as usize)?;
+                    if let Some(c) = c {
+                        if !c.is_completed() {
                             io_yield_one!(c);
                         }
                     }
-                    let trunk_page = trunk_page.as_ref().unwrap();
                     turso_assert!(trunk_page.is_loaded(), "trunk_page should be loaded");
 
                     let trunk_page_contents = trunk_page.get_contents();
@@ -1758,7 +1764,7 @@ impl Pager {
                             trunk_page.get().id == trunk_page_id as usize,
                             "trunk page has unexpected id"
                         );
-                        self.add_dirty(trunk_page);
+                        self.add_dirty(&trunk_page);
 
                         trunk_page_contents.write_u32_no_offset(
                             TRUNK_PAGE_LEAF_COUNT_OFFSET,
@@ -1809,15 +1815,25 @@ impl Pager {
                 assert_eq!(default_header.database_size.get(), 0);
                 default_header.database_size = 1.into();
 
-                // if a key is set, then we will reserve space for encryption metadata
-                let io_ctx = self.io_ctx.borrow();
-                if let Some(ctx) = io_ctx.encryption_context() {
-                    default_header.reserved_space = ctx.required_reserved_bytes()
-                }
+                // based on the IOContext set, we will set the reserved space bytes as required by
+                // either the encryption or checksum, or None if they are not set.
+                let reserved_space_bytes = {
+                    let io_ctx = self.io_ctx.borrow();
+                    io_ctx.get_reserved_space_bytes()
+                };
+                default_header.reserved_space = reserved_space_bytes;
+                self.reserved_space.set(Some(reserved_space_bytes));
 
                 if let Some(size) = self.page_size.get() {
                     default_header.page_size = size;
                 }
+
+                tracing::debug!(
+                    "allocate_page1(Start) page_size = {:?}, reserved_space = {}",
+                    default_header.page_size,
+                    default_header.reserved_space
+                );
+
                 self.buffer_pool
                     .finalize_with_page_size(default_header.page_size.get() as usize)?;
                 let page = allocate_new_page(1, &self.buffer_pool, 0);
@@ -2194,6 +2210,20 @@ impl Pager {
         wal.borrow_mut()
             .set_io_context(self.io_ctx.borrow().clone());
         Ok(())
+    }
+
+    pub fn reset_checksum_context(&self) {
+        {
+            let mut io_ctx = self.io_ctx.borrow_mut();
+            io_ctx.reset_checksum();
+        }
+        let Some(wal) = self.wal.as_ref() else { return };
+        wal.borrow_mut()
+            .set_io_context(self.io_ctx.borrow().clone())
+    }
+
+    pub fn set_reserved_space_bytes(&self, value: u8) {
+        self.reserved_space.set(Some(value))
     }
 }
 

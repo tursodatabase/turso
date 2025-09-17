@@ -16,12 +16,15 @@ path = "main.rs"
 
 [dependencies]
 anyhow.workspace = true
-clap = { version = "4.5", features = ["derive"] }
+clap = { workspace = true, features = ["derive"] }
 memmap2 = "0.9"
 rand = { workspace = true }
-rand_chacha = "0.9.0"
+rand_chacha = { workspace = true }
 sql_generation = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
-turso_core = { path = "../core", features = ["simulator"]}
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+turso_core = { workspace = true, features = ["simulator"]}
 turso_parser = { workspace = true }
+
+[features]
+checksum = ["turso_core/checksum"]

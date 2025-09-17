@@ -126,6 +126,12 @@ pub enum CompletionError {
     DecryptionError { page_idx: usize },
     #[error("I/O error: partial write")]
     ShortWrite,
+    #[error("Checksum mismatch on page {page_id}: expected {expected}, got {actual}")]
+    ChecksumMismatch {
+        page_id: usize,
+        expected: u64,
+        actual: u64,
+    },
 }
 
 #[macro_export]

@@ -1,6 +1,6 @@
 import { registerFileAtWorker, unregisterFileAtWorker } from "@tursodatabase/database-browser-common"
 import { DatabasePromise, DatabaseOpts, NativeDatabase } from "@tursodatabase/database-common"
-import { ProtocolIo, run, SyncOpts, RunOpts, memoryIO } from "@tursodatabase/sync-common";
+import { ProtocolIo, run, SyncOpts, RunOpts, memoryIO, SyncEngineStats } from "@tursodatabase/sync-common";
 
 let BrowserIo: ProtocolIo = {
     async read(path: string): Promise<Buffer | Uint8Array | null> {
@@ -44,7 +44,7 @@ class Database extends DatabasePromise {
     async checkpoint() {
         await run(this.runOpts, this.io, this.engine, this.engine.checkpoint());
     }
-    async stats(): Promise<{ operations: number, mainWal: number, revertWal: number, lastPullUnixTime: number, lastPushUnixTime: number | null }> {
+    async stats(): Promise<SyncEngineStats> {
         return (await run(this.runOpts, this.io, this.engine, this.engine.stats()));
     }
     override async close(): Promise<void> {
@@ -54,7 +54,7 @@ class Database extends DatabasePromise {
             await Promise.all([
                 unregisterFileAtWorker(this.worker, this.fsPath),
                 unregisterFileAtWorker(this.worker, `${this.fsPath}-wal`),
-                unregisterFileAtWorker(this.worker, `${this.fsPath}-revert`),
+                unregisterFileAtWorker(this.worker, `${this.fsPath}-wal-revert`),
                 unregisterFileAtWorker(this.worker, `${this.fsPath}-info`),
                 unregisterFileAtWorker(this.worker, `${this.fsPath}-changes`),
             ]);
@@ -95,7 +95,7 @@ async function connect(opts: SyncOpts, connect: (any) => any, init: () => Promis
         await Promise.all([
             registerFileAtWorker(worker, opts.path),
             registerFileAtWorker(worker, `${opts.path}-wal`),
-            registerFileAtWorker(worker, `${opts.path}-revert`),
+            registerFileAtWorker(worker, `${opts.path}-wal-revert`),
             registerFileAtWorker(worker, `${opts.path}-info`),
             registerFileAtWorker(worker, `${opts.path}-changes`),
         ]);

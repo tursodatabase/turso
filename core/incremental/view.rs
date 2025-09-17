@@ -206,6 +206,7 @@ impl IncrementalView {
         schema: &Schema,
         main_data_root: usize,
         internal_state_root: usize,
+        internal_state_index_root: usize,
     ) -> Result<DbspCircuit> {
         // Build the logical plan from the SELECT statement
         let mut builder = LogicalPlanBuilder::new(schema);
@@ -214,7 +215,11 @@ impl IncrementalView {
         let logical_plan = builder.build_statement(&stmt)?;
 
         // Compile the logical plan to a DBSP circuit with the storage roots
-        let compiler = DbspCompiler::new(main_data_root, internal_state_root);
+        let compiler = DbspCompiler::new(
+            main_data_root,
+            internal_state_root,
+            internal_state_index_root,
+        );
         let circuit = compiler.compile(&logical_plan)?;
 
         Ok(circuit)
@@ -271,6 +276,7 @@ impl IncrementalView {
         schema: &Schema,
         main_data_root: usize,
         internal_state_root: usize,
+        internal_state_index_root: usize,
     ) -> Result<Self> {
         let mut parser = Parser::new(sql.as_bytes());
         let cmd = parser.next_cmd()?;
@@ -287,6 +293,7 @@ impl IncrementalView {
                 schema,
                 main_data_root,
                 internal_state_root,
+                internal_state_index_root,
             ),
             _ => Err(LimboError::ParseError(format!(
                 "View is not a CREATE MATERIALIZED VIEW statement: {sql}"
@@ -300,6 +307,7 @@ impl IncrementalView {
         schema: &Schema,
         main_data_root: usize,
         internal_state_root: usize,
+        internal_state_index_root: usize,
     ) -> Result<Self> {
         let name = view_name.name.as_str().to_string();
 
@@ -327,6 +335,7 @@ impl IncrementalView {
             schema,
             main_data_root,
             internal_state_root,
+            internal_state_index_root,
         )
     }
 
@@ -340,13 +349,19 @@ impl IncrementalView {
         schema: &Schema,
         main_data_root: usize,
         internal_state_root: usize,
+        internal_state_index_root: usize,
     ) -> Result<Self> {
         // Create the tracker that will be shared by all operators
         let tracker = Arc::new(Mutex::new(ComputationTracker::new()));
 
         // Compile the SELECT statement into a DBSP circuit
-        let circuit =
-            Self::try_compile_circuit(&select_stmt, schema, main_data_root, internal_state_root)?;
+        let circuit = Self::try_compile_circuit(
+            &select_stmt,
+            schema,
+            main_data_root,
+            internal_state_root,
+            internal_state_index_root,
+        )?;
 
         Ok(Self {
             name,
@@ -369,7 +384,7 @@ impl IncrementalView {
     pub fn execute_with_uncommitted(
         &mut self,
         uncommitted: DeltaSet,
-        pager: Rc<Pager>,
+        pager: Arc<Pager>,
         execute_state: &mut crate::incremental::compiler::ExecuteState,
     ) -> crate::Result<crate::types::IOResult<Delta>> {
         // Initialize execute_state with the input data
@@ -545,7 +560,7 @@ impl IncrementalView {
     pub fn populate_from_table(
         &mut self,
         conn: &std::sync::Arc<crate::Connection>,
-        pager: &std::rc::Rc<crate::Pager>,
+        pager: &std::sync::Arc<crate::Pager>,
         _btree_cursor: &mut BTreeCursor,
     ) -> crate::Result<IOResult<()>> {
         // If already populated, return immediately
@@ -820,7 +835,7 @@ impl IncrementalView {
     pub fn merge_delta(
         &mut self,
         delta_set: DeltaSet,
-        pager: std::rc::Rc<crate::Pager>,
+        pager: std::sync::Arc<crate::Pager>,
     ) -> crate::Result<IOResult<()>> {
         // Early return if all deltas are empty
         if delta_set.is_empty() {

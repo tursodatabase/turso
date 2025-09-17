@@ -2,6 +2,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use turso_parser::ast::{self, Upsert};
 
+use crate::translate::expr::WalkControl;
 use crate::{
     bail_parse_error,
     error::SQLITE_CONSTRAINT_NOTNULL,
@@ -524,7 +525,7 @@ fn rewrite_upsert_expr_in_place(
     current_start: usize,
     conflict_rowid_reg: usize,
     insertion: &Insertion,
-) -> crate::Result<()> {
+) -> crate::Result<WalkControl> {
     use ast::Expr;
 
     // helper: return the CURRENT-row register for a column (including rowid alias)
@@ -535,34 +536,37 @@ fn rewrite_upsert_expr_in_place(
         let (idx, _c) = table.get_column_by_name(&normalize_ident(name))?;
         Some(current_start + idx)
     };
-    walk_expr_mut(e, &mut |expr: &mut ast::Expr| -> crate::Result<()> {
-        match expr {
-            // EXCLUDED.x -> insertion register
-            Expr::Qualified(ns, ast::Name::Ident(c)) => {
-                if ns.as_str().eq_ignore_ascii_case("excluded") {
-                    let Some(reg) = insertion.get_col_mapping_by_name(c.as_str()) else {
-                        bail_parse_error!("no such column in EXCLUDED: {}", c);
-                    };
-                    *expr = Expr::Register(reg.register);
-                } else if ns.as_str().eq_ignore_ascii_case(table_name)
-                // t.x -> CURRENT, only if t matches the target table name (never "excluded")
-                {
-                    if let Some(reg) = col_reg(c.as_str()) {
+    walk_expr_mut(
+        e,
+        &mut |expr: &mut ast::Expr| -> crate::Result<WalkControl> {
+            match expr {
+                // EXCLUDED.x -> insertion register
+                Expr::Qualified(ns, ast::Name::Ident(c)) => {
+                    if ns.as_str().eq_ignore_ascii_case("excluded") {
+                        let Some(reg) = insertion.get_col_mapping_by_name(c.as_str()) else {
+                            bail_parse_error!("no such column in EXCLUDED: {}", c);
+                        };
+                        *expr = Expr::Register(reg.register);
+                    } else if ns.as_str().eq_ignore_ascii_case(table_name)
+                    // t.x -> CURRENT, only if t matches the target table name (never "excluded")
+                    {
+                        if let Some(reg) = col_reg(c.as_str()) {
+                            *expr = Expr::Register(reg);
+                        }
+                    }
+                }
+                // Unqualified column id -> CURRENT
+                Expr::Id(ast::Name::Ident(name)) => {
+                    if let Some(reg) = col_reg(name.as_str()) {
                         *expr = Expr::Register(reg);
                     }
                 }
-            }
-            // Unqualified column id -> CURRENT
-            Expr::Id(ast::Name::Ident(name)) => {
-                if let Some(reg) = col_reg(name.as_str()) {
-                    *expr = Expr::Register(reg);
+                Expr::RowId { .. } => {
+                    *expr = Expr::Register(conflict_rowid_reg);
                 }
+                _ => {}
             }
-            Expr::RowId { .. } => {
-                *expr = Expr::Register(conflict_rowid_reg);
-            }
-            _ => {}
-        }
-        Ok(())
-    })
+            Ok(WalkControl::Continue)
+        },
+    )
 }

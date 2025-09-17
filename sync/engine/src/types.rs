@@ -67,6 +67,7 @@ pub struct SyncEngineStats {
     pub revert_wal_size: u64,
     pub last_pull_unix_time: i64,
     pub last_push_unix_time: Option<i64>,
+    pub revision: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

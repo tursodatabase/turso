@@ -248,6 +248,8 @@ Note that exploration uses the `chaos` mode so if you need to reproduce a run, u
 SEED=1234 ./whopper/bin/run --mode chaos
 ```
 
+Both `explore` and `run` accept `--enable-checksums` flag to enable per page checksums.
+
 ## Python Bindings
 
 Turso provides Python bindings built on top of the [PyO3](https://pyo3.rs) project.

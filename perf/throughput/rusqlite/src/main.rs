@@ -16,6 +16,13 @@ struct Args {
 
     #[arg(short = 'i', long = "iterations", default_value = "10")]
     iterations: usize,
+
+    #[arg(
+        long = "think",
+        default_value = "0",
+        help = "Per transaction think time (ms)"
+    )]
+    think: u64,
 }
 
 fn main() -> Result<()> {
@@ -54,6 +61,7 @@ fn main() -> Result<()> {
                 args.batch_size,
                 args.iterations,
                 barrier,
+                args.think,
             )
         });
 
@@ -65,7 +73,7 @@ fn main() -> Result<()> {
         match handle.join() {
             Ok(Ok(inserts)) => total_inserts += inserts,
             Ok(Err(e)) => {
-                eprintln!("Thread error: {}", e);
+                eprintln!("Thread error: {e}");
                 return Err(e);
             }
             Err(_) => {
@@ -79,9 +87,9 @@ fn main() -> Result<()> {
     let overall_throughput = (total_inserts as f64) / overall_elapsed.as_secs_f64();
 
     println!("\n=== BENCHMARK RESULTS ===");
-    println!("Total inserts: {}", total_inserts);
+    println!("Total inserts: {total_inserts}",);
     println!("Total time: {:.2}s", overall_elapsed.as_secs_f64());
-    println!("Overall throughput: {:.2} inserts/sec", overall_throughput);
+    println!("Overall throughput: {overall_throughput:.2} inserts/sec");
     println!("Threads: {}", args.threads);
     println!("Batch size: {}", args.batch_size);
     println!("Iterations per thread: {}", args.iterations);
@@ -108,7 +116,7 @@ fn setup_database(db_path: &str) -> Result<Connection> {
         [],
     )?;
 
-    println!("Database created at: {}", db_path);
+    println!("Database created at: {db_path}");
     Ok(conn)
 }
 
@@ -118,12 +126,11 @@ fn worker_thread(
     batch_size: usize,
     iterations: usize,
     start_barrier: Arc<Barrier>,
+    think_ms: u64,
 ) -> Result<u64> {
     let conn = Connection::open(&db_path)?;
 
     conn.busy_timeout(std::time::Duration::from_secs(30))?;
-    
-    let mut stmt = conn.prepare("INSERT INTO test_table (id, data) VALUES (?, ?)")?;
 
     start_barrier.wait();
 
@@ -131,14 +138,18 @@ fn worker_thread(
     let mut total_inserts = 0;
 
     for iteration in 0..iterations {
+        let mut stmt = conn.prepare("INSERT INTO test_table (id, data) VALUES (?, ?)")?;
+
         conn.execute("BEGIN", [])?;
 
         for i in 0..batch_size {
             let id = thread_id * iterations * batch_size + iteration * batch_size + i;
-            stmt.execute([&id.to_string(), &format!("data_{}", id)])?;
+            stmt.execute([&id.to_string(), &format!("data_{id}")])?;
             total_inserts += 1;
         }
-
+        if think_ms > 0 {
+            thread::sleep(std::time::Duration::from_millis(think_ms));
+        }
         conn.execute("COMMIT", [])?;
     }
 

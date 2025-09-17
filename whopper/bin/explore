@@ -2,9 +2,20 @@
 
 set -e
 
-cargo build -p turso_whopper
+# Check for special build time flags (e.g. `--enable-checksums`)
+FEATURES=""
+ARGS=()
+for arg in "$@"; do
+    if [[ "$arg" == "--enable-checksums" ]]; then
+        FEATURES="--features checksum"
+    else
+        ARGS+=("$arg")
+    fi
+done
+
+cargo build $FEATURES -p turso_whopper
 
 echo "Running Whopper in an infinite loop in 'chaos' mode..."
 while true; do
-    time RUST_BACKTRACE=full ./target/debug/turso_whopper --mode chaos
+    time RUST_BACKTRACE=full ./target/debug/turso_whopper --mode chaos "${ARGS[@]}"
 done

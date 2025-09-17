@@ -58,7 +58,7 @@ use crate::storage::btree::offset::{
 };
 use crate::storage::btree::{payload_overflow_threshold_max, payload_overflow_threshold_min};
 use crate::storage::buffer_pool::BufferPool;
-use crate::storage::database::DatabaseStorage;
+use crate::storage::database::{DatabaseStorage, EncryptionOrChecksum};
 use crate::storage::pager::Pager;
 use crate::storage::wal::READMARK_NOT_USED;
 use crate::types::{RawSlice, RefValue, SerialType, SerialTypeKind, TextRef, TextSubtype};
@@ -927,7 +927,7 @@ pub fn begin_read_page(
     db_file.read_page(page_idx, io_ctx, c)
 }
 
-#[instrument(skip_all, level = Level::INFO)]
+#[instrument(skip_all, level = Level::DEBUG)]
 pub fn finish_read_page(page_idx: usize, buffer_ref: Arc<Buffer>, page: PageRef) {
     tracing::trace!("finish_read_page(page_idx = {page_idx})");
     let pos = if page_idx == DatabaseHeader::PAGE_ID {
@@ -1985,40 +1985,74 @@ pub fn begin_read_wal_frame(
     let buf = buffer_pool.get_page();
     let buf = Arc::new(buf);
 
-    if let Some(ctx) = io_ctx.encryption_context() {
-        let encryption_ctx = ctx.clone();
-        let original_complete = complete;
+    match io_ctx.encryption_or_checksum() {
+        EncryptionOrChecksum::Encryption(ctx) => {
+            let encryption_ctx = ctx.clone();
+            let original_complete = complete;
 
-        let decrypt_complete = Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
-            let Ok((encrypted_buf, bytes_read)) = res else {
-                original_complete(res);
-                return;
-            };
-            assert!(
-                bytes_read > 0,
-                "Expected to read some data on success for page_idx={page_idx}"
-            );
-            match encryption_ctx.decrypt_page(encrypted_buf.as_slice(), page_idx) {
-                Ok(decrypted_data) => {
-                    encrypted_buf
-                        .as_mut_slice()
-                        .copy_from_slice(&decrypted_data);
-                    original_complete(Ok((encrypted_buf, bytes_read)));
-                }
-                Err(e) => {
-                    tracing::error!(
-                        "Failed to decrypt WAL frame data for page_idx={page_idx}: {e}"
+            let decrypt_complete =
+                Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
+                    let Ok((encrypted_buf, bytes_read)) = res else {
+                        original_complete(res);
+                        return;
+                    };
+                    assert!(
+                        bytes_read > 0,
+                        "Expected to read some data on success for page_idx={page_idx}"
                     );
-                    original_complete(Err(CompletionError::DecryptionError { page_idx }));
-                }
-            }
-        });
+                    match encryption_ctx.decrypt_page(encrypted_buf.as_slice(), page_idx) {
+                        Ok(decrypted_data) => {
+                            encrypted_buf
+                                .as_mut_slice()
+                                .copy_from_slice(&decrypted_data);
+                            original_complete(Ok((encrypted_buf, bytes_read)));
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "Failed to decrypt WAL frame data for page_idx={page_idx}: {e}"
+                            );
+                            original_complete(Err(CompletionError::DecryptionError { page_idx }));
+                        }
+                    }
+                });
 
-        let new_completion = Completion::new_read(buf, decrypt_complete);
-        io.pread(offset, new_completion)
-    } else {
-        let c = Completion::new_read(buf, complete);
-        io.pread(offset, c)
+            let new_completion = Completion::new_read(buf, decrypt_complete);
+            io.pread(offset, new_completion)
+        }
+        EncryptionOrChecksum::Checksum(ctx) => {
+            let checksum_ctx = ctx.clone();
+            let original_c = complete;
+            let verify_complete =
+                Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
+                    let Ok((buf, bytes_read)) = res else {
+                        original_c(res);
+                        return;
+                    };
+                    if bytes_read <= 0 {
+                        tracing::trace!("Read page {page_idx} with {} bytes", bytes_read);
+                        original_c(Ok((buf, bytes_read)));
+                        return;
+                    }
+
+                    match checksum_ctx.verify_checksum(buf.as_mut_slice(), page_idx) {
+                        Ok(_) => {
+                            original_c(Ok((buf, bytes_read)));
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "Failed to verify checksum for page_id={page_idx}: {e}"
+                            );
+                            original_c(Err(e))
+                        }
+                    }
+                });
+            let c = Completion::new_read(buf, verify_complete);
+            io.pread(offset, c)
+        }
+        EncryptionOrChecksum::None => {
+            let c = Completion::new_read(buf, complete);
+            io.pread(offset, c)
+        }
     }
 }
 

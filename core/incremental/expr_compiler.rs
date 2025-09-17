@@ -12,7 +12,6 @@ use crate::vdbe::insn::Insn;
 use crate::vdbe::{Program, ProgramState, Register};
 use crate::SymbolTable;
 use crate::{CaptureDataChangesMode, Connection, QueryMode, Result, Value};
-use std::rc::Rc;
 use std::sync::Arc;
 use turso_parser::ast::{Expr, Literal, Operator};
 
@@ -386,7 +385,7 @@ impl CompiledExpression {
     }
 
     /// Execute the compiled expression with the given input values
-    pub fn execute(&self, values: &[Value], pager: Rc<Pager>) -> Result<Value> {
+    pub fn execute(&self, values: &[Value], pager: Arc<Pager>) -> Result<Value> {
         match &self.executor {
             ExpressionExecutor::Trivial(trivial) => {
                 // Fast path: evaluate trivial expression inline

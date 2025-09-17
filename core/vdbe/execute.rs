@@ -131,7 +131,7 @@ pub type InsnFunction = fn(
     &Program,
     &mut ProgramState,
     &Insn,
-    &Rc<Pager>,
+    &Arc<Pager>,
     Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult>;
 
@@ -176,7 +176,7 @@ pub fn op_init(
     _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Init { target_pc }, insn);
@@ -189,7 +189,7 @@ pub fn op_add(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Add { lhs, rhs, dest }, insn);
@@ -206,7 +206,7 @@ pub fn op_subtract(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Subtract { lhs, rhs, dest }, insn);
@@ -223,7 +223,7 @@ pub fn op_multiply(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Multiply { lhs, rhs, dest }, insn);
@@ -240,7 +240,7 @@ pub fn op_divide(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Divide { lhs, rhs, dest }, insn);
@@ -257,7 +257,7 @@ pub fn op_drop_index(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(DropIndex { index, db: _ }, insn);
@@ -272,7 +272,7 @@ pub fn op_remainder(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Remainder { lhs, rhs, dest }, insn);
@@ -289,7 +289,7 @@ pub fn op_bit_and(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(BitAnd { lhs, rhs, dest }, insn);
@@ -306,7 +306,7 @@ pub fn op_bit_or(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(BitOr { lhs, rhs, dest }, insn);
@@ -323,7 +323,7 @@ pub fn op_bit_not(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(BitNot { reg, dest }, insn);
@@ -336,7 +336,7 @@ pub fn op_checkpoint(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -380,7 +380,7 @@ pub fn op_null(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     match insn {
@@ -403,7 +403,7 @@ pub fn op_null_row(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(NullRow { cursor_id }, insn);
@@ -420,7 +420,7 @@ pub fn op_compare(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -466,7 +466,7 @@ pub fn op_jump(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -499,7 +499,7 @@ pub fn op_move(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -527,7 +527,7 @@ pub fn op_if_pos(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -562,7 +562,7 @@ pub fn op_not_null(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(NotNull { reg, target_pc }, insn);
@@ -647,7 +647,7 @@ pub fn op_comparison(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let (lhs, rhs, target_pc, flags, collation, op) = match insn {
@@ -872,7 +872,7 @@ pub fn op_if(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -899,7 +899,7 @@ pub fn op_if_not(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -926,7 +926,7 @@ pub fn op_open_read(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    _pager: &Rc<Pager>,
+    _pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -941,8 +941,8 @@ pub fn op_open_read(
     let pager = program.get_pager_from_database_index(db);
 
     let (_, cursor_type) = program.cursor_ref.get(*cursor_id).unwrap();
-    let mv_cursor = match program.connection.mv_tx_id.get() {
-        Some(tx_id) => {
+    let mv_cursor = match program.connection.mv_tx.get() {
+        Some((tx_id, _)) => {
             let table_id = *root_page as u64;
             let mv_store = mv_store.unwrap().clone();
             let mv_cursor = Rc::new(RefCell::new(
@@ -1030,7 +1030,7 @@ pub fn op_vopen(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(VOpen { cursor_id }, insn);
@@ -1052,7 +1052,7 @@ pub fn op_vcreate(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -1093,7 +1093,7 @@ pub fn op_vfilter(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -1137,7 +1137,7 @@ pub fn op_vcolumn(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -1162,7 +1162,7 @@ pub fn op_vupdate(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -1226,7 +1226,7 @@ pub fn op_vnext(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -1255,7 +1255,7 @@ pub fn op_vdestroy(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(VDestroy { db, table_name }, insn);
@@ -1277,7 +1277,7 @@ pub fn op_open_pseudo(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -1304,7 +1304,7 @@ pub fn op_rewind(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -1343,7 +1343,7 @@ pub fn op_last(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -1426,7 +1426,7 @@ pub fn op_column(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -1800,7 +1800,7 @@ pub fn op_type_check(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -1860,7 +1860,7 @@ pub fn op_make_record(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -1899,7 +1899,7 @@ pub fn op_result_row(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(ResultRow { start_reg, count }, insn);
@@ -1916,7 +1916,7 @@ pub fn op_next(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -1965,7 +1965,7 @@ pub fn op_prev(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -2006,7 +2006,7 @@ pub fn op_prev(
 pub fn halt(
     program: &Program,
     state: &mut ProgramState,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
     err_code: usize,
     description: &str,
@@ -2049,7 +2049,7 @@ pub fn op_halt(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -2066,7 +2066,7 @@ pub fn op_halt_if_null(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -2089,7 +2089,7 @@ pub fn op_transaction(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    _pager: &Rc<Pager>,
+    _pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -2156,7 +2156,7 @@ pub fn op_transaction(
         // In MVCC we don't have write exclusivity, therefore we just need to start a transaction if needed.
         // Programs can run Transaction twice, first with read flag and then with write flag. So a single txid is enough
         // for both.
-        if program.connection.mv_tx_id.get().is_none() {
+        if program.connection.mv_tx.get().is_none() {
             // We allocate the first page lazily in the first transaction.
             return_if_io!(pager.maybe_allocate_page1());
             // TODO: when we fix MVCC enable schema cookie detection for reprepare statements
@@ -2168,23 +2168,31 @@ pub fn op_transaction(
             // }
             let tx_id = match tx_mode {
                 TransactionMode::None | TransactionMode::Read | TransactionMode::Concurrent => {
-                    mv_store.begin_tx(pager.clone())
+                    mv_store.begin_tx(pager.clone())?
                 }
                 TransactionMode::Write => {
-                    return_if_io!(mv_store.begin_exclusive_tx(pager.clone()))
+                    return_if_io!(mv_store.begin_exclusive_tx(pager.clone(), None))
                 }
             };
-            conn.mv_transactions.borrow_mut().push(tx_id);
-            program.connection.mv_tx_id.set(Some(tx_id));
-        } else if updated
-            && matches!(new_transaction_state, TransactionState::Write { .. })
-            && matches!(tx_mode, TransactionMode::Write)
-        {
-            // For MVCC with concurrent transactions, we don't need to upgrade to exclusive.
-            // The existing MVCC transaction can handle both reads and writes.
-            // We only upgrade to exclusive for IMMEDIATE/EXCLUSIVE transaction modes.
-            // Since we already have an MVCC transaction from BEGIN CONCURRENT,
-            // we can just continue using it for writes.
+            program.connection.mv_tx.set(Some((tx_id, *tx_mode)));
+        } else if updated {
+            // TODO: fix tx_mode in Insn::Transaction, now each statement overrides it even if there's already a CONCURRENT Tx in progress, for example
+            let mv_tx_mode = program.connection.mv_tx.get().unwrap().1;
+            let actual_tx_mode = if mv_tx_mode == TransactionMode::Concurrent {
+                TransactionMode::Concurrent
+            } else {
+                *tx_mode
+            };
+            if matches!(new_transaction_state, TransactionState::Write { .. })
+                && matches!(actual_tx_mode, TransactionMode::Write)
+            {
+                let (tx_id, mv_tx_mode) = program.connection.mv_tx.get().unwrap();
+                if mv_tx_mode == TransactionMode::Read {
+                    return_if_io!(mv_store.upgrade_to_exclusive_tx(pager.clone(), Some(tx_id)));
+                } else {
+                    return_if_io!(mv_store.begin_exclusive_tx(pager.clone(), Some(tx_id)));
+                }
+            }
         }
     } else {
         if matches!(tx_mode, TransactionMode::Concurrent) {
@@ -2272,7 +2280,7 @@ pub fn op_auto_commit(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -2292,14 +2300,20 @@ pub fn op_auto_commit(
     if *auto_commit != conn.auto_commit.get() {
         if *rollback {
             // TODO(pere): add rollback I/O logic once we implement rollback journal
-            return_if_io!(pager.end_tx(true, &conn));
+            if let Some(mv_store) = mv_store {
+                if let Some((tx_id, _)) = conn.mv_tx.get() {
+                    mv_store.rollback_tx(tx_id, pager.clone(), &conn)?;
+                }
+            } else {
+                return_if_io!(pager.end_tx(true, &conn));
+            }
             conn.transaction_state.replace(TransactionState::None);
             conn.auto_commit.replace(true);
         } else {
             conn.auto_commit.replace(*auto_commit);
         }
     } else {
-        let mvcc_tx_active = program.connection.mv_tx_id.get().is_some();
+        let mvcc_tx_active = program.connection.mv_tx.get().is_some();
         if !mvcc_tx_active {
             if !*auto_commit {
                 return Err(LimboError::TxError(
@@ -2326,7 +2340,7 @@ pub fn op_goto(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Goto { target_pc }, insn);
@@ -2339,7 +2353,7 @@ pub fn op_gosub(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -2359,7 +2373,7 @@ pub fn op_return(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -2389,7 +2403,7 @@ pub fn op_integer(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Integer { value, dest }, insn);
@@ -2402,7 +2416,7 @@ pub fn op_real(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Real { value, dest }, insn);
@@ -2415,7 +2429,7 @@ pub fn op_real_affinity(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(RealAffinity { register }, insn);
@@ -2430,7 +2444,7 @@ pub fn op_string8(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(String8 { value, dest }, insn);
@@ -2443,7 +2457,7 @@ pub fn op_blob(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Blob { value, dest }, insn);
@@ -2456,7 +2470,7 @@ pub fn op_row_data(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(RowData { cursor_id, dest }, insn);
@@ -2498,7 +2512,7 @@ pub fn op_row_id(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(RowId { cursor_id, dest }, insn);
@@ -2596,7 +2610,7 @@ pub fn op_idx_row_id(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(IdxRowId { cursor_id, dest }, insn);
@@ -2616,7 +2630,7 @@ pub fn op_seek_rowid(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -2704,7 +2718,7 @@ pub fn op_deferred_seek(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -2747,7 +2761,7 @@ pub fn op_seek(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let (cursor_id, is_index, record_source, target_pc) = match insn {
@@ -2854,7 +2868,7 @@ pub enum RecordSource {
 pub fn seek_internal(
     program: &Program,
     state: &mut ProgramState,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
     record_source: RecordSource,
     cursor_id: usize,
@@ -2865,7 +2879,7 @@ pub fn seek_internal(
     fn inner(
         program: &Program,
         state: &mut ProgramState,
-        pager: &Rc<Pager>,
+        pager: &Arc<Pager>,
         mv_store: Option<&Arc<MvStore>>,
         record_source: RecordSource,
         cursor_id: usize,
@@ -3142,7 +3156,7 @@ pub fn op_idx_ge(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -3193,7 +3207,7 @@ pub fn op_seek_end(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(SeekEnd { cursor_id }, *insn);
@@ -3211,7 +3225,7 @@ pub fn op_idx_le(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -3262,7 +3276,7 @@ pub fn op_idx_gt(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -3313,7 +3327,7 @@ pub fn op_idx_lt(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -3364,7 +3378,7 @@ pub fn op_decr_jump_zero(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(DecrJumpZero { reg, target_pc }, insn);
@@ -3415,7 +3429,7 @@ pub fn op_agg_step(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -3468,7 +3482,6 @@ pub fn op_agg_step(
                     argc: *argc,
                     step_fn: *step,
                     finalize_fn: *finalize,
-                    finalized_value: None,
                 })),
                 _ => unreachable!("scalar function called in aggregate context"),
             },
@@ -3732,21 +3745,29 @@ pub fn op_agg_final(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
-    load_insn!(AggFinal { register, func }, insn);
-    match state.registers[*register].borrow_mut() {
+    let (acc_reg, dest_reg, func) = match insn {
+        Insn::AggFinal { register, func } => (*register, *register, func),
+        Insn::AggValue {
+            acc_reg,
+            dest_reg,
+            func,
+        } => (*acc_reg, *dest_reg, func),
+        _ => unreachable!("unexpected Insn {:?}", insn),
+    };
+    match &state.registers[acc_reg] {
         Register::Aggregate(agg) => match func {
             AggFunc::Avg => {
-                let AggContext::Avg(acc, count) = agg.borrow_mut() else {
+                let AggContext::Avg(acc, count) = agg else {
                     unreachable!();
                 };
-                *acc /= count.clone();
-                state.registers[*register] = Register::Value(acc.clone());
+                let acc = acc.clone() / count.clone();
+                state.registers[dest_reg] = Register::Value(acc);
             }
             AggFunc::Sum => {
-                let AggContext::Sum(acc, sum_state) = agg.borrow_mut() else {
+                let AggContext::Sum(acc, sum_state) = agg else {
                     unreachable!();
                 };
                 let value = match acc {
@@ -3759,10 +3780,10 @@ pub fn op_agg_final(
                     }
                     _ => Value::Float(acc.as_float() + sum_state.r_err),
                 };
-                state.registers[*register] = Register::Value(value);
+                state.registers[dest_reg] = Register::Value(value);
             }
             AggFunc::Total => {
-                let AggContext::Sum(acc, _) = agg.borrow_mut() else {
+                let AggContext::Sum(acc, _) = agg else {
                     unreachable!();
                 };
                 let value = match acc {
@@ -3771,89 +3792,86 @@ pub fn op_agg_final(
                     Value::Float(f) => Value::Float(*f),
                     _ => unreachable!(),
                 };
-                state.registers[*register] = Register::Value(value);
+                state.registers[dest_reg] = Register::Value(value);
             }
             AggFunc::Count | AggFunc::Count0 => {
-                let AggContext::Count(count) = agg.borrow_mut() else {
+                let AggContext::Count(count) = agg else {
                     unreachable!();
                 };
-                state.registers[*register] = Register::Value(count.clone());
+                state.registers[dest_reg] = Register::Value(count.clone());
             }
             AggFunc::Max => {
-                let AggContext::Max(acc) = agg.borrow_mut() else {
+                let AggContext::Max(acc) = agg else {
                     unreachable!();
                 };
                 match acc {
-                    Some(value) => state.registers[*register] = Register::Value(value.clone()),
-                    None => state.registers[*register] = Register::Value(Value::Null),
+                    Some(value) => state.registers[dest_reg] = Register::Value(value.clone()),
+                    None => state.registers[dest_reg] = Register::Value(Value::Null),
                 }
             }
             AggFunc::Min => {
-                let AggContext::Min(acc) = agg.borrow_mut() else {
+                let AggContext::Min(acc) = agg else {
                     unreachable!();
                 };
                 match acc {
-                    Some(value) => state.registers[*register] = Register::Value(value.clone()),
-                    None => state.registers[*register] = Register::Value(Value::Null),
+                    Some(value) => state.registers[dest_reg] = Register::Value(value.clone()),
+                    None => state.registers[dest_reg] = Register::Value(Value::Null),
                 }
             }
             AggFunc::GroupConcat | AggFunc::StringAgg => {
-                let AggContext::GroupConcat(acc) = agg.borrow_mut() else {
+                let AggContext::GroupConcat(acc) = agg else {
                     unreachable!();
                 };
-                state.registers[*register] = Register::Value(acc.clone());
+                state.registers[dest_reg] = Register::Value(acc.clone());
             }
             #[cfg(feature = "json")]
             AggFunc::JsonGroupObject => {
-                let AggContext::GroupConcat(acc) = agg.borrow_mut() else {
+                let AggContext::GroupConcat(acc) = agg else {
                     unreachable!();
                 };
                 let data = acc.to_blob().expect("Should be blob");
-                state.registers[*register] = Register::Value(json_from_raw_bytes_agg(data, false)?);
+                state.registers[dest_reg] = Register::Value(json_from_raw_bytes_agg(data, false)?);
             }
             #[cfg(feature = "json")]
             AggFunc::JsonbGroupObject => {
-                let AggContext::GroupConcat(acc) = agg.borrow_mut() else {
+                let AggContext::GroupConcat(acc) = agg else {
                     unreachable!();
                 };
                 let data = acc.to_blob().expect("Should be blob");
-                state.registers[*register] = Register::Value(json_from_raw_bytes_agg(data, true)?);
+                state.registers[dest_reg] = Register::Value(json_from_raw_bytes_agg(data, true)?);
             }
             #[cfg(feature = "json")]
             AggFunc::JsonGroupArray => {
-                let AggContext::GroupConcat(acc) = agg.borrow_mut() else {
+                let AggContext::GroupConcat(acc) = agg else {
                     unreachable!();
                 };
                 let data = acc.to_blob().expect("Should be blob");
-                state.registers[*register] = Register::Value(json_from_raw_bytes_agg(data, false)?);
+                state.registers[dest_reg] = Register::Value(json_from_raw_bytes_agg(data, false)?);
             }
             #[cfg(feature = "json")]
             AggFunc::JsonbGroupArray => {
-                let AggContext::GroupConcat(acc) = agg.borrow_mut() else {
+                let AggContext::GroupConcat(acc) = agg else {
                     unreachable!();
                 };
                 let data = acc.to_blob().expect("Should be blob");
-                state.registers[*register] = Register::Value(json_from_raw_bytes_agg(data, true)?);
+                state.registers[dest_reg] = Register::Value(json_from_raw_bytes_agg(data, true)?);
             }
             AggFunc::External(_) => {
-                agg.compute_external()?;
                 let AggContext::External(agg_state) = agg else {
                     unreachable!();
                 };
-                match &agg_state.finalized_value {
-                    Some(value) => state.registers[*register] = Register::Value(value.clone()),
-                    None => state.registers[*register] = Register::Value(Value::Null),
-                }
+                let value = agg.compute_external()?;
+                state.registers[dest_reg] = Register::Value(value)
             }
         },
         Register::Value(Value::Null) => {
             // when the set is empty
             match func {
                 AggFunc::Total => {
-                    state.registers[*register] = Register::Value(Value::Float(0.0));
+                    state.registers[dest_reg] = Register::Value(Value::Float(0.0));
                 }
                 AggFunc::Count | AggFunc::Count0 => {
-                    state.registers[*register] = Register::Value(Value::Integer(0));
+                    state.registers[dest_reg] = Register::Value(Value::Integer(0));
                 }
                 _ => {}
             }
@@ -3870,7 +3888,7 @@ pub fn op_sorter_open(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -3918,7 +3936,7 @@ pub fn op_sorter_data(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -3954,7 +3972,7 @@ pub fn op_sorter_insert(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -3981,7 +3999,7 @@ pub fn op_sorter_sort(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -4016,7 +4034,7 @@ pub fn op_sorter_next(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -4045,7 +4063,7 @@ pub fn op_function(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -5236,7 +5254,7 @@ pub fn op_init_coroutine(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -5264,7 +5282,7 @@ pub fn op_end_coroutine(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(EndCoroutine { yield_reg }, insn);
@@ -5285,7 +5303,7 @@ pub fn op_yield(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -5344,7 +5362,7 @@ pub fn op_insert(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -5580,7 +5598,7 @@ pub fn op_int_64(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -5615,7 +5633,7 @@ pub fn op_delete(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -5722,7 +5740,7 @@ pub fn op_idx_delete(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -5835,7 +5853,7 @@ pub fn op_idx_insert(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -5981,7 +5999,7 @@ pub fn op_new_rowid(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -6115,7 +6133,7 @@ pub fn op_must_be_int(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(MustBeInt { reg }, insn);
@@ -6148,7 +6166,7 @@ pub fn op_soft_null(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(SoftNull { reg }, insn);
@@ -6169,7 +6187,7 @@ pub fn op_no_conflict(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -6263,7 +6281,7 @@ pub fn op_not_exists(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -6296,7 +6314,7 @@ pub fn op_offset_limit(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -6341,7 +6359,7 @@ pub fn op_open_write(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    _pager: &Rc<Pager>,
+    _pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -6374,8 +6392,8 @@ pub fn op_open_write(
         CursorType::BTreeIndex(index) => Some(index),
         _ => None,
     };
-    let mv_cursor = match program.connection.mv_tx_id.get() {
-        Some(tx_id) => {
+    let mv_cursor = match program.connection.mv_tx.get() {
+        Some((tx_id, _)) => {
             let table_id = root_page;
             let mv_store = mv_store.unwrap().clone();
             let mv_cursor = Rc::new(RefCell::new(
@@ -6428,7 +6446,7 @@ pub fn op_copy(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -6450,7 +6468,7 @@ pub fn op_create_btree(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(CreateBtree { db, root, flags }, insn);
@@ -6475,7 +6493,7 @@ pub fn op_destroy(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -6500,11 +6518,38 @@ pub fn op_destroy(
     Ok(InsnFunctionStepResult::Step)
 }
 
+pub fn op_reset_sorter(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+    mv_store: Option<&Arc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(ResetSorter { cursor_id }, insn);
+
+    let (_, cursor_type) = program.cursor_ref.get(*cursor_id).unwrap();
+    let cursor = state.get_cursor(*cursor_id);
+
+    match cursor_type {
+        CursorType::BTreeTable(table) => {
+            let cursor = cursor.as_btree_mut();
+            return_if_io!(cursor.clear_btree());
+        }
+        CursorType::Sorter => {
+            unimplemented!("ResetSorter is not supported for sorter cursors yet")
+        }
+        _ => panic!("ResetSorter is not supported for {cursor_type:?}"),
+    }
+
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
 pub fn op_drop_table(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(DropTable { db, table_name, .. }, insn);
@@ -6526,7 +6571,7 @@ pub fn op_drop_view(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    _pager: &Rc<Pager>,
+    _pager: &Arc<Pager>,
     _mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(DropView { db, view_name }, insn);
@@ -6546,7 +6591,7 @@ pub fn op_close(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Close { cursor_id }, insn);
@@ -6560,7 +6605,7 @@ pub fn op_is_null(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(IsNull { reg, target_pc }, insn);
@@ -6576,7 +6621,7 @@ pub fn op_coll_seq(
     _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    _pager: &Rc<Pager>,
+    _pager: &Arc<Pager>,
     _mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::CollSeq { reg, collation } = insn else {
@@ -6599,7 +6644,7 @@ pub fn op_page_count(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(PageCount { db, dest }, insn);
@@ -6621,7 +6666,7 @@ pub fn op_parse_schema(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -6649,7 +6694,7 @@ pub fn op_parse_schema(
                 stmt,
                 schema,
                 &conn.syms.borrow(),
-                program.connection.mv_tx_id.get(),
+                program.connection.mv_tx.get(),
                 existing_views,
             )
         })
@@ -6664,7 +6709,7 @@ pub fn op_parse_schema(
                 stmt,
                 schema,
                 &conn.syms.borrow(),
-                program.connection.mv_tx_id.get(),
+                program.connection.mv_tx.get(),
                 existing_views,
             )
         })
@@ -6680,7 +6725,7 @@ pub fn op_populate_materialized_views(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     _mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(PopulateMaterializedViews { cursors }, insn);
@@ -6757,7 +6802,7 @@ pub fn op_read_cookie(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(ReadCookie { db, dest, cookie }, insn);
@@ -6787,7 +6832,7 @@ pub fn op_set_cookie(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -6840,7 +6885,7 @@ pub fn op_shift_right(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(ShiftRight { lhs, rhs, dest }, insn);
@@ -6857,7 +6902,7 @@ pub fn op_shift_left(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(ShiftLeft { lhs, rhs, dest }, insn);
@@ -6874,7 +6919,7 @@ pub fn op_add_imm(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(AddImm { register, value }, insn);
@@ -6903,7 +6948,7 @@ pub fn op_variable(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Variable { index, dest }, insn);
@@ -6916,7 +6961,7 @@ pub fn op_zero_or_null(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(ZeroOrNull { rg1, rg2, dest }, insn);
@@ -6933,7 +6978,7 @@ pub fn op_not(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Not { reg, dest }, insn);
@@ -6946,7 +6991,7 @@ pub fn op_concat(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Concat { lhs, rhs, dest }, insn);
@@ -6963,7 +7008,7 @@ pub fn op_and(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(And { lhs, rhs, dest }, insn);
@@ -6980,7 +7025,7 @@ pub fn op_or(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Or { lhs, rhs, dest }, insn);
@@ -6997,7 +7042,7 @@ pub fn op_noop(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     // Do nothing
@@ -7011,10 +7056,10 @@ pub enum OpOpenEphemeralState {
     #[default]
     Start,
     StartingTxn {
-        pager: Rc<Pager>,
+        pager: Arc<Pager>,
     },
     CreateBtree {
-        pager: Rc<Pager>,
+        pager: Arc<Pager>,
     },
     // clippy complains this variant is too big when compared to the rest of the variants
     // so it says we need to box it here
@@ -7026,7 +7071,7 @@ pub fn op_open_ephemeral(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let (cursor_id, is_table) = match insn {
@@ -7080,7 +7125,7 @@ pub fn op_open_ephemeral(
             let buffer_pool = program.connection._db.buffer_pool.clone();
             let page_cache = Arc::new(RwLock::new(PageCache::default()));
 
-            let pager = Rc::new(Pager::new(
+            let pager = Arc::new(Pager::new(
                 db_file,
                 None,
                 db_file_io,
@@ -7120,8 +7165,8 @@ pub fn op_open_ephemeral(
             let root_page = return_if_io!(pager.btree_create(flag));
 
             let (_, cursor_type) = program.cursor_ref.get(cursor_id).unwrap();
-            let mv_cursor = match program.connection.mv_tx_id.get() {
-                Some(tx_id) => {
+            let mv_cursor = match program.connection.mv_tx.get() {
+                Some((tx_id, _)) => {
                     let table_id = root_page as u64;
                     let mv_store = mv_store.unwrap().clone();
                     let mv_cursor = Rc::new(RefCell::new(
@@ -7202,6 +7247,69 @@ pub fn op_open_ephemeral(
     Ok(InsnFunctionStepResult::Step)
 }
 
+pub fn op_open_dup(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+    mv_store: Option<&Arc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        OpenDup {
+            new_cursor_id,
+            original_cursor_id,
+        },
+        insn
+    );
+
+    let original_cursor = state.get_cursor(*original_cursor_id);
+    let original_cursor = original_cursor.as_btree_mut();
+
+    let root_page = original_cursor.root_page();
+    // We use the pager from the original cursor instead of the one attached to
+    // the connection because each ephemeral table creates its own pager (and
+    // a separate database file).
+    let pager = &original_cursor.pager;
+
+    let mv_cursor = match program.connection.mv_tx.get() {
+        Some((tx_id, _)) => {
+            let table_id = root_page as u64;
+            let mv_store = mv_store.unwrap().clone();
+            let mv_cursor = Rc::new(RefCell::new(MvCursor::new(
+                mv_store,
+                tx_id,
+                table_id,
+                pager.clone(),
+            )?));
+            Some(mv_cursor)
+        }
+        None => None,
+    };
+
+    let (_, cursor_type) = program.cursor_ref.get(*original_cursor_id).unwrap();
+    match cursor_type {
+        CursorType::BTreeTable(table) => {
+            let cursor =
+                BTreeCursor::new_table(mv_cursor, pager.clone(), root_page, table.columns.len());
+            let cursors = &mut state.cursors;
+            cursors
+                .get_mut(*new_cursor_id)
+                .unwrap()
+                .replace(Cursor::new_btree(cursor));
+        }
+        CursorType::BTreeIndex(table) => {
+            // In principle, we could implement OpenDup for BTreeIndex,
+            // but doing so now would create dead code since we have no use case,
+            // and it wouldn't be possible to test it.
+            unimplemented!("OpenDup is not supported for BTreeIndex yet")
+        }
+        _ => panic!("OpenDup is not supported for {cursor_type:?}"),
+    }
+
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
 /// Execute the [Insn::Once] instruction.
 ///
 /// This instruction is used to execute a block of code only once.
@@ -7210,7 +7318,7 @@ pub fn op_once(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -7234,7 +7342,7 @@ pub fn op_found(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let (cursor_id, target_pc, record_reg, num_regs) = match insn {
@@ -7296,7 +7404,7 @@ pub fn op_affinity(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -7330,7 +7438,7 @@ pub fn op_count(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -7373,7 +7481,7 @@ pub fn op_integrity_check(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -7453,7 +7561,7 @@ pub fn op_cast(
     _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    _pager: &Rc<Pager>,
+    _pager: &Arc<Pager>,
     _mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Cast { reg, affinity }, insn);
@@ -7476,7 +7584,7 @@ pub fn op_rename_table(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(RenameTable { from, to }, insn);
@@ -7520,7 +7628,7 @@ pub fn op_drop_column(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -7557,7 +7665,7 @@ pub fn op_add_column(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(AddColumn { table, column }, insn);
@@ -7588,7 +7696,7 @@ pub fn op_alter_column(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -7652,7 +7760,7 @@ pub fn op_if_neg(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(IfNeg { reg, target_pc }, insn);
@@ -9087,7 +9195,7 @@ pub fn op_max_pgcnt(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(MaxPgcnt { db, dest, new_max }, insn);
@@ -9115,7 +9223,7 @@ pub fn op_journal_mode(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(JournalMode { db, dest, new_mode }, insn);

@@ -679,6 +679,15 @@ pub enum Insn {
         func: AggFunc,
     },
 
+    /// Similar to AggFinal, but instead of writing the result back into the
+    /// accumulator register, it stores the result in a separate destination
+    /// register.
+    AggValue {
+        acc_reg: usize,
+        dest_reg: usize,
+        func: AggFunc,
+    },
+
     /// Open a sorter.
     SorterOpen {
         cursor_id: CursorID,                   // P1
@@ -847,6 +856,18 @@ pub enum Insn {
         is_temp: usize,
     },
 
+    /// Deletes all contents from the ephemeral table that the cursor points to.
+    ///
+    /// In Turso, we do not currently distinguish strictly between ephemeral
+    /// and standard tables at the type level. Therefore, it is the caller’s
+    /// responsibility to ensure that `ResetSorter` is applied only to ephemeral
+    /// tables.
+    ///
+    /// SQLite also supports sorter cursors, but this is not yet implemented in Turso.
+    ResetSorter {
+        cursor_id: CursorID,
+    },
+
     ///  Drop a table
     DropTable {
         ///  The database within which this b-tree needs to be dropped (P1).
@@ -999,6 +1020,17 @@ pub enum Insn {
     /// Works the same as OpenEphemeral, name just distinguishes its use; used for transient indexes in joins.
     OpenAutoindex {
         cursor_id: usize,
+    },
+    /// Opens a new cursor that points to the same table as the original.
+    /// In SQLite, this is restricted to cursors opened by `OpenEphemeral`
+    /// (i.e., ephemeral tables), and only ephemeral cursors may be duplicated.
+    /// In Turso, we currently do not strictly distinguish between ephemeral
+    /// and standard tables at the type level. Therefore, it is the caller’s
+    /// responsibility to ensure that `OpenDup` is applied only to ephemeral
+    /// cursors.
+    OpenDup {
+        new_cursor_id: CursorID,
+        original_cursor_id: CursorID,
     },
     /// Fall through to the next instruction on the first invocation, otherwise jump to target_pc
     Once {
@@ -1163,7 +1195,6 @@ impl InsnVariants {
             InsnVariants::VUpdate => execute::op_vupdate,
             InsnVariants::VNext => execute::op_vnext,
             InsnVariants::VDestroy => execute::op_vdestroy,
-
             InsnVariants::OpenPseudo => execute::op_open_pseudo,
             InsnVariants::Rewind => execute::op_rewind,
             InsnVariants::Last => execute::op_last,
@@ -1201,7 +1232,7 @@ impl InsnVariants {
             InsnVariants::IdxLT => execute::op_idx_lt,
             InsnVariants::DecrJumpZero => execute::op_decr_jump_zero,
             InsnVariants::AggStep => execute::op_agg_step,
-            InsnVariants::AggFinal => execute::op_agg_final,
+            InsnVariants::AggFinal |  InsnVariants::AggValue  => execute::op_agg_final,
             InsnVariants::SorterOpen => execute::op_sorter_open,
             InsnVariants::SorterInsert => execute::op_sorter_insert,
             InsnVariants::SorterSort => execute::op_sorter_sort,
@@ -1226,6 +1257,7 @@ impl InsnVariants {
             InsnVariants::Copy => execute::op_copy,
             InsnVariants::CreateBtree => execute::op_create_btree,
             InsnVariants::Destroy => execute::op_destroy,
+            InsnVariants::ResetSorter => execute::op_reset_sorter,
 
             InsnVariants::DropTable => execute::op_drop_table,
             InsnVariants::DropView => execute::op_drop_view,
@@ -1262,6 +1294,7 @@ impl InsnVariants {
             InsnVariants::JournalMode => execute::op_journal_mode,
             InsnVariants::IfNeg => execute::op_if_neg,
             InsnVariants::Explain => execute::op_noop,
+            InsnVariants::OpenDup => execute::op_open_dup,
         }
     }
 }

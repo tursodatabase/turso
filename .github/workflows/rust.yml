@@ -42,10 +42,14 @@ jobs:
         run: |
           cargo test --features encryption --color=always --test integration_tests query_processing::encryption
           cargo test --features encryption --color=always --lib storage::encryption
+      - name: Test Checksums
+        run: |
+          cargo test --features checksum --color=always --lib storage::checksum
+          cargo test --features checksum --color=always --test integration_tests storage::checksum
       - name: Test
         env:
           RUST_LOG: ${{ runner.debug && 'turso_core::storage=trace' || '' }}
-        run: cargo test --verbose
+        run: cargo test --verbose --features checksum
         timeout-minutes: 20
 
   clippy:
