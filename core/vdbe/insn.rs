@@ -1232,7 +1232,7 @@ impl InsnVariants {
             InsnVariants::IdxLT => execute::op_idx_lt,
             InsnVariants::DecrJumpZero => execute::op_decr_jump_zero,
             InsnVariants::AggStep => execute::op_agg_step,
-            InsnVariants::AggFinal |  InsnVariants::AggValue  => execute::op_agg_final,
+            InsnVariants::AggFinal | InsnVariants::AggValue => execute::op_agg_final,
             InsnVariants::SorterOpen => execute::op_sorter_open,
             InsnVariants::SorterInsert => execute::op_sorter_insert,
             InsnVariants::SorterSort => execute::op_sorter_sort,
