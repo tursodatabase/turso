@@ -1,4 +1,5 @@
 use crate::incremental::view::IncrementalView;
+use parking_lot::RwLock;
 
 /// Simple view structure for non-materialized views
 #[derive(Debug, Clone)]
@@ -24,10 +25,8 @@ use crate::{
 };
 use crate::{util::normalize_ident, Result};
 use core::fmt;
-use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::ops::Deref;
-use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::Mutex;
 use tracing::trace;
@@ -293,7 +292,7 @@ impl Schema {
     /// Update [Schema] by scanning the first root page (sqlite_schema)
     pub fn make_from_btree(
         &mut self,
-        mv_cursor: Option<Rc<RefCell<MvCursor>>>,
+        mv_cursor: Option<Arc<RwLock<MvCursor>>>,
         pager: Arc<Pager>,
         syms: &SymbolTable,
     ) -> Result<()> {

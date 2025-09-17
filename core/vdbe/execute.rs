@@ -37,7 +37,6 @@ use std::env::temp_dir;
 use std::ops::DerefMut;
 use std::{
     borrow::BorrowMut,
-    rc::Rc,
     sync::{Arc, Mutex},
 };
 use turso_macros::match_ignore_ascii_case;
@@ -82,7 +81,7 @@ use super::{
     sorter::Sorter,
 };
 use regex::{Regex, RegexBuilder};
-use std::{cell::RefCell, collections::HashMap};
+use std::collections::HashMap;
 
 #[cfg(feature = "json")]
 use crate::{
@@ -944,7 +943,7 @@ pub fn op_open_read(
         Some((tx_id, _)) => {
             let table_id = *root_page as u64;
             let mv_store = mv_store.unwrap().clone();
-            let mv_cursor = Rc::new(RefCell::new(
+            let mv_cursor = Arc::new(RwLock::new(
                 MvCursor::new(mv_store, tx_id, table_id, pager.clone()).unwrap(),
             ));
             Some(mv_cursor)
@@ -6007,7 +6006,7 @@ pub fn op_new_rowid(
             let cursor = state.get_cursor(*cursor);
             let cursor = cursor.as_btree_mut();
             let mvcc_cursor = cursor.get_mvcc_cursor();
-            let mut mvcc_cursor = RefCell::borrow_mut(&mvcc_cursor);
+            let mut mvcc_cursor = mvcc_cursor.write();
             mvcc_cursor.get_next_rowid()
         };
         state.registers[*rowid_reg] = Register::Value(Value::Integer(rowid));
@@ -6387,7 +6386,7 @@ pub fn op_open_write(
         Some((tx_id, _)) => {
             let table_id = root_page;
             let mv_store = mv_store.unwrap().clone();
-            let mv_cursor = Rc::new(RefCell::new(
+            let mv_cursor = Arc::new(RwLock::new(
                 MvCursor::new(mv_store.clone(), tx_id, table_id, pager.clone()).unwrap(),
             ));
             Some(mv_cursor)
@@ -7160,7 +7159,7 @@ pub fn op_open_ephemeral(
                 Some((tx_id, _)) => {
                     let table_id = root_page as u64;
                     let mv_store = mv_store.unwrap().clone();
-                    let mv_cursor = Rc::new(RefCell::new(
+                    let mv_cursor = Arc::new(RwLock::new(
                         MvCursor::new(mv_store.clone(), tx_id, table_id, pager.clone()).unwrap(),
                     ));
                     Some(mv_cursor)
@@ -7266,7 +7265,7 @@ pub fn op_open_dup(
         Some((tx_id, _)) => {
             let table_id = root_page as u64;
             let mv_store = mv_store.unwrap().clone();
-            let mv_cursor = Rc::new(RefCell::new(MvCursor::new(
+            let mv_cursor = Arc::new(RwLock::new(MvCursor::new(
                 mv_store,
                 tx_id,
                 table_id,
