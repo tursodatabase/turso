@@ -418,6 +418,7 @@ impl TursoMcpServer {
                 None::<&str>,
                 OpenFlags::default(),
                 DatabaseOpts::new().with_indexes(true),
+                None,
             ) {
                 Ok((_io, db)) => match db.connect() {
                     Ok(c) => c,

@@ -138,6 +138,7 @@ impl<P: ProtocolIO> DatabaseSyncEngine<P> {
             db_file.clone(),
             OpenFlags::Create,
             turso_core::DatabaseOpts::new().with_indexes(true),
+            None,
         )?;
         let tape_opts = DatabaseTapeOpts {
             cdc_table: None,
@@ -183,6 +184,7 @@ impl<P: ProtocolIO> DatabaseSyncEngine<P> {
             self.db_file.clone(),
             OpenFlags::Create,
             turso_core::DatabaseOpts::new().with_indexes(true),
+            None,
         )?;
         let conn = db.connect()?;
         conn.wal_auto_checkpoint_disable();
