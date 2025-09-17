@@ -873,6 +873,15 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 return Ok(TransitionResult::Continue);
             }
             CommitState::EndCommitLogicalLog { end_ts } => {
+                let connection = self.connection.clone();
+                let schema_did_change = match connection.transaction_state.get() {
+                    crate::TransactionState::Write { schema_did_change } => schema_did_change,
+                    _ => false,
+                };
+                if schema_did_change {
+                    let schema = connection.schema.borrow().clone();
+                    connection._db.update_schema_if_newer(schema)?;
+                }
                 if mvcc_store.storage.is_logical_log() {
                     let tx = mvcc_store.txs.get(&self.tx_id).unwrap();
                     let tx_unlocked = tx.value();
