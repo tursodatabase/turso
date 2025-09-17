@@ -6,7 +6,6 @@ use crate::{Connection, LimboError, SymbolTable, Value};
 use std::cell::RefCell;
 use std::ffi::c_void;
 use std::ptr::NonNull;
-use std::rc::Rc;
 use std::sync::Arc;
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind, VTabModuleImpl};
 use turso_parser::{ast, parser::Parser};
@@ -217,7 +216,7 @@ impl VirtualTableCursor {
 
 #[derive(Clone, Debug)]
 pub(crate) struct ExtVirtualTable {
-    implementation: Rc<VTabModuleImpl>,
+    implementation: Arc<VTabModuleImpl>,
     table_ptr: *const c_void,
 }
 
@@ -243,7 +242,7 @@ impl ExtVirtualTable {
     /// takes ownership of the provided Args
     fn create(
         module_name: &str,
-        module: Option<&Rc<crate::ext::VTabImpl>>,
+        module: Option<&Arc<crate::ext::VTabImpl>>,
         args: Vec<turso_ext::Value>,
         kind: VTabKind,
     ) -> crate::Result<(Self, String)> {
@@ -326,14 +325,14 @@ pub struct ExtVirtualTableCursor {
     // the core `[Connection]` pointer the vtab module needs to
     // query other internal tables.
     conn_ptr: Option<NonNull<turso_ext::Conn>>,
-    implementation: Rc<VTabModuleImpl>,
+    implementation: Arc<VTabModuleImpl>,
 }
 
 impl ExtVirtualTableCursor {
     fn new(
         cursor: NonNull<c_void>,
         conn_ptr: NonNull<turso_ext::Conn>,
-        implementation: Rc<VTabModuleImpl>,
+        implementation: Arc<VTabModuleImpl>,
     ) -> crate::Result<Self> {
         Ok(Self {
             cursor,
