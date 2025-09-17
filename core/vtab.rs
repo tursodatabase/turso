@@ -429,7 +429,7 @@ impl Drop for ExtVirtualTableCursor {
     }
 }
 
-pub trait InternalVirtualTable: std::fmt::Debug {
+pub trait InternalVirtualTable: std::fmt::Debug + Send + Sync {
     fn name(&self) -> String;
     fn open(
         &self,
@@ -444,7 +444,7 @@ pub trait InternalVirtualTable: std::fmt::Debug {
     fn sql(&self) -> String;
 }
 
-pub trait InternalVirtualTableCursor {
+pub trait InternalVirtualTableCursor: Send + Sync {
     /// next returns `Ok(true)` if there are more rows, and `Ok(false)` otherwise.
     fn next(&mut self) -> Result<bool, LimboError>;
     fn rowid(&self) -> i64;
