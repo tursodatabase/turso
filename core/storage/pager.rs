@@ -1327,6 +1327,26 @@ impl Pager {
         sync_mode: crate::SyncMode,
         data_sync_retry: bool,
     ) -> Result<IOResult<PagerCommitResult>> {
+        match self.commit_dirty_pages_inner(
+            wal_auto_checkpoint_disabled,
+            sync_mode,
+            data_sync_retry,
+        ) {
+            r @ (Ok(IOResult::Done(..)) | Err(..)) => {
+                self.commit_info.state.set(CommitState::PrepareWal);
+                r
+            }
+            Ok(IOResult::IO(io)) => Ok(IOResult::IO(io)),
+        }
+    }
+
+    #[instrument(skip_all, level = Level::DEBUG)]
+    fn commit_dirty_pages_inner(
+        &self,
+        wal_auto_checkpoint_disabled: bool,
+        sync_mode: crate::SyncMode,
+        data_sync_retry: bool,
+    ) -> Result<IOResult<PagerCommitResult>> {
         let Some(wal) = self.wal.as_ref() else {
             return Err(LimboError::InternalError(
                 "commit_dirty_pages() called on database without WAL".to_string(),
