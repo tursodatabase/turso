@@ -7232,7 +7232,7 @@ pub fn op_open_ephemeral(
                 Arc::new(Mutex::new(())),
             )?);
 
-            pager.page_size.set(Some(page_size));
+            pager.set_page_size(page_size);
 
             state.op_open_ephemeral_state = OpOpenEphemeralState::StartingTxn { pager };
         }

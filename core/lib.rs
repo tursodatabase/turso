@@ -478,7 +478,7 @@ impl Database {
     pub fn connect(self: &Arc<Database>) -> Result<Arc<Connection>> {
         let pager = self.init_pager(None)?;
 
-        let page_size = pager.page_size.get().expect("page size not set");
+        let page_size = pager.get_page_size_unchecked();
 
         let default_cache_size = pager
             .io
@@ -646,7 +646,7 @@ impl Database {
                 db_state,
                 self.init_lock.clone(),
             )?;
-            pager.page_size.set(Some(page_size));
+            pager.set_page_size(page_size);
             if let Some(reserved_bytes) = reserved_bytes {
                 pager.set_reserved_space_bytes(reserved_bytes);
             }
@@ -676,7 +676,7 @@ impl Database {
             Arc::new(Mutex::new(())),
         )?;
 
-        pager.page_size.set(Some(page_size));
+        pager.set_page_size(page_size);
         if let Some(reserved_bytes) = reserved_bytes {
             pager.set_reserved_space_bytes(reserved_bytes);
         }

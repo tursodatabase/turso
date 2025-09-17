@@ -19,7 +19,7 @@ use std::cell::{Cell, RefCell, UnsafeCell};
 use std::collections::HashSet;
 use std::hash;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tracing::{instrument, trace, Level};
 
@@ -517,7 +517,7 @@ pub struct Pager {
     /// Cache page_size and reserved_space at Pager init and reuse for subsequent
     /// `usable_space` calls. TODO: Invalidate reserved_space when we add the functionality
     /// to change it.
-    pub(crate) page_size: Cell<Option<PageSize>>,
+    pub(crate) page_size: AtomicU32,
     reserved_space: Cell<Option<u8>>,
     free_page_state: RefCell<FreePageState>,
     /// Maximum number of pages allowed in the database. Default is 1073741823 (SQLite default).
@@ -620,7 +620,7 @@ impl Pager {
             db_state,
             init_lock,
             allocate_page1_state,
-            page_size: Cell::new(None),
+            page_size: AtomicU32::new(0), // 0 means not set
             reserved_space: Cell::new(None),
             free_page_state: RefCell::new(FreePageState::Start),
             allocate_page_state: RwLock::new(AllocatePageState::Start),
@@ -988,10 +988,13 @@ impl Pager {
     /// The usable size of a page might be an odd number. However, the usable size is not allowed to be less than 480.
     /// In other words, if the page size is 512, then the reserved space size cannot exceed 32.
     pub fn usable_space(&self) -> usize {
-        let page_size = *self.page_size.get().get_or_insert_with(|| {
-            self.io
+        let page_size = self.get_page_size().unwrap_or_else(|| {
+            let size = self
+                .io
                 .block(|| self.with_header(|header| header.page_size))
-                .unwrap_or_default()
+                .unwrap_or_default();
+            self.page_size.store(size.get(), Ordering::SeqCst);
+            size
         });
 
         let reserved_space = *self.reserved_space.get().get_or_insert_with(|| {
@@ -1006,7 +1009,29 @@ impl Pager {
     /// Set the initial page size for the database. Should only be called before the database is initialized
     pub fn set_initial_page_size(&self, size: PageSize) {
         assert_eq!(self.db_state.get(), DbState::Uninitialized);
-        self.page_size.replace(Some(size));
+        self.page_size.store(size.get(), Ordering::SeqCst);
+    }
+
+    /// Get the current page size. Returns None if not set yet.
+    pub fn get_page_size(&self) -> Option<PageSize> {
+        let value = self.page_size.load(Ordering::SeqCst);
+        if value == 0 {
+            None
+        } else {
+            PageSize::new(value)
+        }
+    }
+
+    /// Get the current page size, panicking if not set.
+    pub fn get_page_size_unchecked(&self) -> PageSize {
+        let value = self.page_size.load(Ordering::SeqCst);
+        assert_ne!(value, 0, "page size not set");
+        PageSize::new(value).expect("invalid page size stored")
+    }
+
+    /// Set the page size. Used internally when page size is determined.
+    pub fn set_page_size(&self, size: PageSize) {
+        self.page_size.store(size.get(), Ordering::SeqCst);
     }
 
     #[inline(always)]
@@ -1287,7 +1312,7 @@ impl Pager {
         let len = dirty_pages.len().min(IOV_MAX);
         let mut completions: Vec<Completion> = Vec::new();
         let mut pages = Vec::with_capacity(len);
-        let page_sz = self.page_size.get().unwrap_or_default();
+        let page_sz = self.get_page_size().unwrap_or_default();
 
         let prepare = wal.borrow_mut().prepare_wal_start(page_sz)?;
         if let Some(c) = prepare {
@@ -1384,7 +1409,7 @@ impl Pager {
             trace!(?state);
             match state {
                 CommitState::PrepareWal => {
-                    let page_sz = self.page_size.get().expect("page size not set");
+                    let page_sz = self.get_page_size_unchecked();
                     let c = wal.borrow_mut().prepare_wal_start(page_sz)?;
                     let Some(c) = c else {
                         self.commit_info.state.set(CommitState::GetDbSize);
@@ -1419,7 +1444,7 @@ impl Pager {
 
                     let mut completions = self.commit_info.completions.borrow_mut();
                     completions.clear();
-                    let page_sz = self.page_size.get().expect("page size not set");
+                    let page_sz = self.get_page_size_unchecked();
                     let mut pages: Vec<PageRef> = Vec::with_capacity(dirty_ids.len().min(IOV_MAX));
                     let total = dirty_ids.len();
                     let mut cache = self.page_cache.write();
@@ -1747,7 +1772,7 @@ impl Pager {
                         .io
                         .block(|| self.with_header(|header| header.database_size))?
                         .get();
-                    let page_size = self.page_size.get().unwrap_or_default();
+                    let page_size = self.get_page_size().unwrap_or_default();
                     let expected = (db_size * page_size.get()) as u64;
                     if expected < self.db_file.size()? {
                         if !checkpoint_result.db_truncate_sent {
@@ -1942,7 +1967,7 @@ impl Pager {
                 default_header.reserved_space = reserved_space_bytes;
                 self.reserved_space.set(Some(reserved_space_bytes));
 
-                if let Some(size) = self.page_size.get() {
+                if let Some(size) = self.get_page_size() {
                     default_header.page_size = size;
                 }
 
@@ -2317,7 +2342,7 @@ impl Pager {
         cipher_mode: CipherMode,
         key: &EncryptionKey,
     ) -> Result<()> {
-        let page_size = self.page_size.get().unwrap().get() as usize;
+        let page_size = self.get_page_size_unchecked().get() as usize;
         let encryption_ctx = EncryptionContext::new(cipher_mode, key, page_size)?;
         {
             let mut io_ctx = self.io_ctx.borrow_mut();

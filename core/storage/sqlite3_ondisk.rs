@@ -1000,13 +1000,22 @@ pub fn write_pages_vectored(
         return Ok(Vec::new());
     }
 
-    let page_sz = pager.page_size.get().expect("page size is not set").get() as usize;
-    let run_count = batch
-        .keys()
-        .zip(batch.keys().skip(1))
-        .filter(|(&curr, &next)| next != curr + 1)
-        .count()
-        + 1;
+    let page_sz = pager.get_page_size_unchecked().get() as usize;
+    // Count expected number of runs to create the atomic counter we need to track each batch
+    let mut run_count = 0;
+    let mut prev_id = None;
+    for &id in batch.keys() {
+        if let Some(prev) = prev_id {
+            if id != prev + 1 {
+                run_count += 1;
+            }
+        } else {
+            run_count = 1; // First run
+        }
+        prev_id = Some(id);
+    }
+
+    // Create the atomic counters
     let runs_left = Arc::new(AtomicUsize::new(run_count));
 
     const EST_BUFF_CAPACITY: usize = 32;
