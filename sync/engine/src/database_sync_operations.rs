@@ -216,7 +216,7 @@ pub async fn wal_pull_to_file_v1<C: ProtocolIO, Ctx>(
         encoding: PageUpdatesEncodingReq::Raw as i32,
         server_revision: String::new(),
         client_revision: revision.to_string(),
-        long_poll_timeout_ms: long_poll_timeout.map(|x| x.as_secs() as u32).unwrap_or(0),
+        long_poll_timeout_ms: long_poll_timeout.map(|x| x.as_millis() as u32).unwrap_or(0),
         server_pages: BytesMut::new().into(),
         client_pages: BytesMut::new().into(),
     };
@@ -807,12 +807,11 @@ pub async fn push_logical_changes<C: ProtocolIO, Ctx>(
             }),
             DatabaseTapeOperation::RowChange(change) => {
                 let replay_info = generator.replay_info(coro, &change).await?;
-                let change_type = (&change.change).into();
                 match change.change {
                     DatabaseTapeRowChangeType::Delete { before } => {
                         let values = generator.replay_values(
                             &replay_info,
-                            change_type,
+                            replay_info.change_type,
                             change.id,
                             before,
                             None,
@@ -829,7 +828,7 @@ pub async fn push_logical_changes<C: ProtocolIO, Ctx>(
                     DatabaseTapeRowChangeType::Insert { after } => {
                         let values = generator.replay_values(
                             &replay_info,
-                            change_type,
+                            replay_info.change_type,
                             change.id,
                             after,
                             None,
@@ -850,7 +849,7 @@ pub async fn push_logical_changes<C: ProtocolIO, Ctx>(
                     } => {
                         let values = generator.replay_values(
                             &replay_info,
-                            change_type,
+                            replay_info.change_type,
                             change.id,
                             after,
                             Some(updates),
@@ -871,7 +870,7 @@ pub async fn push_logical_changes<C: ProtocolIO, Ctx>(
                     } => {
                         let values = generator.replay_values(
                             &replay_info,
-                            change_type,
+                            replay_info.change_type,
                             change.id,
                             after,
                             None,
@@ -1361,7 +1360,7 @@ pub async fn wait_proto_message<Ctx, T: prost::Message + Default>(
             Error::DatabaseSyncEngineError(format!("unable to deserialize protobuf message: {e}"))
         })?;
         let _ = bytes.split_to(message_length + prefix_length);
-        tracing::debug!(
+        tracing::trace!(
             "wait_proto_message: elapsed={:?}",
             std::time::Instant::now().duration_since(start_time)
         );
