@@ -1956,7 +1956,7 @@ impl WalFile {
                         return_if_io!(self.truncate_log());
                     }
                     if mode.should_restart_log() {
-                        Self::unlock(&self.shared, None);
+                        Self::unlock_after_restart(&self.shared, None);
                     }
                     let mut checkpoint_result = {
                         let CheckpointState::Truncate {
@@ -2129,7 +2129,10 @@ impl WalFile {
                 let shared = self.shared.clone();
                 move |result| {
                     if let Err(err) = result {
-                        Self::unlock(&shared, Some(&LimboError::InternalError(err.to_string())));
+                        Self::unlock_after_restart(
+                            &shared,
+                            Some(&LimboError::InternalError(err.to_string())),
+                        );
                     } else {
                         tracing::trace!("WAL file truncated to 0 B");
                     }
@@ -2137,7 +2140,7 @@ impl WalFile {
             });
             let c = file
                 .truncate(0, c)
-                .inspect_err(|e| Self::unlock(&self.shared, Some(e)))?;
+                .inspect_err(|e| Self::unlock_after_restart(&self.shared, Some(e)))?;
             *truncate_sent = true;
             io_yield_one!(c);
         } else if !*sync_sent {
@@ -2145,19 +2148,23 @@ impl WalFile {
             let c = file
                 .sync(Completion::new_sync(move |result| {
                     if let Err(err) = result {
-                        Self::unlock(&shared, Some(&LimboError::InternalError(err.to_string())));
+                        Self::unlock_after_restart(
+                            &shared,
+                            Some(&LimboError::InternalError(err.to_string())),
+                        );
                     } else {
                         tracing::trace!("WAL file synced after reset/truncation");
                     }
                 }))
-                .inspect_err(|e| Self::unlock(&self.shared, Some(e)))?;
+                .inspect_err(|e| Self::unlock_after_restart(&self.shared, Some(e)))?;
             *sync_sent = true;
             io_yield_one!(c);
         }
         Ok(IOResult::Done(()))
     }
 
-    fn unlock(shared: &Arc<RwLock<WalFileShared>>, e: Option<&LimboError>) {
+    // unlock shared read locks taken by RESTART/TRUNCATE checkpoint modes
+    fn unlock_after_restart(shared: &Arc<RwLock<WalFileShared>>, e: Option<&LimboError>) {
         // release all read locks we just acquired, the caller will take care of the others
         let shared = shared.write();
         for idx in 1..shared.read_locks.len() {

@@ -23,7 +23,7 @@ fn test_schema_reprepare() {
                 assert_eq!(err.to_string(), "Parse error: no such column: x");
                 break;
             }
-            r => panic!("unexpected response: {:?}", r),
+            r => panic!("unexpected response: {r:?}"),
         }
     }
 
