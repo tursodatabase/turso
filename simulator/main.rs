@@ -247,6 +247,8 @@ fn run_simulator(
     env.clear_poison();
     let env = env.lock().unwrap();
 
+    env.io.print_stats();
+
     // No doublecheck, run shrinking if panicking or found a bug.
     match &result {
         SandboxedResult::Correct => {
@@ -312,6 +314,8 @@ fn run_simulator(
                     }),
                     last_execution,
                 );
+                env.clear_poison();
+                env.lock().unwrap().io.print_stats();
                 (shrunk_plan, shrunk)
             } else {
                 (plan.clone(), result.clone())
