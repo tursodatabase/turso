@@ -1408,8 +1408,49 @@ impl Wal for WalFile {
         Ok(pages)
     }
 
-    fn prepare_wal_start(&mut self, page_sz: PageSize) -> Result<Option<Completion>> {
-        self.ensure_header_if_needed(page_sz)
+    fn prepare_wal_start(&mut self, page_size: PageSize) -> Result<Option<Completion>> {
+        if self.get_shared().is_initialized()? {
+            return Ok(None);
+        }
+        tracing::debug!("ensure_header_if_needed");
+        self.last_checksum = {
+            let mut shared = self.get_shared_mut();
+            let checksum = {
+                let mut hdr = shared.wal_header.lock();
+                hdr.magic = if cfg!(target_endian = "big") {
+                    WAL_MAGIC_BE
+                } else {
+                    WAL_MAGIC_LE
+                };
+                if hdr.page_size == 0 {
+                    hdr.page_size = page_size.get();
+                }
+                if hdr.salt_1 == 0 && hdr.salt_2 == 0 {
+                    hdr.salt_1 = self.io.generate_random_number() as u32;
+                    hdr.salt_2 = self.io.generate_random_number() as u32;
+                }
+
+                // recompute header checksum
+                let prefix = &hdr.as_bytes()[..WAL_HEADER_SIZE - 8];
+                let use_native = (hdr.magic & 1) != 0;
+                let (c1, c2) = checksum_wal(prefix, &hdr, (0, 0), use_native);
+                hdr.checksum_1 = c1;
+                hdr.checksum_2 = c2;
+                (c1, c2)
+            };
+            shared.last_checksum = checksum;
+            checksum
+        };
+
+        self.max_frame = 0;
+        let shared = self.get_shared();
+        assert!(
+            shared.enabled.load(Ordering::Relaxed),
+            "WAL must be enabled"
+        );
+        let file = shared.file.as_ref().unwrap();
+        let c = sqlite3_ondisk::begin_write_wal_header(file, &shared.wal_header.lock())?;
+        Ok(Some(c))
     }
 
     fn prepare_wal_finish(&mut self) -> Result<Completion> {
@@ -1652,49 +1693,14 @@ impl WalFile {
 
     /// the WAL file has been truncated and we are writing the first
     /// frame since then. We need to ensure that the header is initialized.
-    fn ensure_header_if_needed(&mut self, page_size: PageSize) -> Result<Option<Completion>> {
-        if self.get_shared().is_initialized()? {
-            return Ok(None);
-        }
-        tracing::debug!("ensure_header_if_needed");
-        self.last_checksum = {
-            let mut shared = self.get_shared_mut();
-            let checksum = {
-                let mut hdr = shared.wal_header.lock();
-                hdr.magic = if cfg!(target_endian = "big") {
-                    WAL_MAGIC_BE
-                } else {
-                    WAL_MAGIC_LE
-                };
-                if hdr.page_size == 0 {
-                    hdr.page_size = page_size.get();
-                }
-                if hdr.salt_1 == 0 && hdr.salt_2 == 0 {
-                    hdr.salt_1 = self.io.generate_random_number() as u32;
-                    hdr.salt_2 = self.io.generate_random_number() as u32;
-                }
-
-                // recompute header checksum
-                let prefix = &hdr.as_bytes()[..WAL_HEADER_SIZE - 8];
-                let use_native = (hdr.magic & 1) != 0;
-                let (c1, c2) = checksum_wal(prefix, &hdr, (0, 0), use_native);
-                hdr.checksum_1 = c1;
-                hdr.checksum_2 = c2;
-                (c1, c2)
-            };
-            shared.last_checksum = checksum;
-            checksum
+    fn ensure_header_if_needed(&mut self, page_size: PageSize) -> Result<()> {
+        let Some(c) = self.prepare_wal_start(page_size)? else {
+            return Ok(());
         };
-
-        self.max_frame = 0;
-        let shared = self.get_shared();
-        assert!(
-            shared.enabled.load(Ordering::Relaxed),
-            "WAL must be enabled"
-        );
-        let file = shared.file.as_ref().unwrap();
-        let c = sqlite3_ondisk::begin_write_wal_header(file, &shared.wal_header.lock())?;
-        Ok(Some(c))
+        self.io.wait_for_completion(c)?;
+        let c = self.prepare_wal_finish()?;
+        self.io.wait_for_completion(c)?;
+        Ok(())
     }
 
     fn checkpoint_inner(
