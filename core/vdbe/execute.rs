@@ -9750,8 +9750,8 @@ mod tests {
         assert_eq!(input_str.exec_upper().unwrap(), expected_str);
 
         let input_int = Value::Integer(10);
-        assert_eq!(input_int.exec_upper().unwrap(), input_int);
-        assert_eq!(Value::Null.exec_upper().unwrap(), Value::Null)
+        assert_eq!(input_int.exec_upper().unwrap(), Value::build_text("10"));
+        assert_eq!(Value::Null.exec_upper(), None)
     }
 
     #[test]
@@ -9761,8 +9761,8 @@ mod tests {
         assert_eq!(input_str.exec_lower().unwrap(), expected_str);
 
         let input_int = Value::Integer(10);
-        assert_eq!(input_int.exec_lower().unwrap(), input_int);
-        assert_eq!(Value::Null.exec_lower().unwrap(), Value::Null)
+        assert_eq!(input_int.exec_lower().unwrap(), Value::build_text("10"));
+        assert_eq!(Value::Null.exec_lower(), None)
     }
 
     #[test]
@@ -10229,7 +10229,7 @@ mod tests {
         assert_eq!(input.exec_sign(), expected);
 
         let input = Value::build_text("abc");
-        let expected = Some(Value::Null);
+        let expected = None;
         assert_eq!(input.exec_sign(), expected);
 
         let input = Value::build_text("42");
@@ -10245,23 +10245,23 @@ mod tests {
         assert_eq!(input.exec_sign(), expected);
 
         let input = Value::Blob(b"abc".to_vec());
-        let expected = Some(Value::Null);
+        let expected = None;
         assert_eq!(input.exec_sign(), expected);
 
         let input = Value::Blob(b"42".to_vec());
-        let expected = Some(Value::Integer(1));
+        let expected = None;
         assert_eq!(input.exec_sign(), expected);
 
         let input = Value::Blob(b"-42".to_vec());
-        let expected = Some(Value::Integer(-1));
+        let expected = None;
         assert_eq!(input.exec_sign(), expected);
 
         let input = Value::Blob(b"0".to_vec());
-        let expected = Some(Value::Integer(0));
+        let expected = None;
         assert_eq!(input.exec_sign(), expected);
 
         let input = Value::Null;
-        let expected = Some(Value::Null);
+        let expected = None;
         assert_eq!(input.exec_sign(), expected);
     }
 
