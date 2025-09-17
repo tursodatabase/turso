@@ -7110,6 +7110,7 @@ pub fn op_open_ephemeral(
     match &mut state.op_open_ephemeral_state {
         OpOpenEphemeralState::Start => {
             tracing::trace!("Start");
+            let page_size = return_if_io!(pager.with_header(|header| header.page_size));
             let conn = program.connection.clone();
             let io = conn.pager.borrow().io.clone();
             let rand_num = io.generate_random_number();
@@ -7142,11 +7143,6 @@ pub fn op_open_ephemeral(
                 db_file_io = io;
             }
 
-            let page_size = pager
-                .io
-                .block(|| pager.with_header(|header| header.page_size))?
-                .get();
-
             let buffer_pool = program.connection._db.buffer_pool.clone();
             let page_cache = Arc::new(RwLock::new(PageCache::default()));
 
@@ -7159,12 +7155,6 @@ pub fn op_open_ephemeral(
                 Arc::new(AtomicDbState::new(DbState::Uninitialized)),
                 Arc::new(Mutex::new(())),
             )?);
-
-            let page_size = pager
-                .io
-                .block(|| pager.with_header(|header| header.page_size))
-                .unwrap_or_default();
-
             pager.page_size.set(Some(page_size));
 
             state.op_open_ephemeral_state = OpOpenEphemeralState::StartingTxn { pager };
