@@ -348,7 +348,7 @@ pub fn op_checkpoint(
         Ok(result) => Ok(result),
         Err(err) => {
             state.op_checkpoint_state = OpCheckpointState::StartCheckpoint;
-            return Err(err);
+            Err(err)
         }
     }
 }
