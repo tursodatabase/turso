@@ -25,7 +25,6 @@ use std::collections::HashSet;
 use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::ops::Bound;
-use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tracing::instrument;
@@ -303,7 +302,7 @@ struct CommitCoordinator {
 pub struct CommitStateMachine<Clock: LogicalClock> {
     state: CommitState,
     is_finalized: bool,
-    pager: Rc<Pager>,
+    pager: Arc<Pager>,
     tx_id: TxID,
     connection: Arc<Connection>,
     /// Write set sorted by table id and row id
@@ -351,7 +350,7 @@ pub struct DeleteRowStateMachine {
 impl<Clock: LogicalClock> CommitStateMachine<Clock> {
     fn new(
         state: CommitState,
-        pager: Rc<Pager>,
+        pager: Arc<Pager>,
         tx_id: TxID,
         connection: Arc<Connection>,
         commit_coordinator: Arc<CommitCoordinator>,
@@ -1306,7 +1305,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     /// to ensure exclusive write access as per SQLite semantics.
     pub fn begin_exclusive_tx(
         &self,
-        pager: Rc<Pager>,
+        pager: Arc<Pager>,
         maybe_existing_tx_id: Option<TxID>,
     ) -> Result<IOResult<TxID>> {
         self._begin_exclusive_tx(pager, false, maybe_existing_tx_id)
@@ -1318,7 +1317,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     /// to ensure exclusive write access as per SQLite semantics.
     pub fn upgrade_to_exclusive_tx(
         &self,
-        pager: Rc<Pager>,
+        pager: Arc<Pager>,
         maybe_existing_tx_id: Option<TxID>,
     ) -> Result<IOResult<TxID>> {
         self._begin_exclusive_tx(pager, true, maybe_existing_tx_id)
@@ -1331,7 +1330,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     #[instrument(skip_all, level = Level::DEBUG)]
     fn _begin_exclusive_tx(
         &self,
-        pager: Rc<Pager>,
+        pager: Arc<Pager>,
         is_upgrade_from_read: bool,
         maybe_existing_tx_id: Option<TxID>,
     ) -> Result<IOResult<TxID>> {
@@ -1390,7 +1389,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     /// This function starts a new transaction in the database and returns a `TxID` value
     /// that you can use to perform operations within the transaction. All changes made within the
     /// transaction are isolated from other transactions until you commit the transaction.
-    pub fn begin_tx(&self, pager: Rc<Pager>) -> Result<TxID> {
+    pub fn begin_tx(&self, pager: Arc<Pager>) -> Result<TxID> {
         let tx_id = self.get_tx_id();
         let begin_ts = self.get_timestamp();
         let tx = Transaction::new(tx_id, begin_ts);
@@ -1418,7 +1417,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     pub fn commit_tx(
         &self,
         tx_id: TxID,
-        pager: Rc<Pager>,
+        pager: Arc<Pager>,
         connection: &Arc<Connection>,
     ) -> Result<StateMachine<CommitStateMachine<Clock>>> {
         let state_machine: StateMachine<CommitStateMachine<Clock>> =
@@ -1444,7 +1443,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     pub fn rollback_tx(
         &self,
         tx_id: TxID,
-        pager: Rc<Pager>,
+        pager: Arc<Pager>,
         connection: &Connection,
     ) -> Result<()> {
         let tx_unlocked = self.txs.get(&tx_id).unwrap();
@@ -1679,7 +1678,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     ///
     /// # Arguments
     ///
-    pub fn maybe_initialize_table(&self, table_id: u64, pager: Rc<Pager>) -> Result<()> {
+    pub fn maybe_initialize_table(&self, table_id: u64, pager: Arc<Pager>) -> Result<()> {
         tracing::trace!("scan_row_ids_for_table(table_id={})", table_id);
 
         // First, check if the table is already loaded.
@@ -1698,7 +1697,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     /// Scans the table and inserts the rows into the database.
     ///
     /// This is initialization step for a table, where we still don't have any rows so we need to insert them if there are.
-    fn scan_load_table(&self, table_id: u64, pager: Rc<Pager>) -> Result<()> {
+    fn scan_load_table(&self, table_id: u64, pager: Arc<Pager>) -> Result<()> {
         let root_page = table_id as usize;
         let mut cursor = BTreeCursor::new_table(
             None, // No MVCC cursor for scanning

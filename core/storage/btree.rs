@@ -481,7 +481,7 @@ pub struct BTreeCursor {
     /// The multi-version cursor that is used to read and write to the database file.
     mv_cursor: Option<Rc<RefCell<MvCursor>>>,
     /// The pager that is used to read and write to the database file.
-    pub pager: Rc<Pager>,
+    pub pager: Arc<Pager>,
     /// Cached value of the usable space of a BTree page, since it is very expensive to call in a hot loop via pager.usable_space().
     /// This is OK to cache because both 'PRAGMA page_size' and '.filectrl reserve_bytes' only have an effect on:
     /// 1. an uninitialized database,
@@ -584,7 +584,7 @@ impl BTreeNodeState {
 impl BTreeCursor {
     pub fn new(
         mv_cursor: Option<Rc<RefCell<MvCursor>>>,
-        pager: Rc<Pager>,
+        pager: Arc<Pager>,
         root_page: usize,
         num_columns: usize,
     ) -> Self {
@@ -635,7 +635,7 @@ impl BTreeCursor {
 
     pub fn new_table(
         mv_cursor: Option<Rc<RefCell<MvCursor>>>,
-        pager: Rc<Pager>,
+        pager: Arc<Pager>,
         root_page: usize,
         num_columns: usize,
     ) -> Self {
@@ -644,7 +644,7 @@ impl BTreeCursor {
 
     pub fn new_index(
         mv_cursor: Option<Rc<RefCell<MvCursor>>>,
-        pager: Rc<Pager>,
+        pager: Arc<Pager>,
         root_page: usize,
         index: &Index,
         num_columns: usize,
@@ -5832,7 +5832,7 @@ impl std::fmt::Debug for IntegrityCheckState {
 pub fn integrity_check(
     state: &mut IntegrityCheckState,
     errors: &mut Vec<IntegrityCheckError>,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
 ) -> Result<IOResult<()>> {
     loop {
         let Some(IntegrityCheckPageEntry {
@@ -6108,7 +6108,7 @@ pub fn integrity_check(
 }
 
 pub fn btree_read_page(
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     page_idx: usize,
 ) -> Result<(Arc<Page>, Option<Completion>)> {
     pager.read_page(page_idx)
@@ -7476,7 +7476,7 @@ fn fill_cell_payload(
     cell_idx: usize,
     record: &ImmutableRecord,
     usable_space: usize,
-    pager: Rc<Pager>,
+    pager: Arc<Pager>,
     fill_cell_payload_state: &mut FillCellPayloadState,
 ) -> Result<IOResult<()>> {
     let overflow_page_pointer_size = 4;
@@ -7801,7 +7801,7 @@ mod tests {
 
     fn insert_record(
         cursor: &mut BTreeCursor,
-        pager: &Rc<Pager>,
+        pager: &Arc<Pager>,
         rowid: i64,
         val: Value,
     ) -> Result<(), LimboError> {
@@ -7888,7 +7888,7 @@ mod tests {
         }
     }
 
-    fn validate_btree(pager: Rc<Pager>, page_idx: usize) -> (usize, bool) {
+    fn validate_btree(pager: Arc<Pager>, page_idx: usize) -> (usize, bool) {
         let num_columns = 5;
         let cursor = BTreeCursor::new_table(None, pager.clone(), page_idx, num_columns);
         let (page, _c) = cursor.read_page(page_idx).unwrap();
@@ -7998,7 +7998,7 @@ mod tests {
         (depth.unwrap(), valid)
     }
 
-    fn format_btree(pager: Rc<Pager>, page_idx: usize, depth: usize) -> String {
+    fn format_btree(pager: Arc<Pager>, page_idx: usize, depth: usize) -> String {
         let num_columns = 5;
 
         let cursor = BTreeCursor::new_table(None, pager.clone(), page_idx, num_columns);
@@ -8056,7 +8056,7 @@ mod tests {
         }
     }
 
-    fn empty_btree() -> (Rc<Pager>, usize, Arc<Database>, Arc<Connection>) {
+    fn empty_btree() -> (Arc<Pager>, usize, Arc<Database>, Arc<Connection>) {
         #[allow(clippy::arc_with_non_send_sync)]
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db = Database::open_file(io.clone(), ":memory:", false, false).unwrap();
@@ -8739,7 +8739,7 @@ mod tests {
     }
 
     fn validate_expected_keys(
-        pager: &Rc<Pager>,
+        pager: &Arc<Pager>,
         cursor: &mut BTreeCursor,
         expected_keys: &[Vec<u8>],
         seed: u64,
@@ -8967,7 +8967,7 @@ mod tests {
     }
 
     #[allow(clippy::arc_with_non_send_sync)]
-    fn setup_test_env(database_size: u32) -> Rc<Pager> {
+    fn setup_test_env(database_size: u32) -> Arc<Pager> {
         let page_size = 512;
 
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
@@ -8985,7 +8985,7 @@ mod tests {
             buffer_pool.clone(),
         )));
 
-        let pager = Rc::new(
+        let pager = Arc::new(
             Pager::new(
                 db_file,
                 Some(wal),
@@ -10487,7 +10487,7 @@ mod tests {
         }
     }
 
-    fn insert_cell(cell_idx: u64, size: u16, page: PageRef, pager: Rc<Pager>) {
+    fn insert_cell(cell_idx: u64, size: u16, page: PageRef, pager: Arc<Pager>) {
         let mut payload = Vec::new();
         let regs = &[Register::Value(Value::Blob(vec![0; size as usize]))];
         let record = ImmutableRecord::from_registers(regs, regs.len());

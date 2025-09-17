@@ -38,7 +38,7 @@ pub struct MaterializedViewCursor {
     // Core components
     btree_cursor: Box<BTreeCursor>,
     view: Arc<Mutex<IncrementalView>>,
-    pager: Rc<Pager>,
+    pager: Arc<Pager>,
 
     // Current changes that are uncommitted
     uncommitted: RowKeyZSet,
@@ -65,7 +65,7 @@ impl MaterializedViewCursor {
     pub fn new(
         btree_cursor: Box<BTreeCursor>,
         view: Arc<Mutex<IncrementalView>>,
-        pager: Rc<Pager>,
+        pager: Arc<Pager>,
         tx_state: Rc<ViewTransactionState>,
     ) -> Result<Self> {
         Ok(Self {
@@ -302,7 +302,6 @@ mod tests {
     use super::*;
     use crate::util::IOExt;
     use crate::{Connection, Database, OpenFlags};
-    use std::rc::Rc;
     use std::sync::Arc;
 
     /// Helper to create a test connection with a table and materialized view
@@ -335,7 +334,7 @@ mod tests {
     /// Helper to create a test cursor for the materialized view
     fn create_test_cursor(
         conn: &Arc<Connection>,
-    ) -> Result<(MaterializedViewCursor, Rc<ViewTransactionState>, Rc<Pager>)> {
+    ) -> Result<(MaterializedViewCursor, Rc<ViewTransactionState>, Arc<Pager>)> {
         // Get the schema and view
         let view_mutex = conn
             .schema

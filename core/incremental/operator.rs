@@ -2239,7 +2239,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     /// Create a test pager for operator tests with both table and index
-    fn create_test_pager() -> (std::rc::Rc<crate::Pager>, usize, usize) {
+    fn create_test_pager() -> (std::sync::Arc<crate::Pager>, usize, usize) {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db = Database::open_file(io.clone(), ":memory:", false, false).unwrap();
         let conn = db.connect().unwrap();
@@ -2270,7 +2270,7 @@ mod tests {
     /// Returns a Delta with all the current aggregate values
     fn get_current_state_from_btree(
         agg: &AggregateOperator,
-        pager: &std::rc::Rc<crate::Pager>,
+        pager: &std::sync::Arc<crate::Pager>,
         cursors: &mut DbspStateCursors,
     ) -> Delta {
         let mut result = Delta::new();

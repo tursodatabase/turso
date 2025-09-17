@@ -2,7 +2,6 @@
 //! More info: https://www.sqlite.org/pragma.html.
 
 use chrono::Datelike;
-use std::rc::Rc;
 use std::sync::Arc;
 use turso_macros::match_ignore_ascii_case;
 use turso_parser::ast::{self, ColumnDefinition, Expr, Literal, Name};
@@ -39,7 +38,7 @@ pub fn translate_pragma(
     syms: &SymbolTable,
     name: &ast::QualifiedName,
     body: Option<ast::PragmaBody>,
-    pager: Rc<Pager>,
+    pager: Arc<Pager>,
     connection: Arc<crate::Connection>,
     mut program: ProgramBuilder,
 ) -> crate::Result<ProgramBuilder> {
@@ -90,7 +89,7 @@ fn update_pragma(
     schema: &Schema,
     syms: &SymbolTable,
     value: ast::Expr,
-    pager: Rc<Pager>,
+    pager: Arc<Pager>,
     connection: Arc<crate::Connection>,
     mut program: ProgramBuilder,
 ) -> crate::Result<(ProgramBuilder, TransactionMode)> {
@@ -373,7 +372,7 @@ fn query_pragma(
     pragma: PragmaName,
     schema: &Schema,
     value: Option<ast::Expr>,
-    pager: Rc<Pager>,
+    pager: Arc<Pager>,
     connection: Arc<crate::Connection>,
     mut program: ProgramBuilder,
 ) -> crate::Result<(ProgramBuilder, TransactionMode)> {
@@ -710,7 +709,7 @@ fn emit_columns_for_table_info(
 fn update_auto_vacuum_mode(
     auto_vacuum_mode: AutoVacuumMode,
     largest_root_page_number: u32,
-    pager: Rc<Pager>,
+    pager: Arc<Pager>,
 ) -> crate::Result<()> {
     pager.io.block(|| {
         pager.with_header_mut(|header| {
@@ -723,7 +722,7 @@ fn update_auto_vacuum_mode(
 
 fn update_cache_size(
     value: i64,
-    pager: Rc<Pager>,
+    pager: Arc<Pager>,
     connection: Arc<crate::Connection>,
 ) -> crate::Result<()> {
     let mut cache_size_unformatted: i64 = value;
