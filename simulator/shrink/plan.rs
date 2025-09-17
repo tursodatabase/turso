@@ -55,9 +55,6 @@ impl InteractionPlan {
             }
         }
 
-        // assert we always depend on some table for now
-        assert!(!depending_tables.is_empty());
-
         let before = self.plan.len();
 
         // Remove all properties after the failing one

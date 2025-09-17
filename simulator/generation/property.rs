@@ -1282,12 +1282,9 @@ fn property_double_create_failure<R: rand::Rng>(
     env: &SimulatorEnv,
     remaining: &Remaining,
 ) -> Property {
-    // Get a random table
-    let table = pick(&env.tables, rng);
     // Create the table
-    let create_query = Create {
-        table: table.clone(),
-    };
+    let create_query = Create::arbitrary(rng, env);
+    let table = &create_query.table;
 
     // Create random queries respecting the constraints
     let mut queries = Vec::new();

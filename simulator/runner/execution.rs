@@ -210,10 +210,9 @@ pub fn execute_interaction_turso(
             let assumption_result = interaction.execute_assumption(stack, env);
             stack.clear();
 
-            if assumption_result.is_err() {
-                tracing::warn!("assumption failed: {:?}", assumption_result);
-                todo!("remove assumptions");
-                // return Ok(ExecutionContinuation::NextProperty);
+            if let Err(err) = assumption_result {
+                tracing::warn!("assumption failed: {:?}", err);
+                return Err(err);
             }
         }
         InteractionType::Fault(_) => {
@@ -311,10 +310,9 @@ fn execute_interaction_rusqlite(
             let assumption_result = interaction.execute_assumption(stack, env);
             stack.clear();
 
-            if assumption_result.is_err() {
-                tracing::warn!("assumption failed: {:?}", assumption_result);
-                todo!("remove assumptions");
-                // return Ok(ExecutionContinuation::NextProperty);
+            if let Err(err) = assumption_result {
+                tracing::warn!("assumption failed: {:?}", err);
+                return Err(err);
             }
         }
         InteractionType::Fault(_) => {

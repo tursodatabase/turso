@@ -546,9 +546,7 @@ impl InteractionType {
                     &query_str[0..query_str.len().min(4096)],
                     err
                 );
-                if let Some(turso_core::LimboError::ParseError(e)) = err {
-                    panic!("Unexpected parse error: {e}");
-                }
+                // Do not panic on parse error, because DoubleCreateFailure relies on it
                 return Err(err.unwrap());
             }
             let rows = rows?;
