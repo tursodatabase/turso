@@ -159,7 +159,6 @@ pub enum InsnFunctionStepResult {
     IO(IOCompletions),
     Row,
     Interrupt,
-    Busy,
     Step,
 }
 
@@ -2205,11 +2204,7 @@ pub fn op_transaction(
                 !conn.is_nested_stmt.get(),
                 "nested stmt should not begin a new read transaction"
             );
-            let res = pager.begin_read_tx();
-            if let Err(LimboError::Busy) = res {
-                return Ok(InsnFunctionStepResult::Busy);
-            }
-            res?;
+            let res = pager.begin_read_tx()?;
         }
 
         if updated && matches!(new_transaction_state, TransactionState::Write { .. }) {
@@ -2227,7 +2222,7 @@ pub fn op_transaction(
                     conn.transaction_state.replace(TransactionState::None);
                 }
                 assert_eq!(conn.transaction_state.get(), current_state);
-                return Ok(InsnFunctionStepResult::Busy);
+                return Err(LimboError::Busy);
             }
             if let IOResult::IO(io) = begin_w_tx_res? {
                 // set the transaction state to pending so we don't have to

@@ -675,7 +675,7 @@ impl Program {
                     // Instruction interrupted - may resume at same PC
                     return Ok(StepResult::Interrupt);
                 }
-                Ok(InsnFunctionStepResult::Busy) => {
+                Err(LimboError::Busy) => {
                     // Instruction blocked - will retry at same PC
                     return Ok(StepResult::Busy);
                 }
