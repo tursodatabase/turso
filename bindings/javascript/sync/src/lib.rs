@@ -6,7 +6,7 @@ pub mod js_protocol_io;
 
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard},
+    sync::{Arc, Mutex, OnceLock, RwLock, RwLockReadGuard},
 };
 
 use napi::bindgen_prelude::{AsyncTask, Either5, Null};
@@ -149,6 +149,8 @@ impl SyncEngine {
     pub fn new(opts: SyncEngineOpts) -> napi::Result<Self> {
         // helpful for local debugging
         match opts.tracing.as_deref() {
+            Some("error") => init_tracing(LevelFilter::ERROR),
+            Some("warn") => init_tracing(LevelFilter::WARN),
             Some("info") => init_tracing(LevelFilter::INFO),
             Some("debug") => init_tracing(LevelFilter::DEBUG),
             Some("trace") => init_tracing(LevelFilter::TRACE),

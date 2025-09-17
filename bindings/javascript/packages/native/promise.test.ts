@@ -22,7 +22,7 @@ test('drizzle-orm', async () => {
     }
 })
 
-test('in-memory db', async () => {
+test('in-memory-db-async', async () => {
     const db = await connect(":memory:");
     await db.exec("CREATE TABLE t(x)");
     await db.exec("INSERT INTO t VALUES (1), (2), (3)");

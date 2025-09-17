@@ -510,10 +510,7 @@ if (!nativeBinding) {
 
 const { Database, Statement, GeneratorHolder, JsDataCompletion, JsProtocolIo, JsProtocolRequestBytes, SyncEngine, SyncEngineChanges, DatabaseChangeTypeJs, SyncEngineProtocolVersion } = nativeBinding
 export { Database }
-export { Opfs }
-export { OpfsFile }
 export { Statement }
-export { initThreadPool }
 export { GeneratorHolder }
 export { JsDataCompletion }
 export { JsProtocolIo }

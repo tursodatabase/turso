@@ -73,16 +73,6 @@ export declare class Database {
   ioLoopAsync(): Promise<void>
 }
 
-export declare class Opfs {
-  constructor()
-  connectDb(path: string, opts?: DatabaseOpts | undefined | null): Promise<unknown>
-  complete(completionNo: number, result: number): void
-}
-
-export declare class OpfsFile {
-
-}
-
 /** A prepared statement. */
 export declare class Statement {
   reset(): void
@@ -139,12 +129,6 @@ export declare class Statement {
 export interface DatabaseOpts {
   tracing?: string
 }
-
-/**
- * turso-db in the the browser requires explicit thread pool initialization
- * so, we just put no-op task on the thread pool and force emnapi to allocate web worker
- */
-export declare function initThreadPool(): Promise<unknown>
 export declare class GeneratorHolder {
   resumeSync(error?: string | undefined | null): GeneratorResponse
   resumeAsync(error?: string | undefined | null): Promise<unknown>

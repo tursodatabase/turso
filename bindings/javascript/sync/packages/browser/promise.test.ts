@@ -316,46 +316,71 @@ test('pull-push-concurrent', async () => {
     console.info(await db.stats());
 })
 
-test('concurrent-updates', async () => {
+test('concurrent-updates', { timeout: 60000 }, async () => {
     {
-        const db = await connect({ path: ':memory:', url: process.env.VITE_TURSO_DB_URL, longPollTimeoutMs: 5000 });
-        await db.exec("CREATE TABLE IF NOT EXISTS q(x TEXT PRIMARY KEY, y)");
-        await db.exec("DELETE FROM q");
+        const db = await connect({ path: ':memory:', url: process.env.VITE_TURSO_DB_URL, longPollTimeoutMs: 10 });
+        await db.exec("CREATE TABLE IF NOT EXISTS three(x TEXT PRIMARY KEY, y, z)");
+        await db.exec("DELETE FROM three");
         await db.push();
         await db.close();
     }
-    const db1 = await connect({ path: ':memory:', url: process.env.VITE_TURSO_DB_URL });
-    const db2 = await connect({ path: ':memory:', url: process.env.VITE_TURSO_DB_URL });
-    async function pull(db) {
+    let stop = false;
+    const dbs = [];
+    for (let i = 0; i < 8; i++) {
+        dbs.push(await connect({ path: ':memory:', url: process.env.VITE_TURSO_DB_URL }));
+    }
+    async function pull(db, i) {
         try {
+            console.info('pull', i);
             await db.pull();
         } catch (e) {
-            // ignore
+            console.error('pull', i, e);
         } finally {
-            setTimeout(async () => await pull(db), 0);
+            if (!stop) {
+                setTimeout(async () => await pull(db, i), 0);
+            }
         }
     }
-    async function push(db) {
+    async function push(db, i) {
         try {
+            console.info('push', i);
             await db.push();
         } catch (e) {
-            // ignore
+            console.error('push', i, e);
         } finally {
-            setTimeout(async () => await push(db), 0);
+            if (!stop) {
+                setTimeout(async () => await push(db, i), 0);
+            }
         }
     }
-    setTimeout(async () => await pull(db1), 0)
-    setTimeout(async () => await pull(db2), 0)
-    setTimeout(async () => await push(db1), 0)
-    setTimeout(async () => await push(db2), 0)
+    for (let i = 0; i < dbs.length; i++) {
+        setTimeout(async () => await pull(dbs[i], i), 0)
+        setTimeout(async () => await push(dbs[i], i), 0)
+    }
     for (let i = 0; i < 1000; i++) {
         try {
-            await db1.exec(`INSERT INTO q VALUES ('1', 0) ON CONFLICT DO UPDATE SET y = randomblob(128)`);
-            await db2.exec(`INSERT INTO q VALUES ('2', 0) ON CONFLICT DO UPDATE SET y = randomblob(128)`);
+            const tasks = [];
+            for (let s = 0; s < dbs.length; s++) {
+                tasks.push(dbs[s].exec(`INSERT INTO three VALUES ('${s}', 0, randomblob(128)) ON CONFLICT DO UPDATE SET y = y + 1, z = randomblob(128)`));
+            }
+            await Promise.all(tasks);
         } catch (e) {
             // ignore
         }
         await new Promise(resolve => setTimeout(resolve, 1));
+    }
+    stop = true;
+    await Promise.all(dbs.map(db => db.push()));
+    await Promise.all(dbs.map(db => db.pull()));
+    let results = [];
+    for (let i = 0; i < dbs.length; i++) {
+        results.push(await dbs[i].prepare('SELECT x, y FROM three').all());
+    }
+    for (let i = 0; i < dbs.length; i++) {
+        expect(results[i]).toEqual(results[0]);
+        for (let s = 0; s < dbs.length; s++) {
+            expect(results[i][s].y).toBeGreaterThan(500);
+        }
     }
 })
 

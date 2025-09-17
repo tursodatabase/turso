@@ -10,9 +10,9 @@
 //! - Iterating through query results
 //! - Managing the I/O event loop
 
-// #[cfg(feature = "browser")]
+#[cfg(feature = "browser")]
 pub mod browser;
-// #[cfg(feature = "browser")]
+#[cfg(feature = "browser")]
 use crate::browser::opfs;
 
 use napi::bindgen_prelude::*;
@@ -62,6 +62,8 @@ pub(crate) fn init_tracing(level_filter: Option<String>) {
         return;
     };
     let level_filter = match level_filter.as_ref() {
+        "error" => LevelFilter::ERROR,
+        "warn" => LevelFilter::WARN,
         "info" => LevelFilter::INFO,
         "debug" => LevelFilter::DEBUG,
         "trace" => LevelFilter::TRACE,
@@ -596,7 +598,12 @@ impl Statement {
     /// Finalizes the statement.
     #[napi]
     pub fn finalize(&self) -> Result<()> {
-        self.stmt.borrow_mut().take();
+        match self.stmt.try_borrow_mut() {
+            Ok(mut stmt) => {
+                stmt.take();
+            }
+            Err(err) => tracing::error!("borrow error: {:?}", err),
+        }
         Ok(())
     }
 }

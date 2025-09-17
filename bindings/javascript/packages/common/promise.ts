@@ -115,22 +115,17 @@ class Database {
     const db = this;
     const wrapTxn = (mode) => {
       return async (...bindParameters) => {
-        await this.execLock.acquire();
+        await db.exec("BEGIN " + mode);
+        db._inTransaction = true;
         try {
-          await db.exec("BEGIN " + mode);
-          db._inTransaction = true;
-          try {
-            const result = await fn(...bindParameters);
-            await db.exec("COMMIT");
-            db._inTransaction = false;
-            return result;
-          } catch (err) {
-            await db.exec("ROLLBACK");
-            db._inTransaction = false;
-            throw err;
-          }
-        } finally {
-          this.execLock.release();
+          const result = await fn(...bindParameters);
+          await db.exec("COMMIT");
+          db._inTransaction = false;
+          return result;
+        } catch (err) {
+          await db.exec("ROLLBACK");
+          db._inTransaction = false;
+          throw err;
         }
       };
     };
@@ -203,18 +198,11 @@ class Database {
       throw new TypeError("The database connection is not open");
     }
 
-    await this.execLock.acquire();
+    const stmt = this.prepare(sql);
     try {
-      const stmt = this.prepare(sql);
-      try {
-        await stmt.run();
-      } finally {
-        stmt.close();
-      }
-    } catch (err) {
-      throw convertError(err);
+      await stmt.run();
     } finally {
-      this.execLock.release();
+      stmt.close();
     }
   }
 
