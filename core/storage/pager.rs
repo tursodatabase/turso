@@ -504,9 +504,9 @@ pub struct Pager {
     /// Mutex for synchronizing database initialization to prevent race conditions
     init_lock: Arc<Mutex<()>>,
     /// The state of the current allocate page operation.
-    allocate_page_state: RefCell<AllocatePageState>,
+    allocate_page_state: RwLock<AllocatePageState>,
     /// The state of the current allocate page1 operation.
-    allocate_page1_state: RefCell<AllocatePage1State>,
+    allocate_page1_state: RwLock<AllocatePage1State>,
     /// Cache page_size and reserved_space at Pager init and reuse for subsequent
     /// `usable_space` calls. TODO: Invalidate reserved_space when we add the functionality
     /// to change it.
@@ -587,9 +587,9 @@ impl Pager {
         init_lock: Arc<Mutex<()>>,
     ) -> Result<Self> {
         let allocate_page1_state = if !db_state.is_initialized() {
-            RefCell::new(AllocatePage1State::Start)
+            RwLock::new(AllocatePage1State::Start)
         } else {
-            RefCell::new(AllocatePage1State::Done)
+            RwLock::new(AllocatePage1State::Done)
         };
         let now = io.now();
         Ok(Self {
@@ -614,7 +614,7 @@ impl Pager {
             page_size: Cell::new(None),
             reserved_space: Cell::new(None),
             free_page_state: RefCell::new(FreePageState::Start),
-            allocate_page_state: RefCell::new(AllocatePageState::Start),
+            allocate_page_state: RwLock::new(AllocatePageState::Start),
             max_page_count: Cell::new(DEFAULT_MAX_PAGE_COUNT),
             #[cfg(not(feature = "omit_autovacuum"))]
             ptrmap_get_state: RefCell::new(PtrMapGetState::Start),
@@ -1830,7 +1830,7 @@ impl Pager {
 
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn allocate_page1(&self) -> Result<IOResult<PageRef>> {
-        let state = self.allocate_page1_state.borrow().clone();
+        let state = self.allocate_page1_state.read().clone();
         match state {
             AllocatePage1State::Start => {
                 tracing::trace!("allocate_page1(Start)");
@@ -1880,8 +1880,7 @@ impl Pager {
                 );
                 let c = begin_write_btree_page(self, &page1)?;
 
-                self.allocate_page1_state
-                    .replace(AllocatePage1State::Writing { page: page1 });
+                *self.allocate_page1_state.write() = AllocatePage1State::Writing { page: page1 };
                 io_yield_one!(c);
             }
             AllocatePage1State::Writing { page } => {
@@ -1893,7 +1892,7 @@ impl Pager {
                     LimboError::InternalError(format!("Failed to insert page 1 into cache: {e:?}"))
                 })?;
                 self.db_state.set(DbState::Initialized);
-                self.allocate_page1_state.replace(AllocatePage1State::Done);
+                *self.allocate_page1_state.write() = AllocatePage1State::Done;
                 Ok(IOResult::Done(page.clone()))
             }
             AllocatePage1State::Done => unreachable!("cannot try to allocate page 1 again"),
@@ -1902,7 +1901,7 @@ impl Pager {
 
     pub fn allocating_page1(&self) -> bool {
         matches!(
-            *self.allocate_page1_state.borrow(),
+            *self.allocate_page1_state.read(),
             AllocatePage1State::Writing { .. }
         )
     }
@@ -1926,7 +1925,7 @@ impl Pager {
         let header = header_ref.borrow_mut();
 
         loop {
-            let mut state = self.allocate_page_state.borrow_mut();
+            let mut state = self.allocate_page_state.write();
             tracing::debug!("allocate_page(state={:?})", state);
             match &mut *state {
                 AllocatePageState::Start => {
@@ -2191,7 +2190,7 @@ impl Pager {
         self.syncing.store(false, Ordering::Relaxed);
         self.commit_info.state.set(CommitState::Start);
         self.commit_info.time.set(self.io.now());
-        self.allocate_page_state.replace(AllocatePageState::Start);
+        *self.allocate_page_state.write() = AllocatePageState::Start;
         self.free_page_state.replace(FreePageState::Start);
         #[cfg(not(feature = "omit_autovacuum"))]
         {
