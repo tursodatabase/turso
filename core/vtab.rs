@@ -3,7 +3,7 @@ use crate::pragma::{PragmaVirtualTable, PragmaVirtualTableCursor};
 use crate::schema::Column;
 use crate::util::columns_from_create_table_body;
 use crate::{Connection, LimboError, SymbolTable, Value};
-use std::cell::RefCell;
+use parking_lot::RwLock;
 use std::ffi::c_void;
 use std::ptr::NonNull;
 use std::sync::atomic::AtomicPtr;
@@ -15,7 +15,7 @@ use turso_parser::{ast, parser::Parser};
 pub(crate) enum VirtualTableType {
     Pragma(PragmaVirtualTable),
     External(ExtVirtualTable),
-    Internal(Arc<RefCell<dyn InternalVirtualTable>>),
+    Internal(Arc<RwLock<dyn InternalVirtualTable>>),
 }
 
 #[derive(Clone, Debug)]
@@ -65,7 +65,7 @@ impl VirtualTable {
             columns: Self::resolve_columns(json_each.sql())
                 .expect("internal table-valued function schema resolution should not fail"),
             kind: VTabKind::TableValuedFunction,
-            vtab_type: VirtualTableType::Internal(Arc::new(RefCell::new(json_each))),
+            vtab_type: VirtualTableType::Internal(Arc::new(RwLock::new(json_each))),
         };
 
         vec![Arc::new(json_each_virtual_table)]
@@ -131,7 +131,7 @@ impl VirtualTable {
                 Ok(VirtualTableCursor::External(table.open(conn.clone())?))
             }
             VirtualTableType::Internal(table) => {
-                Ok(VirtualTableCursor::Internal(table.borrow().open(conn)?))
+                Ok(VirtualTableCursor::Internal(table.read().open(conn)?))
             }
         }
     }
@@ -160,7 +160,7 @@ impl VirtualTable {
         match &self.vtab_type {
             VirtualTableType::Pragma(table) => table.best_index(constraints),
             VirtualTableType::External(table) => table.best_index(constraints, order_by),
-            VirtualTableType::Internal(table) => table.borrow().best_index(constraints, order_by),
+            VirtualTableType::Internal(table) => table.read().best_index(constraints, order_by),
         }
     }
 }
@@ -168,7 +168,7 @@ impl VirtualTable {
 pub enum VirtualTableCursor {
     Pragma(Box<PragmaVirtualTableCursor>),
     External(ExtVirtualTableCursor),
-    Internal(Arc<RefCell<dyn InternalVirtualTableCursor>>),
+    Internal(Arc<RwLock<dyn InternalVirtualTableCursor>>),
 }
 
 impl VirtualTableCursor {
@@ -176,7 +176,7 @@ impl VirtualTableCursor {
         match self {
             VirtualTableCursor::Pragma(cursor) => cursor.next(),
             VirtualTableCursor::External(cursor) => cursor.next(),
-            VirtualTableCursor::Internal(cursor) => cursor.borrow_mut().next(),
+            VirtualTableCursor::Internal(cursor) => cursor.write().next(),
         }
     }
 
@@ -184,7 +184,7 @@ impl VirtualTableCursor {
         match self {
             VirtualTableCursor::Pragma(cursor) => cursor.rowid(),
             VirtualTableCursor::External(cursor) => cursor.rowid(),
-            VirtualTableCursor::Internal(cursor) => cursor.borrow().rowid(),
+            VirtualTableCursor::Internal(cursor) => cursor.read().rowid(),
         }
     }
 
@@ -192,7 +192,7 @@ impl VirtualTableCursor {
         match self {
             VirtualTableCursor::Pragma(cursor) => cursor.column(column),
             VirtualTableCursor::External(cursor) => cursor.column(column),
-            VirtualTableCursor::Internal(cursor) => cursor.borrow().column(column),
+            VirtualTableCursor::Internal(cursor) => cursor.read().column(column),
         }
     }
 
@@ -208,9 +208,7 @@ impl VirtualTableCursor {
             VirtualTableCursor::External(cursor) => {
                 cursor.filter(idx_num, idx_str, arg_count, args)
             }
-            VirtualTableCursor::Internal(cursor) => {
-                cursor.borrow_mut().filter(&args, idx_str, idx_num)
-            }
+            VirtualTableCursor::Internal(cursor) => cursor.write().filter(&args, idx_str, idx_num),
         }
     }
 }
@@ -434,7 +432,7 @@ pub trait InternalVirtualTable: std::fmt::Debug + Send + Sync {
     fn open(
         &self,
         conn: Arc<Connection>,
-    ) -> crate::Result<Arc<RefCell<dyn InternalVirtualTableCursor>>>;
+    ) -> crate::Result<Arc<RwLock<dyn InternalVirtualTableCursor>>>;
     /// best_index is used by the optimizer. See the comment on `Table::best_index`.
     fn best_index(
         &self,
