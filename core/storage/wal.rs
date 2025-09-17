@@ -1439,7 +1439,7 @@ impl Wal for WalFile {
         );
         turso_assert!(
             self.get_shared().is_initialized()?,
-            "WAL must be prepared with prepare_append method"
+            "WAL must be prepared with prepare_wal_start/prepare_wal_finish method"
         );
 
         let (header, shared_page_size, epoch) = {
