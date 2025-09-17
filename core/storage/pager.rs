@@ -473,7 +473,7 @@ pub struct Pager {
     dirty_pages: Arc<RwLock<HashSet<usize, hash::BuildHasherDefault<hash::DefaultHasher>>>>,
 
     commit_info: CommitInfo,
-    checkpoint_state: RefCell<CheckpointState>,
+    checkpoint_state: RwLock<CheckpointState>,
     syncing: Rc<Cell<bool>>,
     auto_vacuum_mode: Cell<AutoVacuumMode>,
     /// 0 -> Database is empty,
@@ -584,7 +584,7 @@ impl Pager {
                 time: now.into(),
             },
             syncing: Rc::new(Cell::new(false)),
-            checkpoint_state: RefCell::new(CheckpointState::Checkpoint),
+            checkpoint_state: RwLock::new(CheckpointState::Checkpoint),
             buffer_pool,
             auto_vacuum_mode: Cell::new(AutoVacuumMode::None),
             db_state,
@@ -1541,7 +1541,7 @@ impl Pager {
             ));
         };
         loop {
-            let state = std::mem::take(&mut *self.checkpoint_state.borrow_mut());
+            let state = std::mem::take(&mut *self.checkpoint_state.write());
             trace!(?state);
             match state {
                 CheckpointState::Checkpoint => {
@@ -1551,18 +1551,16 @@ impl Pager {
                             upper_bound_inclusive: None
                         }
                     ));
-                    self.checkpoint_state
-                        .replace(CheckpointState::SyncDbFile { res });
+                    *self.checkpoint_state.write() = CheckpointState::SyncDbFile { res };
                 }
                 CheckpointState::SyncDbFile { res } => {
                     let c = sqlite3_ondisk::begin_sync(self.db_file.clone(), self.syncing.clone())?;
-                    self.checkpoint_state
-                        .replace(CheckpointState::CheckpointDone { res });
+                    *self.checkpoint_state.write() = CheckpointState::CheckpointDone { res };
                     io_yield_one!(c);
                 }
                 CheckpointState::CheckpointDone { res } => {
                     turso_assert!(!self.syncing.get(), "syncing should be done");
-                    self.checkpoint_state.replace(CheckpointState::Checkpoint);
+                    *self.checkpoint_state.write() = CheckpointState::Checkpoint;
                     return Ok(IOResult::Done(res));
                 }
             }
@@ -2159,7 +2157,7 @@ impl Pager {
     }
 
     fn reset_internal_states(&self) {
-        self.checkpoint_state.replace(CheckpointState::Checkpoint);
+        *self.checkpoint_state.write() = CheckpointState::Checkpoint;
         self.syncing.replace(false);
         self.commit_info.state.set(CommitState::Start);
         self.commit_info.time.set(self.io.now());
