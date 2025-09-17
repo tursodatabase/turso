@@ -167,7 +167,7 @@ impl SyncEngine {
             }
             #[cfg(feature = "browser")]
             {
-                Arc::new(turso_node::browser::Opfs::new()?)
+                turso_node::browser::opfs()
             }
         };
         Ok(SyncEngine {
