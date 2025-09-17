@@ -163,7 +163,7 @@ impl Database {
     /// Register any built-in extensions that can be stored on the Database so we do not have
     /// to register these once-per-connection, and the connection can just extend its symbol table
     pub fn register_global_builtin_extensions(&self) -> Result<(), String> {
-        let syms = self.builtin_syms.as_ptr();
+        let syms = self.builtin_syms.data_ptr();
         // Pass the mutex pointer and the appropriate handler
         let schema_mutex_ptr = &self.schema as *const Mutex<Arc<Schema>> as *mut Mutex<Arc<Schema>>;
         let ctx = Box::into_raw(Box::new(ExtensionCtx {
@@ -222,7 +222,7 @@ impl Connection {
         let schema_mutex_ptr =
             &self._db.schema as *const Mutex<Arc<Schema>> as *mut Mutex<Arc<Schema>>;
         let ctx = ExtensionCtx {
-            syms: self.syms.as_ptr(),
+            syms: self.syms.data_ptr(),
             schema: schema_mutex_ptr as *mut c_void,
         };
         let ctx = Box::into_raw(Box::new(ctx)) as *mut c_void;

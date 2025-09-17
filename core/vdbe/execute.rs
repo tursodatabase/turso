@@ -1078,12 +1078,9 @@ pub fn op_vcreate(
     };
     let conn = program.connection.clone();
     let table =
-        crate::VirtualTable::table(Some(&table_name), &module_name, args, &conn.syms.borrow())?;
+        crate::VirtualTable::table(Some(&table_name), &module_name, args, &conn.syms.read())?;
     {
-        conn.syms
-            .borrow_mut()
-            .vtabs
-            .insert(table_name, table.clone());
+        conn.syms.write().vtabs.insert(table_name, table.clone());
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -1261,7 +1258,7 @@ pub fn op_vdestroy(
     load_insn!(VDestroy { db, table_name }, insn);
     let conn = program.connection.clone();
     {
-        let Some(vtab) = conn.syms.borrow_mut().vtabs.remove(table_name) else {
+        let Some(vtab) = conn.syms.write().vtabs.remove(table_name) else {
             return Err(crate::LimboError::InternalError(
                 "Could not find Virtual Table to Destroy".to_string(),
             ));
@@ -6693,7 +6690,7 @@ pub fn op_parse_schema(
             parse_schema_rows(
                 stmt,
                 schema,
-                &conn.syms.borrow(),
+                &conn.syms.read(),
                 program.connection.mv_tx.get(),
                 existing_views,
             )
@@ -6708,7 +6705,7 @@ pub fn op_parse_schema(
             parse_schema_rows(
                 stmt,
                 schema,
-                &conn.syms.borrow(),
+                &conn.syms.read(),
                 program.connection.mv_tx.get(),
                 existing_views,
             )
