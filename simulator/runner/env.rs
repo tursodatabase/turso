@@ -200,26 +200,16 @@ impl SimulatorEnv {
         self.connections.iter_mut().for_each(|c| c.disconnect());
         self.rng = ChaCha8Rng::seed_from_u64(self.opts.seed);
 
-        let latency_prof = &self.profile.io.latency;
-
         let io: Arc<dyn SimIO> = if self.memory_io {
             Arc::new(MemorySimIO::new(
                 self.opts.seed,
                 self.opts.page_size,
-                latency_prof.latency_probability,
-                latency_prof.min_tick,
-                latency_prof.max_tick,
+                self.profile.io.clone(),
             ))
         } else {
             Arc::new(
-                SimulatorIO::new(
-                    self.opts.seed,
-                    self.opts.page_size,
-                    latency_prof.latency_probability,
-                    latency_prof.min_tick,
-                    latency_prof.max_tick,
-                )
-                .unwrap(),
+                SimulatorIO::new(self.opts.seed, self.opts.page_size, self.profile.io.clone())
+                    .unwrap(),
             )
         };
 
@@ -356,27 +346,10 @@ impl SimulatorEnv {
 
         profile.validate().unwrap();
 
-        let latency_prof = &profile.io.latency;
-
         let io: Arc<dyn SimIO> = if cli_opts.memory_io {
-            Arc::new(MemorySimIO::new(
-                seed,
-                opts.page_size,
-                latency_prof.latency_probability,
-                latency_prof.min_tick,
-                latency_prof.max_tick,
-            ))
+            Arc::new(MemorySimIO::new(seed, opts.page_size, profile.io.clone()))
         } else {
-            Arc::new(
-                SimulatorIO::new(
-                    seed,
-                    opts.page_size,
-                    latency_prof.latency_probability,
-                    latency_prof.min_tick,
-                    latency_prof.max_tick,
-                )
-                .unwrap(),
-            )
+            Arc::new(SimulatorIO::new(seed, opts.page_size, profile.io.clone()).unwrap())
         };
 
         let db = match Database::open_file(

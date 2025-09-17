@@ -4,12 +4,15 @@ use std::{
     sync::Arc,
 };
 
-use rand::Rng as _;
+use rand::{Rng as _, SeedableRng};
 use rand_chacha::ChaCha8Rng;
-use tracing::{Level, instrument};
+use tracing::{instrument, Level};
 use turso_core::{File, Result};
 
-use crate::runner::{FAULT_ERROR_MSG, clock::SimulatorClock};
+use crate::{
+    profiles::io::IOProfile,
+    runner::{clock::SimulatorClock, FAULT_ERROR_MSG},
+};
 pub(crate) struct SimulatorFile {
     pub path: String,
     pub(crate) inner: Arc<dyn File>,
@@ -37,11 +40,10 @@ pub(crate) struct SimulatorFile {
 
     pub(crate) rng: RefCell<ChaCha8Rng>,
 
-    pub latency_probability: u8,
-
     pub sync_completion: RefCell<Option<turso_core::Completion>>,
     pub queued_io: RefCell<Vec<DelayedIo>>,
     pub clock: Arc<SimulatorClock>,
+    pub io_profile: IOProfile,
 }
 
 type IoOperation = Box<dyn FnOnce(&SimulatorFile) -> Result<turso_core::Completion>>;
@@ -59,10 +61,45 @@ impl Debug for DelayedIo {
     }
 }
 
+enum OperationType {
+    Read,
+    Write,
+    WriteV,
+    Sync,
+    Truncate,
+}
+
 unsafe impl Send for SimulatorFile {}
 unsafe impl Sync for SimulatorFile {}
 
 impl SimulatorFile {
+    pub fn new(
+        path: &str,
+        file: Arc<dyn File>,
+        page_size: usize,
+        seed: u64,
+        io_profile: IOProfile,
+        clock: Arc<SimulatorClock>,
+    ) -> Self {
+        SimulatorFile {
+            path: path.to_string(),
+            inner: file,
+            fault: Cell::new(false),
+            nr_pread_faults: Cell::new(0),
+            nr_pwrite_faults: Cell::new(0),
+            nr_sync_faults: Cell::new(0),
+            nr_pread_calls: Cell::new(0),
+            nr_pwrite_calls: Cell::new(0),
+            nr_sync_calls: Cell::new(0),
+            page_size,
+            rng: RefCell::new(ChaCha8Rng::seed_from_u64(seed)),
+            sync_completion: RefCell::new(None),
+            queued_io: RefCell::new(Vec::new()),
+            clock,
+            io_profile,
+        }
+    }
+
     pub(crate) fn inject_fault(&self, fault: bool) {
         self.fault.replace(fault);
     }
@@ -100,7 +137,7 @@ impl SimulatorFile {
     fn generate_latency_duration(&self) -> Option<turso_core::Instant> {
         let mut rng = self.rng.borrow_mut();
         // Chance to introduce some latency
-        rng.random_bool(self.latency_probability as f64 / 100.0)
+        rng.random_bool(self.io_profile.latency.latency_probability as f64 / 100.0)
             .then(|| {
                 let now = self.clock.now();
                 let sum = now + std::time::Duration::from_millis(rng.random_range(5..20));
@@ -115,6 +152,21 @@ impl SimulatorFile {
             let _c = (io.op)(self)?;
         }
         Ok(())
+    }
+
+    fn should_fault(&self, op: OperationType) -> bool {
+        let profile = &self.io_profile;
+        if !profile.enable || !profile.fault.enable || !self.fault.get() {
+            return false;
+        }
+
+        match op {
+            OperationType::Read => profile.fault.read,
+            OperationType::Write => profile.fault.write,
+            OperationType::WriteV => profile.fault.writev,
+            OperationType::Sync => profile.fault.sync,
+            OperationType::Truncate => profile.fault.truncate,
+        }
     }
 }
 
@@ -139,7 +191,7 @@ impl File for SimulatorFile {
 
     fn pread(&self, pos: u64, c: turso_core::Completion) -> Result<turso_core::Completion> {
         self.nr_pread_calls.set(self.nr_pread_calls.get() + 1);
-        if self.fault.get() {
+        if self.should_fault(OperationType::Read) {
             tracing::debug!("pread fault");
             self.nr_pread_faults.set(self.nr_pread_faults.get() + 1);
             return Err(turso_core::LimboError::InternalError(
@@ -165,7 +217,7 @@ impl File for SimulatorFile {
         c: turso_core::Completion,
     ) -> Result<turso_core::Completion> {
         self.nr_pwrite_calls.set(self.nr_pwrite_calls.get() + 1);
-        if self.fault.get() {
+        if self.should_fault(OperationType::Write) {
             tracing::debug!("pwrite fault");
             self.nr_pwrite_faults.set(self.nr_pwrite_faults.get() + 1);
             return Err(turso_core::LimboError::InternalError(
@@ -186,7 +238,7 @@ impl File for SimulatorFile {
 
     fn sync(&self, c: turso_core::Completion) -> Result<turso_core::Completion> {
         self.nr_sync_calls.set(self.nr_sync_calls.get() + 1);
-        if self.fault.get() {
+        if self.should_fault(OperationType::Sync) {
             // TODO: Enable this when https://github.com/tursodatabase/turso/issues/2091 is fixed.
             tracing::debug!(
                 "ignoring sync fault because it causes false positives with current simulator design"
@@ -219,7 +271,7 @@ impl File for SimulatorFile {
         c: turso_core::Completion,
     ) -> Result<turso_core::Completion> {
         self.nr_pwrite_calls.set(self.nr_pwrite_calls.get() + 1);
-        if self.fault.get() {
+        if self.should_fault(OperationType::WriteV) {
             tracing::debug!("pwritev fault");
             self.nr_pwrite_faults.set(self.nr_pwrite_faults.get() + 1);
             return Err(turso_core::LimboError::InternalError(
@@ -245,7 +297,7 @@ impl File for SimulatorFile {
     }
 
     fn truncate(&self, len: u64, c: turso_core::Completion) -> Result<turso_core::Completion> {
-        if self.fault.get() {
+        if self.should_fault(OperationType::Truncate) {
             return Err(turso_core::LimboError::InternalError(
                 FAULT_ERROR_MSG.into(),
             ));

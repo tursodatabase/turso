@@ -5,11 +5,12 @@ use indexmap::IndexMap;
 use parking_lot::Mutex;
 use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
-use turso_core::{Clock, Completion, IO, Instant, OpenFlags, Result};
+use turso_core::{Clock, Completion, Instant, OpenFlags, Result, IO};
 
-use crate::runner::SimIO;
+use crate::profiles::io::IOProfile;
 use crate::runner::clock::SimulatorClock;
 use crate::runner::memory::file::MemorySimFile;
+use crate::runner::SimIO;
 
 /// File descriptor
 pub type Fd = String;
@@ -58,6 +59,20 @@ pub struct Operation {
 }
 
 impl Operation {
+    fn should_fault(&self, profile: &IOProfile) -> bool {
+        if !profile.enable || !profile.fault.enable || !self.fault {
+            return false;
+        }
+
+        match self.op {
+            OperationType::Read { .. } => profile.fault.read,
+            OperationType::Write { .. } => profile.fault.write,
+            OperationType::WriteV { .. } => profile.fault.writev,
+            OperationType::Sync { .. } => profile.fault.sync,
+            OperationType::Truncate { .. } => profile.fault.truncate,
+        }
+    }
+
     fn do_operation(self, files: &IndexMap<Fd, Arc<MemorySimFile>>) {
         let fd = self.fd;
         match self.op {
@@ -124,21 +139,15 @@ pub struct MemorySimIO {
     pub nr_run_once_faults: Cell<usize>,
     pub page_size: usize,
     seed: u64,
-    latency_probability: u8,
     clock: Arc<SimulatorClock>,
+    io_profile: IOProfile,
 }
 
 unsafe impl Send for MemorySimIO {}
 unsafe impl Sync for MemorySimIO {}
 
 impl MemorySimIO {
-    pub fn new(
-        seed: u64,
-        page_size: usize,
-        latency_probability: u8,
-        min_tick: u64,
-        max_tick: u64,
-    ) -> Self {
+    pub fn new(seed: u64, page_size: usize, io_profile: IOProfile) -> Self {
         let files = RefCell::new(IndexMap::new());
         let rng = RefCell::new(ChaCha8Rng::seed_from_u64(seed));
         let nr_run_once_faults = Cell::new(0);
@@ -150,12 +159,12 @@ impl MemorySimIO {
             nr_run_once_faults,
             page_size,
             seed,
-            latency_probability,
             clock: Arc::new(SimulatorClock::new(
                 ChaCha8Rng::seed_from_u64(seed),
-                min_tick,
-                max_tick,
+                io_profile.latency.min_tick,
+                io_profile.latency.max_tick,
             )),
+            io_profile,
         }
     }
 }
@@ -217,7 +226,7 @@ impl IO for MemorySimIO {
                 self.callbacks.clone(),
                 fd.clone(),
                 self.seed,
-                self.latency_probability,
+                self.io_profile.latency.latency_probability,
                 self.clock.clone(),
             ));
             files.insert(fd, file.clone());
@@ -246,7 +255,9 @@ impl IO for MemorySimIO {
             }
 
             if callback.time.is_none() || callback.time.is_some_and(|time| time < now) {
-                if callback.fault {
+                if callback.should_fault(&self.io_profile) {
+                    let file = files.get(callback.fd.as_str()).unwrap();
+                    file.update_fault_stats(&callback.op);
                     // Inject the fault by aborting the completion
                     completion.abort();
                     continue;
