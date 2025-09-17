@@ -76,6 +76,13 @@ impl Profile {
                 update_weight: 0,
                 ..Default::default()
             },
+            io: IOProfile {
+                fault: FaultProfile {
+                    read: false,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
             ..Default::default()
         };
 
