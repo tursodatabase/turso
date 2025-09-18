@@ -1344,7 +1344,7 @@ impl Pager {
 
         // Calculate journal offset - for SubJournal, offset is based on number of records
         // Each record consists of PAGE_ID_SIZE (usize) + page content
-        let page_size = self.page_size.get().unwrap().0.get() as usize;
+        let page_size = self.page_size.load(Ordering::SeqCst) as usize;
         let page_id_size = std::mem::size_of::<usize>(); // PAGE_ID_SIZE constant from sub_journal.rs
         let journal_offset = (sub_rec_idx * (page_id_size + page_size)) as i64;
 
@@ -1400,7 +1400,7 @@ impl Pager {
         // let p_done = BitVec::<usize>::new();
         match savepoint {
             Some(sp) => {
-                let page_size = self.page_size.get().unwrap().0.get();
+                let page_size = self.page_size.load(Ordering::SeqCst);
                 let mut offset = sp.sub_rec_idx * (4 + page_size) as usize;
                 self.wal
                     .as_ref()

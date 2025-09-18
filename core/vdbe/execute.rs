@@ -2320,6 +2320,9 @@ pub fn op_transaction_inner(
                             assert_eq!(conn.transaction_state.get(), current_state);
                             return Err(LimboError::Busy);
                         }
+                        if !conn.auto_commit.get() {
+                            pager.open_savepoint(conn.savepoint_stack.borrow().len())?;
+                        }
                         if let IOResult::IO(io) = begin_w_tx_res? {
                             // set the transaction state to pending so we don't have to
                             // end the read transaction.
@@ -2367,9 +2370,6 @@ pub fn op_transaction_inner(
 
                 state.pc += 1;
                 return Ok(InsnFunctionStepResult::Step);
-            }
-            if !conn.auto_commit.get() {
-                pager.open_savepoint(conn.savepoint_stack.borrow().len())?;
             }
         }
     }

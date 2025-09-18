@@ -120,7 +120,7 @@ unsafe impl Send for PoolInner {}
 
 impl Default for BufferPool {
     fn default() -> Self {
-        Self::new(Self::DEFAULT_ARENA_SIZE, Self::DEFAULT_PAGE_SIZE.into())
+        Self::new(Self::DEFAULT_ARENA_SIZE, Self::DEFAULT_PAGE_SIZE)
     }
 }
 
@@ -193,7 +193,7 @@ impl BufferPool {
     /// and the pool will temporarily return temporary buffers to prevent reallocation of the
     /// arena if the page size is set to something other than the default value.
     pub fn begin_init(io: &Arc<dyn IO>, arena_size: usize) -> Arc<Self> {
-        let pool = Arc::new(BufferPool::new(arena_size, Self::DEFAULT_PAGE_SIZE.into()));
+        let pool = Arc::new(BufferPool::new(arena_size, Self::DEFAULT_PAGE_SIZE));
         let inner = pool.inner_mut();
         // Just store the IO handle, don't create arena yet
         if inner.io.is_none() {

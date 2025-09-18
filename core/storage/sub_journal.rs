@@ -1,6 +1,6 @@
 //! # Subjournal
 //! Responsible to manage savepoints
-use std::sync::Arc;
+use std::sync::{atomic::Ordering, Arc};
 
 use crate::{
     io,
@@ -21,7 +21,7 @@ impl SubJournal {
         // We should be able to write on disk
         // but let's keep things simple for now
         let mem_io = io.get_memory_io();
-        let page_size = pager.page_size.get().unwrap().0.get();
+        let page_size = pager.page_size.load(Ordering::SeqCst);
 
         let file = mem_io.open_file("", io::OpenFlags::Create, true)?;
         let buffer_pool = Arc::new(BufferPool::new(
@@ -34,7 +34,7 @@ impl SubJournal {
 
     pub fn write_page(&self, pager: &Pager, page: &Page) -> Result<()> {
         // todo: use page from our own buffer pool
-        let page_size = pager.page_size.get().unwrap().0.get();
+        let page_size = pager.page_size.load(Ordering::SeqCst);
         let offset = (pager.n_records.get() * (PAGE_ID_SIZE + page_size as usize) as u32) as u64;
         let c = Completion::new_write(move |_| {});
         let buffer = Arc::new(Buffer::new_temporary(PAGE_ID_SIZE + page_size as usize));
@@ -42,7 +42,7 @@ impl SubJournal {
         page_frame[0..PAGE_ID_SIZE].copy_from_slice(&page.get().id.to_be_bytes());
         // todo: maybe save just the diff?
         let page_content = page.get().contents.as_ref().unwrap();
-        page_frame[PAGE_ID_SIZE..].copy_from_slice(&page_content.as_ptr());
+        page_frame[PAGE_ID_SIZE..].copy_from_slice(page_content.as_ptr());
         let _ = self.file.pwrite(offset, buffer, c)?;
 
         pager.n_records.update(|x| x + 1);

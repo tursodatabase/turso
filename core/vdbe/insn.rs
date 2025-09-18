@@ -1141,14 +1141,6 @@ pub enum Insn {
     },
 }
 
-/// Savepoint operation types
-#[derive(Clone, Copy, Debug)]
-pub enum SavepointOp {
-    Begin = 0,
-    Release = 1,
-    Rollback = 2,
-}
-
 const fn get_insn_virtual_table() -> [InsnFunction; InsnVariants::COUNT] {
     let mut result: [InsnFunction; InsnVariants::COUNT] = [execute::op_init; InsnVariants::COUNT];
 

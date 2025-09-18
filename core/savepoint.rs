@@ -64,6 +64,12 @@ pub struct PagerSavepointVec {
     savepoints: VecDeque<PagerSavepoint>,
 }
 
+impl Default for PagerSavepointVec {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PagerSavepointVec {
     pub fn new() -> Self {
         Self {
