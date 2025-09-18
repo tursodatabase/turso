@@ -996,7 +996,7 @@ pub fn write_pages_vectored(
     done_flag: Arc<AtomicBool>,
 ) -> Result<Vec<Completion>> {
     if batch.is_empty() {
-        done_flag.store(true, Ordering::Relaxed);
+        done_flag.store(true, Ordering::SeqCst);
         return Ok(Vec::new());
     }
 
