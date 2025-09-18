@@ -13,7 +13,11 @@ use serde::{Deserialize, Serialize};
 use sql_generation::{
     generation::{Arbitrary, ArbitraryFrom, GenerationContext, frequency, query::SelectFree},
     model::{
-        query::{Create, CreateIndex, Delete, Drop, Insert, Select, update::Update},
+        query::{
+            Create, CreateIndex, Delete, Drop, Insert, Select,
+            transaction::{Begin, Commit},
+            update::Update,
+        },
         table::SimValue,
     },
 };
@@ -32,10 +36,46 @@ pub(crate) type ResultSet = Result<Vec<Vec<SimValue>>>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct InteractionPlan {
-    pub(crate) plan: Vec<Interactions>,
+    pub plan: Vec<Interactions>,
+    pub mvcc: bool,
 }
 
 impl InteractionPlan {
+    pub(crate) fn new(mvcc: bool) -> Self {
+        Self {
+            plan: Vec::new(),
+            mvcc,
+        }
+    }
+
+    pub fn new_with(plan: Vec<Interactions>, mvcc: bool) -> Self {
+        Self { plan, mvcc }
+    }
+
+    #[inline]
+    pub fn plan(&self) -> &[Interactions] {
+        &self.plan
+    }
+
+    // TODO: this is just simplified logic so we can get something rolling with begin concurrent
+    // transactions in the simulator. Ideally when we generate the plan we will have begin and commits statements across interactions
+    pub fn push(&mut self, interactions: Interactions) {
+        if self.mvcc {
+            let conn_index = interactions.connection_index;
+            let begin = Interactions::new(
+                conn_index,
+                InteractionsType::Query(Query::Begin(Begin::Concurrent)),
+            );
+            let commit =
+                Interactions::new(conn_index, InteractionsType::Query(Query::Commit(Commit)));
+            self.plan.push(begin);
+            self.plan.push(interactions);
+            self.plan.push(commit);
+        } else {
+            self.plan.push(interactions);
+        }
+    }
+
     /// Compute via diff computes a a plan from a given `.plan` file without the need to parse
     /// sql. This is possible because there are two versions of the plan file, one that is human
     /// readable and one that is serialized as JSON. Under watch mode, the users will be able to
@@ -120,6 +160,109 @@ impl InteractionPlan {
                     .map(move |interaction| (idx, interaction))
             })
             .collect()
+    }
+
+    pub(crate) fn stats(&self) -> InteractionStats {
+        let mut stats = InteractionStats {
+            select_count: 0,
+            insert_count: 0,
+            delete_count: 0,
+            update_count: 0,
+            create_count: 0,
+            create_index_count: 0,
+            drop_count: 0,
+            begin_count: 0,
+            commit_count: 0,
+            rollback_count: 0,
+        };
+
+        fn query_stat(q: &Query, stats: &mut InteractionStats) {
+            match q {
+                Query::Select(_) => stats.select_count += 1,
+                Query::Insert(_) => stats.insert_count += 1,
+                Query::Delete(_) => stats.delete_count += 1,
+                Query::Create(_) => stats.create_count += 1,
+                Query::Drop(_) => stats.drop_count += 1,
+                Query::Update(_) => stats.update_count += 1,
+                Query::CreateIndex(_) => stats.create_index_count += 1,
+                Query::Begin(_) => stats.begin_count += 1,
+                Query::Commit(_) => stats.commit_count += 1,
+                Query::Rollback(_) => stats.rollback_count += 1,
+            }
+        }
+        for interactions in &self.plan {
+            match &interactions.interactions {
+                InteractionsType::Property(property) => {
+                    for interaction in &property.interactions(interactions.connection_index) {
+                        if let InteractionType::Query(query) = &interaction.interaction {
+                            query_stat(query, &mut stats);
+                        }
+                    }
+                }
+                InteractionsType::Query(query) => {
+                    query_stat(query, &mut stats);
+                }
+                InteractionsType::Fault(_) => {}
+            }
+        }
+
+        stats
+    }
+
+    pub fn generate_plan<R: rand::Rng>(rng: &mut R, env: &mut SimulatorEnv) -> Self {
+        let mut plan = InteractionPlan::new(env.profile.experimental_mvcc);
+
+        let num_interactions = env.opts.max_interactions as usize;
+
+        // First create at least one table
+        let create_query = Create::arbitrary(rng, &env.connection_context(0));
+        env.committed_tables.push(create_query.table.clone());
+
+        // initial query starts at 0th connection
+        plan.plan.push(Interactions::new(
+            0,
+            InteractionsType::Query(Query::Create(create_query)),
+        ));
+
+        while plan.len() < num_interactions {
+            tracing::debug!(
+                "Generating interaction {}/{}",
+                plan.len(),
+                num_interactions
+            );
+            let interactions =
+                Interactions::arbitrary_from(rng, &PanicGenerationContext, (env, plan.stats()));
+            interactions.shadow(env.get_conn_tables_mut(interactions.connection_index));
+            plan.push(interactions);
+        }
+
+        tracing::info!("Generated plan with {} interactions", plan.plan.len());
+
+        plan
+    }
+}
+
+impl Deref for InteractionPlan {
+    type Target = [Interactions];
+
+    fn deref(&self) -> &Self::Target {
+        &self.plan
+    }
+}
+
+impl DerefMut for InteractionPlan {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.plan
+    }
+}
+
+impl IntoIterator for InteractionPlan {
+    type Item = Interactions;
+
+    type IntoIter = <Vec<Interactions> as IntoIterator>::IntoIter;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.plan.into_iter()
     }
 }
 
@@ -365,90 +508,6 @@ impl Display for Fault {
             Fault::Disconnect => write!(f, "DISCONNECT"),
             Fault::ReopenDatabase => write!(f, "REOPEN_DATABASE"),
         }
-    }
-}
-
-impl InteractionPlan {
-    pub(crate) fn new() -> Self {
-        Self { plan: Vec::new() }
-    }
-
-    pub(crate) fn stats(&self) -> InteractionStats {
-        let mut stats = InteractionStats {
-            select_count: 0,
-            insert_count: 0,
-            delete_count: 0,
-            update_count: 0,
-            create_count: 0,
-            create_index_count: 0,
-            drop_count: 0,
-            begin_count: 0,
-            commit_count: 0,
-            rollback_count: 0,
-        };
-
-        fn query_stat(q: &Query, stats: &mut InteractionStats) {
-            match q {
-                Query::Select(_) => stats.select_count += 1,
-                Query::Insert(_) => stats.insert_count += 1,
-                Query::Delete(_) => stats.delete_count += 1,
-                Query::Create(_) => stats.create_count += 1,
-                Query::Drop(_) => stats.drop_count += 1,
-                Query::Update(_) => stats.update_count += 1,
-                Query::CreateIndex(_) => stats.create_index_count += 1,
-                Query::Begin(_) => stats.begin_count += 1,
-                Query::Commit(_) => stats.commit_count += 1,
-                Query::Rollback(_) => stats.rollback_count += 1,
-            }
-        }
-        for interactions in &self.plan {
-            match &interactions.interactions {
-                InteractionsType::Property(property) => {
-                    for interaction in &property.interactions(interactions.connection_index) {
-                        if let InteractionType::Query(query) = &interaction.interaction {
-                            query_stat(query, &mut stats);
-                        }
-                    }
-                }
-                InteractionsType::Query(query) => {
-                    query_stat(query, &mut stats);
-                }
-                InteractionsType::Fault(_) => {}
-            }
-        }
-
-        stats
-    }
-
-    pub fn generate_plan<R: rand::Rng>(rng: &mut R, env: &mut SimulatorEnv) -> Self {
-        let mut plan = InteractionPlan::new();
-
-        let num_interactions = env.opts.max_interactions as usize;
-
-        // First create at least one table
-        let create_query = Create::arbitrary(rng, &env.connection_context(0));
-        env.committed_tables.push(create_query.table.clone());
-
-        // initial query starts at 0th connection
-        plan.plan.push(Interactions::new(
-            0,
-            InteractionsType::Query(Query::Create(create_query)),
-        ));
-
-        while plan.plan.len() < num_interactions {
-            tracing::debug!(
-                "Generating interaction {}/{}",
-                plan.plan.len(),
-                num_interactions
-            );
-            let interactions =
-                Interactions::arbitrary_from(rng, &PanicGenerationContext, (env, plan.stats()));
-            interactions.shadow(env.get_conn_tables_mut(interactions.connection_index));
-            plan.plan.push(interactions);
-        }
-
-        tracing::info!("Generated plan with {} interactions", plan.plan.len());
-        plan
     }
 }
 

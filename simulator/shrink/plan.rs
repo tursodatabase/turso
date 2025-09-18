@@ -54,7 +54,7 @@ impl InteractionPlan {
             }
         }
 
-        let before = self.plan.len();
+        let before = self.len();
 
         // Remove all properties after the failing one
         plan.plan.truncate(secondary_interactions_index + 1);
@@ -124,7 +124,7 @@ impl InteractionPlan {
             retain
         });
 
-        let after = plan.plan.len();
+        let after = plan.len();
 
         tracing::info!(
             "Shrinking interaction plan from {} to {} properties",
@@ -184,7 +184,7 @@ impl InteractionPlan {
             }
         }
 
-        let before = self.plan.len();
+        let before = self.len();
 
         plan.plan.truncate(secondary_interactions_index + 1);
 
@@ -196,8 +196,8 @@ impl InteractionPlan {
                     | Property::DoubleCreateFailure { queries, .. }
                     | Property::DeleteSelect { queries, .. }
                     | Property::DropSelect { queries, .. } => {
-                        let mut temp_plan = InteractionPlan {
-                            plan: queries
+                        let mut temp_plan = InteractionPlan::new_with(
+                            queries
                                 .iter()
                                 .map(|q| {
                                     Interactions::new(
@@ -206,7 +206,8 @@ impl InteractionPlan {
                                     )
                                 })
                                 .collect(),
-                        };
+                            self.mvcc,
+                        );
 
                         temp_plan = InteractionPlan::iterative_shrink(
                             temp_plan,
@@ -218,7 +219,6 @@ impl InteractionPlan {
                         //temp_plan = Self::shrink_queries(temp_plan, failing_execution, result, env);
 
                         *queries = temp_plan
-                            .plan
                             .into_iter()
                             .filter_map(|i| match i.interactions {
                                 InteractionsType::Query(q) => Some(q),
@@ -247,7 +247,7 @@ impl InteractionPlan {
             secondary_interactions_index,
         );
 
-        let after = plan.plan.len();
+        let after = plan.len();
 
         tracing::info!(
             "Shrinking interaction plan from {} to {} properties",
@@ -266,7 +266,7 @@ impl InteractionPlan {
         env: Arc<Mutex<SimulatorEnv>>,
         secondary_interaction_index: usize,
     ) -> InteractionPlan {
-        for i in (0..plan.plan.len()).rev() {
+        for i in (0..plan.len()).rev() {
             if i == secondary_interaction_index {
                 continue;
             }
