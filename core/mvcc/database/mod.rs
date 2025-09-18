@@ -850,7 +850,8 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 return Ok(TransitionResult::Continue);
             }
             CommitState::BeginCommitLogicalLog { end_ts, log_record } => {
-                if mvcc_store.storage.is_logical_log() && !mvcc_store.is_exclusive_tx(&self.tx_id) {
+                assert!(mvcc_store.storage.is_logical_log());
+                if !mvcc_store.is_exclusive_tx(&self.tx_id) {
                     // logical log needs to be serialized
                     let locked = self.commit_coordinator.pager_commit_lock.write();
                     if !locked {
