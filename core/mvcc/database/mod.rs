@@ -542,12 +542,16 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     if mvcc_store.is_exclusive_tx(&self.tx_id) {
                         mvcc_store.release_exclusive_tx(&self.tx_id);
                         self.commit_coordinator.pager_commit_lock.unlock();
-                        // FIXME: this function isnt re-entrant
-                        self.pager
-                            .io
-                            .block(|| self.pager.end_tx(false, &self.connection))?;
+                        if !mvcc_store.storage.is_logical_log() {
+                            // FIXME: this function isnt re-entrant
+                            self.pager
+                                .io
+                                .block(|| self.pager.end_tx(false, &self.connection))?;
+                        }
                     } else {
-                        self.pager.end_read_tx()?;
+                        if !mvcc_store.storage.is_logical_log() {
+                            self.pager.end_read_tx()?;
+                        }
                     }
                     self.finalize(mvcc_store)?;
                     return Ok(TransitionResult::Done(()));
@@ -900,6 +904,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     let tx = mvcc_store.txs.get(&self.tx_id).unwrap();
                     let tx_unlocked = tx.value();
                     self.header.write().replace(*tx_unlocked.header.borrow());
+                    tracing::trace!("end_commit_logical_log(tx_id={})", self.tx_id);
                     self.commit_coordinator.pager_commit_lock.unlock();
                 }
                 self.state = CommitState::CommitEnd { end_ts: *end_ts };
@@ -1455,11 +1460,19 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         // Try to acquire the pager read lock
         if !is_upgrade_from_read && !is_logical_log {
             pager.begin_read_tx().inspect_err(|_| {
+                tracing::debug!(
+                    "begin_exclusive_tx: tx_id={} failed with Busy on pager_read_lock",
+                    tx_id
+                );
                 self.release_exclusive_tx(&tx_id);
             })?;
         }
         let locked = self.commit_coordinator.pager_commit_lock.write();
         if !locked {
+            tracing::debug!(
+                "begin_exclusive_tx: tx_id={} failed with Busy on pager_commit_lock",
+                tx_id
+            );
             self.release_exclusive_tx(&tx_id);
             pager.end_read_tx()?;
             return Err(LimboError::Busy);
@@ -1707,6 +1720,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
     /// Release the exclusive transaction lock if held by the this transaction.
     fn release_exclusive_tx(&self, tx_id: &TxID) {
+        tracing::trace!("release_exclusive_tx(tx_id={})", tx_id);
         let mut exclusive_tx = self.exclusive_tx.write();
         assert_eq!(exclusive_tx.as_ref(), Some(tx_id));
         *exclusive_tx = None;
