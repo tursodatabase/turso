@@ -1741,9 +1741,9 @@ pub fn insn_to_row(
                 0,
                 format!("savepoint {} '{}'",
                     match op {
-                        crate::vdbe::insn::SavepointOp::Begin => "begin",
-                        crate::vdbe::insn::SavepointOp::Release => "release",
-                        crate::vdbe::insn::SavepointOp::Rollback => "rollback",
+                        crate::savepoint::SavepointOp::Begin => "begin",
+                        crate::savepoint::SavepointOp::Release => "release",
+                        crate::savepoint::SavepointOp::Rollback => "rollback",
                     },
                     name),
             ),

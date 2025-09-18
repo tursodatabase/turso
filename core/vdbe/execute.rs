@@ -2368,6 +2368,9 @@ pub fn op_transaction_inner(
                 state.pc += 1;
                 return Ok(InsnFunctionStepResult::Step);
             }
+            if !conn.auto_commit.get() {
+                pager.open_savepoint(conn.savepoint_stack.borrow().len())?;
+            }
         }
     }
 }
@@ -2427,6 +2430,8 @@ pub fn op_auto_commit(
         }
     }
 
+    conn.savepoint_stack.borrow_mut().close();
+    conn.is_txn_savepoint.set(false);
     program
         .commit_txn(pager.clone(), state, mv_store, *rollback)
         .map(Into::into)
@@ -9390,9 +9395,7 @@ where
 }
 
 // TODO NOW:
-// 1. Implement RELEASE for pure wal mode
-// 2. Handle non-autocommit environments (in-memory wal?)
-// 3. Add more tests (steal from sqlite)
+// 2. Add more tests (steal from sqlite)
 pub fn op_savepoint(
     program: &Program,
     state: &mut ProgramState,
@@ -9400,46 +9403,68 @@ pub fn op_savepoint(
     pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
-    use crate::vdbe::insn::SavepointOp;
+    use crate::savepoint::SavepointOp;
 
     load_insn!(Savepoint { op, name }, insn);
     let conn = program.connection.clone();
 
     let mut savepoint_stack = conn.savepoint_stack.borrow_mut();
-    match op {
-        SavepointOp::Begin => {
-            if let Some(wal) = pager.as_ref().wal.as_ref() {
-                savepoint_stack.push_savepoint(name.clone(), wal.clone());
-            } else {
-                return Err(LimboError::InternalError(
-                    "WAL is not available for the pager".to_string(),
-                ));
+    if matches!(op, SavepointOp::Begin) {
+        if let Some(wal) = pager.as_ref().wal.as_ref() {
+            if conn.auto_commit.get() {
+                conn.auto_commit.set(false);
+                conn.is_txn_savepoint.set(true);
             }
+            savepoint_stack.push_savepoint(name.clone());
+        } else {
+            return Err(LimboError::InternalError(
+                "WAL is not available for the pager".to_string(),
+            ));
         }
 
-        SavepointOp::Release => {
-            if let Some(position) = savepoint_stack.find_savepoint(name.as_str()) {
-                let is_last_sp = position + 1 == savepoint_stack.len();
-                let is_txn = is_last_sp && conn.is_txn_savepoint.get();
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
+    assert!(matches!(op, SavepointOp::Release) || matches!(op, SavepointOp::Rollback));
+    let sp_pos = savepoint_stack
+        .find_savepoint(name)
+        .ok_or_else(|| LimboError::NoSuchSavepoint(name.clone()))?;
 
-                savepoint_stack.release_savepoint(name.as_str())?;
-            } else {
-                return Err(LimboError::NoSuchSavepoint(name.clone()));
+    let is_txn = (sp_pos == savepoint_stack.len() - 1) && conn.is_txn_savepoint.get();
+    if is_txn && matches!(op, SavepointOp::Release) {
+        // todo: checkfkdeferred
+        conn.auto_commit.set(true);
+        match halt(program, state, pager, mv_store, 0, "") {
+            Ok(_) => conn.is_txn_savepoint.set(false),
+            Err(LimboError::Busy) => {
+                // change pc
+                conn.auto_commit.set(false);
+                return Err(LimboError::Busy);
             }
+            Err(_) => conn.auto_commit.set(false),
         }
-        SavepointOp::Rollback => {
-            let mut savepoint = savepoint_stack.rollback_to_savepoint(name.as_str())?;
-            if let Some(wal) = pager.as_ref().wal.as_ref() {
-                let mut wal = wal.as_ref().borrow_mut();
-                wal.undo_savepoint(&mut savepoint.wal_data)?;
-            } else {
-                return Err(LimboError::InternalError(
-                    "WAL is not available for the pager".to_string(),
-                ));
-            }
+    } else {
+        // rename
+        let isSchemaChange = false;
+        let i_sp = (savepoint_stack.len() - sp_pos) as i32 - 1;
+        if matches!(op, SavepointOp::Rollback) {
+            // isSchemaChange
+            // call tripAllCursors for each db in catalog
+            savepoint_stack.rollback_to(name);
+        } else {
+            savepoint_stack.release(name);
+        }
+        // todo: for each db call savepoint
+        pager.savepoint(*op, i_sp);
+        if isSchemaChange {
+            // expirePreparedStatements
+            // resetAllSchemaOfConnection
+        }
+
+        if !is_txn || matches!(op, SavepointOp::Rollback) {
+            // vtabsavepoint
         }
     }
-
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }

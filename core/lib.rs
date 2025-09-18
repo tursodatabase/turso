@@ -40,19 +40,19 @@ pub mod numeric;
 #[cfg(not(feature = "fuzz"))]
 mod numeric;
 
-use crate::storage::checksum::CHECKSUM_REQUIRED_RESERVED_BYTES;
 use crate::incremental::view::AllViewsTxState;
 use crate::savepoint::SavepointStack;
 use crate::storage::checksum::CHECKSUM_REQUIRED_RESERVED_BYTES;
 use crate::storage::encryption::CipherMode;
 use crate::translate::pragma::TURSO_CDC_DEFAULT_TABLE_NAME;
+use crate::storage::{checksum::CHECKSUM_REQUIRED_RESERVED_BYTES, encryption::CipherMode};
+use crate::translate::{emitter::TransactionMode, pragma::TURSO_CDC_DEFAULT_TABLE_NAME};
 #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
 use crate::types::{WalFrameInfo, WalState};
 #[cfg(feature = "fs")]
 use crate::util::{OpenMode, OpenOptions};
 use crate::vdbe::metrics::ConnectionMetrics;
 use crate::vtab::VirtualTable;
-use crate::{incremental::view::AllViewsTxState, translate::emitter::TransactionMode};
 use core::str;
 pub use error::{CompletionError, LimboError};
 pub use io::clock::{Clock, Instant};
@@ -881,6 +881,10 @@ impl DatabaseCatalog {
             index_to_data: HashMap::new(),
             allocated: vec![3], // 0 | 1, as those are reserved for main and temp
         }
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&usize, &(Arc<Database>, Arc<Pager>))> {
+        self.index_to_data.iter()
     }
 
     fn get_database_by_index(&self, index: usize) -> Option<Arc<Database>> {

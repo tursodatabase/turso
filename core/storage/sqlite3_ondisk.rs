@@ -83,7 +83,7 @@ pub const LEFT_CHILD_PTR_SIZE_BYTES: usize = 4;
 #[derive(PartialEq, Eq, Zeroable, Pod, Clone, Copy, Debug)]
 #[repr(transparent)]
 /// Read/Write file format version.
-pub struct PageSize(U16BE);
+pub struct PageSize(pub U16BE);
 
 impl PageSize {
     pub const MIN: u32 = 512;

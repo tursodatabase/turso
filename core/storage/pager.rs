@@ -1,18 +1,22 @@
-use crate::storage::wal::IOV_MAX;
 use crate::storage::{
     buffer_pool::BufferPool,
     database::DatabaseStorage,
     sqlite3_ondisk::{
         self, parse_wal_frame_header, DatabaseHeader, PageContent, PageSize, PageType,
     },
+    sub_journal::{SubJournal, PAGE_ID_SIZE},
+    wal::IOV_MAX,
     wal::{CheckpointResult, Wal},
 };
 use crate::types::{IOCompletions, WalState};
 use crate::util::IOExt as _;
 use crate::{io_yield_many, io_yield_one, IOContext};
 use crate::{
-    return_if_io, turso_assert, types::WalFrameInfo, Completion, Connection, IOResult, LimboError,
-    Result, TransactionState,
+    return_if_io,
+    savepoint::{PagerSavepoint, PagerSavepointVec, SavepointOp},
+    turso_assert,
+    types::WalFrameInfo,
+    Completion, Connection, IOResult, LimboError, Result, TransactionState,
 };
 use parking_lot::RwLock;
 use std::cell::{Cell, RefCell, UnsafeCell};
@@ -495,8 +499,15 @@ pub struct Pager {
     /// The write-ahead log (WAL) for the database.
     /// ephemeral tables and ephemeral indexes do not have a WAL.
     pub(crate) wal: Option<Rc<RefCell<dyn Wal>>>,
+    /// Subjournal used for nested transactions (a.k.a savepoints)
+    pub(crate) sub_journal: Rc<RefCell<Option<SubJournal>>>,
+    pub savepoints: Rc<RefCell<PagerSavepointVec>>,
     /// A page cache for the database.
     page_cache: Arc<RwLock<PageCache>>,
+    /// Number of records written in the subjournal
+    pub n_records: Cell<u32>,
+    /// db_size before the current txn
+    db_orig_size: Cell<usize>,
     /// Buffer pool for temporary data storage.
     pub buffer_pool: Arc<BufferPool>,
     /// I/O interface for input/output operations.
@@ -636,6 +647,10 @@ impl Pager {
             #[cfg(not(feature = "omit_autovacuum"))]
             btree_create_vacuum_full_state: Cell::new(BtreeCreateVacuumFullState::Start),
             io_ctx: RefCell::new(IOContext::default()),
+            sub_journal: Rc::new(RefCell::new(None)),
+            savepoints: Rc::new(RefCell::new(PagerSavepointVec::new())),
+            n_records: Cell::new(0),
+            db_orig_size: Cell::new(0),
         })
     }
 
@@ -1114,6 +1129,7 @@ impl Pager {
             return Ok(IOResult::Done(PagerCommitResult::Rollback));
         }
         tracing::trace!("end_tx(rollback={})", rollback);
+        self.savepoints.borrow_mut().close();
         let Some(wal) = self.wal.as_ref() else {
             // TODO: Unsure what the semantics of "end_tx" is for ephemeral tables and ephemeral indexes.
             return Ok(IOResult::Done(PagerCommitResult::Rollback));
@@ -1292,11 +1308,147 @@ impl Pager {
         Ok(page_cache.resize(capacity))
     }
 
+    fn open_sub_journal(&self) -> Result<()> {
+        let mut sub_journal = self.sub_journal.borrow_mut();
+        if sub_journal.is_none() {
+            *sub_journal = Some(SubJournal::new(&self.io, self)?);
+        }
+        Ok(())
+    }
+
+    /// Check that there are at least `n_sp` savepoints open. If there are
+    /// currently fewer than `n_sp` savepoints open, then open one or more savepoints
+    /// to make up the difference. If the number of savepoints is already
+    /// equal to `n_sp`, then this function is a no-op.
+    ///
+    /// This is equivalent to SQLite's `pagerOpenSavepoint` function.
+    ///
+    /// # Arguments
+    /// * `n_sp` - The minimum number of savepoints that should be open
+    ///
+    /// # Returns
+    /// * `Ok(())` on success
+    /// * `Err(LimboError)` if memory allocation fails or an error occurs
+    ///
+    /// # Preconditions
+    /// * Pager must be in writer state (PAGER_WRITER_LOCKED or higher)
+    /// * `n_sp` should be greater than current number of savepoints
+    /// * Journal must be enabled (useJournal flag)
+    pub fn open_savepoint(&self, n_sp: usize) -> Result<()> {
+        // Get current database size and other required information
+        let db_size = self
+            .io
+            .block(|| self.with_header(|header| header.database_size))?
+            .get() as usize;
+        let sub_rec_idx = self.n_records.get() as usize;
+
+        // Calculate journal offset - for SubJournal, offset is based on number of records
+        // Each record consists of PAGE_ID_SIZE (usize) + page content
+        let page_size = self.page_size.get().unwrap().0.get() as usize;
+        let page_id_size = std::mem::size_of::<usize>(); // PAGE_ID_SIZE constant from sub_journal.rs
+        let journal_offset = (sub_rec_idx * (page_id_size + page_size)) as i64;
+
+        // Open savepoints using the PagerSavepointVec method
+        // This will create new PagerSavepoint instances for indices from current count to n_sp
+        let mut savepoints = self.savepoints.borrow_mut();
+        if let Some(wal) = &self.wal {
+            savepoints.open_savepoint(n_sp, wal.clone(), db_size, journal_offset, sub_rec_idx)?;
+        }
+
+        Ok(())
+    }
+
+    pub fn savepoint(&self, op: SavepointOp, i_sp: i32) -> Result<()> {
+        assert!(matches!(op, SavepointOp::Release) || matches!(op, SavepointOp::Rollback));
+        assert!(i_sp >= 0 || (i_sp == -1 && matches!(op, SavepointOp::Rollback)));
+        let mut savepoints = self.savepoints.borrow_mut();
+        if i_sp < (savepoints.len() as i32) {
+            let n_new = (i_sp
+                + (if matches!(op, SavepointOp::Release) {
+                    0
+                } else {
+                    1
+                })) as usize;
+
+            savepoints.drain(n_new);
+
+            // todo: if release truncate subjournal
+            if matches!(op, SavepointOp::Rollback) {
+                let savepoint = if n_new == 0 {
+                    None
+                } else {
+                    Some(savepoints.get(n_new - 1))
+                };
+                self.playback_savepoint(savepoint)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn playback_savepoint(&self, savepoint: Option<&mut PagerSavepoint>) -> Result<()> {
+        let sub_journal_ref = self.sub_journal.borrow();
+        let sub_journal = match &*sub_journal_ref {
+            Some(sub_journal) => sub_journal,
+            None => {
+                return Err(LimboError::InternalError(
+                    "Subjournal should exist if attempting to rollback".to_string(),
+                ));
+            }
+        };
+
+        // let p_done = BitVec::<usize>::new();
+        match savepoint {
+            Some(sp) => {
+                let page_size = self.page_size.get().unwrap().0.get();
+                let mut offset = sp.sub_rec_idx * (4 + page_size) as usize;
+                self.wal
+                    .as_ref()
+                    .unwrap()
+                    .borrow_mut()
+                    .undo_savepoint(&mut sp.wal_data)?;
+                for _ in sp.sub_rec_idx..self.n_records.get() as usize {
+                    let (page_ref, _) = sub_journal.read_page(offset)?;
+                    offset += page_size as usize + PAGE_ID_SIZE;
+
+                    // do sanity checks (we could fail while reading or writing into the sub journal)
+                    let mut dirty_pages = self.dirty_pages.write();
+                    dirty_pages.insert(page_ref.get().id);
+                    page_ref.set_dirty();
+                    let page_key = PageCacheKey::new(page_ref.get().id);
+                    let mut cache = self.page_cache.write();
+                    cache.upsert_page(page_key, page_ref.clone())?;
+                }
+            }
+            None => {
+                self.wal.as_ref().unwrap().borrow_mut().rollback()?;
+            }
+        };
+        Ok(())
+    }
+
     pub fn add_dirty(&self, page: &Page) {
+        if !self.savepoints.borrow().is_empty() {
+            // handle the error here.
+            self.add_page_if_required(page).unwrap();
+        }
         // TODO: check duplicates?
         let mut dirty_pages = self.dirty_pages.write();
         dirty_pages.insert(page.get().id);
         page.set_dirty();
+    }
+
+    pub fn add_page_if_required(&self, page: &Page) -> Result<()> {
+        self.open_sub_journal()?;
+        if self.savepoints.borrow_mut().requires_page(page.get().id) {
+            // check if subjournal is enabled
+            // if yes -> write on sub_journal
+            if let Some(sub_journal) = &*self.sub_journal.borrow() {
+                sub_journal.write_page(self, page)?;
+            }
+        }
+
+        Ok(())
     }
 
     pub fn wal_state(&self) -> Result<WalState> {

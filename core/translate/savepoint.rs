@@ -1,6 +1,7 @@
+use crate::savepoint::SavepointOp;
 use crate::schema::Schema;
 use crate::translate::{ProgramBuilder, ProgramBuilderOpts};
-use crate::vdbe::insn::{Insn, SavepointOp};
+use crate::vdbe::insn::Insn;
 use crate::Result;
 use turso_parser::ast::Name;
 
