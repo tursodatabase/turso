@@ -1376,10 +1376,84 @@ impl DbspCompiler {
         match expr {
             LogicalExpr::BinaryExpr { left, op, right } => {
                 // Extract column name and value for simple predicates
-                if let (LogicalExpr::Column(col), LogicalExpr::Literal(val)) =
+                // First check for column-to-column comparisons
+                if let (LogicalExpr::Column(left_col), LogicalExpr::Column(right_col)) =
                     (left.as_ref(), right.as_ref())
                 {
-                    // Resolve column name to index using the schema
+                    // Resolve both column names to indices
+                    let left_idx = schema
+                        .columns
+                        .iter()
+                        .position(|c| c.name == left_col.name)
+                        .ok_or_else(|| {
+                            crate::LimboError::ParseError(format!(
+                                "Column '{}' not found in schema for filter",
+                                left_col.name
+                            ))
+                        })?;
+
+                    let right_idx = schema
+                        .columns
+                        .iter()
+                        .position(|c| c.name == right_col.name)
+                        .ok_or_else(|| {
+                            crate::LimboError::ParseError(format!(
+                                "Column '{}' not found in schema for filter",
+                                right_col.name
+                            ))
+                        })?;
+
+                    match op {
+                        BinaryOperator::Equals => Ok(FilterPredicate::ColumnEquals {
+                            left_idx,
+                            right_idx,
+                        }),
+                        BinaryOperator::NotEquals => Ok(FilterPredicate::ColumnNotEquals {
+                            left_idx,
+                            right_idx,
+                        }),
+                        BinaryOperator::Greater => Ok(FilterPredicate::ColumnGreaterThan {
+                            left_idx,
+                            right_idx,
+                        }),
+                        BinaryOperator::GreaterEquals => {
+                            Ok(FilterPredicate::ColumnGreaterThanOrEqual {
+                                left_idx,
+                                right_idx,
+                            })
+                        }
+                        BinaryOperator::Less => Ok(FilterPredicate::ColumnLessThan {
+                            left_idx,
+                            right_idx,
+                        }),
+                        BinaryOperator::LessEquals => Ok(FilterPredicate::ColumnLessThanOrEqual {
+                            left_idx,
+                            right_idx,
+                        }),
+                        BinaryOperator::And | BinaryOperator::Or => {
+                            // Handle logical operators recursively
+                            let left_pred = Self::compile_filter_predicate(left, schema)?;
+                            let right_pred = Self::compile_filter_predicate(right, schema)?;
+                            match op {
+                                BinaryOperator::And => Ok(FilterPredicate::And(
+                                    Box::new(left_pred),
+                                    Box::new(right_pred),
+                                )),
+                                BinaryOperator::Or => Ok(FilterPredicate::Or(
+                                    Box::new(left_pred),
+                                    Box::new(right_pred),
+                                )),
+                                _ => unreachable!(),
+                            }
+                        }
+                        _ => Err(LimboError::ParseError(format!(
+                            "Unsupported operator in filter: {op:?}"
+                        ))),
+                    }
+                } else if let (LogicalExpr::Column(col), LogicalExpr::Literal(val)) =
+                    (left.as_ref(), right.as_ref())
+                {
+                    // Column-to-literal comparisons
                     let column_idx = schema
                         .columns
                         .iter()
@@ -1455,7 +1529,7 @@ impl DbspCompiler {
                     }
                 } else {
                     Err(LimboError::ParseError(
-                        "Filter predicate must be column op value".to_string(),
+                        "Filter predicate must be column op value or column op column".to_string(),
                     ))
                 }
             }

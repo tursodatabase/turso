@@ -25,6 +25,20 @@ pub enum FilterPredicate {
     LessThan { column_idx: usize, value: Value },
     /// Column <= value (using column index)
     LessThanOrEqual { column_idx: usize, value: Value },
+
+    /// Column = Column comparisons
+    ColumnEquals { left_idx: usize, right_idx: usize },
+    /// Column != Column comparisons
+    ColumnNotEquals { left_idx: usize, right_idx: usize },
+    /// Column > Column comparisons
+    ColumnGreaterThan { left_idx: usize, right_idx: usize },
+    /// Column >= Column comparisons
+    ColumnGreaterThanOrEqual { left_idx: usize, right_idx: usize },
+    /// Column < Column comparisons
+    ColumnLessThan { left_idx: usize, right_idx: usize },
+    /// Column <= Column comparisons
+    ColumnLessThanOrEqual { left_idx: usize, right_idx: usize },
+
     /// Logical AND of two predicates
     And(Box<FilterPredicate>, Box<FilterPredicate>),
     /// Logical OR of two predicates
@@ -123,6 +137,82 @@ impl FilterOperator {
                 let left_filter = FilterOperator::new((**left).clone());
                 let right_filter = FilterOperator::new((**right).clone());
                 left_filter.evaluate_predicate(values) || right_filter.evaluate_predicate(values)
+            }
+
+            // Column-to-column comparisons
+            FilterPredicate::ColumnEquals {
+                left_idx,
+                right_idx,
+            } => {
+                if let (Some(left), Some(right)) = (values.get(*left_idx), values.get(*right_idx)) {
+                    return left == right;
+                }
+                false
+            }
+            FilterPredicate::ColumnNotEquals {
+                left_idx,
+                right_idx,
+            } => {
+                if let (Some(left), Some(right)) = (values.get(*left_idx), values.get(*right_idx)) {
+                    return left != right;
+                }
+                false
+            }
+            FilterPredicate::ColumnGreaterThan {
+                left_idx,
+                right_idx,
+            } => {
+                if let (Some(left), Some(right)) = (values.get(*left_idx), values.get(*right_idx)) {
+                    match (left, right) {
+                        (Value::Integer(a), Value::Integer(b)) => return a > b,
+                        (Value::Float(a), Value::Float(b)) => return a > b,
+                        (Value::Text(a), Value::Text(b)) => return a.as_str() > b.as_str(),
+                        _ => {}
+                    }
+                }
+                false
+            }
+            FilterPredicate::ColumnGreaterThanOrEqual {
+                left_idx,
+                right_idx,
+            } => {
+                if let (Some(left), Some(right)) = (values.get(*left_idx), values.get(*right_idx)) {
+                    match (left, right) {
+                        (Value::Integer(a), Value::Integer(b)) => return a >= b,
+                        (Value::Float(a), Value::Float(b)) => return a >= b,
+                        (Value::Text(a), Value::Text(b)) => return a.as_str() >= b.as_str(),
+                        _ => {}
+                    }
+                }
+                false
+            }
+            FilterPredicate::ColumnLessThan {
+                left_idx,
+                right_idx,
+            } => {
+                if let (Some(left), Some(right)) = (values.get(*left_idx), values.get(*right_idx)) {
+                    match (left, right) {
+                        (Value::Integer(a), Value::Integer(b)) => return a < b,
+                        (Value::Float(a), Value::Float(b)) => return a < b,
+                        (Value::Text(a), Value::Text(b)) => return a.as_str() < b.as_str(),
+                        _ => {}
+                    }
+                }
+                false
+            }
+            FilterPredicate::ColumnLessThanOrEqual {
+                left_idx,
+                right_idx,
+            } => {
+                if let (Some(left), Some(right)) = (values.get(*left_idx), values.get(*right_idx)) {
+                    match (left, right) {
+                        (Value::Integer(a), Value::Integer(b)) => return a <= b,
+                        (Value::Float(a), Value::Float(b)) => return a <= b,
+                        (Value::Text(a), Value::Text(b)) => return a.as_str() <= b.as_str(),
+                        _ => {}
+                    }
+                }
+                false
             }
         }
     }
