@@ -49,6 +49,16 @@ impl OperationType {
             | OperationType::Truncate { completion, .. } => completion,
         }
     }
+
+    fn operation_name(&self) -> &'static str {
+        match self {
+            OperationType::Read { .. } => "Read",
+            OperationType::Write { .. } => "Write",
+            OperationType::WriteV { .. } => "WriteV",
+            OperationType::Sync { .. } => "Sync",
+            OperationType::Truncate { .. } => "Truncate",
+        }
+    }
 }
 
 pub struct Operation {
@@ -258,6 +268,7 @@ impl IO for MemorySimIO {
                 if callback.should_fault(&self.io_profile) {
                     let file = files.get(callback.fd.as_str()).unwrap();
                     file.update_fault_stats(&callback.op);
+                    tracing::error!("fault injected - OP: {}", callback.op.operation_name());
                     // Inject the fault by aborting the completion
                     completion.abort();
                     continue;
