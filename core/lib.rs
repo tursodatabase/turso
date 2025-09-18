@@ -40,7 +40,6 @@ pub mod numeric;
 mod numeric;
 
 use crate::storage::checksum::CHECKSUM_REQUIRED_RESERVED_BYTES;
-use crate::storage::encryption::CipherMode;
 use crate::translate::pragma::TURSO_CDC_DEFAULT_TABLE_NAME;
 #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
 use crate::types::{WalFrameInfo, WalState};
@@ -79,7 +78,7 @@ use std::{
 #[cfg(feature = "fs")]
 use storage::database::DatabaseFile;
 pub use storage::database::IOContext;
-pub use storage::encryption::{EncryptionContext, EncryptionKey};
+pub use storage::encryption::{CipherMode, EncryptionContext, EncryptionKey};
 use storage::page_cache::PageCache;
 use storage::pager::{AtomicDbState, DbState};
 use storage::sqlite3_ondisk::PageSize;
