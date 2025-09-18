@@ -189,20 +189,6 @@ pub struct IncrementalView {
 }
 
 impl IncrementalView {
-    /// Validate that a CREATE MATERIALIZED VIEW statement can be handled by IncrementalView
-    /// This should be called early, before updating sqlite_master
-    pub fn can_create_view(select: &ast::Select) -> Result<()> {
-        // Check for JOINs
-        let (join_tables, join_condition) = Self::extract_join_info(select);
-        if join_tables.is_some() || join_condition.is_some() {
-            return Err(LimboError::ParseError(
-                "JOINs in views are not yet supported".to_string(),
-            ));
-        }
-
-        Ok(())
-    }
-
     /// Try to compile the SELECT statement into a DBSP circuit
     fn try_compile_circuit(
         select: &ast::Select,
@@ -306,13 +292,6 @@ impl IncrementalView {
 
         // Extract output columns using the shared function
         let column_schema = extract_view_columns(&select, schema)?;
-
-        let (join_tables, join_condition) = Self::extract_join_info(&select);
-        if join_tables.is_some() || join_condition.is_some() {
-            return Err(LimboError::ParseError(
-                "JOINs in views are not yet supported".to_string(),
-            ));
-        }
 
         // Get all tables from FROM clause and JOINs, along with their aliases
         let (referenced_tables, table_aliases, qualified_table_names) =
@@ -1044,82 +1023,6 @@ impl IncrementalView {
                 }
             }
         }
-    }
-
-    /// Extract JOIN information from SELECT statement
-    #[allow(clippy::type_complexity)]
-    pub fn extract_join_info(
-        select: &ast::Select,
-    ) -> (Option<(String, String)>, Option<(String, String)>) {
-        use turso_parser::ast::*;
-
-        if let OneSelect::Select {
-            from: Some(ref from),
-            ..
-        } = select.body.select
-        {
-            // Check if there are any joins
-            if !from.joins.is_empty() {
-                // Get the first (left) table name
-                let left_table = match from.select.as_ref() {
-                    SelectTable::Table(name, _, _) => Some(name.name.as_str().to_string()),
-                    _ => None,
-                };
-
-                // Get the first join (right) table and condition
-                if let Some(first_join) = from.joins.first() {
-                    let right_table = match &first_join.table.as_ref() {
-                        SelectTable::Table(name, _, _) => Some(name.name.as_str().to_string()),
-                        _ => None,
-                    };
-
-                    // Extract join condition (simplified - assumes single equality)
-                    let join_condition = if let Some(ref constraint) = &first_join.constraint {
-                        match constraint {
-                            JoinConstraint::On(expr) => Self::extract_join_columns_from_expr(expr),
-                            _ => None,
-                        }
-                    } else {
-                        None
-                    };
-
-                    if let (Some(left), Some(right)) = (left_table, right_table) {
-                        return (Some((left, right)), join_condition);
-                    }
-                }
-            }
-        }
-
-        (None, None)
-    }
-
-    /// Extract join column names from a join condition expression
-    fn extract_join_columns_from_expr(expr: &ast::Expr) -> Option<(String, String)> {
-        use turso_parser::ast::*;
-
-        // Look for expressions like: t1.col = t2.col
-        if let Expr::Binary(left, op, right) = expr {
-            if matches!(op, Operator::Equals) {
-                // Extract column names from both sides
-                let left_col = match &**left {
-                    Expr::Qualified(name, _) => Some(name.as_str().to_string()),
-                    Expr::Id(name) => Some(name.as_str().to_string()),
-                    _ => None,
-                };
-
-                let right_col = match &**right {
-                    Expr::Qualified(name, _) => Some(name.as_str().to_string()),
-                    Expr::Id(name) => Some(name.as_str().to_string()),
-                    _ => None,
-                };
-
-                if let (Some(l), Some(r)) = (left_col, right_col) {
-                    return Some((l, r));
-                }
-            }
-        }
-
-        None
     }
 
     /// Merge a delta set of changes into the view's current state
