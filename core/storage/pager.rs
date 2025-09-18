@@ -268,7 +268,7 @@ impl Page {
     pub fn try_unpin(&self) -> bool {
         self.get()
             .pin_count
-            .fetch_update(Ordering::Release, Ordering::Relaxed, |current| {
+            .fetch_update(Ordering::Release, Ordering::SeqCst, |current| {
                 if current == 0 {
                     None
                 } else {

@@ -223,7 +223,7 @@ impl Clone for ExtVirtualTable {
     fn clone(&self) -> Self {
         Self {
             implementation: self.implementation.clone(),
-            table_ptr: AtomicPtr::new(self.table_ptr.load(std::sync::atomic::Ordering::Relaxed)),
+            table_ptr: AtomicPtr::new(self.table_ptr.load(std::sync::atomic::Ordering::SeqCst)),
         }
     }
 }
@@ -289,7 +289,7 @@ impl ExtVirtualTable {
         // store the leaked connection pointer on the table so it can be freed on drop
         let Some(cursor) = NonNull::new(unsafe {
             (self.implementation.open)(
-                self.table_ptr.load(std::sync::atomic::Ordering::Relaxed) as *const c_void,
+                self.table_ptr.load(std::sync::atomic::Ordering::SeqCst) as *const c_void,
                 ext_conn_ptr.as_ptr(),
             ) as *mut c_void
         }) else {
@@ -304,7 +304,7 @@ impl ExtVirtualTable {
         let newrowid = 0i64;
         let rc = unsafe {
             (self.implementation.update)(
-                self.table_ptr.load(std::sync::atomic::Ordering::Relaxed) as *const c_void,
+                self.table_ptr.load(std::sync::atomic::Ordering::SeqCst) as *const c_void,
                 arg_count as i32,
                 ext_args.as_ptr(),
                 &newrowid as *const _ as *mut i64,
@@ -325,7 +325,7 @@ impl ExtVirtualTable {
     fn destroy(&self) -> crate::Result<()> {
         let rc = unsafe {
             (self.implementation.destroy)(
-                self.table_ptr.load(std::sync::atomic::Ordering::Relaxed) as *const c_void
+                self.table_ptr.load(std::sync::atomic::Ordering::SeqCst) as *const c_void
             )
         };
         match rc {

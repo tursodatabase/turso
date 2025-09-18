@@ -239,7 +239,7 @@ impl fmt::Debug for Database {
         debug_struct.field("init_lock", &init_lock_status);
 
         let wal_status = match self.shared_wal.try_read() {
-            Some(wal) if wal.enabled.load(Ordering::Relaxed) => "enabled",
+            Some(wal) if wal.enabled.load(Ordering::SeqCst) => "enabled",
             Some(_) => "disabled",
             None => "locked_for_write",
         };
@@ -254,9 +254,7 @@ impl fmt::Debug for Database {
 
         debug_struct.field(
             "n_connections",
-            &self
-                .n_connections
-                .load(std::sync::atomic::Ordering::Relaxed),
+            &self.n_connections.load(std::sync::atomic::Ordering::SeqCst),
         );
         debug_struct.finish()
     }
@@ -520,7 +518,7 @@ impl Database {
             busy_timeout: Cell::new(None),
         });
         self.n_connections
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let builtin_syms = self.builtin_syms.read();
         // add built-in extensions symbols to the connection to prevent having to load each time
         conn.syms.write().extend(&builtin_syms);
@@ -580,7 +578,7 @@ impl Database {
         shared_wal: &WalFileShared,
         requested_page_size: Option<usize>,
     ) -> Result<PageSize> {
-        if shared_wal.enabled.load(Ordering::Relaxed) {
+        if shared_wal.enabled.load(Ordering::SeqCst) {
             let size_in_wal = shared_wal.page_size();
             if size_in_wal != 0 {
                 let Some(page_size) = PageSize::new(size_in_wal) else {
@@ -622,7 +620,7 @@ impl Database {
         };
         // Check if WAL is enabled
         let shared_wal = self.shared_wal.read();
-        if shared_wal.enabled.load(Ordering::Relaxed) {
+        if shared_wal.enabled.load(Ordering::SeqCst) {
             let page_size = self.determine_actual_page_size(&shared_wal, requested_page_size)?;
             drop(shared_wal);
 
@@ -1019,7 +1017,7 @@ impl Drop for Connection {
             // if connection wasn't properly closed, decrement the connection counter
             self._db
                 .n_connections
-                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         }
     }
 }
@@ -1629,7 +1627,7 @@ impl Connection {
         if self
             ._db
             .n_connections
-            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed)
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst)
             .eq(&1)
         {
             self.pager
@@ -1727,7 +1725,7 @@ impl Connection {
 
         {
             let mut shared_wal = self._db.shared_wal.write();
-            shared_wal.enabled.store(false, Ordering::Relaxed);
+            shared_wal.enabled.store(false, Ordering::SeqCst);
             shared_wal.file = None;
         }
         self.pager.borrow_mut().clear_page_cache();

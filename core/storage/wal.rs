@@ -185,7 +185,7 @@ impl TursoRwLock {
         }
         let desired = cur | Self::WRITER;
         self.0
-            .compare_exchange(cur, desired, Ordering::Acquire, Ordering::Relaxed)
+            .compare_exchange(cur, desired, Ordering::Acquire, Ordering::SeqCst)
             .is_ok()
     }
 
@@ -219,10 +219,10 @@ impl TursoRwLock {
     /// Set the embedded value while holding the write lock.
     pub fn set_value_exclusive(&self, v: u32) {
         // Must be called only while WRITER bit is set
-        let cur = self.0.load(Ordering::Relaxed);
+        let cur = self.0.load(Ordering::SeqCst);
         turso_assert!(Self::has_writer(cur), "must hold exclusive lock");
         let desired = (cur & !Self::VALUE_MASK) | ((v as u64) << Self::VALUE_SHIFT);
-        self.0.store(desired, Ordering::Relaxed);
+        self.0.store(desired, Ordering::SeqCst);
     }
 }
 
@@ -703,7 +703,7 @@ pub struct WalFileShared {
 impl fmt::Debug for WalFileShared {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("WalFileShared")
-            .field("enabled", &self.enabled.load(Ordering::Relaxed))
+            .field("enabled", &self.enabled.load(Ordering::SeqCst))
             .field("wal_header", &self.wal_header)
             .field("min_frame", &self.min_frame)
             .field("max_frame", &self.max_frame)
@@ -1104,10 +1104,7 @@ impl Wal for WalFile {
         });
         let file = {
             let shared = self.get_shared();
-            assert!(
-                shared.enabled.load(Ordering::Relaxed),
-                "WAL must be enabled"
-            );
+            assert!(shared.enabled.load(Ordering::SeqCst), "WAL must be enabled");
             // important not to hold shared lock beyond this point to avoid deadlock scenario where:
             // thread 1: takes readlock here, passes reference to shared.file to begin_read_wal_frame
             // thread 2: tries to acquire write lock elsewhere
@@ -1180,10 +1177,7 @@ impl Wal for WalFile {
             }
         });
         let shared = self.get_shared();
-        assert!(
-            shared.enabled.load(Ordering::Relaxed),
-            "WAL must be enabled"
-        );
+        assert!(shared.enabled.load(Ordering::SeqCst), "WAL must be enabled");
         let file = shared.file.as_ref().unwrap();
         let c = begin_read_wal_frame_raw(&self.buffer_pool, file, offset, complete)?;
         Ok(c)
@@ -1241,10 +1235,7 @@ impl Wal for WalFile {
                 }
             });
             let shared = self.get_shared();
-            assert!(
-                shared.enabled.load(Ordering::Relaxed),
-                "WAL must be enabled"
-            );
+            assert!(shared.enabled.load(Ordering::SeqCst), "WAL must be enabled");
             let file = shared.file.as_ref().unwrap();
             let c = begin_read_wal_frame(
                 file,
@@ -1269,10 +1260,7 @@ impl Wal for WalFile {
         let (header, file) = {
             let shared = self.get_shared();
             let header = shared.wal_header.clone();
-            assert!(
-                shared.enabled.load(Ordering::Relaxed),
-                "WAL must be enabled"
-            );
+            assert!(shared.enabled.load(Ordering::SeqCst), "WAL must be enabled");
             let file = shared.file.as_ref().unwrap().clone();
             (header, file)
         };
@@ -1327,10 +1315,7 @@ impl Wal for WalFile {
         });
         let shared = self.get_shared();
         self.syncing.set(true);
-        assert!(
-            shared.enabled.load(Ordering::Relaxed),
-            "WAL must be enabled"
-        );
+        assert!(shared.enabled.load(Ordering::SeqCst), "WAL must be enabled");
         let file = shared.file.as_ref().unwrap();
         let c = file.sync(completion)?;
         Ok(c)
@@ -1446,10 +1431,7 @@ impl Wal for WalFile {
 
         self.max_frame = 0;
         let shared = self.get_shared();
-        assert!(
-            shared.enabled.load(Ordering::Relaxed),
-            "WAL must be enabled"
-        );
+        assert!(shared.enabled.load(Ordering::SeqCst), "WAL must be enabled");
         let file = shared.file.as_ref().unwrap();
         let c = sqlite3_ondisk::begin_write_wal_header(file, &shared.wal_header.lock())?;
         Ok(Some(c))
@@ -1457,10 +1439,7 @@ impl Wal for WalFile {
 
     fn prepare_wal_finish(&mut self) -> Result<Completion> {
         let shared = self.get_shared();
-        assert!(
-            shared.enabled.load(Ordering::Relaxed),
-            "WAL must be enabled"
-        );
+        assert!(shared.enabled.load(Ordering::SeqCst), "WAL must be enabled");
         let file = shared.file.as_ref().unwrap();
         let shared = self.shared.clone();
         let c = file.sync(Completion::new_sync(move |_| {
@@ -1582,10 +1561,7 @@ impl Wal for WalFile {
         let c = Completion::new_write_linked(cmp);
 
         let shared = self.get_shared();
-        assert!(
-            shared.enabled.load(Ordering::Relaxed),
-            "WAL must be enabled"
-        );
+        assert!(shared.enabled.load(Ordering::SeqCst), "WAL must be enabled");
         let file = shared.file.as_ref().unwrap();
         let c = file.pwritev(start_off, iovecs, c)?;
         Ok(c)
@@ -2108,10 +2084,7 @@ impl WalFile {
     fn truncate_log(&mut self) -> Result<IOResult<()>> {
         let file = {
             let shared = self.get_shared();
-            assert!(
-                shared.enabled.load(Ordering::Relaxed),
-                "WAL must be enabled"
-            );
+            assert!(shared.enabled.load(Ordering::SeqCst), "WAL must be enabled");
             shared.initialized.store(false, Ordering::Release);
             shared.file.as_ref().unwrap().clone()
         };
@@ -2222,10 +2195,7 @@ impl WalFile {
         };
         // schedule read of the page payload
         let shared = self.get_shared();
-        assert!(
-            shared.enabled.load(Ordering::Relaxed),
-            "WAL must be enabled"
-        );
+        assert!(shared.enabled.load(Ordering::SeqCst), "WAL must be enabled");
         let file = shared.file.as_ref().unwrap();
         let c = begin_read_wal_frame(
             file,
@@ -2348,7 +2318,7 @@ impl WalFileShared {
     }
 
     pub fn create(&mut self, file: Arc<dyn File>) -> Result<()> {
-        if self.enabled.load(Ordering::Relaxed) {
+        if self.enabled.load(Ordering::SeqCst) {
             return Err(LimboError::InternalError("WAL already enabled".to_string()));
         }
 
@@ -2370,8 +2340,8 @@ impl WalFileShared {
         };
 
         self.file = Some(file);
-        self.enabled.store(true, Ordering::Relaxed);
-        self.initialized.store(false, Ordering::Relaxed);
+        self.enabled.store(true, Ordering::SeqCst);
+        self.initialized.store(false, Ordering::SeqCst);
 
         Ok(())
     }

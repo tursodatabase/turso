@@ -41,7 +41,7 @@ pub trait File: Send + Sync {
                         // reference buffer in callback to ensure alive for async io
                         let _buf = _cloned.clone();
                         // accumulate bytes actually reported by the backend
-                        total_written.fetch_add(n as usize, Ordering::Relaxed);
+                        total_written.fetch_add(n as usize, Ordering::SeqCst);
                         if outstanding.fetch_sub(1, Ordering::AcqRel) == 1 {
                             // last one finished
                             c_main.complete(total_written.load(Ordering::Acquire) as i32);
