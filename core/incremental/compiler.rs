@@ -11,10 +11,12 @@ use crate::incremental::operator::{
     create_dbsp_state_index, DbspStateCursors, EvalState, FilterOperator, FilterPredicate,
     IncrementalOperator, InputOperator, JoinOperator, JoinType, ProjectOperator,
 };
+use crate::schema::Type;
 use crate::storage::btree::{BTreeCursor, BTreeKey};
 // Note: logical module must be made pub(crate) in translate/mod.rs
 use crate::translate::logical::{
-    BinaryOperator, JoinType as LogicalJoinType, LogicalExpr, LogicalPlan, LogicalSchema, SchemaRef,
+    BinaryOperator, Column, ColumnInfo, JoinType as LogicalJoinType, LogicalExpr, LogicalPlan,
+    LogicalSchema, SchemaRef,
 };
 use crate::types::{IOResult, ImmutableRecord, SeekKey, SeekOp, SeekResult, Value};
 use crate::Pager;
@@ -898,23 +900,151 @@ impl DbspCompiler {
                 // Get input schema for column resolution
                 let input_schema = filter.input.schema();
 
-                // Convert predicate to DBSP expression
-                let dbsp_predicate = Self::compile_expr(&filter.predicate)?;
+                // Check if the predicate contains expressions that need to be computed
+                if Self::predicate_needs_projection(&filter.predicate) {
+                    // Complex expression in WHERE clause - need to add projection first
+                    // 1. Create projection that adds the computed expression as a new column
 
-                // Convert to FilterPredicate
-                let filter_predicate = Self::compile_filter_predicate(&filter.predicate, input_schema)?;
+                    // First, get all existing columns
+                    let mut projection_exprs = Vec::new();
+                    let mut dbsp_exprs = Vec::new();
 
-                // Create executable operator
-                let executable: Box<dyn IncrementalOperator> =
-                    Box::new(FilterOperator::new(filter_predicate));
+                    for col in &input_schema.columns {
+                        projection_exprs.push(LogicalExpr::Column(Column {
+                            name: col.name.clone(),
+                            table: None,
+                        }));
+                        dbsp_exprs.push(DbspExpr::Column(col.name.clone()));
+                    }
 
-                // Create filter node
-                let node_id = self.circuit.add_node(
-                    DbspOperator::Filter { predicate: dbsp_predicate },
-                    vec![input_id],
-                    executable,
-                );
-                Ok(node_id)
+                    // Now add the expression as a computed column
+                    let temp_column_name = "__temp_filter_expr";
+                    let computed_expr = Self::extract_expression_from_predicate(&filter.predicate)?;
+                    projection_exprs.push(computed_expr.clone());
+
+                    // Compile the projection expressions
+                    let mut compiled_exprs = Vec::new();
+                    let mut aliases = Vec::new();
+                    let mut output_names = Vec::new();
+                    for (i, expr) in projection_exprs.iter().enumerate() {
+                        let (compiled, _alias) = Self::compile_expression(expr, input_schema)?;
+                        compiled_exprs.push(compiled);
+                        if i < input_schema.columns.len() {
+                            aliases.push(None);
+                            output_names.push(input_schema.columns[i].name.clone());
+                        } else {
+                            aliases.push(Some(temp_column_name.to_string()));
+                            output_names.push(temp_column_name.to_string());
+                        }
+                    }
+
+                    // Get input column names for ProjectOperator
+                    let input_column_names: Vec<String> = input_schema.columns.iter()
+                        .map(|col| col.name.clone())
+                        .collect();
+
+                    // Create projection operator
+                    let proj_executable: Box<dyn IncrementalOperator> =
+                        Box::new(ProjectOperator::from_compiled(
+                            compiled_exprs.clone(),
+                            aliases.clone(),
+                            input_column_names.clone(),
+                            output_names.clone()
+                        )?);
+
+                    // Create updated schema for the projection output
+                    let mut proj_schema_columns = input_schema.columns.clone();
+                    proj_schema_columns.push(ColumnInfo {
+                        name: temp_column_name.to_string(),
+                        table: None,
+                        database: None,
+                        table_alias: None,
+                        ty: Type::Integer,  // Computed expressions default to Integer
+                    });
+                    let proj_schema = SchemaRef::new(LogicalSchema {
+                        columns: proj_schema_columns,
+                    });
+
+                    // Add projection node
+                    let proj_id = self.circuit.add_node(
+                        DbspOperator::Projection {
+                            exprs: dbsp_exprs.clone(),
+                            schema: proj_schema.clone(),
+                        },
+                        vec![input_id],
+                        proj_executable,
+                    );
+
+                    // Now create a filter that replaces the complex expression with the temp column
+                    // but keeps all other conditions intact
+                    let replaced_predicate = Self::replace_complex_with_temp(&filter.predicate, temp_column_name)?;
+                    let filter_predicate = Self::compile_filter_predicate(&replaced_predicate, &proj_schema)?;
+
+                    let filter_executable: Box<dyn IncrementalOperator> =
+                        Box::new(FilterOperator::new(filter_predicate));
+
+                    // Create filter node
+                    let filter_id = self.circuit.add_node(
+                        DbspOperator::Filter { predicate: Self::compile_expr(&replaced_predicate)? },
+                        vec![proj_id],
+                        filter_executable,
+                    );
+
+                    // Finally, project again to remove the temporary column
+                    let mut final_exprs = Vec::new();
+                    let mut final_aliases = Vec::new();
+                    let mut final_names = Vec::new();
+                    let mut final_dbsp_exprs = Vec::new();
+
+                    for (i, column) in input_schema.columns.iter().enumerate() {
+                        let col_name = &column.name;
+                        final_exprs.push(compiled_exprs[i].clone());
+                        final_aliases.push(None);
+                        final_names.push(col_name.clone());
+                        final_dbsp_exprs.push(DbspExpr::Column(col_name.clone()));
+                    }
+
+                    // Input names for the final projection include the temp column
+                    let filter_output_names = output_names.clone();
+
+                    let final_proj_executable: Box<dyn IncrementalOperator> =
+                        Box::new(ProjectOperator::from_compiled(
+                            final_exprs,
+                            final_aliases,
+                            filter_output_names,
+                            final_names.clone()
+                        )?);
+
+                    let final_id = self.circuit.add_node(
+                        DbspOperator::Projection {
+                            exprs: final_dbsp_exprs,
+                            schema: input_schema.clone(),  // Back to original schema
+                        },
+                        vec![filter_id],
+                        final_proj_executable,
+                    );
+
+                    Ok(final_id)
+                } else {
+                    // Simple filter - use existing implementation
+                    // Convert predicate to DBSP expression
+                    let dbsp_predicate = Self::compile_expr(&filter.predicate)?;
+
+                    // Convert to FilterPredicate
+                    let filter_predicate = Self::compile_filter_predicate(&filter.predicate, input_schema)?;
+
+                    // Create executable operator
+                    let executable: Box<dyn IncrementalOperator> =
+                        Box::new(FilterOperator::new(filter_predicate));
+
+                    // Create filter node
+                    let node_id = self.circuit.add_node(
+                        DbspOperator::Filter { predicate: dbsp_predicate },
+                        vec![input_id],
+                        executable,
+                    );
+                    Ok(node_id)
+                }
             }
             LogicalPlan::Aggregate(agg) => {
                 // Compile the input first
@@ -1285,7 +1415,12 @@ impl DbspCompiler {
                 let lit = match val {
                     Value::Integer(i) => ast::Literal::Numeric(i.to_string()),
                     Value::Float(f) => ast::Literal::Numeric(f.to_string()),
-                    Value::Text(t) => ast::Literal::String(t.to_string()),
+                    Value::Text(t) => {
+                        // Add quotes for string literals as translate_expr expects them
+                        // Also escape any single quotes in the string
+                        let escaped = t.to_string().replace('\'', "''");
+                        ast::Literal::String(format!("'{escaped}'"))
+                    }
                     Value::Blob(b) => ast::Literal::Blob(format!("{b:?}")),
                     Value::Null => ast::Literal::Null,
                 };
@@ -1365,6 +1500,109 @@ impl DbspCompiler {
             _ => Err(LimboError::ParseError(format!(
                 "Cannot convert LogicalExpr to AST Expr: {expr:?}"
             ))),
+        }
+    }
+
+    /// Check if a predicate contains expressions that need projection
+    fn predicate_needs_projection(expr: &LogicalExpr) -> bool {
+        match expr {
+            LogicalExpr::BinaryExpr { left, op, right } => {
+                match (left.as_ref(), right.as_ref()) {
+                    // Simple column to literal - OK
+                    (LogicalExpr::Column(_), LogicalExpr::Literal(_)) => false,
+                    // Simple column to column - OK
+                    (LogicalExpr::Column(_), LogicalExpr::Column(_)) => false,
+                    // AND/OR of simple expressions - check recursively
+                    _ if matches!(op, BinaryOperator::And | BinaryOperator::Or) => {
+                        Self::predicate_needs_projection(left)
+                            || Self::predicate_needs_projection(right)
+                    }
+                    // Any other pattern needs projection
+                    _ => true,
+                }
+            }
+            _ => false,
+        }
+    }
+
+    /// Extract the expression part from a predicate that needs to be computed
+    fn extract_expression_from_predicate(expr: &LogicalExpr) -> Result<LogicalExpr> {
+        match expr {
+            LogicalExpr::BinaryExpr { left, op, right } => {
+                // Handle AND/OR - recursively find the complex expression
+                if matches!(op, BinaryOperator::And | BinaryOperator::Or) {
+                    // Check left side first
+                    if Self::predicate_needs_projection(left) {
+                        return Self::extract_expression_from_predicate(left);
+                    }
+                    // Then check right side
+                    if Self::predicate_needs_projection(right) {
+                        return Self::extract_expression_from_predicate(right);
+                    }
+                    // Neither side needs projection (shouldn't happen if predicate_needs_projection was true)
+                    return Ok(expr.clone());
+                }
+
+                // For expressions like (age * 2) > 30, we want to extract (age * 2)
+                if matches!(
+                    op,
+                    BinaryOperator::Greater
+                        | BinaryOperator::GreaterEquals
+                        | BinaryOperator::Less
+                        | BinaryOperator::LessEquals
+                        | BinaryOperator::Equals
+                        | BinaryOperator::NotEquals
+                ) {
+                    // Return the left side if it's not a simple column
+                    if !matches!(left.as_ref(), LogicalExpr::Column(_)) {
+                        Ok((**left).clone())
+                    } else {
+                        // Must be the whole expression then
+                        Ok(expr.clone())
+                    }
+                } else {
+                    Ok(expr.clone())
+                }
+            }
+            _ => Ok(expr.clone()),
+        }
+    }
+
+    /// Replace complex expressions in the predicate with references to the temp column
+    fn replace_complex_with_temp(
+        expr: &LogicalExpr,
+        temp_column_name: &str,
+    ) -> Result<LogicalExpr> {
+        match expr {
+            LogicalExpr::BinaryExpr { left, op, right } => {
+                // Handle AND/OR - recursively process both sides
+                if matches!(op, BinaryOperator::And | BinaryOperator::Or) {
+                    let new_left = Self::replace_complex_with_temp(left, temp_column_name)?;
+                    let new_right = Self::replace_complex_with_temp(right, temp_column_name)?;
+                    return Ok(LogicalExpr::BinaryExpr {
+                        left: Box::new(new_left),
+                        op: *op,
+                        right: Box::new(new_right),
+                    });
+                }
+
+                // Check if this is a complex comparison that needs replacement
+                if Self::predicate_needs_projection(expr) {
+                    // Replace the complex expression (left side) with the temp column
+                    return Ok(LogicalExpr::BinaryExpr {
+                        left: Box::new(LogicalExpr::Column(Column {
+                            name: temp_column_name.to_string(),
+                            table: None,
+                        })),
+                        op: *op,
+                        right: right.clone(),
+                    });
+                }
+
+                // Simple comparison - keep as is
+                Ok(expr.clone())
+            }
+            _ => Ok(expr.clone()),
         }
     }
 
@@ -5054,5 +5292,76 @@ mod tests {
             Value::Text("Customer Bob".into()),
             "customers.name should be Customer Bob"
         );
+    }
+
+    #[test]
+    fn test_expression_in_where_clause() {
+        // Test expressions in WHERE clauses like (quantity * price) >= 400
+        let (mut circuit, pager) = compile_sql!("SELECT * FROM users WHERE (age * 2) > 30");
+
+        // Create test data
+        let mut input_delta = Delta::new();
+        input_delta.insert(
+            1,
+            vec![
+                Value::Integer(1),
+                Value::Text("Alice".into()),
+                Value::Integer(20), // age * 2 = 40 > 30, should pass
+            ],
+        );
+        input_delta.insert(
+            2,
+            vec![
+                Value::Integer(2),
+                Value::Text("Bob".into()),
+                Value::Integer(10), // age * 2 = 20 <= 30, should be filtered out
+            ],
+        );
+        input_delta.insert(
+            3,
+            vec![
+                Value::Integer(3),
+                Value::Text("Charlie".into()),
+                Value::Integer(16), // age * 2 = 32 > 30, should pass
+            ],
+        );
+
+        // Create input map
+        let mut inputs = HashMap::new();
+        inputs.insert("users".to_string(), input_delta);
+
+        let result = test_execute(&mut circuit, inputs.clone(), pager.clone()).unwrap();
+
+        // Should only have Alice and Charlie (age * 2 > 30)
+        assert_eq!(
+            result.changes.len(),
+            2,
+            "Should have 2 rows after filtering"
+        );
+
+        // Check Alice
+        let alice = result
+            .changes
+            .iter()
+            .find(|(row, _)| row.values[0] == Value::Integer(1))
+            .expect("Alice should be in result");
+        assert_eq!(alice.0.values[1], Value::Text("Alice".into()));
+        assert_eq!(alice.0.values[2], Value::Integer(20));
+
+        // Check Charlie
+        let charlie = result
+            .changes
+            .iter()
+            .find(|(row, _)| row.values[0] == Value::Integer(3))
+            .expect("Charlie should be in result");
+        assert_eq!(charlie.0.values[1], Value::Text("Charlie".into()));
+        assert_eq!(charlie.0.values[2], Value::Integer(16));
+
+        // Bob should not be in result
+        let bob = result
+            .changes
+            .iter()
+            .find(|(row, _)| row.values[0] == Value::Integer(2));
+        assert!(bob.is_none(), "Bob should be filtered out");
     }
 }
