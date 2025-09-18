@@ -316,8 +316,16 @@ impl Page {
 #[derive(Clone, Copy, Debug)]
 /// The state of the current pager cache commit.
 enum CommitState {
+    /// Prepare WAL header for commit if needed
+    PrepareWal,
+    /// Sync WAL header after prepare
+    PrepareWalSync,
+    /// Get DB size (mostly from page cache - but in rare cases we can read it from disk)
+    GetDbSize,
     /// Appends all frames to the WAL.
-    Start,
+    PrepareFrames {
+        db_size: u32,
+    },
     /// Fsync the on-disk WAL.
     SyncWal,
     /// Checkpoint the WAL to the database file (if needed).
@@ -581,7 +589,7 @@ impl Pager {
             commit_info: CommitInfo {
                 result: RefCell::new(None),
                 completions: RefCell::new(Vec::new()),
-                state: CommitState::Start.into(),
+                state: CommitState::PrepareWal.into(),
                 time: now.into(),
             },
             syncing: Rc::new(Cell::new(false)),
@@ -1258,6 +1266,14 @@ impl Pager {
         let mut completions: Vec<Completion> = Vec::new();
         let mut pages = Vec::with_capacity(len);
         let page_sz = self.page_size.get().unwrap_or_default();
+
+        let prepare = wal.borrow_mut().prepare_wal_start(page_sz)?;
+        if let Some(c) = prepare {
+            self.io.wait_for_completion(c)?;
+            let c = wal.borrow_mut().prepare_wal_finish()?;
+            self.io.wait_for_completion(c)?;
+        }
+
         let commit_frame = None; // cacheflush only so we are not setting a commit frame here
         for (idx, page_id) in dirty_pages.iter().enumerate() {
             let page = {
@@ -1315,6 +1331,26 @@ impl Pager {
         sync_mode: crate::SyncMode,
         data_sync_retry: bool,
     ) -> Result<IOResult<PagerCommitResult>> {
+        match self.commit_dirty_pages_inner(
+            wal_auto_checkpoint_disabled,
+            sync_mode,
+            data_sync_retry,
+        ) {
+            r @ (Ok(IOResult::Done(..)) | Err(..)) => {
+                self.commit_info.state.set(CommitState::PrepareWal);
+                r
+            }
+            Ok(IOResult::IO(io)) => Ok(IOResult::IO(io)),
+        }
+    }
+
+    #[instrument(skip_all, level = Level::DEBUG)]
+    fn commit_dirty_pages_inner(
+        &self,
+        wal_auto_checkpoint_disabled: bool,
+        sync_mode: crate::SyncMode,
+        data_sync_retry: bool,
+    ) -> Result<IOResult<PagerCommitResult>> {
         let Some(wal) = self.wal.as_ref() else {
             return Err(LimboError::InternalError(
                 "commit_dirty_pages() called on database without WAL".to_string(),
@@ -1325,14 +1361,34 @@ impl Pager {
             let state = self.commit_info.state.get();
             trace!(?state);
             match state {
-                CommitState::Start => {
+                CommitState::PrepareWal => {
+                    let page_sz = self.page_size.get().expect("page size not set");
+                    let c = wal.borrow_mut().prepare_wal_start(page_sz)?;
+                    let Some(c) = c else {
+                        self.commit_info.state.set(CommitState::GetDbSize);
+                        continue;
+                    };
+                    self.commit_info.state.set(CommitState::PrepareWalSync);
+                    if !c.is_completed() {
+                        io_yield_one!(c);
+                    }
+                }
+                CommitState::PrepareWalSync => {
+                    let c = wal.borrow_mut().prepare_wal_finish()?;
+                    self.commit_info.state.set(CommitState::GetDbSize);
+                    if !c.is_completed() {
+                        io_yield_one!(c);
+                    }
+                }
+                CommitState::GetDbSize => {
+                    let db_size = return_if_io!(self.with_header(|header| header.database_size));
+                    self.commit_info.state.set(CommitState::PrepareFrames {
+                        db_size: db_size.get(),
+                    });
+                }
+                CommitState::PrepareFrames { db_size } => {
                     let now = self.io.now();
                     self.commit_info.time.set(now);
-                    let db_size_after = {
-                        self.io
-                            .block(|| self.with_header(|header| header.database_size))?
-                            .get()
-                    };
 
                     let dirty_ids: Vec<usize> = self.dirty_pages.read().iter().copied().collect();
                     if dirty_ids.is_empty() {
@@ -1364,7 +1420,7 @@ impl Pager {
                         if end_of_chunk {
                             let commit_flag = if i == total - 1 {
                                 // Only the commit frame (final) frame carries the db_size
-                                Some(db_size_after)
+                                Some(db_size)
                             } else {
                                 None
                             };
@@ -1473,7 +1529,7 @@ impl Pager {
                     let mut completions = self.commit_info.completions.borrow_mut();
                     if completions.iter().all(|c| c.is_completed()) {
                         completions.clear();
-                        self.commit_info.state.set(CommitState::Start);
+                        self.commit_info.state.set(CommitState::PrepareWal);
                         wal.borrow_mut().finish_append_frames_commit()?;
                         let result = self.commit_info.result.borrow_mut().take();
                         return Ok(IOResult::Done(result.expect("commit result should be set")));
@@ -1645,15 +1701,20 @@ impl Pager {
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
-    pub fn wal_checkpoint(&self, mode: CheckpointMode) -> Result<CheckpointResult> {
+    pub fn wal_checkpoint_start(&self, mode: CheckpointMode) -> Result<IOResult<CheckpointResult>> {
         let Some(wal) = self.wal.as_ref() else {
             return Err(LimboError::InternalError(
                 "wal_checkpoint() called on database without WAL".to_string(),
             ));
         };
 
-        let mut checkpoint_result = self.io.block(|| wal.borrow_mut().checkpoint(self, mode))?;
+        wal.borrow_mut().checkpoint(self, mode)
+    }
 
+    pub fn wal_checkpoint_finish(
+        &self,
+        checkpoint_result: &mut CheckpointResult,
+    ) -> Result<IOResult<()>> {
         'ensure_sync: {
             if checkpoint_result.num_backfilled != 0 {
                 if checkpoint_result.everything_backfilled() {
@@ -1664,27 +1725,35 @@ impl Pager {
                     let page_size = self.page_size.get().unwrap_or_default();
                     let expected = (db_size * page_size.get()) as u64;
                     if expected < self.db_file.size()? {
-                        self.io.wait_for_completion(self.db_file.truncate(
-                            expected as usize,
-                            Completion::new_trunc(move |_| {
-                                tracing::trace!(
-                                    "Database file truncated to expected size: {} bytes",
-                                    expected
-                                );
-                            }),
-                        )?)?;
-                        self.io
-                            .wait_for_completion(self.db_file.sync(Completion::new_sync(
-                                move |_| {
-                                    tracing::trace!("Database file syncd after truncation");
-                                },
-                            ))?)?;
+                        if !checkpoint_result.db_truncate_sent {
+                            let c = self.db_file.truncate(
+                                expected as usize,
+                                Completion::new_trunc(move |_| {
+                                    tracing::trace!(
+                                        "Database file truncated to expected size: {} bytes",
+                                        expected
+                                    );
+                                }),
+                            )?;
+                            checkpoint_result.db_truncate_sent = true;
+                            io_yield_one!(c);
+                        }
+                        if !checkpoint_result.db_sync_sent {
+                            let c = self.db_file.sync(Completion::new_sync(move |_| {
+                                tracing::trace!("Database file syncd after truncation");
+                            }))?;
+                            checkpoint_result.db_sync_sent = true;
+                            io_yield_one!(c);
+                        }
                         break 'ensure_sync;
                     }
                 }
-                // if we backfilled at all, we have to sync the db-file here
-                self.io
-                    .wait_for_completion(self.db_file.sync(Completion::new_sync(move |_| {}))?)?;
+                if !checkpoint_result.db_sync_sent {
+                    // if we backfilled at all, we have to sync the db-file here
+                    let c = self.db_file.sync(Completion::new_sync(move |_| {}))?;
+                    checkpoint_result.db_sync_sent = true;
+                    io_yield_one!(c);
+                }
             }
         }
         checkpoint_result.release_guard();
@@ -1693,7 +1762,14 @@ impl Pager {
             .write()
             .clear()
             .map_err(|e| LimboError::InternalError(format!("Failed to clear page cache: {e:?}")))?;
-        Ok(checkpoint_result)
+        Ok(IOResult::Done(()))
+    }
+
+    #[instrument(skip_all, level = Level::DEBUG)]
+    pub fn wal_checkpoint(&self, mode: CheckpointMode) -> Result<CheckpointResult> {
+        let mut result = self.io.block(|| self.wal_checkpoint_start(mode))?;
+        self.io.block(|| self.wal_checkpoint_finish(&mut result))?;
+        Ok(result)
     }
 
     pub fn freepage_list(&self) -> u32 {
@@ -2179,7 +2255,7 @@ impl Pager {
     fn reset_internal_states(&self) {
         *self.checkpoint_state.write() = CheckpointState::Checkpoint;
         self.syncing.replace(false);
-        self.commit_info.state.set(CommitState::Start);
+        self.commit_info.state.set(CommitState::PrepareWal);
         self.commit_info.time.set(self.io.now());
         self.allocate_page_state.replace(AllocatePageState::Start);
         self.free_page_state.replace(FreePageState::Start);

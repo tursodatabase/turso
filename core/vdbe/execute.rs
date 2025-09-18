@@ -8,13 +8,13 @@ use crate::storage::btree::{
 use crate::storage::database::DatabaseFile;
 use crate::storage::page_cache::PageCache;
 use crate::storage::pager::{AtomicDbState, CreateBTreeFlags, DbState};
-use crate::storage::sqlite3_ondisk::{read_varint, DatabaseHeader};
+use crate::storage::sqlite3_ondisk::{read_varint, DatabaseHeader, PageSize};
 use crate::translate::collate::CollationSeq;
 use crate::types::{
     compare_immutable, compare_records_generic, Extendable, IOCompletions, ImmutableRecord,
     SeekResult, Text,
 };
-use crate::util::{normalize_ident, IOExt as _};
+use crate::util::normalize_ident;
 use crate::vdbe::insn::InsertFlags;
 use crate::vdbe::registers_to_ref_values;
 use crate::vector::{vector_concat, vector_slice};
@@ -330,7 +330,30 @@ pub fn op_bit_not(
     Ok(InsnFunctionStepResult::Step)
 }
 
+#[derive(Debug)]
+pub enum OpCheckpointState {
+    StartCheckpoint,
+    FinishCheckpoint { result: Option<CheckpointResult> },
+    CompleteResult { result: Result<CheckpointResult> },
+}
+
 pub fn op_checkpoint(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+    mv_store: Option<&Arc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    match op_checkpoint_inner(program, state, insn, pager, mv_store) {
+        Ok(result) => Ok(result),
+        Err(err) => {
+            state.op_checkpoint_state = OpCheckpointState::StartCheckpoint;
+            Err(err)
+        }
+    }
+}
+
+pub fn op_checkpoint_inner(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
@@ -352,26 +375,75 @@ pub fn op_checkpoint(
         // however.
         return Err(LimboError::TableLocked);
     }
-    let result = program.connection.checkpoint(*checkpoint_mode);
-    match result {
-        Ok(CheckpointResult {
-            num_attempted,
-            num_backfilled,
-            ..
-        }) => {
-            // https://sqlite.org/pragma.html#pragma_wal_checkpoint
-            // 1st col: 1 (checkpoint SQLITE_BUSY) or 0 (not busy).
-            state.registers[*dest] = Register::Value(Value::Integer(0));
-            // 2nd col: # modified pages written to wal file
-            state.registers[*dest + 1] = Register::Value(Value::Integer(num_attempted as i64));
-            // 3rd col: # pages moved to db after checkpoint
-            state.registers[*dest + 2] = Register::Value(Value::Integer(num_backfilled as i64));
-        }
-        Err(_err) => state.registers[*dest] = Register::Value(Value::Integer(1)),
-    }
+    loop {
+        match &mut state.op_checkpoint_state {
+            OpCheckpointState::StartCheckpoint => {
+                let step_result = program
+                    .connection
+                    .pager
+                    .borrow_mut()
+                    .wal_checkpoint_start(*checkpoint_mode);
+                match step_result {
+                    Ok(IOResult::Done(result)) => {
+                        state.op_checkpoint_state = OpCheckpointState::FinishCheckpoint {
+                            result: Some(result),
+                        };
+                        continue;
+                    }
+                    Ok(IOResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(io)),
+                    Err(err) => {
+                        state.op_checkpoint_state =
+                            OpCheckpointState::CompleteResult { result: Err(err) };
+                        continue;
+                    }
+                }
+            }
+            OpCheckpointState::FinishCheckpoint { result } => {
+                let step_result = program
+                    .connection
+                    .pager
+                    .borrow_mut()
+                    .wal_checkpoint_finish(result.as_mut().unwrap());
+                match step_result {
+                    Ok(IOResult::Done(())) => {
+                        state.op_checkpoint_state = OpCheckpointState::CompleteResult {
+                            result: Ok(result.take().unwrap()),
+                        };
+                        continue;
+                    }
+                    Ok(IOResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(io)),
+                    Err(err) => {
+                        state.op_checkpoint_state =
+                            OpCheckpointState::CompleteResult { result: Err(err) };
+                        continue;
+                    }
+                }
+            }
+            OpCheckpointState::CompleteResult { result } => {
+                match result {
+                    Ok(CheckpointResult {
+                        num_attempted,
+                        num_backfilled,
+                        ..
+                    }) => {
+                        // https://sqlite.org/pragma.html#pragma_wal_checkpoint
+                        // 1st col: 1 (checkpoint SQLITE_BUSY) or 0 (not busy).
+                        state.registers[*dest] = Register::Value(Value::Integer(0));
+                        // 2nd col: # modified pages written to wal file
+                        state.registers[*dest + 1] =
+                            Register::Value(Value::Integer(*num_attempted as i64));
+                        // 3rd col: # pages moved to db after checkpoint
+                        state.registers[*dest + 2] =
+                            Register::Value(Value::Integer(*num_backfilled as i64));
+                    }
+                    Err(_err) => state.registers[*dest] = Register::Value(Value::Integer(1)),
+                }
 
-    state.pc += 1;
-    Ok(InsnFunctionStepResult::Step)
+                state.pc += 1;
+                return Ok(InsnFunctionStepResult::Step);
+            }
+        }
+    }
 }
 
 pub fn op_null(
@@ -2080,7 +2152,29 @@ pub fn op_halt_if_null(
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum OpTransactionState {
+    Start,
+    CheckSchemaCookie,
+}
+
 pub fn op_transaction(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+    mv_store: Option<&Arc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    match op_transaction_inner(program, state, insn, pager, mv_store) {
+        Ok(result) => Ok(result),
+        Err(err) => {
+            state.op_transaction_state = OpTransactionState::Start;
+            Err(err)
+        }
+    }
+}
+
+pub fn op_transaction_inner(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
@@ -2095,176 +2189,188 @@ pub fn op_transaction(
         },
         insn
     );
-    let conn = program.connection.clone();
-    let write = matches!(tx_mode, TransactionMode::Write);
-    if write && conn._db.open_flags.contains(OpenFlags::ReadOnly) {
-        return Err(LimboError::ReadOnly);
-    }
 
     let pager = program.get_pager_from_database_index(db);
-
-    // 1. We try to upgrade current version
-    let current_state = conn.transaction_state.get();
-    let (new_transaction_state, updated) = if conn.is_nested_stmt.get() {
-        (current_state, false)
-    } else {
-        match (current_state, write) {
-            // pending state means that we tried beginning a tx and the method returned IO.
-            // instead of ending the read tx, just update the state to pending.
-            (TransactionState::PendingUpgrade, write) => {
-                turso_assert!(
-                    write,
-                    "pending upgrade should only be set for write transactions"
-                );
-                (
-                    TransactionState::Write {
-                        schema_did_change: false,
-                    },
-                    true,
-                )
-            }
-            (TransactionState::Write { schema_did_change }, true) => {
-                (TransactionState::Write { schema_did_change }, false)
-            }
-            (TransactionState::Write { schema_did_change }, false) => {
-                (TransactionState::Write { schema_did_change }, false)
-            }
-            (TransactionState::Read, true) => (
-                TransactionState::Write {
-                    schema_did_change: false,
-                },
-                true,
-            ),
-            (TransactionState::Read, false) => (TransactionState::Read, false),
-            (TransactionState::None, true) => (
-                TransactionState::Write {
-                    schema_did_change: false,
-                },
-                true,
-            ),
-            (TransactionState::None, false) => (TransactionState::Read, true),
-        }
-    };
-
-    // 2. Start transaction if needed
-    if let Some(mv_store) = &mv_store {
-        // In MVCC we don't have write exclusivity, therefore we just need to start a transaction if needed.
-        // Programs can run Transaction twice, first with read flag and then with write flag. So a single txid is enough
-        // for both.
-        if program.connection.mv_tx.get().is_none() {
-            // We allocate the first page lazily in the first transaction.
-            // TODO: when we fix MVCC enable schema cookie detection for reprepare statements
-            // let header_schema_cookie = pager
-            //     .io
-            //     .block(|| pager.with_header(|header| header.schema_cookie.get()))?;
-            // if header_schema_cookie != *schema_cookie {
-            //     return Err(LimboError::SchemaUpdated);
-            // }
-            let tx_id = match tx_mode {
-                TransactionMode::None | TransactionMode::Read | TransactionMode::Concurrent => {
-                    mv_store.begin_tx(pager.clone())?
+    loop {
+        match state.op_transaction_state {
+            OpTransactionState::Start => {
+                let conn = program.connection.clone();
+                let write = matches!(tx_mode, TransactionMode::Write);
+                if write && conn._db.open_flags.contains(OpenFlags::ReadOnly) {
+                    return Err(LimboError::ReadOnly);
                 }
-                TransactionMode::Write => {
-                    return_if_io!(mv_store.begin_exclusive_tx(pager.clone(), None))
-                }
-            };
-            program.connection.mv_tx.set(Some((tx_id, *tx_mode)));
-        } else if updated {
-            // TODO: fix tx_mode in Insn::Transaction, now each statement overrides it even if there's already a CONCURRENT Tx in progress, for example
-            let mv_tx_mode = program.connection.mv_tx.get().unwrap().1;
-            let actual_tx_mode = if mv_tx_mode == TransactionMode::Concurrent {
-                TransactionMode::Concurrent
-            } else {
-                *tx_mode
-            };
-            if matches!(new_transaction_state, TransactionState::Write { .. })
-                && matches!(actual_tx_mode, TransactionMode::Write)
-            {
-                let (tx_id, mv_tx_mode) = program.connection.mv_tx.get().unwrap();
-                if mv_tx_mode == TransactionMode::Read {
-                    return_if_io!(mv_store.upgrade_to_exclusive_tx(pager.clone(), Some(tx_id)));
+
+                // 1. We try to upgrade current version
+                let current_state = conn.transaction_state.get();
+                let (new_transaction_state, updated) = if conn.is_nested_stmt.get() {
+                    (current_state, false)
                 } else {
-                    return_if_io!(mv_store.begin_exclusive_tx(pager.clone(), Some(tx_id)));
+                    match (current_state, write) {
+                        // pending state means that we tried beginning a tx and the method returned IO.
+                        // instead of ending the read tx, just update the state to pending.
+                        (TransactionState::PendingUpgrade, write) => {
+                            turso_assert!(
+                                write,
+                                "pending upgrade should only be set for write transactions"
+                            );
+                            (
+                                TransactionState::Write {
+                                    schema_did_change: false,
+                                },
+                                true,
+                            )
+                        }
+                        (TransactionState::Write { schema_did_change }, true) => {
+                            (TransactionState::Write { schema_did_change }, false)
+                        }
+                        (TransactionState::Write { schema_did_change }, false) => {
+                            (TransactionState::Write { schema_did_change }, false)
+                        }
+                        (TransactionState::Read, true) => (
+                            TransactionState::Write {
+                                schema_did_change: false,
+                            },
+                            true,
+                        ),
+                        (TransactionState::Read, false) => (TransactionState::Read, false),
+                        (TransactionState::None, true) => (
+                            TransactionState::Write {
+                                schema_did_change: false,
+                            },
+                            true,
+                        ),
+                        (TransactionState::None, false) => (TransactionState::Read, true),
+                    }
+                };
+
+                // 2. Start transaction if needed
+                if let Some(mv_store) = &mv_store {
+                    // In MVCC we don't have write exclusivity, therefore we just need to start a transaction if needed.
+                    // Programs can run Transaction twice, first with read flag and then with write flag. So a single txid is enough
+                    // for both.
+                    if program.connection.mv_tx.get().is_none() {
+                        // We allocate the first page lazily in the first transaction.
+                        // TODO: when we fix MVCC enable schema cookie detection for reprepare statements
+                        // let header_schema_cookie = pager
+                        //     .io
+                        //     .block(|| pager.with_header(|header| header.schema_cookie.get()))?;
+                        // if header_schema_cookie != *schema_cookie {
+                        //     return Err(LimboError::SchemaUpdated);
+                        // }
+                        let tx_id = match tx_mode {
+                            TransactionMode::None
+                            | TransactionMode::Read
+                            | TransactionMode::Concurrent => mv_store.begin_tx(pager.clone())?,
+                            TransactionMode::Write => {
+                                return_if_io!(mv_store.begin_exclusive_tx(pager.clone(), None))
+                            }
+                        };
+                        program.connection.mv_tx.set(Some((tx_id, *tx_mode)));
+                    } else if updated {
+                        // TODO: fix tx_mode in Insn::Transaction, now each statement overrides it even if there's already a CONCURRENT Tx in progress, for example
+                        let mv_tx_mode = program.connection.mv_tx.get().unwrap().1;
+                        let actual_tx_mode = if mv_tx_mode == TransactionMode::Concurrent {
+                            TransactionMode::Concurrent
+                        } else {
+                            *tx_mode
+                        };
+                        if matches!(new_transaction_state, TransactionState::Write { .. })
+                            && matches!(actual_tx_mode, TransactionMode::Write)
+                        {
+                            let (tx_id, mv_tx_mode) = program.connection.mv_tx.get().unwrap();
+                            if mv_tx_mode == TransactionMode::Read {
+                                return_if_io!(
+                                    mv_store.upgrade_to_exclusive_tx(pager.clone(), Some(tx_id))
+                                );
+                            } else {
+                                return_if_io!(
+                                    mv_store.begin_exclusive_tx(pager.clone(), Some(tx_id))
+                                );
+                            }
+                        }
+                    }
+                } else {
+                    if matches!(tx_mode, TransactionMode::Concurrent) {
+                        return Err(LimboError::TxError(
+                            "Concurrent transaction mode is only supported when MVCC is enabled"
+                                .to_string(),
+                        ));
+                    }
+                    if updated && matches!(current_state, TransactionState::None) {
+                        turso_assert!(
+                            !conn.is_nested_stmt.get(),
+                            "nested stmt should not begin a new read transaction"
+                        );
+                        pager.begin_read_tx()?;
+                    }
+
+                    if updated && matches!(new_transaction_state, TransactionState::Write { .. }) {
+                        turso_assert!(
+                            !conn.is_nested_stmt.get(),
+                            "nested stmt should not begin a new write transaction"
+                        );
+                        let begin_w_tx_res = pager.begin_write_tx();
+                        if let Err(LimboError::Busy) = begin_w_tx_res {
+                            // We failed to upgrade to write transaction so put the transaction into its original state.
+                            // That is, if the transaction had not started, end the read transaction so that next time we
+                            // start a new one.
+                            if matches!(current_state, TransactionState::None) {
+                                pager.end_read_tx()?;
+                                conn.transaction_state.replace(TransactionState::None);
+                            }
+                            assert_eq!(conn.transaction_state.get(), current_state);
+                            return Err(LimboError::Busy);
+                        }
+                        if let IOResult::IO(io) = begin_w_tx_res? {
+                            // set the transaction state to pending so we don't have to
+                            // end the read transaction.
+                            program
+                                .connection
+                                .transaction_state
+                                .replace(TransactionState::PendingUpgrade);
+                            return Ok(InsnFunctionStepResult::IO(io));
+                        }
+                    }
                 }
-            }
-        }
-    } else {
-        if matches!(tx_mode, TransactionMode::Concurrent) {
-            return Err(LimboError::TxError(
-                "Concurrent transaction mode is only supported when MVCC is enabled".to_string(),
-            ));
-        }
-        if updated && matches!(current_state, TransactionState::None) {
-            turso_assert!(
-                !conn.is_nested_stmt.get(),
-                "nested stmt should not begin a new read transaction"
-            );
-            pager.begin_read_tx()?;
-        }
 
-        if updated && matches!(new_transaction_state, TransactionState::Write { .. }) {
-            turso_assert!(
-                !conn.is_nested_stmt.get(),
-                "nested stmt should not begin a new write transaction"
-            );
-            let begin_w_tx_res = pager.begin_write_tx();
-            if let Err(LimboError::Busy) = begin_w_tx_res {
-                // We failed to upgrade to write transaction so put the transaction into its original state.
-                // That is, if the transaction had not started, end the read transaction so that next time we
-                // start a new one.
-                if matches!(current_state, TransactionState::None) {
-                    pager.end_read_tx()?;
-                    conn.transaction_state.replace(TransactionState::None);
+                // 3. Transaction state should be updated before checking for Schema cookie so that the tx is ended properly on error
+                if updated {
+                    conn.transaction_state.replace(new_transaction_state);
                 }
-                assert_eq!(conn.transaction_state.get(), current_state);
-                return Err(LimboError::Busy);
+                state.op_transaction_state = OpTransactionState::CheckSchemaCookie;
+                continue;
             }
-            if let IOResult::IO(io) = begin_w_tx_res? {
-                // set the transaction state to pending so we don't have to
-                // end the read transaction.
-                program
-                    .connection
-                    .transaction_state
-                    .replace(TransactionState::PendingUpgrade);
-                return Ok(InsnFunctionStepResult::IO(io));
+            // 4. Check whether schema has changed if we are actually going to access the database.
+            // Can only read header if page 1 has been allocated already
+            // begin_write_tx that happens, but not begin_read_tx
+            OpTransactionState::CheckSchemaCookie => {
+                let res = with_header(&pager, mv_store, program, |header| {
+                    header.schema_cookie.get()
+                });
+                match res {
+                    Ok(IOResult::Done(header_schema_cookie)) => {
+                        if header_schema_cookie != *schema_cookie {
+                            tracing::debug!(
+                                "schema changed, force reprepare: {} != {}",
+                                header_schema_cookie,
+                                *schema_cookie
+                            );
+                            return Err(LimboError::SchemaUpdated);
+                        }
+                    }
+                    Ok(IOResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(io)),
+                    // This means we are starting a read_tx and we do not have a page 1 yet, so we just continue execution
+                    Err(LimboError::Page1NotAlloc) => {}
+                    Err(err) => {
+                        return Err(err);
+                    }
+                }
+
+                state.pc += 1;
+                return Ok(InsnFunctionStepResult::Step);
             }
         }
     }
-
-    // 3. Transaction state should be updated before checking for Schema cookie so that the tx is ended properly on error
-    if updated {
-        conn.transaction_state.replace(new_transaction_state);
-    }
-
-    // 4. Check whether schema has changed if we are actually going to access the database.
-    // Can only read header if page 1 has been allocated already
-    // begin_write_tx that happens, but not begin_read_tx
-    // TODO: this is a hack to make the pager run the IO loop
-    let res = pager.io.block(|| {
-        with_header(&pager, mv_store, program, |header| {
-            header.schema_cookie.get()
-        })
-    });
-    match res {
-        Ok(header_schema_cookie) => {
-            if header_schema_cookie != *schema_cookie {
-                tracing::debug!(
-                    "schema changed, force reprepare: {} != {}",
-                    header_schema_cookie,
-                    *schema_cookie
-                );
-                return Err(LimboError::SchemaUpdated);
-            }
-        }
-        // This means we are starting a read_tx and we do not have a page 1 yet, so we just continue execution
-        Err(LimboError::Page1NotAlloc) => {}
-        Err(err) => {
-            return Err(err);
-        }
-    }
-
-    state.pc += 1;
-    Ok(InsnFunctionStepResult::Step)
 }
 
 pub fn op_auto_commit(
@@ -3891,14 +3997,17 @@ pub fn op_sorter_open(
         },
         insn
     );
-    let cache_size = program.connection.get_cache_size();
-    // Set the buffer size threshold to be roughly the same as the limit configured for the page-cache.
-    let page_size = pager
-        .io
-        .block(|| pager.with_header(|header| header.page_size))
-        .unwrap_or_default()
-        .get() as usize;
+    // be careful here - we must not use any async operations after pager.with_header because this op-code has no proper state-machine
+    let page_size = match pager.with_header(|header| header.page_size) {
+        Ok(IOResult::Done(page_size)) => page_size,
+        Err(_) => PageSize::default(),
+        Ok(IOResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(io)),
+    };
+    let page_size = page_size.get() as usize;
 
+    let cache_size = program.connection.get_cache_size();
+
+    // Set the buffer size threshold to be roughly the same as the limit configured for the page-cache.
     let max_buffer_size_bytes = if cache_size < 0 {
         (cache_size.abs() * 1024) as usize
     } else {
@@ -7076,6 +7185,8 @@ pub fn op_open_ephemeral(
     match &mut state.op_open_ephemeral_state {
         OpOpenEphemeralState::Start => {
             tracing::trace!("Start");
+            let page_size =
+                return_if_io!(with_header(pager, mv_store, program, |header| header.page_size));
             let conn = program.connection.clone();
             let io = conn.pager.borrow().io.clone();
             let rand_num = io.generate_random_number();
@@ -7108,11 +7219,6 @@ pub fn op_open_ephemeral(
                 db_file_io = io;
             }
 
-            let page_size = pager
-                .io
-                .block(|| with_header(pager, mv_store, program, |header| header.page_size))?
-                .get();
-
             let buffer_pool = program.connection._db.buffer_pool.clone();
             let page_cache = Arc::new(RwLock::new(PageCache::default()));
 
@@ -7125,11 +7231,6 @@ pub fn op_open_ephemeral(
                 Arc::new(AtomicDbState::new(DbState::Uninitialized)),
                 Arc::new(Mutex::new(())),
             )?);
-
-            let page_size = pager
-                .io
-                .block(|| with_header(&pager, mv_store, program, |header| header.page_size))
-                .unwrap_or_default();
 
             pager.page_size.set(Some(page_size));
 
