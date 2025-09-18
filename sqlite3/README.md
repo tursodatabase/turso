@@ -48,8 +48,8 @@ To run C tests against our implementation:
 ```bash
 cd tests
 make clean
-make LIBS="-L../target/debug -lsqlite3"
-./sqlite3-tests
+make LIBS="-L../../target/debug -lturso_sqlite3"
+LD_LIBRARY_PATH=../../target/debug ./sqlite3-tests
 ```
 
 ### 2. Rust Tests (`src/lib.rs`)

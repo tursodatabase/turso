@@ -118,45 +118,54 @@ pub fn translate_insert(
     let mut values: Option<Vec<Box<Expr>>> = None;
     let mut upsert_opt: Option<Upsert> = None;
 
-    let inserting_multiple_rows = match &mut body {
-        InsertBody::Select(select, upsert) => {
-            upsert_opt = upsert.as_deref().cloned();
-            match &mut select.body.select {
-                // TODO see how to avoid clone
-                OneSelect::Values(values_expr) if values_expr.len() <= 1 => {
-                    if values_expr.is_empty() {
-                        crate::bail_parse_error!("no values to insert");
-                    }
-                    let mut param_idx = 1;
-                    for expr in values_expr.iter_mut().flat_map(|v| v.iter_mut()) {
-                        match expr.as_mut() {
-                            Expr::Id(name) => {
-                                if name.is_double_quoted() {
-                                    *expr = Expr::Literal(ast::Literal::String(name.to_string()))
-                                        .into();
-                                } else {
-                                    // an INSERT INTO ... VALUES (...) cannot reference columns
-                                    crate::bail_parse_error!("no such column: {name}");
-                                }
-                            }
-                            Expr::Qualified(first_name, second_name) => {
-                                // an INSERT INTO ... VALUES (...) cannot reference columns
-                                crate::bail_parse_error!(
-                                    "no such column: {first_name}.{second_name}"
-                                );
-                            }
-                            _ => {}
-                        }
-                        rewrite_expr(expr, &mut param_idx)?;
-                    }
-                    values = values_expr.pop();
-                    false
+    let mut param_idx = 1;
+    let mut inserting_multiple_rows = false;
+    if let InsertBody::Select(select, upsert) = &mut body {
+        match &mut select.body.select {
+            // TODO see how to avoid clone
+            OneSelect::Values(values_expr) if values_expr.len() <= 1 => {
+                if values_expr.is_empty() {
+                    crate::bail_parse_error!("no values to insert");
                 }
-                _ => true,
+                for expr in values_expr.iter_mut().flat_map(|v| v.iter_mut()) {
+                    match expr.as_mut() {
+                        Expr::Id(name) => {
+                            if name.is_double_quoted() {
+                                *expr =
+                                    Expr::Literal(ast::Literal::String(name.to_string())).into();
+                            } else {
+                                // an INSERT INTO ... VALUES (...) cannot reference columns
+                                crate::bail_parse_error!("no such column: {name}");
+                            }
+                        }
+                        Expr::Qualified(first_name, second_name) => {
+                            // an INSERT INTO ... VALUES (...) cannot reference columns
+                            crate::bail_parse_error!("no such column: {first_name}.{second_name}");
+                        }
+                        _ => {}
+                    }
+                    rewrite_expr(expr, &mut param_idx)?;
+                }
+                values = values_expr.pop();
+            }
+            _ => inserting_multiple_rows = true,
+        }
+        if let Some(ref mut upsert) = upsert {
+            if let UpsertDo::Set {
+                ref mut sets,
+                ref mut where_clause,
+            } = &mut upsert.do_clause
+            {
+                for set in sets.iter_mut() {
+                    rewrite_expr(set.expr.as_mut(), &mut param_idx)?;
+                }
+                if let Some(ref mut where_expr) = where_clause {
+                    rewrite_expr(where_expr.as_mut(), &mut param_idx)?;
+                }
             }
         }
-        InsertBody::DefaultValues => false,
-    };
+        upsert_opt = upsert.as_deref().cloned();
+    }
 
     if inserting_multiple_rows && btree_table.has_autoincrement {
         ensure_sequence_initialized(&mut program, schema, &btree_table)?;

@@ -305,7 +305,30 @@ do_execsql_test_on_specific_db {:memory:} upsert-omitted-target-updates-unique {
     SELECT * FROM ou;
 } {3|y}
 
-# Target qualified with database.table.column should match too (assuming single db).
+do_execsql_test_on_specific_db {:memory:} upsert-current-qualified.1 {
+  CREATE TABLE dq (a INTEGER UNIQUE, b TEXT);
+  INSERT INTO dq VALUES (1,'old');
+  INSERT INTO dq VALUES (1,'new')
+    ON CONFLICT(dq.a) DO UPDATE SET b = dq.b || '-' || excluded.b;
+  SELECT * FROM dq;
+} {1|old-new}
+
+do_execsql_test_on_specific_db {:memory:} upsert-multicol-set.1 {
+  CREATE TABLE dq (a INTEGER UNIQUE, b TEXT);
+  INSERT INTO dq VALUES (1,'old');
+  INSERT INTO dq VALUES (1,'new')
+    ON CONFLICT(a) DO UPDATE SET (`a`,`b`) = (`excluded`.`a`, `excluded`.`b`);
+  SELECT * FROM dq;
+} {1|new}
+
+do_execsql_test_on_specific_db {:memory:} upsert-where-predicate.1 {
+  CREATE TABLE dq (a INTEGER UNIQUE, b TEXT);
+  INSERT INTO dq VALUES (1,'old');
+  INSERT INTO dq VALUES (1,'old')
+    ON CONFLICT(a) DO UPDATE SET b = excluded.b WHERE dq.b != excluded.b;
+  SELECT * FROM dq;
+} {1|old}
+
 do_execsql_test_on_specific_db {:memory:} upsert-doubly-qualified-target {
     CREATE TABLE dq (a UNIQUE, b);
     INSERT INTO dq VALUES (1,'old');

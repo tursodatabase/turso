@@ -1,7 +1,7 @@
 use clap::{Parser, ValueEnum};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
-use std::time::Instant;
-use tokio::runtime::Runtime;
+use std::time::{Duration, Instant};
 use turso::{Builder, Database, Result};
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -26,10 +26,25 @@ struct Args {
 
     #[arg(short = 'm', long = "mode", default_value = "legacy")]
     mode: TransactionMode,
+
+    #[arg(
+        long = "think",
+        default_value = "0",
+        help = "Per transaction think time (ms)"
+    )]
+    think: u64,
+
+    #[arg(
+        long = "timeout",
+        default_value = "30000",
+        help = "Busy timeout in milliseconds"
+    )]
+    timeout: u64,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
     let args = Args::parse();
 
     println!(
@@ -51,33 +66,34 @@ async fn main() -> Result<()> {
     let start_barrier = Arc::new(Barrier::new(args.threads));
     let mut handles = Vec::new();
 
+    let timeout = Duration::from_millis(args.timeout);
+
     let overall_start = Instant::now();
 
     for thread_id in 0..args.threads {
         let db_clone = db.clone();
         let barrier = Arc::clone(&start_barrier);
 
-        let handle = tokio::task::spawn_blocking(move || {
-            let rt = Runtime::new().unwrap();
-            rt.block_on(worker_thread(
-                thread_id,
-                db_clone,
-                args.batch_size,
-                args.iterations,
-                barrier,
-                args.mode,
-            ))
-        });
+        let handle = tokio::task::spawn(worker_thread(
+            thread_id,
+            db_clone,
+            args.batch_size,
+            args.iterations,
+            barrier,
+            args.mode,
+            args.think,
+            timeout,
+        ));
 
         handles.push(handle);
     }
 
     let mut total_inserts = 0;
-    for handle in handles {
+    for (idx, handle) in handles.into_iter().enumerate() {
         match handle.await {
             Ok(Ok(inserts)) => total_inserts += inserts,
             Ok(Err(e)) => {
-                eprintln!("Thread error: {}", e);
+                eprintln!("Thread error {idx}: {e}");
                 return Err(e);
             }
             Err(_) => {
@@ -91,9 +107,9 @@ async fn main() -> Result<()> {
     let overall_throughput = (total_inserts as f64) / overall_elapsed.as_secs_f64();
 
     println!("\n=== BENCHMARK RESULTS ===");
-    println!("Total inserts: {}", total_inserts);
+    println!("Total inserts: {total_inserts}");
     println!("Total time: {:.2}s", overall_elapsed.as_secs_f64());
-    println!("Overall throughput: {:.2} inserts/sec", overall_throughput);
+    println!("Overall throughput: {overall_throughput:.2} inserts/sec");
     println!("Threads: {}", args.threads);
     println!("Batch size: {}", args.batch_size);
     println!("Iterations per thread: {}", args.iterations);
@@ -128,10 +144,11 @@ async fn setup_database(db_path: &str, mode: TransactionMode) -> Result<Database
     )
     .await?;
 
-    println!("Database created at: {}", db_path);
+    println!("Database created at: {db_path}");
     Ok(db)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn worker_thread(
     thread_id: usize,
     db: Database,
@@ -139,48 +156,70 @@ async fn worker_thread(
     iterations: usize,
     start_barrier: Arc<Barrier>,
     mode: TransactionMode,
+    think_ms: u64,
+    timeout: Duration,
 ) -> Result<u64> {
-    let conn = db.connect()?;
-
-    let mut stmt = conn
-        .prepare("INSERT INTO test_table (id, data) VALUES (?, ?)")
-        .await?;
-
     start_barrier.wait();
 
     let start_time = Instant::now();
-    let mut total_inserts = 0;
+    let total_inserts = Arc::new(AtomicU64::new(0));
+
+    let mut tx_futs = vec![];
 
     for iteration in 0..iterations {
-        let begin_stmt = match mode {
-            TransactionMode::Legacy | TransactionMode::Mvcc => "BEGIN",
-            TransactionMode::Concurrent => "BEGIN CONCURRENT",
+        let conn = db.connect()?;
+        conn.busy_timeout(Some(timeout))?;
+        let total_inserts = Arc::clone(&total_inserts);
+        let tx_fut = async move {
+            let mut stmt = conn
+                .prepare("INSERT INTO test_table (id, data) VALUES (?, ?)")
+                .await?;
+
+            let begin_stmt = match mode {
+                TransactionMode::Legacy | TransactionMode::Mvcc => "BEGIN",
+                TransactionMode::Concurrent => "BEGIN CONCURRENT",
+            };
+            conn.execute(begin_stmt, ()).await?;
+
+            for i in 0..batch_size {
+                let id = thread_id * iterations * batch_size + iteration * batch_size + i;
+                stmt.execute(turso::params::Params::Positional(vec![
+                    turso::Value::Integer(id as i64),
+                    turso::Value::Text(format!("data_{id}")),
+                ]))
+                .await?;
+                total_inserts.fetch_add(1, Ordering::Relaxed);
+            }
+
+            if think_ms > 0 {
+                tokio::time::sleep(tokio::time::Duration::from_millis(think_ms)).await;
+            }
+
+            conn.execute("COMMIT", ()).await?;
+            Ok::<_, turso::Error>(())
         };
-        conn.execute(begin_stmt, ()).await?;
+        match mode {
+            TransactionMode::Concurrent => tx_futs.push(tx_fut),
+            _ => tx_fut.await?,
+        };
+    }
 
-        for i in 0..batch_size {
-            let id = thread_id * iterations * batch_size + iteration * batch_size + i;
-            stmt.execute(turso::params::Params::Positional(vec![
-                turso::Value::Integer(id as i64),
-                turso::Value::Text(format!("data_{}", id)),
-            ]))
-            .await?;
-            total_inserts += 1;
-        }
-
-        conn.execute("COMMIT", ()).await?;
+    let results = futures::future::join_all(tx_futs).await;
+    for result in results {
+        result?;
     }
 
     let elapsed = start_time.elapsed();
-    let throughput = (total_inserts as f64) / elapsed.as_secs_f64();
+    let final_inserts = total_inserts.load(Ordering::Relaxed);
+    let throughput = (final_inserts as f64) / elapsed.as_secs_f64();
 
     println!(
         "Thread {}: {} inserts in {:.2}s ({:.2} inserts/sec)",
         thread_id,
-        total_inserts,
+        final_inserts,
         elapsed.as_secs_f64(),
         throughput
     );
 
-    Ok(total_inserts)
+    Ok(final_inserts)
 }

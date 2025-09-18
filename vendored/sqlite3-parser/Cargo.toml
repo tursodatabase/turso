@@ -27,17 +27,17 @@ serde = ["dep:serde", "indexmap/serde", "bitflags/serde"]
 [dependencies]
 log = "0.4.22"
 memchr = "2.0"
-fallible-iterator = "0.3"
-bitflags = "2.0"
-indexmap = "2.0"
-miette = "7.4.0"
+fallible-iterator = { workspace = true }
+bitflags = { workspace = true }
+indexmap = { workspace = true }
+miette = { workspace = true }
 strum = { workspace = true }
 strum_macros = {workspace = true }
 serde = { workspace = true , optional = true, features = ["derive"] }
 smallvec = { version = "1.15.1", features = ["const_generics"] }
 
 [dev-dependencies]
-env_logger = { version = "0.11", default-features = false }
+env_logger = { workspace = true, default-features = false }
 
 [build-dependencies]
 cc = "1.0"

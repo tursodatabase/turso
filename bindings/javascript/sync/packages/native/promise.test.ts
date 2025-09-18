@@ -4,6 +4,14 @@ import { connect, DatabaseRowMutation, DatabaseRowTransformResult } from './prom
 
 const localeCompare = (a, b) => a.x.localeCompare(b.x);
 
+function cleanup(path) {
+    unlinkSync(path);
+    unlinkSync(`${path}-wal`);
+    unlinkSync(`${path}-info`);
+    unlinkSync(`${path}-changes`);
+    try { unlinkSync(`${path}-wal-revert`) } catch (e) { }
+}
+
 test('select-after-push', async () => {
     {
         const db = await connect({ path: ':memory:', url: process.env.VITE_TURSO_DB_URL });
@@ -161,7 +169,8 @@ test('checkpoint', async () => {
     expect((await db1.stats()).revertWal).toBe(revertWal);
 })
 
-test('persistence', async () => {
+
+test('persistence-push', async () => {
     {
         const db = await connect({ path: ':memory:', url: process.env.VITE_TURSO_DB_URL });
         await db.exec("CREATE TABLE IF NOT EXISTS q(x TEXT PRIMARY KEY, y)");
@@ -182,9 +191,11 @@ test('persistence', async () => {
             const db2 = await connect({ path: path, url: process.env.VITE_TURSO_DB_URL });
             await db2.exec(`INSERT INTO q VALUES ('k3', 'v3')`);
             await db2.exec(`INSERT INTO q VALUES ('k4', 'v4')`);
-            const rows = await db2.prepare('SELECT * FROM q').all();
+            const stmt = db2.prepare('SELECT * FROM q');
+            const rows = await stmt.all();
             const expected = [{ x: 'k1', y: 'v1' }, { x: 'k2', y: 'v2' }, { x: 'k3', y: 'v3' }, { x: 'k4', y: 'v4' }];
             expect(rows).toEqual(expected)
+            stmt.close();
             await db2.close();
         }
 
@@ -201,12 +212,75 @@ test('persistence', async () => {
             expect(rows).toEqual(expected)
             await db4.close();
         }
+    }
+    finally {
+        cleanup(path);
+    }
+})
+
+test('persistence-offline', async () => {
+    {
+        const db = await connect({ path: ':memory:', url: process.env.VITE_TURSO_DB_URL });
+        await db.exec("CREATE TABLE IF NOT EXISTS q(x TEXT PRIMARY KEY, y)");
+        await db.exec("DELETE FROM q");
+        await db.push();
+        await db.close();
+    }
+    const path = `test-${(Math.random() * 10000) | 0}.db`;
+    try {
+        {
+            const db = await connect({ path: path, url: process.env.VITE_TURSO_DB_URL });
+            await db.exec(`INSERT INTO q VALUES ('k1', 'v1')`);
+            await db.exec(`INSERT INTO q VALUES ('k2', 'v2')`);
+            await db.push();
+            await db.close();
+        }
+        {
+            const db = await connect({ path: path, url: "https://not-valid-url.localhost" });
+            const rows = await db.prepare("SELECT * FROM q").all();
+            const expected = [{ x: 'k1', y: 'v1' }, { x: 'k2', y: 'v2' }];
+            expect(rows.sort(localeCompare)).toEqual(expected.sort(localeCompare))
+            await db.close();
+        }
     } finally {
-        unlinkSync(path);
-        unlinkSync(`${path}-wal`);
-        unlinkSync(`${path}-info`);
-        unlinkSync(`${path}-changes`);
-        try { unlinkSync(`${path}-revert`) } catch (e) { }
+        cleanup(path);
+    }
+})
+
+test('persistence-pull-push', async () => {
+    {
+        const db = await connect({ path: ':memory:', url: process.env.VITE_TURSO_DB_URL });
+        await db.exec("CREATE TABLE IF NOT EXISTS q(x TEXT PRIMARY KEY, y)");
+        await db.exec("DELETE FROM q");
+        await db.push();
+        await db.close();
+    }
+    const path1 = `test-${(Math.random() * 10000) | 0}.db`;
+    const path2 = `test-${(Math.random() * 10000) | 0}.db`;
+    try {
+        const db1 = await connect({ path: path1, url: process.env.VITE_TURSO_DB_URL });
+        await db1.exec(`INSERT INTO q VALUES ('k1', 'v1')`);
+        await db1.exec(`INSERT INTO q VALUES ('k2', 'v2')`);
+        const stats1 = await db1.stats();
+
+        const db2 = await connect({ path: path2, url: process.env.VITE_TURSO_DB_URL });
+        await db2.exec(`INSERT INTO q VALUES ('k3', 'v3')`);
+        await db2.exec(`INSERT INTO q VALUES ('k4', 'v4')`);
+
+        await Promise.all([db1.push(), db2.push()]);
+        await Promise.all([db1.pull(), db2.pull()]);
+        const stats2 = await db1.stats();
+        console.info(stats1, stats2);
+        expect(stats1.revision).not.toBe(stats2.revision);
+
+        const rows1 = await db1.prepare('SELECT * FROM q').all();
+        const rows2 = await db2.prepare('SELECT * FROM q').all();
+        const expected = [{ x: 'k1', y: 'v1' }, { x: 'k2', y: 'v2' }, { x: 'k3', y: 'v3' }, { x: 'k4', y: 'v4' }];
+        expect(rows1.sort(localeCompare)).toEqual(expected.sort(localeCompare))
+        expect(rows2.sort(localeCompare)).toEqual(expected.sort(localeCompare))
+    } finally {
+        cleanup(path1);
+        cleanup(path2);
     }
 })
 

@@ -46,6 +46,10 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
                 | PragmaFlags::NoColumns1,
             &["cache_size"],
         ),
+        DataSyncRetry => Pragma::new(
+            PragmaFlags::Result0 | PragmaFlags::NoColumns1,
+            &["data_sync_retry"],
+        ),
         DatabaseList => Pragma::new(PragmaFlags::Result0, &["seq", "name", "file"]),
         Encoding => Pragma::new(
             PragmaFlags::Result0 | PragmaFlags::NoColumns1,

@@ -488,6 +488,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let plan = plan.clone();
         let conn = db.lock().await.connect()?;
 
+        conn.execute("PRAGMA data_sync_retry = 1", ()).await?;
+
         // Apply each DDL statement individually
         for stmt in &plan.ddl_statements {
             if opts.verbose {
@@ -517,6 +519,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
         let handle = tokio::spawn(async move {
             let mut conn = db.lock().await.connect()?;
+
+            conn.execute("PRAGMA data_sync_retry = 1", ()).await?;
+
             println!("\rExecuting queries...");
             for query_index in 0..nr_iterations {
                 if gen_bool(0.0) {

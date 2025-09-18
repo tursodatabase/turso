@@ -14,7 +14,9 @@ use std::cell::RefCell;
 use std::sync::Arc;
 use tracing::trace;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
-use turso_core::{Connection, Database, IO, Statement};
+use turso_core::{
+    CipherMode, Connection, Database, DatabaseOpts, EncryptionOpts, IO, OpenFlags, Statement,
+};
 use turso_parser::ast::SortOrder;
 
 mod io;
@@ -30,6 +32,15 @@ struct Args {
     /// Keep mmap I/O files on disk after run
     #[arg(long)]
     keep: bool,
+    /// Disable creation and manipulation of indexes
+    #[arg(long)]
+    disable_indexes: bool,
+    /// Enable MVCC (Multi-Version Concurrency Control)
+    #[arg(long)]
+    enable_mvcc: bool,
+    /// Enable database encryption
+    #[arg(long)]
+    enable_encryption: bool,
 }
 
 struct SimulatorConfig {
@@ -56,6 +67,8 @@ struct SimulatorContext {
     indexes: Vec<String>,
     opts: Opts,
     stats: Stats,
+    disable_indexes: bool,
+    enable_mvcc: bool,
 }
 
 #[derive(Default)]
@@ -64,6 +77,17 @@ struct Stats {
     updates: usize,
     deletes: usize,
     integrity_checks: usize,
+}
+
+fn may_be_set_encryption(
+    conn: Arc<Connection>,
+    opts: &Option<EncryptionOpts>,
+) -> anyhow::Result<Arc<Connection>> {
+    if let Some(opts) = opts {
+        conn.pragma_update("cipher", format!("'{}'", opts.cipher.clone()))?;
+        conn.pragma_update("hexkey", format!("'{}'", opts.hexkey.clone()))?;
+    }
+    Ok(conn)
 }
 
 fn main() -> anyhow::Result<()> {
@@ -101,14 +125,35 @@ fn main() -> anyhow::Result<()> {
 
     let db_path = format!("whopper-{}-{}.db", seed, std::process::id());
 
-    let db = match Database::open_file(io.clone(), &db_path, false, true) {
-        Ok(db) => db,
-        Err(e) => {
-            return Err(anyhow::anyhow!("Database open failed: {}", e));
+    let encryption_opts = if args.enable_encryption {
+        let opts = random_encryption_config(&mut rng);
+        println!("cipher = {}, key = {}", opts.cipher, opts.hexkey);
+        Some(opts)
+    } else {
+        None
+    };
+
+    let db = {
+        let opts = DatabaseOpts::new()
+            .with_mvcc(args.enable_mvcc)
+            .with_indexes(true);
+
+        match Database::open_file_with_flags(
+            io.clone(),
+            &db_path,
+            OpenFlags::default(),
+            opts,
+            encryption_opts.clone(),
+        ) {
+            Ok(db) => db,
+            Err(e) => {
+                return Err(anyhow::anyhow!("Database open failed: {}", e));
+            }
         }
     };
+
     let boostrap_conn = match db.connect() {
-        Ok(conn) => conn,
+        Ok(conn) => may_be_set_encryption(conn, &encryption_opts)?,
         Err(e) => {
             return Err(anyhow::anyhow!("Connection failed: {}", e));
         }
@@ -122,7 +167,11 @@ fn main() -> anyhow::Result<()> {
         boostrap_conn.execute(&sql)?;
     }
 
-    let indexes = create_initial_indexes(&mut rng, &tables);
+    let indexes = if args.disable_indexes {
+        Vec::new()
+    } else {
+        create_initial_indexes(&mut rng, &tables)
+    };
     for create_index in &indexes {
         let sql = create_index.to_string();
         trace!("{}", sql);
@@ -134,7 +183,7 @@ fn main() -> anyhow::Result<()> {
     let mut fibers = Vec::new();
     for i in 0..config.max_connections {
         let conn = match db.connect() {
-            Ok(conn) => conn,
+            Ok(conn) => may_be_set_encryption(conn, &encryption_opts)?,
             Err(e) => {
                 return Err(anyhow::anyhow!(
                     "Failed to create fiber connection {}: {}",
@@ -156,6 +205,8 @@ fn main() -> anyhow::Result<()> {
         indexes: indexes.iter().map(|idx| idx.index_name.clone()).collect(),
         opts: Opts::default(),
         stats: Stats::default(),
+        disable_indexes: args.disable_indexes,
+        enable_mvcc: args.enable_mvcc,
     };
 
     let progress_interval = config.max_steps / 10;
@@ -309,6 +360,30 @@ fn create_initial_schema(rng: &mut ChaCha8Rng) -> Vec<Create> {
     schema
 }
 
+fn random_encryption_config(rng: &mut ChaCha8Rng) -> EncryptionOpts {
+    let cipher_modes = [
+        CipherMode::Aes128Gcm,
+        CipherMode::Aes256Gcm,
+        CipherMode::Aegis256,
+        CipherMode::Aegis128L,
+        CipherMode::Aegis128X2,
+        CipherMode::Aegis128X4,
+        CipherMode::Aegis256X2,
+        CipherMode::Aegis256X4,
+    ];
+
+    let cipher_mode = cipher_modes[rng.random_range(0..cipher_modes.len())];
+
+    let key_size = cipher_mode.required_key_size();
+    let mut key = vec![0u8; key_size];
+    rng.fill_bytes(&mut key);
+
+    EncryptionOpts {
+        cipher: cipher_mode.to_string(),
+        hexkey: hex::encode(&key),
+    }
+}
+
 fn perform_work(
     fiber_idx: usize,
     rng: &mut ChaCha8Rng,
@@ -356,6 +431,16 @@ fn perform_work(
                             }
                             return Ok(());
                         }
+                        turso_core::LimboError::WriteWriteConflict => {
+                            trace!(
+                                "{} Write-write conflict, transaction automatically rolled back",
+                                fiber_idx
+                            );
+                            drop(stmt_borrow);
+                            context.fibers[fiber_idx].statement.replace(None);
+                            context.fibers[fiber_idx].state = FiberState::Idle;
+                            return Ok(());
+                        }
                         _ => {
                             return Err(e.into());
                         }
@@ -375,12 +460,19 @@ fn perform_work(
         FiberState::Idle => {
             let action = rng.random_range(0..100);
             if action <= 29 {
-                // Start transaction
-                // FIXME: use deferred when it's fixed!
-                if let Ok(stmt) = context.fibers[fiber_idx].connection.prepare("BEGIN") {
+                let begin_cmd = if context.enable_mvcc {
+                    match rng.random_range(0..3) {
+                        0 => "BEGIN DEFERRED",
+                        1 => "BEGIN IMMEDIATE",
+                        _ => "BEGIN CONCURRENT",
+                    }
+                } else {
+                    "BEGIN"
+                };
+                if let Ok(stmt) = context.fibers[fiber_idx].connection.prepare(begin_cmd) {
                     context.fibers[fiber_idx].statement.replace(Some(stmt));
                     context.fibers[fiber_idx].state = FiberState::InTx;
-                    trace!("{} BEGIN", fiber_idx);
+                    trace!("{} {}", fiber_idx, begin_cmd);
                 }
             } else if action == 30 {
                 // Integrity check
@@ -446,17 +538,19 @@ fn perform_work(
                 }
                 70..=71 => {
                     // CREATE INDEX (2%)
-                    let create_index = CreateIndex::arbitrary(rng, context);
-                    let sql = create_index.to_string();
-                    if let Ok(stmt) = context.fibers[fiber_idx].connection.prepare(&sql) {
-                        context.fibers[fiber_idx].statement.replace(Some(stmt));
-                        context.indexes.push(create_index.index_name.clone());
+                    if !context.disable_indexes {
+                        let create_index = CreateIndex::arbitrary(rng, context);
+                        let sql = create_index.to_string();
+                        if let Ok(stmt) = context.fibers[fiber_idx].connection.prepare(&sql) {
+                            context.fibers[fiber_idx].statement.replace(Some(stmt));
+                            context.indexes.push(create_index.index_name.clone());
+                        }
+                        trace!("{} CREATE INDEX: {}", fiber_idx, sql);
                     }
-                    trace!("{} CREATE INDEX: {}", fiber_idx, sql);
                 }
                 72..=73 => {
                     // DROP INDEX (2%)
-                    if !context.indexes.is_empty() {
+                    if !context.disable_indexes && !context.indexes.is_empty() {
                         let index_idx = rng.random_range(0..context.indexes.len());
                         let index_name = context.indexes.remove(index_idx);
                         let drop_index = DropIndex { index_name };

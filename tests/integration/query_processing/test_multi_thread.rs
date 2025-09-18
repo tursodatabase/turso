@@ -16,10 +16,16 @@ fn test_schema_reprepare() {
     let mut stmt = conn2.prepare("SELECT y, z FROM t").unwrap();
     let mut stmt2 = conn2.prepare("SELECT x, z FROM t").unwrap();
     conn1.execute("ALTER TABLE t DROP COLUMN x").unwrap();
-    assert_eq!(
-        stmt2.step().unwrap_err().to_string(),
-        "Parse error: no such column: x"
-    );
+    loop {
+        match stmt2.step() {
+            Ok(StepResult::IO) => tmp_db.io.step().unwrap(),
+            Err(err) => {
+                assert_eq!(err.to_string(), "Parse error: no such column: x");
+                break;
+            }
+            r => panic!("unexpected response: {r:?}"),
+        }
+    }
 
     let mut rows = Vec::new();
     loop {

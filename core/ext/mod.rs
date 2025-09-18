@@ -12,7 +12,6 @@ use crate::{LimboError, IO};
 pub use dynamic::{add_builtin_vfs_extensions, add_vfs_module, list_vfs_modules, VfsMod};
 use std::{
     ffi::{c_char, c_void, CStr, CString},
-    rc::Rc,
     sync::{Arc, Mutex},
 };
 use turso_ext::{
@@ -46,7 +45,7 @@ pub(crate) unsafe extern "C" fn register_vtab_module(
     };
 
     let ext_ctx = unsafe { &mut *(ctx as *mut ExtensionCtx) };
-    let module = Rc::new(module);
+    let module = Arc::new(module);
     let vmodule = VTabImpl {
         module_kind: kind,
         implementation: module,
@@ -77,7 +76,7 @@ pub(crate) unsafe extern "C" fn register_vtab_module(
 #[derive(Clone)]
 pub struct VTabImpl {
     pub module_kind: VTabKind,
-    pub implementation: Rc<VTabModuleImpl>,
+    pub implementation: Arc<VTabModuleImpl>,
 }
 
 pub(crate) unsafe extern "C" fn register_scalar_function(
@@ -163,7 +162,7 @@ impl Database {
     /// Register any built-in extensions that can be stored on the Database so we do not have
     /// to register these once-per-connection, and the connection can just extend its symbol table
     pub fn register_global_builtin_extensions(&self) -> Result<(), String> {
-        let syms = self.builtin_syms.as_ptr();
+        let syms = self.builtin_syms.data_ptr();
         // Pass the mutex pointer and the appropriate handler
         let schema_mutex_ptr = &self.schema as *const Mutex<Arc<Schema>> as *mut Mutex<Arc<Schema>>;
         let ctx = Box::into_raw(Box::new(ExtensionCtx {
@@ -222,7 +221,7 @@ impl Connection {
         let schema_mutex_ptr =
             &self._db.schema as *const Mutex<Arc<Schema>> as *mut Mutex<Arc<Schema>>;
         let ctx = ExtensionCtx {
-            syms: self.syms.as_ptr(),
+            syms: self.syms.data_ptr(),
             schema: schema_mutex_ptr as *mut c_void,
         };
         let ctx = Box::into_raw(Box::new(ctx)) as *mut c_void;

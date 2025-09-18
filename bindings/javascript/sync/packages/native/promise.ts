@@ -1,5 +1,5 @@
 import { DatabasePromise, DatabaseOpts, NativeDatabase } from "@tursodatabase/database-common"
-import { ProtocolIo, run, SyncOpts, RunOpts, DatabaseRowMutation, DatabaseRowStatement, DatabaseRowTransformResult } from "@tursodatabase/sync-common";
+import { ProtocolIo, run, SyncOpts, RunOpts, DatabaseRowMutation, DatabaseRowStatement, DatabaseRowTransformResult, SyncEngineStats } from "@tursodatabase/sync-common";
 import { Database as NativeDB, SyncEngine } from "#index";
 import { promises } from "node:fs";
 
@@ -61,7 +61,7 @@ class Database extends DatabasePromise {
     async checkpoint() {
         await run(this.runOpts, this.io, this.engine, this.engine.checkpoint());
     }
-    async stats(): Promise<{ operations: number, mainWal: number, revertWal: number, lastPullUnixTime: number, lastPushUnixTime: number | null }> {
+    async stats(): Promise<SyncEngineStats> {
         return (await run(this.runOpts, this.io, this.engine, this.engine.stats()));
     }
     override async close(): Promise<void> {

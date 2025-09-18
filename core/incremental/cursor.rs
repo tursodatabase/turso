@@ -9,7 +9,6 @@ use crate::{
     types::{IOResult, SeekKey, SeekOp, SeekResult, Value},
     LimboError, Pager, Result,
 };
-use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 /// State machine for seek operations
@@ -38,13 +37,13 @@ pub struct MaterializedViewCursor {
     // Core components
     btree_cursor: Box<BTreeCursor>,
     view: Arc<Mutex<IncrementalView>>,
-    pager: Rc<Pager>,
+    pager: Arc<Pager>,
 
     // Current changes that are uncommitted
     uncommitted: RowKeyZSet,
 
     // Reference to shared transaction state for this specific view - shared with Connection
-    tx_state: Rc<ViewTransactionState>,
+    tx_state: Arc<ViewTransactionState>,
 
     // The transaction state always grows. It never gets reduced. That is in the very nature of
     // DBSP, because deletions are just appends with weight < 0. So we will use the length of the
@@ -65,8 +64,8 @@ impl MaterializedViewCursor {
     pub fn new(
         btree_cursor: Box<BTreeCursor>,
         view: Arc<Mutex<IncrementalView>>,
-        pager: Rc<Pager>,
-        tx_state: Rc<ViewTransactionState>,
+        pager: Arc<Pager>,
+        tx_state: Arc<ViewTransactionState>,
     ) -> Result<Self> {
         Ok(Self {
             btree_cursor,
@@ -302,7 +301,6 @@ mod tests {
     use super::*;
     use crate::util::IOExt;
     use crate::{Connection, Database, OpenFlags};
-    use std::rc::Rc;
     use std::sync::Arc;
 
     /// Helper to create a test connection with a table and materialized view
@@ -319,6 +317,7 @@ mod tests {
                 enable_views: true,
                 enable_strict: false,
             },
+            None,
         )?;
         let conn = db.connect()?;
 
@@ -334,7 +333,11 @@ mod tests {
     /// Helper to create a test cursor for the materialized view
     fn create_test_cursor(
         conn: &Arc<Connection>,
-    ) -> Result<(MaterializedViewCursor, Rc<ViewTransactionState>, Rc<Pager>)> {
+    ) -> Result<(
+        MaterializedViewCursor,
+        Arc<ViewTransactionState>,
+        Arc<Pager>,
+    )> {
         // Get the schema and view
         let view_mutex = conn
             .schema

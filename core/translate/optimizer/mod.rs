@@ -15,7 +15,7 @@ use crate::{
     parameters::PARAM_PREFIX,
     schema::{Index, IndexColumn, Schema, Table},
     translate::{
-        expr::walk_expr_mut, optimizer::access_method::AccessMethodParams,
+        expr::walk_expr_mut, expr::WalkControl, optimizer::access_method::AccessMethodParams,
         optimizer::constraints::TableConstraints, plan::Scan, plan::TerminationKey,
     },
     types::SeekOp,
@@ -578,6 +578,11 @@ fn rewrite_exprs_select(plan: &mut SelectPlan) -> Result<()> {
     for (expr, _) in plan.order_by.iter_mut() {
         rewrite_expr(expr, &mut param_count)?;
     }
+    if let Some(window) = &mut plan.window {
+        for func in window.functions.iter_mut() {
+            rewrite_expr(&mut func.original_expr, &mut param_count)?;
+        }
+    }
 
     Ok(())
 }
@@ -645,6 +650,7 @@ impl Optimizable for ast::Expr {
             Expr::Between {
                 lhs, start, end, ..
             } => lhs.is_nonnull(tables) && start.is_nonnull(tables) && end.is_nonnull(tables),
+            Expr::Binary(_, ast::Operator::Modulus | ast::Operator::Divide, _) => false, // 1 % 0, 1 / 0
             Expr::Binary(expr, _, expr1) => expr.is_nonnull(tables) && expr1.is_nonnull(tables),
             Expr::Case {
                 base,
@@ -1443,71 +1449,74 @@ fn build_seek_def(
     })
 }
 
-pub fn rewrite_expr(top_level_expr: &mut ast::Expr, param_idx: &mut usize) -> Result<()> {
-    walk_expr_mut(top_level_expr, &mut |expr: &mut ast::Expr| -> Result<()> {
-        match expr {
-            ast::Expr::Id(id) => {
-                // Convert "true" and "false" to 1 and 0
-                let id_bytes = id.as_str().as_bytes();
-                match_ignore_ascii_case!(match id_bytes {
-                    b"true" => {
-                        *expr = ast::Expr::Literal(ast::Literal::Numeric("1".to_owned()));
-                    }
-                    b"false" => {
-                        *expr = ast::Expr::Literal(ast::Literal::Numeric("0".to_owned()));
-                    }
-                    _ => {}
-                })
-            }
-            ast::Expr::Variable(var) => {
-                if var.is_empty() {
-                    // rewrite anonymous variables only, ensure that the `param_idx` starts at 1 and
-                    // all the expressions are rewritten in the order they come in the statement
-                    *expr = ast::Expr::Variable(format!("{PARAM_PREFIX}{param_idx}"));
-                    *param_idx += 1;
+pub fn rewrite_expr(top_level_expr: &mut ast::Expr, param_idx: &mut usize) -> Result<WalkControl> {
+    walk_expr_mut(
+        top_level_expr,
+        &mut |expr: &mut ast::Expr| -> Result<WalkControl> {
+            match expr {
+                ast::Expr::Id(id) => {
+                    // Convert "true" and "false" to 1 and 0
+                    let id_bytes = id.as_str().as_bytes();
+                    match_ignore_ascii_case!(match id_bytes {
+                        b"true" => {
+                            *expr = ast::Expr::Literal(ast::Literal::Numeric("1".to_owned()));
+                        }
+                        b"false" => {
+                            *expr = ast::Expr::Literal(ast::Literal::Numeric("0".to_owned()));
+                        }
+                        _ => {}
+                    })
                 }
-            }
-            ast::Expr::Between {
-                lhs,
-                not,
-                start,
-                end,
-            } => {
-                // Convert `y NOT BETWEEN x AND z` to `x > y OR y > z`
-                let (lower_op, upper_op) = if *not {
-                    (ast::Operator::Greater, ast::Operator::Greater)
-                } else {
-                    // Convert `y BETWEEN x AND z` to `x <= y AND y <= z`
-                    (ast::Operator::LessEquals, ast::Operator::LessEquals)
-                };
-
-                let start = start.take_ownership();
-                let lhs = lhs.take_ownership();
-                let end = end.take_ownership();
-
-                let lower_bound =
-                    ast::Expr::Binary(Box::new(start), lower_op, Box::new(lhs.clone()));
-                let upper_bound = ast::Expr::Binary(Box::new(lhs), upper_op, Box::new(end));
-
-                if *not {
-                    *expr = ast::Expr::Binary(
-                        Box::new(lower_bound),
-                        ast::Operator::Or,
-                        Box::new(upper_bound),
-                    );
-                } else {
-                    *expr = ast::Expr::Binary(
-                        Box::new(lower_bound),
-                        ast::Operator::And,
-                        Box::new(upper_bound),
-                    );
+                ast::Expr::Variable(var) => {
+                    if var.is_empty() {
+                        // rewrite anonymous variables only, ensure that the `param_idx` starts at 1 and
+                        // all the expressions are rewritten in the order they come in the statement
+                        *expr = ast::Expr::Variable(format!("{PARAM_PREFIX}{param_idx}"));
+                        *param_idx += 1;
+                    }
                 }
-            }
-            _ => {}
-        }
+                ast::Expr::Between {
+                    lhs,
+                    not,
+                    start,
+                    end,
+                } => {
+                    // Convert `y NOT BETWEEN x AND z` to `x > y OR y > z`
+                    let (lower_op, upper_op) = if *not {
+                        (ast::Operator::Greater, ast::Operator::Greater)
+                    } else {
+                        // Convert `y BETWEEN x AND z` to `x <= y AND y <= z`
+                        (ast::Operator::LessEquals, ast::Operator::LessEquals)
+                    };
 
-        Ok(())
-    })
+                    let start = start.take_ownership();
+                    let lhs = lhs.take_ownership();
+                    let end = end.take_ownership();
+
+                    let lower_bound =
+                        ast::Expr::Binary(Box::new(start), lower_op, Box::new(lhs.clone()));
+                    let upper_bound = ast::Expr::Binary(Box::new(lhs), upper_op, Box::new(end));
+
+                    if *not {
+                        *expr = ast::Expr::Binary(
+                            Box::new(lower_bound),
+                            ast::Operator::Or,
+                            Box::new(upper_bound),
+                        );
+                    } else {
+                        *expr = ast::Expr::Binary(
+                            Box::new(lower_bound),
+                            ast::Operator::And,
+                            Box::new(upper_bound),
+                        );
+                    }
+                }
+                _ => {}
+            }
+
+            Ok(WalkControl::Continue)
+        },
+    )
 }
 
 trait TakeOwnership {

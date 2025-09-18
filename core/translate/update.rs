@@ -316,6 +316,7 @@ pub fn prepare_update_plan(
             contains_constant_false_condition: false,
             distinctness: super::plan::Distinctness::NonDistinct,
             values: vec![],
+            window: None,
         };
 
         optimize_select_plan(&mut ephemeral_plan, schema)?;

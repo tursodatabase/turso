@@ -1445,3 +1445,9 @@ do_execsql_test unary-plus-noop-string {
 do_execsql_test unary-plus-noop-blob {
     SELECT typeof(+x'00') = 'blob'
 } { 1 }
+
+do_execsql_test_on_specific_db {:memory:} is-nonnull-divide-by-zero {
+    CREATE TABLE t (x PRIMARY KEY, y, z);
+    INSERT INTO t VALUES (37, -70, -196792117);
+    SELECT * FROM t WHERE  (1 / 0) >= -3289742039 < t.x;
+} {}

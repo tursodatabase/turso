@@ -618,8 +618,8 @@ impl PageCache {
                     "slot={}, page={:?}, flags={}, pin_count={}, ref_bit={:?}",
                     i,
                     entry_opt.key,
-                    page.get().flags.load(Ordering::Relaxed),
-                    page.get().pin_count.load(Ordering::Relaxed),
+                    page.get().flags.load(Ordering::SeqCst),
+                    page.get().pin_count.load(Ordering::SeqCst),
                     entry_opt.ref_bit,
                 );
             }
