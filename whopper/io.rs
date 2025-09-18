@@ -225,7 +225,12 @@ impl File for SimulatorFile {
     ) -> Result<Completion> {
         let mut offset = pos as usize;
         let mut total_written = 0;
-
+        let total_bytes: usize = buffers.iter().map(|buf| buf.len()).sum();
+        if pos as usize + total_bytes > FILE_SIZE {
+            return Err(turso_core::LimboError::DatabaseFull(
+                "File is too large, 1GB limit for `whopper`".to_string(),
+            ));
+        }
         {
             let mut mmap = self.mmap.lock().unwrap();
             for buffer in buffers {
