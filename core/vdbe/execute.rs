@@ -8,7 +8,7 @@ use crate::storage::btree::{
 use crate::storage::database::DatabaseFile;
 use crate::storage::page_cache::PageCache;
 use crate::storage::pager::{AtomicDbState, CreateBTreeFlags, DbState};
-use crate::storage::sqlite3_ondisk::{read_varint, PageSize};
+use crate::storage::sqlite3_ondisk::{read_varint, DatabaseHeader, PageSize};
 use crate::translate::collate::CollationSeq;
 use crate::types::{
     compare_immutable, compare_records_generic, Extendable, IOCompletions, ImmutableRecord,
@@ -2189,6 +2189,7 @@ pub fn op_transaction_inner(
         },
         insn
     );
+
     let pager = program.get_pager_from_database_index(db);
     loop {
         match state.op_transaction_state {
@@ -2249,7 +2250,6 @@ pub fn op_transaction_inner(
                     // for both.
                     if program.connection.mv_tx.get().is_none() {
                         // We allocate the first page lazily in the first transaction.
-                        return_if_io!(pager.maybe_allocate_page1());
                         // TODO: when we fix MVCC enable schema cookie detection for reprepare statements
                         // let header_schema_cookie = pager
                         //     .io
@@ -2337,16 +2337,16 @@ pub fn op_transaction_inner(
                 if updated {
                     conn.transaction_state.replace(new_transaction_state);
                 }
-
                 state.op_transaction_state = OpTransactionState::CheckSchemaCookie;
                 continue;
             }
             // 4. Check whether schema has changed if we are actually going to access the database.
             // Can only read header if page 1 has been allocated already
             // begin_write_tx that happens, but not begin_read_tx
-            // TODO: this is a hack to make the pager run the IO loop
             OpTransactionState::CheckSchemaCookie => {
-                let res = pager.with_header(|header| header.schema_cookie.get());
+                let res = with_header(&pager, mv_store, program, |header| {
+                    header.schema_cookie.get()
+                });
                 match res {
                     Ok(IOResult::Done(header_schema_cookie)) => {
                         if header_schema_cookie != *schema_cookie {
@@ -6752,7 +6752,9 @@ pub fn op_page_count(
         // TODO: implement temp databases
         todo!("temp databases not implemented yet");
     }
-    let count = match pager.with_header(|header| header.database_size.get()) {
+    let count = match with_header(pager, mv_store, program, |header| {
+        header.database_size.get()
+    }) {
         Err(_) => 0.into(),
         Ok(IOResult::Done(v)) => v.into(),
         Ok(IOResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(io)),
@@ -6911,7 +6913,7 @@ pub fn op_read_cookie(
         todo!("temp databases not implemented yet");
     }
 
-    let cookie_value = match pager.with_header(|header| match cookie {
+    let cookie_value = match with_header(pager, mv_store, program, |header| match cookie {
         Cookie::ApplicationId => header.application_id.get().into(),
         Cookie::UserVersion => header.user_version.get().into(),
         Cookie::SchemaVersion => header.schema_cookie.get().into(),
@@ -6948,16 +6950,14 @@ pub fn op_set_cookie(
         todo!("temp databases not implemented yet");
     }
 
-    return_if_io!(pager.with_header_mut(|header| {
+    return_if_io!(with_header_mut(pager, mv_store, program, |header| {
         match cookie {
             Cookie::ApplicationId => header.application_id = (*value).into(),
             Cookie::UserVersion => header.user_version = (*value).into(),
             Cookie::LargestRootPageNumber => {
                 header.vacuum_mode_largest_root_page = (*value as u32).into();
             }
-            Cookie::IncrementalVacuum => {
-                header.incremental_vacuum_enabled = (*value as u32).into()
-            }
+            Cookie::IncrementalVacuum => header.incremental_vacuum_enabled = (*value as u32).into(),
             Cookie::SchemaVersion => {
                 // we update transaction state to indicate that the schema has changed
                 match program.connection.transaction_state.get() {
@@ -7185,7 +7185,8 @@ pub fn op_open_ephemeral(
     match &mut state.op_open_ephemeral_state {
         OpOpenEphemeralState::Start => {
             tracing::trace!("Start");
-            let page_size = return_if_io!(pager.with_header(|header| header.page_size));
+            let page_size =
+                return_if_io!(with_header(pager, mv_store, program, |header| header.page_size));
             let conn = program.connection.clone();
             let io = conn.pager.borrow().io.clone();
             let rand_num = io.generate_random_number();
@@ -7230,6 +7231,7 @@ pub fn op_open_ephemeral(
                 Arc::new(AtomicDbState::new(DbState::Uninitialized)),
                 Arc::new(Mutex::new(())),
             )?);
+
             pager.page_size.set(Some(page_size));
 
             state.op_open_ephemeral_state = OpOpenEphemeralState::StartingTxn { pager };
@@ -7585,14 +7587,18 @@ pub fn op_integrity_check(
     match &mut state.op_integrity_check_state {
         OpIntegrityCheckState::Start => {
             let freelist_trunk_page =
-                return_if_io!(pager.with_header(|header| header.freelist_trunk_page.get()));
+                return_if_io!(with_header(pager, mv_store, program, |header| header
+                    .freelist_trunk_page
+                    .get()));
             let mut errors = Vec::new();
             let mut integrity_check_state = IntegrityCheckState::new();
             let mut current_root_idx = 0;
             // check freelist pages first, if there are any for database
             if freelist_trunk_page > 0 {
                 let expected_freelist_count =
-                    return_if_io!(pager.with_header(|header| header.freelist_pages.get()));
+                    return_if_io!(with_header(pager, mv_store, program, |header| header
+                        .freelist_pages
+                        .get()));
                 integrity_check_state.set_expected_freelist_count(expected_freelist_count as usize);
                 integrity_check_state.start(
                     freelist_trunk_page as usize,
@@ -9346,6 +9352,42 @@ pub fn op_journal_mode(
     state.registers[*dest] = Register::Value(Value::build_text("wal"));
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
+}
+
+fn with_header<T, F>(
+    pager: &Arc<Pager>,
+    mv_store: Option<&Arc<MvStore>>,
+    program: &Program,
+    f: F,
+) -> Result<IOResult<T>>
+where
+    F: Fn(&DatabaseHeader) -> T,
+{
+    if let Some(mv_store) = mv_store {
+        let tx_id = program.connection.mv_tx.get().map(|(tx_id, _)| tx_id);
+        mv_store.with_header(f, tx_id.as_ref()).map(IOResult::Done)
+    } else {
+        pager.with_header(&f)
+    }
+}
+
+fn with_header_mut<T, F>(
+    pager: &Arc<Pager>,
+    mv_store: Option<&Arc<MvStore>>,
+    program: &Program,
+    f: F,
+) -> Result<IOResult<T>>
+where
+    F: Fn(&mut DatabaseHeader) -> T,
+{
+    if let Some(mv_store) = mv_store {
+        let tx_id = program.connection.mv_tx.get().map(|(tx_id, _)| tx_id);
+        mv_store
+            .with_header_mut(f, tx_id.as_ref())
+            .map(IOResult::Done)
+    } else {
+        pager.with_header_mut(&f)
+    }
 }
 
 #[cfg(test)]

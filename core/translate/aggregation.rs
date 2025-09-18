@@ -337,17 +337,7 @@ pub fn translate_aggregation_step(
             }
 
             let delimiter_reg = if num_args == 2 {
-                match &agg_arg_source.arg_at(1) {
-                    ast::Expr::Column { .. } => {
-                        agg_arg_source.translate(program, referenced_tables, resolver, 1)?
-                    }
-                    ast::Expr::Literal(ast::Literal::String(s)) => {
-                        let delimiter_expr =
-                            ast::Expr::Literal(ast::Literal::String(s.to_string()));
-                        translate_const_arg(program, referenced_tables, resolver, &delimiter_expr)?
-                    }
-                    _ => crate::bail_parse_error!("Incorrect delimiter parameter"),
-                }
+                agg_arg_source.translate(program, referenced_tables, resolver, 1)?
             } else {
                 let delimiter_expr =
                     ast::Expr::Literal(ast::Literal::String(String::from("\",\"")));
@@ -435,18 +425,9 @@ pub fn translate_aggregation_step(
                 crate::bail_parse_error!("string_agg bad number of arguments");
             }
 
-            let delimiter_reg = match &agg_arg_source.arg_at(1) {
-                ast::Expr::Column { .. } => {
-                    agg_arg_source.translate(program, referenced_tables, resolver, 1)?
-                }
-                ast::Expr::Literal(ast::Literal::String(s)) => {
-                    let delimiter_expr = ast::Expr::Literal(ast::Literal::String(s.to_string()));
-                    translate_const_arg(program, referenced_tables, resolver, &delimiter_expr)?
-                }
-                _ => crate::bail_parse_error!("Incorrect delimiter parameter"),
-            };
-
             let expr_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
+            let delimiter_reg =
+                agg_arg_source.translate(program, referenced_tables, resolver, 1)?;
 
             program.emit_insn(Insn::AggStep {
                 acc_reg: target_register,

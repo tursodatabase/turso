@@ -480,7 +480,9 @@ macro_rules! get_cursor {
 
 pub struct Program {
     pub max_registers: usize,
-    pub insns: Vec<(Insn, InsnFunction)>,
+    // we store original indices because we don't want to create new vec from
+    // ProgramBuilder
+    pub insns: Vec<(Insn, usize)>,
     pub cursor_ref: Vec<(Option<CursorKey>, CursorType)>,
     pub comments: Vec<(InsnReference, &'static str)>,
     pub parameters: crate::parameters::Parameters,
@@ -649,7 +651,8 @@ impl Program {
             }
             // invalidate row
             let _ = state.result_row.take();
-            let (insn, insn_function) = &self.insns[state.pc as usize];
+            let (insn, _) = &self.insns[state.pc as usize];
+            let insn_function = insn.to_function();
             if enable_tracing {
                 trace_insn(self, state.pc as InsnReference, insn);
             }

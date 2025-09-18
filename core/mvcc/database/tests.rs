@@ -1,6 +1,8 @@
 use super::*;
 use crate::io::PlatformIO;
 use crate::mvcc::clock::LocalClock;
+use crate::storage::sqlite3_ondisk::DatabaseHeader;
+use std::cell::RefCell;
 
 pub(crate) struct MvccTestDbNoConn {
     pub(crate) db: Option<Arc<Database>>,
@@ -1077,6 +1079,7 @@ fn new_tx(tx_id: TxID, begin_ts: u64, state: TransactionState) -> Transaction {
         begin_ts,
         write_set: SkipSet::new(),
         read_set: SkipSet::new(),
+        header: RefCell::new(DatabaseHeader::default()),
     }
 }
 
@@ -1488,6 +1491,7 @@ fn transaction_display() {
         begin_ts,
         write_set,
         read_set,
+        header: RefCell::new(DatabaseHeader::default()),
     };
 
     let expected = "{ state: Preparing, id: 42, begin_ts: 20250914, write_set: [RowID { table_id: 1, row_id: 11 }, RowID { table_id: 1, row_id: 13 }], read_set: [RowID { table_id: 2, row_id: 17 }, RowID { table_id: 2, row_id: 19 }] }";

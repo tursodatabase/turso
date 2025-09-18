@@ -1,6 +1,8 @@
 use std::{
     fmt::{Debug, Display},
+    ops::{Deref, DerefMut},
     path::Path,
+    rc::Rc,
     sync::Arc,
     vec,
 };
@@ -40,7 +42,7 @@ impl InteractionPlan {
     /// delete interactions from the human readable file, and this function uses the JSON file as
     /// a baseline to detect with interactions were deleted and constructs the plan from the
     /// remaining interactions.
-    pub(crate) fn compute_via_diff(plan_path: &Path) -> Vec<Vec<Interaction>> {
+    pub(crate) fn compute_via_diff(plan_path: &Path) -> Vec<Interaction> {
         let interactions = std::fs::read_to_string(plan_path).unwrap();
         let interactions = interactions.lines().collect::<Vec<_>>();
 
@@ -95,18 +97,73 @@ impl InteractionPlan {
             }
         }
         let _ = plan.split_off(j);
-        plan
+        plan.into_iter().flatten().collect()
+    }
+
+    pub fn interactions_list(&self) -> Vec<Interaction> {
+        self.plan
+            .clone()
+            .into_iter()
+            .flat_map(|interactions| interactions.interactions().into_iter())
+            .collect()
+    }
+
+    pub fn interactions_list_with_secondary_index(&self) -> Vec<(usize, Interaction)> {
+        self.plan
+            .clone()
+            .into_iter()
+            .enumerate()
+            .flat_map(|(idx, interactions)| {
+                interactions
+                    .interactions()
+                    .into_iter()
+                    .map(move |interaction| (idx, interaction))
+            })
+            .collect()
     }
 }
 
-pub(crate) struct InteractionPlanState {
-    pub(crate) stack: Vec<ResultSet>,
-    pub(crate) interaction_pointer: usize,
-    pub(crate) secondary_pointer: usize,
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct InteractionPlanState {
+    pub interaction_pointer: usize,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct ConnectionState {
+    pub stack: Vec<ResultSet>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) enum Interactions {
+pub struct Interactions {
+    pub connection_index: usize,
+    pub interactions: InteractionsType,
+}
+
+impl Interactions {
+    pub fn new(connection_index: usize, interactions: InteractionsType) -> Self {
+        Self {
+            connection_index,
+            interactions,
+        }
+    }
+}
+
+impl Deref for Interactions {
+    type Target = InteractionsType;
+
+    fn deref(&self) -> &Self::Target {
+        &self.interactions
+    }
+}
+
+impl DerefMut for Interactions {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.interactions
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum InteractionsType {
     Property(Property),
     Query(Query),
     Fault(Fault),
@@ -116,130 +173,101 @@ impl Shadow for Interactions {
     type Result = ();
 
     fn shadow(&self, tables: &mut SimulatorTables) {
-        match self {
-            Interactions::Property(property) => {
+        match &self.interactions {
+            InteractionsType::Property(property) => {
                 let initial_tables = tables.clone();
-                let mut is_error = false;
-                for interaction in property.interactions() {
-                    match interaction {
-                        Interaction::Query(query) | Interaction::FsyncQuery(query) => {
-                            if query.shadow(tables).is_err() {
-                                is_error = true;
-                            }
-                        }
-                        Interaction::FaultyQuery(..) => {}
-                        Interaction::Assertion(_) => {}
-                        Interaction::Assumption(_) => {}
-                        Interaction::Fault(_) => {}
-                    }
-                    if is_error {
+                for interaction in property.interactions(self.connection_index) {
+                    let res = interaction.shadow(tables);
+                    if res.is_err() {
                         // If any interaction fails, we reset the tables to the initial state
                         *tables = initial_tables.clone();
                         break;
                     }
                 }
             }
-            Interactions::Query(query) => {
+            InteractionsType::Query(query) => {
                 let _ = query.shadow(tables);
             }
-            Interactions::Fault(_) => {}
+            InteractionsType::Fault(_) => {}
         }
     }
 }
 
 impl Interactions {
     pub(crate) fn name(&self) -> Option<&str> {
-        match self {
-            Interactions::Property(property) => Some(property.name()),
-            Interactions::Query(_) => None,
-            Interactions::Fault(_) => None,
+        match &self.interactions {
+            InteractionsType::Property(property) => Some(property.name()),
+            InteractionsType::Query(_) => None,
+            InteractionsType::Fault(_) => None,
         }
     }
 
     pub(crate) fn interactions(&self) -> Vec<Interaction> {
-        match self {
-            Interactions::Property(property) => property.interactions(),
-            Interactions::Query(query) => vec![Interaction::Query(query.clone())],
-            Interactions::Fault(fault) => vec![Interaction::Fault(fault.clone())],
+        match &self.interactions {
+            InteractionsType::Property(property) => property.interactions(self.connection_index),
+            InteractionsType::Query(query) => vec![Interaction::new(
+                self.connection_index,
+                InteractionType::Query(query.clone()),
+            )],
+            InteractionsType::Fault(fault) => vec![Interaction::new(
+                self.connection_index,
+                InteractionType::Fault(*fault),
+            )],
         }
     }
-}
 
-impl Interactions {
     pub(crate) fn dependencies(&self) -> IndexSet<String> {
-        match self {
-            Interactions::Property(property) => {
-                property
-                    .interactions()
-                    .iter()
-                    .fold(IndexSet::new(), |mut acc, i| match i {
-                        Interaction::Query(q) => {
-                            acc.extend(q.dependencies());
-                            acc
-                        }
-                        _ => acc,
-                    })
-            }
-            Interactions::Query(query) => query.dependencies(),
-            Interactions::Fault(_) => IndexSet::new(),
+        match &self.interactions {
+            InteractionsType::Property(property) => property
+                .interactions(self.connection_index)
+                .iter()
+                .fold(IndexSet::new(), |mut acc, i| match &i.interaction {
+                    InteractionType::Query(q) => {
+                        acc.extend(q.dependencies());
+                        acc
+                    }
+                    _ => acc,
+                }),
+            InteractionsType::Query(query) => query.dependencies(),
+            InteractionsType::Fault(_) => IndexSet::new(),
         }
     }
 
     pub(crate) fn uses(&self) -> Vec<String> {
-        match self {
-            Interactions::Property(property) => {
-                property
-                    .interactions()
-                    .iter()
-                    .fold(vec![], |mut acc, i| match i {
-                        Interaction::Query(q) => {
-                            acc.extend(q.uses());
-                            acc
-                        }
-                        _ => acc,
-                    })
-            }
-            Interactions::Query(query) => query.uses(),
-            Interactions::Fault(_) => vec![],
+        match &self.interactions {
+            InteractionsType::Property(property) => property
+                .interactions(self.connection_index)
+                .iter()
+                .fold(vec![], |mut acc, i| match &i.interaction {
+                    InteractionType::Query(q) => {
+                        acc.extend(q.uses());
+                        acc
+                    }
+                    _ => acc,
+                }),
+            InteractionsType::Query(query) => query.uses(),
+            InteractionsType::Fault(_) => vec![],
         }
     }
 }
 
+// FIXME: for the sql display come back and add connection index as a comment
 impl Display for InteractionPlan {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         for interactions in &self.plan {
-            match interactions {
-                Interactions::Property(property) => {
+            match &interactions.interactions {
+                InteractionsType::Property(property) => {
                     let name = property.name();
                     writeln!(f, "-- begin testing '{name}'")?;
-                    for interaction in property.interactions() {
-                        write!(f, "\t")?;
-
-                        match interaction {
-                            Interaction::Query(query) => writeln!(f, "{query};")?,
-                            Interaction::Assumption(assumption) => {
-                                writeln!(f, "-- ASSUME {};", assumption.name)?
-                            }
-                            Interaction::Assertion(assertion) => {
-                                writeln!(f, "-- ASSERT {};", assertion.name)?
-                            }
-                            Interaction::Fault(fault) => writeln!(f, "-- FAULT '{fault}';")?,
-                            Interaction::FsyncQuery(query) => {
-                                writeln!(f, "-- FSYNC QUERY;")?;
-                                writeln!(f, "{query};")?;
-                                writeln!(f, "{query};")?
-                            }
-                            Interaction::FaultyQuery(query) => {
-                                writeln!(f, "{query}; -- FAULTY QUERY")?
-                            }
-                        }
+                    for interaction in property.interactions(interactions.connection_index) {
+                        writeln!(f, "\t{interaction}")?;
                     }
                     writeln!(f, "-- end testing '{name}'")?;
                 }
-                Interactions::Fault(fault) => {
+                InteractionsType::Fault(fault) => {
                     writeln!(f, "-- FAULT '{fault}'")?;
                 }
-                Interactions::Query(query) => {
+                InteractionsType::Query(query) => {
                     writeln!(f, "{query};")?;
                 }
             }
@@ -293,40 +321,16 @@ impl Display for InteractionStats {
     }
 }
 
-#[derive(Debug)]
-pub(crate) enum Interaction {
-    Query(Query),
-    Assumption(Assertion),
-    Assertion(Assertion),
-    Fault(Fault),
-    /// Will attempt to run any random query. However, when the connection tries to sync it will
-    /// close all connections and reopen the database and assert that no data was lost
-    FsyncQuery(Query),
-    FaultyQuery(Query),
-}
-
-impl Display for Interaction {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Query(query) => write!(f, "{query}"),
-            Self::Assumption(assumption) => write!(f, "ASSUME {}", assumption.name),
-            Self::Assertion(assertion) => write!(f, "ASSERT {}", assertion.name),
-            Self::Fault(fault) => write!(f, "FAULT '{fault}'"),
-            Self::FsyncQuery(query) => write!(f, "{query}"),
-            Self::FaultyQuery(query) => write!(f, "{query}; -- FAULTY QUERY"),
-        }
-    }
-}
-
 type AssertionFunc = dyn Fn(&Vec<ResultSet>, &mut SimulatorEnv) -> Result<Result<(), String>>;
 
 enum AssertionAST {
     Pick(),
 }
 
-pub(crate) struct Assertion {
-    pub(crate) func: Box<AssertionFunc>,
-    pub(crate) name: String, // For display purposes in the plan
+#[derive(Clone)]
+pub struct Assertion {
+    pub func: Rc<AssertionFunc>,
+    pub name: String, // For display purposes in the plan
 }
 
 impl Debug for Assertion {
@@ -337,7 +341,19 @@ impl Debug for Assertion {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl Assertion {
+    pub fn new<F>(name: String, func: F) -> Self
+    where
+        F: Fn(&Vec<ResultSet>, &mut SimulatorEnv) -> Result<Result<(), String>> + 'static,
+    {
+        Self {
+            func: Rc::new(func),
+            name,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub(crate) enum Fault {
     Disconnect,
     ReopenDatabase,
@@ -386,18 +402,18 @@ impl InteractionPlan {
             }
         }
         for interactions in &self.plan {
-            match interactions {
-                Interactions::Property(property) => {
-                    for interaction in &property.interactions() {
-                        if let Interaction::Query(query) = interaction {
+            match &interactions.interactions {
+                InteractionsType::Property(property) => {
+                    for interaction in &property.interactions(interactions.connection_index) {
+                        if let InteractionType::Query(query) = &interaction.interaction {
                             query_stat(query, &mut stats);
                         }
                     }
                 }
-                Interactions::Query(query) => {
+                InteractionsType::Query(query) => {
                     query_stat(query, &mut stats);
                 }
-                Interactions::Fault(_) => {}
+                InteractionsType::Fault(_) => {}
             }
         }
 
@@ -413,8 +429,11 @@ impl InteractionPlan {
         let create_query = Create::arbitrary(rng, env);
         env.tables.push(create_query.table.clone());
 
-        plan.plan
-            .push(Interactions::Query(Query::Create(create_query)));
+        // initial query starts at 0th connection
+        plan.plan.push(Interactions::new(
+            0,
+            InteractionsType::Query(Query::Create(create_query)),
+        ));
 
         while plan.plan.len() < num_interactions {
             tracing::debug!(
@@ -432,7 +451,74 @@ impl InteractionPlan {
     }
 }
 
-impl Shadow for Interaction {
+#[derive(Debug, Clone)]
+pub struct Interaction {
+    pub connection_index: usize,
+    pub interaction: InteractionType,
+}
+
+impl Deref for Interaction {
+    type Target = InteractionType;
+
+    fn deref(&self) -> &Self::Target {
+        &self.interaction
+    }
+}
+
+impl DerefMut for Interaction {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.interaction
+    }
+}
+
+impl Interaction {
+    pub fn new(connection_index: usize, interaction: InteractionType) -> Self {
+        Self {
+            connection_index,
+            interaction,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum InteractionType {
+    Query(Query),
+    Assumption(Assertion),
+    Assertion(Assertion),
+    Fault(Fault),
+    /// Will attempt to run any random query. However, when the connection tries to sync it will
+    /// close all connections and reopen the database and assert that no data was lost
+    FsyncQuery(Query),
+    FaultyQuery(Query),
+}
+
+// FIXME: add the connection index here later
+impl Display for Interaction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.interaction)
+    }
+}
+
+impl Display for InteractionType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Query(query) => write!(f, "{query}"),
+            Self::Assumption(assumption) => write!(f, "-- ASSUME {};", assumption.name),
+            Self::Assertion(assertion) => {
+                write!(f, "-- ASSERT {};", assertion.name)
+            }
+            Self::Fault(fault) => write!(f, "-- FAULT '{fault}';"),
+            Self::FsyncQuery(query) => {
+                writeln!(f, "-- FSYNC QUERY;")?;
+                writeln!(f, "{query};")?;
+                write!(f, "{query};")
+            }
+            Self::FaultyQuery(query) => write!(f, "{query}; -- FAULTY QUERY"),
+        }
+    }
+}
+
+impl Shadow for InteractionType {
     type Result = anyhow::Result<Vec<Vec<SimValue>>>;
     fn shadow(&self, env: &mut SimulatorTables) -> Self::Result {
         match self {
@@ -448,7 +534,7 @@ impl Shadow for Interaction {
         }
     }
 }
-impl Interaction {
+impl InteractionType {
     pub(crate) fn execute_query(&self, conn: &mut Arc<Connection>) -> ResultSet {
         if let Self::Query(query) = self {
             let query_str = query.to_string();
@@ -460,9 +546,7 @@ impl Interaction {
                     &query_str[0..query_str.len().min(4096)],
                     err
                 );
-                if let Some(turso_core::LimboError::ParseError(e)) = err {
-                    panic!("Unexpected parse error: {e}");
-                }
+                // Do not panic on parse error, because DoubleCreateFailure relies on it
                 return Err(err.unwrap());
             }
             let rows = rows?;
@@ -755,31 +839,52 @@ fn random_create<R: rand::Rng>(rng: &mut R, env: &SimulatorEnv) -> Interactions 
     while env.tables.iter().any(|t| t.name == create.table.name) {
         create = Create::arbitrary(rng, env);
     }
-    Interactions::Query(Query::Create(create))
+    Interactions::new(
+        env.choose_conn(rng),
+        InteractionsType::Query(Query::Create(create)),
+    )
 }
 
 fn random_read<R: rand::Rng>(rng: &mut R, env: &SimulatorEnv) -> Interactions {
-    Interactions::Query(Query::Select(Select::arbitrary(rng, env)))
+    Interactions::new(
+        env.choose_conn(rng),
+        InteractionsType::Query(Query::Select(Select::arbitrary(rng, env))),
+    )
 }
 
 fn random_expr<R: rand::Rng>(rng: &mut R, env: &SimulatorEnv) -> Interactions {
-    Interactions::Query(Query::Select(SelectFree::arbitrary(rng, env).0))
+    Interactions::new(
+        env.choose_conn(rng),
+        InteractionsType::Query(Query::Select(SelectFree::arbitrary(rng, env).0)),
+    )
 }
 
 fn random_write<R: rand::Rng>(rng: &mut R, env: &SimulatorEnv) -> Interactions {
-    Interactions::Query(Query::Insert(Insert::arbitrary(rng, env)))
+    Interactions::new(
+        env.choose_conn(rng),
+        InteractionsType::Query(Query::Insert(Insert::arbitrary(rng, env))),
+    )
 }
 
 fn random_delete<R: rand::Rng>(rng: &mut R, env: &SimulatorEnv) -> Interactions {
-    Interactions::Query(Query::Delete(Delete::arbitrary(rng, env)))
+    Interactions::new(
+        env.choose_conn(rng),
+        InteractionsType::Query(Query::Delete(Delete::arbitrary(rng, env))),
+    )
 }
 
 fn random_update<R: rand::Rng>(rng: &mut R, env: &SimulatorEnv) -> Interactions {
-    Interactions::Query(Query::Update(Update::arbitrary(rng, env)))
+    Interactions::new(
+        env.choose_conn(rng),
+        InteractionsType::Query(Query::Update(Update::arbitrary(rng, env))),
+    )
 }
 
 fn random_drop<R: rand::Rng>(rng: &mut R, env: &SimulatorEnv) -> Interactions {
-    Interactions::Query(Query::Drop(Drop::arbitrary(rng, env)))
+    Interactions::new(
+        env.choose_conn(rng),
+        InteractionsType::Query(Query::Drop(Drop::arbitrary(rng, env))),
+    )
 }
 
 fn random_create_index<R: rand::Rng>(rng: &mut R, env: &SimulatorEnv) -> Option<Interactions> {
@@ -799,7 +904,10 @@ fn random_create_index<R: rand::Rng>(rng: &mut R, env: &SimulatorEnv) -> Option<
         create_index = CreateIndex::arbitrary(rng, env);
     }
 
-    Some(Interactions::Query(Query::CreateIndex(create_index)))
+    Some(Interactions::new(
+        env.choose_conn(rng),
+        InteractionsType::Query(Query::CreateIndex(create_index)),
+    ))
 }
 
 fn random_fault<R: rand::Rng>(rng: &mut R, env: &SimulatorEnv) -> Interactions {
@@ -808,8 +916,8 @@ fn random_fault<R: rand::Rng>(rng: &mut R, env: &SimulatorEnv) -> Interactions {
     } else {
         vec![Fault::Disconnect, Fault::ReopenDatabase]
     };
-    let fault = faults[rng.random_range(0..faults.len())].clone();
-    Interactions::Fault(fault)
+    let fault = faults[rng.random_range(0..faults.len())];
+    Interactions::new(env.choose_conn(rng), InteractionsType::Fault(fault))
 }
 
 impl ArbitraryFrom<(&SimulatorEnv, InteractionStats)> for Interactions {
@@ -824,7 +932,14 @@ impl ArbitraryFrom<(&SimulatorEnv, InteractionStats)> for Interactions {
                 (
                     u32::min(remaining_.select, remaining_.insert) + remaining_.create,
                     Box::new(|rng: &mut R| {
-                        Interactions::Property(Property::arbitrary_from(rng, env, (env, &stats)))
+                        Interactions::new(
+                            env.choose_conn(rng),
+                            InteractionsType::Property(Property::arbitrary_from(
+                                rng,
+                                env,
+                                (env, &stats),
+                            )),
+                        )
                     }),
                 ),
                 (
