@@ -182,11 +182,6 @@ pub fn translate_insert(
         connection,
     )?;
 
-    // Set up the program to return result columns if RETURNING is specified
-    if !result_columns.is_empty() {
-        program.result_columns = result_columns.clone();
-    }
-
     let mut yield_reg_opt = None;
     let mut temp_table_ctx = None;
     let (num_values, cursor_id) = match body {
@@ -347,6 +342,11 @@ pub fn translate_insert(
             program.alloc_cursor_id(CursorType::BTreeTable(btree_table.clone())),
         ),
     };
+
+    // Set up the program to return result columns if RETURNING is specified
+    if !result_columns.is_empty() {
+        program.result_columns = result_columns.clone();
+    }
 
     // allocate cursor id's for each btree index cursor we'll need to populate the indexes
     // (idx name, root_page, idx cursor id)
