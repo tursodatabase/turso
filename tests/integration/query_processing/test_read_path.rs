@@ -79,8 +79,8 @@ fn test_statement_bind() -> anyhow::Result<()> {
                     assert_eq!(*i, 42)
                 }
 
-                if let turso_core::Value::Blob(v) = row.get::<&Value>(3).unwrap() {
-                    assert_eq!(v.as_slice(), &vec![0x1_u8, 0x2, 0x3])
+                if let turso_core::Value::Blob(b) = row.get::<&Value>(3).unwrap() {
+                    assert_eq!(b.value.as_slice(), &vec![0x1_u8, 0x2, 0x3])
                 }
 
                 if let turso_core::Value::Float(f) = row.get::<&Value>(4).unwrap() {
@@ -889,7 +889,7 @@ fn test_stmt_reset() -> anyhow::Result<()> {
     let mut stmt1 = conn1.prepare("INSERT INTO test VALUES (?)").unwrap();
     for _ in 0..3 {
         stmt1.reset();
-        stmt1.bind_at(1.try_into().unwrap(), Value::Blob(vec![0u8; 1024]));
+        stmt1.bind_at(1.try_into().unwrap(), Value::build_blob(vec![0u8; 1024]));
         loop {
             match stmt1.step().unwrap() {
                 StepResult::Done => break,
@@ -904,7 +904,7 @@ fn test_stmt_reset() -> anyhow::Result<()> {
         .unwrap();
 
     stmt1.reset();
-    stmt1.bind_at(1.try_into().unwrap(), Value::Blob(vec![0u8; 1024]));
+    stmt1.bind_at(1.try_into().unwrap(), Value::build_blob(vec![0u8; 1024]));
     loop {
         match stmt1.step().unwrap() {
             StepResult::Done => break,

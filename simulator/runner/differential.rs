@@ -157,7 +157,7 @@ fn compare_results(
                                     match &sim_val.0 {
                                         turso_core::Value::Blob(blob) => {
                                             let convert_blob = || -> anyhow::Result<String> {
-                                                let val = String::from_utf8(blob.clone())?;
+                                                let val = String::from_utf8(blob.value.clone())?;
                                                 Ok(val)
                                             };
 

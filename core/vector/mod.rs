@@ -77,11 +77,11 @@ pub fn vector_extract(args: &[Register]) -> Result<Value> {
         }
     };
 
-    if blob.is_empty() {
+    if blob.value.is_empty() {
         return Ok(Value::build_text("[]"));
     }
 
-    let vector = Vector::from_vec(blob.to_vec())?;
+    let vector = Vector::from_vec(blob.value.to_vec())?;
     Ok(Value::build_text(operations::text::vector_to_text(&vector)))
 }
 

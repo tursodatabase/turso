@@ -32,7 +32,8 @@ use std::{
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use turso_core::{
-    Connection, Database, DatabaseOpts, LimboError, OpenFlags, QueryMode, Statement, StepResult,
+    types::BlobSubtype, Connection, Database, DatabaseOpts, LimboError, OpenFlags, QueryMode, Statement,
+    StepResult,
     Value,
 };
 
@@ -1736,9 +1737,17 @@ impl Limbo {
                 out.write_all(b"'")
             }
             Value::Blob(b) => {
+                let bytes = match b.subtype {
+                    BlobSubtype::Unallocated(_) => {
+                        let mut blob = b.clone();
+                        blob.expand();
+                        blob.value
+                    }
+                    _ => b.value.clone(),
+                };
                 out.write_all(b"X'")?;
                 const HEX: &[u8; 16] = b"0123456789abcdef";
-                for &byte in b {
+                for &byte in bytes.as_slice() {
                     out.write_all(&[HEX[(byte >> 4) as usize], HEX[(byte & 0x0F) as usize]])?;
                 }
                 out.write_all(b"'")

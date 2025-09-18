@@ -81,7 +81,7 @@ pub fn jsonb_remove(args: &[Register], json_cache: &JsonCacheCell) -> crate::Res
         }
     }
 
-    Ok(Value::Blob(json.data()))
+    Ok(Value::build_blob(json.data()))
 }
 
 pub fn json_replace(args: &[Register], json_cache: &JsonCacheCell) -> crate::Result<Value> {
@@ -229,7 +229,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "blob is not supported!")]
     fn test_blob_not_supported() {
-        let target = Value::Blob(vec![1, 2, 3]);
+        let target = Value::build_blob(vec![1, 2, 3]);
         let patch = create_text("{}");
         let cache = JsonCacheCell::new();
 

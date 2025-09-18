@@ -8197,7 +8197,7 @@ mod tests {
         let large_payload = vec![b'X'; large_payload_size];
 
         // Create a record with the large payload
-        let regs = &[Register::Value(Value::Blob(large_payload.clone()))];
+        let regs = &[Register::Value(Value::build_blob(large_payload.clone()))];
         let large_record = ImmutableRecord::from_registers(regs, regs.len());
 
         // Create cursor for the table
@@ -8249,7 +8249,7 @@ mod tests {
 
         // Create a smaller record to overwrite with
         let small_payload = vec![b'Y'; 100]; // Much smaller payload
-        let regs = &[Register::Value(Value::Blob(small_payload.clone()))];
+        let regs = &[Register::Value(Value::build_blob(small_payload.clone()))];
         let small_record = ImmutableRecord::from_registers(regs, regs.len());
 
         // Seek to the existing record
@@ -8363,7 +8363,7 @@ mod tests {
                     pager.deref(),
                 )
                 .unwrap();
-                let regs = &[Register::Value(Value::Blob(vec![0; *size]))];
+                let regs = &[Register::Value(Value::build_blob(vec![0; *size]))];
                 let value = ImmutableRecord::from_registers(regs, regs.len());
                 tracing::info!("insert key:{}", key);
                 run_until_done(
@@ -8456,7 +8456,7 @@ mod tests {
                     pager.deref(),
                 )
                 .unwrap();
-                let regs = &[Register::Value(Value::Blob(vec![0; size]))];
+                let regs = &[Register::Value(Value::build_blob(vec![0; size]))];
                 let value = ImmutableRecord::from_registers(regs, regs.len());
                 let btree_before = if do_validate {
                     format_btree(pager.clone(), root_page, 0)
@@ -8761,7 +8761,7 @@ mod tests {
                     }
                     expected_keys.push(key.clone());
 
-                    let regs = vec![Register::Value(Value::Blob(key))];
+                    let regs = vec![Register::Value(Value::build_blob(key))];
                     let value = ImmutableRecord::from_registers(&regs, regs.len());
 
                     let seek_result = run_until_done(
@@ -8791,7 +8791,7 @@ mod tests {
                             tracing::info!("delete {}/{}, seed: {seed}", i + 1, operations);
                         }
 
-                        let regs = vec![Register::Value(Value::Blob(key_to_delete.clone()))];
+                        let regs = vec![Register::Value(Value::build_blob(key_to_delete.clone()))];
                         let record = ImmutableRecord::from_registers(&regs, regs.len());
 
                         // Seek to the key to delete
@@ -8850,7 +8850,7 @@ mod tests {
             );
             let exists = run_until_done(
                 || {
-                    let regs = vec![Register::Value(Value::Blob(key.clone()))];
+                    let regs = vec![Register::Value(Value::build_blob(key.clone()))];
                     cursor.seek(
                         SeekKey::IndexKey(&ImmutableRecord::from_registers(&regs, regs.len())),
                         SeekOp::GE { eq_only: true },
@@ -8903,7 +8903,7 @@ mod tests {
             let record = record.as_ref().unwrap();
             let cur = record.get_values().clone();
             let cur = cur.first().unwrap();
-            let ValueRef::Blob(ref cur) = cur else {
+            let ValueRef::Blob(ref cur, _) = cur else {
                 panic!("expected blob, got {cur:?}");
             };
             assert_eq!(cur, key, "key {key:?} is not found, seed: {seed}");
@@ -9498,7 +9498,7 @@ mod tests {
 
         for rowid in 1..=record_count {
             let large_blob = vec![b'A'; 8192];
-            insert_record(&mut cursor, &pager, rowid, Value::Blob(large_blob))?;
+            insert_record(&mut cursor, &pager, rowid, Value::build_blob(large_blob))?;
         }
 
         let page_count_after_inserts = pager
@@ -10168,7 +10168,7 @@ mod tests {
 
         let page = get_page(2);
         let usable_space = 4096;
-        let regs = &[Register::Value(Value::Blob(vec![0; 3600]))];
+        let regs = &[Register::Value(Value::build_blob(vec![0; 3600]))];
         let record = ImmutableRecord::from_registers(regs, regs.len());
         let mut payload: Vec<u8> = Vec::new();
         let mut fill_cell_payload_state = FillCellPayloadState::Start;
@@ -10343,7 +10343,7 @@ mod tests {
         let offset = 2; // blobs data starts at offset 2
         let initial_text = "hello world";
         let initial_blob = initial_text.as_bytes().to_vec();
-        let regs = &[Register::Value(Value::Blob(initial_blob.clone()))];
+        let regs = &[Register::Value(Value::build_blob(initial_blob.clone()))];
         let value = ImmutableRecord::from_registers(regs, regs.len());
 
         run_until_done(
@@ -10420,7 +10420,7 @@ mod tests {
         let mut large_blob = vec![b'A'; 40960 - 11]; // insert large blob. 40960 = 10 page long.
         let hello_world = b"hello world";
         large_blob.extend_from_slice(hello_world);
-        let regs = &[Register::Value(Value::Blob(large_blob.clone()))];
+        let regs = &[Register::Value(Value::build_blob(large_blob.clone()))];
         let value = ImmutableRecord::from_registers(regs, regs.len());
 
         run_until_done(
@@ -10577,7 +10577,7 @@ mod tests {
 
     fn insert_cell(cell_idx: u64, size: u16, page: PageRef, pager: Arc<Pager>) {
         let mut payload = Vec::new();
-        let regs = &[Register::Value(Value::Blob(vec![0; size as usize]))];
+        let regs = &[Register::Value(Value::build_blob(vec![0; size as usize]))];
         let record = ImmutableRecord::from_registers(regs, regs.len());
         let mut fill_cell_payload_state = FillCellPayloadState::Start;
         let contents = page.get_contents();

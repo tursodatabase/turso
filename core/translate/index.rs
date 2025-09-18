@@ -543,7 +543,7 @@ pub fn resolve_index_method_parameters(
                 },
                 ast::Literal::Null => crate::Value::Null,
                 ast::Literal::String(s) => crate::Value::Text(s.into()),
-                ast::Literal::Blob(b) => crate::Value::Blob(
+                ast::Literal::Blob(b) => crate::Value::build_blob(
                     b.as_bytes()
                         .chunks_exact(2)
                         .map(|pair| {
@@ -552,7 +552,7 @@ pub fn resolve_index_method_parameters(
                             let hex_byte = std::str::from_utf8(pair).unwrap();
                             u8::from_str_radix(hex_byte, 16).unwrap()
                         })
-                        .collect(),
+                        .collect::<Vec<u8>>(),
                 ),
                 _ => bail_parse_error!("parameters must be constant literals"),
             },
