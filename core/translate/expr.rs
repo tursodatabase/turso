@@ -3272,6 +3272,12 @@ pub fn bind_and_rewrite_expr<'a>(
         top_level_expr,
         &mut |expr: &mut ast::Expr| -> Result<WalkControl> {
             match expr {
+                ast::Expr::Id(ast::Name::Ident(n)) if n.eq_ignore_ascii_case("true") => {
+                    *expr = ast::Expr::Literal(ast::Literal::Numeric("1".to_string()));
+                }
+                ast::Expr::Id(ast::Name::Ident(n)) if n.eq_ignore_ascii_case("false") => {
+                    *expr = ast::Expr::Literal(ast::Literal::Numeric("0".to_string()));
+                }
                 // Rewrite anonymous variables in encounter order.
                 ast::Expr::Variable(var) if var.is_empty() => {
                     *expr = ast::Expr::Variable(format!(
