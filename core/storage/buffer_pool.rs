@@ -120,7 +120,7 @@ unsafe impl Send for PoolInner {}
 
 impl Default for BufferPool {
     fn default() -> Self {
-        Self::new(Self::DEFAULT_ARENA_SIZE)
+        Self::new(Self::DEFAULT_ARENA_SIZE, Self::DEFAULT_PAGE_SIZE.into())
     }
 }
 
@@ -137,7 +137,7 @@ impl BufferPool {
     const MAX_ARENA_SIZE: usize = 32 * 1024 * 1024;
     /// 64kb Minimum arena size
     const MIN_ARENA_SIZE: usize = 1024 * 64;
-    fn new(arena_size: usize) -> Self {
+    pub fn new(arena_size: usize, db_page_size: usize) -> Self {
         turso_assert!(
             (Self::MIN_ARENA_SIZE..Self::MAX_ARENA_SIZE).contains(&arena_size),
             "Arena size needs to be between {}..{} bytes",
@@ -149,7 +149,7 @@ impl BufferPool {
                 page_arena: None,
                 wal_frame_arena: None,
                 arena_size: arena_size.into(),
-                db_page_size: Self::DEFAULT_PAGE_SIZE.into(),
+                db_page_size: db_page_size.into(),
                 init_lock: Mutex::new(()),
                 io: None,
             }),
@@ -193,7 +193,7 @@ impl BufferPool {
     /// and the pool will temporarily return temporary buffers to prevent reallocation of the
     /// arena if the page size is set to something other than the default value.
     pub fn begin_init(io: &Arc<dyn IO>, arena_size: usize) -> Arc<Self> {
-        let pool = Arc::new(BufferPool::new(arena_size));
+        let pool = Arc::new(BufferPool::new(arena_size, Self::DEFAULT_PAGE_SIZE.into()));
         let inner = pool.inner_mut();
         // Just store the IO handle, don't create arena yet
         if inner.io.is_none() {
