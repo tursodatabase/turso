@@ -28,12 +28,17 @@ macro_rules! peek_expect {
                     match (TK_ID, tt.fallback_id_if_ok()) {
                         $(($x, TK_ID) => token,)*
                         _ => {
+                            let token_text = String::from_utf8_lossy(token.value).to_string();
+                            let offset = $parser.offset();
                             return Err(Error::ParseUnexpectedToken {
                                 parsed_offset: ($parser.offset(), token_len).into(),
                                 expected: &[
                                     $($x,)*
                                 ],
                                 got: tt,
+                                token_text: token_text.clone(),
+                                offset,
+                                expected_display: crate::token::TokenType::format_expected_tokens(&[$($x,)*]),
                             })
                         }
                     }
@@ -219,10 +224,17 @@ impl<'a> Parser<'a> {
                 Some(token) => {
                     if !found_semi {
                         let tt = token.token_type.unwrap();
+                        let token_text = String::from_utf8_lossy(token.value).to_string();
+                        let offset = self.offset();
                         return Err(Error::ParseUnexpectedToken {
-                            parsed_offset: (self.offset(), 1).into(),
+                            parsed_offset: (offset, 1).into(),
                             expected: &[TK_SEMI],
                             got: tt,
+                            token_text: token_text.clone(),
+                            offset,
+                            expected_display: crate::token::TokenType::format_expected_tokens(&[
+                                TK_SEMI,
+                            ]),
                         });
                     }
 
@@ -1472,10 +1484,18 @@ impl<'a> Parser<'a> {
                         Some(self.parse_nm()?)
                     } else if tok.token_type == Some(TK_LP) {
                         if can_be_lit_str {
+                            let token = self.peek_no_eof()?;
+                            let token_text = String::from_utf8_lossy(token.value).to_string();
+                            let offset = self.offset();
                             return Err(Error::ParseUnexpectedToken {
                                 parsed_offset: (self.offset() - name.len(), name.len()).into(),
                                 got: TK_STRING,
                                 expected: &[TK_ID, TK_INDEXED, TK_JOIN_KW],
+                                token_text: token_text.clone(),
+                                offset,
+                                expected_display: crate::token::TokenType::format_expected_tokens(
+                                    &[TK_ID, TK_INDEXED, TK_JOIN_KW],
+                                ),
                             });
                         } // can not be literal string in function name
 
