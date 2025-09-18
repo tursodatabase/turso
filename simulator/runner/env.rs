@@ -346,7 +346,8 @@ impl SimulatorEnv {
         });
     }
 
-    pub fn connection_context(&self, connection_index: usize) -> impl GenerationContext {
+    // TODO: does not yet create the appropriate context to avoid WriteWriteConflitcs
+    pub fn connection_context(&self, conn_index: usize) -> impl GenerationContext {
         struct ConnectionGenContext<'a> {
             tables: &'a Vec<sql_generation::model::table::Table>,
             opts: &'a sql_generation::generation::Opts,
@@ -362,16 +363,28 @@ impl SimulatorEnv {
             }
         }
 
-        let tables = if let Some(tables) = self.connection_tables.get(connection_index).unwrap() {
-            &tables.tables
-        } else {
-            &self.committed_tables.tables
-        };
+        let tables = &self.get_conn_tables(conn_index).tables;
 
         ConnectionGenContext {
             opts: &self.profile.query.gen_opts,
             tables,
         }
+    }
+
+    pub fn get_conn_tables(&self, conn_index: usize) -> &SimulatorTables {
+        self.connection_tables
+            .get(conn_index)
+            .unwrap()
+            .as_ref()
+            .unwrap_or(&self.committed_tables)
+    }
+
+    pub fn get_conn_tables_mut(&mut self, conn_index: usize) -> &mut SimulatorTables {
+        self.connection_tables
+            .get_mut(conn_index)
+            .unwrap()
+            .as_mut()
+            .unwrap_or(&mut self.committed_tables)
     }
 }
 

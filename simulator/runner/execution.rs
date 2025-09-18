@@ -230,7 +230,7 @@ pub fn execute_interaction_turso(
             limbo_integrity_check(&conn)?;
         }
     }
-    let _ = interaction.shadow(&mut env.tables);
+    let _ = interaction.shadow(env.get_conn_tables_mut(interaction.connection_index));
     Ok(ExecutionContinuation::NextInteraction)
 }
 
@@ -323,7 +323,7 @@ fn execute_interaction_rusqlite(
         }
     }
 
-    let _ = interaction.shadow(&mut env.tables);
+    let _ = interaction.shadow(env.get_conn_tables_mut(interaction.connection_index));
     Ok(ExecutionContinuation::NextInteraction)
 }
 

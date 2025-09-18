@@ -1,6 +1,6 @@
 use sql_generation::generation::GenerationContext;
 
-use crate::runner::env::{SimulatorEnv, SimulatorTables};
+use crate::runner::env::SimulatorTables;
 
 pub mod plan;
 pub mod property;
@@ -20,22 +20,16 @@ pub(crate) trait Shadow {
     fn shadow(&self, tables: &mut SimulatorTables) -> Self::Result;
 }
 
-impl GenerationContext for SimulatorEnv {
+/// Generation context that will always panic when called
+/// This is meant to be used when want to ensure that no downstream arbitrary fn will use this context
+pub struct PanicGenerationContext;
+
+impl GenerationContext for PanicGenerationContext {
     fn tables(&self) -> &Vec<sql_generation::model::table::Table> {
-        &self.tables.tables
+        unimplemented!("you are not supposed to use this context")
     }
 
     fn opts(&self) -> &sql_generation::generation::Opts {
-        &self.profile.query.gen_opts
-    }
-}
-
-impl GenerationContext for &mut SimulatorEnv {
-    fn tables(&self) -> &Vec<sql_generation::model::table::Table> {
-        &self.tables.tables
-    }
-
-    fn opts(&self) -> &sql_generation::generation::Opts {
-        &self.profile.query.gen_opts
+        unimplemented!("you are not supposed to use this context")
     }
 }
