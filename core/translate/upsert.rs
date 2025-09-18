@@ -556,7 +556,7 @@ fn rewrite_upsert_expr_in_place(
                 }
                 // Unqualified column id -> CURRENT
                 Expr::Id(Name::Ident(name)) | Expr::Id(Name::Quoted(name)) => {
-                    if let Some(reg) = col_reg(name.as_str()) {
+                    if let Some(reg) = col_reg(&normalize_ident(name.as_str())) {
                         *expr = Expr::Register(reg);
                     }
                 }
