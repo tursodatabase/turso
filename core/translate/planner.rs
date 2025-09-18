@@ -888,17 +888,10 @@ pub fn parse_where(
     connection: &Arc<crate::Connection>,
 ) -> Result<()> {
     if let Some(where_expr) = where_clause {
-        let mut predicates = vec![];
-        break_predicate_at_and_boundaries(where_expr, &mut predicates);
-        for expr in predicates.iter_mut() {
-            bind_column_references(expr, table_references, result_columns, connection)?;
-        }
-        for expr in predicates {
-            out_where_clause.push(WhereTerm {
-                expr,
-                from_outer_join: None,
-                consumed: false,
-            });
+        let start_idx = out_where_clause.len();
+        break_predicate_at_and_boundaries(where_expr, out_where_clause);
+        for expr in out_where_clause[start_idx..].iter_mut() {
+            bind_column_references(&mut expr.expr, table_references, result_columns, connection)?;
         }
         Ok(())
     } else {
@@ -1170,21 +1163,20 @@ fn parse_join(
     if let Some(constraint) = constraint {
         match constraint {
             ast::JoinConstraint::On(ref expr) => {
-                let mut preds = vec![];
-                break_predicate_at_and_boundaries(expr, &mut preds);
-                for predicate in preds.iter_mut() {
-                    bind_column_references(predicate, table_references, None, connection)?;
-                }
-                for pred in preds {
-                    out_where_clause.push(WhereTerm {
-                        expr: pred,
-                        from_outer_join: if outer {
-                            Some(table_references.joined_tables().last().unwrap().internal_id)
-                        } else {
-                            None
-                        },
-                        consumed: false,
-                    });
+                let start_idx = out_where_clause.len();
+                break_predicate_at_and_boundaries(expr, out_where_clause);
+                for predicate in out_where_clause[start_idx..].iter_mut() {
+                    predicate.from_outer_join = if outer {
+                        Some(table_references.joined_tables().last().unwrap().internal_id)
+                    } else {
+                        None
+                    };
+                    bind_column_references(
+                        &mut predicate.expr,
+                        table_references,
+                        None,
+                        connection,
+                    )?;
                 }
             }
             ast::JoinConstraint::Using(distinct_names) => {
@@ -1283,14 +1275,17 @@ fn parse_join(
     Ok(())
 }
 
-pub fn break_predicate_at_and_boundaries(predicate: &Expr, out_predicates: &mut Vec<Expr>) {
+pub fn break_predicate_at_and_boundaries<T: From<Expr>>(
+    predicate: &Expr,
+    out_predicates: &mut Vec<T>,
+) {
     match predicate {
         Expr::Binary(left, ast::Operator::And, right) => {
             break_predicate_at_and_boundaries(left, out_predicates);
             break_predicate_at_and_boundaries(right, out_predicates);
         }
         _ => {
-            out_predicates.push(predicate.clone());
+            out_predicates.push(predicate.clone().into());
         }
     }
 }

@@ -113,6 +113,16 @@ impl WhereTerm {
     }
 }
 
+impl From<Expr> for WhereTerm {
+    fn from(value: Expr) -> Self {
+        Self {
+            expr: value,
+            from_outer_join: None,
+            consumed: false,
+        }
+    }
+}
+
 use crate::ast::Expr;
 use crate::util::exprs_are_equivalent;
 
