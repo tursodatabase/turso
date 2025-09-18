@@ -425,11 +425,11 @@ impl PageCache {
         Err(CacheError::Full)
     }
 
-    pub fn clear(&mut self) -> Result<(), CacheError> {
+    pub fn clear(&mut self, clear_dirty: bool) -> Result<(), CacheError> {
         // Check all pages are clean
         for &entry_ptr in self.map.values() {
             let entry = unsafe { &*entry_ptr };
-            if entry.page.is_dirty() {
+            if entry.page.is_dirty() && !clear_dirty {
                 return Err(CacheError::Dirty {
                     pgno: entry.page.get().id,
                 });
@@ -852,7 +852,7 @@ mod tests {
         let key1 = insert_page(&mut cache, 1);
         let key2 = insert_page(&mut cache, 2);
 
-        assert!(cache.clear().is_ok());
+        assert!(cache.clear(false).is_ok());
         assert!(cache.get(&key1).unwrap().is_none());
         assert!(cache.get(&key2).unwrap().is_none());
         assert_eq!(cache.len(), 0);
@@ -1141,7 +1141,7 @@ mod tests {
                 cache.insert(key, page).unwrap();
             }
 
-            cache.clear().unwrap();
+            cache.clear(false).unwrap();
             drop(cache);
         }
 
@@ -1231,7 +1231,7 @@ mod tests {
         for i in 1..=3 {
             let _ = insert_page(&mut c, i);
         }
-        c.clear().unwrap();
+        c.clear(false).unwrap();
         // No elements; insert should not rely on stale hand
         let _ = insert_page(&mut c, 10);
 
