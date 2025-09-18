@@ -19,7 +19,9 @@ use std::cell::{Cell, RefCell, UnsafeCell};
 use std::collections::HashSet;
 use std::hash;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{
+    AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
+};
 use std::sync::{Arc, Mutex};
 use tracing::{instrument, trace, Level};
 
@@ -31,6 +33,7 @@ use crate::storage::encryption::{CipherMode, EncryptionContext, EncryptionKey};
 
 /// SQLite's default maximum page count
 const DEFAULT_MAX_PAGE_COUNT: u32 = 0xfffffffe;
+const RESERVED_SPACE_NOT_SET: u16 = u16::MAX;
 
 #[cfg(not(feature = "omit_autovacuum"))]
 use ptrmap::*;
@@ -518,7 +521,7 @@ pub struct Pager {
     /// `usable_space` calls. TODO: Invalidate reserved_space when we add the functionality
     /// to change it.
     pub(crate) page_size: AtomicU32,
-    reserved_space: Cell<Option<u8>>,
+    reserved_space: AtomicU16,
     free_page_state: RefCell<FreePageState>,
     /// Maximum number of pages allowed in the database. Default is 1073741823 (SQLite default).
     max_page_count: Cell<u32>,
@@ -621,7 +624,7 @@ impl Pager {
             init_lock,
             allocate_page1_state,
             page_size: AtomicU32::new(0), // 0 means not set
-            reserved_space: Cell::new(None),
+            reserved_space: AtomicU16::new(RESERVED_SPACE_NOT_SET),
             free_page_state: RefCell::new(FreePageState::Start),
             allocate_page_state: RwLock::new(AllocatePageState::Start),
             max_page_count: Cell::new(DEFAULT_MAX_PAGE_COUNT),
@@ -997,10 +1000,13 @@ impl Pager {
             size
         });
 
-        let reserved_space = *self.reserved_space.get().get_or_insert_with(|| {
-            self.io
+        let reserved_space = self.get_reserved_space().unwrap_or_else(|| {
+            let space = self
+                .io
                 .block(|| self.with_header(|header| header.reserved_space))
-                .unwrap_or_default()
+                .unwrap_or_default();
+            self.set_reserved_space(space);
+            space
         });
 
         (page_size.get() as usize) - (reserved_space as usize)
@@ -1032,6 +1038,21 @@ impl Pager {
     /// Set the page size. Used internally when page size is determined.
     pub fn set_page_size(&self, size: PageSize) {
         self.page_size.store(size.get(), Ordering::SeqCst);
+    }
+
+    /// Get the current reserved space. Returns None if not set yet.
+    pub fn get_reserved_space(&self) -> Option<u8> {
+        let value = self.reserved_space.load(Ordering::SeqCst);
+        if value == RESERVED_SPACE_NOT_SET {
+            None
+        } else {
+            Some(value as u8)
+        }
+    }
+
+    /// Set the reserved space. Must fit in u8.
+    pub fn set_reserved_space(&self, space: u8) {
+        self.reserved_space.store(space as u16, Ordering::SeqCst);
     }
 
     #[inline(always)]
@@ -1965,7 +1986,7 @@ impl Pager {
                     io_ctx.get_reserved_space_bytes()
                 };
                 default_header.reserved_space = reserved_space_bytes;
-                self.reserved_space.set(Some(reserved_space_bytes));
+                self.set_reserved_space(reserved_space_bytes);
 
                 if let Some(size) = self.get_page_size() {
                     default_header.page_size = size;
@@ -2367,7 +2388,7 @@ impl Pager {
     }
 
     pub fn set_reserved_space_bytes(&self, value: u8) {
-        self.reserved_space.set(Some(value))
+        self.set_reserved_space(value);
     }
 }
 
