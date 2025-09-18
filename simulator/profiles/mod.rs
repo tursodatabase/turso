@@ -28,17 +28,19 @@ pub struct Profile {
     #[garde(skip)]
     /// Experimental MVCC feature
     pub experimental_mvcc: bool,
+    #[garde(range(min = 1))]
+    pub max_connections: usize,
     #[garde(dive)]
     pub io: IOProfile,
     #[garde(dive)]
     pub query: QueryProfile,
 }
 
-#[allow(clippy::derivable_impls)]
 impl Default for Profile {
     fn default() -> Self {
         Self {
             experimental_mvcc: false,
+            max_connections: 10,
             io: Default::default(),
             query: Default::default(),
         }
