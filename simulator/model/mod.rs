@@ -358,6 +358,8 @@ impl Shadow for Select {
 impl Shadow for Begin {
     type Result = Vec<Vec<SimValue>>;
     fn shadow(&self, tables: &mut SimulatorTables) -> Self::Result {
+        // FIXME: currently the snapshot is taken eagerly
+        // this is wrong for Deffered transactions
         tables.snapshot = Some(tables.tables.clone());
         vec![]
     }

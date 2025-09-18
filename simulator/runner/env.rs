@@ -8,6 +8,7 @@ use std::sync::Arc;
 use garde::Validate;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
+use sql_generation::generation::GenerationContext;
 use sql_generation::model::table::Table;
 use turso_core::Database;
 
@@ -71,8 +72,12 @@ pub(crate) struct SimulatorEnv {
     pub(crate) paths: Paths,
     pub(crate) type_: SimulationType,
     pub(crate) phase: SimulationPhase,
-    pub(crate) tables: SimulatorTables,
     pub memory_io: bool,
+
+    /// If connection state is None, means we are not in a transaction
+    pub connection_tables: Vec<Option<SimulatorTables>>,
+    // Table data that is committed into the database or wal
+    pub committed_tables: SimulatorTables,
 }
 
 impl UnwindSafe for SimulatorEnv {}
@@ -81,10 +86,6 @@ impl SimulatorEnv {
     pub(crate) fn clone_without_connections(&self) -> Self {
         SimulatorEnv {
             opts: self.opts.clone(),
-            tables: self.tables.clone(),
-            connections: (0..self.connections.len())
-                .map(|_| SimConnection::Disconnected)
-                .collect(),
             io: self.io.clone(),
             db: self.db.clone(),
             rng: self.rng.clone(),
@@ -93,11 +94,17 @@ impl SimulatorEnv {
             phase: self.phase,
             memory_io: self.memory_io,
             profile: self.profile.clone(),
+            connections: (0..self.connections.len())
+                .map(|_| SimConnection::Disconnected)
+                .collect(),
+            // TODO: not sure if connection_tables should be recreated instead
+            connection_tables: self.connection_tables.clone(),
+            committed_tables: self.committed_tables.clone(),
         }
     }
 
     pub(crate) fn clear(&mut self) {
-        self.tables.clear();
+        self.clear_tables();
         self.connections.iter_mut().for_each(|c| c.disconnect());
         self.rng = ChaCha8Rng::seed_from_u64(self.opts.seed);
 
@@ -284,7 +291,6 @@ impl SimulatorEnv {
 
         SimulatorEnv {
             opts,
-            tables: SimulatorTables::new(),
             connections,
             paths,
             rng,
@@ -294,6 +300,8 @@ impl SimulatorEnv {
             phase: SimulationPhase::Test,
             memory_io: cli_opts.memory_io,
             profile: profile.clone(),
+            committed_tables: SimulatorTables::new(),
+            connection_tables: vec![None; profile.max_connections],
         }
     }
 
@@ -326,6 +334,44 @@ impl SimulatorEnv {
                 );
             }
         };
+    }
+
+    /// Clears the commited tables and the connection tables
+    pub fn clear_tables(&mut self) {
+        self.committed_tables.clear();
+        self.connection_tables.iter_mut().for_each(|t| {
+            if let Some(t) = t {
+                t.clear();
+            }
+        });
+    }
+
+    pub fn connection_context(&self, connection_index: usize) -> impl GenerationContext {
+        struct ConnectionGenContext<'a> {
+            tables: &'a Vec<sql_generation::model::table::Table>,
+            opts: &'a sql_generation::generation::Opts,
+        }
+
+        impl<'a> GenerationContext for ConnectionGenContext<'a> {
+            fn tables(&self) -> &Vec<sql_generation::model::table::Table> {
+                self.tables
+            }
+
+            fn opts(&self) -> &sql_generation::generation::Opts {
+                self.opts
+            }
+        }
+
+        let tables = if let Some(tables) = self.connection_tables.get(connection_index).unwrap() {
+            &tables.tables
+        } else {
+            &self.committed_tables.tables
+        };
+
+        ConnectionGenContext {
+            opts: &self.profile.query.gen_opts,
+            tables,
+        }
     }
 }
 

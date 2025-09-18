@@ -65,7 +65,7 @@ pub(crate) fn execute_interactions(
     env.clear_poison();
     let mut env = env.lock().unwrap();
 
-    env.tables.clear();
+    env.clear_tables();
 
     for _tick in 0..env.opts.ticks {
         tracing::trace!("Executing tick {}", _tick);
