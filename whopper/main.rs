@@ -71,6 +71,12 @@ struct SimulatorContext {
     enable_mvcc: bool,
 }
 
+#[derive(Debug)]
+enum WorkResult {
+    Stepped,
+    Done,
+}
+
 #[derive(Default)]
 struct Stats {
     inserts: usize,
@@ -229,7 +235,10 @@ fn main() -> anyhow::Result<()> {
 
     for i in 0..config.max_steps {
         let fiber_idx = i % context.fibers.len();
-        perform_work(fiber_idx, &mut rng, &mut context)?;
+        if let WorkResult::Done = perform_work(fiber_idx, &mut rng, &mut context)? {
+            println!("Simulation complete after {} steps", i + 1);
+            break;
+        }
         io.step()?;
         if progress_interval > 0 && (i + 1) % progress_interval == 0 {
             println!(
@@ -388,7 +397,7 @@ fn perform_work(
     fiber_idx: usize,
     rng: &mut ChaCha8Rng,
     context: &mut SimulatorContext,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<WorkResult> {
     // If we have a statement, step it.
     let done = {
         let mut stmt_borrow = context.fibers[fiber_idx].statement.borrow_mut();
@@ -397,6 +406,10 @@ fn perform_work(
                 Ok(result) => matches!(result, turso_core::StepResult::Done),
                 Err(e) => {
                     match e {
+                        turso_core::LimboError::DatabaseFull(_) => {
+                            // simulation is over
+                            return Ok(WorkResult::Done);
+                        }
                         turso_core::LimboError::SchemaUpdated => {
                             trace!("{} Schema changed, rolling back transaction", fiber_idx);
                             drop(stmt_borrow);
@@ -412,7 +425,7 @@ fn perform_work(
                                     context.fibers[fiber_idx].state = FiberState::Idle;
                                 }
                             }
-                            return Ok(());
+                            return Ok(WorkResult::Stepped);
                         }
                         turso_core::LimboError::Busy => {
                             trace!("{} Database busy, rolling back transaction", fiber_idx);
@@ -429,7 +442,7 @@ fn perform_work(
                                     context.fibers[fiber_idx].state = FiberState::Idle;
                                 }
                             }
-                            return Ok(());
+                            return Ok(WorkResult::Stepped);
                         }
                         turso_core::LimboError::WriteWriteConflict => {
                             trace!(
@@ -439,7 +452,7 @@ fn perform_work(
                             drop(stmt_borrow);
                             context.fibers[fiber_idx].statement.replace(None);
                             context.fibers[fiber_idx].state = FiberState::Idle;
-                            return Ok(());
+                            return Ok(WorkResult::Stepped);
                         }
                         _ => {
                             return Err(e.into());
@@ -453,7 +466,7 @@ fn perform_work(
     };
     // If the statement has more work, we're done for this simulation step
     if !done {
-        return Ok(());
+        return Ok(WorkResult::Stepped);
     }
     context.fibers[fiber_idx].statement.replace(None);
     match context.fibers[fiber_idx].state {
@@ -581,7 +594,7 @@ fn perform_work(
             }
         }
     }
-    Ok(())
+    Ok(WorkResult::Stepped)
 }
 
 impl GenerationContext for SimulatorContext {
