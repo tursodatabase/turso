@@ -11,7 +11,6 @@ use super::{
     select::prepare_select_plan,
     SymbolTable,
 };
-use crate::function::{AggFunc, ExtFunc};
 use crate::translate::expr::WalkControl;
 use crate::translate::plan::{Window, WindowFunction};
 use crate::{
@@ -22,6 +21,10 @@ use crate::{
     util::{exprs_are_equivalent, normalize_ident},
     vdbe::builder::TableRefIdCounter,
     Result,
+};
+use crate::{
+    function::{AggFunc, ExtFunc},
+    translate::expr::{bind_and_rewrite_expr, ParamState},
 };
 use turso_macros::match_ignore_ascii_case;
 use turso_parser::ast::Literal::Null;
@@ -886,12 +889,19 @@ pub fn parse_where(
     result_columns: Option<&[ResultSetColumn]>,
     out_where_clause: &mut Vec<WhereTerm>,
     connection: &Arc<crate::Connection>,
+    param_ctx: &mut ParamState,
 ) -> Result<()> {
     if let Some(where_expr) = where_clause {
         let start_idx = out_where_clause.len();
         break_predicate_at_and_boundaries(where_expr, out_where_clause);
         for expr in out_where_clause[start_idx..].iter_mut() {
-            bind_column_references(&mut expr.expr, table_references, result_columns, connection)?;
+            bind_and_rewrite_expr(
+                &mut expr.expr,
+                Some(table_references),
+                result_columns,
+                connection,
+                param_ctx,
+            )?;
         }
         Ok(())
     } else {
@@ -1290,7 +1300,7 @@ pub fn break_predicate_at_and_boundaries<T: From<Expr>>(
     }
 }
 
-fn parse_row_id<F>(
+pub fn parse_row_id<F>(
     column_name: &str,
     table_id: TableInternalId,
     fn_check: F,
@@ -1315,11 +1325,11 @@ where
 pub fn parse_limit(
     limit: &mut Limit,
     connection: &std::sync::Arc<crate::Connection>,
+    param_ctx: &mut ParamState,
 ) -> Result<(Option<Box<Expr>>, Option<Box<Expr>>)> {
-    let mut empty_refs = TableReferences::new(Vec::new(), Vec::new());
-    bind_column_references(&mut limit.expr, &mut empty_refs, None, connection)?;
+    bind_and_rewrite_expr(&mut limit.expr, None, None, connection, param_ctx)?;
     if let Some(ref mut off_expr) = limit.offset {
-        bind_column_references(off_expr, &mut empty_refs, None, connection)?;
+        bind_and_rewrite_expr(off_expr, None, None, connection, param_ctx)?;
     }
     Ok((Some(limit.expr.clone()), limit.offset.clone()))
 }
