@@ -54,7 +54,7 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let _ = tracing_subscriber::fmt()
+    tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .with_ansi(false)
         .with_thread_ids(true)
@@ -156,17 +156,9 @@ async fn setup_database(
     let db = match mode {
         TransactionMode::Legacy => builder.build().await?,
         TransactionMode::Mvcc | TransactionMode::Concurrent => {
-            builder
-                .with_mvcc(true, turso::MvccMode::Noop)
-                .build()
-                .await?
+            builder.with_mvcc(true).build().await?
         }
-        TransactionMode::LogicalLog => {
-            builder
-                .with_mvcc(true, turso::MvccMode::LogicalLog)
-                .build()
-                .await?
-        }
+        TransactionMode::LogicalLog => builder.with_mvcc(true).build().await?,
     };
     let conn = db.connect()?;
 

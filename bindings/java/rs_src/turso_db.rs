@@ -68,7 +68,7 @@ pub extern "system" fn Java_tech_turso_core_TursoDB_openUtf8<'local>(
         }
     };
 
-    let db = match Database::open_file(io.clone(), &path, false, true, turso_core::MvccMode::Noop) {
+    let db = match Database::open_file(io.clone(), &path, false, true) {
         Ok(db) => db,
         Err(e) => {
             set_err_msg_and_throw_exception(&mut env, obj, TURSO_ETC, e.to_string());

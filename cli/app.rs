@@ -182,11 +182,6 @@ impl Limbo {
                 flags,
                 turso_core::DatabaseOpts::new()
                     .with_mvcc(opts.experimental_mvcc)
-                    .with_mvcc_mode(if opts.experimental_logical_log {
-                        turso_core::MvccMode::LogicalLog
-                    } else {
-                        turso_core::MvccMode::Noop
-                    })
                     .with_indexes(indexes_enabled)
                     .with_views(opts.experimental_views)
                     .with_strict(opts.experimental_strict),
@@ -382,7 +377,7 @@ impl Limbo {
             };
             (
                 io.clone(),
-                Database::open_file(io.clone(), path, false, false, turso_core::MvccMode::Noop)?,
+                Database::open_file(io.clone(), path, false, false)?,
             )
         };
         self.io = io;
@@ -1663,13 +1658,7 @@ impl Limbo {
             anyhow::bail!("Refusing to overwrite existing file: {output_file}");
         }
         let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new()?);
-        let db = Database::open_file(
-            io.clone(),
-            output_file,
-            false,
-            true,
-            turso_core::MvccMode::Noop,
-        )?;
+        let db = Database::open_file(io.clone(), output_file, false, true)?;
         let target = db.connect()?;
 
         let mut applier = ApplyWriter::new(&target);

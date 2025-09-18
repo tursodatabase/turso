@@ -2,7 +2,7 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 use pprof::criterion::{Output, PProfProfiler};
 use regex::Regex;
 use std::{sync::Arc, time::Instant};
-use turso_core::{Database, LimboError, MvccMode, PlatformIO, StepResult};
+use turso_core::{Database, LimboError, PlatformIO, StepResult};
 
 #[cfg(not(target_family = "wasm"))]
 #[global_allocator]
@@ -29,7 +29,6 @@ fn bench_open(criterion: &mut Criterion) {
             "../testing/schema_5k.db",
             false,
             false,
-            MvccMode::Noop,
         )
         .unwrap();
         let conn = db.connect().unwrap();
@@ -52,7 +51,6 @@ fn bench_open(criterion: &mut Criterion) {
                 "../testing/schema_5k.db",
                 false,
                 false,
-                MvccMode::Noop,
             )
             .unwrap();
             let conn = db.connect().unwrap();
@@ -85,7 +83,6 @@ fn bench_alter(criterion: &mut Criterion) {
             "../testing/schema_5k.db",
             false,
             false,
-            MvccMode::Noop,
         )
         .unwrap();
         let conn = db.connect().unwrap();
@@ -107,7 +104,6 @@ fn bench_alter(criterion: &mut Criterion) {
             "../testing/schema_5k.db",
             false,
             false,
-            MvccMode::Noop,
         )
         .unwrap();
         let conn = db.connect().unwrap();
@@ -159,7 +155,6 @@ fn bench_alter(criterion: &mut Criterion) {
             "../testing/schema_5k.db",
             false,
             false,
-            MvccMode::Noop,
         )
         .unwrap();
         let conn = db.connect().unwrap();
@@ -212,7 +207,6 @@ fn bench_alter(criterion: &mut Criterion) {
             "../testing/schema_5k.db",
             false,
             false,
-            MvccMode::Noop,
         )
         .unwrap();
         let conn = db.connect().unwrap();
@@ -264,7 +258,6 @@ fn bench_alter(criterion: &mut Criterion) {
             "../testing/schema_5k.db",
             false,
             false,
-            MvccMode::Noop,
         )
         .unwrap();
         let conn = db.connect().unwrap();
@@ -319,7 +312,6 @@ fn bench_prepare_query(criterion: &mut Criterion) {
         "../testing/testing.db",
         false,
         false,
-        MvccMode::Noop,
     )
     .unwrap();
     let limbo_conn = db.connect().unwrap();
@@ -405,7 +397,6 @@ fn bench_execute_select_rows(criterion: &mut Criterion) {
         "../testing/testing.db",
         false,
         false,
-        MvccMode::Noop,
     )
     .unwrap();
     let limbo_conn = db.connect().unwrap();
@@ -480,7 +471,6 @@ fn bench_execute_select_1(criterion: &mut Criterion) {
         "../testing/testing.db",
         false,
         false,
-        MvccMode::Noop,
     )
     .unwrap();
     let limbo_conn = db.connect().unwrap();
@@ -539,7 +529,6 @@ fn bench_execute_select_count(criterion: &mut Criterion) {
         "../testing/testing.db",
         false,
         false,
-        MvccMode::Noop,
     )
     .unwrap();
     let limbo_conn = db.connect().unwrap();
@@ -604,7 +593,6 @@ fn bench_insert_rows(criterion: &mut Criterion) {
             db_path.to_str().unwrap(),
             false,
             false,
-            MvccMode::Noop,
         )
         .unwrap();
         let limbo_conn = db.connect().unwrap();
@@ -735,7 +723,6 @@ fn bench_limbo(
         path.to_str().unwrap(),
         mvcc,
         false,
-        MvccMode::Noop,
     )
     .unwrap();
     let mut connecitons = Vec::new();
@@ -825,7 +812,6 @@ fn bench_limbo_mvcc(
         path.to_str().unwrap(),
         mvcc,
         false,
-        MvccMode::Noop,
     )
     .unwrap();
     let mut connecitons = Vec::new();

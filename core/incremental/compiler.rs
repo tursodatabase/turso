@@ -1115,7 +1115,7 @@ impl DbspCompiler {
 
         // Create an internal connection for expression compilation
         let io = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io, ":memory:", false, false, crate::MvccMode::Noop)?;
+        let db = Database::open_file(io, ":memory:", false, false)?;
         let internal_conn = db.connect()?;
         internal_conn.query_only.set(true);
         internal_conn.auto_commit.set(false);
@@ -1318,8 +1318,7 @@ mod tests {
     use crate::translate::logical::LogicalPlanBuilder;
     use crate::translate::logical::LogicalSchema;
     use crate::util::IOExt;
-    use crate::{Database, MemoryIO, MvccMode, Pager, IO};
-    use std::rc::Rc;
+    use crate::{Database, MemoryIO, Pager, IO};
     use std::sync::Arc;
     use turso_parser::ast;
     use turso_parser::parser::Parser;
@@ -1417,7 +1416,7 @@ mod tests {
 
     fn setup_btree_for_circuit() -> (Arc<Pager>, usize, usize, usize) {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io.clone(), ":memory:", false, false, MvccMode::Noop).unwrap();
+        let db = Database::open_file(io.clone(), ":memory:", false, false).unwrap();
         let conn = db.connect().unwrap();
         let pager = conn.pager.borrow().clone();
 

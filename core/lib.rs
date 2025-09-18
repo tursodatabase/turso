@@ -99,12 +99,6 @@ use util::parse_schema_rows;
 pub use util::IOExt;
 pub use vdbe::{builder::QueryMode, explain::EXPLAIN_COLUMNS, explain::EXPLAIN_QUERY_PLAN_COLUMNS};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MvccMode {
-    Noop,
-    LogicalLog,
-}
-
 /// Configuration for database features
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DatabaseOpts {
@@ -119,7 +113,7 @@ impl Default for DatabaseOpts {
     fn default() -> Self {
         Self {
             enable_mvcc: false,
-            mvcc_mode: MvccMode::Noop,
+            mvcc_mode: MvccMode::LogicalLog,
             enable_indexes: true,
             enable_views: false,
             enable_strict: false,
@@ -134,11 +128,6 @@ impl DatabaseOpts {
 
     pub fn with_mvcc(mut self, enable: bool) -> Self {
         self.enable_mvcc = enable;
-        self
-    }
-
-    pub fn with_mvcc_mode(mut self, mvcc_mode: MvccMode) -> Self {
-        self.mvcc_mode = mvcc_mode;
         self
     }
 
@@ -184,6 +173,12 @@ enum TransactionState {
 pub enum SyncMode {
     Off = 0,
     Full = 2,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MvccMode {
+    Noop,
+    LogicalLog,
 }
 
 pub(crate) type MvStore = mvcc::MvStore<mvcc::LocalClock>;
@@ -280,7 +275,6 @@ impl Database {
         path: &str,
         enable_mvcc: bool,
         enable_indexes: bool,
-        mvcc_mode: MvccMode,
     ) -> Result<Arc<Database>> {
         Self::open_file_with_flags(
             io,
@@ -288,7 +282,6 @@ impl Database {
             OpenFlags::default(),
             DatabaseOpts::new()
                 .with_mvcc(enable_mvcc)
-                .with_mvcc_mode(mvcc_mode)
                 .with_indexes(enable_indexes),
             None,
         )

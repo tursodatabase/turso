@@ -2427,14 +2427,7 @@ pub mod test {
                 .unwrap();
         }
         let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
-        let db = Database::open_file(
-            io.clone(),
-            path.to_str().unwrap(),
-            false,
-            false,
-            crate::MvccMode::Noop,
-        )
-        .unwrap();
+        let db = Database::open_file(io.clone(), path.to_str().unwrap(), false, false).unwrap();
         // db + tmp directory
         (db, dbpath)
     }

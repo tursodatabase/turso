@@ -594,7 +594,7 @@ async fn multiple_connections_fuzz(opts: FuzzOptions) {
         // Create a fresh database for each iteration
         let tempfile = tempfile::NamedTempFile::new().unwrap();
         let db = Builder::new_local(tempfile.path().to_str().unwrap())
-            .with_mvcc(opts.mvcc_enabled, turso::MvccMode::Noop)
+            .with_mvcc(opts.mvcc_enabled)
             .build()
             .await
             .unwrap();

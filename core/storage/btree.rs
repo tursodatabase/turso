@@ -7810,8 +7810,7 @@ mod tests {
         },
         types::Text,
         vdbe::Register,
-        BufferPool, Completion, Connection, IOContext, MvccMode, StepResult, WalFile,
-        WalFileShared,
+        BufferPool, Completion, Connection, IOContext, StepResult, WalFile, WalFileShared,
     };
     use std::{
         cell::RefCell,
@@ -7857,14 +7856,7 @@ mod tests {
                 .unwrap();
         }
         let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
-        let db = Database::open_file(
-            io.clone(),
-            path.to_str().unwrap(),
-            false,
-            false,
-            MvccMode::Noop,
-        )
-        .unwrap();
+        let db = Database::open_file(io.clone(), path.to_str().unwrap(), false, false).unwrap();
 
         db
     }
@@ -8166,7 +8158,7 @@ mod tests {
     fn empty_btree() -> (Arc<Pager>, usize, Arc<Database>, Arc<Connection>) {
         #[allow(clippy::arc_with_non_send_sync)]
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io.clone(), ":memory:", false, false, MvccMode::Noop).unwrap();
+        let db = Database::open_file(io.clone(), ":memory:", false, false).unwrap();
         let conn = db.connect().unwrap();
         let pager = conn.pager.borrow().clone();
 
@@ -8181,7 +8173,7 @@ mod tests {
     fn btree_with_virtual_page_1() -> Result<()> {
         #[allow(clippy::arc_with_non_send_sync)]
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io.clone(), ":memory:", false, false, MvccMode::Noop).unwrap();
+        let db = Database::open_file(io.clone(), ":memory:", false, false).unwrap();
         let conn = db.connect().unwrap();
         let pager = conn.pager.borrow().clone();
 
