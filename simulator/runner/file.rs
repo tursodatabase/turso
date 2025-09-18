@@ -68,7 +68,7 @@ impl SimulatorFile {
     pub(crate) fn inject_fault(&self, fault: bool) {
         self.fault.replace(fault);
     }
-    
+
     fn should_apply_short_write(&self) -> bool {
         if !self.short_write_profile.enable {
             return false;
