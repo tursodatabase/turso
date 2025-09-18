@@ -8089,8 +8089,9 @@ impl Value {
             return Value::Float(((f + if f < 0.0 { -0.5 } else { 0.5 }) as i64) as f64);
         }
 
-        let factor = 10f64.powi(precision as _);
-        Value::Float((f * factor).round() / factor)
+        let f: f64 = crate::numeric::str_to_f64(format!("{f:.precision$}")).unwrap().into();
+
+        Value::Float(f)
     }
 
     // Implements TRIM pattern matching.
