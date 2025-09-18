@@ -1179,7 +1179,7 @@ impl Connection {
             &self.syms.read(),
             None,
             existing_views,
-            self._db.mv_store.as_ref(),
+            self.db.mv_store.as_ref(),
         )?;
 
         tracing::debug!(
@@ -1797,7 +1797,7 @@ impl Connection {
                 &syms,
                 None,
                 existing_views,
-                self._db.mv_store.as_ref(),
+                self.db.mv_store.as_ref(),
             ) {
                 // this means that a vtab exists and we no longer have the module loaded. we print
                 // a warning to the user to load the module
