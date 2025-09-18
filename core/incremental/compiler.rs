@@ -4506,6 +4506,296 @@ mod tests {
     }
 
     #[test]
+    fn test_projection_with_function_and_ambiguous_columns() {
+        // Test projection with functions operating on potentially ambiguous columns
+        // Uses HEX() function on sum of columns from different tables with same names
+        // Tables: customers(id, name), vendors(id, name, price), purchases(id, customer_id, vendor_id, quantity)
+        // This test ensures column references are correctly resolved to their respective tables
+
+        let sql = "SELECT HEX(c.id + v.id) as hex_sum,
+                          UPPER(c.name) as customer_upper,
+                          LOWER(v.name) as vendor_lower,
+                          c.id * v.price as product_value
+                   FROM customers c
+                   JOIN vendors v ON c.id = v.id";
+
+        let (mut circuit, pager) = compile_sql!(sql);
+
+        // Create test data for customers (id, name)
+        let mut customers_delta = Delta::new();
+        customers_delta.insert(1, vec![Value::Integer(1), Value::Text("Alice".into())]);
+        customers_delta.insert(2, vec![Value::Integer(2), Value::Text("Bob".into())]);
+        customers_delta.insert(3, vec![Value::Integer(3), Value::Text("Charlie".into())]);
+
+        // Create test data for vendors (id, name, price)
+        let mut vendors_delta = Delta::new();
+        vendors_delta.insert(
+            1,
+            vec![
+                Value::Integer(1),
+                Value::Text("Widget Co".into()),
+                Value::Integer(10),
+            ],
+        );
+        vendors_delta.insert(
+            2,
+            vec![
+                Value::Integer(2),
+                Value::Text("Gadget Inc".into()),
+                Value::Integer(20),
+            ],
+        );
+        vendors_delta.insert(
+            3,
+            vec![
+                Value::Integer(3),
+                Value::Text("Tool Corp".into()),
+                Value::Integer(30),
+            ],
+        );
+
+        let inputs = HashMap::from([
+            ("customers".to_string(), customers_delta),
+            ("vendors".to_string(), vendors_delta),
+        ]);
+
+        let result = test_execute(&mut circuit, inputs.clone(), pager.clone()).unwrap();
+
+        // Expected results:
+        // For customer 1 (Alice) + vendor 1:
+        //   - HEX(1 + 1) = HEX(2) = "32"
+        //   - UPPER("Alice") = "ALICE"
+        //   - LOWER("Widget Co") = "widget co"
+        //   - 1 * 10 = 10
+        assert_eq!(result.len(), 3, "Should have 3 join results");
+
+        let mut results = result.changes.clone();
+        results.sort_by_key(|(row, _)| {
+            // Sort by the product_value column for predictable ordering
+            match &row.values[3] {
+                Value::Integer(n) => *n,
+                _ => 0,
+            }
+        });
+
+        // First result: Alice + Widget Co
+        assert_eq!(results[0].0.values[0], Value::Text("32".into())); // HEX(2)
+        assert_eq!(results[0].0.values[1], Value::Text("ALICE".into()));
+        assert_eq!(results[0].0.values[2], Value::Text("widget co".into()));
+        assert_eq!(results[0].0.values[3], Value::Integer(10)); // 1 * 10
+
+        // Second result: Bob + Gadget Inc
+        assert_eq!(results[1].0.values[0], Value::Text("34".into())); // HEX(4)
+        assert_eq!(results[1].0.values[1], Value::Text("BOB".into()));
+        assert_eq!(results[1].0.values[2], Value::Text("gadget inc".into()));
+        assert_eq!(results[1].0.values[3], Value::Integer(40)); // 2 * 20
+
+        // Third result: Charlie + Tool Corp
+        assert_eq!(results[2].0.values[0], Value::Text("36".into())); // HEX(6)
+        assert_eq!(results[2].0.values[1], Value::Text("CHARLIE".into()));
+        assert_eq!(results[2].0.values[2], Value::Text("tool corp".into()));
+        assert_eq!(results[2].0.values[3], Value::Integer(90)); // 3 * 30
+    }
+
+    #[test]
+    fn test_projection_column_selection_after_join() {
+        // Test selecting specific columns after a join, especially with overlapping column names
+        // This ensures the projection correctly picks columns by their qualified references
+
+        let sql = "SELECT c.id as customer_id,
+                          c.name as customer_name,
+                          o.order_id,
+                          o.quantity,
+                          p.product_name
+                   FROM users c
+                   JOIN orders o ON c.id = o.user_id
+                   JOIN products p ON o.product_id = p.product_id
+                   WHERE o.quantity > 2";
+
+        let (mut circuit, pager) = compile_sql!(sql);
+
+        // Create test data for users (id, name, age)
+        let mut users_delta = Delta::new();
+        users_delta.insert(
+            1,
+            vec![
+                Value::Integer(1),
+                Value::Text("Alice".into()),
+                Value::Integer(25),
+            ],
+        );
+        users_delta.insert(
+            2,
+            vec![
+                Value::Integer(2),
+                Value::Text("Bob".into()),
+                Value::Integer(30),
+            ],
+        );
+
+        // Create test data for orders (order_id, user_id, product_id, quantity)
+        let mut orders_delta = Delta::new();
+        orders_delta.insert(
+            1,
+            vec![
+                Value::Integer(101),
+                Value::Integer(1),   // Alice
+                Value::Integer(201), // Widget
+                Value::Integer(5),   // quantity > 2
+            ],
+        );
+        orders_delta.insert(
+            2,
+            vec![
+                Value::Integer(102),
+                Value::Integer(2),   // Bob
+                Value::Integer(202), // Gadget
+                Value::Integer(1),   // quantity <= 2, filtered out
+            ],
+        );
+        orders_delta.insert(
+            3,
+            vec![
+                Value::Integer(103),
+                Value::Integer(1),   // Alice
+                Value::Integer(202), // Gadget
+                Value::Integer(3),   // quantity > 2
+            ],
+        );
+
+        // Create test data for products (product_id, product_name, price)
+        let mut products_delta = Delta::new();
+        products_delta.insert(
+            201,
+            vec![
+                Value::Integer(201),
+                Value::Text("Widget".into()),
+                Value::Integer(10),
+            ],
+        );
+        products_delta.insert(
+            202,
+            vec![
+                Value::Integer(202),
+                Value::Text("Gadget".into()),
+                Value::Integer(20),
+            ],
+        );
+
+        let inputs = HashMap::from([
+            ("users".to_string(), users_delta),
+            ("orders".to_string(), orders_delta),
+            ("products".to_string(), products_delta),
+        ]);
+
+        let result = test_execute(&mut circuit, inputs.clone(), pager.clone()).unwrap();
+
+        // Should have 2 results (orders with quantity > 2)
+        assert_eq!(result.len(), 2, "Should have 2 results after filtering");
+
+        let mut results = result.changes.clone();
+        results.sort_by_key(|(row, _)| {
+            match &row.values[2] {
+                // Sort by order_id
+                Value::Integer(n) => *n,
+                _ => 0,
+            }
+        });
+
+        // First result: Alice's order 101 for Widget
+        assert_eq!(results[0].0.values[0], Value::Integer(1)); // customer_id
+        assert_eq!(results[0].0.values[1], Value::Text("Alice".into())); // customer_name
+        assert_eq!(results[0].0.values[2], Value::Integer(101)); // order_id
+        assert_eq!(results[0].0.values[3], Value::Integer(5)); // quantity
+        assert_eq!(results[0].0.values[4], Value::Text("Widget".into())); // product_name
+
+        // Second result: Alice's order 103 for Gadget
+        assert_eq!(results[1].0.values[0], Value::Integer(1)); // customer_id
+        assert_eq!(results[1].0.values[1], Value::Text("Alice".into())); // customer_name
+        assert_eq!(results[1].0.values[2], Value::Integer(103)); // order_id
+        assert_eq!(results[1].0.values[3], Value::Integer(3)); // quantity
+        assert_eq!(results[1].0.values[4], Value::Text("Gadget".into())); // product_name
+    }
+
+    #[test]
+    fn test_projection_column_reordering_and_duplication() {
+        // Test that projection can reorder columns and select the same column multiple times
+        // This is important for views that need specific column arrangements
+
+        let sql = "SELECT o.quantity,
+                          u.name,
+                          u.id,
+                          o.quantity * 2 as double_quantity,
+                          u.id as user_id_again
+                   FROM users u
+                   JOIN orders o ON u.id = o.user_id
+                   WHERE u.id = 1";
+
+        let (mut circuit, pager) = compile_sql!(sql);
+
+        // Create test data for users
+        let mut users_delta = Delta::new();
+        users_delta.insert(
+            1,
+            vec![
+                Value::Integer(1),
+                Value::Text("Alice".into()),
+                Value::Integer(25),
+            ],
+        );
+
+        // Create test data for orders
+        let mut orders_delta = Delta::new();
+        orders_delta.insert(
+            1,
+            vec![
+                Value::Integer(101),
+                Value::Integer(1),   // user_id
+                Value::Integer(201), // product_id
+                Value::Integer(5),   // quantity
+            ],
+        );
+        orders_delta.insert(
+            2,
+            vec![
+                Value::Integer(102),
+                Value::Integer(1),   // user_id
+                Value::Integer(202), // product_id
+                Value::Integer(3),   // quantity
+            ],
+        );
+
+        let inputs = HashMap::from([
+            ("users".to_string(), users_delta),
+            ("orders".to_string(), orders_delta),
+        ]);
+
+        let result = test_execute(&mut circuit, inputs.clone(), pager.clone()).unwrap();
+
+        assert_eq!(result.len(), 2, "Should have 2 results for user 1");
+
+        // Check that columns are in the right order and values are correct
+        for (row, _) in &result.changes {
+            // Column 0: o.quantity (5 or 3)
+            assert!(matches!(
+                row.values[0],
+                Value::Integer(5) | Value::Integer(3)
+            ));
+            // Column 1: u.name
+            assert_eq!(row.values[1], Value::Text("Alice".into()));
+            // Column 2: u.id
+            assert_eq!(row.values[2], Value::Integer(1));
+            // Column 3: o.quantity * 2 (10 or 6)
+            assert!(matches!(
+                row.values[3],
+                Value::Integer(10) | Value::Integer(6)
+            ));
+            // Column 4: u.id again
+            assert_eq!(row.values[4], Value::Integer(1));
+        }
+    }
+
+    #[test]
     fn test_join_with_aggregate_execution() {
         let (mut circuit, pager) = compile_sql!(
             "SELECT u.name, SUM(o.quantity) as total_quantity
