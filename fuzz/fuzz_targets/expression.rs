@@ -161,6 +161,7 @@ str_enum! {
         Power => "pow",
         Mod => "mod",
         Atan2 => "atan2",
+        Log => "log",
     }
 }
 

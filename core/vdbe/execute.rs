@@ -8089,7 +8089,9 @@ impl Value {
             return Value::Float(((f + if f < 0.0 { -0.5 } else { 0.5 }) as i64) as f64);
         }
 
-        let f: f64 = crate::numeric::str_to_f64(format!("{f:.precision$}")).unwrap().into();
+        let f: f64 = crate::numeric::str_to_f64(format!("{f:.precision$}"))
+            .unwrap()
+            .into();
 
         Value::Float(f)
     }
@@ -8355,6 +8357,11 @@ impl Value {
 
         let log_x = libm::log(f);
         let log_base = libm::log(base);
+
+        if log_base <= 0.0 {
+            return Value::Null;
+        }
+
         let result = log_x / log_base;
         Value::Float(result)
     }
