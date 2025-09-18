@@ -3250,6 +3250,10 @@ where
     Ok(WalkControl::Continue)
 }
 
+/// Context needed to walk all expressions in a INSERT|UPDATE|SELECT|DELETE body,
+/// in the order they are encountered, to ensure that the parameters are rewritten from
+/// anonymous ("?") to our internal named scheme so when the columns are re-ordered we are able
+/// to bind the proper parameter values.
 pub struct ParamState {
     /// ALWAYS starts at 1
     pub next_param_idx: usize,
@@ -3261,6 +3265,9 @@ impl Default for ParamState {
     }
 }
 
+/// Rewrite ast::Expr in place, binding Column references/rewriting Expr::Id -> Expr::Column
+/// using the provided TableReferences, and replacing anonymous parameters with internal named
+/// ones, as well as normalizing any DoublyQualified/Qualified quoted identifiers.
 pub fn bind_and_rewrite_expr<'a>(
     top_level_expr: &mut ast::Expr,
     mut referenced_tables: Option<&'a mut TableReferences>,
