@@ -2,6 +2,7 @@
 /.idea
 /.vscode
 **/target
+/.zed
 
 *.so
 *.ipynb
@@ -47,4 +48,3 @@ simulator-output/
 &1
 bisected.sql
 *.log
-
