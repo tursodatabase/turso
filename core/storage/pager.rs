@@ -44,7 +44,7 @@ pub struct HeaderRef(PageRef);
 impl HeaderRef {
     pub fn from_pager(pager: &Pager) -> Result<IOResult<Self>> {
         loop {
-            let state = pager.header_ref_state.borrow().clone();
+            let state = pager.header_ref_state.read().clone();
             tracing::trace!("HeaderRef::from_pager - {:?}", state);
             match state {
                 HeaderRefState::Start => {
@@ -53,7 +53,7 @@ impl HeaderRef {
                     }
 
                     let (page, c) = pager.read_page(DatabaseHeader::PAGE_ID)?;
-                    *pager.header_ref_state.borrow_mut() = HeaderRefState::CreateHeader { page };
+                    *pager.header_ref_state.write() = HeaderRefState::CreateHeader { page };
                     if let Some(c) = c {
                         io_yield_one!(c);
                     }
@@ -64,7 +64,7 @@ impl HeaderRef {
                         page.get().id == DatabaseHeader::PAGE_ID,
                         "incorrect header page id"
                     );
-                    *pager.header_ref_state.borrow_mut() = HeaderRefState::Start;
+                    *pager.header_ref_state.write() = HeaderRefState::Start;
                     break Ok(IOResult::Done(Self(page)));
                 }
             }
@@ -84,7 +84,7 @@ pub struct HeaderRefMut(PageRef);
 impl HeaderRefMut {
     pub fn from_pager(pager: &Pager) -> Result<IOResult<Self>> {
         loop {
-            let state = pager.header_ref_state.borrow().clone();
+            let state = pager.header_ref_state.read().clone();
             tracing::trace!(?state);
             match state {
                 HeaderRefState::Start => {
@@ -93,7 +93,7 @@ impl HeaderRefMut {
                     }
 
                     let (page, c) = pager.read_page(DatabaseHeader::PAGE_ID)?;
-                    *pager.header_ref_state.borrow_mut() = HeaderRefState::CreateHeader { page };
+                    *pager.header_ref_state.write() = HeaderRefState::CreateHeader { page };
                     if let Some(c) = c {
                         io_yield_one!(c);
                     }
@@ -106,7 +106,7 @@ impl HeaderRefMut {
                     );
 
                     pager.add_dirty(&page);
-                    *pager.header_ref_state.borrow_mut() = HeaderRefState::Start;
+                    *pager.header_ref_state.write() = HeaderRefState::Start;
                     break Ok(IOResult::Done(Self(page)));
                 }
             }
@@ -527,14 +527,14 @@ pub struct Pager {
     max_page_count: AtomicU32,
     #[cfg(not(feature = "omit_autovacuum"))]
     /// State machine for [Pager::ptrmap_get]
-    ptrmap_get_state: RefCell<PtrMapGetState>,
+    ptrmap_get_state: RwLock<PtrMapGetState>,
     #[cfg(not(feature = "omit_autovacuum"))]
     /// State machine for [Pager::ptrmap_put]
-    ptrmap_put_state: RefCell<PtrMapPutState>,
-    header_ref_state: RefCell<HeaderRefState>,
+    ptrmap_put_state: RwLock<PtrMapPutState>,
+    header_ref_state: RwLock<HeaderRefState>,
     #[cfg(not(feature = "omit_autovacuum"))]
-    btree_create_vacuum_full_state: Cell<BtreeCreateVacuumFullState>,
-    pub(crate) io_ctx: RefCell<IOContext>,
+    btree_create_vacuum_full_state: RwLock<BtreeCreateVacuumFullState>,
+    pub(crate) io_ctx: RwLock<IOContext>,
 }
 
 #[derive(Debug, Clone)]
@@ -629,13 +629,13 @@ impl Pager {
             allocate_page_state: RwLock::new(AllocatePageState::Start),
             max_page_count: AtomicU32::new(DEFAULT_MAX_PAGE_COUNT),
             #[cfg(not(feature = "omit_autovacuum"))]
-            ptrmap_get_state: RefCell::new(PtrMapGetState::Start),
+            ptrmap_get_state: RwLock::new(PtrMapGetState::Start),
             #[cfg(not(feature = "omit_autovacuum"))]
-            ptrmap_put_state: RefCell::new(PtrMapPutState::Start),
-            header_ref_state: RefCell::new(HeaderRefState::Start),
+            ptrmap_put_state: RwLock::new(PtrMapPutState::Start),
+            header_ref_state: RwLock::new(HeaderRefState::Start),
             #[cfg(not(feature = "omit_autovacuum"))]
-            btree_create_vacuum_full_state: Cell::new(BtreeCreateVacuumFullState::Start),
-            io_ctx: RefCell::new(IOContext::default()),
+            btree_create_vacuum_full_state: RwLock::new(BtreeCreateVacuumFullState::Start),
+            io_ctx: RwLock::new(IOContext::default()),
         })
     }
 
@@ -675,7 +675,7 @@ impl Pager {
     #[cfg(not(feature = "omit_autovacuum"))]
     pub fn ptrmap_get(&self, target_page_num: u32) -> Result<IOResult<Option<PtrmapEntry>>> {
         loop {
-            let ptrmap_get_state = self.ptrmap_get_state.borrow().clone();
+            let ptrmap_get_state = self.ptrmap_get_state.read().clone();
             match ptrmap_get_state {
                 PtrMapGetState::Start => {
                     tracing::trace!("ptrmap_get(page_idx = {})", target_page_num);
@@ -702,10 +702,10 @@ impl Pager {
                     );
 
                     let (ptrmap_page, c) = self.read_page(ptrmap_pg_no as usize)?;
-                    self.ptrmap_get_state.replace(PtrMapGetState::Deserialize {
+                    *self.ptrmap_get_state.write() = PtrMapGetState::Deserialize {
                         ptrmap_page,
                         offset_in_ptrmap_page,
-                    });
+                    };
                     if let Some(c) = c {
                         io_yield_one!(c);
                     }
@@ -749,7 +749,7 @@ impl Pager {
 
                     let entry_slice = &ptrmap_page_data_slice
                         [offset_in_ptrmap_page..offset_in_ptrmap_page + PTRMAP_ENTRY_SIZE];
-                    self.ptrmap_get_state.replace(PtrMapGetState::Start);
+                    *self.ptrmap_get_state.write() = PtrMapGetState::Start;
                     break match PtrmapEntry::deserialize(entry_slice) {
                         Some(entry) => Ok(IOResult::Done(Some(entry))),
                         None => Err(LimboError::Corrupt(format!(
@@ -778,7 +778,7 @@ impl Pager {
             parent_page_no
         );
         loop {
-            let ptrmap_put_state = self.ptrmap_put_state.borrow().clone();
+            let ptrmap_put_state = self.ptrmap_put_state.read().clone();
             match ptrmap_put_state {
                 PtrMapPutState::Start => {
                     let page_size =
@@ -806,10 +806,10 @@ impl Pager {
                     );
 
                     let (ptrmap_page, c) = self.read_page(ptrmap_pg_no as usize)?;
-                    self.ptrmap_put_state.replace(PtrMapPutState::Deserialize {
+                    *self.ptrmap_put_state.write() = PtrMapPutState::Deserialize {
                         ptrmap_page,
                         offset_in_ptrmap_page,
-                    });
+                    };
                     if let Some(c) = c {
                         io_yield_one!(c);
                     }
@@ -857,7 +857,7 @@ impl Pager {
                         "ptrmap page has unexpected number"
                     );
                     self.add_dirty(&ptrmap_page);
-                    self.ptrmap_put_state.replace(PtrMapPutState::Start);
+                    *self.ptrmap_put_state.write() = PtrMapPutState::Start;
                     break Ok(IOResult::Done(()));
                 }
             }
@@ -892,7 +892,7 @@ impl Pager {
                 }
                 AutoVacuumMode::Full => {
                     loop {
-                        match self.btree_create_vacuum_full_state.get() {
+                        match *self.btree_create_vacuum_full_state.read() {
                             BtreeCreateVacuumFullState::Start => {
                                 let (mut root_page_num, page_size) = return_if_io!(self
                                     .with_header(|header| {
@@ -910,9 +910,8 @@ impl Pager {
                                     root_page_num += 1;
                                 }
                                 assert!(root_page_num >= 3); //  the very first root page is page 3
-                                self.btree_create_vacuum_full_state.set(
-                                    BtreeCreateVacuumFullState::AllocatePage { root_page_num },
-                                );
+                                *self.btree_create_vacuum_full_state.write() =
+                                    BtreeCreateVacuumFullState::AllocatePage { root_page_num };
                             }
                             BtreeCreateVacuumFullState::AllocatePage { root_page_num } => {
                                 //  root_page_num here is the desired root page
@@ -927,9 +926,8 @@ impl Pager {
                                 }
 
                                 //  TODO(Zaid): Update the header metadata to reflect the new root page number
-                                self.btree_create_vacuum_full_state.set(
-                                    BtreeCreateVacuumFullState::PtrMapPut { allocated_page_id },
-                                );
+                                *self.btree_create_vacuum_full_state.write() =
+                                    BtreeCreateVacuumFullState::PtrMapPut { allocated_page_id };
                             }
                             BtreeCreateVacuumFullState::PtrMapPut { allocated_page_id } => {
                                 //  For now map allocated_page_id since we are not swapping it with root_page_num
@@ -938,8 +936,8 @@ impl Pager {
                                     PtrmapType::RootPage,
                                     0,
                                 ));
-                                self.btree_create_vacuum_full_state
-                                    .set(BtreeCreateVacuumFullState::Start);
+                                *self.btree_create_vacuum_full_state.write() =
+                                    BtreeCreateVacuumFullState::Start;
                                 return Ok(IOResult::Done(allocated_page_id));
                             }
                         }
@@ -1167,7 +1165,7 @@ impl Pager {
     ) -> Result<(PageRef, Completion)> {
         tracing::trace!("read_page_no_cache(page_idx = {})", page_idx);
         let page = Arc::new(Page::new(page_idx));
-        let io_ctx = &self.io_ctx.borrow();
+        let io_ctx = &self.io_ctx.read();
         let Some(wal) = self.wal.as_ref() else {
             turso_assert!(
                 matches!(frame_watermark, Some(0) | None),
@@ -1982,7 +1980,7 @@ impl Pager {
                 // based on the IOContext set, we will set the reserved space bytes as required by
                 // either the encryption or checksum, or None if they are not set.
                 let reserved_space_bytes = {
-                    let io_ctx = self.io_ctx.borrow();
+                    let io_ctx = self.io_ctx.read();
                     io_ctx.get_reserved_space_bytes()
                 };
                 default_header.reserved_space = reserved_space_bytes;
@@ -2333,13 +2331,12 @@ impl Pager {
         *self.free_page_state.write() = FreePageState::Start;
         #[cfg(not(feature = "omit_autovacuum"))]
         {
-            self.ptrmap_get_state.replace(PtrMapGetState::Start);
-            self.ptrmap_put_state.replace(PtrMapPutState::Start);
-            self.btree_create_vacuum_full_state
-                .replace(BtreeCreateVacuumFullState::Start);
+            *self.ptrmap_get_state.write() = PtrMapGetState::Start;
+            *self.ptrmap_put_state.write() = PtrMapPutState::Start;
+            *self.btree_create_vacuum_full_state.write() = BtreeCreateVacuumFullState::Start;
         }
 
-        self.header_ref_state.replace(HeaderRefState::Start);
+        *self.header_ref_state.write() = HeaderRefState::Start;
     }
 
     pub fn with_header<T>(&self, f: impl Fn(&DatabaseHeader) -> T) -> Result<IOResult<T>> {
@@ -2355,7 +2352,7 @@ impl Pager {
     }
 
     pub fn is_encryption_ctx_set(&self) -> bool {
-        self.io_ctx.borrow_mut().encryption_context().is_some()
+        self.io_ctx.write().encryption_context().is_some()
     }
 
     pub fn set_encryption_context(
@@ -2366,25 +2363,23 @@ impl Pager {
         let page_size = self.get_page_size_unchecked().get() as usize;
         let encryption_ctx = EncryptionContext::new(cipher_mode, key, page_size)?;
         {
-            let mut io_ctx = self.io_ctx.borrow_mut();
+            let mut io_ctx = self.io_ctx.write();
             io_ctx.set_encryption(encryption_ctx);
         }
         let Some(wal) = self.wal.as_ref() else {
             return Ok(());
         };
-        wal.borrow_mut()
-            .set_io_context(self.io_ctx.borrow().clone());
+        wal.borrow_mut().set_io_context(self.io_ctx.read().clone());
         Ok(())
     }
 
     pub fn reset_checksum_context(&self) {
         {
-            let mut io_ctx = self.io_ctx.borrow_mut();
+            let mut io_ctx = self.io_ctx.write();
             io_ctx.reset_checksum();
         }
         let Some(wal) = self.wal.as_ref() else { return };
-        wal.borrow_mut()
-            .set_io_context(self.io_ctx.borrow().clone())
+        wal.borrow_mut().set_io_context(self.io_ctx.read().clone())
     }
 
     pub fn set_reserved_space_bytes(&self, value: u8) {
