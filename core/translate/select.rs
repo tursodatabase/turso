@@ -236,6 +236,7 @@ fn prepare_one_select_plan(
                 &mut table_references,
                 table_ref_counter,
                 connection,
+                param_ctx,
             )?;
 
             // Preallocate space for the result columns

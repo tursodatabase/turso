@@ -3321,121 +3321,137 @@ pub fn bind_and_rewrite_expr<'a>(
                 }
                 _ => {}
             }
-
             if let Some(referenced_tables) = &mut referenced_tables {
                 match expr {
                     // Unqualified identifier binding (including rowid aliases, outer refs, result-column fallback).
-                    ast::Expr::Id(id) => {
-                        let ident = normalize_ident(id.as_str());
-                        // Optional fast-path for rowid on simple FROM t
+                    Expr::Id(id) => {
+                        let normalized_id = normalize_ident(id.as_str());
                         if !referenced_tables.joined_tables().is_empty() {
                             if let Some(row_id_expr) = parse_row_id(
-                                &ident,
+                                &normalized_id,
                                 referenced_tables.joined_tables()[0].internal_id,
                                 || referenced_tables.joined_tables().len() != 1,
                             )? {
                                 *expr = row_id_expr;
+
                                 return Ok(WalkControl::Continue);
                             }
                         }
+                        let mut match_result = None;
 
-                        // Search joined tables
-                        let mut match_result: Option<(TableInternalId, usize, bool)> = None;
-                        for jt in referenced_tables.joined_tables().iter() {
-                            if let Some(col_idx) = jt.table.columns().iter().position(|c| {
+                        // First check joined tables
+                        for joined_table in referenced_tables.joined_tables().iter() {
+                            let col_idx = joined_table.table.columns().iter().position(|c| {
                                 c.name
                                     .as_ref()
-                                    .is_some_and(|n| n.eq_ignore_ascii_case(&ident))
-                            }) {
+                                    .is_some_and(|name| name.eq_ignore_ascii_case(&normalized_id))
+                            });
+                            if col_idx.is_some() {
                                 if match_result.is_some() {
                                     crate::bail_parse_error!("Column {} is ambiguous", id.as_str());
                                 }
-                                let col = jt.table.columns()[col_idx].clone();
-                                match_result = Some((jt.internal_id, col_idx, col.is_rowid_alias));
+                                let col =
+                                    joined_table.table.columns().get(col_idx.unwrap()).unwrap();
+                                match_result = Some((
+                                    joined_table.internal_id,
+                                    col_idx.unwrap(),
+                                    col.is_rowid_alias,
+                                ));
                             }
                         }
 
-                        // If not found, search outer query references (outer scope wins for inner queries)
+                        // Then check outer query references, if we still didn't find something.
+                        // Normally finding multiple matches for a non-qualified column is an error (column x is ambiguous)
+                        // but in the case of subqueries, the inner query takes precedence.
+                        // For example:
+                        // SELECT * FROM t WHERE x = (SELECT x FROM t2)
+                        // In this case, there is no ambiguity:
+                        // - x in the outer query refers to t.x,
+                        // - x in the inner query refers to t2.x.
                         if match_result.is_none() {
-                            for outer in referenced_tables.outer_query_refs().iter() {
-                                if let Some(col_idx) = outer.table.columns().iter().position(|c| {
-                                    c.name
-                                        .as_ref()
-                                        .is_some_and(|n| n.eq_ignore_ascii_case(&ident))
-                                }) {
+                            for outer_ref in referenced_tables.outer_query_refs().iter() {
+                                let col_idx = outer_ref.table.columns().iter().position(|c| {
+                                    c.name.as_ref().is_some_and(|name| {
+                                        name.eq_ignore_ascii_case(&normalized_id)
+                                    })
+                                });
+                                if col_idx.is_some() {
                                     if match_result.is_some() {
                                         crate::bail_parse_error!(
                                             "Column {} is ambiguous",
                                             id.as_str()
                                         );
                                     }
-                                    let col = outer.table.columns()[col_idx].clone();
-                                    match_result =
-                                        Some((outer.internal_id, col_idx, col.is_rowid_alias));
+                                    let col =
+                                        outer_ref.table.columns().get(col_idx.unwrap()).unwrap();
+                                    match_result = Some((
+                                        outer_ref.internal_id,
+                                        col_idx.unwrap(),
+                                        col.is_rowid_alias,
+                                    ));
                                 }
                             }
                         }
 
-                        if let Some((tbl_id, col_idx, is_rowid_alias)) = match_result {
-                            *expr = ast::Expr::Column {
-                                database: None,
-                                table: tbl_id,
+                        if let Some((table_id, col_idx, is_rowid_alias)) = match_result {
+                            *expr = Expr::Column {
+                                database: None, // TODO: support different databases
+                                table: table_id,
                                 column: col_idx,
                                 is_rowid_alias,
                             };
-                            referenced_tables.mark_column_used(tbl_id, col_idx);
+                            referenced_tables.mark_column_used(table_id, col_idx);
                             return Ok(WalkControl::Continue);
                         }
 
-                        // Result-column fallback (e.g. SELECT ... WHERE name; name is a result alias)
-                        if let Some(rcs) = result_columns {
-                            for rc in rcs {
-                                if rc
+                        if let Some(result_columns) = result_columns {
+                            for result_column in result_columns.iter() {
+                                if result_column
                                     .name(referenced_tables)
-                                    .is_some_and(|n| n.eq_ignore_ascii_case(&ident))
+                                    .is_some_and(|name| name.eq_ignore_ascii_case(&normalized_id))
                                 {
-                                    *expr = rc.expr.clone();
+                                    *expr = result_column.expr.clone();
                                     return Ok(WalkControl::Continue);
                                 }
                             }
                         }
-
-                        // Double-quoted unresolved, string literal, others must resolve
+                        // SQLite behavior: Only double-quoted identifiers get fallback to string literals
+                        // Single quotes are handled as literals earlier, unquoted identifiers must resolve to columns
                         if id.is_double_quoted() {
-                            *expr =
-                                ast::Expr::Literal(ast::Literal::String(id.as_str().to_string()));
+                            // Convert failed double-quoted identifier to string literal
+                            *expr = Expr::Literal(ast::Literal::String(id.as_str().to_string()));
                             return Ok(WalkControl::Continue);
                         } else {
+                            // Unquoted identifiers must resolve to columns - no fallback
                             crate::bail_parse_error!("no such column: {}", id.as_str())
                         }
                     }
+                    Expr::Qualified(tbl, id) => {
+                        let normalized_table_name = normalize_ident(tbl.as_str());
+                        let matching_tbl = referenced_tables
+                            .find_table_and_internal_id_by_identifier(&normalized_table_name);
+                        if matching_tbl.is_none() {
+                            crate::bail_parse_error!("no such table: {}", normalized_table_name);
+                        }
+                        let (tbl_id, tbl) = matching_tbl.unwrap();
+                        let normalized_id = normalize_ident(id.as_str());
 
-                    ast::Expr::Qualified(tbl, id) => {
-                        let tbl_name = normalize_ident(tbl.as_str());
-                        let Some((tbl_id, tbl_ref)) =
-                            referenced_tables.find_table_and_internal_id_by_identifier(&tbl_name)
-                        else {
-                            crate::bail_parse_error!("no such table: {}", tbl_name);
-                        };
-
-                        let ident = normalize_ident(id.as_str());
-
-                        if let Some(row_id_expr) = parse_row_id(&ident, tbl_id, || false)? {
+                        if let Some(row_id_expr) = parse_row_id(&normalized_id, tbl_id, || false)? {
                             *expr = row_id_expr;
+
                             return Ok(WalkControl::Continue);
                         }
-
-                        let Some(col_idx) = tbl_ref.columns().iter().position(|c| {
+                        let col_idx = tbl.columns().iter().position(|c| {
                             c.name
                                 .as_ref()
-                                .is_some_and(|n| n.eq_ignore_ascii_case(&ident))
-                        }) else {
-                            crate::bail_parse_error!("no such column: {}", ident);
+                                .is_some_and(|name| name.eq_ignore_ascii_case(&normalized_id))
+                        });
+                        let Some(col_idx) = col_idx else {
+                            crate::bail_parse_error!("no such column: {}", normalized_id);
                         };
-
-                        let col = &tbl_ref.columns()[col_idx];
-                        *expr = ast::Expr::Column {
-                            database: None,
+                        let col = tbl.columns().get(col_idx).unwrap();
+                        *expr = Expr::Column {
+                            database: None, // TODO: support different databases
                             table: tbl_id,
                             column: col_idx,
                             is_rowid_alias: col.is_rowid_alias,
@@ -3443,18 +3459,20 @@ pub fn bind_and_rewrite_expr<'a>(
                         referenced_tables.mark_column_used(tbl_id, col_idx);
                         return Ok(WalkControl::Continue);
                     }
+                    Expr::DoublyQualified(db_name, tbl_name, col_name) => {
+                        let normalized_col_name = normalize_ident(col_name.as_str());
 
-                    // db.t.x  (requires table to already be present in FROM)
-                    ast::Expr::DoublyQualified(db_name, tbl_name, col_name) => {
-                        let qn = ast::QualifiedName {
+                        // Create a QualifiedName and use existing resolve_database_id method
+                        let qualified_name = ast::QualifiedName {
                             db_name: Some(db_name.clone()),
-                            name: ast::Name::Ident(normalize_ident(tbl_name.as_str())),
+                            name: tbl_name.clone(),
                             alias: None,
                         };
-                        let db_id = connection.resolve_database_id(&qn)?;
+                        let database_id = connection.resolve_database_id(&qualified_name)?;
 
+                        // Get the table from the specified database
                         let table = connection
-                            .with_schema(db_id, |schema| schema.get_table(tbl_name.as_str()))
+                            .with_schema(database_id, |schema| schema.get_table(tbl_name.as_str()))
                             .ok_or_else(|| {
                                 crate::LimboError::ParseError(format!(
                                     "no such table: {}.{}",
@@ -3463,14 +3481,14 @@ pub fn bind_and_rewrite_expr<'a>(
                                 ))
                             })?;
 
-                        let ident = normalize_ident(col_name.as_str());
+                        // Find the column in the table
                         let col_idx = table
                             .columns()
                             .iter()
                             .position(|c| {
-                                c.name
-                                    .as_ref()
-                                    .is_some_and(|n| n.eq_ignore_ascii_case(&ident))
+                                c.name.as_ref().is_some_and(|name| {
+                                    name.eq_ignore_ascii_case(&normalized_col_name)
+                                })
                             })
                             .ok_or_else(|| {
                                 crate::LimboError::ParseError(format!(
@@ -3481,26 +3499,32 @@ pub fn bind_and_rewrite_expr<'a>(
                                 ))
                             })?;
 
-                        let is_rowid_alias = table.columns()[col_idx].is_rowid_alias;
+                        let col = table.columns().get(col_idx).unwrap();
 
-                        // Only allow if the table is already in the FROM clause
-                        let normalized_tbl = normalize_ident(tbl_name.as_str());
-                        let Some((tbl_id, _)) = referenced_tables
-                            .find_table_and_internal_id_by_identifier(&normalized_tbl)
-                        else {
+                        // Check if this is a rowid alias
+                        let is_rowid_alias = col.is_rowid_alias;
+
+                        // Convert to Column expression - since this is a cross-database reference,
+                        // we need to create a synthetic table reference for it
+                        // For now, we'll error if the table isn't already in the referenced tables
+                        let normalized_tbl_name = normalize_ident(tbl_name.as_str());
+                        let matching_tbl = referenced_tables
+                            .find_table_and_internal_id_by_identifier(&normalized_tbl_name);
+
+                        if let Some((tbl_id, _)) = matching_tbl {
+                            // Table is already in referenced tables, use existing internal ID
+                            *expr = Expr::Column {
+                                database: Some(database_id),
+                                table: tbl_id,
+                                column: col_idx,
+                                is_rowid_alias,
+                            };
+                            referenced_tables.mark_column_used(tbl_id, col_idx);
+                        } else {
                             return Err(crate::LimboError::ParseError(format!(
-                        "table {normalized_tbl} is not in FROM clause - cross-database column references require the table to be explicitly joined"
-                    )));
-                        };
-
-                        *expr = ast::Expr::Column {
-                            database: Some(db_id),
-                            table: tbl_id,
-                            column: col_idx,
-                            is_rowid_alias,
-                        };
-                        referenced_tables.mark_column_used(tbl_id, col_idx);
-                        return Ok(WalkControl::Continue);
+                            "table {normalized_tbl_name} is not in FROM clause - cross-database column references require the table to be explicitly joined"
+                        )));
+                        }
                     }
                     _ => {}
                 }
