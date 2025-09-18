@@ -1450,13 +1450,10 @@ mod tests {
             BTreeCursor::new_index(None, pager.clone(), index_root_page_id, &index_def, 4);
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
-        let mut filter = FilterOperator::new(
-            FilterPredicate::GreaterThan {
-                column: "b".to_string(),
-                value: Value::Integer(2),
-            },
-            vec!["a".to_string(), "b".to_string()],
-        );
+        let mut filter = FilterOperator::new(FilterPredicate::GreaterThan {
+            column_idx: 1, // "b" is at index 1
+            value: Value::Integer(2),
+        });
 
         // Initialize with a row (rowid=3, values=[3, 3])
         let mut init_data = Delta::new();
@@ -1512,13 +1509,10 @@ mod tests {
             BTreeCursor::new_index(None, pager.clone(), index_root_page_id, &index_def, 4);
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
-        let mut filter = FilterOperator::new(
-            FilterPredicate::GreaterThan {
-                column: "age".to_string(),
-                value: Value::Integer(25),
-            },
-            vec!["id".to_string(), "name".to_string(), "age".to_string()],
-        );
+        let mut filter = FilterOperator::new(FilterPredicate::GreaterThan {
+            column_idx: 2, // "age" is at index 2
+            value: Value::Integer(25),
+        });
 
         // Initialize with some data
         let mut init_data = Delta::new();

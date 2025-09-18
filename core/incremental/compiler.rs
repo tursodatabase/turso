@@ -895,21 +895,18 @@ impl DbspCompiler {
                 // Compile the input first
                 let input_id = self.compile_plan(&filter.input)?;
 
-                // Get column names from input schema
+                // Get input schema for column resolution
                 let input_schema = filter.input.schema();
-                let column_names: Vec<String> = input_schema.columns.iter()
-                    .map(|col| col.name.clone())
-                    .collect();
 
                 // Convert predicate to DBSP expression
                 let dbsp_predicate = Self::compile_expr(&filter.predicate)?;
 
                 // Convert to FilterPredicate
-                let filter_predicate = Self::compile_filter_predicate(&filter.predicate)?;
+                let filter_predicate = Self::compile_filter_predicate(&filter.predicate, input_schema)?;
 
                 // Create executable operator
                 let executable: Box<dyn IncrementalOperator> =
-                    Box::new(FilterOperator::new(filter_predicate, column_names));
+                    Box::new(FilterOperator::new(filter_predicate));
 
                 // Create filter node
                 let node_id = self.circuit.add_node(
@@ -1372,42 +1369,57 @@ impl DbspCompiler {
     }
 
     /// Compile a logical expression to a FilterPredicate for execution
-    fn compile_filter_predicate(expr: &LogicalExpr) -> Result<FilterPredicate> {
+    fn compile_filter_predicate(
+        expr: &LogicalExpr,
+        schema: &LogicalSchema,
+    ) -> Result<FilterPredicate> {
         match expr {
             LogicalExpr::BinaryExpr { left, op, right } => {
                 // Extract column name and value for simple predicates
                 if let (LogicalExpr::Column(col), LogicalExpr::Literal(val)) =
                     (left.as_ref(), right.as_ref())
                 {
+                    // Resolve column name to index using the schema
+                    let column_idx = schema
+                        .columns
+                        .iter()
+                        .position(|c| c.name == col.name)
+                        .ok_or_else(|| {
+                            crate::LimboError::ParseError(format!(
+                                "Column '{}' not found in schema for filter",
+                                col.name
+                            ))
+                        })?;
+
                     match op {
                         BinaryOperator::Equals => Ok(FilterPredicate::Equals {
-                            column: col.name.clone(),
+                            column_idx,
                             value: val.clone(),
                         }),
                         BinaryOperator::NotEquals => Ok(FilterPredicate::NotEquals {
-                            column: col.name.clone(),
+                            column_idx,
                             value: val.clone(),
                         }),
                         BinaryOperator::Greater => Ok(FilterPredicate::GreaterThan {
-                            column: col.name.clone(),
+                            column_idx,
                             value: val.clone(),
                         }),
                         BinaryOperator::GreaterEquals => Ok(FilterPredicate::GreaterThanOrEqual {
-                            column: col.name.clone(),
+                            column_idx,
                             value: val.clone(),
                         }),
                         BinaryOperator::Less => Ok(FilterPredicate::LessThan {
-                            column: col.name.clone(),
+                            column_idx,
                             value: val.clone(),
                         }),
                         BinaryOperator::LessEquals => Ok(FilterPredicate::LessThanOrEqual {
-                            column: col.name.clone(),
+                            column_idx,
                             value: val.clone(),
                         }),
                         BinaryOperator::And => {
                             // Handle AND of two predicates
-                            let left_pred = Self::compile_filter_predicate(left)?;
-                            let right_pred = Self::compile_filter_predicate(right)?;
+                            let left_pred = Self::compile_filter_predicate(left, schema)?;
+                            let right_pred = Self::compile_filter_predicate(right, schema)?;
                             Ok(FilterPredicate::And(
                                 Box::new(left_pred),
                                 Box::new(right_pred),
@@ -1415,8 +1427,8 @@ impl DbspCompiler {
                         }
                         BinaryOperator::Or => {
                             // Handle OR of two predicates
-                            let left_pred = Self::compile_filter_predicate(left)?;
-                            let right_pred = Self::compile_filter_predicate(right)?;
+                            let left_pred = Self::compile_filter_predicate(left, schema)?;
+                            let right_pred = Self::compile_filter_predicate(right, schema)?;
                             Ok(FilterPredicate::Or(
                                 Box::new(left_pred),
                                 Box::new(right_pred),
@@ -1428,8 +1440,8 @@ impl DbspCompiler {
                     }
                 } else if matches!(op, BinaryOperator::And | BinaryOperator::Or) {
                     // Handle logical operators
-                    let left_pred = Self::compile_filter_predicate(left)?;
-                    let right_pred = Self::compile_filter_predicate(right)?;
+                    let left_pred = Self::compile_filter_predicate(left, schema)?;
+                    let right_pred = Self::compile_filter_predicate(right, schema)?;
                     match op {
                         BinaryOperator::And => Ok(FilterPredicate::And(
                             Box::new(left_pred),
@@ -3777,13 +3789,10 @@ mod tests {
             Box::new(InputOperator::new("test".to_string())),
         );
 
-        let filter_op = FilterOperator::new(
-            FilterPredicate::GreaterThan {
-                column: "value".to_string(),
-                value: Value::Integer(10),
-            },
-            vec!["id".to_string(), "value".to_string()],
-        );
+        let filter_op = FilterOperator::new(FilterPredicate::GreaterThan {
+            column_idx: 1, // "value" is at index 1
+            value: Value::Integer(10),
+        });
 
         // Create the filter predicate using DbspExpr
         let predicate = DbspExpr::BinaryExpr {
@@ -4587,18 +4596,18 @@ mod tests {
     fn test_filter_with_qualified_columns_in_join() {
         // Test that filters correctly handle qualified column names in joins
         // when multiple tables have columns with the SAME names.
-        // Both users and sales tables have an 'id' column which can be ambiguous.
+        // Both users and customers tables have 'id' and 'name' columns which can be ambiguous.
 
         let (mut circuit, pager) = compile_sql!(
-            "SELECT users.id, users.name, sales.id, sales.amount
+            "SELECT users.id, users.name, customers.id, customers.name
              FROM users
-             JOIN sales ON users.id = sales.customer_id
-             WHERE users.id > 1 AND sales.id < 100"
+             JOIN customers ON users.id = customers.id
+             WHERE users.id > 1 AND customers.id < 100"
         );
 
         // Create test data
         let mut users_delta = Delta::new();
-        let mut sales_delta = Delta::new();
+        let mut customers_delta = Delta::new();
 
         // Users data: (id, name, age)
         users_delta.insert(
@@ -4626,48 +4635,60 @@ mod tests {
             ],
         ); // id = 3
 
-        // Sales data: (id, customer_id, amount)
-        sales_delta.insert(
-            50,
-            vec![Value::Integer(50), Value::Integer(1), Value::Integer(100)],
-        ); // sales.id = 50, customer_id = 1
-        sales_delta.insert(
-            99,
-            vec![Value::Integer(99), Value::Integer(2), Value::Integer(200)],
-        ); // sales.id = 99, customer_id = 2
-        sales_delta.insert(
-            150,
-            vec![Value::Integer(150), Value::Integer(3), Value::Integer(300)],
-        ); // sales.id = 150, customer_id = 3
+        // Customers data: (id, name, email)
+        customers_delta.insert(
+            1,
+            vec![
+                Value::Integer(1),
+                Value::Text("Customer Alice".into()),
+                Value::Text("alice@example.com".into()),
+            ],
+        ); // id = 1
+        customers_delta.insert(
+            2,
+            vec![
+                Value::Integer(2),
+                Value::Text("Customer Bob".into()),
+                Value::Text("bob@example.com".into()),
+            ],
+        ); // id = 2
+        customers_delta.insert(
+            3,
+            vec![
+                Value::Integer(3),
+                Value::Text("Customer Charlie".into()),
+                Value::Text("charlie@example.com".into()),
+            ],
+        ); // id = 3
 
         let mut inputs = HashMap::new();
         inputs.insert("users".to_string(), users_delta);
-        inputs.insert("sales".to_string(), sales_delta);
+        inputs.insert("customers".to_string(), customers_delta);
 
         let result = test_execute(&mut circuit, inputs.clone(), pager.clone()).unwrap();
 
-        // Should only get row with Bob (users.id=2, sales.id=99):
-        // - users.id=2 (> 1) AND sales.id=99 (< 100) ✓
+        // Should get rows where users.id > 1 AND customers.id < 100
+        // - users.id=2 (> 1) AND customers.id=2 (< 100) ✓
+        // - users.id=3 (> 1) AND customers.id=3 (< 100) ✓
         // Alice excluded: users.id=1 (NOT > 1)
-        // Charlie excluded: sales.id=150 (NOT < 100)
-        assert_eq!(result.len(), 1, "Should have 1 filtered result");
+        assert_eq!(result.len(), 2, "Should have 2 filtered results");
 
         let (row, weight) = &result.changes[0];
         assert_eq!(*weight, 1);
         assert_eq!(row.values.len(), 4, "Should have 4 columns");
 
-        // Verify the filter correctly used qualified columns
+        // Verify the filter correctly used qualified columns for Bob
         assert_eq!(row.values[0], Value::Integer(2), "users.id should be 2");
         assert_eq!(
             row.values[1],
             Value::Text("Bob".into()),
             "users.name should be Bob"
         );
-        assert_eq!(row.values[2], Value::Integer(99), "sales.id should be 99");
+        assert_eq!(row.values[2], Value::Integer(2), "customers.id should be 2");
         assert_eq!(
             row.values[3],
-            Value::Integer(200),
-            "sales.amount should be 200"
+            Value::Text("Customer Bob".into()),
+            "customers.name should be Customer Bob"
         );
     }
 }
