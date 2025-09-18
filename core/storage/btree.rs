@@ -5459,12 +5459,7 @@ impl BTreeCursor {
     fn get_immutable_record_or_create(&self) -> std::cell::RefMut<'_, Option<ImmutableRecord>> {
         let mut reusable_immutable_record = self.reusable_immutable_record.borrow_mut();
         if reusable_immutable_record.is_none() {
-            let page_size = self
-                .pager
-                .page_size
-                .get()
-                .expect("page size is not set")
-                .get();
+            let page_size = self.pager.get_page_size_unchecked().get();
             let record = ImmutableRecord::new(page_size as usize);
             reusable_immutable_record.replace(record);
         }
