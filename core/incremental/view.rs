@@ -22,8 +22,15 @@ use turso_parser::{
 pub enum PopulateState {
     /// Initial state - need to prepare the query
     Start,
+    /// All tables that need to be populated
+    ProcessingAllTables {
+        queries: Vec<String>,
+        current_idx: usize,
+    },
     /// Actively processing rows from the query
-    Processing {
+    ProcessingOneTable {
+        queries: Vec<String>,
+        current_idx: usize,
         stmt: Box<Statement>,
         rows_processed: usize,
         /// If we're in the middle of processing a row (merge_delta returned I/O)
@@ -38,14 +45,26 @@ impl fmt::Debug for PopulateState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             PopulateState::Start => write!(f, "Start"),
-            PopulateState::Processing {
+            PopulateState::ProcessingAllTables {
+                current_idx,
+                queries,
+            } => f
+                .debug_struct("ProcessingAllTables")
+                .field("current_idx", current_idx)
+                .field("num_queries", &queries.len())
+                .finish(),
+            PopulateState::ProcessingOneTable {
+                current_idx,
                 rows_processed,
                 pending_row,
+                queries,
                 ..
             } => f
-                .debug_struct("Processing")
+                .debug_struct("ProcessingOneTable")
+                .field("current_idx", current_idx)
                 .field("rows_processed", rows_processed)
                 .field("has_pending", &pending_row.is_some())
+                .field("total_queries", &queries.len())
                 .finish(),
             PopulateState::Done => write!(f, "Done"),
         }
@@ -604,11 +623,19 @@ impl IncrementalView {
                     }
                     _ => {
                         // For comparison operators, check if this condition references only our table
+                        // AND is simple enough to be pushed down (no complex expressions)
                         let referenced_tables = self.get_referenced_tables_in_expr(expr)?;
                         if referenced_tables.len() == 1
                             && referenced_tables.contains(&table_name.to_string())
                         {
-                            Ok(Some(expr.clone()))
+                            // Check if this is a simple comparison that can be pushed down
+                            // Complex expressions like (a * b) >= c should be handled by the circuit
+                            if self.is_simple_comparison(expr) {
+                                Ok(Some(expr.clone()))
+                            } else {
+                                // Complex expression - let the circuit handle it
+                                Ok(None)
+                            }
                         } else {
                             Ok(None)
                         }
@@ -624,9 +651,11 @@ impl IncrementalView {
             }
             _ => {
                 // For other expressions, check if they reference only our table
+                // AND are simple enough to be pushed down
                 let referenced_tables = self.get_referenced_tables_in_expr(expr)?;
                 if referenced_tables.len() == 1
                     && referenced_tables.contains(&table_name.to_string())
+                    && self.is_simple_comparison(expr)
                 {
                     Ok(Some(expr.clone()))
                 } else {
@@ -634,6 +663,39 @@ impl IncrementalView {
                 }
             }
         }
+    }
+
+    /// Check if an expression is a simple comparison that can be pushed down to table scan
+    /// Returns true for simple comparisons like "column = value" or "column > value"
+    /// Returns false for complex expressions like "(a * b) > value"
+    fn is_simple_comparison(&self, expr: &ast::Expr) -> bool {
+        match expr {
+            ast::Expr::Binary(left, op, right) => {
+                // Check if it's a comparison operator
+                matches!(
+                    op,
+                    ast::Operator::Equals
+                        | ast::Operator::NotEquals
+                        | ast::Operator::Greater
+                        | ast::Operator::GreaterEquals
+                        | ast::Operator::Less
+                        | ast::Operator::LessEquals
+                ) && self.is_simple_operand(left)
+                    && self.is_simple_operand(right)
+            }
+            _ => false,
+        }
+    }
+
+    /// Check if an operand is simple (column reference or literal)
+    fn is_simple_operand(&self, expr: &ast::Expr) -> bool {
+        matches!(
+            expr,
+            ast::Expr::Id(_)
+                | ast::Expr::Qualified(_, _)
+                | ast::Expr::DoublyQualified(_, _, _)
+                | ast::Expr::Literal(_)
+        )
     }
 
     /// Get the set of table names referenced in an expression
@@ -820,208 +882,234 @@ impl IncrementalView {
         pager: &std::sync::Arc<crate::Pager>,
         _btree_cursor: &mut BTreeCursor,
     ) -> crate::Result<IOResult<()>> {
-        // If already populated, return immediately
-        if matches!(self.populate_state, PopulateState::Done) {
-            return Ok(IOResult::Done(()));
-        }
-
         // Assert that this is a materialized view with a root page
         assert!(
             self.root_page != 0,
             "populate_from_table should only be called for materialized views with root_page"
         );
 
-        loop {
-            // To avoid borrow checker issues, we need to handle state transitions carefully
-            let needs_start = matches!(self.populate_state, PopulateState::Start);
+        'outer: loop {
+            match std::mem::replace(&mut self.populate_state, PopulateState::Done) {
+                PopulateState::Start => {
+                    // Generate the SQL query for populating the view
+                    // It is best to use a standard query than a cursor for two reasons:
+                    // 1) Using a sql query will allow us to be much more efficient in cases where we only want
+                    //    some rows, in particular for indexed filters
+                    // 2) There are two types of cursors: index and table. In some situations (like for example
+                    //    if the table has an integer primary key), the key will be exclusively in the index
+                    //    btree and not in the table btree. Using cursors would force us to be aware of this
+                    //    distinction (and others), and ultimately lead to reimplementing the whole query
+                    //    machinery (next step is which index is best to use, etc)
+                    let queries = self.sql_for_populate()?;
 
-            if needs_start {
-                // Generate the SQL query for populating the view
-                // It is best to use a standard query than a cursor for two reasons:
-                // 1) Using a sql query will allow us to be much more efficient in cases where we only want
-                //    some rows, in particular for indexed filters
-                // 2) There are two types of cursors: index and table. In some situations (like for example
-                //    if the table has an integer primary key), the key will be exclusively in the index
-                //    btree and not in the table btree. Using cursors would force us to be aware of this
-                //    distinction (and others), and ultimately lead to reimplementing the whole query
-                //    machinery (next step is which index is best to use, etc)
-                let queries = self.sql_for_populate()?;
-
-                // For now, only use the first query (single table population)
-                if queries.is_empty() {
-                    return Err(LimboError::ParseError(
-                        "No populate queries generated".to_string(),
-                    ));
+                    self.populate_state = PopulateState::ProcessingAllTables {
+                        queries,
+                        current_idx: 0,
+                    };
                 }
-                let query = queries[0].clone();
 
-                // Create a new connection for reading to avoid transaction conflicts
-                // This allows us to read from tables while the parent transaction is writing the view
-                // The statement holds a reference to this connection, keeping it alive
-                let read_conn = conn.db.connect()?;
-
-                // Prepare the statement using the read connection
-                let stmt = read_conn.prepare(&query)?;
-
-                self.populate_state = PopulateState::Processing {
-                    stmt: Box::new(stmt),
-                    rows_processed: 0,
-                    pending_row: None,
-                };
-                // Continue to next state
-                continue;
-            }
-
-            // Handle Done state
-            if matches!(self.populate_state, PopulateState::Done) {
-                return Ok(IOResult::Done(()));
-            }
-
-            // Handle Processing state - extract state to avoid borrow issues
-            let (mut stmt, mut rows_processed, pending_row) =
-                match std::mem::replace(&mut self.populate_state, PopulateState::Done) {
-                    PopulateState::Processing {
-                        stmt,
-                        rows_processed,
-                        pending_row,
-                    } => (stmt, rows_processed, pending_row),
-                    _ => unreachable!("We already handled Start and Done states"),
-                };
-
-            // If we have a pending row from a previous I/O interruption, process it first
-            if let Some((rowid, values)) = pending_row {
-                // Create a single-row delta for the pending row
-                let mut single_row_delta = Delta::new();
-                single_row_delta.insert(rowid, values.clone());
-
-                // Create a DeltaSet with this delta for the first table (for now)
-                let mut delta_set = DeltaSet::new();
-                // TODO: When we support JOINs, determine which table this row came from
-                delta_set.insert(self.referenced_tables[0].name.clone(), single_row_delta);
-
-                // Process the pending row with the pager
-                match self.merge_delta(delta_set, pager.clone())? {
-                    IOResult::Done(_) => {
-                        // Row processed successfully, continue to next row
-                        rows_processed += 1;
-                        // Continue to fetch next row from statement
+                PopulateState::ProcessingAllTables {
+                    queries,
+                    current_idx,
+                } => {
+                    if current_idx >= queries.len() {
+                        self.populate_state = PopulateState::Done;
+                        return Ok(IOResult::Done(()));
                     }
-                    IOResult::IO(io) => {
-                        // Still not done, save state with pending row
-                        self.populate_state = PopulateState::Processing {
-                            stmt,
-                            rows_processed,
-                            pending_row: Some((rowid, values)), // Keep the pending row
-                        };
-                        return Ok(IOResult::IO(io));
-                    }
+
+                    let query = queries[current_idx].clone();
+                    // Create a new connection for reading to avoid transaction conflicts
+                    // This allows us to read from tables while the parent transaction is writing the view
+                    // The statement holds a reference to this connection, keeping it alive
+                    let read_conn = conn.db.connect()?;
+
+                    // Prepare the statement using the read connection
+                    let stmt = read_conn.prepare(&query)?;
+
+                    self.populate_state = PopulateState::ProcessingOneTable {
+                        queries,
+                        current_idx,
+                        stmt: Box::new(stmt),
+                        rows_processed: 0,
+                        pending_row: None,
+                    };
                 }
-            }
 
-            // Process rows one at a time - no batching
-            loop {
-                // This step() call resumes from where the statement left off
-                match stmt.step()? {
-                    crate::vdbe::StepResult::Row => {
-                        // Get the row
-                        let row = stmt.row().unwrap();
-
-                        // Extract values from the row
-                        let all_values: Vec<crate::types::Value> =
-                            row.get_values().cloned().collect();
-
-                        // Determine how to extract the rowid
-                        // If there's a rowid alias (INTEGER PRIMARY KEY), the rowid is one of the columns
-                        // Otherwise, it's the last value we explicitly selected
-                        let (rowid, values) = if let Some((idx, _)) =
-                            self.referenced_tables[0].get_rowid_alias_column()
-                        {
-                            // The rowid is the value at the rowid alias column index
-                            let rowid = match all_values.get(idx) {
-                                Some(crate::types::Value::Integer(id)) => *id,
-                                _ => {
-                                    // This shouldn't happen - rowid alias must be an integer
-                                    rows_processed += 1;
-                                    continue;
-                                }
-                            };
-                            // All values are table columns (no separate rowid was selected)
-                            (rowid, all_values)
-                        } else {
-                            // The last value is the explicitly selected rowid
-                            let rowid = match all_values.last() {
-                                Some(crate::types::Value::Integer(id)) => *id,
-                                _ => {
-                                    // This shouldn't happen - rowid must be an integer
-                                    rows_processed += 1;
-                                    continue;
-                                }
-                            };
-                            // Get all values except the rowid
-                            let values = all_values[..all_values.len() - 1].to_vec();
-                            (rowid, values)
-                        };
-
-                        // Create a single-row delta and process it immediately
-                        let mut single_row_delta = Delta::new();
-                        single_row_delta.insert(rowid, values.clone());
-
-                        // Create a DeltaSet with this delta for the first table (for now)
-                        let mut delta_set = DeltaSet::new();
-                        // TODO: When we support JOINs, determine which table this row came from
-                        delta_set.insert(self.referenced_tables[0].name.clone(), single_row_delta);
-
-                        // Process this single row through merge_delta with the pager
-                        match self.merge_delta(delta_set, pager.clone())? {
+                PopulateState::ProcessingOneTable {
+                    queries,
+                    current_idx,
+                    mut stmt,
+                    mut rows_processed,
+                    pending_row,
+                } => {
+                    // If we have a pending row from a previous I/O interruption, process it first
+                    if let Some((rowid, values)) = pending_row {
+                        match self.process_one_row(
+                            rowid,
+                            values.clone(),
+                            current_idx,
+                            pager.clone(),
+                        )? {
                             IOResult::Done(_) => {
                                 // Row processed successfully, continue to next row
                                 rows_processed += 1;
                             }
                             IOResult::IO(io) => {
-                                // Save state and return I/O
-                                // We'll resume at the SAME row when called again (don't increment rows_processed)
-                                // The circuit still has unfinished work for this row
-                                self.populate_state = PopulateState::Processing {
+                                // Still not done, restore state with pending row and return
+                                self.populate_state = PopulateState::ProcessingOneTable {
+                                    queries,
+                                    current_idx,
                                     stmt,
-                                    rows_processed, // Don't increment - row not done yet!
-                                    pending_row: Some((rowid, values)), // Save the row for resumption
+                                    rows_processed,
+                                    pending_row: Some((rowid, values)),
                                 };
                                 return Ok(IOResult::IO(io));
                             }
                         }
                     }
 
-                    crate::vdbe::StepResult::Done => {
-                        // All rows processed, we're done
-                        self.populate_state = PopulateState::Done;
-                        return Ok(IOResult::Done(()));
-                    }
+                    // Process rows one at a time - no batching
+                    loop {
+                        // This step() call resumes from where the statement left off
+                        match stmt.step()? {
+                            crate::vdbe::StepResult::Row => {
+                                // Get the row
+                                let row = stmt.row().unwrap();
 
-                    crate::vdbe::StepResult::Interrupt | crate::vdbe::StepResult::Busy => {
-                        // Save state before returning error
-                        self.populate_state = PopulateState::Processing {
-                            stmt,
-                            rows_processed,
-                            pending_row: None, // No pending row when interrupted between rows
-                        };
-                        return Err(LimboError::Busy);
-                    }
+                                // Extract values from the row
+                                let all_values: Vec<crate::types::Value> =
+                                    row.get_values().cloned().collect();
 
-                    crate::vdbe::StepResult::IO => {
-                        // Statement needs I/O - save state and return
-                        self.populate_state = PopulateState::Processing {
-                            stmt,
-                            rows_processed,
-                            pending_row: None, // No pending row when interrupted between rows
-                        };
-                        // TODO: Get the actual I/O completion from the statement
-                        let completion = crate::io::Completion::new_dummy();
-                        return Ok(IOResult::IO(crate::types::IOCompletions::Single(
-                            completion,
-                        )));
+                                // Extract rowid and values using helper
+                                let (rowid, values) =
+                                    match self.extract_rowid_and_values(all_values, current_idx) {
+                                        Some(result) => result,
+                                        None => {
+                                            // Invalid rowid, skip this row
+                                            rows_processed += 1;
+                                            continue;
+                                        }
+                                    };
+
+                                // Process this row
+                                match self.process_one_row(
+                                    rowid,
+                                    values.clone(),
+                                    current_idx,
+                                    pager.clone(),
+                                )? {
+                                    IOResult::Done(_) => {
+                                        // Row processed successfully, continue to next row
+                                        rows_processed += 1;
+                                    }
+                                    IOResult::IO(io) => {
+                                        // Save state and return I/O
+                                        // We'll resume at the SAME row when called again (don't increment rows_processed)
+                                        // The circuit still has unfinished work for this row
+                                        self.populate_state = PopulateState::ProcessingOneTable {
+                                            queries,
+                                            current_idx,
+                                            stmt,
+                                            rows_processed, // Don't increment - row not done yet!
+                                            pending_row: Some((rowid, values)), // Save the row for resumption
+                                        };
+                                        return Ok(IOResult::IO(io));
+                                    }
+                                }
+                            }
+
+                            crate::vdbe::StepResult::Done => {
+                                // All rows processed from this table
+                                // Move to next table
+                                self.populate_state = PopulateState::ProcessingAllTables {
+                                    queries,
+                                    current_idx: current_idx + 1,
+                                };
+                                continue 'outer;
+                            }
+
+                            crate::vdbe::StepResult::Interrupt | crate::vdbe::StepResult::Busy => {
+                                // Save state before returning error
+                                self.populate_state = PopulateState::ProcessingOneTable {
+                                    queries,
+                                    current_idx,
+                                    stmt,
+                                    rows_processed,
+                                    pending_row: None, // No pending row when interrupted between rows
+                                };
+                                return Err(LimboError::Busy);
+                            }
+
+                            crate::vdbe::StepResult::IO => {
+                                // Statement needs I/O - save state and return
+                                self.populate_state = PopulateState::ProcessingOneTable {
+                                    queries,
+                                    current_idx,
+                                    stmt,
+                                    rows_processed,
+                                    pending_row: None, // No pending row when interrupted between rows
+                                };
+                                // TODO: Get the actual I/O completion from the statement
+                                let completion = crate::io::Completion::new_dummy();
+                                return Ok(IOResult::IO(crate::types::IOCompletions::Single(
+                                    completion,
+                                )));
+                            }
+                        }
                     }
                 }
+
+                PopulateState::Done => {
+                    return Ok(IOResult::Done(()));
+                }
             }
+        }
+    }
+
+    /// Process a single row through the circuit
+    fn process_one_row(
+        &mut self,
+        rowid: i64,
+        values: Vec<Value>,
+        table_idx: usize,
+        pager: Arc<crate::Pager>,
+    ) -> crate::Result<IOResult<()>> {
+        // Create a single-row delta
+        let mut single_row_delta = Delta::new();
+        single_row_delta.insert(rowid, values);
+
+        // Create a DeltaSet with this delta for the current table
+        let mut delta_set = DeltaSet::new();
+        let table_name = self.referenced_tables[table_idx].name.clone();
+        delta_set.insert(table_name, single_row_delta);
+
+        // Process through merge_delta
+        self.merge_delta(delta_set, pager)
+    }
+
+    /// Extract rowid and values from a row
+    fn extract_rowid_and_values(
+        &self,
+        all_values: Vec<Value>,
+        table_idx: usize,
+    ) -> Option<(i64, Vec<Value>)> {
+        if let Some((idx, _)) = self.referenced_tables[table_idx].get_rowid_alias_column() {
+            // The rowid is the value at the rowid alias column index
+            let rowid = match all_values.get(idx) {
+                Some(Value::Integer(id)) => *id,
+                _ => return None, // Invalid rowid
+            };
+            // All values are table columns (no separate rowid was selected)
+            Some((rowid, all_values))
+        } else {
+            // The last value is the explicitly selected rowid
+            let rowid = match all_values.last() {
+                Some(Value::Integer(id)) => *id,
+                _ => return None, // Invalid rowid
+            };
+            // Get all values except the rowid
+            let values = all_values[..all_values.len() - 1].to_vec();
+            Some((rowid, values))
         }
     }
 
@@ -1029,7 +1117,7 @@ impl IncrementalView {
     pub fn merge_delta(
         &mut self,
         delta_set: DeltaSet,
-        pager: std::sync::Arc<crate::Pager>,
+        pager: Arc<crate::Pager>,
     ) -> crate::Result<IOResult<()>> {
         // Early return if all deltas are empty
         if delta_set.is_empty() {
