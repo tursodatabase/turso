@@ -1176,8 +1176,10 @@ fn property_insert_values_select<R: rand::Rng>(
     // - [x] The inserted row will not be updated.
     // - [ ] The table `t` will not be renamed, dropped, or altered. (todo: add this constraint once ALTER or DROP is implemented)
     if let Some(ref interactive) = interactive {
-        queries.push(Query::Begin(Begin {
-            immediate: interactive.start_with_immediate,
+        queries.push(Query::Begin(if interactive.start_with_immediate {
+            Begin::Immediate
+        } else {
+            Begin::Deferred
         }));
     }
     for _ in 0..rng.random_range(0..3) {
