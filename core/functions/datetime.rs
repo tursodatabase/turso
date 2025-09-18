@@ -935,7 +935,7 @@ mod tests {
             Value::Float(f64::NAN),                   // NaN
             Value::Float(f64::INFINITY),              // Infinity
             Value::Null,                              // Null value
-            Value::Blob(vec![1, 2, 3]),               // Blob (unsupported type)
+            Value::build_blob(vec![1, 2, 3]),         // Blob (unsupported type)
             // Invalid timezone tests
             Value::build_text("2024-07-21T12:00:00+24:00"), // Invalid timezone offset (too large)
             Value::build_text("2024-07-21T12:00:00-24:00"), // Invalid timezone offset (too small)
@@ -1067,7 +1067,7 @@ mod tests {
             Value::Float(f64::NAN),                   // NaN
             Value::Float(f64::INFINITY),              // Infinity
             Value::Null,                              // Null value
-            Value::Blob(vec![1, 2, 3]),               // Blob (unsupported type)
+            Value::build_blob(vec![1, 2, 3]),         // Blob (unsupported type)
             // Invalid timezone tests
             Value::build_text("2024-07-21T12:00:00+24:00"), // Invalid timezone offset (too large)
             Value::build_text("2024-07-21T12:00:00-24:00"), // Invalid timezone offset (too small)
