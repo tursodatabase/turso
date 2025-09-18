@@ -66,11 +66,9 @@ use crate::{
     bail_corrupt_error, turso_assert, CompletionError, File, IOContext, Result, WalFileShared,
 };
 use parking_lot::RwLock;
-use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap};
 use std::mem::MaybeUninit;
 use std::pin::Pin;
-use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -1066,12 +1064,12 @@ pub fn write_pages_vectored(
 #[instrument(skip_all, level = Level::DEBUG)]
 pub fn begin_sync(
     db_file: Arc<dyn DatabaseStorage>,
-    syncing: Rc<Cell<bool>>,
+    syncing: Arc<AtomicBool>,
 ) -> Result<Completion> {
-    assert!(!syncing.get());
-    syncing.set(true);
+    assert!(!syncing.load(Ordering::SeqCst));
+    syncing.store(true, Ordering::SeqCst);
     let completion = Completion::new_sync(move |_| {
-        syncing.set(false);
+        syncing.store(false, Ordering::SeqCst);
     });
     #[allow(clippy::arc_with_non_send_sync)]
     db_file.sync(completion)
