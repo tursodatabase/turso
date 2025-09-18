@@ -660,12 +660,12 @@ def test_csv():
     )
     limbo.run_test_fn(
         "create virtual table t1 using csv(data='1'\\'2');",
-        lambda res: "unrecognized token at" in res,
+        lambda res: "unrecognized token " in res,
         "Create CSV table with malformed escape sequence",
     )
     limbo.run_test_fn(
         "create virtual table t1 using csv(data=\"12');",
-        lambda res: "non-terminated literal at" in res,
+        lambda res: "non-terminated literal " in res,
         "Create CSV table with unterminated quoted string",
     )
 
