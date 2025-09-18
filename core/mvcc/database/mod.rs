@@ -19,6 +19,7 @@ use crate::Result;
 use crate::{Connection, Pager};
 use crossbeam_skiplist::{SkipMap, SkipSet};
 use parking_lot::RwLock;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::Debug;
@@ -116,16 +117,19 @@ pub struct Transaction {
     write_set: SkipSet<RowID>,
     /// The transaction read set.
     read_set: SkipSet<RowID>,
+    /// The transaction header.
+    header: RefCell<DatabaseHeader>,
 }
 
 impl Transaction {
-    fn new(tx_id: u64, begin_ts: u64) -> Transaction {
+    fn new(tx_id: u64, begin_ts: u64, header: DatabaseHeader) -> Transaction {
         Transaction {
             state: TransactionState::Active.into(),
             tx_id,
             begin_ts,
             write_set: SkipSet::new(),
             read_set: SkipSet::new(),
+            header: RefCell::new(header),
         }
     }
 
@@ -370,6 +374,34 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
             _phantom: PhantomData,
         }
     }
+
+    /// We need to update pager's header to account for changes made by other transactions.
+    fn update_pager_header(&self, mvcc_store: &MvStore<Clock>) -> Result<()> {
+        let header = self.header.read();
+        let last_commited_header = header.as_ref().expect("Header not found");
+        self.pager.io.block(|| self.pager.maybe_allocate_page1())?;
+        let _ = self.pager.io.block(|| {
+            self.pager.with_header_mut(|header_in_pager| {
+                let header_in_transaction = mvcc_store.get_transaction_database_header(&self.tx_id);
+                tracing::debug!("update header here {}", header_in_transaction.schema_cookie);
+                // database_size should only be updated in each commit so it should be safe to assume correct database_size is in last_commited_header
+                header_in_pager.database_size = last_commited_header.database_size;
+                if header_in_transaction.schema_cookie < last_commited_header.schema_cookie {
+                    tracing::error!("txn's schema cookie went back in time, aborting");
+                    return Err(LimboError::SchemaUpdated);
+                }
+
+                assert!(
+                    header_in_transaction.schema_cookie >= last_commited_header.schema_cookie,
+                    "txn's schema cookie went back in time"
+                );
+                header_in_pager.schema_cookie = header_in_transaction.schema_cookie;
+                // TODO: deal with other fields
+                Ok(())
+            })
+        })?;
+        Ok(())
+    }
 }
 
 impl WriteRowStateMachine {
@@ -518,6 +550,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 // If this is the exclusive transaction, we already acquired a write transaction
                 // on the pager in begin_exclusive_tx() and don't need to acquire it.
                 if mvcc_store.is_exclusive_tx(&self.tx_id) {
+                    self.update_pager_header(mvcc_store)?;
                     self.state = CommitState::WriteRow {
                         end_ts,
                         write_set_index: 0,
@@ -545,22 +578,15 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                         Completion::new_dummy(),
                     )));
                 }
+
+                self.update_pager_header(mvcc_store)?;
+
                 {
                     let mut wal = self.pager.wal.as_ref().unwrap().borrow_mut();
                     // we need to update the max frame to the latest shared max frame in order to avoid snapshot staleness
                     wal.update_max_frame();
                 }
-                // TODO: Force updated header?
-                {
-                    if let Some(last_commited_header) = self.header.read().as_ref() {
-                        self.pager.io.block(|| {
-                            self.pager.with_header_mut(|header_in_pager| {
-                                header_in_pager.database_size = last_commited_header.database_size;
-                                // TODO: deal with other fields
-                            })
-                        })?;
-                    }
-                }
+
                 // We started a pager read transaction at the beginning of the MV transaction, because
                 // any reads we do from the database file and WAL must uphold snapshot isolation.
                 // However, now we must end and immediately restart the read transaction before committing.
@@ -740,11 +766,9 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 match result {
                     IOResult::Done(_) => {
                         // FIXME: hack for now to keep database header updated for pager commit
-                        self.pager.io.block(|| {
-                            self.pager.with_header(|header| {
-                                self.header.write().replace(*header);
-                            })
-                        })?;
+                        let tx = mvcc_store.txs.get(&self.tx_id).unwrap();
+                        let tx_unlocked = tx.value();
+                        self.header.write().replace(*tx_unlocked.header.borrow());
                         self.commit_coordinator.pager_commit_lock.unlock();
                         // TODO: here mark we are ready for a batch
                         self.state = CommitState::Commit { end_ts };
@@ -1011,7 +1035,7 @@ pub struct MvStore<Clock: LogicalClock> {
     /// exclusive transactions to support single-writer semantics for compatibility with SQLite.
     exclusive_tx: RwLock<Option<TxID>>,
     commit_coordinator: Arc<CommitCoordinator>,
-    header: Arc<RwLock<Option<DatabaseHeader>>>,
+    global_header: Arc<RwLock<Option<DatabaseHeader>>>,
 }
 
 impl<Clock: LogicalClock> MvStore<Clock> {
@@ -1030,7 +1054,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 pager_commit_lock: Arc::new(TursoRwLock::new()),
                 commits_waiting: Arc::new(AtomicU64::new(0)),
             }),
-            header: Arc::new(RwLock::new(None)),
+            global_header: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -1352,6 +1376,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             pager.end_read_tx()?;
             return Err(LimboError::Busy);
         }
+        let header = self.get_new_transaction_database_header(&pager);
         // Try to acquire the pager write lock
         let begin_w_tx_res = pager.begin_write_tx();
         if let Err(LimboError::Busy) = begin_w_tx_res {
@@ -1368,7 +1393,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             return Err(LimboError::Busy);
         }
         return_if_io!(begin_w_tx_res);
-        let tx = Transaction::new(tx_id, begin_ts);
+        let tx = Transaction::new(tx_id, begin_ts, header);
         tracing::trace!(
             "begin_exclusive_tx(tx_id={}) - exclusive write transaction",
             tx_id
@@ -1387,14 +1412,85 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     pub fn begin_tx(&self, pager: Arc<Pager>) -> Result<TxID> {
         let tx_id = self.get_tx_id();
         let begin_ts = self.get_timestamp();
-        let tx = Transaction::new(tx_id, begin_ts);
-        tracing::trace!("begin_tx(tx_id={})", tx_id);
-        self.txs.insert(tx_id, tx);
 
         // TODO: we need to tie a pager's read transaction to a transaction ID, so that future refactors to read
         // pages from WAL/DB read from a consistent state to maintiain snapshot isolation.
         pager.begin_read_tx()?;
+
+        // Set txn's header to the global header
+        let header = self.get_new_transaction_database_header(&pager);
+        let tx = Transaction::new(tx_id, begin_ts, header);
+        tracing::trace!("begin_tx(tx_id={})", tx_id);
+        self.txs.insert(tx_id, tx);
+
         Ok(tx_id)
+    }
+
+    fn get_new_transaction_database_header(&self, pager: &Arc<Pager>) -> DatabaseHeader {
+        if self.global_header.read().is_none() {
+            pager.io.block(|| pager.maybe_allocate_page1()).unwrap();
+            let header = pager
+                .io
+                .block(|| pager.with_header(|header| *header))
+                .unwrap();
+            // TODO: We initialize header here, maybe this needs more careful handling
+            self.global_header.write().replace(header);
+            tracing::debug!(
+                "get_transaction_database_header create: header={:?}",
+                header
+            );
+            header
+        } else {
+            let header = self.global_header.read().unwrap();
+            tracing::debug!("get_transaction_database_header read: header={:?}", header);
+            header
+        }
+    }
+
+    pub fn get_transaction_database_header(&self, tx_id: &TxID) -> DatabaseHeader {
+        let tx = self
+            .txs
+            .get(tx_id)
+            .expect("transaction not found when trying to get header");
+        let header = tx.value();
+        let header = header.header.borrow();
+        tracing::debug!("get_transaction_database_header read: header={:?}", header);
+        *header
+    }
+
+    pub fn with_header<T, F>(&self, f: F, tx_id: Option<&TxID>) -> Result<T>
+    where
+        F: Fn(&DatabaseHeader) -> T,
+    {
+        if let Some(tx_id) = tx_id {
+            let tx = self.txs.get(tx_id).unwrap();
+            let header = tx.value();
+            let header = header.header.borrow();
+            tracing::debug!("with_header read: header={:?}", header);
+            Ok(f(&header))
+        } else {
+            let header = self.global_header.read();
+            tracing::debug!("with_header read: header={:?}", header);
+            Ok(f(header.as_ref().unwrap()))
+        }
+    }
+
+    pub fn with_header_mut<T, F>(&self, f: F, tx_id: Option<&TxID>) -> Result<T>
+    where
+        F: Fn(&mut DatabaseHeader) -> T,
+    {
+        if let Some(tx_id) = tx_id {
+            let tx = self.txs.get(tx_id).unwrap();
+            let header = tx.value();
+            let mut header = header.header.borrow_mut();
+            tracing::debug!("with_header_mut read: header={:?}", header);
+            Ok(f(&mut header))
+        } else {
+            let mut header = self.global_header.write();
+            let header = header.as_mut().unwrap();
+            tracing::debug!("with_header_mut write: header={:?}", header);
+            Ok(f(header))
+        }
     }
 
     /// Commits a transaction with the specified transaction ID.
@@ -1419,7 +1515,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 tx_id,
                 connection.clone(),
                 self.commit_coordinator.clone(),
-                self.header.clone(),
+                self.global_header.clone(),
             ));
         Ok(state_machine)
     }
