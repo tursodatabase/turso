@@ -48,8 +48,8 @@ impl LogicalLog {
                 );
             }
         });
-        self.offset += buffer.len() as u64;
         let c = self.file.pwrite(self.offset, buffer, c)?;
+        self.offset += buffer.len() as u64;
         Ok(IOResult::IO(IOCompletions::Single(c)))
     }
 
