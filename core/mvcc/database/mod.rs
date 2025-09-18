@@ -548,10 +548,8 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                                 .io
                                 .block(|| self.pager.end_tx(false, &self.connection))?;
                         }
-                    } else {
-                        if !mvcc_store.storage.is_logical_log() {
-                            self.pager.end_read_tx()?;
-                        }
+                    } else if !mvcc_store.storage.is_logical_log() {
+                        self.pager.end_read_tx()?;
                     }
                     self.finalize(mvcc_store)?;
                     return Ok(TransitionResult::Done(()));
