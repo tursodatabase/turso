@@ -1515,7 +1515,9 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
         // TODO: we need to tie a pager's read transaction to a transaction ID, so that future refactors to read
         // pages from WAL/DB read from a consistent state to maintiain snapshot isolation.
-        pager.begin_read_tx()?;
+        if !self.storage.is_logical_log() {
+            pager.begin_read_tx()?;
+        }
 
         // Set txn's header to the global header
         let header = self.get_new_transaction_database_header(&pager);
