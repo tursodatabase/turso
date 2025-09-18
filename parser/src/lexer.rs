@@ -441,29 +441,11 @@ impl<'a> Lexer<'a> {
                                     self.eat_and_assert(|b| b == b'/');
                                     break; // End of block comment
                                 }
-                                None => {
-                                    let token_text =
-                                        String::from_utf8_lossy(&self.input[start..self.offset])
-                                            .to_string();
-                                    return Err(Error::UnterminatedBlockComment {
-                                        span: (start, self.offset - start).into(),
-                                        token_text,
-                                        offset: start,
-                                    });
-                                }
+                                None => break,
                                 _ => {}
                             }
                         }
-                        None => {
-                            let token_text =
-                                String::from_utf8_lossy(&self.input[start..self.offset])
-                                    .to_string();
-                            return Err(Error::UnterminatedBlockComment {
-                                span: (start, self.offset - start).into(),
-                                token_text,
-                                offset: start,
-                            });
-                        }
+                        None => break,
                         _ => unreachable!(), // We should not reach here
                     }
                 }
