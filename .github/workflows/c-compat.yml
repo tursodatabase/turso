@@ -1,0 +1,43 @@
+name: C compat Tests
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - v*
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust(stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build Turso C bindings
+        run: cargo build -p turso_sqlite3 --features capi
+
+      - name: Run C compat tests from Rust
+        working-directory: sqlite3
+        run: cargo test
+
+      - name: Run C compat C tests linking against real SQLite
+        working-directory: sqlite3/tests
+        run: |
+          make clean
+          make LIBS="-lsqlite3"
+          ./sqlite3-tests
+
+      - name: Run C compat C tests linking against Turso
+        working-directory: sqlite3/tests
+        run: |
+          make clean
+          make LIBS="-L../../target/debug -lturso_sqlite3"
+          LD_LIBRARY_PATH=../../target/debug ./sqlite3-tests
