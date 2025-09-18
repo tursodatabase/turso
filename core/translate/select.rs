@@ -417,7 +417,7 @@ fn prepare_one_select_plan(
                     bind_and_rewrite_expr(
                         expr,
                         Some(&mut plan.table_references),
-                        Some(&mut plan.result_columns),
+                        Some(&plan.result_columns),
                         connection,
                         param_ctx,
                     )?;
@@ -433,7 +433,7 @@ fn prepare_one_select_plan(
                             bind_and_rewrite_expr(
                                 expr,
                                 Some(&mut plan.table_references),
-                                Some(&mut plan.result_columns),
+                                Some(&plan.result_columns),
                                 connection,
                                 param_ctx,
                             )?;
@@ -472,7 +472,7 @@ fn prepare_one_select_plan(
                 bind_and_rewrite_expr(
                     &mut o.expr,
                     Some(&mut plan.table_references),
-                    Some(&mut plan.result_columns),
+                    Some(&plan.result_columns),
                     connection,
                     param_ctx,
                 )?;

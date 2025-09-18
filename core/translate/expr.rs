@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use tracing::{instrument, Level};
-use turso_parser::ast::{self, As, Expr, TableInternalId, UnaryOperator};
+use turso_parser::ast::{self, As, Expr, UnaryOperator};
 
 use super::emitter::Resolver;
 use super::optimizer::Optimizable;
