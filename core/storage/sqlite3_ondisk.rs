@@ -1036,8 +1036,17 @@ pub fn write_pages_vectored(
             let done_cl = done_flag.clone();
             let total_sz = (page_sz * run_bufs.len()) as i32;
 
+            let pages = pager.cache_get_list(start_id..start_id + run_bufs.len())?;
+
             let cmp = Completion::new_write_linked(move |res| {
-                let Ok(res) = res else { return };
+                let Ok(res) = res else {
+                    // Cleanup dirty pages
+                    for page in &pages {
+                        let page = page.as_ref().expect("page should exist");
+                        page.clear_dirty();
+                    }
+                    return;
+                };
                 turso_assert!(total_sz == res, "failed to write expected size");
                 if runs_left_cl.fetch_sub(1, Ordering::AcqRel) == 1 {
                     done_cl.store(true, Ordering::Release);

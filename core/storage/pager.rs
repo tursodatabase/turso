@@ -1259,6 +1259,20 @@ impl Pager {
         page_cache.get(&page_key)
     }
 
+    // Get a list of pages from the cache, if it exists.
+    pub fn cache_get_list(
+        &self,
+        page_idxs: impl Iterator<Item = usize>,
+    ) -> Result<Vec<Option<PageRef>>> {
+        let mut page_cache = self.page_cache.write();
+        page_idxs
+            .map(|page_idx| {
+                let page_key = PageCacheKey::new(page_idx);
+                page_cache.get(&page_key)
+            })
+            .collect()
+    }
+
     /// Get a page from cache only if it matches the target frame
     pub fn cache_get_for_checkpoint(
         &self,
