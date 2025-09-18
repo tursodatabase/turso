@@ -9,6 +9,7 @@ use rand_chacha::ChaCha8Rng;
 use tracing::{Level, instrument};
 use turso_core::{File, Result};
 
+use crate::profiles::io::ShortWriteProfile;
 use crate::runner::{FAULT_ERROR_MSG, clock::SimulatorClock};
 pub(crate) struct SimulatorFile {
     pub path: String,
@@ -42,6 +43,7 @@ pub(crate) struct SimulatorFile {
     pub sync_completion: RefCell<Option<turso_core::Completion>>,
     pub queued_io: RefCell<Vec<DelayedIo>>,
     pub clock: Arc<SimulatorClock>,
+    pub short_write_profile: ShortWriteProfile,
 }
 
 type IoOperation = Box<dyn FnOnce(&SimulatorFile) -> Result<turso_core::Completion>>;
@@ -65,6 +67,28 @@ unsafe impl Sync for SimulatorFile {}
 impl SimulatorFile {
     pub(crate) fn inject_fault(&self, fault: bool) {
         self.fault.replace(fault);
+    }
+    
+    fn should_apply_short_write(&self) -> bool {
+        if !self.short_write_profile.enable {
+            return false;
+        }
+
+        if self.short_write_profile.wal_only && !self.path.ends_with("-wal") {
+            return false;
+        }
+
+        let mut rng = self.rng.borrow_mut();
+        rng.random_range(0..100) < self.short_write_profile.probability
+    }
+
+    /// Calculate short write length for a given buffer size
+    fn calculate_short_write_length(&self, full_length: usize) -> usize {
+        let mut rng = self.rng.borrow_mut();
+        let bytes_to_subtract =
+            rng.random_range(1..=self.short_write_profile.max_bytes_short.min(full_length));
+        let short_length = full_length.saturating_sub(bytes_to_subtract);
+        short_length.max(self.short_write_profile.min_bytes)
     }
 
     pub(crate) fn stats_table(&self) -> String {
@@ -172,7 +196,66 @@ impl File for SimulatorFile {
                 FAULT_ERROR_MSG.into(),
             ));
         }
-        if let Some(latency) = self.generate_latency_duration() {
+
+        if self.should_apply_short_write() {
+            // Simulate a "successful" full write that is later partially corrupted on disk.
+            // 1) Issue the full write as normal so upper layers see success.
+            // 2) Immediately overwrite the tail with zeros to mimic torn page/short write persistence.
+            let total_len = buffer.len();
+            let corrupt_tail = total_len - self.calculate_short_write_length(total_len);
+            let tail_len = corrupt_tail.min(total_len);
+
+            if let Some(latency) = self.generate_latency_duration() {
+                let forward_c = c.clone();
+                let expected = total_len as i32;
+                let op = Box::new(move |file: &SimulatorFile| {
+                    // Full write first with a shim completion that forces expected byte count
+                    let shim = turso_core::Completion::new_write(move |_| {
+                        forward_c.complete(expected);
+                    });
+                    let res = file.inner.pwrite(pos, buffer.clone(), shim);
+                    // Corrupt the tail by zeroing last tail_len bytes
+                    if tail_len > 0 {
+                        let zero_buf = turso_core::Buffer::new_temporary(tail_len);
+                        zero_buf.as_mut_slice().fill(0);
+                        let zero_arc = Arc::new(zero_buf);
+                        // Use a fresh, inert completion for the corruption write so we don't
+                        // interfere with the caller's expected byte count.
+                        let completion_for_tail = turso_core::Completion::new_write(|_| {});
+                        let _ = file.inner.pwrite(
+                            pos + (total_len - tail_len) as u64,
+                            zero_arc,
+                            completion_for_tail,
+                        );
+                    }
+                    res
+                });
+                self.queued_io
+                    .borrow_mut()
+                    .push(DelayedIo { time: latency, op });
+                Ok(c)
+            } else {
+                // Full write with a shim completion that forces expected byte count
+                let forward_c = c.clone();
+                let expected = total_len as i32;
+                let shim = turso_core::Completion::new_write(move |_| {
+                    forward_c.complete(expected);
+                });
+                let completion = self.inner.pwrite(pos, buffer.clone(), shim);
+                // Corrupt tail
+                if tail_len > 0 {
+                    let zero_buf = turso_core::Buffer::new_temporary(tail_len);
+                    zero_buf.as_mut_slice().fill(0);
+                    let zero_arc = Arc::new(zero_buf);
+                    let _ = self.inner.pwrite(
+                        pos + (total_len - tail_len) as u64,
+                        zero_arc,
+                        turso_core::Completion::new_write(|_| {}),
+                    );
+                }
+                completion
+            }
+        } else if let Some(latency) = self.generate_latency_duration() {
             let cloned_c = c.clone();
             let op = Box::new(move |file: &SimulatorFile| file.inner.pwrite(pos, buffer, cloned_c));
             self.queued_io
@@ -226,7 +309,56 @@ impl File for SimulatorFile {
                 FAULT_ERROR_MSG.into(),
             ));
         }
-        if let Some(latency) = self.generate_latency_duration() {
+        if self.should_apply_short_write() {
+            // Same approach as pwrite: write full, then corrupt the tail
+            let total_length: usize = buffers.iter().map(|b| b.len()).sum();
+            let tail_len = total_length - self.calculate_short_write_length(total_length);
+
+            if let Some(latency) = self.generate_latency_duration() {
+                let forward_c = c.clone();
+                let expected = total_length as i32;
+                let op = Box::new(move |file: &SimulatorFile| {
+                    let shim = turso_core::Completion::new_write(move |_| {
+                        forward_c.complete(expected);
+                    });
+                    let res = file.inner.pwritev(pos, buffers.clone(), shim);
+                    if tail_len > 0 {
+                        let zero_buf = turso_core::Buffer::new_temporary(tail_len);
+                        zero_buf.as_mut_slice().fill(0);
+                        let zero_arc = Arc::new(zero_buf);
+                        let completion_for_tail = turso_core::Completion::new_write(|_| {});
+                        let _ = file.inner.pwrite(
+                            pos + (total_length - tail_len) as u64,
+                            zero_arc,
+                            completion_for_tail,
+                        );
+                    }
+                    res
+                });
+                self.queued_io
+                    .borrow_mut()
+                    .push(DelayedIo { time: latency, op });
+                Ok(c)
+            } else {
+                let forward_c = c.clone();
+                let expected = total_length as i32;
+                let shim = turso_core::Completion::new_write(move |_| {
+                    forward_c.complete(expected);
+                });
+                let completion = self.inner.pwritev(pos, buffers.clone(), shim);
+                if tail_len > 0 {
+                    let zero_buf = turso_core::Buffer::new_temporary(tail_len);
+                    zero_buf.as_mut_slice().fill(0);
+                    let zero_arc = Arc::new(zero_buf);
+                    let _ = self.inner.pwrite(
+                        pos + (total_length - tail_len) as u64,
+                        zero_arc,
+                        turso_core::Completion::new_write(|_| {}),
+                    );
+                }
+                completion
+            }
+        } else if let Some(latency) = self.generate_latency_duration() {
             let cloned_c = c.clone();
             let op =
                 Box::new(move |file: &SimulatorFile| file.inner.pwritev(pos, buffers, cloned_c));

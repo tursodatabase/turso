@@ -65,6 +65,8 @@ pub struct FaultProfile {
     pub write: bool,
     #[garde(skip)]
     pub sync: bool,
+    #[garde(dive)]
+    pub short_write: ShortWriteProfile,
 }
 
 impl Default for FaultProfile {
@@ -74,6 +76,37 @@ impl Default for FaultProfile {
             read: true,
             write: true,
             sync: true,
+            short_write: Default::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Validate)]
+#[serde(deny_unknown_fields, default)]
+pub struct ShortWriteProfile {
+    #[garde(skip)]
+    pub enable: bool,
+    #[garde(range(min = 0, max = 100))]
+    pub probability: usize,
+    #[garde(range(min = 1, max = 8192))]
+    /// Minimum bytes to write in a short write (must be at least 1)
+    pub min_bytes: usize,
+    #[garde(range(min = 1, max = 8192))]
+    /// Maximum bytes to subtract from full write (creates partial write)
+    pub max_bytes_short: usize,
+    #[garde(skip)]
+    /// Only apply short writes to WAL files (files ending with "-wal")
+    pub wal_only: bool,
+}
+
+impl Default for ShortWriteProfile {
+    fn default() -> Self {
+        Self {
+            enable: false,
+            probability: 5,
+            min_bytes: 1,
+            max_bytes_short: 512,
+            wal_only: true,
         }
     }
 }
