@@ -104,7 +104,7 @@ pub fn translate_create_table(
     // https://github.com/sqlite/sqlite/blob/95f6df5b8d55e67d1e34d2bff217305a2f21b1fb/src/build.c#L2856-L2871
     // https://github.com/sqlite/sqlite/blob/95f6df5b8d55e67d1e34d2bff217305a2f21b1fb/src/build.c#L1334C5-L1336C65
 
-    let index_regs = collect_autoindexes(&body, &mut program, tbl_name.name.as_str())?;
+    let index_regs = collect_autoindexes(&body, &mut program, &normalized_tbl_name)?;
     if let Some(index_regs) = index_regs.as_ref() {
         if !schema.indexes_enabled() {
             bail_parse_error!("Constraints UNIQUE and PRIMARY KEY (unless INTEGER PRIMARY KEY) on table are not supported without indexes");
@@ -146,7 +146,7 @@ pub fn translate_create_table(
         for (idx, index_reg) in index_regs.into_iter().enumerate() {
             let index_name = format!(
                 "{PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX}{}_{}",
-                tbl_name.name.as_str(),
+                normalized_tbl_name,
                 idx + 1
             );
             emit_schema_entry(
