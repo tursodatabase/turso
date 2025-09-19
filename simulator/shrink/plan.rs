@@ -59,70 +59,73 @@ impl InteractionPlan {
         // Remove all properties after the failing one
         plan.plan.truncate(secondary_interactions_index + 1);
 
-        let mut idx = 0;
-        // Remove all properties that do not use the failing tables
-        plan.plan.retain_mut(|interactions| {
-            let retain = if idx == secondary_interactions_index {
-                if let InteractionsType::Property(
-                    Property::FsyncNoWait { tables, .. } | Property::FaultyQuery { tables, .. },
-                ) = &mut interactions.interactions
-                {
-                    tables.retain(|table| depending_tables.contains(table));
-                }
-                true
-            } else {
-                let mut has_table = interactions
-                    .uses()
-                    .iter()
-                    .any(|t| depending_tables.contains(t));
-
-                if has_table {
-                    // Remove the extensional parts of the properties
-                    if let InteractionsType::Property(p) = &mut interactions.interactions {
-                        match p {
-                            Property::InsertValuesSelect { queries, .. }
-                            | Property::DoubleCreateFailure { queries, .. }
-                            | Property::DeleteSelect { queries, .. }
-                            | Property::DropSelect { queries, .. } => {
-                                queries.clear();
-                            }
-                            Property::FsyncNoWait { tables, query }
-                            | Property::FaultyQuery { tables, query } => {
-                                if !query.uses().iter().any(|t| depending_tables.contains(t)) {
-                                    tables.clear();
-                                } else {
-                                    tables.retain(|table| depending_tables.contains(table));
-                                }
-                            }
-                            Property::SelectLimit { .. }
-                            | Property::SelectSelectOptimizer { .. }
-                            | Property::WhereTrueFalseNull { .. }
-                            | Property::UNIONAllPreservesCardinality { .. }
-                            | Property::ReadYourUpdatesBack { .. }
-                            | Property::TableHasExpectedContent { .. } => {}
-                        }
+        // means we errored in some fault on transaction statement so just maintain the statements from before the failing one
+        if !depending_tables.is_empty() {
+            let mut idx = 0;
+            // Remove all properties that do not use the failing tables
+            plan.plan.retain_mut(|interactions| {
+                let retain = if idx == secondary_interactions_index {
+                    if let InteractionsType::Property(
+                        Property::FsyncNoWait { tables, .. } | Property::FaultyQuery { tables, .. },
+                    ) = &mut interactions.interactions
+                    {
+                        tables.retain(|table| depending_tables.contains(table));
                     }
-                    // Check again after query clear if the interactions still uses the failing table
-                    has_table = interactions
+                    true
+                } else {
+                    let mut has_table = interactions
                         .uses()
                         .iter()
                         .any(|t| depending_tables.contains(t));
-                }
-                let is_fault = matches!(interactions.interactions, InteractionsType::Fault(..));
-                is_fault
-                    || (has_table
-                        && !matches!(
-                            interactions.interactions,
-                            InteractionsType::Query(Query::Select(_))
-                                | InteractionsType::Property(Property::SelectLimit { .. })
-                                | InteractionsType::Property(
-                                    Property::SelectSelectOptimizer { .. }
-                                )
-                        ))
-            };
-            idx += 1;
-            retain
-        });
+
+                    if has_table {
+                        // Remove the extensional parts of the properties
+                        if let InteractionsType::Property(p) = &mut interactions.interactions {
+                            match p {
+                                Property::InsertValuesSelect { queries, .. }
+                                | Property::DoubleCreateFailure { queries, .. }
+                                | Property::DeleteSelect { queries, .. }
+                                | Property::DropSelect { queries, .. } => {
+                                    queries.clear();
+                                }
+                                Property::FsyncNoWait { tables, query }
+                                | Property::FaultyQuery { tables, query } => {
+                                    if !query.uses().iter().any(|t| depending_tables.contains(t)) {
+                                        tables.clear();
+                                    } else {
+                                        tables.retain(|table| depending_tables.contains(table));
+                                    }
+                                }
+                                Property::SelectLimit { .. }
+                                | Property::SelectSelectOptimizer { .. }
+                                | Property::WhereTrueFalseNull { .. }
+                                | Property::UNIONAllPreservesCardinality { .. }
+                                | Property::ReadYourUpdatesBack { .. }
+                                | Property::TableHasExpectedContent { .. } => {}
+                            }
+                        }
+                        // Check again after query clear if the interactions still uses the failing table
+                        has_table = interactions
+                            .uses()
+                            .iter()
+                            .any(|t| depending_tables.contains(t));
+                    }
+                    let is_fault = matches!(interactions.interactions, InteractionsType::Fault(..));
+                    is_fault
+                        || (has_table
+                            && !matches!(
+                                interactions.interactions,
+                                InteractionsType::Query(Query::Select(_))
+                                    | InteractionsType::Property(Property::SelectLimit { .. })
+                                    | InteractionsType::Property(
+                                        Property::SelectSelectOptimizer { .. }
+                                    )
+                            ))
+                };
+                idx += 1;
+                retain
+            });
+        }
 
         let after = plan.len();
 

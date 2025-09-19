@@ -225,11 +225,7 @@ impl InteractionPlan {
         ));
 
         while plan.len() < num_interactions {
-            tracing::debug!(
-                "Generating interaction {}/{}",
-                plan.len(),
-                num_interactions
-            );
+            tracing::debug!("Generating interaction {}/{}", plan.len(), num_interactions);
             let interactions =
                 Interactions::arbitrary_from(rng, &PanicGenerationContext, (env, plan.stats()));
             interactions.shadow(env.get_conn_tables_mut(interactions.connection_index));
