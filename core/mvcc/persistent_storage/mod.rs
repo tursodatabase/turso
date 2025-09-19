@@ -1,6 +1,5 @@
-use std::cell::RefCell;
 use std::fmt::Debug;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 mod logical_log;
 use crate::mvcc::database::LogRecord;
@@ -9,20 +8,20 @@ use crate::types::IOResult;
 use crate::{File, Result};
 
 pub struct Storage {
-    logical_log: RefCell<LogicalLog>,
+    logical_log: RwLock<LogicalLog>,
 }
 
 impl Storage {
     pub fn new(file: Arc<dyn File>) -> Self {
         Self {
-            logical_log: RefCell::new(LogicalLog::new(file)),
+            logical_log: RwLock::new(LogicalLog::new(file)),
         }
     }
 }
 
 impl Storage {
     pub fn log_tx(&self, m: &LogRecord) -> Result<IOResult<()>> {
-        self.logical_log.borrow_mut().log_tx(m)
+        self.logical_log.write().unwrap().log_tx(m)
     }
 
     pub fn read_tx_log(&self) -> Result<Vec<LogRecord>> {
@@ -30,7 +29,7 @@ impl Storage {
     }
 
     pub fn sync(&self) -> Result<IOResult<()>> {
-        self.logical_log.borrow_mut().sync()
+        self.logical_log.write().unwrap().sync()
     }
 }
 
