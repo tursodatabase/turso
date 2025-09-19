@@ -3631,6 +3631,7 @@ impl BTreeCursor {
                         );
                         let divider_cell_insert_idx_in_parent =
                             balance_info.first_divider_cell + sibling_page_idx;
+                        #[cfg(debug_assertions)]
                         let overflow_cell_count_before = parent_contents.overflow_cells.len();
                         insert_into_cell(
                             parent_contents,
@@ -3638,9 +3639,9 @@ impl BTreeCursor {
                             divider_cell_insert_idx_in_parent,
                             usable_space,
                         )?;
-                        let overflow_cell_count_after = parent_contents.overflow_cells.len();
                         #[cfg(debug_assertions)]
                         {
+                            let overflow_cell_count_after = parent_contents.overflow_cells.len();
                             let divider_cell_is_overflow_cell =
                                 overflow_cell_count_after > overflow_cell_count_before;
 
