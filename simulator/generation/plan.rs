@@ -27,7 +27,7 @@ use crate::{
     SimulatorEnv,
     generation::{PanicGenerationContext, Shadow},
     model::Query,
-    runner::env::{SimConnection, SimulationType, SimulatorTables},
+    runner::env::{ShadowTablesMut, SimConnection, SimulationType},
 };
 
 use super::property::{Property, remaining};
@@ -228,7 +228,7 @@ impl InteractionPlan {
             tracing::debug!("Generating interaction {}/{}", plan.len(), num_interactions);
             let interactions =
                 Interactions::arbitrary_from(rng, &PanicGenerationContext, (env, plan.stats()));
-            interactions.shadow(env.get_conn_tables_mut(interactions.connection_index));
+            interactions.shadow(&mut env.get_conn_tables_mut(interactions.connection_index));
             plan.push(interactions);
         }
 
@@ -311,7 +311,7 @@ pub enum InteractionsType {
 impl Shadow for Interactions {
     type Result = ();
 
-    fn shadow(&self, tables: &mut SimulatorTables) {
+    fn shadow(&self, tables: &mut ShadowTablesMut) {
         match &self.interactions {
             InteractionsType::Property(property) => {
                 let initial_tables = tables.clone();
@@ -319,7 +319,7 @@ impl Shadow for Interactions {
                     let res = interaction.shadow(tables);
                     if res.is_err() {
                         // If any interaction fails, we reset the tables to the initial state
-                        *tables = initial_tables.clone();
+                        **tables = initial_tables.clone();
                         break;
                     }
                 }
@@ -576,7 +576,7 @@ impl Display for InteractionType {
 
 impl Shadow for InteractionType {
     type Result = anyhow::Result<Vec<Vec<SimValue>>>;
-    fn shadow(&self, env: &mut SimulatorTables) -> Self::Result {
+    fn shadow(&self, env: &mut ShadowTablesMut) -> Self::Result {
         match self {
             Self::Query(query) => query.shadow(env),
             Self::FsyncQuery(query) => {

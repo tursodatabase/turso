@@ -1,6 +1,6 @@
 use sql_generation::generation::GenerationContext;
 
-use crate::runner::env::SimulatorTables;
+use crate::runner::env::ShadowTablesMut;
 
 pub mod plan;
 pub mod property;
@@ -17,7 +17,7 @@ pub mod query;
 /// might return a vector of rows that were inserted into the table.
 pub(crate) trait Shadow {
     type Result;
-    fn shadow(&self, tables: &mut SimulatorTables) -> Self::Result;
+    fn shadow(&self, tables: &mut ShadowTablesMut<'_>) -> Self::Result;
 }
 
 /// Generation context that will always panic when called

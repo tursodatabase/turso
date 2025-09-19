@@ -796,8 +796,8 @@ impl Property {
                         let last = stack.last().unwrap();
                         match last {
                             Ok(_) => {
-                                let _ =
-                                    query_clone.shadow(env.get_conn_tables_mut(connection_index));
+                                let _ = query_clone
+                                    .shadow(&mut env.get_conn_tables_mut(connection_index));
                                 Ok(Ok(()))
                             }
                             Err(err) => {
@@ -1040,7 +1040,8 @@ fn assert_all_table_values(
         let assertion = InteractionType::Assertion(Assertion::new(format!("table {table} should contain all of its expected values"), {
                 let table = table.clone();
                 move |stack: &Vec<ResultSet>, env: &mut SimulatorEnv| {
-                    let table = env.get_conn_tables(connection_index).iter().find(|t| t.name == table).ok_or_else(|| {
+                    let conn_ctx = env.get_conn_tables(connection_index);
+                    let table = conn_ctx.iter().find(|t| t.name == table).ok_or_else(|| {
                         LimboError::InternalError(format!(
                             "table {table} should exist in simulator env"
                         ))
