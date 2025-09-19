@@ -803,6 +803,10 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
             }
             CommitState::Commit { end_ts } => {
                 let mut log_record = LogRecord::new(*end_ts);
+                if !mvcc_store.is_exclusive_tx(&self.tx_id) && mvcc_store.has_exclusive_tx() {
+                    // A non-CONCURRENT transaction is holding the exclusive lock, we must abort.
+                    return Err(LimboError::WriteWriteConflict);
+                }
                 for id in &self.write_set {
                     if let Some(row_versions) = mvcc_store.rows.get(id) {
                         let mut row_versions = row_versions.value().write();
