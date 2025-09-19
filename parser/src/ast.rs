@@ -1312,6 +1312,8 @@ pub enum PragmaName {
     ApplicationId,
     /// set the autovacuum mode
     AutoVacuum,
+    /// set the busy_timeout
+    BusyTimeout,
     /// `cache_size` pragma
     CacheSize,
     /// encryption cipher algorithm name for encrypted databases
