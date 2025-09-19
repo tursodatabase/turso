@@ -1,3 +1,4 @@
+pub mod aggregate_operator;
 pub mod compiler;
 pub mod cursor;
 pub mod dbsp;
