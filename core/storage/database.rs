@@ -56,7 +56,7 @@ impl Default for IOContext {
 
 /// DatabaseStorage is an interface a database file that consists of pages.
 ///
-/// The purpose of this trait is to abstract the upper layers of Limbo from
+/// The purpose of this trait is to abstract the upper layers of Turso from
 /// the storage medium. A database can either be a file on disk, like in SQLite,
 /// or something like a remote page server service.
 pub trait DatabaseStorage: Send + Sync {

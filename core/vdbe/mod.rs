@@ -273,6 +273,7 @@ pub struct ProgramState {
     regex_cache: RegexCache,
     interrupted: bool,
     pub parameters: HashMap<NonZero<usize>, Value>,
+
     commit_state: CommitState,
     #[cfg(feature = "json")]
     json_cache: JsonCacheCell,

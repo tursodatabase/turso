@@ -16,6 +16,7 @@ pub mod mvcc;
 mod parameters;
 mod pragma;
 mod pseudo;
+mod savepoint;
 mod schema;
 #[cfg(feature = "series")]
 mod series;
@@ -39,6 +40,7 @@ pub mod numeric;
 #[cfg(not(feature = "fuzz"))]
 mod numeric;
 
+use crate::savepoint::SavepointStack;
 use crate::storage::checksum::CHECKSUM_REQUIRED_RESERVED_BYTES;
 use crate::translate::pragma::TURSO_CDC_DEFAULT_TABLE_NAME;
 #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
@@ -516,6 +518,8 @@ impl Database {
             sync_mode: Cell::new(SyncMode::Full),
             data_sync_retry: Cell::new(false),
             busy_timeout: Cell::new(None),
+            savepoint_stack: RefCell::new(SavepointStack::new()),
+            is_txn_savepoint: Cell::new(false),
         });
         self.n_connections
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -876,6 +880,10 @@ impl DatabaseCatalog {
         }
     }
 
+    pub fn iter(&self) -> impl Iterator<Item = (&usize, &(Arc<Database>, Arc<Pager>))> {
+        self.index_to_data.iter()
+    }
+
     fn get_database_by_index(&self, index: usize) -> Option<Arc<Database>> {
         self.index_to_data
             .get(&index)
@@ -1009,6 +1017,9 @@ pub struct Connection {
     data_sync_retry: Cell<bool>,
     /// User defined max accumulated Busy timeout duration
     busy_timeout: Cell<Option<std::time::Duration>>,
+    savepoint_stack: RefCell<SavepointStack>,
+    /// Mark if the outermost transaction is a savepoint
+    is_txn_savepoint: Cell<bool>,
 }
 
 impl Drop for Connection {

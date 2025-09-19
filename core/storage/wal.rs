@@ -28,6 +28,26 @@ use crate::{
     Completion, CompletionError, IOContext, LimboError, Result,
 };
 
+/// Necessary info to save a position in the WAL
+#[derive(Debug, Clone)]
+pub struct SavepointWalData {
+    pub max_frame: u64,
+    pub checksum_1: u32,
+    pub checksum_2: u32,
+    pub checkpoint_seq: u32,
+}
+
+impl SavepointWalData {
+    pub fn new(max_frame: u64, checksum_1: u32, checksum_2: u32, checkpoint_seq: u32) -> Self {
+        Self {
+            max_frame,
+            checksum_1,
+            checksum_2,
+            checkpoint_seq,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct CheckpointResult {
     /// number of frames in WAL that could have been backfilled
@@ -303,6 +323,8 @@ pub trait Wal: Debug {
     fn get_max_frame(&self) -> u64;
     fn get_min_frame(&self) -> u64;
     fn rollback(&mut self) -> Result<()>;
+    fn savepoint(&self) -> SavepointWalData;
+    fn undo_savepoint(&mut self, data: &mut SavepointWalData) -> Result<()>;
 
     /// Return unique set of pages changed **after** frame_watermark position and until current WAL session max_frame_no
     fn changed_pages_after(&self, frame_watermark: u64) -> Result<Vec<u32>>;
@@ -1580,6 +1602,48 @@ impl Wal for WalFile {
         let new_max_frame = self.get_shared().max_frame.load(Ordering::Acquire);
         self.max_frame = new_max_frame;
     }
+
+    fn savepoint(&self) -> SavepointWalData {
+        SavepointWalData::new(
+            self.max_frame,
+            self.header.checksum_1,
+            self.header.checksum_2,
+            self.header.checkpoint_seq,
+        )
+    }
+
+    fn undo_savepoint(&mut self, data: &mut SavepointWalData) -> Result<()> {
+        assert!(data.max_frame <= self.max_frame);
+
+        if data.checkpoint_seq != self.header.checkpoint_seq {
+            // This savepoint was opened immediately after the write-transaction
+            // was started. Right after that, the writer decided to wrap around
+            // to the start of the log. Update the savepoint values to match.
+            data.max_frame = 0;
+            data.checkpoint_seq = self.header.checkpoint_seq;
+        }
+
+        if data.max_frame < self.max_frame {
+            self.max_frame = data.max_frame;
+            self.header.checksum_1 = data.checksum_1;
+            self.header.checksum_2 = data.checksum_2;
+            let shared = self.get_shared();
+            let mut frame_cache = shared.frame_cache.lock();
+            frame_cache.retain(|_, frames| {
+                while frames.last().is_some_and(|&f| f > self.max_frame) {
+                    frames.pop();
+                }
+                !frames.is_empty()
+            });
+        }
+
+        // TODO: Add equivalent code -> https://sqlite.org/forum/forumpost/b490f726db
+        // if( pWal->iReCksum>pWal->hdr.mxFrame ){
+        // pWal->iReCksum = 0;
+        // }
+
+        Ok(())
+    }
 }
 
 impl WalFile {
@@ -1990,7 +2054,7 @@ impl WalFile {
     /// because we might overwrite content the reader is reading from the database file.
     ///
     /// A checkpoint must never overwrite a page in the main DB file if some
-    /// active reader might still need to read that page from the WAL.  
+    /// active reader might still need to read that page from the WAL.
     /// Concretely: the checkpoint may only copy frames `<= aReadMark[k]` for
     /// every in-use reader slot `k > 0`.
     ///

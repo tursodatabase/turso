@@ -616,7 +616,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     write_set_index: 0,
                     requires_seek: true,
                 };
-                return Ok(TransitionResult::Continue);
+                Ok(TransitionResult::Continue)
             }
             CommitState::WriteRow {
                 end_ts,
@@ -700,9 +700,9 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
             } => {
                 let write_row_state_machine = self.write_row_state_machine.as_mut().unwrap();
                 match write_row_state_machine.step(&())? {
-                    TransitionResult::Io(io) => return Ok(TransitionResult::Io(io)),
+                    TransitionResult::Io(io) => Ok(TransitionResult::Io(io)),
                     TransitionResult::Continue => {
-                        return Ok(TransitionResult::Continue);
+                        Ok(TransitionResult::Continue)
                     }
                     TransitionResult::Done(_) => {
                         let requires_seek = {
@@ -726,7 +726,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                             write_set_index: write_set_index + 1,
                             requires_seek,
                         };
-                        return Ok(TransitionResult::Continue);
+                        Ok(TransitionResult::Continue)
                     }
                 }
             }
@@ -736,9 +736,9 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
             } => {
                 let delete_row_state_machine = self.delete_row_state_machine.as_mut().unwrap();
                 match delete_row_state_machine.step(&())? {
-                    TransitionResult::Io(io) => return Ok(TransitionResult::Io(io)),
+                    TransitionResult::Io(io) => Ok(TransitionResult::Io(io)),
                     TransitionResult::Continue => {
-                        return Ok(TransitionResult::Continue);
+                        Ok(TransitionResult::Continue)
                     }
                     TransitionResult::Done(_) => {
                         self.state = CommitState::WriteRow {
@@ -746,7 +746,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                             write_set_index: write_set_index + 1,
                             requires_seek: true,
                         };
-                        return Ok(TransitionResult::Continue);
+                        Ok(TransitionResult::Continue)
                     }
                 }
             }
@@ -772,10 +772,10 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                         self.commit_coordinator.pager_commit_lock.unlock();
                         // TODO: here mark we are ready for a batch
                         self.state = CommitState::Commit { end_ts };
-                        return Ok(TransitionResult::Continue);
+                        Ok(TransitionResult::Continue)
                     }
                     IOResult::IO(io) => {
-                        return Ok(TransitionResult::Io(io));
+                        Ok(TransitionResult::Io(io))
                     }
                 }
             }
@@ -967,7 +967,7 @@ impl StateTransition for DeleteRowStateMachine {
                         Ok(TransitionResult::Continue)
                     }
                     IOResult::IO(io) => {
-                        return Ok(TransitionResult::Io(io));
+                        Ok(TransitionResult::Io(io))
                     }
                 }
             }

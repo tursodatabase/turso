@@ -80,6 +80,7 @@ aes = { version = "0.8.4"}
 turso_parser = { workspace = true }
 aegis = "0.9.0"
 twox-hash = "2.1.1"
+bitvec = "1.0.1"
 
 [build-dependencies]
 chrono = { workspace = true, default-features = false }

@@ -30,6 +30,7 @@ pub(crate) mod planner;
 pub(crate) mod pragma;
 pub(crate) mod result_row;
 pub(crate) mod rollback;
+pub(crate) mod savepoint;
 pub(crate) mod schema;
 pub(crate) mod select;
 pub(crate) mod subquery;
@@ -51,6 +52,7 @@ use analyze::translate_analyze;
 use index::{translate_create_index, translate_drop_index};
 use insert::translate_insert;
 use rollback::translate_rollback;
+use savepoint::{translate_release, translate_rollback_to_savepoint, translate_savepoint};
 use schema::{translate_create_table, translate_create_virtual_table, translate_drop_table};
 use select::translate_select;
 use std::sync::Arc;
@@ -267,12 +269,18 @@ pub fn translate_inner(
             bail_parse_error!("PRAGMA statement cannot be evaluated in a nested context")
         }
         ast::Stmt::Reindex { .. } => bail_parse_error!("REINDEX not supported yet"),
-        ast::Stmt::Release { .. } => bail_parse_error!("RELEASE not supported yet"),
+        ast::Stmt::Release { name } => translate_release(name, schema, program)?,
         ast::Stmt::Rollback {
             tx_name,
             savepoint_name,
-        } => translate_rollback(schema, syms, program, tx_name, savepoint_name)?,
-        ast::Stmt::Savepoint { .. } => bail_parse_error!("SAVEPOINT not supported yet"),
+        } => {
+            if let Some(savepoint_name) = savepoint_name {
+                translate_rollback_to_savepoint(savepoint_name, schema, program)?
+            } else {
+                translate_rollback(schema, syms, program, tx_name, None)?
+            }
+        }
+        ast::Stmt::Savepoint { name } => translate_savepoint(name, schema, program)?,
         ast::Stmt::Select(select) => {
             translate_select(
                 schema,

@@ -2320,6 +2320,9 @@ pub fn op_transaction_inner(
                             assert_eq!(conn.transaction_state.get(), current_state);
                             return Err(LimboError::Busy);
                         }
+                        if !conn.auto_commit.get() {
+                            pager.open_savepoint(conn.savepoint_stack.borrow().len())?;
+                        }
                         if let IOResult::IO(io) = begin_w_tx_res? {
                             // set the transaction state to pending so we don't have to
                             // end the read transaction.
@@ -2427,6 +2430,8 @@ pub fn op_auto_commit(
         }
     }
 
+    conn.savepoint_stack.borrow_mut().close();
+    conn.is_txn_savepoint.set(false);
     program
         .commit_txn(pager.clone(), state, mv_store, *rollback)
         .map(Into::into)
@@ -9387,6 +9392,81 @@ where
     } else {
         pager.with_header_mut(&f)
     }
+}
+
+// TODO NOW:
+// 2. Add more tests (steal from sqlite)
+pub fn op_savepoint(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+    mv_store: Option<&Arc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    use crate::savepoint::SavepointOp;
+
+    load_insn!(Savepoint { op, name }, insn);
+    let conn = program.connection.clone();
+
+    let mut savepoint_stack = conn.savepoint_stack.borrow_mut();
+    if matches!(op, SavepointOp::Begin) {
+        if let Some(wal) = pager.as_ref().wal.as_ref() {
+            if conn.auto_commit.get() {
+                conn.auto_commit.set(false);
+                conn.is_txn_savepoint.set(true);
+            }
+            savepoint_stack.push_savepoint(name.clone());
+        } else {
+            return Err(LimboError::InternalError(
+                "WAL is not available for the pager".to_string(),
+            ));
+        }
+
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
+    assert!(matches!(op, SavepointOp::Release) || matches!(op, SavepointOp::Rollback));
+    let sp_pos = savepoint_stack
+        .find_savepoint(name)
+        .ok_or_else(|| LimboError::NoSuchSavepoint(name.clone()))?;
+
+    let is_txn = (sp_pos == savepoint_stack.len() - 1) && conn.is_txn_savepoint.get();
+    if is_txn && matches!(op, SavepointOp::Release) {
+        // todo: checkfkdeferred
+        conn.auto_commit.set(true);
+        match halt(program, state, pager, mv_store, 0, "") {
+            Ok(_) => conn.is_txn_savepoint.set(false),
+            Err(LimboError::Busy) => {
+                // change pc
+                conn.auto_commit.set(false);
+                return Err(LimboError::Busy);
+            }
+            Err(_) => conn.auto_commit.set(false),
+        }
+    } else {
+        // rename
+        let isSchemaChange = false;
+        let i_sp = (savepoint_stack.len() - sp_pos) as i32 - 1;
+        if matches!(op, SavepointOp::Rollback) {
+            // isSchemaChange
+            // call tripAllCursors for each db in catalog
+            savepoint_stack.rollback_to(name);
+        } else {
+            savepoint_stack.release(name);
+        }
+        // todo: for each db call savepoint
+        pager.savepoint(*op, i_sp);
+        if isSchemaChange {
+            // expirePreparedStatements
+            // resetAllSchemaOfConnection
+        }
+
+        if !is_txn || matches!(op, SavepointOp::Rollback) {
+            // vtabsavepoint
+        }
+    }
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
 }
 
 #[cfg(test)]

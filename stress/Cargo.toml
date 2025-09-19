@@ -20,7 +20,7 @@ antithesis = ["turso/antithesis"]
 experimental_indexes = []
 
 [dependencies]
-anarchist-readable-name-generator-lib = "0.1.0"
+anarchist-readable-name-generator-lib = "=0.1.2"
 antithesis_sdk = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 hex = { workspace = true }

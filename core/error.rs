@@ -79,6 +79,8 @@ pub enum LimboError {
     InvalidBlobSize(usize),
     #[error("Planning error: {0}")]
     PlanningError(String),
+    #[error("Runtime error: no such savepoint: {0}")]
+    NoSuchSavepoint(String),
 }
 
 // We only propagate the error kind so we can avoid string allocation in hot path and copying/cloning enums is cheaper
