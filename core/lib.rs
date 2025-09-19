@@ -103,7 +103,6 @@ pub use vdbe::{builder::QueryMode, explain::EXPLAIN_COLUMNS, explain::EXPLAIN_QU
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DatabaseOpts {
     pub enable_mvcc: bool,
-    pub mvcc_mode: MvccMode,
     pub enable_indexes: bool,
     pub enable_views: bool,
     pub enable_strict: bool,
@@ -113,7 +112,6 @@ impl Default for DatabaseOpts {
     fn default() -> Self {
         Self {
             enable_mvcc: false,
-            mvcc_mode: MvccMode::LogicalLog,
             enable_indexes: true,
             enable_views: false,
             enable_strict: false,
@@ -173,12 +171,6 @@ enum TransactionState {
 pub enum SyncMode {
     Off = 0,
     Full = 2,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum MvccMode {
-    Noop,
-    LogicalLog,
 }
 
 pub(crate) type MvStore = mvcc::MvStore<mvcc::LocalClock>;
@@ -401,12 +393,8 @@ impl Database {
         let shared_wal = WalFileShared::open_shared_if_exists(&io, wal_path)?;
 
         let mv_store = if opts.enable_mvcc {
-            let storage = match opts.mvcc_mode {
-                MvccMode::Noop => mvcc::persistent_storage::Storage::new_noop(),
-                MvccMode::LogicalLog => mvcc::persistent_storage::Storage::new_logical_log(
-                    io.open_file(&format!("{path}-lg"), OpenFlags::default(), false)?,
-                ),
-            };
+            let file = io.open_file(&format!("{path}-lg"), OpenFlags::default(), false)?;
+            let storage = mvcc::persistent_storage::Storage::new(file);
             Some(Arc::new(MvStore::new(mvcc::LocalClock::new(), storage)))
         } else {
             None
