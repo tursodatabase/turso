@@ -64,7 +64,7 @@ pub struct OpfsInner {
 }
 
 thread_local! {
-    static OPFS: Arc<Opfs> = Arc::new(Opfs::new());
+    static OPFS: Arc<Opfs> = Arc::new(Opfs::default());
 }
 
 #[napi]
@@ -73,9 +73,6 @@ struct OpfsFile {
     handle: i32,
     opfs: Opfs,
 }
-
-// unsafe impl Send for OpfsFile {}
-// unsafe impl Sync for OpfsFile {}
 
 unsafe impl Send for Opfs {}
 unsafe impl Sync for Opfs {}
@@ -107,15 +104,6 @@ pub fn opfs() -> Arc<Opfs> {
 }
 
 impl Opfs {
-    pub fn new() -> Self {
-        Self {
-            inner: Arc::new(OpfsInner {
-                completion_no: RefCell::new(0),
-                completions: RefCell::new(HashMap::new()),
-            }),
-        }
-    }
-
     pub fn complete(&self, completion_no: u32, result: i32) {
         let completion = {
             let mut completions = self.inner.completions.borrow_mut();
@@ -144,6 +132,18 @@ impl Clock for Opfs {
         Instant {
             secs: now.timestamp(),
             micros: now.timestamp_subsec_micros(),
+        }
+    }
+}
+
+impl Default for Opfs {
+    fn default() -> Self {
+        Self {
+            #[allow(clippy::arc_with_non_send_sync)]
+            inner: Arc::new(OpfsInner {
+                completion_no: RefCell::new(0),
+                completions: RefCell::new(HashMap::new()),
+            }),
         }
     }
 }

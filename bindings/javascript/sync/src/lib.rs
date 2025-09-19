@@ -255,7 +255,7 @@ impl SyncEngine {
     #[napi]
     pub fn push(&self) -> GeneratorHolder {
         self.run(async move |coro, guard| {
-            let sync_engine = try_read(&guard)?;
+            let sync_engine = try_read(guard)?;
             let sync_engine = try_unwrap(&sync_engine)?;
             sync_engine.push_changes_to_remote(coro).await?;
             Ok(None)
@@ -265,7 +265,7 @@ impl SyncEngine {
     #[napi]
     pub fn stats(&self) -> GeneratorHolder {
         self.run(async move |coro, guard| {
-            let sync_engine = try_read(&guard)?;
+            let sync_engine = try_read(guard)?;
             let sync_engine = try_unwrap(&sync_engine)?;
             let stats = sync_engine.stats(coro).await?;
             Ok(Some(GeneratorResponse::SyncEngineStats {
@@ -282,7 +282,7 @@ impl SyncEngine {
     #[napi]
     pub fn wait(&self) -> GeneratorHolder {
         self.run(async move |coro, guard| {
-            let sync_engine = try_read(&guard)?;
+            let sync_engine = try_read(guard)?;
             let sync_engine = try_unwrap(&sync_engine)?;
             Ok(Some(GeneratorResponse::SyncEngineChanges {
                 changes: SyncEngineChanges {
@@ -296,7 +296,7 @@ impl SyncEngine {
     pub fn apply(&self, changes: &mut SyncEngineChanges) -> GeneratorHolder {
         let status = changes.status.take().unwrap();
         self.run(async move |coro, guard| {
-            let sync_engine = try_read(&guard)?;
+            let sync_engine = try_read(guard)?;
             let sync_engine = try_unwrap(&sync_engine)?;
             sync_engine.apply_changes_from_remote(coro, status).await?;
             Ok(None)
@@ -306,7 +306,7 @@ impl SyncEngine {
     #[napi]
     pub fn checkpoint(&self) -> GeneratorHolder {
         self.run(async move |coro, guard| {
-            let sync_engine = try_read(&guard)?;
+            let sync_engine = try_read(guard)?;
             let sync_engine = try_unwrap(&sync_engine)?;
             sync_engine.checkpoint(coro).await?;
             Ok(None)
