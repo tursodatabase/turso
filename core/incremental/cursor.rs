@@ -313,7 +313,6 @@ mod tests {
             OpenFlags::default(),
             crate::DatabaseOpts {
                 enable_mvcc: false,
-                mvcc_mode: crate::MvccMode::Noop,
                 enable_indexes: false,
                 enable_views: true,
                 enable_strict: false,

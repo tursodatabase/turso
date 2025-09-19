@@ -54,10 +54,6 @@ impl LogicalLog {
         Ok(IOResult::IO(IOCompletions::Single(c)))
     }
 
-    pub fn read_tx_log(&self) -> Result<Vec<LogRecord>> {
-        todo!()
-    }
-
     pub fn sync(&mut self) -> Result<IOResult<()>> {
         let completion = Completion::new_sync(move |_| {
             tracing::debug!("logical_log_sync finish");
