@@ -12,8 +12,6 @@
 
 #[cfg(feature = "browser")]
 pub mod browser;
-#[cfg(feature = "browser")]
-use crate::browser::opfs;
 
 use napi::bindgen_prelude::*;
 use napi::{Env, Task};

@@ -140,7 +140,11 @@ impl Opfs {
 
 impl Clock for Opfs {
     fn now(&self) -> Instant {
-        Instant { secs: 0, micros: 0 } // TODO
+        let now = chrono::Local::now();
+        Instant {
+            secs: now.timestamp(),
+            micros: now.timestamp_subsec_micros(),
+        }
     }
 }
 
