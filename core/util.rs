@@ -103,17 +103,6 @@ impl<I: ?Sized + IO> IOExt for I {
     }
 }
 
-pub trait RoundToPrecision {
-    fn round_to_precision(self, precision: i32) -> f64;
-}
-
-impl RoundToPrecision for f64 {
-    fn round_to_precision(self, precision: i32) -> f64 {
-        let factor = 10f64.powi(precision);
-        (self * factor).round() / factor
-    }
-}
-
 // https://sqlite.org/lang_keywords.html
 const QUOTE_PAIRS: &[(char, char)] = &[
     ('"', '"'),
