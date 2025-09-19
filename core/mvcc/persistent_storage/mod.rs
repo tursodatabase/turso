@@ -29,10 +29,6 @@ impl Storage {
         todo!()
     }
 
-    pub fn is_logical_log(&self) -> bool {
-        true
-    }
-
     pub fn sync(&self) -> Result<IOResult<()>> {
         self.logical_log.borrow_mut().sync()
     }
