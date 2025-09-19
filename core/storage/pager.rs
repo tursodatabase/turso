@@ -44,7 +44,7 @@ pub struct HeaderRef(PageRef);
 impl HeaderRef {
     pub fn from_pager(pager: &Pager) -> Result<IOResult<Self>> {
         loop {
-            let state = pager.header_ref_state.borrow().clone();
+            let state = pager.header_ref_state.read().clone();
             tracing::trace!("HeaderRef::from_pager - {:?}", state);
             match state {
                 HeaderRefState::Start => {
@@ -53,7 +53,7 @@ impl HeaderRef {
                     }
 
                     let (page, c) = pager.read_page(DatabaseHeader::PAGE_ID)?;
-                    *pager.header_ref_state.borrow_mut() = HeaderRefState::CreateHeader { page };
+                    *pager.header_ref_state.write() = HeaderRefState::CreateHeader { page };
                     if let Some(c) = c {
                         io_yield_one!(c);
                     }
@@ -64,7 +64,7 @@ impl HeaderRef {
                         page.get().id == DatabaseHeader::PAGE_ID,
                         "incorrect header page id"
                     );
-                    *pager.header_ref_state.borrow_mut() = HeaderRefState::Start;
+                    *pager.header_ref_state.write() = HeaderRefState::Start;
                     break Ok(IOResult::Done(Self(page)));
                 }
             }
@@ -84,7 +84,7 @@ pub struct HeaderRefMut(PageRef);
 impl HeaderRefMut {
     pub fn from_pager(pager: &Pager) -> Result<IOResult<Self>> {
         loop {
-            let state = pager.header_ref_state.borrow().clone();
+            let state = pager.header_ref_state.read().clone();
             tracing::trace!(?state);
             match state {
                 HeaderRefState::Start => {
@@ -93,7 +93,7 @@ impl HeaderRefMut {
                     }
 
                     let (page, c) = pager.read_page(DatabaseHeader::PAGE_ID)?;
-                    *pager.header_ref_state.borrow_mut() = HeaderRefState::CreateHeader { page };
+                    *pager.header_ref_state.write() = HeaderRefState::CreateHeader { page };
                     if let Some(c) = c {
                         io_yield_one!(c);
                     }
@@ -106,7 +106,7 @@ impl HeaderRefMut {
                     );
 
                     pager.add_dirty(&page);
-                    *pager.header_ref_state.borrow_mut() = HeaderRefState::Start;
+                    *pager.header_ref_state.write() = HeaderRefState::Start;
                     break Ok(IOResult::Done(Self(page)));
                 }
             }
@@ -525,13 +525,13 @@ pub struct Pager {
     free_page_state: RwLock<FreePageState>,
     /// Maximum number of pages allowed in the database. Default is 1073741823 (SQLite default).
     max_page_count: AtomicU32,
+    header_ref_state: RwLock<HeaderRefState>,
     #[cfg(not(feature = "omit_autovacuum"))]
     /// State machine for [Pager::ptrmap_get]
     ptrmap_get_state: RefCell<PtrMapGetState>,
     #[cfg(not(feature = "omit_autovacuum"))]
     /// State machine for [Pager::ptrmap_put]
     ptrmap_put_state: RefCell<PtrMapPutState>,
-    header_ref_state: RefCell<HeaderRefState>,
     #[cfg(not(feature = "omit_autovacuum"))]
     btree_create_vacuum_full_state: Cell<BtreeCreateVacuumFullState>,
     pub(crate) io_ctx: RefCell<IOContext>,
@@ -632,7 +632,7 @@ impl Pager {
             ptrmap_get_state: RefCell::new(PtrMapGetState::Start),
             #[cfg(not(feature = "omit_autovacuum"))]
             ptrmap_put_state: RefCell::new(PtrMapPutState::Start),
-            header_ref_state: RefCell::new(HeaderRefState::Start),
+            header_ref_state: RwLock::new(HeaderRefState::Start),
             #[cfg(not(feature = "omit_autovacuum"))]
             btree_create_vacuum_full_state: Cell::new(BtreeCreateVacuumFullState::Start),
             io_ctx: RefCell::new(IOContext::default()),
@@ -2339,7 +2339,7 @@ impl Pager {
                 .replace(BtreeCreateVacuumFullState::Start);
         }
 
-        self.header_ref_state.replace(HeaderRefState::Start);
+        *self.header_ref_state.write() = HeaderRefState::Start;
     }
 
     pub fn with_header<T>(&self, f: impl Fn(&DatabaseHeader) -> T) -> Result<IOResult<T>> {
