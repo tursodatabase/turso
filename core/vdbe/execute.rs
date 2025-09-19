@@ -6797,6 +6797,7 @@ pub fn op_parse_schema(
                 &conn.syms.read(),
                 program.connection.mv_tx.get(),
                 existing_views,
+                mv_store,
             )
         })
     } else {
@@ -6812,6 +6813,7 @@ pub fn op_parse_schema(
                 &conn.syms.read(),
                 program.connection.mv_tx.get(),
                 existing_views,
+                mv_store,
             )
         })
     };

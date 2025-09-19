@@ -21,7 +21,7 @@ use crate::util::{
 };
 use crate::{
     contains_ignore_ascii_case, eq_ignore_ascii_case, match_ignore_ascii_case, LimboError,
-    MvCursor, Pager, RefValue, SymbolTable, VirtualTable,
+    MvCursor, MvStore, Pager, RefValue, SymbolTable, VirtualTable,
 };
 use crate::{util::normalize_ident, Result};
 use core::fmt;
@@ -296,6 +296,10 @@ impl Schema {
         pager: Arc<Pager>,
         syms: &SymbolTable,
     ) -> Result<()> {
+        assert!(
+            mv_cursor.is_none(),
+            "mvcc not yet supported for make_from_btree"
+        );
         let mut cursor = BTreeCursor::new_table(mv_cursor, Arc::clone(&pager), 1, 10);
 
         let mut from_sql_indexes = Vec::with_capacity(10);
@@ -357,6 +361,7 @@ impl Schema {
                 &mut dbsp_state_roots,
                 &mut dbsp_state_index_roots,
                 &mut materialized_view_info,
+                None,
             )?;
             drop(record_cursor);
             drop(row);
@@ -553,6 +558,7 @@ impl Schema {
         dbsp_state_roots: &mut std::collections::HashMap<String, usize>,
         dbsp_state_index_roots: &mut std::collections::HashMap<String, usize>,
         materialized_view_info: &mut std::collections::HashMap<String, (String, usize)>,
+        mv_store: Option<&Arc<MvStore>>,
     ) -> Result<()> {
         match ty {
             "table" => {
@@ -574,6 +580,9 @@ impl Schema {
                         )?
                     };
                     self.add_virtual_table(vtab);
+                    if let Some(mv_store) = mv_store {
+                        mv_store.mark_table_as_loaded(root_page as u64);
+                    }
                 } else {
                     let table = BTreeTable::from_sql(sql, root_page as usize)?;
 
@@ -588,10 +597,14 @@ impl Schema {
                         dbsp_state_roots.insert(view_name, root_page as usize);
                     }
 
+                    if let Some(mv_store) = mv_store {
+                        mv_store.mark_table_as_loaded(root_page as u64);
+                    }
                     self.add_btree_table(Arc::new(table));
                 }
             }
             "index" => {
+                assert!(mv_store.is_none(), "indexes not yet supported for mvcc");
                 match maybe_sql {
                     Some(sql) => {
                         from_sql_indexes.push(UnparsedFromSqlIndex {
@@ -635,6 +648,7 @@ impl Schema {
 
                 let sql = maybe_sql.expect("sql should be present for view");
                 let view_name = name.to_string();
+                assert!(mv_store.is_none(), "views not yet supported for mvcc");
 
                 // Parse the SQL to determine if it's a regular or materialized view
                 let mut parser = Parser::new(sql.as_bytes());

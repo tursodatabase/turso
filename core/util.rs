@@ -10,7 +10,7 @@ use crate::{
     types::{Value, ValueType},
     LimboError, OpenFlags, Result, Statement, StepResult, SymbolTable,
 };
-use crate::{Connection, IO};
+use crate::{Connection, MvStore, IO};
 use std::{
     collections::HashMap,
     rc::Rc,
@@ -153,6 +153,7 @@ pub fn parse_schema_rows(
     syms: &SymbolTable,
     mv_tx: Option<(u64, TransactionMode)>,
     mut existing_views: HashMap<String, Arc<Mutex<IncrementalView>>>,
+    mv_store: Option<&Arc<MvStore>>,
 ) -> Result<()> {
     rows.set_mv_tx(mv_tx);
     // TODO: if we IO, this unparsed indexes is lost. Will probably need some state between
@@ -190,6 +191,7 @@ pub fn parse_schema_rows(
                     &mut dbsp_state_roots,
                     &mut dbsp_state_index_roots,
                     &mut materialized_view_info,
+                    mv_store,
                 )?
             }
             StepResult::IO => {
