@@ -29,6 +29,10 @@ impl Instant {
         }
     }
 
+    pub fn as_micros(&self) -> u128 {
+        self.secs as u128 * 1_000_000 + self.micros as u128
+    }
+
     pub fn checked_add_duration(&self, other: &Duration) -> Option<Instant> {
         let mut secs = self.secs.checked_add_unsigned(other.as_secs())?;
 

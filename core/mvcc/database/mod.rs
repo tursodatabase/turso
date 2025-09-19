@@ -7,7 +7,6 @@ use crate::storage::btree::BTreeCursor;
 use crate::storage::btree::BTreeKey;
 use crate::storage::btree::CursorValidState;
 use crate::storage::sqlite3_ondisk::DatabaseHeader;
-use crate::storage::wal::TursoRwLock;
 use crate::types::IOCompletions;
 use crate::types::IOResult;
 use crate::types::ImmutableRecord;
@@ -16,6 +15,7 @@ use crate::Completion;
 use crate::IOExt;
 use crate::LimboError;
 use crate::Result;
+use crate::IO;
 use crate::{Connection, Pager};
 use crossbeam_skiplist::{SkipMap, SkipSet};
 use parking_lot::RwLock;
@@ -25,6 +25,7 @@ use std::collections::HashSet;
 use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::ops::Bound;
+use std::sync::atomic::AtomicU8;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tracing::instrument;
@@ -289,13 +290,35 @@ pub enum CommitState {
         end_ts: u64,
         log_record: LogRecord,
     },
+    /// Wait for the group commit to start.
+    /// The group commit starts immediately when there are [GROUP_COMMIT_MAX_SIZE] transactions in the group commit,
+    /// but also after [GROUP_COMMIT_WAIT_TIME_LIMIT_MICROS] microseconds, whichever comes first.
+    WaitForGroupCommitStart {
+        is_leader: bool,
+        end_ts: u64,
+    },
+    /// Wait for the group commit to end.
+    /// Follower transactions will loop here until the leader does the write and fsyncs.
+    WaitForGroupCommitEnd {
+        end_ts: u64,
+    },
+    /// Commit the logical log (leader only)
+    CommitLogicalLog {
+        end_ts: u64,
+    },
+    /// End the commit of the logical log (leader only)
     EndCommitLogicalLog {
         end_ts: u64,
     },
+    /// Sync the logical log (leader only)
     SyncLogicalLog {
         end_ts: u64,
     },
+    /// End the group commit. Leader will set the state to [GroupCommitState::Finalizing]
+    /// and followers will enter this state after the new state is set.
+    /// Group commit ends once all participants have released the pager commit semaphore.
     CommitEnd {
+        is_leader: bool,
         end_ts: u64,
     },
 }
@@ -309,10 +332,131 @@ pub enum WriteRowState {
     Next,
 }
 
+const GROUP_COMMIT_MAX_SIZE: usize = 4;
+const GROUP_COMMIT_WAIT_TIME_LIMIT_MICROS: u128 = 50;
+
+#[derive(Debug, PartialEq, Eq)]
+enum GroupCommitState {
+    Collecting,
+    Started,
+    Finalizing,
+}
+
 #[derive(Debug)]
+struct GroupCommit {
+    /// The transactions in the group commit.
+    txns: [Option<(u64, u64, LogRecord)>; GROUP_COMMIT_MAX_SIZE], // (end_ts, tx_id, log_record)
+    /// The timestamp when the group commit starts; it will start immediately when
+    /// there are [GROUP_COMMIT_MAX_SIZE] transactions in the group commit,
+    /// but also after a specified time limit, which is this field.
+    starts_at: u128,
+    state: GroupCommitState,
+}
+
+impl GroupCommit {
+    fn new(current_time_micros: u128, end_ts: u64, tx_id: u64, log_record: LogRecord) -> Self {
+        let mut txns = [const { None }; GROUP_COMMIT_MAX_SIZE];
+        txns[0] = Some((end_ts, tx_id, log_record));
+        Self {
+            txns,
+            starts_at: current_time_micros + GROUP_COMMIT_WAIT_TIME_LIMIT_MICROS,
+            state: GroupCommitState::Collecting,
+        }
+    }
+}
+
 struct CommitCoordinator {
-    pager_commit_lock: Arc<TursoRwLock>,
-    commits_waiting: Arc<AtomicU64>,
+    io: Arc<dyn IO>,
+    pager_commit_semaphore: Arc<AtomicU8>,
+    group_commit: Arc<RwLock<Option<GroupCommit>>>,
+}
+
+impl Debug for CommitCoordinator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CommitCoordinator").finish()
+    }
+}
+
+enum JoinGroupCommitResult {
+    Leader,
+    Follower,
+    AlreadyFull,
+}
+
+impl CommitCoordinator {
+    pub fn semaphore_try_acquire(&self) -> bool {
+        let current = self.pager_commit_semaphore.load(Ordering::SeqCst);
+        if current >= GROUP_COMMIT_MAX_SIZE as u8 {
+            return false;
+        }
+        self.pager_commit_semaphore
+            .compare_exchange(current, current + 1, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
+
+    /// Join the current group commit or initiate a new one.
+    pub fn join_group_commit(
+        &self,
+        end_ts: u64,
+        tx_id: u64,
+        log_record: LogRecord,
+    ) -> JoinGroupCommitResult {
+        let mut maybe_group_commit = self.group_commit.write();
+        let acquired = self.semaphore_try_acquire();
+        if !acquired {
+            return JoinGroupCommitResult::AlreadyFull;
+        }
+        if let Some(group_commit) = maybe_group_commit.as_mut() {
+            if group_commit.state != GroupCommitState::Collecting {
+                self.semaphore_release();
+                return JoinGroupCommitResult::AlreadyFull;
+            }
+            for i in 0..GROUP_COMMIT_MAX_SIZE as usize {
+                if group_commit.txns[i].is_none() {
+                    group_commit.txns[i] = Some((end_ts, tx_id, log_record));
+                    assert!(
+                        self.participants() == i + 1,
+                        "Participants must be {}, got {}",
+                        i + 1,
+                        self.participants()
+                    );
+                    return if i == 0 {
+                        JoinGroupCommitResult::Leader
+                    } else {
+                        JoinGroupCommitResult::Follower
+                    };
+                }
+            }
+            panic!("Group commit is full");
+        }
+
+        let current_time_micros = self.io.now().as_micros();
+        assert!(
+            self.participants() == 1,
+            "Participants must be 1, got {}",
+            self.participants()
+        );
+        maybe_group_commit.replace(GroupCommit::new(
+            current_time_micros,
+            end_ts,
+            tx_id,
+            log_record,
+        ));
+        JoinGroupCommitResult::Leader
+    }
+
+    pub fn semaphore_release(&self) {
+        let prev = self.pager_commit_semaphore.fetch_sub(1, Ordering::SeqCst);
+        assert!(
+            prev > 0 && prev <= GROUP_COMMIT_MAX_SIZE as u8,
+            "Semaphore release wraparound: previous value was {}",
+            prev
+        );
+    }
+
+    pub fn participants(&self) -> usize {
+        self.pager_commit_semaphore.load(Ordering::SeqCst) as usize
+    }
 }
 
 pub struct CommitStateMachine<Clock: LogicalClock> {
@@ -540,7 +684,6 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     tx.state.store(TransactionState::Committed(end_ts));
                     if mvcc_store.is_exclusive_tx(&self.tx_id) {
                         mvcc_store.release_exclusive_tx(&self.tx_id);
-                        self.commit_coordinator.pager_commit_lock.unlock();
                     }
                     self.finalize(mvcc_store)?;
                     return Ok(TransitionResult::Done(()));
@@ -575,18 +718,6 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 // * We don't want BTree modifications to happen in parallel.
                 // If any of these were to happen, we would find ourselves in a bad corruption situation.
 
-                // NOTE: since we are blocking for `begin_write_tx` we do not care about re-entrancy right now.
-                let locked = self.commit_coordinator.pager_commit_lock.write();
-                if !locked {
-                    self.commit_coordinator
-                        .commits_waiting
-                        .fetch_add(1, Ordering::SeqCst);
-                    // FIXME: IOCompletions still needs a yield variant...
-                    return Ok(TransitionResult::Io(crate::types::IOCompletions::Single(
-                        Completion::new_dummy(),
-                    )));
-                }
-
                 self.update_pager_header(mvcc_store)?;
 
                 {
@@ -608,14 +739,14 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 let result = self.pager.begin_read_tx();
                 if let Err(LimboError::Busy) = result {
                     // We cannot obtain a WAL read lock due to contention, so we must abort.
-                    self.commit_coordinator.pager_commit_lock.unlock();
+                    self.commit_coordinator.semaphore_release();
                     return Err(LimboError::WriteWriteConflict);
                 }
                 result?;
                 let result = self.pager.io.block(|| self.pager.begin_write_tx());
                 if let Err(LimboError::Busy) = result {
                     // There is a non-CONCURRENT transaction holding the write lock. We must abort.
-                    self.commit_coordinator.pager_commit_lock.unlock();
+                    self.commit_coordinator.semaphore_release();
                     return Err(LimboError::WriteWriteConflict);
                 }
                 result?;
@@ -777,7 +908,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                         let tx = mvcc_store.txs.get(&self.tx_id).unwrap();
                         let tx_unlocked = tx.value();
                         self.header.write().replace(*tx_unlocked.header.borrow());
-                        self.commit_coordinator.pager_commit_lock.unlock();
+                        self.commit_coordinator.semaphore_release();
                         // TODO: here mark we are ready for a batch
                         self.state = CommitState::Commit { end_ts: *end_ts };
                         return Ok(TransitionResult::Continue);
@@ -826,7 +957,10 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
 
                 if log_record.row_versions.is_empty() {
                     // Nothing to do, just end commit.
-                    self.state = CommitState::CommitEnd { end_ts: *end_ts };
+                    self.state = CommitState::CommitEnd {
+                        end_ts: *end_ts,
+                        is_leader: false,
+                    };
                 } else {
                     // We might need to serialize log writes
                     self.state = CommitState::BeginCommitLogicalLog {
@@ -837,16 +971,65 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 return Ok(TransitionResult::Continue);
             }
             CommitState::BeginCommitLogicalLog { end_ts, log_record } => {
-                if !mvcc_store.is_exclusive_tx(&self.tx_id) {
-                    // logical log needs to be serialized
-                    let locked = self.commit_coordinator.pager_commit_lock.write();
-                    if !locked {
+                let result = self.commit_coordinator.join_group_commit(
+                    *end_ts,
+                    self.tx_id,
+                    log_record.clone(),
+                );
+                match result {
+                    JoinGroupCommitResult::Leader => {
+                        self.state = CommitState::WaitForGroupCommitStart {
+                            is_leader: true,
+                            end_ts: *end_ts,
+                        };
+                    }
+                    JoinGroupCommitResult::Follower => {
+                        self.state = CommitState::WaitForGroupCommitStart {
+                            is_leader: false,
+                            end_ts: *end_ts,
+                        };
+                    }
+                    JoinGroupCommitResult::AlreadyFull => {
                         return Ok(TransitionResult::Io(IOCompletions::Single(
                             Completion::new_dummy(),
                         )));
                     }
                 }
-                let result = mvcc_store.storage.log_tx(log_record)?;
+                return Ok(TransitionResult::Continue);
+            }
+            CommitState::WaitForGroupCommitStart { is_leader, end_ts } => {
+                if !*is_leader {
+                    self.state = CommitState::WaitForGroupCommitEnd { end_ts: *end_ts };
+                    return Ok(TransitionResult::Continue);
+                }
+                let mut group_commit = self.commit_coordinator.group_commit.write();
+                let group_commit = group_commit.as_mut().unwrap();
+                let mut should_start =
+                    group_commit.txns.iter().flatten().count() == GROUP_COMMIT_MAX_SIZE;
+                if !should_start {
+                    should_start =
+                        group_commit.starts_at <= self.commit_coordinator.io.now().as_micros();
+                }
+                if should_start {
+                    group_commit.state = GroupCommitState::Started;
+                    self.state = CommitState::CommitLogicalLog { end_ts: *end_ts };
+                } else {
+                    return Ok(TransitionResult::Io(IOCompletions::Single(
+                        Completion::new_dummy(),
+                    )));
+                }
+                return Ok(TransitionResult::Continue);
+            }
+            CommitState::CommitLogicalLog { end_ts } => {
+                assert!(
+                    self.commit_coordinator.participants() > 0
+                        && self.commit_coordinator.participants() <= GROUP_COMMIT_MAX_SIZE,
+                    "Participants must be between 1 and {}",
+                    GROUP_COMMIT_MAX_SIZE
+                );
+                let group_commit = self.commit_coordinator.group_commit.read();
+                let group_commit = group_commit.as_ref().unwrap();
+                let result = mvcc_store.storage.log_tx(&group_commit.txns)?;
                 self.state = CommitState::SyncLogicalLog { end_ts: *end_ts };
                 match result {
                     IOResult::Done(_) => {}
@@ -859,6 +1042,12 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 return Ok(TransitionResult::Continue);
             }
             CommitState::SyncLogicalLog { end_ts } => {
+                assert!(
+                    self.commit_coordinator.participants() > 0
+                        && self.commit_coordinator.participants() <= GROUP_COMMIT_MAX_SIZE,
+                    "Participants must be between 1 and {}",
+                    GROUP_COMMIT_MAX_SIZE
+                );
                 let result = mvcc_store.storage.sync()?;
                 self.state = CommitState::EndCommitLogicalLog { end_ts: *end_ts };
                 if let IOResult::IO(io) = result {
@@ -869,6 +1058,12 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 return Ok(TransitionResult::Continue);
             }
             CommitState::EndCommitLogicalLog { end_ts } => {
+                assert!(
+                    self.commit_coordinator.participants() > 0
+                        && self.commit_coordinator.participants() <= GROUP_COMMIT_MAX_SIZE,
+                    "Participants must be between 1 and {}",
+                    GROUP_COMMIT_MAX_SIZE
+                );
                 let connection = self.connection.clone();
                 let schema_did_change = match connection.transaction_state.get() {
                     crate::TransactionState::Write { schema_did_change } => schema_did_change,
@@ -878,15 +1073,48 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     let schema = connection.schema.borrow().clone();
                     connection.db.update_schema_if_newer(schema)?;
                 }
-                let tx = mvcc_store.txs.get(&self.tx_id).unwrap();
-                let tx_unlocked = tx.value();
-                self.header.write().replace(*tx_unlocked.header.borrow());
-                tracing::trace!("end_commit_logical_log(tx_id={})", self.tx_id);
-                self.commit_coordinator.pager_commit_lock.unlock();
-                self.state = CommitState::CommitEnd { end_ts: *end_ts };
+                let group_commit = self.commit_coordinator.group_commit.read();
+                let group_commit = group_commit.as_ref().unwrap();
+                for (_, tx_id, _) in group_commit.txns.iter().flatten() {
+                    let tx = mvcc_store.txs.get(&tx_id).unwrap();
+                    let tx_unlocked = tx.value();
+                    self.header.write().replace(*tx_unlocked.header.borrow());
+                    tracing::trace!("end_commit_logical_log(tx_id={})", self.tx_id);
+                }
+                self.state = CommitState::CommitEnd {
+                    end_ts: *end_ts,
+                    is_leader: true,
+                };
                 return Ok(TransitionResult::Continue);
             }
-            CommitState::CommitEnd { end_ts } => {
+            CommitState::WaitForGroupCommitEnd { end_ts } => {
+                assert!(
+                    self.commit_coordinator.participants() > 0
+                        && self.commit_coordinator.participants() <= GROUP_COMMIT_MAX_SIZE,
+                    "Participants must be between 1 and {}",
+                    GROUP_COMMIT_MAX_SIZE
+                );
+                let group_commit = self.commit_coordinator.group_commit.read();
+                let group_commit = group_commit.as_ref().unwrap();
+                if group_commit.state != GroupCommitState::Finalizing {
+                    return Ok(TransitionResult::Io(IOCompletions::Single(
+                        Completion::new_dummy(),
+                    )));
+                }
+                self.state = CommitState::CommitEnd {
+                    end_ts: *end_ts,
+                    is_leader: false,
+                };
+                return Ok(TransitionResult::Continue);
+            }
+            CommitState::CommitEnd { end_ts, is_leader } => {
+                // TODO: handle rolling back follower transactions if leader failed
+                assert!(
+                    self.commit_coordinator.participants() > 0
+                        && self.commit_coordinator.participants() <= GROUP_COMMIT_MAX_SIZE,
+                    "Participants must be between 1 and {}",
+                    GROUP_COMMIT_MAX_SIZE
+                );
                 let tx = mvcc_store.txs.get(&self.tx_id).unwrap();
                 let tx_unlocked = tx.value();
                 tx_unlocked
@@ -906,7 +1134,18 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     mvcc_store.release_exclusive_tx(&self.tx_id);
                 }
                 tracing::trace!("logged(tx_id={}, end_ts={})", self.tx_id, *end_ts);
+                if *is_leader {
+                    let mut g = self.commit_coordinator.group_commit.write();
+                    let g = g.as_mut().unwrap();
+                    g.state = GroupCommitState::Finalizing;
+                }
+                self.commit_coordinator.semaphore_release();
+                if self.commit_coordinator.participants() == 0 {
+                    let mut g = self.commit_coordinator.group_commit.write();
+                    let _ = g.take();
+                }
                 self.finalize(mvcc_store)?;
+
                 Ok(TransitionResult::Done(()))
             }
         }
@@ -1113,7 +1352,7 @@ pub struct MvStore<Clock: LogicalClock> {
 
 impl<Clock: LogicalClock> MvStore<Clock> {
     /// Creates a new database.
-    pub fn new(clock: Clock, storage: Storage) -> Self {
+    pub fn new(io: Arc<dyn IO>, clock: Clock, storage: Storage) -> Self {
         Self {
             rows: SkipMap::new(),
             txs: SkipMap::new(),
@@ -1124,8 +1363,9 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             loaded_tables: RwLock::new(HashSet::new()),
             exclusive_tx: RwLock::new(None),
             commit_coordinator: Arc::new(CommitCoordinator {
-                pager_commit_lock: Arc::new(TursoRwLock::new()),
-                commits_waiting: Arc::new(AtomicU64::new(0)),
+                io,
+                pager_commit_semaphore: Arc::new(AtomicU8::new(0)),
+                group_commit: Arc::new(RwLock::new(None)),
             }),
             global_header: Arc::new(RwLock::new(None)),
         }
@@ -1416,16 +1656,6 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
         self.acquire_exclusive_tx(&tx_id)?;
 
-        let locked = self.commit_coordinator.pager_commit_lock.write();
-        if !locked {
-            tracing::debug!(
-                "begin_exclusive_tx: tx_id={} failed with Busy on pager_commit_lock",
-                tx_id
-            );
-            self.release_exclusive_tx(&tx_id);
-            return Err(LimboError::Busy);
-        }
-
         let header = self.get_new_transaction_database_header(&pager);
 
         let tx = Transaction::new(tx_id, begin_ts, header);
@@ -1573,7 +1803,6 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         let write_set: Vec<RowID> = tx.write_set.iter().map(|v| *v.value()).collect();
 
         if self.is_exclusive_tx(&tx_id) {
-            self.commit_coordinator.pager_commit_lock.unlock();
             self.release_exclusive_tx(&tx_id);
         }
 

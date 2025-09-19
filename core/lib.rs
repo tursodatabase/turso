@@ -395,7 +395,11 @@ impl Database {
         let mv_store = if opts.enable_mvcc {
             let file = io.open_file(&format!("{path}-lg"), OpenFlags::default(), false)?;
             let storage = mvcc::persistent_storage::Storage::new(file);
-            Some(Arc::new(MvStore::new(mvcc::LocalClock::new(), storage)))
+            Some(Arc::new(MvStore::new(
+                io.clone(),
+                mvcc::LocalClock::new(),
+                storage,
+            )))
         } else {
             None
         };

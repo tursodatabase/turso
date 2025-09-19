@@ -21,7 +21,7 @@ impl Storage {
 }
 
 impl Storage {
-    pub fn log_tx(&self, m: &LogRecord) -> Result<IOResult<()>> {
+    pub fn log_tx(&self, m: &[Option<(u64, u64, LogRecord)>]) -> Result<IOResult<()>> {
         self.logical_log.borrow_mut().log_tx(m)
     }
 

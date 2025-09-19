@@ -19,21 +19,23 @@ impl LogicalLog {
         Self { file, offset: 0 }
     }
 
-    pub fn log_tx(&mut self, tx: &LogRecord) -> Result<IOResult<()>> {
+    pub fn log_tx(&mut self, txs: &[Option<(u64, u64, LogRecord)>]) -> Result<IOResult<()>> {
         let mut buffer = Vec::new();
-        buffer.extend_from_slice(&tx.tx_timestamp.to_be_bytes());
-        tx.row_versions.iter().for_each(|row_version| {
-            let data = &row_version.row.data;
-            buffer.extend_from_slice(&row_version.row.id.table_id.to_be_bytes());
-            buffer.extend_from_slice(&row_version.row.id.row_id.to_be_bytes());
-            if row_version.end.is_some() {
-                buffer.extend_from_slice(&TOMBSTONE.to_be_bytes());
-            } else {
-                buffer.extend_from_slice(&NOT_TOMBSTONE.to_be_bytes());
-                buffer.extend_from_slice(&row_version.row.column_count.to_be_bytes());
-                buffer.extend_from_slice(data);
-            }
-        });
+        for (_, _, tx) in txs.iter().flatten() {
+            buffer.extend_from_slice(&tx.tx_timestamp.to_be_bytes());
+            tx.row_versions.iter().for_each(|row_version| {
+                let data = &row_version.row.data;
+                buffer.extend_from_slice(&row_version.row.id.table_id.to_be_bytes());
+                buffer.extend_from_slice(&row_version.row.id.row_id.to_be_bytes());
+                if row_version.end.is_some() {
+                    buffer.extend_from_slice(&TOMBSTONE.to_be_bytes());
+                } else {
+                    buffer.extend_from_slice(&NOT_TOMBSTONE.to_be_bytes());
+                    buffer.extend_from_slice(&row_version.row.column_count.to_be_bytes());
+                    buffer.extend_from_slice(data);
+                }
+            });
+        }
         let buffer = Arc::new(Buffer::new(buffer));
         let c = Completion::new_write({
             let buffer = buffer.clone();
