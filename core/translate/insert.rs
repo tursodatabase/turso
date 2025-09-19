@@ -10,7 +10,8 @@ use crate::translate::emitter::{
     emit_cdc_insns, emit_cdc_patch_record, prepare_cdc_if_necessary, OperationMode,
 };
 use crate::translate::expr::{
-    emit_returning_results, process_returning_clause, ReturningValueRegisters,
+    bind_and_rewrite_expr, emit_returning_results, process_returning_clause, ParamState,
+    ReturningValueRegisters,
 };
 use crate::translate::planner::ROWID;
 use crate::translate::upsert::{
@@ -31,7 +32,6 @@ use crate::{Result, SymbolTable, VirtualTable};
 
 use super::emitter::Resolver;
 use super::expr::{translate_expr, translate_expr_no_constant_opt, NoConstantOptReason};
-use super::optimizer::rewrite_expr;
 use super::plan::QueryDestination;
 use super::select::translate_select;
 
@@ -118,7 +118,7 @@ pub fn translate_insert(
     let mut values: Option<Vec<Box<Expr>>> = None;
     let mut upsert_opt: Option<Upsert> = None;
 
-    let mut param_idx = 1;
+    let mut param_ctx = ParamState::default();
     let mut inserting_multiple_rows = false;
     if let InsertBody::Select(select, upsert) = &mut body {
         match &mut select.body.select {
@@ -144,7 +144,7 @@ pub fn translate_insert(
                         }
                         _ => {}
                     }
-                    rewrite_expr(expr, &mut param_idx)?;
+                    bind_and_rewrite_expr(expr, None, None, connection, &mut param_ctx)?;
                 }
                 values = values_expr.pop();
             }
@@ -157,10 +157,10 @@ pub fn translate_insert(
             } = &mut upsert.do_clause
             {
                 for set in sets.iter_mut() {
-                    rewrite_expr(set.expr.as_mut(), &mut param_idx)?;
+                    bind_and_rewrite_expr(&mut set.expr, None, None, connection, &mut param_ctx)?;
                 }
                 if let Some(ref mut where_expr) = where_clause {
-                    rewrite_expr(where_expr.as_mut(), &mut param_idx)?;
+                    bind_and_rewrite_expr(where_expr, None, None, connection, &mut param_ctx)?;
                 }
             }
         }
@@ -180,6 +180,7 @@ pub fn translate_insert(
         table_name.as_str(),
         &mut program,
         connection,
+        &mut param_ctx,
     )?;
 
     let mut yield_reg_opt = None;

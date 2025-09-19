@@ -1,5 +1,6 @@
 use crate::schema::Table;
 use crate::translate::emitter::emit_program;
+use crate::translate::expr::ParamState;
 use crate::translate::optimizer::optimize_plan;
 use crate::translate::plan::{DeletePlan, Operation, Plan};
 use crate::translate::planner::{parse_limit, parse_where};
@@ -108,6 +109,7 @@ pub fn prepare_delete_plan(
     let mut table_references = TableReferences::new(joined_tables, vec![]);
 
     let mut where_predicates = vec![];
+    let mut param_ctx = ParamState::default();
 
     // Parse the WHERE clause
     parse_where(
@@ -116,11 +118,13 @@ pub fn prepare_delete_plan(
         None,
         &mut where_predicates,
         connection,
+        &mut param_ctx,
     )?;
 
     // Parse the LIMIT/OFFSET clause
-    let (resolved_limit, resolved_offset) =
-        limit.map_or(Ok((None, None)), |mut l| parse_limit(&mut l, connection))?;
+    let (resolved_limit, resolved_offset) = limit.map_or(Ok((None, None)), |mut l| {
+        parse_limit(&mut l, connection, &mut param_ctx)
+    })?;
 
     let plan = DeletePlan {
         table_references,
