@@ -72,6 +72,13 @@ impl InteractionPlan {
                         tables.retain(|table| depending_tables.contains(table));
                     }
                     true
+                } else if matches!(
+                    interactions.interactions,
+                    InteractionsType::Query(Query::Begin(..))
+                        | InteractionsType::Query(Query::Commit(..))
+                        | InteractionsType::Query(Query::Rollback(..))
+                ) {
+                    true
                 } else {
                     let mut has_table = interactions
                         .uses()
@@ -122,6 +129,45 @@ impl InteractionPlan {
                                     )
                             ))
                 };
+                idx += 1;
+                retain
+            });
+
+            // Comprise of idxs of Begin interactions
+            let mut begin_idx = Vec::new();
+            // Comprise of idxs of the intereactions Commit and Rollback
+            let mut end_tx_idx = Vec::new();
+
+            for (idx, interactions) in plan.plan.iter().enumerate() {
+                match &interactions.interactions {
+                    InteractionsType::Query(Query::Begin(..)) => {
+                        begin_idx.push(idx);
+                    }
+                    InteractionsType::Query(Query::Commit(..))
+                    | InteractionsType::Query(Query::Rollback(..)) => {
+                        let last_begin = begin_idx.last().unwrap() + 1;
+                        if last_begin == idx {
+                            end_tx_idx.push(idx);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            // remove interactions if its just a Begin Commit/Rollback with no queries in the middle
+            let mut range_transactions = end_tx_idx.into_iter().peekable();
+            let mut idx = 0;
+            plan.plan.retain_mut(|_| {
+                let mut retain = true;
+
+                if let Some(txn_interaction_idx) = range_transactions.peek().copied() {
+                    if txn_interaction_idx == idx {
+                        range_transactions.next();
+                    }
+                    if txn_interaction_idx == idx || txn_interaction_idx.saturating_sub(1) == idx {
+                        retain = false;
+                    }
+                }
                 idx += 1;
                 retain
             });
