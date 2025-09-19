@@ -92,7 +92,7 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
                 }
                 match &values[args_index].get_value() {
                     Value::Text(t) => result.push_str(t.as_str()),
-                    Value::Null => result.push_str("(null)"),
+                    Value::Null => (),
                     v => result.push_str(&format!("{v}")),
                 }
                 args_index += 1;
@@ -282,7 +282,7 @@ mod tests {
             // String with null value
             (
                 vec![text("Hello, %s!"), Register::Value(Value::Null)],
-                text("Hello, (null)!"),
+                text("Hello, !"),
             ),
             // String with number conversion
             (vec![text("Value: %s"), integer(42)], text("Value: 42")),
