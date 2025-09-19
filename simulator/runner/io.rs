@@ -7,6 +7,7 @@ use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use turso_core::{Clock, IO, Instant, OpenFlags, PlatformIO, Result};
 
+use crate::profiles::io::ShortWriteProfile;
 use crate::runner::{SimIO, clock::SimulatorClock, file::SimulatorFile};
 
 pub(crate) struct SimulatorIO {
@@ -18,6 +19,7 @@ pub(crate) struct SimulatorIO {
     seed: u64,
     latency_probability: usize,
     clock: Arc<SimulatorClock>,
+    short_write_profile: ShortWriteProfile,
 }
 
 unsafe impl Send for SimulatorIO {}
@@ -30,6 +32,7 @@ impl SimulatorIO {
         latency_probability: usize,
         min_tick: u64,
         max_tick: u64,
+        short_write_profile: ShortWriteProfile,
     ) -> Result<Self> {
         let inner = Box::new(PlatformIO::new()?);
         let fault = Cell::new(false);
@@ -46,6 +49,7 @@ impl SimulatorIO {
             seed,
             latency_probability,
             clock: Arc::new(clock),
+            short_write_profile,
         })
     }
 }
@@ -111,6 +115,7 @@ impl IO for SimulatorIO {
             sync_completion: RefCell::new(None),
             queued_io: RefCell::new(Vec::new()),
             clock: self.clock.clone(),
+            short_write_profile: self.short_write_profile.clone(),
         });
         self.files.borrow_mut().push(file.clone());
         Ok(file)
