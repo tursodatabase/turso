@@ -104,7 +104,6 @@ impl IO for UnixIO {
 
         let file = file.open(path)?;
 
-        #[allow(clippy::arc_with_non_send_sync)]
         let unix_file = Arc::new(UnixFile {
             file: Arc::new(Mutex::new(file)),
         });

@@ -41,8 +41,6 @@
 //!
 //! https://www.sqlite.org/fileformat.html
 
-#![allow(clippy::arc_with_non_send_sync)]
-
 use bytemuck::{Pod, Zeroable};
 use pack1::{I32BE, U16BE, U32BE};
 use tracing::{instrument, Level};
@@ -903,7 +901,6 @@ pub fn begin_read_page(
 ) -> Result<Completion> {
     tracing::trace!("begin_read_btree_page(page_idx = {})", page_idx);
     let buf = buffer_pool.get_page();
-    #[allow(clippy::arc_with_non_send_sync)]
     let buf = Arc::new(buf);
     let complete = Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
         let Ok((mut buf, bytes_read)) = res else {
@@ -1080,7 +1077,6 @@ pub fn begin_sync(
     let completion = Completion::new_sync(move |_| {
         syncing.store(false, Ordering::SeqCst);
     });
-    #[allow(clippy::arc_with_non_send_sync)]
     db_file.sync(completion)
 }
 
@@ -2095,7 +2091,6 @@ pub fn begin_write_wal_header(io: &Arc<dyn File>, header: &WalHeader) -> Result<
         buf[24..28].copy_from_slice(&header.checksum_1.to_be_bytes());
         buf[28..32].copy_from_slice(&header.checksum_2.to_be_bytes());
 
-        #[allow(clippy::arc_with_non_send_sync)]
         Arc::new(buffer)
     };
 
@@ -2111,7 +2106,6 @@ pub fn begin_write_wal_header(io: &Arc<dyn File>, header: &WalHeader) -> Result<
             "wal header wrote({bytes_written}) != expected({WAL_HEADER_SIZE})"
         );
     };
-    #[allow(clippy::arc_with_non_send_sync)]
     let c = Completion::new_write(write_complete);
     let c = io.pwrite(0, buffer.clone(), c.clone())?;
     Ok(c)

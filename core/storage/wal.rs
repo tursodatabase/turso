@@ -2415,7 +2415,6 @@ pub mod test {
         rc::Rc,
         sync::{atomic::Ordering, Arc},
     };
-    #[allow(clippy::arc_with_non_send_sync)]
     pub(crate) fn get_database() -> (Arc<Database>, std::path::PathBuf) {
         let mut path = tempfile::tempdir().unwrap().keep();
         let dbpath = path.clone();
