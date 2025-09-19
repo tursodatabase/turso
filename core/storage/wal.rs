@@ -1545,6 +1545,9 @@ impl Wal for WalFile {
         let page_frame_for_cb = page_frame_and_checksum.clone();
         let cmp = move |res: Result<i32, CompletionError>| {
             let Ok(bytes_written) = res else {
+                for (page, ..) in &page_frame_for_cb {
+                    page.clear_dirty();
+                }
                 return;
             };
             turso_assert!(
