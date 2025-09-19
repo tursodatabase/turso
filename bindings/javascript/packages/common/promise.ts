@@ -352,7 +352,7 @@ class Statement {
         }
       }
     } finally {
-
+      this.db.execLock.release();
     }
   }
 
