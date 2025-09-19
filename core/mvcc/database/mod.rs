@@ -803,11 +803,6 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
             }
             CommitState::Commit { end_ts } => {
                 let mut log_record = LogRecord::new(*end_ts);
-                let tx = mvcc_store.txs.get(&self.tx_id).unwrap();
-                let tx_unlocked = tx.value();
-                tx_unlocked
-                    .state
-                    .store(TransactionState::Committed(*end_ts));
                 for id in &self.write_set {
                     if let Some(row_versions) = mvcc_store.rows.get(id) {
                         let mut row_versions = row_versions.value().write();
@@ -909,6 +904,11 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 return Ok(TransitionResult::Continue);
             }
             CommitState::CommitEnd { end_ts } => {
+                let tx = mvcc_store.txs.get(&self.tx_id).unwrap();
+                let tx_unlocked = tx.value();
+                tx_unlocked
+                    .state
+                    .store(TransactionState::Committed(*end_ts));
                 // We have now updated all the versions with a reference to the
                 // transaction ID to a timestamp and can, therefore, remove the
                 // transaction. Please note that when we move to lockless, the
