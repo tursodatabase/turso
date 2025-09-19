@@ -38,7 +38,7 @@ impl InternalVirtualTable for JsonEachVirtualTable {
     fn open(
         &self,
         _conn: Arc<Connection>,
-    ) -> crate::Result<std::sync::Arc<RwLock<(dyn InternalVirtualTableCursor + 'static)>>> {
+    ) -> crate::Result<std::sync::Arc<RwLock<dyn InternalVirtualTableCursor + 'static>>> {
         Ok(Arc::new(RwLock::new(JsonEachCursor::default())))
     }
 

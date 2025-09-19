@@ -2452,7 +2452,7 @@ impl Statement {
         }
     }
 
-    pub fn get_column_name(&self, idx: usize) -> Cow<str> {
+    pub fn get_column_name(&self, idx: usize) -> Cow<'_, str> {
         match self.query_mode {
             QueryMode::Normal => {
                 let column = &self.program.result_columns.get(idx).expect("No column");
@@ -2466,7 +2466,7 @@ impl Statement {
         }
     }
 
-    pub fn get_column_table_name(&self, idx: usize) -> Option<Cow<str>> {
+    pub fn get_column_table_name(&self, idx: usize) -> Option<Cow<'_, str>> {
         let column = &self.program.result_columns.get(idx).expect("No column");
         match &column.expr {
             turso_parser::ast::Expr::Column { table, .. } => self

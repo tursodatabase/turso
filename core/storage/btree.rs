@@ -4633,7 +4633,7 @@ impl BTreeCursor {
     /// If record was not parsed yet, then we have to parse it and in case of I/O we yield control
     /// back.
     #[instrument(skip(self), level = Level::DEBUG)]
-    pub fn record(&self) -> Result<IOResult<Option<Ref<ImmutableRecord>>>> {
+    pub fn record(&self) -> Result<IOResult<Option<Ref<'_, ImmutableRecord>>>> {
         if !self.has_record.get() && self.mv_cursor.is_none() {
             return Ok(IOResult::Done(None));
         }
