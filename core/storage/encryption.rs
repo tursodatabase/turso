@@ -1,5 +1,4 @@
 #![allow(unused_variables, dead_code)]
-use crate::storage::sqlite3_ondisk::DatabaseHeader;
 use crate::{LimboError, Result};
 use aegis::aegis128l::Aegis128L;
 use aegis::aegis128x2::Aegis128X2;
@@ -426,6 +425,7 @@ impl EncryptionContext {
 
     #[cfg(feature = "encryption")]
     pub fn encrypt_page(&self, page: &[u8], page_id: usize) -> Result<Vec<u8>> {
+        use crate::storage::sqlite3_ondisk::DatabaseHeader;
         tracing::debug!("encrypting page {}", page_id);
         assert_eq!(
             page.len(),
@@ -473,6 +473,7 @@ impl EncryptionContext {
 
     #[cfg(feature = "encryption")]
     pub fn decrypt_page(&self, encrypted_page: &[u8], page_id: usize) -> Result<Vec<u8>> {
+        use crate::storage::sqlite3_ondisk::DatabaseHeader;
         tracing::debug!("decrypting page {}", page_id);
         assert_eq!(
             encrypted_page.len(),
@@ -626,6 +627,7 @@ impl From<CipherError> for LimboError {
 }
 
 #[cfg(test)]
+#[cfg(feature = "encryption")]
 mod tests {
     use super::*;
     use rand::Rng;
@@ -634,7 +636,6 @@ mod tests {
     macro_rules! test_cipher_wrapper {
         ($test_name:ident, $cipher_type:ty, $key_gen:expr, $nonce_size:literal, $message:literal) => {
             #[test]
-            #[cfg(feature = "encryption")]
             fn $test_name() {
                 let key = EncryptionKey::from_hex_string(&$key_gen()).unwrap();
                 let cipher = <$cipher_type>::new(&key);
@@ -655,7 +656,6 @@ mod tests {
     macro_rules! test_aes_cipher_wrapper {
         ($test_name:ident, $cipher_type:ty, $key_gen:expr, $nonce_size:literal, $message:literal) => {
             #[test]
-            #[cfg(feature = "encryption")]
             fn $test_name() {
                 let key = EncryptionKey::from_hex_string(&$key_gen()).unwrap();
                 let cipher = <$cipher_type>::new(&key).unwrap();
@@ -676,7 +676,6 @@ mod tests {
     macro_rules! test_raw_encryption {
         ($test_name:ident, $cipher_mode:expr, $key_gen:expr, $nonce_size:literal, $message:literal) => {
             #[test]
-            #[cfg(feature = "encryption")]
             fn $test_name() {
                 let key = EncryptionKey::from_hex_string(&$key_gen()).unwrap();
                 let ctx = EncryptionContext::new($cipher_mode, &key, DEFAULT_ENCRYPTED_PAGE_SIZE)
@@ -725,7 +724,6 @@ mod tests {
     );
 
     #[test]
-    #[cfg(feature = "encryption")]
     fn test_aes128gcm_encrypt_decrypt_round_trip() {
         let mut rng = rand::thread_rng();
         let cipher_mode = CipherMode::Aes128Gcm;
@@ -756,7 +754,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "encryption")]
     fn test_aes_encrypt_decrypt_round_trip() {
         let mut rng = rand::thread_rng();
         let cipher_mode = CipherMode::Aes256Gcm;
@@ -803,7 +800,6 @@ mod tests {
     );
 
     #[test]
-    #[cfg(feature = "encryption")]
     fn test_aegis256_encrypt_decrypt_round_trip() {
         let mut rng = rand::thread_rng();
         let cipher_mode = CipherMode::Aegis256;
@@ -849,7 +845,6 @@ mod tests {
     );
 
     #[test]
-    #[cfg(feature = "encryption")]
     fn test_aegis128x2_encrypt_decrypt_round_trip() {
         let mut rng = rand::thread_rng();
         let cipher_mode = CipherMode::Aegis128X2;
@@ -895,7 +890,6 @@ mod tests {
     );
 
     #[test]
-    #[cfg(feature = "encryption")]
     fn test_aegis128l_encrypt_decrypt_round_trip() {
         let mut rng = rand::thread_rng();
         let cipher_mode = CipherMode::Aegis128L;
@@ -941,7 +935,6 @@ mod tests {
     );
 
     #[test]
-    #[cfg(feature = "encryption")]
     fn test_aegis128x4_encrypt_decrypt_round_trip() {
         let mut rng = rand::thread_rng();
         let cipher_mode = CipherMode::Aegis128X4;
@@ -987,7 +980,6 @@ mod tests {
     );
 
     #[test]
-    #[cfg(feature = "encryption")]
     fn test_aegis256x2_encrypt_decrypt_round_trip() {
         let mut rng = rand::thread_rng();
         let cipher_mode = CipherMode::Aegis256X2;
@@ -1033,7 +1025,6 @@ mod tests {
     );
 
     #[test]
-    #[cfg(feature = "encryption")]
     fn test_aegis256x4_encrypt_decrypt_round_trip() {
         let mut rng = rand::thread_rng();
         let cipher_mode = CipherMode::Aegis256X4;

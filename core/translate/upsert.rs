@@ -39,28 +39,26 @@ pub struct ConflictTarget {
 // Extract `(column, optional_collate)` from an ON CONFLICT target Expr.
 // Accepts: Id, Qualified, DoublyQualified, Parenthesized, Collate
 fn extract_target_key(e: &ast::Expr) -> Option<ConflictTarget> {
+    use ast::Name::{Ident, Quoted};
     match e {
-        // expr COLLATE c: carry c and keep descending into expr
         ast::Expr::Collate(inner, c) => {
             let mut tk = extract_target_key(inner.as_ref())?;
             let cstr = match c {
-                ast::Name::Ident(s) => s.as_str(),
-                _ => return None,
+                Ident(s) | Quoted(s) => s.as_str(),
             };
             tk.collate = Some(cstr.to_ascii_lowercase());
             Some(tk)
         }
         ast::Expr::Parenthesized(v) if v.len() == 1 => extract_target_key(&v[0]),
-        // Bare identifier
-        ast::Expr::Id(ast::Name::Ident(name)) => Some(ConflictTarget {
+
+        ast::Expr::Id(Ident(name)) | ast::Expr::Id(Quoted(name)) => Some(ConflictTarget {
             col_name: normalize_ident(name),
             collate: None,
         }),
-        // t.a or db.t.a
+        // t.a or db.t.a: accept ident or quoted in the column position
         ast::Expr::Qualified(_, col) | ast::Expr::DoublyQualified(_, _, col) => {
             let cname = match col {
-                ast::Name::Ident(s) => s.as_str(),
-                _ => return None,
+                Ident(s) | Quoted(s) => s.as_str(),
             };
             Some(ConflictTarget {
                 col_name: normalize_ident(cname),
@@ -526,38 +524,39 @@ fn rewrite_upsert_expr_in_place(
     conflict_rowid_reg: usize,
     insertion: &Insertion,
 ) -> crate::Result<WalkControl> {
-    use ast::Expr;
+    use ast::{Expr, Name};
 
-    // helper: return the CURRENT-row register for a column (including rowid alias)
     let col_reg = |name: &str| -> Option<usize> {
         if name.eq_ignore_ascii_case("rowid") {
             return Some(conflict_rowid_reg);
         }
-        let (idx, _c) = table.get_column_by_name(&normalize_ident(name))?;
+        let (idx, _) = table.get_column_by_name(name)?;
         Some(current_start + idx)
     };
+
     walk_expr_mut(
         e,
         &mut |expr: &mut ast::Expr| -> crate::Result<WalkControl> {
             match expr {
-                // EXCLUDED.x -> insertion register
-                Expr::Qualified(ns, ast::Name::Ident(c)) => {
-                    if ns.as_str().eq_ignore_ascii_case("excluded") {
-                        let Some(reg) = insertion.get_col_mapping_by_name(c.as_str()) else {
+                // EXCLUDED.x or t.x (t may be quoted)
+                Expr::Qualified(ns, Name::Ident(c) | Name::Quoted(c))
+                | Expr::DoublyQualified(_, ns, Name::Ident(c) | Name::Quoted(c)) => {
+                    let ns = normalize_ident(ns.as_str());
+                    let c = normalize_ident(c.as_str());
+                    if ns.eq_ignore_ascii_case("excluded") {
+                        let Some(reg) = insertion.get_col_mapping_by_name(&c) else {
                             bail_parse_error!("no such column in EXCLUDED: {}", c);
                         };
                         *expr = Expr::Register(reg.register);
-                    } else if ns.as_str().eq_ignore_ascii_case(table_name)
-                    // t.x -> CURRENT, only if t matches the target table name (never "excluded")
-                    {
+                    } else if ns.eq_ignore_ascii_case(table_name) {
                         if let Some(reg) = col_reg(c.as_str()) {
                             *expr = Expr::Register(reg);
                         }
                     }
                 }
                 // Unqualified column id -> CURRENT
-                Expr::Id(ast::Name::Ident(name)) => {
-                    if let Some(reg) = col_reg(name.as_str()) {
+                Expr::Id(Name::Ident(name)) | Expr::Id(Name::Quoted(name)) => {
+                    if let Some(reg) = col_reg(&normalize_ident(name.as_str())) {
                         *expr = Expr::Register(reg);
                     }
                 }

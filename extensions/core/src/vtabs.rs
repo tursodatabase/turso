@@ -30,6 +30,11 @@ pub struct VTabModuleImpl {
     pub best_idx: BestIdxFn,
 }
 
+// SAFETY: VTabModuleImpl contains function pointers and a name pointer that are
+// immutable after creation and, therefore, safe to share between threads.
+unsafe impl Send for VTabModuleImpl {}
+unsafe impl Sync for VTabModuleImpl {}
+
 #[repr(C)]
 pub struct VTabCreateResult {
     pub code: ResultCode,

@@ -248,7 +248,7 @@ Note that exploration uses the `chaos` mode so if you need to reproduce a run, u
 SEED=1234 ./whopper/bin/run --mode chaos
 ```
 
-Both `explore` and `run` accept `--enable-checksums` flag to enable per page checksums.
+Both `explore` and `run` accept the `--enable-checksums` and `--enable-encryption` flags for per page checksums and encryption respectively.
 
 ## Python Bindings
 

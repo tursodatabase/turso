@@ -11,13 +11,17 @@ use sql_generation::{
     model::table::{Column, ColumnType, Table},
 };
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::trace;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
-use turso_core::{Connection, Database, IO, Statement};
+use turso_core::{
+    CipherMode, Connection, Database, DatabaseOpts, EncryptionOpts, IO, OpenFlags, Statement,
+};
 use turso_parser::ast::SortOrder;
 
 mod io;
+use crate::io::FILE_SIZE_SOFT_LIMIT;
 use io::{IOFaultConfig, SimulatorIO};
 
 #[derive(Parser)]
@@ -36,6 +40,9 @@ struct Args {
     /// Enable MVCC (Multi-Version Concurrency Control)
     #[arg(long)]
     enable_mvcc: bool,
+    /// Enable database encryption
+    #[arg(long)]
+    enable_encryption: bool,
 }
 
 struct SimulatorConfig {
@@ -74,6 +81,17 @@ struct Stats {
     integrity_checks: usize,
 }
 
+fn may_be_set_encryption(
+    conn: Arc<Connection>,
+    opts: &Option<EncryptionOpts>,
+) -> anyhow::Result<Arc<Connection>> {
+    if let Some(opts) = opts {
+        conn.pragma_update("cipher", format!("'{}'", opts.cipher.clone()))?;
+        conn.pragma_update("hexkey", format!("'{}'", opts.hexkey.clone()))?;
+    }
+    Ok(conn)
+}
+
 fn main() -> anyhow::Result<()> {
     init_logger();
 
@@ -105,18 +123,42 @@ fn main() -> anyhow::Result<()> {
         println!("cosmic ray probability = {}", config.cosmic_ray_probability);
     }
 
-    let io = Arc::new(SimulatorIO::new(args.keep, io_rng, fault_config)) as Arc<dyn IO>;
+    let simulator_io = Arc::new(SimulatorIO::new(args.keep, io_rng, fault_config));
+    let file_sizes = simulator_io.file_sizes();
+    let io = simulator_io as Arc<dyn IO>;
 
     let db_path = format!("whopper-{}-{}.db", seed, std::process::id());
+    let wal_path = format!("{db_path}-wal");
 
-    let db = match Database::open_file(io.clone(), &db_path, args.enable_mvcc, true) {
-        Ok(db) => db,
-        Err(e) => {
-            return Err(anyhow::anyhow!("Database open failed: {}", e));
+    let encryption_opts = if args.enable_encryption {
+        let opts = random_encryption_config(&mut rng);
+        println!("cipher = {}, key = {}", opts.cipher, opts.hexkey);
+        Some(opts)
+    } else {
+        None
+    };
+
+    let db = {
+        let opts = DatabaseOpts::new()
+            .with_mvcc(args.enable_mvcc)
+            .with_indexes(true);
+
+        match Database::open_file_with_flags(
+            io.clone(),
+            &db_path,
+            OpenFlags::default(),
+            opts,
+            encryption_opts.clone(),
+        ) {
+            Ok(db) => db,
+            Err(e) => {
+                return Err(anyhow::anyhow!("Database open failed: {}", e));
+            }
         }
     };
+
     let boostrap_conn = match db.connect() {
-        Ok(conn) => conn,
+        Ok(conn) => may_be_set_encryption(conn, &encryption_opts)?,
         Err(e) => {
             return Err(anyhow::anyhow!("Connection failed: {}", e));
         }
@@ -146,7 +188,7 @@ fn main() -> anyhow::Result<()> {
     let mut fibers = Vec::new();
     for i in 0..config.max_connections {
         let conn = match db.connect() {
-            Ok(conn) => conn,
+            Ok(conn) => may_be_set_encryption(conn, &encryption_opts)?,
             Err(e) => {
                 return Err(anyhow::anyhow!(
                     "Failed to create fiber connection {}: {}",
@@ -204,6 +246,9 @@ fn main() -> anyhow::Result<()> {
                 context.stats.integrity_checks
             );
             progress_index += 1;
+        }
+        if file_size_soft_limit_exceeded(&wal_path, file_sizes.clone()) {
+            break;
         }
     }
     Ok(())
@@ -321,6 +366,30 @@ fn create_initial_schema(rng: &mut ChaCha8Rng) -> Vec<Create> {
     }
 
     schema
+}
+
+fn random_encryption_config(rng: &mut ChaCha8Rng) -> EncryptionOpts {
+    let cipher_modes = [
+        CipherMode::Aes128Gcm,
+        CipherMode::Aes256Gcm,
+        CipherMode::Aegis256,
+        CipherMode::Aegis128L,
+        CipherMode::Aegis128X2,
+        CipherMode::Aegis128X4,
+        CipherMode::Aegis256X2,
+        CipherMode::Aegis256X4,
+    ];
+
+    let cipher_mode = cipher_modes[rng.random_range(0..cipher_modes.len())];
+
+    let key_size = cipher_mode.required_key_size();
+    let mut key = vec![0u8; key_size];
+    rng.fill_bytes(&mut key);
+
+    EncryptionOpts {
+        cipher: cipher_mode.to_string(),
+        hexkey: hex::encode(&key),
+    }
 }
 
 fn perform_work(
@@ -521,6 +590,17 @@ fn perform_work(
         }
     }
     Ok(())
+}
+
+fn file_size_soft_limit_exceeded(
+    wal_path: &str,
+    file_sizes: Arc<std::sync::Mutex<HashMap<String, u64>>>,
+) -> bool {
+    let wal_size = {
+        let sizes = file_sizes.lock().unwrap();
+        sizes.get(wal_path).cloned().unwrap_or(0)
+    };
+    wal_size > FILE_SIZE_SOFT_LIMIT
 }
 
 impl GenerationContext for SimulatorContext {

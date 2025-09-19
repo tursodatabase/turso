@@ -16,7 +16,6 @@ pub mod mvcc;
 mod parameters;
 mod pragma;
 mod pseudo;
-pub mod result;
 mod schema;
 #[cfg(feature = "series")]
 mod series;
@@ -41,7 +40,6 @@ pub mod numeric;
 mod numeric;
 
 use crate::storage::checksum::CHECKSUM_REQUIRED_RESERVED_BYTES;
-use crate::storage::encryption::CipherMode;
 use crate::translate::pragma::TURSO_CDC_DEFAULT_TABLE_NAME;
 #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
 use crate::types::{WalFrameInfo, WalState};
@@ -80,7 +78,7 @@ use std::{
 #[cfg(feature = "fs")]
 use storage::database::DatabaseFile;
 pub use storage::database::IOContext;
-pub use storage::encryption::{EncryptionContext, EncryptionKey};
+pub use storage::encryption::{CipherMode, EncryptionContext, EncryptionKey};
 use storage::page_cache::PageCache;
 use storage::pager::{AtomicDbState, DbState};
 use storage::sqlite3_ondisk::PageSize;
@@ -203,7 +201,7 @@ pub struct Database {
     db_state: Arc<AtomicDbState>,
     init_lock: Arc<Mutex<()>>,
     open_flags: OpenFlags,
-    builtin_syms: RefCell<SymbolTable>,
+    builtin_syms: RwLock<SymbolTable>,
     opts: DatabaseOpts,
     n_connections: AtomicUsize,
 }
@@ -241,7 +239,7 @@ impl fmt::Debug for Database {
         debug_struct.field("init_lock", &init_lock_status);
 
         let wal_status = match self.shared_wal.try_read() {
-            Some(wal) if wal.enabled.load(Ordering::Relaxed) => "enabled",
+            Some(wal) if wal.enabled.load(Ordering::SeqCst) => "enabled",
             Some(_) => "disabled",
             None => "locked_for_write",
         };
@@ -256,9 +254,7 @@ impl fmt::Debug for Database {
 
         debug_struct.field(
             "n_connections",
-            &self
-                .n_connections
-                .load(std::sync::atomic::Ordering::Relaxed),
+            &self.n_connections.load(std::sync::atomic::Ordering::SeqCst),
         );
         debug_struct.finish()
     }
@@ -397,10 +393,9 @@ impl Database {
         let shared_wal = WalFileShared::open_shared_if_exists(&io, wal_path)?;
 
         let mv_store = if opts.enable_mvcc {
-            Some(Arc::new(MvStore::new(
-                mvcc::LocalClock::new(),
-                mvcc::persistent_storage::Storage::new_noop(),
-            )))
+            let file = io.open_file(&format!("{path}-lg"), OpenFlags::default(), false)?;
+            let storage = mvcc::persistent_storage::Storage::new(file);
+            Some(Arc::new(MvStore::new(mvcc::LocalClock::new(), storage)))
         } else {
             None
         };
@@ -445,7 +440,7 @@ impl Database {
             // parse schema
             let conn = db.connect()?;
 
-            let syms = conn.syms.borrow();
+            let syms = conn.syms.read();
             let pager = conn.pager.borrow().clone();
 
             if let Some(encryption_opts) = encryption_opts {
@@ -480,7 +475,7 @@ impl Database {
     pub fn connect(self: &Arc<Database>) -> Result<Arc<Connection>> {
         let pager = self.init_pager(None)?;
 
-        let page_size = pager.page_size.get().expect("page size not set");
+        let page_size = pager.get_page_size_unchecked();
 
         let default_cache_size = pager
             .io
@@ -488,7 +483,7 @@ impl Database {
             .unwrap_or_default()
             .get();
         let conn = Arc::new(Connection {
-            _db: self.clone(),
+            db: self.clone(),
             pager: RefCell::new(Arc::new(pager)),
             schema: RefCell::new(
                 self.schema
@@ -502,7 +497,7 @@ impl Database {
             last_insert_rowid: Cell::new(0),
             last_change: Cell::new(0),
             total_changes: Cell::new(0),
-            syms: RefCell::new(SymbolTable::new()),
+            syms: RwLock::new(SymbolTable::new()),
             _shared_cache: false,
             cache_size: Cell::new(default_cache_size),
             page_size: Cell::new(page_size),
@@ -522,10 +517,10 @@ impl Database {
             busy_timeout: Cell::new(None),
         });
         self.n_connections
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let builtin_syms = self.builtin_syms.borrow();
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let builtin_syms = self.builtin_syms.read();
         // add built-in extensions symbols to the connection to prevent having to load each time
-        conn.syms.borrow_mut().extend(&builtin_syms);
+        conn.syms.write().extend(&builtin_syms);
         Ok(conn)
     }
 
@@ -582,7 +577,7 @@ impl Database {
         shared_wal: &WalFileShared,
         requested_page_size: Option<usize>,
     ) -> Result<PageSize> {
-        if shared_wal.enabled.load(Ordering::Relaxed) {
+        if shared_wal.enabled.load(Ordering::SeqCst) {
             let size_in_wal = shared_wal.page_size();
             if size_in_wal != 0 {
                 let Some(page_size) = PageSize::new(size_in_wal) else {
@@ -624,7 +619,7 @@ impl Database {
         };
         // Check if WAL is enabled
         let shared_wal = self.shared_wal.read();
-        if shared_wal.enabled.load(Ordering::Relaxed) {
+        if shared_wal.enabled.load(Ordering::SeqCst) {
             let page_size = self.determine_actual_page_size(&shared_wal, requested_page_size)?;
             drop(shared_wal);
 
@@ -648,7 +643,7 @@ impl Database {
                 db_state,
                 self.init_lock.clone(),
             )?;
-            pager.page_size.set(Some(page_size));
+            pager.set_page_size(page_size);
             if let Some(reserved_bytes) = reserved_bytes {
                 pager.set_reserved_space_bytes(reserved_bytes);
             }
@@ -678,7 +673,7 @@ impl Database {
             Arc::new(Mutex::new(())),
         )?;
 
-        pager.page_size.set(Some(page_size));
+        pager.set_page_size(page_size);
         if let Some(reserved_bytes) = reserved_bytes {
             pager.set_reserved_space_bytes(reserved_bytes);
         }
@@ -971,7 +966,7 @@ impl DatabaseCatalog {
 }
 
 pub struct Connection {
-    _db: Arc<Database>,
+    db: Arc<Database>,
     pager: RefCell<Arc<Pager>>,
     schema: RefCell<Arc<Schema>>,
     /// Per-database schema cache (database_index -> schema)
@@ -983,7 +978,7 @@ pub struct Connection {
     last_insert_rowid: Cell<i64>,
     last_change: Cell<i64>,
     total_changes: Cell<i64>,
-    syms: RefCell<SymbolTable>,
+    syms: RwLock<SymbolTable>,
     _shared_cache: bool,
     cache_size: Cell<i32>,
     /// page size used for an uninitialized database or the next vacuum command.
@@ -1019,9 +1014,9 @@ impl Drop for Connection {
     fn drop(&mut self) {
         if !self.closed.get() {
             // if connection wasn't properly closed, decrement the connection counter
-            self._db
+            self.db
                 .n_connections
-                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         }
     }
 }
@@ -1042,7 +1037,7 @@ impl Connection {
         tracing::trace!("Preparing: {}", sql);
         let mut parser = Parser::new(sql.as_bytes());
         let cmd = parser.next_cmd()?;
-        let syms = self.syms.borrow();
+        let syms = self.syms.read();
         let cmd = cmd.expect("Successful parse on nonempty input string should produce a command");
         let byte_offset_end = parser.offset();
         let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
@@ -1063,7 +1058,7 @@ impl Connection {
         )?;
         Ok(Statement::new(
             program,
-            self._db.mv_store.clone(),
+            self.db.mv_store.clone(),
             pager,
             mode,
         ))
@@ -1094,10 +1089,10 @@ impl Connection {
         };
         pager.end_read_tx().expect("read txn must be finished");
 
-        let db_schema_version = self._db.schema.lock().unwrap().schema_version;
+        let db_schema_version = self.db.schema.lock().unwrap().schema_version;
         tracing::debug!(
             "path: {}, db_schema_version={} vs on_disk_schema_version={}",
-            self._db.path,
+            self.db.path,
             db_schema_version,
             on_disk_schema_version
         );
@@ -1134,7 +1129,7 @@ impl Connection {
         reparse_result?;
 
         let schema = self.schema.borrow().clone();
-        self._db.update_schema_if_newer(schema)
+        self.db.update_schema_if_newer(schema)
     }
 
     fn reparse_schema(self: &Arc<Connection>) -> Result<()> {
@@ -1166,7 +1161,14 @@ impl Connection {
         let stmt = self.prepare("SELECT * FROM sqlite_schema")?;
 
         // TODO: This function below is synchronous, make it async
-        parse_schema_rows(stmt, &mut fresh, &self.syms.borrow(), None, existing_views)?;
+        parse_schema_rows(
+            stmt,
+            &mut fresh,
+            &self.syms.read(),
+            None,
+            existing_views,
+            self.db.mv_store.as_ref(),
+        )?;
 
         tracing::debug!(
             "reparse_schema: schema_version={}, tables={:?}",
@@ -1194,7 +1196,7 @@ impl Connection {
         tracing::trace!("Preparing and executing batch: {}", sql);
         let mut parser = Parser::new(sql.as_bytes());
         while let Some(cmd) = parser.next_cmd()? {
-            let syms = self.syms.borrow();
+            let syms = self.syms.read();
             let pager = self.pager.borrow().clone();
             let byte_offset_end = parser.offset();
             let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
@@ -1211,7 +1213,7 @@ impl Connection {
                 mode,
                 input,
             )?;
-            Statement::new(program, self._db.mv_store.clone(), pager.clone(), mode)
+            Statement::new(program, self.db.mv_store.clone(), pager.clone(), mode)
                 .run_ignore_rows()?;
         }
         Ok(())
@@ -1246,7 +1248,7 @@ impl Connection {
         if self.closed.get() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
-        let syms = self.syms.borrow();
+        let syms = self.syms.read();
         let pager = self.pager.borrow().clone();
         let mode = QueryMode::new(&cmd);
         let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
@@ -1259,7 +1261,7 @@ impl Connection {
             mode,
             input,
         )?;
-        let stmt = Statement::new(program, self._db.mv_store.clone(), pager, mode);
+        let stmt = Statement::new(program, self.db.mv_store.clone(), pager, mode);
         Ok(Some(stmt))
     }
 
@@ -1278,7 +1280,7 @@ impl Connection {
         self.maybe_update_schema()?;
         let mut parser = Parser::new(sql.as_bytes());
         while let Some(cmd) = parser.next_cmd()? {
-            let syms = self.syms.borrow();
+            let syms = self.syms.read();
             let pager = self.pager.borrow().clone();
             let byte_offset_end = parser.offset();
             let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
@@ -1295,7 +1297,7 @@ impl Connection {
                 mode,
                 input,
             )?;
-            Statement::new(program, self._db.mv_store.clone(), pager.clone(), mode)
+            Statement::new(program, self.db.mv_store.clone(), pager.clone(), mode)
                 .run_ignore_rows()?;
         }
         Ok(())
@@ -1398,7 +1400,7 @@ impl Connection {
     pub fn maybe_update_schema(&self) -> Result<()> {
         let current_schema_version = self.schema.borrow().schema_version;
         let schema = self
-            ._db
+            .db
             .schema
             .lock()
             .map_err(|_| LimboError::SchemaLocked)?;
@@ -1499,7 +1501,7 @@ impl Connection {
         use crate::storage::sqlite3_ondisk::parse_wal_frame_header;
 
         let c = self.pager.borrow().wal_get_frame(frame_no, frame)?;
-        self._db.io.wait_for_completion(c)?;
+        self.db.io.wait_for_completion(c)?;
         let (header, _) = parse_wal_frame_header(frame);
         Ok(WalFrameInfo {
             page_no: header.page_number,
@@ -1519,19 +1521,10 @@ impl Connection {
     #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
     pub fn wal_insert_begin(&self) -> Result<()> {
         let pager = self.pager.borrow();
-        match pager.begin_read_tx()? {
-            result::LimboResult::Busy => return Err(LimboError::Busy),
-            result::LimboResult::Ok => {}
-        }
-        match pager.io.block(|| pager.begin_write_tx()).inspect_err(|_| {
+        pager.begin_read_tx()?;
+        pager.io.block(|| pager.begin_write_tx()).inspect_err(|_| {
             pager.end_read_tx().expect("read txn must be closed");
-        })? {
-            result::LimboResult::Busy => {
-                pager.end_read_tx().expect("read txn must be closed");
-                return Err(LimboError::Busy);
-            }
-            result::LimboResult::Ok => {}
-        }
+        })?;
 
         // start write transaction and disable auto-commit mode as SQL can be executed within WAL session (at caller own risk)
         self.transaction_state.replace(TransactionState::Write {
@@ -1638,9 +1631,9 @@ impl Connection {
         }
 
         if self
-            ._db
+            .db
             .n_connections
-            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed)
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst)
             .eq(&1)
         {
             self.pager
@@ -1694,14 +1687,14 @@ impl Connection {
     }
 
     pub fn get_database_canonical_path(&self) -> String {
-        if self._db.path == ":memory:" {
+        if self.db.path == ":memory:" {
             // For in-memory databases, SQLite shows empty string
             String::new()
         } else {
             // For file databases, try show the full absolute path if that doesn't fail
-            match std::fs::canonicalize(&self._db.path) {
+            match std::fs::canonicalize(&self.db.path) {
                 Ok(abs_path) => abs_path.to_string_lossy().to_string(),
-                Err(_) => self._db.path.to_string(),
+                Err(_) => self.db.path.to_string(),
             }
         }
     }
@@ -1709,7 +1702,7 @@ impl Connection {
     /// Check if a specific attached database is read only or not, by its index
     pub fn is_readonly(&self, index: usize) -> bool {
         if index == 0 {
-            self._db.is_readonly()
+            self.db.is_readonly()
         } else {
             let db = self
                 .attached_databases
@@ -1732,17 +1725,17 @@ impl Connection {
         };
 
         self.page_size.set(size);
-        if self._db.db_state.get() != DbState::Uninitialized {
+        if self.db.db_state.get() != DbState::Uninitialized {
             return Ok(());
         }
 
         {
-            let mut shared_wal = self._db.shared_wal.write();
-            shared_wal.enabled.store(false, Ordering::Relaxed);
+            let mut shared_wal = self.db.shared_wal.write();
+            shared_wal.enabled.store(false, Ordering::SeqCst);
             shared_wal.file = None;
         }
         self.pager.borrow_mut().clear_page_cache();
-        let pager = self._db.init_pager(Some(size.get() as usize))?;
+        let pager = self.db.init_pager(Some(size.get() as usize))?;
         self.pager.replace(Arc::new(pager));
         self.pager.borrow().set_initial_page_size(size);
 
@@ -1751,7 +1744,7 @@ impl Connection {
 
     #[cfg(feature = "fs")]
     pub fn open_new(&self, path: &str, vfs: &str) -> Result<(Arc<dyn IO>, Arc<Database>)> {
-        Database::open_with_vfs(&self._db, path, vfs)
+        Database::open_with_vfs(&self.db, path, vfs)
     }
 
     pub fn list_vfs(&self) -> Vec<String> {
@@ -1783,12 +1776,17 @@ impl Connection {
         let rows = self
             .query("SELECT * FROM sqlite_schema")?
             .expect("query must be parsed to statement");
-        let syms = self.syms.borrow();
+        let syms = self.syms.read();
         self.with_schema_mut(|schema| {
             let existing_views = schema.incremental_views.clone();
-            if let Err(LimboError::ExtensionError(e)) =
-                parse_schema_rows(rows, schema, &syms, None, existing_views)
-            {
+            if let Err(LimboError::ExtensionError(e)) = parse_schema_rows(
+                rows,
+                schema,
+                &syms,
+                None,
+                existing_views,
+                self.db.mv_store.as_ref(),
+            ) {
                 // this means that a vtab exists and we no longer have the module loaded. we print
                 // a warning to the user to load the module
                 eprintln!("Warning: {e}");
@@ -1826,11 +1824,11 @@ impl Connection {
     }
 
     pub fn experimental_views_enabled(&self) -> bool {
-        self._db.experimental_views_enabled()
+        self.db.experimental_views_enabled()
     }
 
     pub fn experimental_strict_enabled(&self) -> bool {
-        self._db.experimental_strict_enabled()
+        self.db.experimental_strict_enabled()
     }
 
     /// Query the current value(s) of `pragma_name` associated to
@@ -1874,7 +1872,7 @@ impl Connection {
     }
 
     pub fn is_db_initialized(&self) -> bool {
-        self._db.db_state.is_initialized()
+        self.db.db_state.is_initialized()
     }
 
     fn get_pager_from_database_index(&self, index: &usize) -> Arc<Pager> {
@@ -1922,21 +1920,21 @@ impl Connection {
         }
 
         let use_indexes = self
-            ._db
+            .db
             .schema
             .lock()
             .map_err(|_| LimboError::SchemaLocked)?
             .indexes_enabled();
-        let use_mvcc = self._db.mv_store.is_some();
-        let use_views = self._db.experimental_views_enabled();
-        let use_strict = self._db.experimental_strict_enabled();
+        let use_mvcc = self.db.mv_store.is_some();
+        let use_views = self.db.experimental_views_enabled();
+        let use_strict = self.db.experimental_strict_enabled();
 
         let db_opts = DatabaseOpts::new()
             .with_mvcc(use_mvcc)
             .with_indexes(use_indexes)
             .with_views(use_views)
             .with_strict(use_strict);
-        let db = Self::from_uri_attached(path, db_opts, self._db.io.clone())?;
+        let db = Self::from_uri_attached(path, db_opts, self.db.io.clone())?;
         let pager = Arc::new(db.init_pager(None)?);
 
         self.attached_databases
@@ -2072,7 +2070,7 @@ impl Connection {
         let mut databases = Vec::new();
 
         // Add main database (always seq=0, name="main")
-        let main_path = Self::get_canonical_path_for_database(&self._db);
+        let main_path = Self::get_canonical_path_for_database(&self.db);
         databases.push((0, "main".to_string(), main_path));
 
         // Add attached databases
@@ -2122,7 +2120,7 @@ impl Connection {
 
     /// Creates a HashSet of modules that have been loaded
     pub fn get_syms_vtab_mods(&self) -> std::collections::HashSet<String> {
-        self.syms.borrow().vtab_modules.keys().cloned().collect()
+        self.syms.read().vtab_modules.keys().cloned().collect()
     }
 
     pub fn set_encryption_key(&self, key: EncryptionKey) -> Result<()> {
@@ -2399,13 +2397,13 @@ impl Statement {
     fn reprepare(&mut self) -> Result<()> {
         tracing::trace!("repreparing statement");
         let conn = self.program.connection.clone();
-        *conn.schema.borrow_mut() = conn._db.clone_schema()?;
+        *conn.schema.borrow_mut() = conn.db.clone_schema()?;
         self.program = {
             let mut parser = Parser::new(self.program.sql.as_bytes());
             let cmd = parser.next_cmd()?;
             let cmd = cmd.expect("Same SQL string should be able to be parsed");
 
-            let syms = conn.syms.borrow();
+            let syms = conn.syms.read();
             let mode = self.query_mode;
             debug_assert_eq!(QueryMode::new(&cmd), mode,);
             let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
@@ -2465,7 +2463,7 @@ impl Statement {
         }
     }
 
-    pub fn get_column_name(&self, idx: usize) -> Cow<str> {
+    pub fn get_column_name(&self, idx: usize) -> Cow<'_, str> {
         match self.query_mode {
             QueryMode::Normal => {
                 let column = &self.program.result_columns.get(idx).expect("No column");
@@ -2476,6 +2474,18 @@ impl Statement {
             }
             QueryMode::Explain => Cow::Borrowed(EXPLAIN_COLUMNS[idx]),
             QueryMode::ExplainQueryPlan => Cow::Borrowed(EXPLAIN_QUERY_PLAN_COLUMNS[idx]),
+        }
+    }
+
+    pub fn get_column_table_name(&self, idx: usize) -> Option<Cow<'_, str>> {
+        let column = &self.program.result_columns.get(idx).expect("No column");
+        match &column.expr {
+            turso_parser::ast::Expr::Column { table, .. } => self
+                .program
+                .table_references
+                .find_table_by_internal_id(*table)
+                .map(|table_ref| Cow::Borrowed(table_ref.get_name())),
+            _ => None,
         }
     }
 
@@ -2580,7 +2590,7 @@ pub type StepResult = vdbe::StepResult;
 pub struct SymbolTable {
     pub functions: HashMap<String, Arc<function::ExternalFunc>>,
     pub vtabs: HashMap<String, Arc<VirtualTable>>,
-    pub vtab_modules: HashMap<String, Rc<crate::ext::VTabImpl>>,
+    pub vtab_modules: HashMap<String, Arc<crate::ext::VTabImpl>>,
 }
 
 impl std::fmt::Debug for SymbolTable {

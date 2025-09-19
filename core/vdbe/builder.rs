@@ -34,7 +34,7 @@ impl TableRefIdCounter {
     }
 }
 
-use super::{BranchOffset, CursorID, Insn, InsnFunction, InsnReference, JumpTarget, Program};
+use super::{BranchOffset, CursorID, Insn, InsnReference, JumpTarget, Program};
 
 /// A key that uniquely identifies a cursor.
 /// The key is a pair of table reference id and index.
@@ -85,7 +85,7 @@ pub struct ProgramBuilder {
     next_free_register: usize,
     next_free_cursor_id: usize,
     /// Instruction, the function to execute it with, and its original index in the vector.
-    insns: Vec<(Insn, InsnFunction, usize)>,
+    insns: Vec<(Insn, usize)>,
     /// A span of instructions from (offset_start_inclusive, offset_end_exclusive),
     /// that are deemed to be compile-time constant and can be hoisted out of loops
     /// so that they get evaluated only once at the start of the program.
@@ -328,10 +328,9 @@ impl ProgramBuilder {
 
     #[instrument(skip(self), level = Level::DEBUG)]
     pub fn emit_insn(&mut self, insn: Insn) {
-        let function = insn.to_function();
         // This seemingly empty trace here is needed so that a function span is emmited with it
         tracing::trace!("");
-        self.insns.push((insn, function, self.insns.len()));
+        self.insns.push((insn, self.insns.len()));
     }
 
     pub fn close_cursors(&mut self, cursors: &[CursorID]) {
@@ -419,7 +418,7 @@ impl ProgramBuilder {
     pub fn pop_current_parent_explain(&mut self) {
         if let QueryMode::ExplainQueryPlan = self.query_mode {
             if let Some(current) = self.current_parent_explain_idx {
-                let (Insn::Explain { p2, .. }, _, _) = &self.insns[current] else {
+                let (Insn::Explain { p2, .. }, _) = &self.insns[current] else {
                     unreachable!("current_parent_explain_idx must point to an Explain insn");
                 };
                 self.current_parent_explain_idx = *p2;
@@ -447,7 +446,7 @@ impl ProgramBuilder {
         // 1. if insn not in any constant span, it stays where it is
         // 2. if insn is in a constant span, it is after other insns, except those that are in a later constant span
         // 3. within a single constant span the order is preserver
-        self.insns.sort_by(|(_, _, index_a), (_, _, index_b)| {
+        self.insns.sort_by(|(_, index_a), (_, index_b)| {
             let a_span = self
                 .constant_spans
                 .iter()
@@ -471,7 +470,7 @@ impl ProgramBuilder {
                 let new_offset = self
                     .insns
                     .iter()
-                    .position(|(_, _, index)| *old_offset == *index as u32)
+                    .position(|(_, index)| *old_offset == *index as u32)
                     .unwrap() as u32;
                 *resolved_offset = Some((new_offset, *target));
             }
@@ -482,7 +481,7 @@ impl ProgramBuilder {
             let new_offset = self
                 .insns
                 .iter()
-                .position(|(_, _, index)| *old_offset == *index as u32)
+                .position(|(_, index)| *old_offset == *index as u32)
                 .expect("comment must exist") as u32;
             *old_offset = new_offset;
         }
@@ -492,25 +491,23 @@ impl ProgramBuilder {
                 if let Some(old_parent) = self.current_parent_explain_idx {
                     self.insns
                         .iter()
-                        .position(|(_, _, index)| old_parent == *index)
+                        .position(|(_, index)| old_parent == *index)
                 } else {
                     None
                 };
 
             for i in 0..self.insns.len() {
-                let (Insn::Explain { p2, .. }, _, _) = &self.insns[i] else {
+                let (Insn::Explain { p2, .. }, _) = &self.insns[i] else {
                     continue;
                 };
 
                 let new_p2 = if p2.is_some() {
-                    self.insns
-                        .iter()
-                        .position(|(_, _, index)| *p2 == Some(*index))
+                    self.insns.iter().position(|(_, index)| *p2 == Some(*index))
                 } else {
                     None
                 };
 
-                let (Insn::Explain { p1, p2, .. }, _, _) = &mut self.insns[i] else {
+                let (Insn::Explain { p1, p2, .. }, _) = &mut self.insns[i] else {
                     unreachable!();
                 };
 
@@ -591,7 +588,7 @@ impl ProgramBuilder {
                 );
             }
         };
-        for (insn, _, _) in self.insns.iter_mut() {
+        for (insn, _) in self.insns.iter_mut() {
             match insn {
                 Insn::Init { target_pc } => {
                     resolve(target_pc, "Init");
@@ -997,11 +994,7 @@ impl ProgramBuilder {
         self.parameters.list.dedup();
         Program {
             max_registers: self.next_free_register,
-            insns: self
-                .insns
-                .into_iter()
-                .map(|(insn, function, _)| (insn, function))
-                .collect(),
+            insns: self.insns,
             cursor_ref: self.cursor_ref,
             comments: self.comments,
             connection,

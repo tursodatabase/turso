@@ -1,7 +1,7 @@
 use crate::{
     SandboxedResult, SimulatorEnv,
     generation::{
-        plan::{Interaction, InteractionPlan, Interactions},
+        plan::{InteractionPlan, InteractionType, Interactions, InteractionsType},
         property::Property,
     },
     model::Query,
@@ -17,21 +17,28 @@ impl InteractionPlan {
         // - Shrink to multiple values by removing random interactions
         // - Shrink properties by removing their extensions, or shrinking their values
         let mut plan = self.clone();
-        let failing_property = &self.plan[failing_execution.interaction_index];
+
+        let all_interactions = self.interactions_list_with_secondary_index();
+        let secondary_interactions_index = all_interactions[failing_execution.interaction_index].0;
+
+        // Index of the parent property where the interaction originated from
+        let failing_property = &self.plan[secondary_interactions_index];
         let mut depending_tables = failing_property.dependencies();
 
-        let interactions = failing_property.interactions();
-
         {
-            let mut idx = failing_execution.secondary_index;
+            let mut idx = failing_execution.interaction_index;
             loop {
-                match &interactions[idx] {
-                    Interaction::Query(query) => {
+                if all_interactions[idx].0 != secondary_interactions_index {
+                    // Stop when we reach a different property
+                    break;
+                }
+                match &all_interactions[idx].1.interaction {
+                    InteractionType::Query(query) => {
                         depending_tables = query.dependencies();
                         break;
                     }
                     // Fault does not depend on
-                    Interaction::Fault(..) => break,
+                    InteractionType::Fault(..) => break,
                     _ => {
                         // In principle we should never fail this checked_sub.
                         // But if there is a bug in how we count the secondary index
@@ -50,15 +57,15 @@ impl InteractionPlan {
         let before = self.plan.len();
 
         // Remove all properties after the failing one
-        plan.plan.truncate(failing_execution.interaction_index + 1);
+        plan.plan.truncate(secondary_interactions_index + 1);
 
         let mut idx = 0;
         // Remove all properties that do not use the failing tables
         plan.plan.retain_mut(|interactions| {
-            let retain = if idx == failing_execution.interaction_index {
-                if let Interactions::Property(
+            let retain = if idx == secondary_interactions_index {
+                if let InteractionsType::Property(
                     Property::FsyncNoWait { tables, .. } | Property::FaultyQuery { tables, .. },
-                ) = interactions
+                ) = &mut interactions.interactions
                 {
                     tables.retain(|table| depending_tables.contains(table));
                 }
@@ -71,7 +78,7 @@ impl InteractionPlan {
 
                 if has_table {
                     // Remove the extensional parts of the properties
-                    if let Interactions::Property(p) = interactions {
+                    if let InteractionsType::Property(p) = &mut interactions.interactions {
                         match p {
                             Property::InsertValuesSelect { queries, .. }
                             | Property::DoubleCreateFailure { queries, .. }
@@ -101,14 +108,16 @@ impl InteractionPlan {
                         .iter()
                         .any(|t| depending_tables.contains(t));
                 }
-                let is_fault = matches!(interactions, Interactions::Fault(..));
+                let is_fault = matches!(interactions.interactions, InteractionsType::Fault(..));
                 is_fault
                     || (has_table
                         && !matches!(
-                            interactions,
-                            Interactions::Query(Query::Select(_))
-                                | Interactions::Property(Property::SelectLimit { .. })
-                                | Interactions::Property(Property::SelectSelectOptimizer { .. })
+                            interactions.interactions,
+                            InteractionsType::Query(Query::Select(_))
+                                | InteractionsType::Property(Property::SelectLimit { .. })
+                                | InteractionsType::Property(
+                                    Property::SelectSelectOptimizer { .. }
+                                )
                         ))
             };
             idx += 1;
@@ -147,16 +156,19 @@ impl InteractionPlan {
         };
 
         let mut plan = self.clone();
-        let failing_property = &self.plan[failing_execution.interaction_index];
-
-        let interactions = failing_property.interactions();
+        let all_interactions = self.interactions_list_with_secondary_index();
+        let secondary_interactions_index = all_interactions[failing_execution.interaction_index].0;
 
         {
-            let mut idx = failing_execution.secondary_index;
+            let mut idx = failing_execution.interaction_index;
             loop {
-                match &interactions[idx] {
+                if all_interactions[idx].0 != secondary_interactions_index {
+                    // Stop when we reach a different property
+                    break;
+                }
+                match &all_interactions[idx].1.interaction {
                     // Fault does not depend on
-                    Interaction::Fault(..) => break,
+                    InteractionType::Fault(..) => break,
                     _ => {
                         // In principle we should never fail this checked_sub.
                         // But if there is a bug in how we count the secondary index
@@ -174,11 +186,11 @@ impl InteractionPlan {
 
         let before = self.plan.len();
 
-        plan.plan.truncate(failing_execution.interaction_index + 1);
+        plan.plan.truncate(secondary_interactions_index + 1);
 
         // phase 1: shrink extensions
         for interaction in &mut plan.plan {
-            if let Interactions::Property(property) = interaction {
+            if let InteractionsType::Property(property) = &mut interaction.interactions {
                 match property {
                     Property::InsertValuesSelect { queries, .. }
                     | Property::DoubleCreateFailure { queries, .. }
@@ -187,7 +199,12 @@ impl InteractionPlan {
                         let mut temp_plan = InteractionPlan {
                             plan: queries
                                 .iter()
-                                .map(|q| Interactions::Query(q.clone()))
+                                .map(|q| {
+                                    Interactions::new(
+                                        interaction.connection_index,
+                                        InteractionsType::Query(q.clone()),
+                                    )
+                                })
                                 .collect(),
                         };
 
@@ -196,14 +213,15 @@ impl InteractionPlan {
                             failing_execution,
                             result,
                             env.clone(),
+                            secondary_interactions_index,
                         );
                         //temp_plan = Self::shrink_queries(temp_plan, failing_execution, result, env);
 
                         *queries = temp_plan
                             .plan
                             .into_iter()
-                            .filter_map(|i| match i {
-                                Interactions::Query(q) => Some(q),
+                            .filter_map(|i| match i.interactions {
+                                InteractionsType::Query(q) => Some(q),
                                 _ => None,
                             })
                             .collect();
@@ -221,7 +239,13 @@ impl InteractionPlan {
         }
 
         // phase 2: shrink the entire plan
-        plan = Self::iterative_shrink(plan, failing_execution, result, env);
+        plan = Self::iterative_shrink(
+            plan,
+            failing_execution,
+            result,
+            env,
+            secondary_interactions_index,
+        );
 
         let after = plan.plan.len();
 
@@ -240,9 +264,10 @@ impl InteractionPlan {
         failing_execution: &Execution,
         old_result: &SandboxedResult,
         env: Arc<Mutex<SimulatorEnv>>,
+        secondary_interaction_index: usize,
     ) -> InteractionPlan {
         for i in (0..plan.plan.len()).rev() {
-            if i == failing_execution.interaction_index {
+            if i == secondary_interaction_index {
                 continue;
             }
             let mut test_plan = plan.clone();
@@ -265,11 +290,9 @@ impl InteractionPlan {
         let last_execution = Arc::new(Mutex::new(*failing_execution));
         let result = SandboxedResult::from(
             std::panic::catch_unwind(|| {
-                run_simulation(
-                    env.clone(),
-                    &mut [test_plan.clone()],
-                    last_execution.clone(),
-                )
+                let interactions = test_plan.interactions_list();
+
+                run_simulation(env.clone(), interactions, last_execution.clone())
             }),
             last_execution,
         );

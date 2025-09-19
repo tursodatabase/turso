@@ -35,8 +35,9 @@ use crate::{
     types::{IOCompletions, IOResult, RawSlice, TextRef},
     vdbe::{
         execute::{
-            OpColumnState, OpDeleteState, OpDeleteSubState, OpIdxInsertState, OpInsertState,
-            OpInsertSubState, OpNewRowidState, OpNoConflictState, OpRowIdState, OpSeekState,
+            OpCheckpointState, OpColumnState, OpDeleteState, OpDeleteSubState, OpIdxInsertState,
+            OpInsertState, OpInsertSubState, OpNewRowidState, OpNoConflictState, OpRowIdState,
+            OpSeekState, OpTransactionState,
         },
         metrics::StatementMetrics,
     },
@@ -290,6 +291,8 @@ pub struct ProgramState {
     current_collation: Option<CollationSeq>,
     op_column_state: OpColumnState,
     op_row_id_state: OpRowIdState,
+    op_transaction_state: OpTransactionState,
+    op_checkpoint_state: OpCheckpointState,
     /// State machine for committing view deltas with I/O handling
     view_delta_state: ViewDeltaCommitState,
 }
@@ -333,6 +336,8 @@ impl ProgramState {
             current_collation: None,
             op_column_state: OpColumnState::Start,
             op_row_id_state: OpRowIdState::Start,
+            op_transaction_state: OpTransactionState::Start,
+            op_checkpoint_state: OpCheckpointState::StartCheckpoint,
             view_delta_state: ViewDeltaCommitState::NotStarted,
         }
     }
@@ -475,7 +480,9 @@ macro_rules! get_cursor {
 
 pub struct Program {
     pub max_registers: usize,
-    pub insns: Vec<(Insn, InsnFunction)>,
+    // we store original indices because we don't want to create new vec from
+    // ProgramBuilder
+    pub insns: Vec<(Insn, usize)>,
     pub cursor_ref: Vec<(Option<CursorKey>, CursorType)>,
     pub comments: Vec<(InsnReference, &'static str)>,
     pub parameters: crate::parameters::Parameters,
@@ -644,7 +651,8 @@ impl Program {
             }
             // invalidate row
             let _ = state.result_row.take();
-            let (insn, insn_function) = &self.insns[state.pc as usize];
+            let (insn, _) = &self.insns[state.pc as usize];
+            let insn_function = insn.to_function();
             if enable_tracing {
                 trace_insn(self, state.pc as InsnReference, insn);
             }
@@ -675,7 +683,7 @@ impl Program {
                     // Instruction interrupted - may resume at same PC
                     return Ok(StepResult::Interrupt);
                 }
-                Ok(InsnFunctionStepResult::Busy) => {
+                Err(LimboError::Busy) => {
                     // Instruction blocked - will retry at same PC
                     return Ok(StepResult::Busy);
                 }

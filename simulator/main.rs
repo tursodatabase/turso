@@ -7,9 +7,9 @@ use notify::{EventKind, RecursiveMode, Watcher};
 use rand::prelude::*;
 use runner::bugbase::{Bug, BugBase, LoadedBug};
 use runner::cli::{SimulatorCLI, SimulatorCommand};
+use runner::differential;
 use runner::env::SimulatorEnv;
-use runner::execution::{Execution, ExecutionHistory, ExecutionResult, execute_plans};
-use runner::{differential, watch};
+use runner::execution::{Execution, ExecutionHistory, ExecutionResult, execute_interactions};
 use std::any::Any;
 use std::backtrace::Backtrace;
 use std::fs::OpenOptions;
@@ -21,6 +21,7 @@ use tracing_subscriber::field::MakeExt;
 use tracing_subscriber::fmt::format;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+use crate::generation::plan::ConnectionState;
 use crate::profiles::Profile;
 use crate::runner::doublecheck;
 use crate::runner::env::{Paths, SimulationPhase, SimulationType};
@@ -167,7 +168,7 @@ fn watch_mode(env: SimulatorEnv) -> notify::Result<()> {
     // below will be monitored for changes.
     watcher.watch(&env.get_plan_path(), RecursiveMode::NonRecursive)?;
     // Block forever, printing out events as they come in
-    let last_execution = Arc::new(Mutex::new(Execution::new(0, 0, 0)));
+    let last_execution = Arc::new(Mutex::new(Execution::new(0, 0)));
     for res in rx {
         match res {
             Ok(event) => {
@@ -178,8 +179,7 @@ fn watch_mode(env: SimulatorEnv) -> notify::Result<()> {
                     let result = SandboxedResult::from(
                         std::panic::catch_unwind(move || {
                             let mut env = env;
-                            let plan: Vec<Vec<Interaction>> =
-                                InteractionPlan::compute_via_diff(&env.get_plan_path());
+                            let plan = InteractionPlan::compute_via_diff(&env.get_plan_path());
                             tracing::error!("plan_len: {}", plan.len());
                             env.clear();
 
@@ -190,7 +190,7 @@ fn watch_mode(env: SimulatorEnv) -> notify::Result<()> {
                             // });
 
                             let env = Arc::new(Mutex::new(env.clone_without_connections()));
-                            watch::run_simulation(env, &mut [plan], last_execution_.clone())
+                            run_simulation_default(env, plan, last_execution_.clone())
                         }),
                         last_execution.clone(),
                     );
@@ -217,7 +217,7 @@ fn run_simulator(
     mut bugbase: Option<&mut BugBase>,
     cli_opts: &SimulatorCLI,
     env: SimulatorEnv,
-    plans: Vec<InteractionPlan>,
+    plan: InteractionPlan,
 ) -> anyhow::Result<()> {
     std::panic::set_hook(Box::new(move |info| {
         tracing::error!("panic occurred");
@@ -235,11 +235,12 @@ fn run_simulator(
         tracing::error!("captured backtrace:\n{}", bt);
     }));
 
-    let last_execution = Arc::new(Mutex::new(Execution::new(0, 0, 0)));
+    let last_execution = Arc::new(Mutex::new(Execution::new(0, 0)));
     let env = Arc::new(Mutex::new(env));
     let result = SandboxedResult::from(
         std::panic::catch_unwind(|| {
-            run_simulation(env.clone(), &mut plans.clone(), last_execution.clone())
+            let interactions = plan.interactions_list();
+            run_simulation(env.clone(), interactions, last_execution.clone())
         }),
         last_execution.clone(),
     );
@@ -269,10 +270,8 @@ fn run_simulator(
                 for execution in history.history.iter() {
                     writeln!(
                         f,
-                        "{} {} {}",
-                        execution.connection_index,
-                        execution.interaction_index,
-                        execution.secondary_index
+                        "{} {}",
+                        execution.connection_index, execution.interaction_index,
                     )
                     .unwrap();
                 }
@@ -284,51 +283,38 @@ fn run_simulator(
                 tracing::info!("shrinking is disabled, skipping shrinking");
                 if let Some(bugbase) = bugbase.as_deref_mut() {
                     bugbase
-                        .add_bug(
-                            env.opts.seed,
-                            plans[0].clone(),
-                            Some(error.clone()),
-                            cli_opts,
-                        )
+                        .add_bug(env.opts.seed, plan.clone(), Some(error.clone()), cli_opts)
                         .unwrap();
                 }
                 return Err(anyhow!("failed with error: '{}'", error));
             }
 
             tracing::info!("Starting to shrink");
-            let (shrunk_plans, shrunk) = if !cli_opts.disable_heuristic_shrinking {
-                let shrunk_plans = plans
-                    .iter()
-                    .map(|plan| {
-                        let shrunk = plan.shrink_interaction_plan(last_execution);
-                        tracing::info!("{}", shrunk.stats());
-                        shrunk
-                    })
-                    .collect::<Vec<_>>();
+            let (shrunk_plan, shrunk) = if !cli_opts.disable_heuristic_shrinking {
+                let shrunk_plan = plan.shrink_interaction_plan(last_execution);
+                tracing::info!("{}", shrunk_plan.stats());
                 // Write the shrunk plan to a file
                 let shrunk_plan_path = env
                     .paths
                     .plan(&SimulationType::Default, &SimulationPhase::Shrink);
                 let mut f = std::fs::File::create(&shrunk_plan_path).unwrap();
                 tracing::trace!("writing shrunk plan to {}", shrunk_plan_path.display());
-                f.write_all(shrunk_plans[0].to_string().as_bytes()).unwrap();
+                f.write_all(shrunk_plan.to_string().as_bytes()).unwrap();
 
                 let last_execution = Arc::new(Mutex::new(*last_execution));
                 let env = env.clone_at_phase(SimulationPhase::Shrink);
                 let env = Arc::new(Mutex::new(env));
                 let shrunk = SandboxedResult::from(
                     std::panic::catch_unwind(|| {
-                        run_simulation(
-                            env.clone(),
-                            &mut shrunk_plans.clone(),
-                            last_execution.clone(),
-                        )
+                        let interactions = shrunk_plan.interactions_list();
+
+                        run_simulation(env.clone(), interactions, last_execution.clone())
                     }),
                     last_execution,
                 );
-                (shrunk_plans, shrunk)
+                (shrunk_plan, shrunk)
             } else {
-                (plans.to_vec(), result.clone())
+                (plan.clone(), result.clone())
             };
 
             match (&shrunk, &result) {
@@ -344,16 +330,11 @@ fn run_simulator(
                         tracing::trace!(
                             "adding bug to bugbase, seed: {}, plan: {}, error: {}",
                             env.opts.seed,
-                            plans[0].plan.len(),
+                            plan.plan.len(),
                             error
                         );
                         bugbase
-                            .add_bug(
-                                env.opts.seed,
-                                plans[0].clone(),
-                                Some(error.clone()),
-                                cli_opts,
-                            )
+                            .add_bug(env.opts.seed, plan.clone(), Some(error.clone()), cli_opts)
                             .unwrap();
                     }
 
@@ -369,30 +350,26 @@ fn run_simulator(
                         let env = env.clone_at_phase(SimulationPhase::Shrink);
                         let env = Arc::new(Mutex::new(env));
 
-                        let final_plans = if cli_opts.enable_brute_force_shrinking {
-                            let brute_shrunk_plans = shrunk_plans
-                                .iter()
-                                .map(|plan| {
-                                    plan.brute_shrink_interaction_plan(&shrunk, env.clone())
-                                })
-                                .collect::<Vec<_>>();
+                        let final_plan = if cli_opts.enable_brute_force_shrinking {
+                            let brute_shrunk_plan =
+                                shrunk_plan.brute_shrink_interaction_plan(&shrunk, env.clone());
                             tracing::info!("Brute force shrinking completed");
-                            brute_shrunk_plans
+                            brute_shrunk_plan
                         } else {
-                            shrunk_plans
+                            shrunk_plan
                         };
 
                         tracing::info!(
                             "shrinking succeeded, reduced the plan from {} to {}",
-                            plans[0].plan.len(),
-                            final_plans[0].plan.len()
+                            plan.plan.len(),
+                            final_plan.plan.len()
                         );
                         // Save the shrunk database
                         if let Some(bugbase) = bugbase.as_deref_mut() {
                             bugbase.make_shrunk(
                                 seed,
                                 cli_opts,
-                                final_plans[0].clone(),
+                                final_plan.clone(),
                                 Some(e1.clone()),
                             )?;
                         }
@@ -410,12 +387,7 @@ fn run_simulator(
                     );
                     if let Some(bugbase) = bugbase {
                         bugbase
-                            .add_bug(
-                                env.opts.seed,
-                                plans[0].clone(),
-                                Some(error.clone()),
-                                cli_opts,
-                            )
+                            .add_bug(env.opts.seed, plan.clone(), Some(error.clone()), cli_opts)
                             .unwrap();
                     }
                     Err(anyhow!("failed with error: '{}'", error))
@@ -482,7 +454,7 @@ fn setup_simulation(
     bugbase: Option<&mut BugBase>,
     cli_opts: &SimulatorCLI,
     profile: &Profile,
-) -> (u64, SimulatorEnv, Vec<InteractionPlan>) {
+) -> (u64, SimulatorEnv, InteractionPlan) {
     if let Some(seed) = &cli_opts.load {
         let seed = seed.parse::<u64>().expect("seed should be a number");
         let bugbase = bugbase.expect("BugBase must be enabled to load a bug");
@@ -521,8 +493,7 @@ fn setup_simulation(
             serde_json::to_string_pretty(&plan).unwrap(),
         )
         .unwrap();
-        let plans = vec![plan];
-        (seed, env, plans)
+        (seed, env, plan)
     } else {
         let seed = cli_opts.seed.unwrap_or_else(|| {
             let mut rng = rand::rng();
@@ -549,12 +520,9 @@ fn setup_simulation(
 
         tracing::info!("Generating database interaction plan...");
 
-        let plans = (1..=env.opts.max_connections)
-            .map(|_| InteractionPlan::generate_plan(&mut env.rng.clone(), &mut env))
-            .collect::<Vec<_>>();
+        let plan = InteractionPlan::generate_plan(&mut env.rng.clone(), &mut env);
 
         // todo: for now, we only use 1 connection, so it's safe to use the first plan.
-        let plan = &plans[0];
         tracing::info!("{}", plan.stats());
         std::fs::write(env.get_plan_path(), plan.to_string()).unwrap();
         std::fs::write(
@@ -563,13 +531,13 @@ fn setup_simulation(
         )
         .unwrap();
 
-        (seed, env, plans)
+        (seed, env, plan)
     }
 }
 
 fn run_simulation(
     env: Arc<Mutex<SimulatorEnv>>,
-    plans: &mut [InteractionPlan],
+    plan: Vec<Interaction>,
     last_execution: Arc<Mutex<Execution>>,
 ) -> ExecutionResult {
     let simulation_type = {
@@ -580,14 +548,14 @@ fn run_simulation(
     };
 
     match simulation_type {
-        SimulationType::Default => run_simulation_default(env, plans, last_execution),
+        SimulationType::Default => run_simulation_default(env, plan, last_execution),
         SimulationType::Differential => {
             let limbo_env = {
                 let env = env.lock().unwrap();
                 env.clone_as(SimulationType::Default)
             };
             let limbo_env = Arc::new(Mutex::new(limbo_env));
-            differential::run_simulation(limbo_env, env, plans, last_execution)
+            differential::run_simulation(limbo_env, env, plan, last_execution)
         }
         SimulationType::Doublecheck => {
             let limbo_env = {
@@ -595,28 +563,38 @@ fn run_simulation(
                 env.clone_as(SimulationType::Default)
             };
             let limbo_env = Arc::new(Mutex::new(limbo_env));
-            doublecheck::run_simulation(limbo_env, env, plans, last_execution)
+            doublecheck::run_simulation(limbo_env, env, plan, last_execution)
         }
     }
 }
 
 fn run_simulation_default(
     env: Arc<Mutex<SimulatorEnv>>,
-    plans: &mut [InteractionPlan],
+    plan: Vec<Interaction>,
     last_execution: Arc<Mutex<Execution>>,
 ) -> ExecutionResult {
     tracing::info!("Executing database interaction plan...");
 
-    let mut states = plans
-        .iter()
-        .map(|_| InteractionPlanState {
-            stack: vec![],
-            interaction_pointer: 0,
-            secondary_pointer: 0,
-        })
+    let num_conns = {
+        let env = env.lock().unwrap();
+        env.connections.len()
+    };
+
+    let mut conn_states = (0..num_conns)
+        .map(|_| ConnectionState::default())
         .collect::<Vec<_>>();
 
-    let mut result = execute_plans(env.clone(), plans, &mut states, last_execution);
+    let mut state = InteractionPlanState {
+        interaction_pointer: 0,
+    };
+
+    let mut result = execute_interactions(
+        env.clone(),
+        plan,
+        &mut state,
+        &mut conn_states,
+        last_execution,
+    );
 
     let env = env.lock().unwrap();
     env.io.print_stats();
