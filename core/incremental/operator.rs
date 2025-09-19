@@ -2050,13 +2050,13 @@ impl AggregateOperator {
             .join(",")
     }
 
-    fn seek_key_from_str(&self, group_key_str: &str) -> SeekKey {
+    fn seek_key_from_str(&self, group_key_str: &str) -> SeekKey<'_> {
         // Calculate the composite key for seeking
         let key_i64 = self.generate_storage_key(group_key_str);
         SeekKey::TableRowId(key_i64)
     }
 
-    fn seek_key(&self, row: HashableRow) -> SeekKey {
+    fn seek_key(&self, row: HashableRow) -> SeekKey<'_> {
         // Extract group key for first row
         let group_key = self.extract_group_key(&row.values);
         let group_key_str = Self::group_key_to_string(&group_key);

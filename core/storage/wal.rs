@@ -1638,11 +1638,11 @@ impl WalFile {
         WAL_HEADER_SIZE as u64 + page_offset
     }
 
-    fn get_shared_mut(&self) -> parking_lot::RwLockWriteGuard<WalFileShared> {
+    fn get_shared_mut(&self) -> parking_lot::RwLockWriteGuard<'_, WalFileShared> {
         self.shared.write()
     }
 
-    fn get_shared(&self) -> parking_lot::RwLockReadGuard<WalFileShared> {
+    fn get_shared(&self) -> parking_lot::RwLockReadGuard<'_, WalFileShared> {
         self.shared.read()
     }
 
