@@ -9,13 +9,15 @@ use rustix::{
     fs::{self, FlockOperation},
 };
 use std::os::fd::RawFd;
+use std::sync::mpsc::{channel, Sender, Receiver};
+use std::thread::{self, JoinHandle};
 
 use std::{io::ErrorKind, sync::Arc};
-#[cfg(feature = "fs")]
-use tracing::debug;
 use tracing::{instrument, trace, Level};
 
-pub struct UnixIO {}
+pub struct UnixIO {
+    fsync_queue: Option<Arc<FsyncQueue>>,
+}
 
 unsafe impl Send for UnixIO {}
 unsafe impl Sync for UnixIO {}
@@ -23,8 +25,9 @@ unsafe impl Sync for UnixIO {}
 impl UnixIO {
     #[cfg(feature = "fs")]
     pub fn new() -> Result<Self> {
-        debug!("Using IO backend 'syscall'");
-        Ok(Self {})
+        Ok(Self {
+            fsync_queue: Some(Arc::new(FsyncQueue::new()?)),
+        })
     }
 }
 
@@ -107,6 +110,7 @@ impl IO for UnixIO {
         #[allow(clippy::arc_with_non_send_sync)]
         let unix_file = Arc::new(UnixFile {
             file: Arc::new(Mutex::new(file)),
+            fsync_queue: self.fsync_queue.as_ref().unwrap().clone(),
         });
         if std::env::var(common::ENV_DISABLE_FILE_LOCK).is_err() {
             unix_file.lock_file(!flags.contains(OpenFlags::ReadOnly))?;
@@ -127,6 +131,7 @@ impl IO for UnixIO {
 
 pub struct UnixFile {
     file: Arc<Mutex<std::fs::File>>,
+    fsync_queue: Arc<FsyncQueue>,
 }
 unsafe impl Send for UnixFile {}
 unsafe impl Sync for UnixFile {}
@@ -311,33 +316,12 @@ impl File for UnixFile {
 
     #[instrument(err, skip_all, level = Level::TRACE)]
     fn sync(&self, c: Completion) -> Result<Completion> {
+        trace!("submitting async fsync");
         let file = self.file.lock();
+        let fd = file.as_raw_fd();
 
-        let result = unsafe {
-            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
-            {
-                libc::fsync(file.as_raw_fd())
-            }
-
-            #[cfg(any(target_os = "macos", target_os = "ios"))]
-            {
-                libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC)
-            }
-        };
-
-        if result == -1 {
-            let e = std::io::Error::last_os_error();
-            Err(e.into())
-        } else {
-            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
-            trace!("fsync");
-
-            #[cfg(any(target_os = "macos", target_os = "ios"))]
-            trace!("fcntl(F_FULLSYNC)");
-
-            c.complete(0);
-            Ok(c)
-        }
+        self.fsync_queue.submit(fd, c.clone())?;
+        Ok(c)
     }
 
     #[instrument(err, skip_all, level = Level::TRACE)]
@@ -364,6 +348,109 @@ impl File for UnixFile {
 impl Drop for UnixFile {
     fn drop(&mut self) {
         self.unlock_file().expect("Failed to unlock file");
+    }
+}
+
+impl Drop for UnixIO {
+    fn drop(&mut self) {
+        self.fsync_queue.take();
+    }
+}
+
+enum FsyncRequest {
+    Sync { fd: RawFd, completion: Completion },
+    Shutdown,
+}
+
+unsafe impl Send for FsyncRequest {}
+
+struct FsyncQueue {
+    sender: Sender<FsyncRequest>,
+    worker_handle: Option<JoinHandle<()>>,
+}
+
+impl Drop for FsyncQueue {
+    fn drop(&mut self) {
+        let _ = self.sender.send(FsyncRequest::Shutdown);
+        if let Some(handle) = self.worker_handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl FsyncQueue {
+    fn new() -> Result<Self> {
+        let (sender, receiver) = channel::<FsyncRequest>();
+
+        let worker_handle = thread::Builder::new()
+            .name("fsync-worker".to_string())
+            .spawn(move || {
+                Self::worker_loop(receiver);
+            })?;
+
+        Ok(Self {
+            sender,
+            worker_handle: Some(worker_handle),
+        })
+    }
+
+    fn submit(&self, fd: RawFd, completion: Completion) -> Result<()> {
+        self.sender.send(FsyncRequest::Sync {
+            fd,
+            completion,
+        }).map_err(|_| LimboError::InternalError("Fsync queue closed".into()))?;
+        Ok(())
+    }
+
+    fn worker_loop(receiver: Receiver<FsyncRequest>) {
+        use std::collections::HashMap;
+
+        loop {
+            match receiver.recv() {
+                Ok(FsyncRequest::Shutdown) => break,
+                Ok(FsyncRequest::Sync { fd, completion }) => {
+                    let mut batch: HashMap<RawFd, Vec<Completion>> = HashMap::new();
+                    batch.entry(fd).or_default().push(completion);
+                    while let Ok(request) = receiver.try_recv() {
+                        match request {
+                            FsyncRequest::Sync { fd, completion } => {
+                                batch.entry(fd).or_default().push(completion);
+                            }
+                            FsyncRequest::Shutdown => {
+                                Self::process_batch(batch);
+                                return;
+                            }
+                        }
+                    }
+                    Self::process_batch(batch);
+                }
+                Err(_) => break,
+            }
+        }
+    }
+
+    fn process_batch(batch: std::collections::HashMap<RawFd, Vec<Completion>>) {
+        if batch.is_empty() {
+            return;
+        }
+        for (fd, completions) in batch {
+            let result = unsafe {
+                #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+                {
+                    libc::fsync(fd)
+                }
+
+                #[cfg(any(target_os = "macos", target_os = "ios"))]
+                {
+                    libc::fcntl(fd, libc::F_FULLFSYNC)
+                }
+            };
+
+            let result = if result == -1 { -1 } else { 0 };
+            for c in completions {
+                c.complete(result);
+            }
+        }
     }
 }
 
