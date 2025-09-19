@@ -527,7 +527,7 @@ impl Schema {
             let table = Arc::new(Table::BTree(Arc::new(BTreeTable {
                 name: view_name.clone(),
                 root_page: main_root,
-                columns: incremental_view.columns.clone(),
+                columns: incremental_view.column_schema.flat_columns(),
                 primary_key_columns: Vec::new(),
                 has_rowid: true,
                 is_strict: false,
@@ -673,11 +673,12 @@ impl Schema {
                             ..
                         } => {
                             // Extract actual columns from the SELECT statement
-                            let view_columns = crate::util::extract_view_columns(&select, self);
+                            let view_column_schema =
+                                crate::util::extract_view_columns(&select, self)?;
 
                             // If column names were provided in CREATE VIEW (col1, col2, ...),
                             // use them to rename the columns
-                            let mut final_columns = view_columns;
+                            let mut final_columns = view_column_schema.flat_columns();
                             for (i, indexed_col) in column_names.iter().enumerate() {
                                 if let Some(col) = final_columns.get_mut(i) {
                                     col.name = Some(indexed_col.col_name.to_string());

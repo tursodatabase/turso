@@ -508,7 +508,8 @@ fn query_pragma(
                     emit_columns_for_table_info(&mut program, table.columns(), base_reg);
                 } else if let Some(view_mutex) = schema.get_materialized_view(&name) {
                     let view = view_mutex.lock().unwrap();
-                    emit_columns_for_table_info(&mut program, &view.columns, base_reg);
+                    let flat_columns = view.column_schema.flat_columns();
+                    emit_columns_for_table_info(&mut program, &flat_columns, base_reg);
                 } else if let Some(view) = schema.get_view(&name) {
                     emit_columns_for_table_info(&mut program, &view.columns, base_reg);
                 }

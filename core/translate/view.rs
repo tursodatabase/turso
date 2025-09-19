@@ -42,7 +42,8 @@ pub fn translate_create_materialized_view(
     // storing invalid view definitions
     use crate::incremental::view::IncrementalView;
     use crate::schema::BTreeTable;
-    let view_columns = IncrementalView::validate_and_extract_columns(select_stmt, schema)?;
+    let view_column_schema = IncrementalView::validate_and_extract_columns(select_stmt, schema)?;
+    let view_columns = view_column_schema.flat_columns();
 
     // Reconstruct the SQL string for storage
     let sql = create_materialized_view_to_str(view_name, select_stmt);
