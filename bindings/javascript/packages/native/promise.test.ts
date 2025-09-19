@@ -1,8 +1,28 @@
 import { unlinkSync } from "node:fs";
 import { expect, test } from 'vitest'
 import { connect } from './promise.js'
+import { sql } from 'drizzle-orm';
+import { drizzle } from 'drizzle-orm/better-sqlite3';
 
-test('in-memory db', async () => {
+test('drizzle-orm', async () => {
+    const path = `test-${(Math.random() * 10000) | 0}.db`;
+    try {
+        const conn = await connect(path);
+        const db = drizzle(conn);
+        await db.run('CREATE TABLE t(x, y)');
+        let tasks = [];
+        for (let i = 0; i < 1234; i++) {
+            tasks.push(db.run(sql`INSERT INTO t VALUES (${i}, randomblob(${i} * 5))`))
+        }
+        await Promise.all(tasks);
+        expect(await db.all("SELECT COUNT(*) as cnt FROM t")).toEqual([{ cnt: 1234 }])
+    } finally {
+        unlinkSync(path);
+        unlinkSync(`${path}-wal`);
+    }
+})
+
+test('in-memory-db-async', async () => {
     const db = await connect(":memory:");
     await db.exec("CREATE TABLE t(x)");
     await db.exec("INSERT INTO t VALUES (1), (2), (3)");

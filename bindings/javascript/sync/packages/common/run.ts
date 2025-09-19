@@ -1,6 +1,7 @@
 "use strict";
 
 import { GeneratorResponse, ProtocolIo, RunOpts } from "./types.js";
+import { AsyncLock } from "@tursodatabase/database-common";
 
 const GENERATOR_RESUME_IO = 0;
 const GENERATOR_RESUME_DONE = 1;
@@ -114,6 +115,10 @@ export async function run(opts: RunOpts, io: ProtocolIo, engine: any, generator:
         if (type == 'SyncEngineStats') {
             return rest;
         }
+        if (type == 'SyncEngineChanges') {
+            //@ts-ignore
+            return rest.changes;
+        }
         for (let request = engine.protocolIo(); request != null; request = engine.protocolIo()) {
             tasks.push(trackPromise(process(opts, io, request)));
         }
@@ -124,4 +129,67 @@ export async function run(opts: RunOpts, io: ProtocolIo, engine: any, generator:
         tasks = tasks.filter(t => !t.finished);
     }
     return generator.take();
+}
+
+
+
+export class SyncEngineGuards {
+    waitLock: AsyncLock;
+    pushLock: AsyncLock;
+    pullLock: AsyncLock;
+    checkpointLock: AsyncLock;
+    constructor() {
+        this.waitLock = new AsyncLock();
+        this.pushLock = new AsyncLock();
+        this.pullLock = new AsyncLock();
+        this.checkpointLock = new AsyncLock();
+    }
+    async wait(f: () => Promise<any>): Promise<any> {
+        try {
+            await this.waitLock.acquire();
+            return await f();
+        } finally {
+            this.waitLock.release();
+        }
+    }
+    async push(f: () => Promise<void>) {
+        try {
+            await this.pushLock.acquire();
+            await this.pullLock.acquire();
+            await this.checkpointLock.acquire();
+            return await f();
+        } finally {
+            this.pushLock.release();
+            this.pullLock.release();
+            this.checkpointLock.release();
+        }
+    }
+    async apply(f: () => Promise<void>) {
+        try {
+            await this.waitLock.acquire();
+            await this.pushLock.acquire();
+            await this.pullLock.acquire();
+            await this.checkpointLock.acquire();
+            return await f();
+        } finally {
+            this.waitLock.release();
+            this.pushLock.release();
+            this.pullLock.release();
+            this.checkpointLock.release();
+        }
+    }
+    async checkpoint(f: () => Promise<void>) {
+        try {
+            await this.waitLock.acquire();
+            await this.pushLock.acquire();
+            await this.pullLock.acquire();
+            await this.checkpointLock.acquire();
+            return await f();
+        } finally {
+            this.waitLock.release();
+            this.pushLock.release();
+            this.pullLock.release();
+            this.checkpointLock.release();
+        }
+    }
 }

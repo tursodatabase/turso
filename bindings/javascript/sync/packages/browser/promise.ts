@@ -1,6 +1,6 @@
 import { registerFileAtWorker, unregisterFileAtWorker } from "@tursodatabase/database-browser-common"
 import { DatabasePromise, DatabaseOpts, NativeDatabase } from "@tursodatabase/database-common"
-import { ProtocolIo, run, SyncOpts, RunOpts, memoryIO, SyncEngineStats } from "@tursodatabase/sync-common";
+import { ProtocolIo, run, SyncOpts, RunOpts, memoryIO, SyncEngineStats, SyncEngineGuards } from "@tursodatabase/sync-common";
 
 let BrowserIo: ProtocolIo = {
     async read(path: string): Promise<Buffer | Uint8Array | null> {
@@ -24,6 +24,7 @@ class Database extends DatabasePromise {
     io: ProtocolIo;
     worker: Worker | null;
     fsPath: string | null;
+    guards: SyncEngineGuards;
     constructor(db: NativeDatabase, io: ProtocolIo, worker: Worker | null, runOpts: RunOpts, engine: any, fsPath: string | null, opts: DatabaseOpts = {}) {
         super(db, opts)
         this.io = io;
@@ -31,18 +32,21 @@ class Database extends DatabasePromise {
         this.runOpts = runOpts;
         this.engine = engine;
         this.fsPath = fsPath;
+        this.guards = new SyncEngineGuards();
     }
     async sync() {
-        await run(this.runOpts, this.io, this.engine, this.engine.sync());
+        await this.push();
+        await this.pull();
     }
     async pull() {
-        await run(this.runOpts, this.io, this.engine, this.engine.pull());
+        const changes = await this.guards.wait(async () => await run(this.runOpts, this.io, this.engine, this.engine.wait()));
+        await this.guards.apply(async () => await run(this.runOpts, this.io, this.engine, this.engine.apply(changes)));
     }
     async push() {
-        await run(this.runOpts, this.io, this.engine, this.engine.push());
+        await this.guards.push(async () => await run(this.runOpts, this.io, this.engine, this.engine.push()));
     }
     async checkpoint() {
-        await run(this.runOpts, this.io, this.engine, this.engine.checkpoint());
+        await this.guards.checkpoint(async () => await run(this.runOpts, this.io, this.engine, this.engine.checkpoint()));
     }
     async stats(): Promise<SyncEngineStats> {
         return (await run(this.runOpts, this.io, this.engine, this.engine.stats()));
@@ -76,7 +80,8 @@ async function connect(opts: SyncOpts, connect: (any) => any, init: () => Promis
         tablesIgnore: opts.tablesIgnore,
         useTransform: opts.transform != null,
         tracing: opts.tracing,
-        protocolVersion: 1
+        protocolVersion: 1,
+        longPollTimeoutMs: opts.longPollTimeoutMs
     });
     const runOpts: RunOpts = {
         url: opts.url,

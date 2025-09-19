@@ -24,46 +24,94 @@ interface BrowserImports {
     is_web_worker(): boolean;
     lookup_file(ptr: number, len: number): number;
     read(handle: number, ptr: number, len: number, offset: number): number;
+    read_async(handle: number, ptr: number, len: number, offset: number, c: number);
     write(handle: number, ptr: number, len: number, offset: number): number;
+    write_async(handle: number, ptr: number, len: number, offset: number, c: number);
     sync(handle: number): number;
+    sync_async(handle: number, c: number);
     truncate(handle: number, len: number): number;
+    truncate_async(handle: number, len: number, c: number);
     size(handle: number): number;
 }
 
-function panic(name): never {
+function panicMain(name): never {
+    throw new Error(`method ${name} must be invoked only from the worker thread`);
+}
+
+function panicWorker(name): never {
     throw new Error(`method ${name} must be invoked only from the main thread`);
 }
 
-const MainDummyImports: BrowserImports = {
-    is_web_worker: function (): boolean {
-        return false;
-    },
-    lookup_file: function (ptr: number, len: number): number {
-        panic("lookup_file")
-    },
-    read: function (handle: number, ptr: number, len: number, offset: number): number {
-        panic("read")
-    },
-    write: function (handle: number, ptr: number, len: number, offset: number): number {
-        panic("write")
-    },
-    sync: function (handle: number): number {
-        panic("sync")
-    },
-    truncate: function (handle: number, len: number): number {
-        panic("truncate")
-    },
-    size: function (handle: number): number {
-        panic("size")
-    }
+let completeOpfs: any = null;
+
+function mainImports(worker: Worker): BrowserImports {
+    return {
+        is_web_worker(): boolean {
+            return false;
+        },
+        write_async(handle, ptr, len, offset, c) {
+            writeFileAtWorker(worker, handle, ptr, len, offset)
+                .then(result => {
+                    completeOpfs(c, result);
+                }, err => {
+                    console.error('write_async', err);
+                    completeOpfs(c, -1);
+                });
+        },
+        sync_async(handle, c) {
+            syncFileAtWorker(worker, handle)
+                .then(result => {
+                    completeOpfs(c, result);
+                }, err => {
+                    console.error('sync_async', err);
+                    completeOpfs(c, -1);
+                });
+        },
+        read_async(handle, ptr, len, offset, c) {
+            readFileAtWorker(worker, handle, ptr, len, offset)
+                .then(result => {
+                    completeOpfs(c, result);
+                }, err => {
+                    console.error('read_async', err);
+                    completeOpfs(c, -1);
+                });
+        },
+        truncate_async(handle, len, c) {
+            truncateFileAtWorker(worker, handle, len)
+                .then(result => {
+                    completeOpfs(c, result);
+                }, err => {
+                    console.error('truncate_async', err);
+                    completeOpfs(c, -1);
+                });
+        },
+        lookup_file(ptr, len): number {
+            panicMain("lookup_file")
+        },
+        read(handle, ptr, len, offset): number {
+            panicMain("read")
+        },
+        write(handle, ptr, len, offset): number {
+            panicMain("write")
+        },
+        sync(handle): number {
+            panicMain("sync")
+        },
+        truncate(handle, len): number {
+            panicMain("truncate")
+        },
+        size(handle): number {
+            panicMain("size")
+        }
+    };
 };
 
 function workerImports(opfs: OpfsDirectory, memory: WebAssembly.Memory): BrowserImports {
     return {
-        is_web_worker: function (): boolean {
+        is_web_worker(): boolean {
             return true;
         },
-        lookup_file: function (ptr: number, len: number): number {
+        lookup_file(ptr, len): number {
             try {
                 const handle = opfs.lookupFileHandle(getStringFromMemory(memory, ptr, len));
                 return handle == null ? -404 : handle;
@@ -71,29 +119,28 @@ function workerImports(opfs: OpfsDirectory, memory: WebAssembly.Memory): Browser
                 return -1;
             }
         },
-        read: function (handle: number, ptr: number, len: number, offset: number): number {
+        read(handle, ptr, len, offset): number {
             try {
                 return opfs.read(handle, getUint8ArrayFromMemory(memory, ptr, len), offset);
             } catch (e) {
                 return -1;
             }
         },
-        write: function (handle: number, ptr: number, len: number, offset: number): number {
+        write(handle, ptr, len, offset): number {
             try {
                 return opfs.write(handle, getUint8ArrayFromMemory(memory, ptr, len), offset)
             } catch (e) {
                 return -1;
             }
         },
-        sync: function (handle: number): number {
+        sync(handle): number {
             try {
-                opfs.sync(handle);
-                return 0;
+                return opfs.sync(handle);
             } catch (e) {
                 return -1;
             }
         },
-        truncate: function (handle: number, len: number): number {
+        truncate(handle, len): number {
             try {
                 opfs.truncate(handle, len);
                 return 0;
@@ -101,13 +148,25 @@ function workerImports(opfs: OpfsDirectory, memory: WebAssembly.Memory): Browser
                 return -1;
             }
         },
-        size: function (handle: number): number {
+        size(handle): number {
             try {
                 return opfs.size(handle);
             } catch (e) {
                 return -1;
             }
-        }
+        },
+        read_async(handle, ptr, len, offset, completion) {
+            panicWorker("read_async")
+        },
+        write_async(handle, ptr, len, offset, completion) {
+            panicWorker("write_async")
+        },
+        sync_async(handle, completion) {
+            panicWorker("sync_async")
+        },
+        truncate_async(handle, len, c) {
+            panicWorker("truncate_async")
+        },
     }
 }
 
@@ -175,10 +234,11 @@ class OpfsDirectory {
             throw e;
         }
     }
-    sync(handle: number) {
+    sync(handle: number): number {
         try {
             const file = this.fileByHandle.get(handle);
             file.flush();
+            return 0;
         } catch (e) {
             console.error('sync', handle, e);
             throw e;
@@ -187,8 +247,8 @@ class OpfsDirectory {
     truncate(handle: number, size: number) {
         try {
             const file = this.fileByHandle.get(handle);
-            const result = file.truncate(size);
-            return result;
+            file.truncate(size);
+            return 0;
         } catch (e) {
             console.error('truncate', handle, size, e);
             throw e;
@@ -214,7 +274,7 @@ function waitForWorkerResponse(worker: Worker, id: number): Promise<any> {
             if (msg.data.error != null) {
                 waitReject(msg.data.error)
             } else {
-                waitResolve()
+                waitResolve(msg.data.result)
             }
             cleanup();
         }
@@ -227,6 +287,38 @@ function waitForWorkerResponse(worker: Worker, id: number): Promise<any> {
         waitReject = reject;
     });
     return result;
+}
+
+function readFileAtWorker(worker: Worker, handle: number, ptr: number, len: number, offset: number) {
+    workerRequestId += 1;
+    const currentId = workerRequestId;
+    const promise = waitForWorkerResponse(worker, currentId);
+    worker.postMessage({ __turso__: "read_async", handle: handle, ptr: ptr, len: len, offset: offset, id: currentId });
+    return promise;
+}
+
+function writeFileAtWorker(worker: Worker, handle: number, ptr: number, len: number, offset: number) {
+    workerRequestId += 1;
+    const currentId = workerRequestId;
+    const promise = waitForWorkerResponse(worker, currentId);
+    worker.postMessage({ __turso__: "write_async", handle: handle, ptr: ptr, len: len, offset: offset, id: currentId });
+    return promise;
+}
+
+function syncFileAtWorker(worker: Worker, handle: number) {
+    workerRequestId += 1;
+    const currentId = workerRequestId;
+    const promise = waitForWorkerResponse(worker, currentId);
+    worker.postMessage({ __turso__: "sync_async", handle: handle, id: currentId });
+    return promise;
+}
+
+function truncateFileAtWorker(worker: Worker, handle: number, len: number) {
+    workerRequestId += 1;
+    const currentId = workerRequestId;
+    const promise = waitForWorkerResponse(worker, currentId);
+    worker.postMessage({ __turso__: "truncate_async", handle: handle, len: len, id: currentId });
+    return promise;
 }
 
 function registerFileAtWorker(worker: Worker, path: string): Promise<void> {
@@ -299,12 +391,25 @@ function setupWebWorker() {
                 self.postMessage({ id: e.data.id, error: error });
             }
             return;
+        } else if (e.data.__turso__ == 'read_async') {
+            let result = opfs.read(e.data.handle, getUint8ArrayFromMemory(memory, e.data.ptr, e.data.len), e.data.offset);
+            self.postMessage({ id: e.data.id, result: result });
+        } else if (e.data.__turso__ == 'write_async') {
+            let result = opfs.write(e.data.handle, getUint8ArrayFromMemory(memory, e.data.ptr, e.data.len), e.data.offset);
+            self.postMessage({ id: e.data.id, result: result });
+        } else if (e.data.__turso__ == 'sync_async') {
+            let result = opfs.sync(e.data.handle);
+            self.postMessage({ id: e.data.id, result: result });
+        } else if (e.data.__turso__ == 'truncate_async') {
+            let result = opfs.truncate(e.data.handle, e.data.len);
+            self.postMessage({ id: e.data.id, result: result });
         }
         handler.handle(e)
     }
 }
 
 async function setupMainThread(wasmFile: ArrayBuffer, factory: () => Worker): Promise<any> {
+    const worker = factory();
     const __emnapiContext = __emnapiGetDefaultContext()
     const __wasi = new __WASI({
         version: 'preview1',
@@ -322,13 +427,13 @@ async function setupMainThread(wasmFile: ArrayBuffer, factory: () => Worker): Pr
         context: __emnapiContext,
         asyncWorkPoolSize: 1,
         wasi: __wasi,
-        onCreateWorker() { return factory() },
+        onCreateWorker() { return worker; },
         overwriteImports(importObject) {
             importObject.env = {
                 ...importObject.env,
                 ...importObject.napi,
                 ...importObject.emnapi,
-                ...MainDummyImports,
+                ...mainImports(worker),
                 memory: __sharedMemory,
             }
             return importObject
@@ -340,8 +445,9 @@ async function setupMainThread(wasmFile: ArrayBuffer, factory: () => Worker): Pr
                 }
             }
         },
-    })
+    });
+    completeOpfs = __napiModule.exports.completeOpfs;
     return __napiModule;
 }
 
-export { OpfsDirectory, workerImports, MainDummyImports, waitForWorkerResponse, registerFileAtWorker, unregisterFileAtWorker, isWebWorker, setupWebWorker, setupMainThread }
+export { OpfsDirectory, workerImports, mainImports as MainDummyImports, waitForWorkerResponse, registerFileAtWorker, unregisterFileAtWorker, isWebWorker, setupWebWorker, setupMainThread }

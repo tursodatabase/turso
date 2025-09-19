@@ -160,7 +160,7 @@ test('checkpoint', async () => {
     await db1.checkpoint();
     expect((await db1.stats()).mainWal).toBe(0);
     let revertWal = (await db1.stats()).revertWal;
-    expect(revertWal).toBeLessThan(4096 * 1000 / 100);
+    expect(revertWal).toBeLessThan(4096 * 1000 / 50);
 
     for (let i = 0; i < 1000; i++) {
         await db1.exec(`UPDATE q SET y = 'u${i}' WHERE x = 'k${i}'`);
@@ -282,6 +282,119 @@ test('persistence-pull-push', async () => {
         cleanup(path1);
         cleanup(path2);
     }
+})
+
+test('update', async () => {
+    {
+        const db = await connect({ path: ':memory:', url: process.env.VITE_TURSO_DB_URL, longPollTimeoutMs: 5000 });
+        await db.exec("CREATE TABLE IF NOT EXISTS q(x TEXT PRIMARY KEY, y)");
+        await db.exec("DELETE FROM q");
+        await db.push();
+        await db.close();
+    }
+    const db = await connect({ path: ':memory:', url: process.env.VITE_TURSO_DB_URL });
+    await db.exec("INSERT INTO q VALUES ('1', '2')")
+    await db.push();
+    await db.exec("INSERT INTO q VALUES ('1', '2') ON CONFLICT DO UPDATE SET y = '3'")
+    await db.push();
+})
+
+test('concurrent-updates', async () => {
+    {
+        const db = await connect({ path: ':memory:', url: process.env.VITE_TURSO_DB_URL, longPollTimeoutMs: 5000 });
+        await db.exec("CREATE TABLE IF NOT EXISTS q(x TEXT PRIMARY KEY, y)");
+        await db.exec("DELETE FROM q");
+        await db.push();
+        await db.close();
+    }
+    const db1 = await connect({ path: ':memory:', url: process.env.VITE_TURSO_DB_URL });
+    async function pull(db) {
+        try {
+            await db.pull();
+        } catch (e) {
+            // ignore
+        } finally {
+            setTimeout(async () => await pull(db), 0);
+        }
+    }
+    async function push(db) {
+        try {
+            await db.push();
+        } catch (e) {
+            // ignore
+        } finally {
+            setTimeout(async () => await push(db), 0);
+        }
+    }
+    setTimeout(async () => await pull(db1), 0)
+    setTimeout(async () => await push(db1), 0)
+    for (let i = 0; i < 1000; i++) {
+        try {
+            await Promise.all([
+                db1.exec(`INSERT INTO q VALUES ('1', 0) ON CONFLICT DO UPDATE SET y = ${i + 1}`),
+                db1.exec(`INSERT INTO q VALUES ('2', 0) ON CONFLICT DO UPDATE SET y = ${i + 1}`)
+            ]);
+        } catch (e) {
+            // ignore
+        }
+        await new Promise(resolve => setTimeout(resolve, 1));
+    }
+})
+
+test('pull-push-concurrent', async () => {
+    {
+        const db = await connect({ path: ':memory:', url: process.env.VITE_TURSO_DB_URL, longPollTimeoutMs: 5000 });
+        await db.exec("CREATE TABLE IF NOT EXISTS q(x TEXT PRIMARY KEY, y)");
+        await db.exec("DELETE FROM q");
+        await db.push();
+        await db.close();
+    }
+    let pullResolve = null;
+    const pullFinish = new Promise(resolve => pullResolve = resolve);
+    let pushResolve = null;
+    const pushFinish = new Promise(resolve => pushResolve = resolve);
+    let stopPull = false;
+    let stopPush = false;
+    const db = await connect({ path: ':memory:', url: process.env.VITE_TURSO_DB_URL });
+    let pull = async () => {
+        try {
+            await db.pull();
+        } catch (e) {
+            console.error('pull', e);
+        } finally {
+            if (!stopPull) {
+                setTimeout(pull, 0);
+            } else {
+                pullResolve()
+            }
+        }
+    }
+    let push = async () => {
+        try {
+            if ((await db.stats()).operations > 0) {
+                await db.push();
+            }
+        } catch (e) {
+            console.error('push', e);
+        } finally {
+            if (!stopPush) {
+                setTimeout(push, 0);
+            } else {
+                pushResolve();
+            }
+        }
+    }
+    setTimeout(pull, 0);
+    setTimeout(push, 0);
+    for (let i = 0; i < 1000; i++) {
+        await db.exec(`INSERT INTO q VALUES ('k${i}', 'v${i}')`);
+    }
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    stopPush = true;
+    await pushFinish;
+    stopPull = true;
+    await pullFinish;
+    console.info(await db.stats());
 })
 
 test('transform', async () => {

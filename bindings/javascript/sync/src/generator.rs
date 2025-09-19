@@ -5,7 +5,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use turso_sync_engine::types::ProtocolCommand;
+use turso_sync_engine::types::{DbChangesStatus, ProtocolCommand};
 
 pub const GENERATOR_RESUME_IO: u32 = 0;
 pub const GENERATOR_RESUME_DONE: u32 = 1;
@@ -35,7 +35,12 @@ impl<F: Future<Output = turso_sync_engine::Result<()>>> Generator
     }
 }
 
-#[napi(discriminant = "type")]
+#[napi]
+pub struct SyncEngineChanges {
+    pub(crate) status: Box<Option<DbChangesStatus>>,
+}
+
+#[napi(discriminant = "type", object_from_js = false)]
 pub enum GeneratorResponse {
     IO,
     Done,
@@ -46,6 +51,9 @@ pub enum GeneratorResponse {
         last_pull_unix_time: i64,
         last_push_unix_time: Option<i64>,
         revision: Option<String>,
+    },
+    SyncEngineChanges {
+        changes: SyncEngineChanges,
     },
 }
 
