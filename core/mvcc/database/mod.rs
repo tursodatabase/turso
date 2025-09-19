@@ -1648,7 +1648,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     pub fn rollback_tx(
         &self,
         tx_id: TxID,
-        pager: Arc<Pager>,
+        _pager: Arc<Pager>,
         connection: &Connection,
     ) -> Result<()> {
         let tx_unlocked = self.txs.get(&tx_id).unwrap();
@@ -1659,14 +1659,10 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         tracing::trace!("abort(tx_id={})", tx_id);
         let write_set: Vec<RowID> = tx.write_set.iter().map(|v| *v.value()).collect();
 
-        let pager_rollback_done = if self.is_exclusive_tx(&tx_id) {
+        if self.is_exclusive_tx(&tx_id) {
             self.commit_coordinator.pager_commit_lock.unlock();
             self.release_exclusive_tx(&tx_id);
-            pager.io.block(|| pager.end_tx(true, connection))?;
-            true
-        } else {
-            false
-        };
+        }
 
         for ref id in write_set {
             if let Some(row_versions) = self.rows.get(id) {
@@ -1688,9 +1684,6 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         let tx = tx_unlocked.value();
         tx.state.store(TransactionState::Terminated);
         tracing::trace!("terminate(tx_id={})", tx_id);
-        if !pager_rollback_done {
-            pager.end_read_tx()?;
-        }
         // FIXME: verify that we can already remove the transaction here!
         // Maybe it's fine for snapshot isolation, but too early for serializable?
         self.txs.remove(&tx_id);
