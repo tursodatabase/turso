@@ -3300,7 +3300,6 @@ pub fn bind_and_rewrite_expr<'a>(
                         ast::Name::Ident(normalize_ident(c.as_str())),
                     );
                 }
-                // Expand BETWEEN to binary ops (kept identical to your logic).
                 ast::Expr::Between {
                     lhs,
                     not,
