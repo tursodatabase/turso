@@ -490,15 +490,14 @@ async fn test_multiple_connections_fuzz() {
 }
 
 #[tokio::test]
-#[ignore = "MVCC is currently under development, it is expected to fail"]
 // Same as test_multiple_connections_fuzz, but with MVCC enabled.
 async fn test_multiple_connections_fuzz_mvcc() {
     let mvcc_fuzz_options = FuzzOptions {
         mvcc_enabled: true,
         max_num_connections: 8,
         query_gen_options: QueryGenOptions {
-            weight_begin_deferred: 8,
-            weight_begin_concurrent: 8,
+            weight_begin_deferred: 4,
+            weight_begin_concurrent: 12,
             weight_commit: 8,
             weight_rollback: 8,
             weight_checkpoint: 0,
