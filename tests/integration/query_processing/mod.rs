@@ -1,4 +1,5 @@
 mod test_btree;
+mod test_busy_timeout;
 mod test_read_path;
 mod test_write_path;
 
