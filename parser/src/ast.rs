@@ -1312,7 +1312,7 @@ pub enum PragmaName {
     ApplicationId,
     /// set the autovacuum mode
     AutoVacuum,
-    /// set the busy_timeout
+    /// set the busy_timeout (see https://www.sqlite.org/pragma.html#pragma_busy_timeout)
     BusyTimeout,
     /// `cache_size` pragma
     CacheSize,
