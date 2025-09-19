@@ -1455,7 +1455,11 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     ) -> Result<IOResult<TxID>> {
         let is_logical_log = self.storage.is_logical_log();
         let tx_id = maybe_existing_tx_id.unwrap_or_else(|| self.get_tx_id());
-        let begin_ts = self.get_timestamp();
+        let begin_ts = if let Some(tx_id) = maybe_existing_tx_id {
+            self.txs.get(&tx_id).unwrap().value().begin_ts
+        } else {
+            self.get_timestamp()
+        };
 
         self.acquire_exclusive_tx(&tx_id)?;
 
