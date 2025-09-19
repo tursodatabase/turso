@@ -1006,7 +1006,12 @@ impl ArbitraryFrom<(&SimulatorEnv, InteractionStats)> for Interactions {
         _context: &C,
         (env, stats): (&SimulatorEnv, InteractionStats),
     ) -> Self {
-        let remaining_ = remaining(env.opts.max_interactions, &env.profile.query, &stats);
+        let remaining_ = remaining(
+            env.opts.max_interactions,
+            &env.profile.query,
+            &stats,
+            env.profile.experimental_mvcc,
+        );
         let conn_index = env.choose_conn(rng);
         frequency(
             vec![

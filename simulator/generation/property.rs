@@ -1100,6 +1100,7 @@ pub(crate) fn remaining(
     max_interactions: u32,
     opts: &QueryProfile,
     stats: &InteractionStats,
+    mvcc: bool,
 ) -> Remaining {
     let total_weight = opts.select_weight
         + opts.create_table_weight
@@ -1126,7 +1127,7 @@ pub(crate) fn remaining(
     let remaining_create = total_create
         .checked_sub(stats.create_count)
         .unwrap_or_default();
-    let remaining_create_index = total_create_index
+    let mut remaining_create_index = total_create_index
         .checked_sub(stats.create_index_count)
         .unwrap_or_default();
     let remaining_delete = total_delete
@@ -1136,6 +1137,11 @@ pub(crate) fn remaining(
         .checked_sub(stats.update_count)
         .unwrap_or_default();
     let remaining_drop = total_drop.checked_sub(stats.drop_count).unwrap_or_default();
+
+    if mvcc {
+        // TODO: index not supported yet for mvcc
+        remaining_create_index = 0;
+    }
 
     Remaining {
         select: remaining_select,
@@ -1515,7 +1521,12 @@ impl ArbitraryFrom<(&SimulatorEnv, &InteractionStats, usize)> for Property {
     ) -> Self {
         let conn_ctx = &env.connection_context(conn_index);
         let opts = conn_ctx.opts();
-        let remaining_ = remaining(env.opts.max_interactions, &env.profile.query, stats);
+        let remaining_ = remaining(
+            env.opts.max_interactions,
+            &env.profile.query,
+            stats,
+            env.profile.experimental_mvcc,
+        );
 
         frequency(
             vec![

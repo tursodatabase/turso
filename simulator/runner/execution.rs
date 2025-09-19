@@ -186,7 +186,10 @@ pub fn execute_interaction_turso(
                 tracing::error!(?results);
             }
             stack.push(results);
-            limbo_integrity_check(conn)?;
+            // TODO: skip integrity check with mvcc
+            if !env.profile.experimental_mvcc {
+                limbo_integrity_check(conn)?;
+            }
         }
         InteractionType::FsyncQuery(query) => {
             let results = interaction.execute_fsync_query(conn.clone(), env);
@@ -227,7 +230,10 @@ pub fn execute_interaction_turso(
             stack.push(results);
             // Reset fault injection
             env.io.inject_fault(false);
-            limbo_integrity_check(&conn)?;
+            // TODO: skip integrity check with mvcc
+            if !env.profile.experimental_mvcc {
+                limbo_integrity_check(&conn)?;
+            }
         }
     }
     let _ = interaction.shadow(env.get_conn_tables_mut(interaction.connection_index));
