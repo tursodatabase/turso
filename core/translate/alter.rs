@@ -48,6 +48,15 @@ pub fn translate_alter_table(
         )));
     };
 
+    // Check if this table has dependent materialized views
+    let dependent_views = schema.get_dependent_materialized_views(table_name);
+    if !dependent_views.is_empty() {
+        return Err(LimboError::ParseError(format!(
+            "cannot alter table \"{table_name}\": it has dependent materialized view(s): {}",
+            dependent_views.join(", ")
+        )));
+    }
+
     let mut btree = (*original_btree).clone();
 
     Ok(match alter_table {
