@@ -7811,9 +7811,9 @@ mod cmath {
 
 impl Value {
     pub fn exec_lower(&self) -> Option<Self> {
-        match self {
-            Value::Text(t) => Some(Value::build_text(t.as_str().to_lowercase())),
-            t => Some(t.to_owned()),
+        match self.transform_chars(char::to_lowercase) {
+            Ok(value) => Some(value),
+            Err(_) => Some(self.to_owned()),
         }
     }
 
@@ -7843,9 +7843,9 @@ impl Value {
     }
 
     pub fn exec_upper(&self) -> Option<Self> {
-        match self {
-            Value::Text(t) => Some(Value::build_text(t.as_str().to_uppercase())),
-            t => Some(t.to_owned()),
+        match self.transform_chars(char::to_uppercase) {
+            Ok(value) => Some(value),
+            Err(_) => Some(self.to_owned()),
         }
     }
 

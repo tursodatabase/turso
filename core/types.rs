@@ -16,7 +16,7 @@ use crate::vdbe::sorter::Sorter;
 use crate::vdbe::Register;
 use crate::vtab::VirtualTableCursor;
 use crate::{turso_assert, Completion, CompletionError, Result, IO};
-use std::fmt::{Debug, Display};
+use std::fmt::{Debug, Display, Write};
 
 /// SQLite by default uses 2000 as maximum numbers in a row.
 /// It controlld by the constant called SQLITE_MAX_COLUMN
@@ -387,11 +387,49 @@ impl Value {
         };
     }
 
+    /// This function is lossy for blobs, so be careful when using it.
     pub fn cast_text(&self) -> Option<String> {
         Some(match self {
             Value::Null => return None,
             v => v.to_string(),
         })
+    }
+
+    /// Transform each character in the text/blob value using the provided function.
+    /// Invalid characters in blobs are preserved.
+    pub fn transform_chars<F, I>(&self, f: F) -> Result<Self>
+    where
+        I: IntoIterator<Item = char>,
+        F: Fn(char) -> I,
+    {
+        match self {
+            Value::Text(t) => {
+                let mut result = String::with_capacity(t.as_str().len());
+                for ch in t.as_str().chars().flat_map(f) {
+                    result.write_char(ch).unwrap();
+                }
+                let mut value: Text = result.into();
+                value.subtype = t.subtype;
+                Ok(Self::Text(value))
+            }
+            Value::Blob(b) => {
+                let mut result = String::with_capacity(b.len());
+                for chunk in b.utf8_chunks() {
+                    for ch1 in chunk.valid().chars() {
+                        for ch2 in f(ch1) {
+                            result.write_char(ch2).unwrap();
+                        }
+                    }
+
+                    // SAFETY: we will convert back to bytes in the end,
+                    // so it's fine to extend with invalid bytes
+                    unsafe { result.as_mut_vec().extend(chunk.invalid()) };
+                }
+
+                Ok(Value::Blob(result.into()))
+            }
+            _ => Err(LimboError::InvalidColumnType),
+        }
     }
 }
 
@@ -424,7 +462,13 @@ impl Display for Value {
             Self::Text(s) => {
                 write!(f, "{}", s.as_str())
             }
-            Self::Blob(b) => write!(f, "{}", String::from_utf8_lossy(b)),
+            Self::Blob(b) => {
+                // sqlite ignores invalid utf8 in blobs when displaying
+                for chunk in b.utf8_chunks() {
+                    f.write_str(chunk.valid())?;
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -1500,7 +1544,13 @@ impl Display for RefValue {
             Self::Integer(i) => write!(f, "{i}"),
             Self::Float(fl) => write!(f, "{fl:?}"),
             Self::Text(s) => write!(f, "{}", s.as_str()),
-            Self::Blob(b) => write!(f, "{}", String::from_utf8_lossy(b.to_slice())),
+            Self::Blob(b) => {
+                // sqlite ignores invalid utf8 in blobs when displaying
+                for chunk in b.to_slice().utf8_chunks() {
+                    f.write_str(chunk.valid())?;
+                }
+                Ok(())
+            }
         }
     }
 }

@@ -943,3 +943,17 @@ do_execsql_test parse-large-integral-numeric-string-as-number {
 # do_execsql_test soundex-text {
 #  select soundex('Pfister'), soundex('husobee'), soundex('Tymczak'), soundex('Ashcraft'), soundex('Robert'), soundex('Rupert'), soundex('Rubin'), soundex('Kant'), soundex('Knuth'), soundex('x'), soundex('');
 # } {P236|H210|T522|A261|R163|R163|R150|K530|K530|X000|0000}
+
+
+do_execsql_test lower-hex {
+  SELECT lower(x'7Eff7E50');
+} {~~p}
+
+do_execsql_test upper-hex {
+  SELECT upper(x'7Eff7E70');
+} {~~P}
+
+# https://github.com/tursodatabase/turso/issues/3202
+do_execsql_test issue-3202 {
+  SELECT hex(lower(x'ffff'));
+} {FFFF}
