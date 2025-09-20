@@ -1204,6 +1204,20 @@ impl DbspCompiler {
                     .map(|col| col.name.clone())
                     .collect();
 
+                // Check if there are any non-equijoin conditions in the filter
+                if join.filter.is_some() {
+                    return Err(LimboError::ParseError(
+                        "Non-equijoin conditions are not supported in materialized views. Only equality joins (=) are allowed.".to_string()
+                    ));
+                }
+
+                // Check if we have at least one equijoin condition
+                if join.on.is_empty() {
+                    return Err(LimboError::ParseError(
+                        "Joins in materialized views must have at least one equality condition.".to_string()
+                    ));
+                }
+
                 // Extract join key indices from join conditions
                 // For now, we only support equijoin conditions
                 let mut left_key_indices = Vec::new();
