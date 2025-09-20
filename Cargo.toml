@@ -32,7 +32,9 @@ members = [
     "whopper",
     "perf/throughput/turso",
     "perf/throughput/rusqlite",
+    "perf/encryption"
 ]
+
 exclude = [
     "perf/latency/limbo",
 ]

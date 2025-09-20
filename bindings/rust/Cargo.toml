@@ -15,6 +15,7 @@ conn_raw_api = ["turso_core/conn_raw_api"]
 experimental_indexes = []
 antithesis = ["turso_core/antithesis"]
 tracing_release = ["turso_core/tracing_release"]
+encryption = ["turso_core/encryption"]
 
 [dependencies]
 turso_core = { workspace = true, features = ["io_uring"] }

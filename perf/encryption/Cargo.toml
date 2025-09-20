@@ -1,0 +1,17 @@
+[package]
+name = "encryption-throughput"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "encryption-throughput"
+path = "src/main.rs"
+
+[dependencies]
+turso = { workspace = true, features = ["encryption"] }
+clap = { workspace = true, features = ["derive"] }
+tokio = { workspace = true, default-features = true, features = ["full"] }
+futures = { workspace = true }
+tracing-subscriber = { workspace = true }
+rand = { workspace = true, features = ["small_rng"] }
+hex = { workspace = true }
