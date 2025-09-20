@@ -392,7 +392,15 @@ fn get_core_value_text(row: &turso_core::Row, index: usize) -> Result<String> {
 fn get_core_value_blob_or_null(row: &turso_core::Row, index: usize) -> Result<Option<Vec<u8>>> {
     match row.get_value(index) {
         turso_core::Value::Null => Ok(None),
-        turso_core::Value::Blob(x) => Ok(Some(x.clone())),
+        turso_core::Value::Blob(x) => {
+            if x.unalloc_bytes > 0 {
+                let mut blob = x.clone();
+                blob.expand();
+                Ok(Some(blob.value))
+            } else {
+                Ok(Some(x.value.clone()))
+            }
+        }
         v => Err(Error::DatabaseTapeError(format!(
             "column {index} type mismatch: expected blob, got '{v:?}'"
         ))),

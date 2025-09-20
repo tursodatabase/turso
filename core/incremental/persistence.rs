@@ -41,7 +41,7 @@ impl ReadRecord {
                         let blob = values[3].to_owned();
 
                         let (state, _group_key) = match blob {
-                            Value::Blob(blob) => AggregateState::from_blob(&blob, aggregates)
+                            Value::Blob(blob) => AggregateState::from_blob(&blob.value, aggregates)
                                 .ok_or_else(|| {
                                     LimboError::InternalError(format!(
                                         "Cannot deserialize aggregate state {blob:?}",

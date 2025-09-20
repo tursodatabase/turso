@@ -102,7 +102,7 @@ impl ArbitraryFrom<&ColumnType> for SimValue {
             ColumnType::Integer => Value::Integer(rng.random_range(i64::MIN..i64::MAX)),
             ColumnType::Float => Value::Float(rng.random_range(-1e10..1e10)),
             ColumnType::Text => Value::build_text(gen_random_text(rng)),
-            ColumnType::Blob => Value::Blob(gen_random_text(rng).as_bytes().to_vec()),
+            ColumnType::Blob => Value::build_blob(gen_random_text(rng).as_bytes()),
         };
         SimValue(value)
     }
@@ -158,18 +158,25 @@ impl ArbitraryFrom<&SimValue> for LTValue {
             }
             Value::Blob(b) => {
                 // Either shorten the blob, or make at least one byte smaller and mutate the rest
-                let mut b = b.clone();
-                if rng.random_bool(0.01) {
-                    b.pop();
-                    Value::Blob(b)
+                let mut bytes = if b.unalloc_bytes > 0 {
+                    let mut blob = b.clone();
+                    blob.expand();
+                    blob.value
                 } else {
-                    let index = rng.random_range(0..b.len());
-                    b[index] -= 1;
+                    b.value.clone()
+                };
+
+                if rng.random_bool(0.01) {
+                    bytes.pop();
+                    Value::build_blob(bytes)
+                } else {
+                    let index = rng.random_range(0..bytes.len());
+                    bytes[index] -= 1;
                     // Mutate the rest of the blob
-                    for val in b.iter_mut().skip(index + 1) {
+                    for val in bytes.iter_mut().skip(index + 1) {
                         *val = rng.random_range(0..=255);
                     }
-                    Value::Blob(b)
+                    Value::build_blob(bytes)
                 }
             }
             _ => unreachable!(),
@@ -228,18 +235,25 @@ impl ArbitraryFrom<&SimValue> for GTValue {
             }
             Value::Blob(b) => {
                 // Either lengthen the blob, or make at least one byte smaller and mutate the rest
-                let mut b = b.clone();
-                if rng.random_bool(0.01) {
-                    b.push(rng.random_range(0..=255));
-                    Value::Blob(b)
+                let mut bytes = if b.unalloc_bytes > 0 {
+                    let mut blob = b.clone();
+                    blob.expand();
+                    blob.value
                 } else {
-                    let index = rng.random_range(0..b.len());
-                    b[index] += 1;
+                    b.value.clone()
+                };
+
+                if rng.random_bool(0.01) {
+                    bytes.push(rng.random_range(0..=255));
+                    Value::build_blob(bytes)
+                } else {
+                    let index = rng.random_range(0..bytes.len());
+                    bytes[index] += 1;
                     // Mutate the rest of the blob
-                    for val in b.iter_mut().skip(index + 1) {
+                    for val in bytes.iter_mut().skip(index + 1) {
                         *val = rng.random_range(0..=255);
                     }
-                    Value::Blob(b)
+                    Value::build_blob(bytes)
                 }
             }
             _ => unreachable!(),

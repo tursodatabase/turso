@@ -332,7 +332,7 @@ mod tests {
                 if let Some(Value::Blob(blob)) = values.get(3) {
                     // Deserialize the state
                     if let Some((state, group_key)) =
-                        AggregateState::from_blob(blob, &agg.aggregates)
+                        AggregateState::from_blob(&blob.value, &agg.aggregates)
                     {
                         // Should not have made it this far.
                         assert!(state.count != 0);

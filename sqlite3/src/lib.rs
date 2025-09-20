@@ -801,7 +801,7 @@ pub unsafe extern "C" fn sqlite3_bind_blob(
     let slice_blob = std::slice::from_raw_parts(blob as *const u8, len as usize).to_vec();
 
     let stmt_ref = &mut *stmt;
-    let val_blob = Value::from_blob(slice_blob);
+    let val_blob = Value::build_blob(slice_blob);
 
     if let Some(nz_idx) = NonZeroUsize::new(idx as usize) {
         stmt_ref.stmt.bind_at(nz_idx, val_blob);
@@ -839,12 +839,9 @@ pub unsafe extern "C" fn sqlite3_bind_zeroblob(
     }
 
     let stmt_ref = &mut *stmt;
-    let zeroblob = vec![0u8; len as usize];
-    let blob_value = Value::from_blob(zeroblob);
-
     stmt_ref
         .stmt
-        .bind_at(NonZero::new_unchecked(idx as usize), blob_value);
+        .bind_zeroblob_at(NonZero::new_unchecked(idx as usize), len as usize);
 
     SQLITE_OK
 }
@@ -984,7 +981,15 @@ pub unsafe extern "C" fn sqlite3_column_blob(
         None => return std::ptr::null(),
     };
     match row.get::<&Value>(idx as usize) {
-        Ok(turso_core::Value::Blob(blob)) => blob.as_ptr() as *const ffi::c_void,
+        Ok(turso_core::Value::Blob(blob)) => {
+            if blob.unalloc_bytes > 0 {
+                panic!(
+                    "sqlite3_column_blob called on unexpanded zeroblob with {} unallocated bytes",
+                    blob.unalloc_bytes
+                );
+            }
+            blob.value.as_ptr() as *const ffi::c_void
+        }
         _ => std::ptr::null(),
     }
 }
@@ -1002,7 +1007,7 @@ pub unsafe extern "C" fn sqlite3_column_bytes(
     };
     match row.get::<&Value>(idx as usize) {
         Ok(turso_core::Value::Text(text)) => text.as_str().len() as ffi::c_int,
-        Ok(turso_core::Value::Blob(blob)) => blob.len() as ffi::c_int,
+        Ok(turso_core::Value::Blob(blob)) => blob.bytes_len() as ffi::c_int,
         _ => 0,
     }
 }
@@ -1055,7 +1060,15 @@ pub unsafe extern "C" fn sqlite3_value_blob(value: *mut ffi::c_void) -> *const f
     let value = value as *mut turso_core::Value;
     let value = &*value;
     match value {
-        turso_core::Value::Blob(blob) => blob.as_ptr() as *const ffi::c_void,
+        turso_core::Value::Blob(blob) => {
+            if blob.unalloc_bytes > 0 {
+                panic!(
+                    "sqlite3_value_blob called on unexpanded zeroblob with {} unallocated bytes",
+                    blob.unalloc_bytes
+                );
+            }
+            blob.value.as_ptr() as *const ffi::c_void
+        }
         _ => std::ptr::null(),
     }
 }
@@ -1065,7 +1078,7 @@ pub unsafe extern "C" fn sqlite3_value_bytes(value: *mut ffi::c_void) -> ffi::c_
     let value = value as *mut turso_core::Value;
     let value = &*value;
     match value {
-        turso_core::Value::Blob(blob) => blob.len() as ffi::c_int,
+        turso_core::Value::Blob(blob) => blob.bytes_len() as ffi::c_int,
         _ => 0,
     }
 }

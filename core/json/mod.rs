@@ -11,7 +11,7 @@ pub use crate::json::ops::{
     jsonb_replace,
 };
 use crate::json::path::{json_path, JsonPath, PathElement};
-use crate::types::{RawSlice, Text, TextRef, TextSubtype, Value, ValueType};
+use crate::types::{BlobRef, Text, TextRef, TextSubtype, Value, ValueType};
 use crate::vdbe::Register;
 use crate::{bail_constraint_error, bail_parse_error, LimboError, RefValue};
 pub use cache::JsonCacheCell;
@@ -51,7 +51,7 @@ pub fn get_json(json_value: &Value, indent: Option<&str>) -> crate::Result<Value
             Ok(Value::Text(Text::json(json)))
         }
         Value::Blob(b) => {
-            let jsonbin = Jsonb::new(b.len(), Some(b));
+            let jsonbin = Jsonb::new(b.bytes_len(), Some(b.value.as_slice()));
             jsonbin.element_type()?;
             Ok(Value::Text(Text {
                 value: jsonbin.to_string().into_bytes(),
@@ -80,7 +80,7 @@ pub fn jsonb(json_value: &Value, cache: &JsonCacheCell) -> crate::Result<Value> 
 
     let jsonbin = cache.get_or_insert_with(json_value, json_conv_fn);
     match jsonbin {
-        Ok(jsonbin) => Ok(Value::Blob(jsonbin.data())),
+        Ok(jsonbin) => Ok(Value::build_blob(jsonbin.data().as_slice())),
         Err(_) => {
             bail_parse_error!("malformed JSON")
         }
@@ -112,7 +112,9 @@ pub fn convert_dbtype_to_jsonb(val: &Value, strict: Conv) -> crate::Result<Jsonb
             Value::Text(text) => {
                 RefValue::Text(TextRef::create_from(text.as_str().as_bytes(), text.subtype))
             }
-            Value::Blob(items) => RefValue::Blob(RawSlice::create_from(items)),
+            Value::Blob(blob) => {
+                RefValue::Blob(BlobRef::create_from(&blob.value, blob.unalloc_bytes))
+            }
         },
         strict,
     )
@@ -140,7 +142,7 @@ pub fn convert_ref_dbtype_to_jsonb(val: &RefValue, strict: Conv) -> crate::Resul
             res.map_err(|_| LimboError::ParseError("malformed JSON".to_string()))
         }
         RefValue::Blob(blob) => {
-            let bytes = blob.to_slice();
+            let bytes = blob.value.to_slice();
             // Valid JSON can start with these whitespace characters
             let index = bytes
                 .iter()
@@ -470,7 +472,7 @@ pub fn json_string_to_db_type(
 ) -> crate::Result<Value> {
     let mut json_string = json.to_string();
     if matches!(flag, OutputVariant::Binary) {
-        return Ok(Value::Blob(json.data()));
+        return Ok(Value::build_blob(json.data()));
     }
     match element_type {
         ElementType::ARRAY | ElementType::OBJECT => Ok(Value::Text(Text::json(json_string))),
@@ -782,7 +784,7 @@ mod tests {
     #[test]
     fn test_get_json_blob_valid_jsonb() {
         let binary_json = vec![124, 55, 104, 101, 121, 39, 121, 111];
-        let input = Value::Blob(binary_json);
+        let input = Value::build_blob(binary_json);
         let result = get_json(&input, None).unwrap();
         if let Value::Text(result_str) = result {
             assert!(result_str.as_str().contains(r#"{"hey":"yo"}"#));
@@ -795,7 +797,7 @@ mod tests {
     #[test]
     fn test_get_json_blob_invalid_jsonb() {
         let binary_json: Vec<u8> = vec![0xA2, 0x62, 0x6B, 0x31, 0x62, 0x76]; // Incomplete binary JSON
-        let input = Value::Blob(binary_json);
+        let input = Value::build_blob(binary_json);
         let result = get_json(&input, None);
         println!("{result:?}");
         match result {
@@ -850,7 +852,7 @@ mod tests {
 
     #[test]
     fn test_json_array_blob_invalid() {
-        let blob = Register::Value(Value::Blob("1".as_bytes().to_vec()));
+        let blob = Register::Value(Value::build_blob("1".as_bytes()));
 
         let input = vec![blob];
 
