@@ -330,7 +330,7 @@ fn run_simulator(
                         tracing::trace!(
                             "adding bug to bugbase, seed: {}, plan: {}, error: {}",
                             env.opts.seed,
-                            plan.plan.len(),
+                            plan.len(),
                             error
                         );
                         bugbase
@@ -361,8 +361,8 @@ fn run_simulator(
 
                         tracing::info!(
                             "shrinking succeeded, reduced the plan from {} to {}",
-                            plan.plan.len(),
-                            final_plan.plan.len()
+                            plan.len(),
+                            final_plan.len()
                         );
                         // Save the shrunk database
                         if let Some(bugbase) = bugbase.as_deref_mut() {
