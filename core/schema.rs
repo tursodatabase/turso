@@ -1187,11 +1187,6 @@ pub fn create_table(
             if col.ty != Type::Integer {
                 crate::bail_parse_error!("AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY");
             }
-        } else {
-            crate::bail_parse_error!(
-                "Primary key column '{}' not found for AUTOINCREMENT check",
-                pk_col_name
-            );
         }
     }
 

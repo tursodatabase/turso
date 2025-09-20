@@ -5609,7 +5609,7 @@ pub fn op_insert(
                     let cursor = cursor.as_btree_mut();
                     cursor.root_page()
                 };
-                if root_page != 1 && table_name != "sqlite_sequence"{
+                if root_page != 1 && table_name != "sqlite_sequence" {
                     state.op_insert_state.sub_state = OpInsertSubState::UpdateLastRowid;
                 } else {
                     let schema = program.connection.schema.borrow();
