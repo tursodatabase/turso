@@ -10,8 +10,8 @@ use crate::translate::emitter::{
     emit_cdc_insns, emit_cdc_patch_record, prepare_cdc_if_necessary, OperationMode,
 };
 use crate::translate::expr::{
-    bind_and_rewrite_expr, emit_returning_results, process_returning_clause, ParamState,
-    ReturningValueRegisters,
+    bind_and_rewrite_expr, emit_returning_results, process_returning_clause, walk_expr_mut,
+    ParamState, ReturningValueRegisters, WalkControl,
 };
 use crate::translate::planner::ROWID;
 use crate::translate::upsert::{
@@ -21,6 +21,7 @@ use crate::util::normalize_ident;
 use crate::vdbe::builder::ProgramBuilderOpts;
 use crate::vdbe::insn::{IdxInsertFlags, InsertFlags, RegisterOrLiteral};
 use crate::vdbe::BranchOffset;
+use crate::{bail_parse_error, Result, SymbolTable, VirtualTable};
 use crate::{
     schema::{Column, Schema},
     vdbe::{
@@ -28,7 +29,6 @@ use crate::{
         insn::Insn,
     },
 };
-use crate::{Result, SymbolTable, VirtualTable};
 
 use super::emitter::Resolver;
 use super::expr::{translate_expr, translate_expr_no_constant_opt, NoConstantOptReason};
@@ -510,6 +510,32 @@ pub fn translate_insert(
             .map(|(_, _, c_id)| *c_id)
             .expect("no cursor found for index");
 
+        let skip_index_label = if let Some(where_clause) = &index.where_clause {
+            // Clone and rewrite WHERE to use insertion registers
+            let mut where_for_eval = where_clause.as_ref().clone();
+            rewrite_partial_index_where(&mut where_for_eval, &insertion)?;
+
+            // Evaluate rewritten WHERE clause
+            let where_result_reg = program.alloc_register();
+            translate_expr(
+                &mut program,
+                None,
+                &where_for_eval,
+                where_result_reg,
+                &resolver,
+            )?;
+            // Skip index update if WHERE is false/null
+            let skip_label = program.allocate_label();
+            program.emit_insn(Insn::IfNot {
+                reg: where_result_reg,
+                target_pc: skip_label,
+                jump_if_null: true,
+            });
+            Some(skip_label)
+        } else {
+            None
+        };
+
         let num_cols = index.columns.len();
         // allocate scratch registers for the index columns plus rowid
         let idx_start_reg = program.alloc_registers(num_cols + 1);
@@ -623,6 +649,9 @@ pub fn translate_insert(
             // TODO: figure out how to determine whether or not we need to seek prior to insert.
             flags: IdxInsertFlags::new().nchange(true),
         });
+        if let Some(skip_label) = skip_index_label {
+            program.resolve_label(skip_label, program.offset());
+        }
     }
 
     for column_mapping in insertion
@@ -1185,4 +1214,55 @@ fn translate_virtual_table_insert(
     program.resolve_label(halt_label, program.offset());
 
     Ok(program)
+}
+
+/// Rewrite WHERE clause for partial index to reference insertion registers
+pub fn rewrite_partial_index_where(
+    expr: &mut ast::Expr,
+    insertion: &Insertion,
+) -> crate::Result<WalkControl> {
+    walk_expr_mut(
+        expr,
+        &mut |e: &mut ast::Expr| -> crate::Result<WalkControl> {
+            match e {
+                // Unqualified column reference, map to insertion register
+                Expr::Column {
+                    column,
+                    is_rowid_alias,
+                    ..
+                } => {
+                    if *is_rowid_alias {
+                        *e = Expr::Register(insertion.key_register());
+                    } else if let Some(col_mapping) = insertion.col_mappings.get(*column) {
+                        *e = Expr::Register(col_mapping.register);
+                    } else {
+                        bail_parse_error!("Column index {} not found in insertion", column);
+                    }
+                }
+                Expr::Id(ast::Name::Ident(name)) | Expr::Id(ast::Name::Quoted(name)) => {
+                    let normalized = normalize_ident(name.as_str());
+                    if normalized.eq_ignore_ascii_case("rowid") {
+                        *e = Expr::Register(insertion.key_register());
+                    } else if let Some(col_mapping) = insertion.get_col_mapping_by_name(&normalized)
+                    {
+                        *e = Expr::Register(col_mapping.register);
+                    }
+                }
+                Expr::Qualified(_, col) | Expr::DoublyQualified(_, _, col) => {
+                    let normalized = normalize_ident(col.as_str());
+                    if normalized.eq_ignore_ascii_case("rowid") {
+                        *e = Expr::Register(insertion.key_register());
+                    } else if let Some(col_mapping) = insertion.get_col_mapping_by_name(&normalized)
+                    {
+                        *e = Expr::Register(col_mapping.register);
+                    }
+                }
+                Expr::RowId { .. } => {
+                    *e = Expr::Register(insertion.key_register());
+                }
+                _ => {}
+            }
+            Ok(WalkControl::Continue)
+        },
+    )
 }

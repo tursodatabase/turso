@@ -7,6 +7,7 @@ use crate::{
         plan::{JoinOrderMember, TableReferences, WhereTerm},
         planner::{table_mask_from_expr, TableMask},
     },
+    util::exprs_are_equivalent,
     Result,
 };
 use turso_ext::{ConstraintInfo, ConstraintOp};
@@ -319,26 +320,21 @@ pub fn constraints_from_where_clause(
                 if let Some(position_in_index) =
                     index.column_table_pos_to_index_pos(constraint.table_col_pos)
                 {
-                    let index_candidate = cs
-                        .candidates
-                        .iter_mut()
-                        .find_map(|candidate| {
-                            if candidate
-                                .index
-                                .as_ref()
-                                .is_some_and(|i| Arc::ptr_eq(index, i))
-                            {
-                                Some(candidate)
-                            } else {
-                                None
-                            }
-                        })
-                        .unwrap();
-                    index_candidate.refs.push(ConstraintRef {
-                        constraint_vec_pos: i,
-                        index_col_pos: position_in_index,
-                        sort_order: index.columns[position_in_index].order,
-                    });
+                    if let Some(index_candidate) = cs.candidates.iter_mut().find_map(|candidate| {
+                        if candidate.index.as_ref().is_some_and(|i| {
+                            Arc::ptr_eq(index, i) && can_use_partial_index(index, where_clause)
+                        }) {
+                            Some(candidate)
+                        } else {
+                            None
+                        }
+                    }) {
+                        index_candidate.refs.push(ConstraintRef {
+                            constraint_vec_pos: i,
+                            index_col_pos: position_in_index,
+                            sort_order: index.columns[position_in_index].order,
+                        });
+                    }
                 }
             }
         }
@@ -401,6 +397,21 @@ pub fn usable_constraints_for_join_order<'a>(
         usable_until += 1;
     }
     &refs[..usable_until]
+}
+
+fn can_use_partial_index(index: &Index, query_where_clause: &[WhereTerm]) -> bool {
+    let Some(index_where) = &index.where_clause else {
+        // Full index, always usable
+        return true;
+    };
+    // Check if query WHERE contains the exact same predicate
+    for term in query_where_clause {
+        if exprs_are_equivalent(&term.expr, index_where.as_ref()) {
+            return true;
+        }
+    }
+    // TODO: do better to determine if we should use partial index
+    false
 }
 
 pub fn convert_to_vtab_constraint(

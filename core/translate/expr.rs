@@ -3264,6 +3264,14 @@ impl Default for ParamState {
         Self { next_param_idx: 1 }
     }
 }
+impl ParamState {
+    pub fn is_valid(&self) -> bool {
+        self.next_param_idx > 0
+    }
+    pub fn disallow() -> Self {
+        Self { next_param_idx: 0 }
+    }
+}
 
 /// Rewrite ast::Expr in place, binding Column references/rewriting Expr::Id -> Expr::Column
 /// using the provided TableReferences, and replacing anonymous parameters with internal named
@@ -3287,6 +3295,9 @@ pub fn bind_and_rewrite_expr<'a>(
                 }
                 // Rewrite anonymous variables in encounter order.
                 ast::Expr::Variable(var) if var.is_empty() => {
+                    if !param_state.is_valid() {
+                        crate::bail_parse_error!("Parameters are not allowed in this context");
+                    }
                     *expr = ast::Expr::Variable(format!(
                         "{}{}",
                         PARAM_PREFIX, param_state.next_param_idx
