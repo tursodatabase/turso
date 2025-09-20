@@ -834,14 +834,11 @@ pub unsafe extern "C" fn sqlite3_bind_zeroblob(
     if idx <= 0 {
         return SQLITE_RANGE;
     }
-    if len < 0 {
-        return SQLITE_ERROR;
-    }
 
     let stmt_ref = &mut *stmt;
     stmt_ref
         .stmt
-        .bind_zeroblob_at(NonZero::new_unchecked(idx as usize), len as usize);
+        .bind_zeroblob_at(NonZero::new_unchecked(idx as usize), len.max(0) as usize);
 
     SQLITE_OK
 }
