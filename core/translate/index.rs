@@ -4,9 +4,7 @@ use crate::schema::Table;
 use crate::translate::emitter::{
     emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary, OperationMode, Resolver,
 };
-use crate::translate::expr::{
-    bind_and_rewrite_expr, translate_condition_expr, ConditionMetadata, ParamState,
-};
+use crate::translate::expr::{translate_condition_expr, ConditionMetadata};
 use crate::translate::plan::{
     ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan, TableReferences,
 };
@@ -37,7 +35,7 @@ pub fn translate_create_index(
     syms: &SymbolTable,
     mut program: ProgramBuilder,
     connection: &Arc<crate::Connection>,
-    mut where_clause: Option<Box<Expr>>,
+    where_clause: Option<Box<Expr>>,
 ) -> crate::Result<ProgramBuilder> {
     if !schema.indexes_enabled() {
         crate::bail_parse_error!(
@@ -62,10 +60,10 @@ pub fn translate_create_index(
         }
         crate::bail_parse_error!("Error: index with name '{idx_name}' already exists.");
     }
-    let Some(tbl) = schema.tables.get(&tbl_name) else {
+    let Some(table) = schema.tables.get(&tbl_name) else {
         crate::bail_parse_error!("Error: table '{tbl_name}' does not exist.");
     };
-    let Some(tbl) = tbl.btree() else {
+    let Some(tbl) = table.btree() else {
         crate::bail_parse_error!("Error: table '{tbl_name}' is not a b-tree table.");
     };
     let columns = resolve_sorted_columns(&tbl, columns)?;
@@ -87,9 +85,19 @@ pub fn translate_create_index(
         unique: unique_if_not_exists.0,
         ephemeral: false,
         has_rowid: tbl.has_rowid,
-        where_clause: where_clause.clone(), // store the *original* where clause, because we need to rewrite it
-                                            // before translating, and it cannot reference a table alias
+        // store the *original* where clause, because we need to rewrite it
+        // before translating, and it cannot reference a table alias
+        where_clause: where_clause.clone(),
     });
+
+    if !idx.validate_where_expr(table) {
+        crate::bail_parse_error!(
+            "Error: cannot use aggregate, window functions or reference other tables in WHERE clause of CREATE INDEX:\n {}",
+            where_clause
+                .expect("where expr has to exist in order to fail")
+                .to_string()
+        );
+    }
 
     // Allocate the necessary cursors:
     //
@@ -127,16 +135,7 @@ pub fn translate_create_index(
         }],
         vec![],
     );
-    let mut param_state = ParamState::default();
-    if let Some(where_clause) = where_clause.as_mut() {
-        bind_and_rewrite_expr(
-            where_clause,
-            Some(&mut table_references),
-            None,
-            connection,
-            &mut param_state,
-        )?;
-    }
+    let where_clause = idx.bind_where_expr(Some(&mut table_references), connection);
 
     // Create a new B-Tree and store the root page index in a register
     let root_page_reg = program.alloc_register();
