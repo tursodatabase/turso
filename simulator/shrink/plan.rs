@@ -33,7 +33,7 @@ impl InteractionPlan {
                     break;
                 }
                 match &all_interactions[idx].1.interaction {
-                    InteractionType::Query(query) => {
+                    InteractionType::Query(query) | InteractionType::FaultyQuery(query) => {
                         depending_tables = query.dependencies();
                         break;
                     }
