@@ -8565,6 +8565,7 @@ mod tests {
                 .unwrap() as usize;
             let index_def = Index {
                 name: "testindex".to_string(),
+                where_clause: None,
                 columns: (0..10)
                     .map(|i| IndexColumn {
                         name: format!("test{i}"),
@@ -8726,6 +8727,7 @@ mod tests {
                 .unwrap() as usize;
             let index_def = Index {
                 name: "testindex".to_string(),
+                where_clause: None,
                 columns: vec![IndexColumn {
                     name: "testcol".to_string(),
                     order: SortOrder::Asc,

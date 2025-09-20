@@ -664,6 +664,7 @@ mod tests {
         let index = Arc::new(Index {
             name: "sqlite_autoindex_test_table_1".to_string(),
             table_name: "test_table".to_string(),
+            where_clause: None,
             columns: vec![IndexColumn {
                 name: "id".to_string(),
                 order: SortOrder::Asc,
@@ -733,6 +734,7 @@ mod tests {
         let index1 = Arc::new(Index {
             name: "index1".to_string(),
             table_name: "table1".to_string(),
+            where_clause: None,
             columns: vec![IndexColumn {
                 name: "id".to_string(),
                 order: SortOrder::Asc,
@@ -849,6 +851,7 @@ mod tests {
                 let index_name = format!("sqlite_autoindex_{table_name}_1");
                 let index = Arc::new(Index {
                     name: index_name,
+                    where_clause: None,
                     table_name: table_name.to_string(),
                     columns: vec![IndexColumn {
                         name: "id".to_string(),
@@ -867,6 +870,7 @@ mod tests {
         let customer_id_idx = Arc::new(Index {
             name: "orders_customer_id_idx".to_string(),
             table_name: "orders".to_string(),
+            where_clause: None,
             columns: vec![IndexColumn {
                 name: "customer_id".to_string(),
                 order: SortOrder::Asc,
@@ -882,6 +886,7 @@ mod tests {
         let order_id_idx = Arc::new(Index {
             name: "order_items_order_id_idx".to_string(),
             table_name: "order_items".to_string(),
+            where_clause: None,
             columns: vec![IndexColumn {
                 name: "order_id".to_string(),
                 order: SortOrder::Asc,
@@ -1295,6 +1300,7 @@ mod tests {
         let index = Arc::new(Index {
             name: "idx_xy".to_string(),
             table_name: "t1".to_string(),
+            where_clause: None,
             columns: vec![
                 IndexColumn {
                     name: "x".to_string(),
@@ -1381,6 +1387,7 @@ mod tests {
         let index = Arc::new(Index {
             name: "idx1".to_string(),
             table_name: "t1".to_string(),
+            where_clause: None,
             columns: vec![
                 IndexColumn {
                     name: "c1".to_string(),
@@ -1492,6 +1499,7 @@ mod tests {
         let index = Arc::new(Index {
             name: "idx1".to_string(),
             table_name: "t1".to_string(),
+            where_clause: None,
             columns: vec![
                 IndexColumn {
                     name: "c1".to_string(),

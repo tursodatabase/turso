@@ -163,20 +163,17 @@ pub fn translate_inner(
             tbl_name,
             columns,
             where_clause,
-        } => {
-            if where_clause.is_some() {
-                bail_parse_error!("Partial indexes are not supported");
-            }
-            translate_create_index(
-                (unique, if_not_exists),
-                idx_name.name.as_str(),
-                tbl_name.as_str(),
-                &columns,
-                schema,
-                syms,
-                program,
-            )?
-        }
+        } => translate_create_index(
+            (unique, if_not_exists),
+            idx_name.name.as_str(),
+            tbl_name.as_str(),
+            &columns,
+            schema,
+            syms,
+            program,
+            connection,
+            where_clause,
+        )?,
         ast::Stmt::CreateTable {
             temporary,
             if_not_exists,
