@@ -17,13 +17,13 @@ use crate::translate::emitter::Resolver;
 use crate::translate::ProgramBuilder;
 use crate::translate::ProgramBuilderOpts;
 use crate::util::normalize_ident;
+use crate::util::PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX;
 use crate::vdbe::builder::CursorType;
 use crate::vdbe::insn::Cookie;
 use crate::vdbe::insn::{CmpInsFlags, InsertFlags, Insn};
 use crate::Connection;
 use crate::SymbolTable;
 use crate::{bail_parse_error, Result};
-use crate::util::PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX;
 
 use turso_ext::VTabKind;
 

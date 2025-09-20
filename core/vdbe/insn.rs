@@ -198,9 +198,9 @@ pub enum Insn {
     },
     /// Updates the value of register dest_reg to the maximum of its current
     /// value and the value in src_reg.
-    /// 
+    ///
     ///    - dest_reg = max(int(dest_reg), int(src_reg))
-    /// 
+    ///
     /// Both registers are converted to integers before the comparison.
     MemMax {
         dest_reg: usize, // P1
@@ -1190,11 +1190,11 @@ impl InsnVariants {
             InsnVariants::IfPos => execute::op_if_pos,
             InsnVariants::NotNull => execute::op_not_null,
             InsnVariants::Eq
-                    | InsnVariants::Ne
-                    | InsnVariants::Lt
-                    | InsnVariants::Le
-                    | InsnVariants::Gt
-                    | InsnVariants::Ge => execute::op_comparison,
+            | InsnVariants::Ne
+            | InsnVariants::Lt
+            | InsnVariants::Le
+            | InsnVariants::Gt
+            | InsnVariants::Ge => execute::op_comparison,
             InsnVariants::If => execute::op_if,
             InsnVariants::IfNot => execute::op_if_not,
             InsnVariants::OpenRead => execute::op_open_read,
@@ -1232,9 +1232,9 @@ impl InsnVariants {
             InsnVariants::SeekRowid => execute::op_seek_rowid,
             InsnVariants::DeferredSeek => execute::op_deferred_seek,
             InsnVariants::SeekGE
-                    | InsnVariants::SeekGT
-                    | InsnVariants::SeekLE
-                    | InsnVariants::SeekLT => execute::op_seek,
+            | InsnVariants::SeekGT
+            | InsnVariants::SeekLE
+            | InsnVariants::SeekLT => execute::op_seek,
             InsnVariants::SeekEnd => execute::op_seek_end,
             InsnVariants::IdxGE => execute::op_idx_ge,
             InsnVariants::IdxGT => execute::op_idx_gt,

@@ -488,7 +488,6 @@ pub fn translate_insert(
 
     program.preassign_label_to_next_insn(key_generation_label);
     if btree_table.has_autoincrement {
-        
         let (_, r_seq, _, _) = autoincrement_meta.unwrap();
         let r_max = program.alloc_register();
 
@@ -499,7 +498,6 @@ pub fn translate_insert(
             rowid_reg: dummy_reg,
             prev_largest_reg: r_max,
         });
-
 
         program.emit_insn(Insn::Copy {
             src_reg: r_seq,
