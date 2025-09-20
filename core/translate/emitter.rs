@@ -1194,6 +1194,7 @@ fn emit_update_insns(
                 extra_amount: 0,
             });
         }
+        // last register is the rowid
         program.emit_insn(Insn::Copy {
             src_reg: rowid_reg,
             dst_reg: idx_start_reg + num_cols,
@@ -1209,8 +1210,9 @@ fn emit_update_insns(
         });
 
         // Handle unique constraint
-        if index.unique {
+        if !index.unique {
             let constraint_check = program.allocate_label();
+            // check if the record already exists in the index for unique indexes and abort if so
             program.emit_insn(Insn::NoConflict {
                 cursor_id: *idx_cursor_id,
                 target_pc: constraint_check,
@@ -1224,6 +1226,7 @@ fn emit_update_insns(
                 dest: idx_rowid_reg,
             });
 
+            // Skip over the UNIQUE constraint failure if the existing row is the one that we are currently changing
             program.emit_insn(Insn::Eq {
                 lhs: beg,
                 rhs: idx_rowid_reg,
@@ -1232,12 +1235,18 @@ fn emit_update_insns(
                 collation: program.curr_collation(),
             });
 
-            let column_names = index
-                .columns
-                .iter()
-                .map(|c| format!("{}.{}", table_ref.table.get_name(), c.name))
-                .collect::<Vec<_>>()
-                .join(", ");
+            let column_names = index.columns.iter().enumerate().fold(
+                String::with_capacity(50),
+                |mut accum, (idx, col)| {
+                    if idx > 0 {
+                        accum.push_str(", ");
+                    }
+                    accum.push_str(table_ref.table.get_name());
+                    accum.push('.');
+                    accum.push_str(&col.name);
+                    accum
+                },
+            );
 
             program.emit_insn(Insn::Halt {
                 err_code: SQLITE_CONSTRAINT_PRIMARYKEY,

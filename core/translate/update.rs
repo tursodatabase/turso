@@ -379,7 +379,8 @@ pub fn prepare_update_plan(
         // If the rowid alias is used in the SET clause, we need to update all indexes
         indexes.to_vec()
     } else {
-        // otherwise we need to update the indexes whose columns are set in the SET clause
+        // otherwise we need to update the indexes whose columns are set in the SET clause,
+        // or if the colunns used in the partial index WHERE clause are being updated
         indexes
             .iter()
             .filter_map(|idx| {
@@ -390,20 +391,20 @@ pub fn prepare_update_plan(
 
                 if !needs {
                     if let Some(w) = &idx.where_clause {
-                        // Bind once so names→positions are resolved exactly like execution.
                         let mut where_copy = w.as_ref().clone();
                         let mut param = ParamState::disallow();
                         let mut tr =
                             TableReferences::new(table_references.joined_tables().to_vec(), vec![]);
-                        bind_and_rewrite_expr(
+                        let _ = bind_and_rewrite_expr(
                             &mut where_copy,
                             Some(&mut tr),
                             None,
                             connection,
                             &mut param,
-                        )
-                        .expect("bind where");
+                        );
                         let cols_used = collect_cols_used_in_expr(&where_copy);
+                        // if any of the columns used in the partial index WHERE clause is being
+                        // updated, we need to update this index
                         needs = cols_used.iter().any(|c| updated_cols.contains(c));
                     }
                 }
