@@ -10,9 +10,11 @@ use crate::translate::emitter::{
     emit_cdc_insns, emit_cdc_patch_record, prepare_cdc_if_necessary, OperationMode,
 };
 use crate::translate::expr::{
-    bind_and_rewrite_expr, emit_returning_results, process_returning_clause, walk_expr_mut,
-    ParamState, ReturningValueRegisters, WalkControl,
+    bind_and_rewrite_expr, emit_returning_results, process_returning_clause,
+    translate_condition_expr, walk_expr_mut, ConditionMetadata, ParamState,
+    ReturningValueRegisters, WalkControl,
 };
+use crate::translate::plan::TableReferences;
 use crate::translate::planner::ROWID;
 use crate::translate::upsert::{
     collect_set_clauses_for_upsert, emit_upsert, upsert_matches_index, upsert_matches_pk,
@@ -422,17 +424,6 @@ pub fn translate_insert(
         });
     }
 
-    let emit_halt_with_constraint = |program: &mut ProgramBuilder, col_name: &str| {
-        let mut description = String::with_capacity(table_name.as_str().len() + col_name.len() + 2);
-        description.push_str(table_name.as_str());
-        description.push('.');
-        description.push_str(col_name);
-        program.emit_insn(Insn::Halt {
-            err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
-            description,
-        });
-    };
-
     // Check uniqueness constraint for rowid if it was provided by user.
     // When the DB allocates it there are no need for separate uniqueness checks.
     if has_user_provided_rowid {
@@ -481,7 +472,15 @@ pub fn translate_insert(
                     break 'emit_halt;
                 }
             }
-            emit_halt_with_constraint(&mut program, rowid_column_name);
+            let mut description =
+                String::with_capacity(table_name.as_str().len() + rowid_column_name.len() + 2);
+            description.push_str(table_name.as_str());
+            description.push('.');
+            description.push_str(rowid_column_name);
+            program.emit_insn(Insn::Halt {
+                err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
+                description,
+            });
         }
         program.preassign_label_to_next_insn(make_record_label);
     }
@@ -516,21 +515,22 @@ pub fn translate_insert(
             rewrite_partial_index_where(&mut where_for_eval, &insertion)?;
 
             // Evaluate rewritten WHERE clause
-            let where_result_reg = program.alloc_register();
-            translate_expr(
+            let skip_label = program.allocate_label();
+            // We can use an empty TableReferences here because we shouldn't have any
+            // Expr::Column's in the partial index WHERE clause after rewriting it to use
+            // regsisters
+            let table_references = TableReferences::new_empty();
+            translate_condition_expr(
                 &mut program,
-                None,
+                &table_references,
                 &where_for_eval,
-                where_result_reg,
+                ConditionMetadata {
+                    jump_if_condition_is_true: false,
+                    jump_target_when_false: skip_label,
+                    jump_target_when_true: BranchOffset::Placeholder,
+                },
                 &resolver,
             )?;
-            // Skip index update if WHERE is false/null
-            let skip_label = program.allocate_label();
-            program.emit_insn(Insn::IfNot {
-                reg: where_result_reg,
-                target_pc: skip_label,
-                jump_if_null: true,
-            });
             Some(skip_label)
         } else {
             None
@@ -584,7 +584,7 @@ pub fn translate_insert(
                     if idx > 0 {
                         accum.push_str(", ");
                     }
-                    accum.push_str(&index.name);
+                    accum.push_str(table_name.as_str());
                     accum.push('.');
                     accum.push_str(&column.name);
                     accum
