@@ -105,7 +105,7 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
                 match value {
                     Value::Float(f) => result.push_str(&format!("{f:.6}")),
                     Value::Integer(i) => result.push_str(&format!("{:.6}", *i as f64)),
-                    _ => result.push_str("0.0"),
+                    _ => result.push_str("0.000000"),
                 }
                 args_index += 1;
             }
@@ -194,6 +194,10 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
                 match value {
                     Value::Float(f) => result.push_str(&format!("{:x}", *f as i64)),
                     Value::Integer(i) => result.push_str(&format!("{i:x}")),
+                    Value::Text(s) => {
+                        let i: i64 = s.as_str().parse::<i64>().unwrap_or(0);
+                        result.push_str(&format!("{i:x}"))
+                    }
                     _ => result.push('0'),
                 }
                 args_index += 1;
@@ -206,6 +210,10 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
                 match value {
                     Value::Float(f) => result.push_str(&format!("{:X}", *f as i64)),
                     Value::Integer(i) => result.push_str(&format!("{i:X}")),
+                    Value::Text(s) => {
+                        let i: i64 = s.as_str().parse::<i64>().unwrap_or(0);
+                        result.push_str(&format!("{i:X}"))
+                    }
                     _ => result.push('0'),
                 }
                 args_index += 1;
@@ -218,6 +226,10 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
                 match value {
                     Value::Float(f) => result.push_str(&format!("{:o}", *f as i64)),
                     Value::Integer(i) => result.push_str(&format!("{i:o}")),
+                    Value::Text(s) => {
+                        let i: i64 = s.as_str().parse::<i64>().unwrap_or(0);
+                        result.push_str(&format!("{i:o}"))
+                    }
                     _ => result.push('0'),
                 }
                 args_index += 1;
@@ -367,7 +379,7 @@ mod tests {
             // Non-numeric value defaults to 0.0
             (
                 vec![text("Number: %f"), text("not a number")],
-                text("Number: 0.0"),
+                text("Number: 0.000000"),
             ),
         ];
 
@@ -505,7 +517,7 @@ mod tests {
                 text("hex: ffffffffffffffd6"),
             ),
             // Text
-            (vec![text("hex: %x"), text("42")], text("hex: 0")),
+            (vec![text("hex: %x"), text("42")], text("hex: 2a")),
             // Empty Text
             (vec![text("hex: %x"), text("")], text("hex: 0")),
         ];
@@ -538,7 +550,7 @@ mod tests {
                 text("octal: 1777777777777777777726"),
             ),
             // Text
-            (vec![text("octal: %o"), text("42")], text("octal: 0")),
+            (vec![text("octal: %o"), text("42")], text("octal: 52")),
             // Empty Text
             (vec![text("octal: %o"), text("")], text("octal: 0")),
         ];
