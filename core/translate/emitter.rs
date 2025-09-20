@@ -28,7 +28,7 @@ use crate::translate::expr::{
     bind_and_rewrite_expr, emit_returning_results, walk_expr_mut, ParamState,
     ReturningValueRegisters, WalkControl,
 };
-use crate::translate::plan::{DeletePlan, Plan, QueryDestination, Search};
+use crate::translate::plan::{DeletePlan, JoinedTable, Plan, QueryDestination, Search};
 use crate::translate::result_row::try_fold_expr_to_i64;
 use crate::translate::values::emit_values;
 use crate::translate::window::{emit_window_results, init_window, WindowMetadata};
@@ -499,32 +499,29 @@ fn emit_delete_insns(
     table_references: &mut TableReferences,
     result_columns: &[super::plan::ResultSetColumn],
 ) -> Result<()> {
-    let table_reference = table_references.joined_tables().first().unwrap().clone();
-    if table_reference
+    // we can either use this obviously safe raw pointer or we can clone it
+    let table_reference: *const JoinedTable = table_references.joined_tables().first().unwrap();
+    if unsafe { &*table_reference }
         .virtual_table()
         .is_some_and(|t| t.readonly())
     {
         return Err(crate::LimboError::ReadOnly);
     }
+    let internal_id = unsafe { (*table_reference).internal_id };
 
-    let cursor_id = match &table_reference.op {
-        Operation::Scan { .. } => {
-            program.resolve_cursor_id(&CursorKey::table(table_reference.internal_id))
-        }
+    let table_name = unsafe { &*table_reference }.table.get_name();
+    let cursor_id = match unsafe { &(*table_reference).op } {
+        Operation::Scan { .. } => program.resolve_cursor_id(&CursorKey::table(internal_id)),
         Operation::Search(search) => match search {
             Search::RowidEq { .. } | Search::Seek { index: None, .. } => {
-                program.resolve_cursor_id(&CursorKey::table(table_reference.internal_id))
+                program.resolve_cursor_id(&CursorKey::table(internal_id))
             }
             Search::Seek {
                 index: Some(index), ..
-            } => program.resolve_cursor_id(&CursorKey::index(
-                table_reference.internal_id,
-                index.clone(),
-            )),
+            } => program.resolve_cursor_id(&CursorKey::index(internal_id, index.clone())),
         },
     };
-    let main_table_cursor_id =
-        program.resolve_cursor_id(&CursorKey::table(table_reference.internal_id));
+    let main_table_cursor_id = program.resolve_cursor_id(&CursorKey::table(internal_id));
 
     // Emit the instructions to delete the row
     let key_reg = program.alloc_register();
@@ -533,7 +530,7 @@ fn emit_delete_insns(
         dest: key_reg,
     });
 
-    if table_reference.virtual_table().is_some() {
+    if unsafe { &*table_reference }.virtual_table().is_some() {
         let conflict_action = 0u16;
         let start_reg = key_reg;
 
@@ -550,14 +547,10 @@ fn emit_delete_insns(
         });
     } else {
         // Delete from all indexes before deleting from the main table.
-        let indexes = t_ctx
-            .resolver
-            .schema
-            .indexes
-            .get(table_reference.table.get_name());
+        let indexes = t_ctx.resolver.schema.indexes.get(table_name);
 
         // Get the index that is being used to iterate the deletion loop, if there is one.
-        let iteration_index = table_reference.op.index();
+        let iteration_index = unsafe { &*table_reference }.op.index();
         // Get all indexes that are not the iteration index.
         let other_indexes = indexes
             .map(|indexes| {
@@ -571,10 +564,8 @@ fn emit_delete_insns(
                     .map(|index| {
                         (
                             index.clone(),
-                            program.resolve_cursor_id(&CursorKey::index(
-                                table_reference.internal_id,
-                                index.clone(),
-                            )),
+                            program
+                                .resolve_cursor_id(&CursorKey::index(internal_id, index.clone())),
                         )
                     })
                     .collect::<Vec<_>>()
@@ -651,7 +642,7 @@ fn emit_delete_insns(
             let before_record_reg = if cdc_has_before {
                 Some(emit_cdc_full_record(
                     program,
-                    table_reference.table.columns(),
+                    unsafe { &*table_reference }.table.columns(),
                     main_table_cursor_id,
                     rowid_reg,
                 ))
@@ -667,7 +658,7 @@ fn emit_delete_insns(
                 before_record_reg,
                 None,
                 None,
-                table_reference.table.get_name(),
+                table_name,
             )?;
         }
 
@@ -679,12 +670,13 @@ fn emit_delete_insns(
                 cursor_id: main_table_cursor_id,
                 dest: rowid_reg,
             });
+            let cols_len = unsafe { &*table_reference }.columns().len();
 
             // Allocate registers for column values
-            let columns_start_reg = program.alloc_registers(table_reference.columns().len());
+            let columns_start_reg = program.alloc_registers(cols_len);
 
             // Read all column values from the row to be deleted
-            for (i, _column) in table_reference.columns().iter().enumerate() {
+            for (i, _column) in unsafe { &*table_reference }.columns().iter().enumerate() {
                 program.emit_column_or_rowid(main_table_cursor_id, i, columns_start_reg + i);
             }
 
@@ -692,7 +684,7 @@ fn emit_delete_insns(
             let value_registers = ReturningValueRegisters {
                 rowid_register: rowid_reg,
                 columns_start_register: columns_start_reg,
-                num_columns: table_reference.columns().len(),
+                num_columns: cols_len,
             };
 
             emit_returning_results(program, result_columns, &value_registers)?;
@@ -700,14 +692,12 @@ fn emit_delete_insns(
 
         program.emit_insn(Insn::Delete {
             cursor_id: main_table_cursor_id,
-            table_name: table_reference.table.get_name().to_string(),
+            table_name: table_name.to_string(),
         });
 
         if let Some(index) = iteration_index {
-            let iteration_index_cursor = program.resolve_cursor_id(&CursorKey::index(
-                table_reference.internal_id,
-                index.clone(),
-            ));
+            let iteration_index_cursor =
+                program.resolve_cursor_id(&CursorKey::index(internal_id, index.clone()));
             program.emit_insn(Insn::Delete {
                 cursor_id: iteration_index_cursor,
                 table_name: index.name.clone(),
@@ -858,26 +848,22 @@ fn emit_update_insns(
     index_cursors: Vec<(usize, usize)>,
     temp_cursor_id: Option<CursorID>,
 ) -> crate::Result<()> {
-    let table_ref = plan
-        .table_references
-        .joined_tables()
-        .first()
-        .unwrap()
-        .clone();
+    // we can either use this obviously safe raw pointer or we can clone it
+    let table_ref: *const JoinedTable = plan.table_references.joined_tables().first().unwrap();
+    let internal_id = unsafe { (*table_ref).internal_id };
     let loop_labels = t_ctx.labels_main_loop.first().unwrap();
-    let cursor_id = program.resolve_cursor_id(&CursorKey::table(table_ref.internal_id));
-    let (index, is_virtual) = match &table_ref.op {
+    let cursor_id = program.resolve_cursor_id(&CursorKey::table(internal_id));
+    let (index, is_virtual) = match &unsafe { &*table_ref }.op {
         Operation::Scan(Scan::BTreeTable { index, .. }) => (
             index.as_ref().map(|index| {
                 (
                     index.clone(),
-                    program
-                        .resolve_cursor_id(&CursorKey::index(table_ref.internal_id, index.clone())),
+                    program.resolve_cursor_id(&CursorKey::index(internal_id, index.clone())),
                 )
             }),
             false,
         ),
-        Operation::Scan(_) => (None, table_ref.virtual_table().is_some()),
+        Operation::Scan(_) => (None, unsafe { &*table_ref }.virtual_table().is_some()),
         Operation::Search(search) => match search {
             &Search::RowidEq { .. } | Search::Seek { index: None, .. } => (None, false),
             Search::Seek {
@@ -885,8 +871,7 @@ fn emit_update_insns(
             } => (
                 Some((
                     index.clone(),
-                    program
-                        .resolve_cursor_id(&CursorKey::index(table_ref.internal_id, index.clone())),
+                    program.resolve_cursor_id(&CursorKey::index(internal_id, index.clone())),
                 )),
                 false,
             ),
@@ -894,7 +879,7 @@ fn emit_update_insns(
     };
 
     let beg = program.alloc_registers(
-        table_ref.table.columns().len()
+        unsafe { &*table_ref }.table.columns().len()
             + if is_virtual {
                 2 // two args before the relevant columns for VUpdate
             } else {
@@ -907,7 +892,10 @@ fn emit_update_insns(
     });
 
     // Check if rowid was provided (through INTEGER PRIMARY KEY as a rowid alias)
-    let rowid_alias_index = table_ref.columns().iter().position(|c| c.is_rowid_alias);
+    let rowid_alias_index = unsafe { &*table_ref }
+        .columns()
+        .iter()
+        .position(|c| c.is_rowid_alias);
 
     let has_user_provided_rowid = if let Some(index) = rowid_alias_index {
         plan.set_clauses.iter().position(|(idx, _)| *idx == index)
@@ -957,6 +945,7 @@ fn emit_update_insns(
             decrement_by: 1,
         });
     }
+    let col_len = unsafe { &*table_ref }.columns().len();
 
     // we scan a column at a time, loading either the column's values, or the new value
     // from the Set expression, into registers so we can emit a MakeRecord and update the row.
@@ -964,13 +953,14 @@ fn emit_update_insns(
     // we allocate 2C registers for "updates" as the structure of this column for CDC table is following:
     // [C boolean values where true set for changed columns] [C values with updates where NULL is set for not-changed columns]
     let cdc_updates_register = if program.capture_data_changes_mode().has_updates() {
-        Some(program.alloc_registers(2 * table_ref.columns().len()))
+        Some(program.alloc_registers(2 * col_len))
     } else {
         None
     };
+    let table_name = unsafe { &*table_ref }.table.get_name();
 
     let start = if is_virtual { beg + 2 } else { beg + 1 };
-    for (idx, table_column) in table_ref.columns().iter().enumerate() {
+    for (idx, table_column) in unsafe { &*table_ref }.columns().iter().enumerate() {
         let target_reg = start + idx;
         if let Some((_, expr)) = plan.set_clauses.iter().find(|(i, _)| *i == idx) {
             if has_user_provided_rowid
@@ -1006,7 +996,7 @@ fn emit_update_insns(
                         err_code: SQLITE_CONSTRAINT_NOTNULL,
                         description: format!(
                             "{}.{}",
-                            table_ref.table.get_name(),
+                            table_name,
                             table_column
                                 .name
                                 .as_ref()
@@ -1018,7 +1008,7 @@ fn emit_update_insns(
 
             if let Some(cdc_updates_register) = cdc_updates_register {
                 let change_reg = cdc_updates_register + idx;
-                let value_reg = cdc_updates_register + table_ref.columns().len() + idx;
+                let value_reg = cdc_updates_register + col_len + idx;
                 program.emit_bool(true, change_reg);
                 program.mark_last_insn_constant();
                 let mut updated = false;
@@ -1073,7 +1063,7 @@ fn emit_update_insns(
 
             if let Some(cdc_updates_register) = cdc_updates_register {
                 let change_bit_reg = cdc_updates_register + idx;
-                let value_reg = cdc_updates_register + table_ref.columns().len() + idx;
+                let value_reg = cdc_updates_register + col_len + idx;
                 program.emit_bool(false, change_bit_reg);
                 program.mark_last_insn_constant();
                 program.emit_null(value_reg, None);
@@ -1106,7 +1096,7 @@ fn emit_update_insns(
                 let mut new_where = where_clause.as_ref().clone();
                 rewrite_where_for_update_registers(
                     &mut new_where,
-                    table_ref.columns(),
+                    unsafe { &*table_ref }.columns(),
                     start,
                     rowid_set_clause_reg.unwrap_or(beg),
                 )?;
@@ -1180,7 +1170,7 @@ fn emit_update_insns(
         let rowid_reg = rowid_set_clause_reg.unwrap_or(beg);
 
         for (i, col) in index.columns.iter().enumerate() {
-            let col_in_table = table_ref
+            let col_in_table = unsafe { &*table_ref }
                 .columns()
                 .get(col.pos_in_table)
                 .expect("column index out of bounds");
@@ -1241,7 +1231,7 @@ fn emit_update_insns(
                     if idx > 0 {
                         accum.push_str(", ");
                     }
-                    accum.push_str(table_ref.table.get_name());
+                    accum.push_str(table_name);
                     accum.push('.');
                     accum.push_str(&col.name);
                     accum
@@ -1271,11 +1261,11 @@ fn emit_update_insns(
         }
     }
 
-    if let Some(btree_table) = table_ref.btree() {
+    if let Some(btree_table) = unsafe { &*table_ref }.btree() {
         if btree_table.is_strict {
             program.emit_insn(Insn::TypeCheck {
                 start_reg: start,
-                count: table_ref.columns().len(),
+                count: col_len,
                 check_generated: true,
                 table_reference: Arc::clone(&btree_table),
             });
@@ -1303,8 +1293,8 @@ fn emit_update_insns(
                 err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
                 description: format!(
                     "{}.{}",
-                    table_ref.table.get_name(),
-                    &table_ref
+                    table_name,
+                    unsafe { &*table_ref }
                         .columns()
                         .get(idx)
                         .unwrap()
@@ -1319,7 +1309,7 @@ fn emit_update_insns(
 
         let record_reg = program.alloc_register();
 
-        let affinity_str = table_ref
+        let affinity_str = unsafe { &*table_ref }
             .columns()
             .iter()
             .map(|col| col.affinity().aff_mask())
@@ -1327,7 +1317,7 @@ fn emit_update_insns(
 
         program.emit_insn(Insn::MakeRecord {
             start_reg: start,
-            count: table_ref.columns().len(),
+            count: col_len,
             dest_reg: record_reg,
             index_name: None,
             affinity_str: Some(affinity_str),
@@ -1364,7 +1354,7 @@ fn emit_update_insns(
         let cdc_before_reg = if program.capture_data_changes_mode().has_before() {
             Some(emit_cdc_full_record(
                 program,
-                table_ref.table.columns(),
+                unsafe { &*table_ref }.table.columns(),
                 cursor_id,
                 cdc_rowid_before_reg.expect("cdc_rowid_before_reg must be set"),
             ))
@@ -1378,7 +1368,7 @@ fn emit_update_insns(
         if has_user_provided_rowid {
             program.emit_insn(Insn::Delete {
                 cursor_id,
-                table_name: table_ref.table.get_name().to_string(),
+                table_name: table_name.to_string(),
             });
         }
 
@@ -1393,7 +1383,7 @@ fn emit_update_insns(
             } else {
                 InsertFlags::new()
             },
-            table_name: table_ref.identifier.clone(),
+            table_name: unsafe { &*table_ref }.identifier.clone(),
         });
 
         // Emit RETURNING results if specified
@@ -1402,7 +1392,7 @@ fn emit_update_insns(
                 let value_registers = ReturningValueRegisters {
                     rowid_register: rowid_set_clause_reg.unwrap_or(beg),
                     columns_start_register: start,
-                    num_columns: table_ref.columns().len(),
+                    num_columns: col_len,
                 };
 
                 emit_returning_results(program, returning_columns, &value_registers)?;
@@ -1413,7 +1403,7 @@ fn emit_update_insns(
         let cdc_after_reg = if program.capture_data_changes_mode().has_after() {
             Some(emit_cdc_patch_record(
                 program,
-                &table_ref.table,
+                &unsafe { &*table_ref }.table,
                 start,
                 record_reg,
                 cdc_rowid_after_reg,
@@ -1426,7 +1416,7 @@ fn emit_update_insns(
             let record_reg = program.alloc_register();
             program.emit_insn(Insn::MakeRecord {
                 start_reg: cdc_updates_register,
-                count: 2 * table_ref.columns().len(),
+                count: 2 * col_len,
                 dest_reg: record_reg,
                 index_name: None,
                 affinity_str: None,
@@ -1450,7 +1440,7 @@ fn emit_update_insns(
                     cdc_before_reg,
                     None,
                     None,
-                    table_ref.table.get_name(),
+                    table_name,
                 )?;
                 emit_cdc_insns(
                     program,
@@ -1461,7 +1451,7 @@ fn emit_update_insns(
                     cdc_after_reg,
                     None,
                     None,
-                    table_ref.table.get_name(),
+                    table_name,
                 )?;
             } else {
                 emit_cdc_insns(
@@ -1473,12 +1463,12 @@ fn emit_update_insns(
                     cdc_before_reg,
                     cdc_after_reg,
                     cdc_updates_record,
-                    table_ref.table.get_name(),
+                    table_name,
                 )?;
             }
         }
-    } else if table_ref.virtual_table().is_some() {
-        let arg_count = table_ref.columns().len() + 2;
+    } else if unsafe { &*table_ref }.virtual_table().is_some() {
+        let arg_count = col_len + 2;
         program.emit_insn(Insn::VUpdate {
             cursor_id,
             arg_count,
