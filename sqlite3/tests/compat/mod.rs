@@ -1247,8 +1247,10 @@ mod tests {
             // Test with "main" database name
             let filename = sqlite3_db_filename(db, c"main".as_ptr());
             assert!(!filename.is_null());
-            let filename_str = std::ffi::CStr::from_ptr(filename).to_str().unwrap();
-            assert_eq!(filename_str, temp_file.path().to_str().unwrap());
+            let filename_pathbuf =
+                std::fs::canonicalize(std::ffi::CStr::from_ptr(filename).to_str().unwrap())
+                    .unwrap();
+            assert_eq!(filename_pathbuf, temp_file.path().canonicalize().unwrap());
 
             // Test with NULL database name (defaults to main)
             let filename_default = sqlite3_db_filename(db, ptr::null());
