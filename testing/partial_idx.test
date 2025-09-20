@@ -153,3 +153,80 @@ do_execsql_test_on_specific_db {:memory:} partial-index-delete {
     SELECT id, sku, price FROM products WHERE price > 100 ORDER BY id;
 } {5|ABC123|500
 6|XYZ789|600}
+
+do_execsql_test_on_specific_db {:memory:} partial-index-delete-function-where {
+    CREATE TABLE func_del (id INTEGER PRIMARY KEY, name TEXT);
+    CREATE UNIQUE INDEX idx_lower ON func_del(name) WHERE LOWER(name) = name;
+    
+    INSERT INTO func_del VALUES (1, 'lowercase');
+    INSERT INTO func_del VALUES (2, 'UPPERCASE');
+    INSERT INTO func_del VALUES (3, 'MixedCase');
+    DELETE FROM func_del WHERE LOWER(name) = name;
+
+    -- Should be able to insert lowercase now
+    INSERT INTO func_del VALUES (4, 'lowercase');
+    INSERT INTO func_del VALUES (5, 'another');
+    SELECT id, name FROM func_del ORDER BY id;
+} {2|UPPERCASE
+3|MixedCase
+4|lowercase
+5|another}
+
+do_execsql_test_in_memory_error_content partial-index-delete-all {
+    CREATE TABLE del_all (id INTEGER PRIMARY KEY, val TEXT, flag INTEGER);
+    CREATE UNIQUE INDEX idx_all ON del_all(val) WHERE flag = 1;
+    INSERT INTO del_all VALUES (1, 'test', 1), (2, 'test', 0), (3, 'other', 1);
+    DELETE FROM del_all;
+    -- Should be able to insert anything now
+    INSERT INTO del_all VALUES (4, 'test', 1);
+    INSERT INTO del_all VALUES (5, 'test', 1);
+} {UNIQUE constraint failed: idx_all.val (19)}
+
+do_execsql_test_on_specific_db {:memory:} partial-index-delete-cascade-scenario {
+    CREATE TABLE parent_del (id INTEGER PRIMARY KEY, status TEXT);
+    CREATE TABLE child_del (id INTEGER PRIMARY KEY, parent_id INTEGER, name TEXT, active INTEGER);
+    CREATE UNIQUE INDEX idx_active_child ON child_del(name) WHERE active = 1;
+    
+    INSERT INTO parent_del VALUES (1, 'active'), (2, 'inactive');
+    INSERT INTO child_del VALUES (1, 1, 'child1', 1);
+    INSERT INTO child_del VALUES (2, 1, 'child2', 1);
+    INSERT INTO child_del VALUES (3, 2, 'child1', 0);
+    -- Simulate cascade by deleting children of parent 1
+    DELETE FROM child_del WHERE parent_id = 1;
+    -- Should now allow these since active children are gone
+    INSERT INTO child_del VALUES (4, 2, 'child1', 1);
+    INSERT INTO child_del VALUES (5, 2, 'child2', 1);
+    SELECT COUNT(*) FROM child_del WHERE active = 1;
+} {2}
+
+do_execsql_test_on_specific_db {:memory:} partial-index-delete-null-where {
+    CREATE TABLE null_del (id INTEGER PRIMARY KEY, code TEXT, category TEXT);
+    CREATE UNIQUE INDEX idx_with_category ON null_del(code) WHERE category IS NOT NULL;
+    INSERT INTO null_del VALUES (1, 'CODE1', 'cat1');
+    INSERT INTO null_del VALUES (2, 'CODE1', NULL);
+    INSERT INTO null_del VALUES (3, 'CODE2', 'cat2');
+    INSERT INTO null_del VALUES (4, 'CODE1', NULL);
+    -- Delete the one with category
+    DELETE FROM null_del WHERE code = 'CODE1' AND category IS NOT NULL;
+    -- Should allow this now
+    INSERT INTO null_del VALUES (5, 'CODE1', 'cat3');
+    
+    SELECT id, code, category FROM null_del WHERE code = 'CODE1' ORDER BY id;
+} {2|CODE1|
+4|CODE1|
+5|CODE1|cat3}
+
+do_execsql_test_on_specific_db {:memory:} partial-index-delete-complex-where {
+    CREATE TABLE complex_del (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c TEXT);
+    CREATE UNIQUE INDEX idx_complex ON complex_del(c) WHERE a > 10 AND b < 20;
+    INSERT INTO complex_del VALUES (1, 15, 10, 'dup');
+    INSERT INTO complex_del VALUES (2, 5, 15, 'dup');
+    INSERT INTO complex_del VALUES (3, 15, 25, 'dup');
+    INSERT INTO complex_del VALUES (4, 20, 10, 'unique');
+    -- Delete the one entry that's actually in the partial index
+    DELETE FROM complex_del WHERE a > 10 AND b < 20;
+    
+    -- Should now allow this since we deleted the conflicting entry
+    INSERT INTO complex_del VALUES (5, 12, 18, 'dup');
+    SELECT COUNT(*) FROM complex_del WHERE c = 'dup';
+} {3}
