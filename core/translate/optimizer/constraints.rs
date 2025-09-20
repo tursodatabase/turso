@@ -361,6 +361,15 @@ pub fn constraints_from_where_clause(
                 candidate.refs.truncate(first_inequality + 1);
             }
         }
+        cs.candidates.retain(|c| {
+            if let Some(idx) = &c.index {
+                if idx.where_clause.is_some() && c.refs.is_empty() {
+                    // prevent a partial index from even being considered as a scan driver.
+                    return false;
+                }
+            }
+            true
+        });
         constraints.push(cs);
     }
 
