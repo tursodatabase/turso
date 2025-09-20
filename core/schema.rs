@@ -1,8 +1,6 @@
 use crate::function::Func;
 use crate::incremental::view::IncrementalView;
-use crate::translate::emitter::Resolver;
 use crate::translate::expr::{bind_and_rewrite_expr, walk_expr, ParamState, WalkControl};
-use crate::translate::optimizer::Optimizable;
 use parking_lot::RwLock;
 
 /// Simple view structure for non-materialized views

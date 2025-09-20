@@ -577,7 +577,6 @@ fn emit_delete_insns(
                 let where_copy = index
                     .bind_where_expr(Some(table_references), connection)
                     .expect("where clause to exist");
-                let where_result_reg = program.alloc_register();
                 let skip_label = program.allocate_label();
                 translate_condition_expr(
                     program,
