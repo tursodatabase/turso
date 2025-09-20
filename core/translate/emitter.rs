@@ -25,8 +25,8 @@ use crate::function::Func;
 use crate::schema::{BTreeTable, Column, Schema, Table};
 use crate::translate::compound_select::emit_program_for_compound_select;
 use crate::translate::expr::{
-    bind_and_rewrite_expr, emit_returning_results, walk_expr_mut, ParamState,
-    ReturningValueRegisters, WalkControl,
+    emit_returning_results, translate_condition_expr, translate_expr_no_constant_opt,
+    walk_expr_mut, ConditionMetadata, NoConstantOptReason, ReturningValueRegisters, WalkControl,
 };
 use crate::translate::plan::{DeletePlan, JoinedTable, Plan, QueryDestination, Search};
 use crate::translate::result_row::try_fold_expr_to_i64;
@@ -573,31 +573,23 @@ fn emit_delete_insns(
             .unwrap_or_default();
 
         for (index, index_cursor_id) in other_indexes {
-            let skip_delete_label = if let Some(where_clause) = &index.where_clause {
-                let mut where_copy = where_clause.as_ref().clone();
-                let mut param_state = ParamState::disallow();
-                bind_and_rewrite_expr(
-                    &mut where_copy,
-                    Some(table_references),
-                    None,
-                    connection,
-                    &mut param_state,
-                )?;
+            let skip_delete_label = if index.where_clause.is_some() {
+                let where_copy = index
+                    .bind_where_expr(Some(table_references), connection)
+                    .expect("where clause to exist");
                 let where_result_reg = program.alloc_register();
-                translate_expr(
+                let skip_label = program.allocate_label();
+                translate_condition_expr(
                     program,
-                    Some(table_references),
+                    table_references,
                     &where_copy,
-                    where_result_reg,
+                    ConditionMetadata {
+                        jump_if_condition_is_true: false,
+                        jump_target_when_false: skip_label,
+                        jump_target_when_true: BranchOffset::Placeholder,
+                    },
                     &t_ctx.resolver,
                 )?;
-
-                let skip_label = program.allocate_label();
-                program.emit_insn(Insn::IfNot {
-                    reg: where_result_reg,
-                    target_pc: skip_label,
-                    jump_if_null: true,
-                });
                 Some(skip_label)
             } else {
                 None
@@ -1077,55 +1069,53 @@ fn emit_update_insns(
         // partial index, so we can know whether or not to delete the old index entry,
         // as well as whether or not the NEW values satisfy the predicate, to determine whether
         // or not to insert a new index entry for a partial index
-        let (old_satisfies_where, new_satisfies_where) =
-            if let Some(where_clause) = &index.where_clause {
-                let mut where_copy = where_clause.as_ref().clone();
-                let mut param_state = ParamState::disallow();
-                // This means that we need to bind the column references to a copy of the index Expr,
-                // so we can emit Insn::Column instructions and refer to the old values.
-                bind_and_rewrite_expr(
-                    &mut where_copy,
-                    Some(&mut plan.table_references),
-                    None,
-                    connection,
-                    &mut param_state,
-                )?;
-                let old_satisfied_reg = program.alloc_register();
-                translate_expr(
-                    program,
-                    Some(&plan.table_references),
-                    &where_copy,
-                    old_satisfied_reg,
-                    &t_ctx.resolver,
-                )?;
+        let (old_satisfies_where, new_satisfies_where) = if index.where_clause.is_some() {
+            // This means that we need to bind the column references to a copy of the index Expr,
+            // so we can emit Insn::Column instructions and refer to the old values.
+            let where_clause = index
+                .bind_where_expr(Some(&mut plan.table_references), connection)
+                .expect("where clause to exist");
+            let old_satisfied_reg = program.alloc_register();
+            let old_satisfied_reg = translate_expr_no_constant_opt(
+                program,
+                Some(&plan.table_references),
+                &where_clause,
+                old_satisfied_reg,
+                &t_ctx.resolver,
+                NoConstantOptReason::RegisterReuse,
+            )?;
 
-                let mut new_where = where_clause.as_ref().clone();
-                // Now we need to rewrite the Expr::Id and Expr::Qualified/Expr::RowID (from a copy of the original, un-bound `where` expr),
-                // to refer to the new values, which are already loaded into registers starting at
-                // `start`.
-                rewrite_where_for_update_registers(
-                    &mut new_where,
-                    unsafe { &*table_ref }.columns(),
-                    start,
-                    rowid_set_clause_reg.unwrap_or(beg),
-                )?;
+            // grab a new copy of the original where clause from the index
+            let mut new_where = index
+                .where_clause
+                .as_ref()
+                .expect("checked where clause to exist")
+                .clone();
+            // Now we need to rewrite the Expr::Id and Expr::Qualified/Expr::RowID (from a copy of the original, un-bound `where` expr),
+            // to refer to the new values, which are already loaded into registers starting at `start`.
+            rewrite_where_for_update_registers(
+                &mut new_where,
+                unsafe { &*table_ref }.columns(),
+                start,
+                rowid_set_clause_reg.unwrap_or(beg),
+            )?;
 
-                let new_satisfied_reg = program.alloc_register();
-                translate_expr(
-                    program,
-                    None,
-                    &new_where,
-                    new_satisfied_reg,
-                    &t_ctx.resolver,
-                )?;
+            let new_satisfied_reg = program.alloc_register();
+            translate_expr(
+                program,
+                None,
+                &new_where,
+                new_satisfied_reg,
+                &t_ctx.resolver,
+            )?;
 
-                // now we have two registers that tell us whether or not the old and new values satisfy
-                // the partial index predicate, and we can use those to decide whether or not to
-                // delete/insert a new index entry for this partial index.
-                (Some(old_satisfied_reg), Some(new_satisfied_reg))
-            } else {
-                (None, None)
-            };
+            // now we have two registers that tell us whether or not the old and new values satisfy
+            // the partial index predicate, and we can use those to decide whether or not to
+            // delete/insert a new index entry for this partial index.
+            (Some(old_satisfied_reg), Some(new_satisfied_reg))
+        } else {
+            (None, None)
+        };
 
         let mut skip_delete_label = None;
         let mut skip_insert_label = None;
