@@ -366,3 +366,207 @@ do_execsql_test_in_memory_error_content partial-index-update-only-predicate-col-
     INSERT INTO r2 VALUES (2,'A',1);
     UPDATE r2 SET x = 1 WHERE id = 1;
 } {UNIQUE constraint failed: r2.k (19)}
+
+
+do_execsql_test_on_specific_db {:memory:} partial-index-multi-predicate-references {
+    CREATE TABLE r2 (id INTEGER PRIMARY KEY, k TEXT, x INT);
+    CREATE UNIQUE INDEX idx_k ON r2(k) WHERE x < 10 AND id > 10;
+    INSERT INTO r2 (k,x) VALUES ('A',1), ('A',2), ('A',3), ('A',4), ('A',5), ('A',6), ('A',7), ('A',8), ('A', 9), ('A', 10), ('A', 10);
+	-- now `id` will be greater than 10, so anything added with k='A' and x<10 should conflict
+    INSERT INTO r2 (k,x) VALUES ('A',11);
+	INSERT INTO r2 (k,x) VALUES ('A',12);
+	SELECT id FROM r2 ORDER BY id DESC LIMIT 1;
+} {13}
+
+do_execsql_test_in_memory_error_content partial-index-multi-predicate-references-rowid-alais {
+    CREATE TABLE r2 (id INTEGER PRIMARY KEY, k TEXT, x INT);
+    CREATE UNIQUE INDEX idx_k ON r2(k) WHERE x < 10 AND id > 10;
+    INSERT INTO r2 (k,x) VALUES ('A',1), ('A',2), ('A',3), ('A',4), ('A',5), ('A',6), ('A',7), ('A',8), ('A', 9), ('A', 10), ('A', 10);
+	-- now `id` will be greater than 10, so anything added with k='A' and x<10 should conflict
+    INSERT INTO r2 (k,x) VALUES ('A',11);
+	INSERT INTO r2 (k,x) VALUES ('A',12);
+	INSERT INTO r2 (k,x) VALUES ('A', 3);
+	INSERT INTO r2 (k,x) VALUES ('A', 9);
+	 -- should fail now
+} {UNIQUE constraint failed: r2.k (19)}
+
+
+do_execsql_test_in_memory_any_error upsert-partial-donothing-basic {
+  CREATE TABLE u1(id INTEGER PRIMARY KEY, email TEXT, status TEXT, note TEXT);
+  CREATE UNIQUE INDEX idx_active_email ON u1(email) WHERE status='active';
+  INSERT INTO u1(email,status,note)
+    VALUES('a@test','active','n3')
+    ON CONFLICT(email) DO NOTHING;
+}
+
+do_execsql_test_on_specific_db {:memory:} upsert-partial-doupdate-basic {
+  CREATE TABLE u2(id INTEGER PRIMARY KEY, email TEXT, status TEXT, note TEXT);
+  CREATE UNIQUE INDEX idx_active_email ON u2(email) WHERE status='active';
+
+  INSERT INTO u2 VALUES (1,'a@test','active','n1');
+
+  INSERT INTO u2(email,status,note)
+    VALUES('a@test','active','nNEW')
+    ON CONFLICT DO UPDATE SET note=excluded.note;
+
+  SELECT id,email,status,note FROM u2;
+} {1|a@test|active|nNEW}
+
+do_execsql_test_on_specific_db {:memory:} upsert-partial-doupdate-leave-predicate {
+  CREATE TABLE u3(id INTEGER PRIMARY KEY, email TEXT, status TEXT);
+  CREATE UNIQUE INDEX idx_active_email ON u3(email) WHERE status='active';
+
+  INSERT INTO u3 VALUES (1,'a@test','active');
+
+  INSERT INTO u3(email,status)
+    VALUES('a@test','active')
+    ON CONFLICT DO UPDATE SET status='inactive';
+
+  -- After update, the conflicting row no longer participates in idx predicate.
+  -- Insert should now succeed for active variant.
+  INSERT INTO u3 VALUES (2,'a@test','active');
+
+  SELECT id,email,status FROM u3 ORDER BY id;
+} {1|a@test|inactive 2|a@test|active}
+
+do_execsql_test_on_specific_db {:memory:} upsert-partial-doupdate-where-skip {
+  CREATE TABLE u4(id INTEGER PRIMARY KEY, email TEXT, status TEXT, hits INT DEFAULT 0);
+  CREATE UNIQUE INDEX idx_active_email ON u4(email) WHERE status='active';
+
+  INSERT INTO u4 VALUES(1,'a@test','active',5);
+
+  INSERT INTO u4(email,status)
+    VALUES('a@test','active')
+    ON CONFLICT DO UPDATE SET hits=hits+1 WHERE excluded.status='inactive';
+
+  -- filter false => no UPDATE; constraint remains => INSERT must be suppressed,
+  -- SQLite semantics: when WHERE is false, the UPSERT does nothing (no row added).
+  SELECT id,email,status,hits FROM u4 ORDER BY id;
+} {1|a@test|active|5}
+
+do_execsql_test_on_specific_db {:memory:} upsert-partial-omitted-target-matches {
+  CREATE TABLE u6(id INTEGER PRIMARY KEY, email TEXT, status TEXT, n INT);
+  CREATE UNIQUE INDEX idx_active_email ON u6(email) WHERE status='active';
+  INSERT INTO u6 VALUES (1,'a@test','active',0);
+
+  INSERT INTO u6(email,status,n)
+    VALUES('a@test','active',10)
+    ON CONFLICT DO UPDATE SET n = excluded.n;
+
+  SELECT id,email,status,n FROM u6;
+} {1|a@test|active|10}
+
+do_execsql_test_on_specific_db {:memory:} upsert-partial-multicol-leave-predicate {
+  CREATE TABLE m2(id INTEGER PRIMARY KEY, sku TEXT, region TEXT, price INT);
+  CREATE UNIQUE INDEX idx_sr ON m2(sku,region) WHERE price > 100;
+
+  INSERT INTO m2 VALUES(1,'A','US',150);
+
+  INSERT INTO m2(sku,region,price)
+    VALUES('A','US',150)
+    ON CONFLICT DO UPDATE SET price=50;
+
+  -- Now predicate false; insert another high-price duplicate should succeed
+  INSERT INTO m2 VALUES(2,'A','US',200);
+
+  SELECT id,sku,region,price FROM m2 ORDER BY id;
+} {1|A|US|50 2|A|US|200}
+
+do_execsql_test_on_specific_db {:memory:} upsert-partial-func-predicate {
+  CREATE TABLE d1(id INTEGER PRIMARY KEY, title TEXT, n INT DEFAULT 0);
+  CREATE UNIQUE INDEX idx_lower_title ON d1(title) WHERE LOWER(title)=title;
+
+  INSERT INTO d1 VALUES(1,'lower',0);
+
+  INSERT INTO d1(title)
+    VALUES('lower')
+    ON CONFLICT DO UPDATE SET n = n+1;
+
+  SELECT id,title,n FROM d1;
+} {1|lower|1}
+
+do_execsql_test_on_specific_db {:memory:} upsert-partial-rowid-predicate {
+  CREATE TABLE r1(id INTEGER PRIMARY KEY, k TEXT, x INT, hits INT DEFAULT 0);
+  CREATE UNIQUE INDEX idx_k ON r1(k) WHERE x < 10 AND id > 10;
+
+  -- create ids 1..12, with ('A', >=10) rows to push rowid>10
+  INSERT INTO r1(k,x) VALUES('A',10),('A',10),('A',10),('A',10),('A',10),
+                            ('A',10),('A',10),('A',10),('A',10),('A',10),('A',11),('A',12);
+
+  -- Now conflict for ('A', 5) is against partial index (id>10 & x<10)
+  INSERT INTO r1(k,x,hits)
+    VALUES('A',5,1)
+    ON CONFLICT DO UPDATE SET hits = hits + excluded.hits;
+
+  SELECT k, SUM(hits) FROM r1 GROUP BY k;
+} {A|1}
+
+# EXCLUDED usage inside DO UPDATE stays within predicate and changes key
+do_execsql_test_on_specific_db {:memory:} upsert-partial-excluded-rewrite {
+  CREATE TABLE ex1(id INTEGER PRIMARY KEY, a TEXT, b INT, c TEXT);
+  CREATE UNIQUE INDEX idx_a ON ex1(a) WHERE b>0;
+
+  INSERT INTO ex1 VALUES(1,'X',1,'old');
+
+  INSERT INTO ex1(a,b,c)
+    VALUES('X',1,'new')
+    ON CONFLICT DO UPDATE SET c = excluded.c, b = excluded.b;
+
+  SELECT id,a,b,c FROM ex1;
+} {1|X|1|new}
+
+do_execsql_test_on_specific_db {:memory:} upsert-partial-stay-change-to-unique {
+  CREATE TABLE s1(id INTEGER PRIMARY KEY, a TEXT, flag INT);
+  CREATE UNIQUE INDEX idx_a ON s1(a) WHERE flag=1;
+
+  INSERT INTO s1 VALUES(1,'K',1);
+
+  INSERT INTO s1(a,flag)
+    VALUES('K',1)
+    ON CONFLICT DO UPDATE SET a='K2';
+
+  SELECT id,a,flag FROM s1;
+} {1|K2|1}
+
+do_execsql_test_on_specific_db {:memory:} upsert-partial-toggle-predicate {
+  CREATE TABLE tgl(id INTEGER PRIMARY KEY, k TEXT, x INT);
+  CREATE UNIQUE INDEX idx_k ON tgl(k) WHERE x>0;
+
+  INSERT INTO tgl VALUES(1,'A',1);
+
+  -- Conflicts on 'A', flips x to 0 (leaves predicate)
+  INSERT INTO tgl(k,x)
+    VALUES('A',1)
+    ON CONFLICT DO UPDATE SET x=0;
+
+  -- Now another 'A' with x>0 should insert
+  INSERT INTO tgl VALUES(2,'A',5);
+
+  SELECT id,k,x FROM tgl ORDER BY id;
+} {1|A|0 2|A|5}
+
+do_execsql_test_in_memory_error_content upsert-partial-target-pk-only {
+  CREATE TABLE pko(id INTEGER PRIMARY KEY, k TEXT, x INT);
+  CREATE UNIQUE INDEX idx_k ON pko(k) WHERE x>0;
+
+  INSERT INTO pko VALUES(1,'A',1);
+
+  -- Target PK only; conflict is on idx_k, so DO UPDATE must NOT fire and error is raised
+  INSERT INTO pko(id,k,x)
+    VALUES(2,'A',1)
+    ON CONFLICT(id) DO UPDATE SET x=99;
+} {UNIQUE constraint failed: pko.k (19)}
+
+do_execsql_test_on_specific_db {:memory:} upsert-partial-omitted-no-conflict {
+  CREATE TABLE insfree(id INTEGER PRIMARY KEY, k TEXT, x INT);
+  CREATE UNIQUE INDEX idx_k ON insfree(k) WHERE x>0;
+
+  INSERT INTO insfree VALUES(1,'A',1);
+
+  -- x=0 => not in predicate, so no conflict; row must be inserted
+  INSERT INTO insfree(k,x)
+    VALUES('A',0)
+    ON CONFLICT DO NOTHING;
+
+  SELECT COUNT(*) FROM insfree WHERE k='A';
+} {2}
