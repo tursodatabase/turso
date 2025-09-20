@@ -17,7 +17,7 @@ use crate::translate::expr::{
 use crate::translate::plan::TableReferences;
 use crate::translate::planner::ROWID;
 use crate::translate::upsert::{
-    collect_set_clauses_for_upsert, emit_upsert, upsert_matches_index, upsert_matches_pk,
+    collect_set_clauses_for_upsert, emit_upsert, resolve_upsert_target, ResolvedUpsertTarget,
 };
 use crate::util::normalize_ident;
 use crate::vdbe::builder::ProgramBuilderOpts;
@@ -168,6 +168,12 @@ pub fn translate_insert(
         }
         upsert_opt = upsert.as_deref().cloned();
     }
+    // resolve the constrained target for UPSERT if specified
+    let resolved_upsert = if let Some(upsert) = &upsert_opt {
+        Some(resolve_upsert_target(schema, &table, upsert)?)
+    } else {
+        None
+    };
 
     let halt_label = program.allocate_label();
     let loop_start_label = program.allocate_label();
@@ -438,8 +444,13 @@ pub fn translate_insert(
         // Conflict on rowid: attempt to route through UPSERT if it targets the PK, otherwise raise constraint.
         // emit Halt for every case *except* when upsert handles the conflict
         'emit_halt: {
-            if let Some(ref mut upsert) = upsert_opt.as_mut() {
-                if upsert_matches_pk(upsert, &table) {
+            if let (Some(ref mut upsert), Some(ref target)) =
+                (upsert_opt.as_mut(), resolved_upsert.as_ref())
+            {
+                if matches!(
+                    target,
+                    ResolvedUpsertTarget::CatchAll | ResolvedUpsertTarget::PrimaryKey
+                ) {
                     match upsert.do_clause {
                         UpsertDo::Nothing => {
                             program.emit_insn(Insn::Goto {
@@ -451,7 +462,6 @@ pub fn translate_insert(
                             ref mut where_clause,
                         } => {
                             let mut rewritten_sets = collect_set_clauses_for_upsert(&table, sets)?;
-
                             emit_upsert(
                                 &mut program,
                                 schema,
@@ -590,11 +600,16 @@ pub fn translate_insert(
                     accum
                 },
             );
-
             // again, emit halt for every case *except* when upsert handles the conflict
             'emit_halt: {
-                if let Some(ref mut upsert) = upsert_opt.as_mut() {
-                    if upsert_matches_index(upsert, index, &table) {
+                if let (Some(ref mut upsert), Some(ref target)) =
+                    (upsert_opt.as_mut(), resolved_upsert.as_ref())
+                {
+                    if match target {
+                        ResolvedUpsertTarget::CatchAll => true,
+                        ResolvedUpsertTarget::Index(tgt) => Arc::ptr_eq(tgt, index),
+                        ResolvedUpsertTarget::PrimaryKey => false,
+                    } {
                         match upsert.do_clause {
                             UpsertDo::Nothing => {
                                 program.emit_insn(Insn::Goto {
