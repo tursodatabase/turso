@@ -4,12 +4,15 @@ use crate::schema::Table;
 use crate::translate::emitter::{
     emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary, OperationMode, Resolver,
 };
-use crate::translate::expr::{bind_and_rewrite_expr, translate_expr, ParamState};
+use crate::translate::expr::{
+    bind_and_rewrite_expr, translate_condition_expr, translate_expr, ConditionMetadata, ParamState,
+};
 use crate::translate::plan::{
     ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan, TableReferences,
 };
 use crate::vdbe::builder::CursorKey;
 use crate::vdbe::insn::{CmpInsFlags, Cookie};
+use crate::vdbe::BranchOffset;
 use crate::SymbolTable;
 use crate::{
     schema::{BTreeTable, Column, Index, IndexColumn, PseudoCursorType, Schema},
@@ -208,20 +211,18 @@ pub fn translate_create_index(
     // Then insert the record into the sorter
     let mut skip_row_label = None;
     if let Some(where_clause) = where_clause {
-        let reg = program.alloc_register();
         let label = program.allocate_label();
-        let pr = translate_expr(
+        translate_condition_expr(
             &mut program,
-            Some(&table_references),
+            &table_references,
             &where_clause,
-            reg,
+            ConditionMetadata {
+                jump_if_condition_is_true: false,
+                jump_target_when_false: label,
+                jump_target_when_true: BranchOffset::Placeholder,
+            },
             &resolver,
         )?;
-        program.emit_insn(Insn::IfNot {
-            reg: pr,
-            target_pc: label,
-            jump_if_null: true,
-        });
         skip_row_label = Some(label);
     }
 

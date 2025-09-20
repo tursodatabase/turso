@@ -395,13 +395,14 @@ pub fn prepare_update_plan(
                         let mut param = ParamState::disallow();
                         let mut tr =
                             TableReferences::new(table_references.joined_tables().to_vec(), vec![]);
-                        let _ = bind_and_rewrite_expr(
+                        bind_and_rewrite_expr(
                             &mut where_copy,
                             Some(&mut tr),
                             None,
                             connection,
                             &mut param,
-                        );
+                        )
+                        .ok()?;
                         let cols_used = collect_cols_used_in_expr(&where_copy);
                         // if any of the columns used in the partial index WHERE clause is being
                         // updated, we need to update this index
@@ -447,6 +448,8 @@ fn build_scan_op(table: &Table, iter_dir: IterationDirection) -> Operation {
     }
 }
 
+/// Returns a set of column indices used in the expression.
+/// *Must* be used on an Expr already processed by `bind_and_rewrite_expr`
 fn collect_cols_used_in_expr(expr: &Expr) -> HashSet<usize> {
     let mut acc = HashSet::new();
     let _ = walk_expr(expr, &mut |expr| match expr {

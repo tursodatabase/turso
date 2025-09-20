@@ -1073,10 +1073,16 @@ fn emit_update_insns(
     }
 
     for (index, (idx_cursor_id, record_reg)) in plan.indexes_to_update.iter().zip(&index_cursors) {
+        // We need to know whether or not the OLD values satisfied the predicate on the
+        // partial index, so we can know whether or not to delete the old index entry,
+        // as well as whether or not the NEW values satisfy the predicate, to determine whether
+        // or not to insert a new index entry for a partial index
         let (old_satisfies_where, new_satisfies_where) =
             if let Some(where_clause) = &index.where_clause {
                 let mut where_copy = where_clause.as_ref().clone();
                 let mut param_state = ParamState::disallow();
+                // This means that we need to bind the column references to a copy of the index Expr,
+                // so we can emit Insn::Column instructions and refer to the old values.
                 bind_and_rewrite_expr(
                     &mut where_copy,
                     Some(&mut plan.table_references),
@@ -1094,6 +1100,9 @@ fn emit_update_insns(
                 )?;
 
                 let mut new_where = where_clause.as_ref().clone();
+                // Now we need to rewrite the Expr::Id and Expr::Qualified/Expr::RowID (from a copy of the original, un-bound `where` expr),
+                // to refer to the new values, which are already loaded into registers starting at
+                // `start`.
                 rewrite_where_for_update_registers(
                     &mut new_where,
                     unsafe { &*table_ref }.columns(),
@@ -1110,6 +1119,9 @@ fn emit_update_insns(
                     &t_ctx.resolver,
                 )?;
 
+                // now we have two registers that tell us whether or not the old and new values satisfy
+                // the partial index predicate, and we can use those to decide whether or not to
+                // delete/insert a new index entry for this partial index.
                 (Some(old_satisfied_reg), Some(new_satisfied_reg))
             } else {
                 (None, None)
@@ -1121,6 +1133,7 @@ fn emit_update_insns(
         // Handle deletion for partial indexes
         if let Some(old_satisfied) = old_satisfies_where {
             skip_delete_label = Some(program.allocate_label());
+            // If the old values don't satisfy the WHERE clause, skip the delete
             program.emit_insn(Insn::IfNot {
                 reg: old_satisfied,
                 target_pc: skip_delete_label.unwrap(),
@@ -1146,7 +1159,7 @@ fn emit_update_insns(
             start_reg: delete_start_reg,
             num_regs,
             cursor_id: *idx_cursor_id,
-            raise_error_if_no_matching_entry: old_satisfies_where.is_none(),
+            raise_error_if_no_matching_entry: true,
         });
 
         // Resolve delete skip label if it exists
@@ -1157,6 +1170,7 @@ fn emit_update_insns(
         // Check if we should insert into partial index
         if let Some(new_satisfied) = new_satisfies_where {
             skip_insert_label = Some(program.allocate_label());
+            // If the new values don't satisfy the WHERE clause, skip the idx insert
             program.emit_insn(Insn::IfNot {
                 reg: new_satisfied,
                 target_pc: skip_insert_label.unwrap(),
@@ -1200,7 +1214,7 @@ fn emit_update_insns(
         });
 
         // Handle unique constraint
-        if !index.unique {
+        if index.unique {
             let constraint_check = program.allocate_label();
             // check if the record already exists in the index for unique indexes and abort if so
             program.emit_insn(Insn::NoConflict {
@@ -1765,6 +1779,10 @@ fn init_limit(
     }
 }
 
+/// We have `Expr`s which have *not* had column references bound to them,
+/// so they are in the state of Expr::Id/Expr::Qualified, etc, and instead of binding Expr::Column
+/// we need to bind Expr::Register, as we have already loaded the *new* column values from the
+/// UPDATE statement into registers starting at `columns_start_reg`, which we want to reference.
 fn rewrite_where_for_update_registers(
     expr: &mut Expr,
     columns: &[Column],
