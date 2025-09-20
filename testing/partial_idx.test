@@ -21,7 +21,7 @@ do_execsql_test_in_memory_error_content partial-index-unique-violation {
     INSERT INTO users VALUES (2, 'user@test.com', 'inactive');
     INSERT INTO users VALUES (3, 'user@test.com', 'deleted');
     INSERT INTO users VALUES (4, 'user@test.com', 'active');
-} {UNIQUE constraint failed: idx_active_email.email (19)}
+} {UNIQUE constraint failed: users.email (19)}
 
 do_execsql_test_on_specific_db {:memory:} partial-index-expression-where {
     CREATE TABLE products (id INTEGER PRIMARY KEY, sku TEXT, price INTEGER);
@@ -45,7 +45,7 @@ do_execsql_test_in_memory_error_content partial-index-expensive-violation {
     INSERT INTO products VALUES (4, 'ABC123', 75);
     INSERT INTO products VALUES (5, 'ABC123', 250);
 	-- should fail with unique sku where price > 100
-} {UNIQUE constraint failed: idx_expensive.sku (19)}
+} {UNIQUE constraint failed: products.sku (19)}
 
 do_execsql_test_in_memory_error_content partial-index-expensive-violation-update {
     CREATE TABLE products (id INTEGER PRIMARY KEY, sku TEXT, price INTEGER);
@@ -78,7 +78,7 @@ do_execsql_test_in_memory_error_content partial-index-function-where {
     INSERT INTO docs VALUES (1, 'lowercase');
     INSERT INTO docs VALUES (2, 'UPPERCASE');
     INSERT INTO docs VALUES (3, 'lowercase');
-} {UNIQUE constraint failed: idx_lower_title.title (19)}
+} {UNIQUE constraint failed: docs.title (19)}
 
 do_execsql_test_on_specific_db {:memory:} partial-index-multiple { 
     CREATE TABLE tasks (id INTEGER PRIMARY KEY, name TEXT, priority INTEGER, status TEXT);
@@ -107,7 +107,7 @@ do_execsql_test_in_memory_error_content partial-index-function-where {
     INSERT INTO tasks VALUES (4, 'task2', 1, 'done');
 	INSERT INTO tasks VALUES (5, 'task1', 1, 'pending');
 	--  should fail for unique name where priority = 1
-} {UNIQUE constraint failed: idx_urgent.name (19)}
+} {UNIQUE constraint failed: tasks.name (19)}
 
 do_execsql_test_in_memory_error_content partial-index-function-where-2 {
     CREATE TABLE tasks (id INTEGER PRIMARY KEY, name TEXT, priority INTEGER, status TEXT);
@@ -119,7 +119,7 @@ do_execsql_test_in_memory_error_content partial-index-function-where-2 {
     INSERT INTO tasks VALUES (4, 'task2', 1, 'done');
 	INSERT INTO tasks VALUES (6, 'task1', 2, 'done');
 	 -- should fail for unique name where status = 'done'
-} {UNIQUE constraint failed: idx_completed.name (19)}
+} {UNIQUE constraint failed: tasks.name (19)}
 
 do_execsql_test_on_specific_db {:memory:} partial-index-update-rowid {
     CREATE TABLE rowid_test (id INTEGER PRIMARY KEY, val TEXT, flag INTEGER);
@@ -138,7 +138,7 @@ do_execsql_test_in_memory_error_content partial-index-update-complex {
     INSERT INTO complex VALUES (2, 'dup', 15, 'inactive');
     INSERT INTO complex VALUES (3, 'dup', 15, 'active');
     INSERT INTO complex VALUES (4, 'dup', 20, 'active');
-} {UNIQUE constraint failed: idx_complex.a (19)}
+} {UNIQUE constraint failed: complex.a (19)}
 
 do_execsql_test_on_specific_db {:memory:} partial-index-delete {
 	CREATE TABLE products (id INTEGER PRIMARY KEY, sku TEXT, price INTEGER);
@@ -180,7 +180,7 @@ do_execsql_test_in_memory_error_content partial-index-delete-all {
     -- Should be able to insert anything now
     INSERT INTO del_all VALUES (4, 'test', 1);
     INSERT INTO del_all VALUES (5, 'test', 1);
-} {UNIQUE constraint failed: idx_all.val (19)}
+} {UNIQUE constraint failed: del_all.val (19)}
 
 do_execsql_test_on_specific_db {:memory:} partial-index-delete-cascade-scenario {
     CREATE TABLE parent_del (id INTEGER PRIMARY KEY, status TEXT);
