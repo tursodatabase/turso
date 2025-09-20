@@ -1778,7 +1778,7 @@ fn rewrite_where_for_update_registers(
                 if let Some((idx, _)) = columns.iter().enumerate().find(|(_, c)| {
                     c.name
                         .as_ref()
-                        .map_or(false, |n| n.eq_ignore_ascii_case(&normalized))
+                        .is_some_and(|n| n.eq_ignore_ascii_case(&normalized))
                 }) {
                     *e = Expr::Register(columns_start_reg + idx);
                 }
@@ -1790,7 +1790,7 @@ fn rewrite_where_for_update_registers(
                 } else if let Some((idx, _)) = columns.iter().enumerate().find(|(_, c)| {
                     c.name
                         .as_ref()
-                        .map_or(false, |n| n.eq_ignore_ascii_case(&normalized))
+                        .is_some_and(|n| n.eq_ignore_ascii_case(&normalized))
                 }) {
                     *e = Expr::Register(columns_start_reg + idx);
                 }
