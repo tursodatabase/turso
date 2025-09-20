@@ -230,3 +230,139 @@ do_execsql_test_on_specific_db {:memory:} partial-index-delete-complex-where {
     INSERT INTO complex_del VALUES (5, 12, 18, 'dup');
     SELECT COUNT(*) FROM complex_del WHERE c = 'dup';
 } {3}
+
+
+# Entering predicate via UPDATE should conflict with an existing in-predicate key
+do_execsql_test_in_memory_error_content partial-index-update-enter-conflict-1 {
+    CREATE TABLE products (id INTEGER PRIMARY KEY, sku TEXT, price INTEGER);
+    CREATE UNIQUE INDEX idx_expensive ON products(sku) WHERE price > 100;
+    INSERT INTO products VALUES (1, 'ABC123', 50);
+    INSERT INTO products VALUES (2, 'ABC123', 150);
+    UPDATE products SET price = 200 WHERE id = 1;
+} {UNIQUE constraint failed: products.sku (19)}
+
+# Staying in predicate but changing key to a conflicting key should fail
+do_execsql_test_in_memory_error_content partial-index-update-change-key-conflict {
+    CREATE TABLE products (id INTEGER PRIMARY KEY, sku TEXT, price INTEGER);
+    CREATE UNIQUE INDEX idx_expensive ON products(sku) WHERE price > 100;
+    INSERT INTO products VALUES (1, 'ABC123', 150);
+    INSERT INTO products VALUES (2, 'XYZ789', 200);
+    UPDATE products SET sku = 'XYZ789' WHERE id = 1;
+} {UNIQUE constraint failed: products.sku (19)}
+
+# Exiting predicate via UPDATE should remove index entry; then re-entering later may fail
+do_execsql_test_in_memory_error_content partial-index-update-exit-then-reenter {
+    CREATE TABLE products (id INTEGER PRIMARY KEY, sku TEXT, price INTEGER);
+    CREATE UNIQUE INDEX idx_expensive ON products(sku) WHERE price > 100;
+    INSERT INTO products VALUES (1, 'ABC123', 150);
+    UPDATE products SET price = 50 WHERE id = 1;
+    INSERT INTO products VALUES (2, 'ABC123', 200);
+    UPDATE products SET price = 300 WHERE id = 1;
+} {UNIQUE constraint failed: products.sku (19)}
+
+# Multi-row UPDATE causing multiple rows to enter predicate together should conflict
+do_execsql_test_in_memory_error_content partial-index-update-multirow-conflict {
+    CREATE TABLE products (id INTEGER PRIMARY KEY, sku TEXT, price INTEGER);
+    CREATE UNIQUE INDEX idx_expensive ON products(sku) WHERE price > 100;
+    INSERT INTO products VALUES (1, 'ABC123', 50);
+    INSERT INTO products VALUES (2, 'ABC123', 150);
+    INSERT INTO products VALUES (3, 'ABC123', 75);
+    UPDATE products SET price = 150 WHERE sku = 'ABC123';
+} {UNIQUE constraint failed: products.sku (19)}
+
+# Update of unrelated columns should not affect partial index membership
+do_execsql_test_on_specific_db {:memory:} partial-index-update-unrelated-column {
+    CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT, status TEXT, note TEXT);
+    CREATE UNIQUE INDEX idx_active_email ON users(email) WHERE status = 'active';
+    INSERT INTO users VALUES (1, 'u@test.com', 'active',  'n1');
+    INSERT INTO users VALUES (2, 'u@test.com', 'inactive','n2');
+    UPDATE users SET note = 'changed' WHERE id = 2;
+    SELECT id,email,status,note FROM users ORDER BY id;
+} {1|u@test.com|active|n1
+2|u@test.com|inactive|changed}
+
+# NULL -> NOT NULL transition enters predicate and may conflict
+do_execsql_test_in_memory_error_content partial-index-update-null-enters-conflict {
+    CREATE TABLE items (id INTEGER PRIMARY KEY, code TEXT, category TEXT);
+    CREATE UNIQUE INDEX idx_categorized ON items(code) WHERE category IS NOT NULL;
+    INSERT INTO items VALUES (1,'CODE1','electronics');
+    INSERT INTO items VALUES (2,'CODE1',NULL);
+    UPDATE items SET category = 'x' WHERE id = 2;
+} {UNIQUE constraint failed: items.code (19)}
+
+# Function predicate: UPDATE causes entry into predicate -> conflict
+do_execsql_test_in_memory_error_content partial-index-update-function-enters {
+    CREATE TABLE docs (id INTEGER PRIMARY KEY, title TEXT);
+    CREATE UNIQUE INDEX idx_lower_title ON docs(title) WHERE LOWER(title) = title;
+    INSERT INTO docs VALUES (1, 'lowercase');
+    INSERT INTO docs VALUES (2, 'UPPERCASE');
+    UPDATE docs SET title = 'lowercase' WHERE id = 2;
+} {UNIQUE constraint failed: docs.title (19)}
+
+# Multi-column unique key with partial predicate: conflict on UPDATE entering predicate
+do_execsql_test_in_memory_error_content partial-index-update-multicol-enter-conflict {
+    CREATE TABLE inv (id INTEGER PRIMARY KEY, sku TEXT, region TEXT, price INT);
+    CREATE UNIQUE INDEX idx_sr ON inv(sku,region) WHERE price > 100;
+    INSERT INTO inv VALUES (1,'A','US', 50);
+    INSERT INTO inv VALUES (2,'A','US',150);
+    INSERT INTO inv VALUES (3,'A','EU',150);
+    UPDATE inv SET price = 200 WHERE id = 1;
+} {UNIQUE constraint failed: inv.sku, inv.region (19)}
+
+# Staying in predicate but changing second key part to collide should fail
+do_execsql_test_in_memory_error_content partial-index-update-multicol-change-second {
+    CREATE TABLE inv2 (id INTEGER PRIMARY KEY, sku TEXT, region TEXT, price INT);
+    CREATE UNIQUE INDEX idx_sr2 ON inv2(sku,region) WHERE price > 100;
+    INSERT INTO inv2 VALUES (1,'A','US',150);
+    INSERT INTO inv2 VALUES (2,'A','EU',150);
+    UPDATE inv2 SET region = 'US' WHERE id = 2;
+} {UNIQUE constraint failed: inv2.sku, inv2.region (19)}
+
+# UPDATE that leaves predicate and then changes key should be allowed, then re-entering may fail
+do_execsql_test_in_memory_error_content partial-index-update-exit-change-key-reenter {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, b INT);
+    CREATE UNIQUE INDEX idx_a ON t(a) WHERE b > 0;
+    INSERT INTO t VALUES (1,'K', 10);
+    INSERT INTO t VALUES (2,'X', 10);
+    UPDATE t SET b = 0       WHERE id = 1;
+    UPDATE t SET a = 'X'     WHERE id = 1;
+    UPDATE t SET b = 5       WHERE id = 1;
+} {UNIQUE constraint failed: t.a (19)}
+
+# Rowid (INTEGER PRIMARY KEY) change while in predicate should not self-conflict
+do_execsql_test_on_specific_db {:memory:} partial-index-update-rowid-no-self-conflict {
+    CREATE TABLE rowid_test (id INTEGER PRIMARY KEY, val TEXT, flag INT);
+    CREATE UNIQUE INDEX idx_flagged ON rowid_test(val) WHERE flag = 1;
+    INSERT INTO rowid_test VALUES (1,'v',1);
+    UPDATE rowid_test SET id = 9 WHERE id = 1;
+    SELECT id,val,flag FROM rowid_test ORDER BY id;
+} {9|v|1}
+
+# Batch UPDATE that toggles predicate truth for multiple rows; ensure net uniqueness is enforced
+do_execsql_test_in_memory_error_content partial-index-update-batch-crossing {
+    CREATE TABLE p (id INTEGER PRIMARY KEY, k TEXT, x INT);
+    CREATE UNIQUE INDEX idx_k ON p(k) WHERE x > 0;
+    INSERT INTO p VALUES (1,'A', 1);
+    INSERT INTO p VALUES (2,'A', 0);
+    INSERT INTO p VALUES (3,'A', 0);
+    UPDATE p SET x = CASE id WHEN 1 THEN 0 ELSE 1 END;
+} {UNIQUE constraint failed: p.k (19)}
+
+# UPDATE with WHERE predicate true, but changing to a unique new key while staying in predicate
+do_execsql_test_on_specific_db {:memory:} partial-index-update-stay-in-predicate-change-to-unique {
+    CREATE TABLE q (id INTEGER PRIMARY KEY, k TEXT, x INT);
+    CREATE UNIQUE INDEX idx_kx ON q(k) WHERE x > 0;
+    INSERT INTO q VALUES (1,'A',1);
+    INSERT INTO q VALUES (2,'B',1);
+    UPDATE q SET k='C' WHERE id=1;   -- stays in predicate, key now unique
+    SELECT id,k,x FROM q ORDER BY id;
+} {1|C|1
+2|B|1}
+
+do_execsql_test_in_memory_error_content partial-index-update-only-predicate-col-error {
+    CREATE TABLE r2 (id INTEGER PRIMARY KEY, k TEXT, x INT);
+    CREATE UNIQUE INDEX idx_k ON r2(k) WHERE x > 0;
+    INSERT INTO r2 VALUES (1,'A',0);
+    INSERT INTO r2 VALUES (2,'A',1);
+    UPDATE r2 SET x = 1 WHERE id = 1;
+} {UNIQUE constraint failed: r2.k (19)}
