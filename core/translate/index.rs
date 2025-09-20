@@ -5,7 +5,7 @@ use crate::translate::emitter::{
     emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary, OperationMode, Resolver,
 };
 use crate::translate::expr::{
-    bind_and_rewrite_expr, translate_condition_expr, translate_expr, ConditionMetadata, ParamState,
+    bind_and_rewrite_expr, translate_condition_expr, ConditionMetadata, ParamState,
 };
 use crate::translate::plan::{
     ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan, TableReferences,
