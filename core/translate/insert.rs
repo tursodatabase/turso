@@ -23,7 +23,6 @@ use crate::util::normalize_ident;
 use crate::vdbe::builder::ProgramBuilderOpts;
 use crate::vdbe::insn::{IdxInsertFlags, InsertFlags, RegisterOrLiteral};
 use crate::vdbe::BranchOffset;
-use crate::{bail_parse_error, Result, SymbolTable, VirtualTable};
 use crate::{
     schema::{Column, Schema},
     vdbe::{
@@ -31,6 +30,7 @@ use crate::{
         insn::Insn,
     },
 };
+use crate::{Result, SymbolTable, VirtualTable};
 
 use super::emitter::Resolver;
 use super::expr::{translate_expr, translate_expr_no_constant_opt, NoConstantOptReason};
@@ -1225,27 +1225,18 @@ pub fn rewrite_partial_index_where(
         expr,
         &mut |e: &mut ast::Expr| -> crate::Result<WalkControl> {
             match e {
-                // Unqualified column reference, map to insertion register
-                Expr::Column {
-                    column,
-                    is_rowid_alias,
-                    ..
-                } => {
-                    if *is_rowid_alias {
-                        *e = Expr::Register(insertion.key_register());
-                    } else if let Some(col_mapping) = insertion.col_mappings.get(*column) {
-                        *e = Expr::Register(col_mapping.register);
-                    } else {
-                        bail_parse_error!("Column index {} not found in insertion", column);
-                    }
-                }
+                // NOTE: should not have ANY Expr::Columns bound to the expr
                 Expr::Id(ast::Name::Ident(name)) | Expr::Id(ast::Name::Quoted(name)) => {
                     let normalized = normalize_ident(name.as_str());
                     if normalized.eq_ignore_ascii_case("rowid") {
                         *e = Expr::Register(insertion.key_register());
                     } else if let Some(col_mapping) = insertion.get_col_mapping_by_name(&normalized)
                     {
-                        *e = Expr::Register(col_mapping.register);
+                        if col_mapping.column.is_rowid_alias {
+                            *e = Expr::Register(insertion.key_register());
+                        } else {
+                            *e = Expr::Register(col_mapping.register);
+                        }
                     }
                 }
                 Expr::Qualified(_, col) | Expr::DoublyQualified(_, _, col) => {
@@ -1254,7 +1245,11 @@ pub fn rewrite_partial_index_where(
                         *e = Expr::Register(insertion.key_register());
                     } else if let Some(col_mapping) = insertion.get_col_mapping_by_name(&normalized)
                     {
-                        *e = Expr::Register(col_mapping.register);
+                        if col_mapping.column.is_rowid_alias {
+                            *e = Expr::Register(insertion.key_register());
+                        } else {
+                            *e = Expr::Register(col_mapping.register);
+                        }
                     }
                 }
                 Expr::RowId { .. } => {
