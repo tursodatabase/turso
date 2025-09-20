@@ -1412,24 +1412,10 @@ impl Connection {
     #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
     pub fn read_schema_version(&self) -> Result<u32> {
         let pager = self.pager.borrow();
-        let was_in_tx = self.transaction_state.get() != TransactionState::None;
-        if !was_in_tx {
-            pager.begin_read_tx()?;
-        }
-
-        let result = pager
+        pager
             .io
-            .block(|| pager.with_header(|header| header.schema_cookie));
-
-        if !was_in_tx {
-            pager.end_read_tx()?;
-        }
-
-        match result {
-            Ok(version) => Ok(version.get()),
-            Err(LimboError::Page1NotAlloc) => Ok(0),
-            Err(e) => Err(e),
-        }
+            .block(|| pager.with_header(|header| header.schema_cookie))
+            .map(|version| version.get())
     }
 
     /// Update schema version to the new value within opened write transaction
