@@ -1407,6 +1407,7 @@ impl Connection {
         if matches!(self.transaction_state.get(), TransactionState::None)
             && current_schema_version != schema.schema_version
         {
+            //  if current_schema_version != schema.schema_version {
             self.schema.replace(schema.clone());
         }
 
@@ -2417,6 +2418,7 @@ impl Statement {
                 &self.program.sql,
             )?
         };
+
         // Save parameters before they are reset
         let parameters = std::mem::take(&mut self.state.parameters);
         let (max_registers, cursor_count) = match self.query_mode {

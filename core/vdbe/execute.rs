@@ -1962,6 +1962,29 @@ pub fn op_make_record(
     Ok(InsnFunctionStepResult::Step)
 }
 
+pub fn op_mem_max(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+    mv_store: Option<&Arc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(MemMax { dest_reg, src_reg }, insn);
+
+    let dest_val = state.registers[*dest_reg].get_value();
+    let src_val = state.registers[*src_reg].get_value();
+
+    let dest_int = extract_int_value(dest_val);
+    let src_int = extract_int_value(src_val);
+
+    if dest_int < src_int {
+        state.registers[*dest_reg] = Register::Value(Value::Integer(src_int));
+    }
+
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
 pub fn op_result_row(
     program: &Program,
     state: &mut ProgramState,
@@ -5581,7 +5604,7 @@ pub fn op_insert(
                     let cursor = cursor.as_btree_mut();
                     cursor.root_page()
                 };
-                if root_page != 1 {
+                if root_page != 1 && table_name != "sqlite_sequence" {
                     state.op_insert_state.sub_state = OpInsertSubState::UpdateLastRowid;
                 } else {
                     let schema = program.connection.schema.borrow();
@@ -6816,6 +6839,10 @@ pub fn op_parse_schema(
     conn.is_nested_stmt.set(false);
     conn.auto_commit.set(previous_auto_commit);
     maybe_nested_stmt_err?;
+
+    // let updated_local_schema = conn.schema.borrow().clone();
+    // conn._db.update_schema_if_newer(updated_local_schema)?;
+
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
