@@ -99,7 +99,7 @@ fn update_pragma(
             let app_id_value = match data {
                 Value::Integer(i) => i as i32,
                 Value::Float(f) => f as i32,
-                _ => unreachable!(),
+                _ => bail_parse_error!("expected integer, got {:?}", data),
             };
 
             program.emit_insn(Insn::SetCookie {
@@ -108,6 +108,19 @@ fn update_pragma(
                 value: app_id_value,
                 p5: 1,
             });
+            Ok((program, TransactionMode::Write))
+        }
+        PragmaName::BusyTimeout => {
+            let data = parse_signed_number(&value)?;
+            let busy_timeout_ms = match data {
+                Value::Integer(i) => i as i32,
+                Value::Float(f) => f as i32,
+                _ => bail_parse_error!("expected integer, got {:?}", data),
+            };
+            let busy_timeout_ms = busy_timeout_ms.max(0);
+            connection.set_busy_timeout(Some(std::time::Duration::from_millis(
+                busy_timeout_ms as u64,
+            )));
             Ok((program, TransactionMode::Write))
         }
         PragmaName::CacheSize => {
@@ -387,6 +400,18 @@ fn query_pragma(
             program.add_pragma_result_column(pragma.to_string());
             program.emit_result_row(register, 1);
             Ok((program, TransactionMode::Read))
+        }
+        PragmaName::BusyTimeout => {
+            program.emit_int(
+                connection
+                    .get_busy_timeout()
+                    .map(|t| t.as_millis() as i64)
+                    .unwrap_or_default(),
+                register,
+            );
+            program.emit_result_row(register, 1);
+            program.add_pragma_result_column(pragma.to_string());
+            Ok((program, TransactionMode::None))
         }
         PragmaName::CacheSize => {
             program.emit_int(connection.get_cache_size() as i64, register);
