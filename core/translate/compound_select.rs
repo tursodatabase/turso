@@ -401,6 +401,7 @@ fn create_dedupe_index(
         table_name: String::new(),
         unique: false,
         has_rowid: false,
+        where_clause: None,
     });
     let cursor_id = program.alloc_cursor_id(CursorType::BTreeIndex(dedupe_index.clone()));
     program.emit_insn(Insn::OpenEphemeral {

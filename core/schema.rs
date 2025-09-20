@@ -447,11 +447,13 @@ impl Schema {
                     )?));
                 } else {
                     // Add single column unique index
-                    self.add_index(Arc::new(Index::automatic_from_unique(
-                        table.as_ref(),
-                        automatic_indexes.pop().unwrap(),
-                        vec![(pos_in_table, unique_set.columns.first().unwrap().1)],
-                    )?));
+                    if let Some(autoidx) = automatic_indexes.pop() {
+                        self.add_index(Arc::new(Index::automatic_from_unique(
+                            table.as_ref(),
+                            autoidx,
+                            vec![(pos_in_table, unique_set.columns.first().unwrap().1)],
+                        )?));
+                    }
                 }
             }
             for unique_set in table.unique_sets.iter().filter(|us| us.columns.len() > 1) {
@@ -1593,6 +1595,7 @@ pub struct Index {
     /// For example, WITHOUT ROWID tables (not supported in Limbo yet),
     /// and  SELECT DISTINCT ephemeral indexes will not have a rowid.
     pub has_rowid: bool,
+    pub where_clause: Option<Box<Expr>>,
 }
 
 #[allow(dead_code)]
@@ -1620,6 +1623,7 @@ impl Index {
                 tbl_name,
                 columns,
                 unique,
+                where_clause,
                 ..
             })) => {
                 let index_name = normalize_ident(idx_name.name.as_str());
@@ -1649,6 +1653,7 @@ impl Index {
                     unique,
                     ephemeral: false,
                     has_rowid: table.has_rowid,
+                    where_clause,
                 })
             }
             _ => todo!("Expected create index statement"),
@@ -1693,6 +1698,7 @@ impl Index {
             unique: true,
             ephemeral: false,
             has_rowid: table.has_rowid,
+            where_clause: None,
         })
     }
 
@@ -1729,6 +1735,7 @@ impl Index {
             unique: true,
             ephemeral: false,
             has_rowid: table.has_rowid,
+            where_clause: None,
         })
     }
 

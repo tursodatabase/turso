@@ -1,8 +1,14 @@
 use std::sync::Arc;
 
+use crate::schema::Table;
 use crate::translate::emitter::{
     emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary, OperationMode, Resolver,
 };
+use crate::translate::expr::{bind_and_rewrite_expr, translate_expr, ParamState};
+use crate::translate::plan::{
+    ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan, TableReferences,
+};
+use crate::vdbe::builder::CursorKey;
 use crate::vdbe::insn::{CmpInsFlags, Cookie};
 use crate::SymbolTable;
 use crate::{
@@ -18,6 +24,7 @@ use turso_parser::ast::{self, Expr, SortOrder, SortedColumn};
 
 use super::schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
 
+#[allow(clippy::too_many_arguments)]
 pub fn translate_create_index(
     unique_if_not_exists: (bool, bool),
     idx_name: &str,
@@ -26,6 +33,8 @@ pub fn translate_create_index(
     schema: &Schema,
     syms: &SymbolTable,
     mut program: ProgramBuilder,
+    connection: &Arc<crate::Connection>,
+    mut where_clause: Option<Box<Expr>>,
 ) -> crate::Result<ProgramBuilder> {
     if !schema.indexes_enabled() {
         crate::bail_parse_error!(
@@ -75,6 +84,8 @@ pub fn translate_create_index(
         unique: unique_if_not_exists.0,
         ephemeral: false,
         has_rowid: tbl.has_rowid,
+        where_clause: where_clause.clone(), // store the *original* where clause, because we need to rewrite it
+                                            // before translating, and it cannot reference a table alias
     });
 
     // Allocate the necessary cursors:
@@ -87,12 +98,42 @@ pub fn translate_create_index(
     let sqlite_table = schema.get_btree_table(SQLITE_TABLEID).unwrap();
     let sqlite_schema_cursor_id =
         program.alloc_cursor_id(CursorType::BTreeTable(sqlite_table.clone()));
+    let table_ref = program.table_reference_counter.next();
     let btree_cursor_id = program.alloc_cursor_id(CursorType::BTreeIndex(idx.clone()));
-    let table_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(tbl.clone()));
+    let table_cursor_id = program.alloc_cursor_id_keyed(
+        CursorKey::table(table_ref),
+        CursorType::BTreeTable(tbl.clone()),
+    );
     let sorter_cursor_id = program.alloc_cursor_id(CursorType::Sorter);
     let pseudo_cursor_id = program.alloc_cursor_id(CursorType::Pseudo(PseudoCursorType {
         column_count: tbl.columns.len(),
     }));
+
+    let mut table_references = TableReferences::new(
+        vec![JoinedTable {
+            op: Operation::Scan(Scan::BTreeTable {
+                iter_dir: IterationDirection::Forwards,
+                index: None,
+            }),
+            table: Table::BTree(tbl.clone()),
+            identifier: tbl_name.clone(),
+            internal_id: table_ref,
+            join_info: None,
+            col_used_mask: ColumnUsedMask::default(),
+            database_id: 0,
+        }],
+        vec![],
+    );
+    let mut param_state = ParamState::default();
+    if let Some(where_clause) = where_clause.as_mut() {
+        bind_and_rewrite_expr(
+            where_clause,
+            Some(&mut table_references),
+            None,
+            connection,
+            &mut param_state,
+        )?;
+    }
 
     // Create a new B-Tree and store the root page index in a register
     let root_page_reg = program.alloc_register();
@@ -108,7 +149,13 @@ pub fn translate_create_index(
         root_page: RegisterOrLiteral::Literal(sqlite_table.root_page),
         db: 0,
     });
-    let sql = create_idx_stmt_to_sql(&tbl_name, &idx_name, unique_if_not_exists, &columns);
+    let sql = create_idx_stmt_to_sql(
+        &tbl_name,
+        &idx_name,
+        unique_if_not_exists,
+        &columns,
+        &idx.where_clause.clone(),
+    );
     let resolver = Resolver::new(schema, syms);
     let cdc_table = prepare_cdc_if_necessary(&mut program, schema, SQLITE_TABLEID)?;
     emit_schema_entry(
@@ -159,6 +206,25 @@ pub fn translate_create_index(
     // emit MakeRecord (index key + rowid) into record_reg.
     //
     // Then insert the record into the sorter
+    let mut skip_row_label = None;
+    if let Some(where_clause) = where_clause {
+        let reg = program.alloc_register();
+        let label = program.allocate_label();
+        let pr = translate_expr(
+            &mut program,
+            Some(&table_references),
+            &where_clause,
+            reg,
+            &resolver,
+        )?;
+        program.emit_insn(Insn::IfNot {
+            reg: pr,
+            target_pc: label,
+            jump_if_null: true,
+        });
+        skip_row_label = Some(label);
+    }
+
     let start_reg = program.alloc_registers(columns.len() + 1);
     for (i, (col, _)) in columns.iter().enumerate() {
         program.emit_column_or_rowid(table_cursor_id, col.0, start_reg + i);
@@ -181,6 +247,9 @@ pub fn translate_create_index(
         record_reg,
     });
 
+    if let Some(skip_row_label) = skip_row_label {
+        program.resolve_label(skip_row_label, program.offset());
+    }
     program.emit_insn(Insn::Next {
         cursor_id: table_cursor_id,
         pc_if_next: loop_start_label,
@@ -285,6 +354,7 @@ fn create_idx_stmt_to_sql(
     idx_name: &str,
     unique_if_not_exists: (bool, bool),
     cols: &[((usize, &Column), SortOrder)],
+    where_clause: &Option<Box<Expr>>,
 ) -> String {
     let mut sql = String::with_capacity(128);
     sql.push_str("CREATE ");
@@ -309,6 +379,10 @@ fn create_idx_stmt_to_sql(
         }
     }
     sql.push(')');
+    if let Some(where_clause) = where_clause {
+        sql.push_str(" WHERE ");
+        sql.push_str(&where_clause.to_string());
+    }
     sql
 }
 
