@@ -660,7 +660,7 @@ mod tests {
     pub fn partial_index_mutation_and_upsert_fuzz() {
         let _ = env_logger::try_init();
         const OUTER_ITERS: usize = 5;
-        const INNER_ITERS: usize = 200;
+        const INNER_ITERS: usize = 500;
 
         let (mut rng, seed) = if std::env::var("SEED").is_ok() {
             let seed = std::env::var("SEED").unwrap().parse::<u64>().unwrap();
@@ -889,11 +889,37 @@ mod tests {
                                 });
                             }
                         }
-                        format!(
-                            "INSERT INTO t({}) VALUES({}) ON CONFLICT DO NOTHING",
-                            cols_list.join(","),
-                            vals_list.join(",")
-                        )
+                        if rng.random_bool(0.3) {
+                            // 30% chance ON CONFLICT DO UPDATE SET ...
+                            let mut set_list = Vec::new();
+                            let num_set = rng.random_range(1..=cols_list.len());
+                            let set_cols = cols_list
+                                .choose_multiple(&mut rng, num_set)
+                                .cloned()
+                                .collect::<Vec<_>>();
+                            for c in set_cols.iter() {
+                                let v = if c == "k" {
+                                    format!("'{}'", K_POOL.choose(&mut rng).unwrap())
+                                } else if rng.random_bool(0.2) {
+                                    "NULL".into()
+                                } else {
+                                    rng.random_range(-5..=15).to_string()
+                                };
+                                set_list.push(format!("{c} = {v}"));
+                            }
+                            format!(
+                                "INSERT INTO t({}) VALUES({}) ON CONFLICT DO UPDATE SET {}",
+                                cols_list.join(","),
+                                vals_list.join(","),
+                                set_list.join(", ")
+                            )
+                        } else {
+                            format!(
+                                "INSERT INTO t({}) VALUES({}) ON CONFLICT DO NOTHING",
+                                cols_list.join(","),
+                                vals_list.join(",")
+                            )
+                        }
                     }
                     _ => unreachable!(),
                 };
