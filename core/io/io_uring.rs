@@ -1,5 +1,3 @@
-#![allow(clippy::arc_with_non_send_sync)]
-
 use super::{common, Completion, CompletionInner, File, OpenFlags, IO};
 use crate::io::clock::{Clock, Instant};
 use crate::storage::wal::CKPT_BATCH_PAGES;
