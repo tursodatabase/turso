@@ -12,7 +12,6 @@ use tracing::debug;
 pub struct MemoryIO {
     files: Arc<Mutex<HashMap<String, Arc<MemoryFile>>>>,
 }
-unsafe impl Send for MemoryIO {}
 
 // TODO: page size flag
 const PAGE_SIZE: usize = 4096;
@@ -76,7 +75,7 @@ pub struct MemoryFile {
     pages: UnsafeCell<BTreeMap<usize, MemPage>>,
     size: Cell<u64>,
 }
-unsafe impl Send for MemoryFile {}
+
 unsafe impl Sync for MemoryFile {}
 
 impl File for MemoryFile {

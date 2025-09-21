@@ -34,7 +34,6 @@ impl<T> DerefMut for SpinLockGuard<'_, T> {
     }
 }
 
-unsafe impl<T: Send> Send for SpinLock<T> {}
 unsafe impl<T> Sync for SpinLock<T> {}
 
 impl<T> SpinLock<T> {

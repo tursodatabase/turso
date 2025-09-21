@@ -17,9 +17,6 @@ use tracing::{instrument, trace, Level};
 
 pub struct UnixIO {}
 
-unsafe impl Send for UnixIO {}
-unsafe impl Sync for UnixIO {}
-
 impl UnixIO {
     #[cfg(feature = "fs")]
     pub fn new() -> Result<Self> {
@@ -128,8 +125,6 @@ impl IO for UnixIO {
 pub struct UnixFile {
     file: Arc<Mutex<std::fs::File>>,
 }
-unsafe impl Send for UnixFile {}
-unsafe impl Sync for UnixFile {}
 
 impl File for UnixFile {
     fn lock_file(&self, exclusive: bool) -> Result<()> {
