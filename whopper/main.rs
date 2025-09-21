@@ -11,6 +11,7 @@ use sql_generation::{
     model::table::{Column, ColumnType, Table},
 };
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::trace;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
@@ -20,6 +21,7 @@ use turso_core::{
 use turso_parser::ast::SortOrder;
 
 mod io;
+use crate::io::FILE_SIZE_SOFT_LIMIT;
 use io::{IOFaultConfig, SimulatorIO};
 
 #[derive(Parser)]
@@ -121,9 +123,12 @@ fn main() -> anyhow::Result<()> {
         println!("cosmic ray probability = {}", config.cosmic_ray_probability);
     }
 
-    let io = Arc::new(SimulatorIO::new(args.keep, io_rng, fault_config)) as Arc<dyn IO>;
+    let simulator_io = Arc::new(SimulatorIO::new(args.keep, io_rng, fault_config));
+    let file_sizes = simulator_io.file_sizes();
+    let io = simulator_io as Arc<dyn IO>;
 
     let db_path = format!("whopper-{}-{}.db", seed, std::process::id());
+    let wal_path = format!("{db_path}-wal");
 
     let encryption_opts = if args.enable_encryption {
         let opts = random_encryption_config(&mut rng);
@@ -241,6 +246,9 @@ fn main() -> anyhow::Result<()> {
                 context.stats.integrity_checks
             );
             progress_index += 1;
+        }
+        if file_size_soft_limit_exceeded(&wal_path, file_sizes.clone()) {
+            break;
         }
     }
     Ok(())
@@ -582,6 +590,17 @@ fn perform_work(
         }
     }
     Ok(())
+}
+
+fn file_size_soft_limit_exceeded(
+    wal_path: &str,
+    file_sizes: Arc<std::sync::Mutex<HashMap<String, u64>>>,
+) -> bool {
+    let wal_size = {
+        let sizes = file_sizes.lock().unwrap();
+        sizes.get(wal_path).cloned().unwrap_or(0)
+    };
+    wal_size > FILE_SIZE_SOFT_LIMIT
 }
 
 impl GenerationContext for SimulatorContext {

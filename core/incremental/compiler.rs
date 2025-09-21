@@ -9,12 +9,14 @@ use crate::incremental::dbsp::{Delta, DeltaPair};
 use crate::incremental::expr_compiler::CompiledExpression;
 use crate::incremental::operator::{
     create_dbsp_state_index, DbspStateCursors, EvalState, FilterOperator, FilterPredicate,
-    IncrementalOperator, InputOperator, ProjectOperator,
+    IncrementalOperator, InputOperator, JoinOperator, JoinType, ProjectOperator,
 };
+use crate::schema::Type;
 use crate::storage::btree::{BTreeCursor, BTreeKey};
 // Note: logical module must be made pub(crate) in translate/mod.rs
 use crate::translate::logical::{
-    BinaryOperator, LogicalExpr, LogicalPlan, LogicalSchema, SchemaRef,
+    BinaryOperator, Column, ColumnInfo, JoinType as LogicalJoinType, LogicalExpr, LogicalPlan,
+    LogicalSchema, SchemaRef,
 };
 use crate::types::{IOResult, ImmutableRecord, SeekKey, SeekOp, SeekResult, Value};
 use crate::Pager;
@@ -286,6 +288,12 @@ pub enum DbspOperator {
     Aggregate {
         group_exprs: Vec<DbspExpr>,
         aggr_exprs: Vec<crate::incremental::operator::AggregateFunction>,
+        schema: SchemaRef,
+    },
+    /// Join operator (⋈) - joins two relations
+    Join {
+        join_type: JoinType,
+        on_exprs: Vec<(DbspExpr, DbspExpr)>,
         schema: SchemaRef,
     },
     /// Input operator - source of data
@@ -789,6 +797,13 @@ impl DbspCircuit {
                         "{indent}Aggregate[{node_id}]: GROUP BY {group_exprs:?}, AGGR {aggr_exprs:?}"
                     )?;
                 }
+                DbspOperator::Join {
+                    join_type,
+                    on_exprs,
+                    ..
+                } => {
+                    writeln!(f, "{indent}Join[{node_id}]: {join_type:?} ON {on_exprs:?}")?;
+                }
                 DbspOperator::Input { name, .. } => {
                     writeln!(f, "{indent}Input[{node_id}]: {name}")?;
                 }
@@ -841,7 +856,7 @@ impl DbspCompiler {
                 // Get input column names for the ProjectOperator
                 let input_schema = proj.input.schema();
                 let input_column_names: Vec<String> = input_schema.columns.iter()
-                    .map(|(name, _)| name.clone())
+                    .map(|col| col.name.clone())
                     .collect();
 
                 // Convert logical expressions to DBSP expressions
@@ -853,14 +868,14 @@ impl DbspCompiler {
                 let mut compiled_exprs = Vec::new();
                 let mut aliases = Vec::new();
                 for expr in &proj.exprs {
-                    let (compiled, alias) = Self::compile_expression(expr, &input_column_names)?;
+                    let (compiled, alias) = Self::compile_expression(expr, input_schema)?;
                     compiled_exprs.push(compiled);
                     aliases.push(alias);
                 }
 
                 // Get output column names from the projection schema
                 let output_column_names: Vec<String> = proj.schema.columns.iter()
-                    .map(|(name, _)| name.clone())
+                    .map(|col| col.name.clone())
                     .collect();
 
                 // Create the ProjectOperator
@@ -882,29 +897,154 @@ impl DbspCompiler {
                 // Compile the input first
                 let input_id = self.compile_plan(&filter.input)?;
 
-                // Get column names from input schema
+                // Get input schema for column resolution
                 let input_schema = filter.input.schema();
-                let column_names: Vec<String> = input_schema.columns.iter()
-                    .map(|(name, _)| name.clone())
-                    .collect();
 
-                // Convert predicate to DBSP expression
-                let dbsp_predicate = Self::compile_expr(&filter.predicate)?;
+                // Check if the predicate contains expressions that need to be computed
+                if Self::predicate_needs_projection(&filter.predicate) {
+                    // Complex expression in WHERE clause - need to add projection first
+                    // 1. Create projection that adds the computed expression as a new column
 
-                // Convert to FilterPredicate
-                let filter_predicate = Self::compile_filter_predicate(&filter.predicate)?;
+                    // First, get all existing columns
+                    let mut projection_exprs = Vec::new();
+                    let mut dbsp_exprs = Vec::new();
 
-                // Create executable operator
-                let executable: Box<dyn IncrementalOperator> =
-                    Box::new(FilterOperator::new(filter_predicate, column_names));
+                    for col in &input_schema.columns {
+                        projection_exprs.push(LogicalExpr::Column(Column {
+                            name: col.name.clone(),
+                            table: None,
+                        }));
+                        dbsp_exprs.push(DbspExpr::Column(col.name.clone()));
+                    }
 
-                // Create filter node
-                let node_id = self.circuit.add_node(
-                    DbspOperator::Filter { predicate: dbsp_predicate },
-                    vec![input_id],
-                    executable,
-                );
-                Ok(node_id)
+                    // Now add the expression as a computed column
+                    let temp_column_name = "__temp_filter_expr";
+                    let computed_expr = Self::extract_expression_from_predicate(&filter.predicate)?;
+                    projection_exprs.push(computed_expr.clone());
+
+                    // Compile the projection expressions
+                    let mut compiled_exprs = Vec::new();
+                    let mut aliases = Vec::new();
+                    let mut output_names = Vec::new();
+                    for (i, expr) in projection_exprs.iter().enumerate() {
+                        let (compiled, _alias) = Self::compile_expression(expr, input_schema)?;
+                        compiled_exprs.push(compiled);
+                        if i < input_schema.columns.len() {
+                            aliases.push(None);
+                            output_names.push(input_schema.columns[i].name.clone());
+                        } else {
+                            aliases.push(Some(temp_column_name.to_string()));
+                            output_names.push(temp_column_name.to_string());
+                        }
+                    }
+
+                    // Get input column names for ProjectOperator
+                    let input_column_names: Vec<String> = input_schema.columns.iter()
+                        .map(|col| col.name.clone())
+                        .collect();
+
+                    // Create projection operator
+                    let proj_executable: Box<dyn IncrementalOperator> =
+                        Box::new(ProjectOperator::from_compiled(
+                            compiled_exprs.clone(),
+                            aliases.clone(),
+                            input_column_names.clone(),
+                            output_names.clone()
+                        )?);
+
+                    // Create updated schema for the projection output
+                    let mut proj_schema_columns = input_schema.columns.clone();
+                    proj_schema_columns.push(ColumnInfo {
+                        name: temp_column_name.to_string(),
+                        table: None,
+                        database: None,
+                        table_alias: None,
+                        ty: Type::Integer,  // Computed expressions default to Integer
+                    });
+                    let proj_schema = SchemaRef::new(LogicalSchema {
+                        columns: proj_schema_columns,
+                    });
+
+                    // Add projection node
+                    let proj_id = self.circuit.add_node(
+                        DbspOperator::Projection {
+                            exprs: dbsp_exprs.clone(),
+                            schema: proj_schema.clone(),
+                        },
+                        vec![input_id],
+                        proj_executable,
+                    );
+
+                    // Now create a filter that replaces the complex expression with the temp column
+                    // but keeps all other conditions intact
+                    let replaced_predicate = Self::replace_complex_with_temp(&filter.predicate, temp_column_name)?;
+                    let filter_predicate = Self::compile_filter_predicate(&replaced_predicate, &proj_schema)?;
+
+                    let filter_executable: Box<dyn IncrementalOperator> =
+                        Box::new(FilterOperator::new(filter_predicate));
+
+                    // Create filter node
+                    let filter_id = self.circuit.add_node(
+                        DbspOperator::Filter { predicate: Self::compile_expr(&replaced_predicate)? },
+                        vec![proj_id],
+                        filter_executable,
+                    );
+
+                    // Finally, project again to remove the temporary column
+                    let mut final_exprs = Vec::new();
+                    let mut final_aliases = Vec::new();
+                    let mut final_names = Vec::new();
+                    let mut final_dbsp_exprs = Vec::new();
+
+                    for (i, column) in input_schema.columns.iter().enumerate() {
+                        let col_name = &column.name;
+                        final_exprs.push(compiled_exprs[i].clone());
+                        final_aliases.push(None);
+                        final_names.push(col_name.clone());
+                        final_dbsp_exprs.push(DbspExpr::Column(col_name.clone()));
+                    }
+
+                    // Input names for the final projection include the temp column
+                    let filter_output_names = output_names.clone();
+
+                    let final_proj_executable: Box<dyn IncrementalOperator> =
+                        Box::new(ProjectOperator::from_compiled(
+                            final_exprs,
+                            final_aliases,
+                            filter_output_names,
+                            final_names.clone()
+                        )?);
+
+                    let final_id = self.circuit.add_node(
+                        DbspOperator::Projection {
+                            exprs: final_dbsp_exprs,
+                            schema: input_schema.clone(),  // Back to original schema
+                        },
+                        vec![filter_id],
+                        final_proj_executable,
+                    );
+
+                    Ok(final_id)
+                } else {
+                    // Simple filter - use existing implementation
+                    // Convert predicate to DBSP expression
+                    let dbsp_predicate = Self::compile_expr(&filter.predicate)?;
+
+                    // Convert to FilterPredicate
+                    let filter_predicate = Self::compile_filter_predicate(&filter.predicate, input_schema)?;
+
+                    // Create executable operator
+                    let executable: Box<dyn IncrementalOperator> =
+                        Box::new(FilterOperator::new(filter_predicate));
+
+                    // Create filter node
+                    let node_id = self.circuit.add_node(
+                        DbspOperator::Filter { predicate: dbsp_predicate },
+                        vec![input_id],
+                        executable,
+                    );
+                    Ok(node_id)
+                }
             }
             LogicalPlan::Aggregate(agg) => {
                 // Compile the input first
@@ -913,16 +1053,21 @@ impl DbspCompiler {
                 // Get input column names
                 let input_schema = agg.input.schema();
                 let input_column_names: Vec<String> = input_schema.columns.iter()
-                    .map(|(name, _)| name.clone())
+                    .map(|col| col.name.clone())
                     .collect();
 
-                // Compile group by expressions to column names
-                let mut group_by_columns = Vec::new();
+                // Compile group by expressions to column indices
+                let mut group_by_indices = Vec::new();
                 let mut dbsp_group_exprs = Vec::new();
                 for expr in &agg.group_expr {
                     // For now, only support simple column references in GROUP BY
                     if let LogicalExpr::Column(col) = expr {
-                        group_by_columns.push(col.name.clone());
+                        // Find the column index in the input schema using qualified lookup
+                        let (col_idx, _) = input_schema.find_column(&col.name, col.table.as_deref())
+                            .ok_or_else(|| LimboError::ParseError(
+                                format!("GROUP BY column '{}' not found in input", col.name)
+                            ))?;
+                        group_by_indices.push(col_idx);
                         dbsp_group_exprs.push(DbspExpr::Column(col.name.clone()));
                     } else {
                         return Err(LimboError::ParseError(
@@ -936,7 +1081,7 @@ impl DbspCompiler {
                 for expr in &agg.aggr_expr {
                     if let LogicalExpr::AggregateFunction { fun, args, .. } = expr {
                         use crate::function::AggFunc;
-                        use crate::incremental::operator::AggregateFunction;
+                        use crate::incremental::aggregate_operator::AggregateFunction;
 
                         match fun {
                             AggFunc::Count | AggFunc::Count0 => {
@@ -946,9 +1091,13 @@ impl DbspCompiler {
                                 if args.is_empty() {
                                     return Err(LimboError::ParseError("SUM requires an argument".to_string()));
                                 }
-                                // Extract column name from the argument
+                                // Extract column index from the argument
                                 if let LogicalExpr::Column(col) = &args[0] {
-                                    aggregate_functions.push(AggregateFunction::Sum(col.name.clone()));
+                                    let (col_idx, _) = input_schema.find_column(&col.name, col.table.as_deref())
+                                        .ok_or_else(|| LimboError::ParseError(
+                                            format!("SUM column '{}' not found in input", col.name)
+                                        ))?;
+                                    aggregate_functions.push(AggregateFunction::Sum(col_idx));
                                 } else {
                                     return Err(LimboError::ParseError(
                                         "Only column references are supported in aggregate functions for incremental views".to_string()
@@ -960,7 +1109,11 @@ impl DbspCompiler {
                                     return Err(LimboError::ParseError("AVG requires an argument".to_string()));
                                 }
                                 if let LogicalExpr::Column(col) = &args[0] {
-                                    aggregate_functions.push(AggregateFunction::Avg(col.name.clone()));
+                                    let (col_idx, _) = input_schema.find_column(&col.name, col.table.as_deref())
+                                        .ok_or_else(|| LimboError::ParseError(
+                                            format!("AVG column '{}' not found in input", col.name)
+                                        ))?;
+                                    aggregate_functions.push(AggregateFunction::Avg(col_idx));
                                 } else {
                                     return Err(LimboError::ParseError(
                                         "Only column references are supported in aggregate functions for incremental views".to_string()
@@ -972,7 +1125,11 @@ impl DbspCompiler {
                                     return Err(LimboError::ParseError("MIN requires an argument".to_string()));
                                 }
                                 if let LogicalExpr::Column(col) = &args[0] {
-                                    aggregate_functions.push(AggregateFunction::Min(col.name.clone()));
+                                    let (col_idx, _) = input_schema.find_column(&col.name, col.table.as_deref())
+                                        .ok_or_else(|| LimboError::ParseError(
+                                            format!("MIN column '{}' not found in input", col.name)
+                                        ))?;
+                                    aggregate_functions.push(AggregateFunction::Min(col_idx));
                                 } else {
                                     return Err(LimboError::ParseError(
                                         "Only column references are supported in MIN for incremental views".to_string()
@@ -984,7 +1141,11 @@ impl DbspCompiler {
                                     return Err(LimboError::ParseError("MAX requires an argument".to_string()));
                                 }
                                 if let LogicalExpr::Column(col) = &args[0] {
-                                    aggregate_functions.push(AggregateFunction::Max(col.name.clone()));
+                                    let (col_idx, _) = input_schema.find_column(&col.name, col.table.as_deref())
+                                        .ok_or_else(|| LimboError::ParseError(
+                                            format!("MAX column '{}' not found in input", col.name)
+                                        ))?;
+                                    aggregate_functions.push(AggregateFunction::Max(col_idx));
                                 } else {
                                     return Err(LimboError::ParseError(
                                         "Only column references are supported in MAX for incremental views".to_string()
@@ -1006,10 +1167,10 @@ impl DbspCompiler {
 
                 let operator_id = self.circuit.next_id;
 
-                use crate::incremental::operator::AggregateOperator;
+                use crate::incremental::aggregate_operator::AggregateOperator;
                 let executable: Box<dyn IncrementalOperator> = Box::new(AggregateOperator::new(
                     operator_id,
-                    group_by_columns.clone(),
+                    group_by_indices.clone(),
                     aggregate_functions.clone(),
                     input_column_names.clone(),
                 ));
@@ -1025,6 +1186,90 @@ impl DbspCompiler {
                 );
 
                 Ok(result_node_id)
+            }
+            LogicalPlan::Join(join) => {
+                // Compile left and right inputs
+                let left_id = self.compile_plan(&join.left)?;
+                let right_id = self.compile_plan(&join.right)?;
+
+                // Get schemas from inputs
+                let left_schema = join.left.schema();
+                let right_schema = join.right.schema();
+
+                // Get column names from left and right
+                let left_columns: Vec<String> = left_schema.columns.iter()
+                    .map(|col| col.name.clone())
+                    .collect();
+                let right_columns: Vec<String> = right_schema.columns.iter()
+                    .map(|col| col.name.clone())
+                    .collect();
+
+                // Extract join key indices from join conditions
+                // For now, we only support equijoin conditions
+                let mut left_key_indices = Vec::new();
+                let mut right_key_indices = Vec::new();
+                let mut dbsp_on_exprs = Vec::new();
+
+                for (left_expr, right_expr) in &join.on {
+                    // Extract column indices from join expressions
+                    // We expect simple column references in join conditions
+                    if let (LogicalExpr::Column(left_col), LogicalExpr::Column(right_col)) = (left_expr, right_expr) {
+                        // Find indices in respective schemas using qualified lookup
+                        let (left_idx, _) = left_schema.find_column(&left_col.name, left_col.table.as_deref())
+                            .ok_or_else(|| LimboError::ParseError(
+                                format!("Join column '{}' not found in left input", left_col.name)
+                            ))?;
+                        let (right_idx, _) = right_schema.find_column(&right_col.name, right_col.table.as_deref())
+                            .ok_or_else(|| LimboError::ParseError(
+                                format!("Join column '{}' not found in right input", right_col.name)
+                            ))?;
+
+                        left_key_indices.push(left_idx);
+                        right_key_indices.push(right_idx);
+
+                        // Convert to DBSP expressions
+                        dbsp_on_exprs.push((
+                            DbspExpr::Column(left_col.name.clone()),
+                            DbspExpr::Column(right_col.name.clone())
+                        ));
+                    } else {
+                        return Err(LimboError::ParseError(
+                            "Only simple column references are supported in join conditions for incremental views".to_string()
+                        ));
+                    }
+                }
+
+                // Convert logical join type to operator join type
+                let operator_join_type = match join.join_type {
+                    LogicalJoinType::Inner => JoinType::Inner,
+                    LogicalJoinType::Left => JoinType::Left,
+                    LogicalJoinType::Right => JoinType::Right,
+                    LogicalJoinType::Full => JoinType::Full,
+                    LogicalJoinType::Cross => JoinType::Cross,
+                };
+
+                // Create JoinOperator
+                let operator_id = self.circuit.next_id;
+                let executable: Box<dyn IncrementalOperator> = Box::new(JoinOperator::new(
+                    operator_id,
+                    operator_join_type.clone(),
+                    left_key_indices,
+                    right_key_indices,
+                    left_columns,
+                    right_columns,
+                )?);
+
+                // Create join node
+                let node_id = self.circuit.add_node(
+                    DbspOperator::Join {
+                        join_type: operator_join_type,
+                        on_exprs: dbsp_on_exprs,
+                        schema: join.schema.clone(),
+                    },
+                    vec![left_id, right_id],
+                    executable,
+                );
+                Ok(node_id)
             }
             LogicalPlan::TableScan(scan) => {
                 // Create input node with InputOperator for uniform handling
@@ -1042,7 +1287,7 @@ impl DbspCompiler {
                 Ok(node_id)
             }
             _ => Err(LimboError::ParseError(
-                format!("Unsupported operator in DBSP compiler: only Filter, Projection and Aggregate are supported, got: {:?}",
+                format!("Unsupported operator in DBSP compiler: only Filter, Projection, Join and Aggregate are supported, got: {:?}",
                     match plan {
                         LogicalPlan::Sort(_) => "Sort",
                         LogicalPlan::Limit(_) => "Limit",
@@ -1095,17 +1340,24 @@ impl DbspCompiler {
     /// Compile a logical expression to a CompiledExpression and optional alias
     fn compile_expression(
         expr: &LogicalExpr,
-        input_column_names: &[String],
+        input_schema: &LogicalSchema,
     ) -> Result<(CompiledExpression, Option<String>)> {
         // Check for alias first
         if let LogicalExpr::Alias { expr, alias } = expr {
             // For aliases, compile the underlying expression and return with alias
-            let (compiled, _) = Self::compile_expression(expr, input_column_names)?;
+            let (compiled, _) = Self::compile_expression(expr, input_schema)?;
             return Ok((compiled, Some(alias.clone())));
         }
 
-        // Convert LogicalExpr to AST Expr
-        let ast_expr = Self::logical_to_ast_expr(expr)?;
+        // Convert LogicalExpr to AST Expr with proper column resolution
+        let ast_expr = Self::logical_to_ast_expr_with_schema(expr, input_schema)?;
+
+        // Extract column names from schema for CompiledExpression::compile
+        let input_column_names: Vec<String> = input_schema
+            .columns
+            .iter()
+            .map(|col| col.name.clone())
+            .collect();
 
         // For all expressions (simple or complex), use CompiledExpression::compile
         // This handles both trivial cases and complex VDBE compilation
@@ -1129,7 +1381,7 @@ impl DbspCompiler {
         // Compile the expression using the existing CompiledExpression::compile
         let compiled = CompiledExpression::compile(
             &ast_expr,
-            input_column_names,
+            &input_column_names,
             &schema,
             &temp_syms,
             internal_conn,
@@ -1138,25 +1390,45 @@ impl DbspCompiler {
         Ok((compiled, None))
     }
 
-    /// Convert LogicalExpr to AST Expr
-    fn logical_to_ast_expr(expr: &LogicalExpr) -> Result<turso_parser::ast::Expr> {
+    /// Convert LogicalExpr to AST Expr with qualified column resolution
+    fn logical_to_ast_expr_with_schema(
+        expr: &LogicalExpr,
+        schema: &LogicalSchema,
+    ) -> Result<turso_parser::ast::Expr> {
         use turso_parser::ast;
 
         match expr {
-            LogicalExpr::Column(col) => Ok(ast::Expr::Id(ast::Name::Ident(col.name.clone()))),
+            LogicalExpr::Column(col) => {
+                // Find the column index using qualified lookup
+                let (idx, _) = schema
+                    .find_column(&col.name, col.table.as_deref())
+                    .ok_or_else(|| {
+                        LimboError::ParseError(format!(
+                            "Column '{}' with table {:?} not found in schema",
+                            col.name, col.table
+                        ))
+                    })?;
+                // Return a Register expression with the correct index
+                Ok(ast::Expr::Register(idx))
+            }
             LogicalExpr::Literal(val) => {
                 let lit = match val {
                     Value::Integer(i) => ast::Literal::Numeric(i.to_string()),
                     Value::Float(f) => ast::Literal::Numeric(f.to_string()),
-                    Value::Text(t) => ast::Literal::String(t.to_string()),
+                    Value::Text(t) => {
+                        // Add quotes for string literals as translate_expr expects them
+                        // Also escape any single quotes in the string
+                        let escaped = t.to_string().replace('\'', "''");
+                        ast::Literal::String(format!("'{escaped}'"))
+                    }
                     Value::Blob(b) => ast::Literal::Blob(format!("{b:?}")),
                     Value::Null => ast::Literal::Null,
                 };
                 Ok(ast::Expr::Literal(lit))
             }
             LogicalExpr::BinaryExpr { left, op, right } => {
-                let left_expr = Self::logical_to_ast_expr(left)?;
-                let right_expr = Self::logical_to_ast_expr(right)?;
+                let left_expr = Self::logical_to_ast_expr_with_schema(left, schema)?;
+                let right_expr = Self::logical_to_ast_expr_with_schema(right, schema)?;
                 Ok(ast::Expr::Binary(
                     Box::new(left_expr),
                     *op,
@@ -1164,7 +1436,10 @@ impl DbspCompiler {
                 ))
             }
             LogicalExpr::ScalarFunction { fun, args } => {
-                let ast_args: Result<Vec<_>> = args.iter().map(Self::logical_to_ast_expr).collect();
+                let ast_args: Result<Vec<_>> = args
+                    .iter()
+                    .map(|arg| Self::logical_to_ast_expr_with_schema(arg, schema))
+                    .collect();
                 let ast_args: Vec<Box<ast::Expr>> = ast_args?.into_iter().map(Box::new).collect();
                 Ok(ast::Expr::FunctionCall {
                     name: ast::Name::Ident(fun.clone()),
@@ -1179,7 +1454,7 @@ impl DbspCompiler {
             }
             LogicalExpr::Alias { expr, .. } => {
                 // For conversion to AST, ignore the alias and convert the inner expression
-                Self::logical_to_ast_expr(expr)
+                Self::logical_to_ast_expr_with_schema(expr, schema)
             }
             LogicalExpr::AggregateFunction {
                 fun,
@@ -1187,7 +1462,10 @@ impl DbspCompiler {
                 distinct,
             } => {
                 // Convert aggregate function to AST
-                let ast_args: Result<Vec<_>> = args.iter().map(Self::logical_to_ast_expr).collect();
+                let ast_args: Result<Vec<_>> = args
+                    .iter()
+                    .map(|arg| Self::logical_to_ast_expr_with_schema(arg, schema))
+                    .collect();
                 let ast_args: Vec<Box<ast::Expr>> = ast_args?.into_iter().map(Box::new).collect();
 
                 // Get the function name based on the aggregate type
@@ -1225,43 +1503,235 @@ impl DbspCompiler {
         }
     }
 
+    /// Check if a predicate contains expressions that need projection
+    fn predicate_needs_projection(expr: &LogicalExpr) -> bool {
+        match expr {
+            LogicalExpr::BinaryExpr { left, op, right } => {
+                match (left.as_ref(), right.as_ref()) {
+                    // Simple column to literal - OK
+                    (LogicalExpr::Column(_), LogicalExpr::Literal(_)) => false,
+                    // Simple column to column - OK
+                    (LogicalExpr::Column(_), LogicalExpr::Column(_)) => false,
+                    // AND/OR of simple expressions - check recursively
+                    _ if matches!(op, BinaryOperator::And | BinaryOperator::Or) => {
+                        Self::predicate_needs_projection(left)
+                            || Self::predicate_needs_projection(right)
+                    }
+                    // Any other pattern needs projection
+                    _ => true,
+                }
+            }
+            _ => false,
+        }
+    }
+
+    /// Extract the expression part from a predicate that needs to be computed
+    fn extract_expression_from_predicate(expr: &LogicalExpr) -> Result<LogicalExpr> {
+        match expr {
+            LogicalExpr::BinaryExpr { left, op, right } => {
+                // Handle AND/OR - recursively find the complex expression
+                if matches!(op, BinaryOperator::And | BinaryOperator::Or) {
+                    // Check left side first
+                    if Self::predicate_needs_projection(left) {
+                        return Self::extract_expression_from_predicate(left);
+                    }
+                    // Then check right side
+                    if Self::predicate_needs_projection(right) {
+                        return Self::extract_expression_from_predicate(right);
+                    }
+                    // Neither side needs projection (shouldn't happen if predicate_needs_projection was true)
+                    return Ok(expr.clone());
+                }
+
+                // For expressions like (age * 2) > 30, we want to extract (age * 2)
+                if matches!(
+                    op,
+                    BinaryOperator::Greater
+                        | BinaryOperator::GreaterEquals
+                        | BinaryOperator::Less
+                        | BinaryOperator::LessEquals
+                        | BinaryOperator::Equals
+                        | BinaryOperator::NotEquals
+                ) {
+                    // Return the left side if it's not a simple column
+                    if !matches!(left.as_ref(), LogicalExpr::Column(_)) {
+                        Ok((**left).clone())
+                    } else {
+                        // Must be the whole expression then
+                        Ok(expr.clone())
+                    }
+                } else {
+                    Ok(expr.clone())
+                }
+            }
+            _ => Ok(expr.clone()),
+        }
+    }
+
+    /// Replace complex expressions in the predicate with references to the temp column
+    fn replace_complex_with_temp(
+        expr: &LogicalExpr,
+        temp_column_name: &str,
+    ) -> Result<LogicalExpr> {
+        match expr {
+            LogicalExpr::BinaryExpr { left, op, right } => {
+                // Handle AND/OR - recursively process both sides
+                if matches!(op, BinaryOperator::And | BinaryOperator::Or) {
+                    let new_left = Self::replace_complex_with_temp(left, temp_column_name)?;
+                    let new_right = Self::replace_complex_with_temp(right, temp_column_name)?;
+                    return Ok(LogicalExpr::BinaryExpr {
+                        left: Box::new(new_left),
+                        op: *op,
+                        right: Box::new(new_right),
+                    });
+                }
+
+                // Check if this is a complex comparison that needs replacement
+                if Self::predicate_needs_projection(expr) {
+                    // Replace the complex expression (left side) with the temp column
+                    return Ok(LogicalExpr::BinaryExpr {
+                        left: Box::new(LogicalExpr::Column(Column {
+                            name: temp_column_name.to_string(),
+                            table: None,
+                        })),
+                        op: *op,
+                        right: right.clone(),
+                    });
+                }
+
+                // Simple comparison - keep as is
+                Ok(expr.clone())
+            }
+            _ => Ok(expr.clone()),
+        }
+    }
+
     /// Compile a logical expression to a FilterPredicate for execution
-    fn compile_filter_predicate(expr: &LogicalExpr) -> Result<FilterPredicate> {
+    fn compile_filter_predicate(
+        expr: &LogicalExpr,
+        schema: &LogicalSchema,
+    ) -> Result<FilterPredicate> {
         match expr {
             LogicalExpr::BinaryExpr { left, op, right } => {
                 // Extract column name and value for simple predicates
-                if let (LogicalExpr::Column(col), LogicalExpr::Literal(val)) =
+                // First check for column-to-column comparisons
+                if let (LogicalExpr::Column(left_col), LogicalExpr::Column(right_col)) =
                     (left.as_ref(), right.as_ref())
                 {
+                    // Resolve both column names to indices
+                    let left_idx = schema
+                        .columns
+                        .iter()
+                        .position(|c| c.name == left_col.name)
+                        .ok_or_else(|| {
+                            crate::LimboError::ParseError(format!(
+                                "Column '{}' not found in schema for filter",
+                                left_col.name
+                            ))
+                        })?;
+
+                    let right_idx = schema
+                        .columns
+                        .iter()
+                        .position(|c| c.name == right_col.name)
+                        .ok_or_else(|| {
+                            crate::LimboError::ParseError(format!(
+                                "Column '{}' not found in schema for filter",
+                                right_col.name
+                            ))
+                        })?;
+
+                    match op {
+                        BinaryOperator::Equals => Ok(FilterPredicate::ColumnEquals {
+                            left_idx,
+                            right_idx,
+                        }),
+                        BinaryOperator::NotEquals => Ok(FilterPredicate::ColumnNotEquals {
+                            left_idx,
+                            right_idx,
+                        }),
+                        BinaryOperator::Greater => Ok(FilterPredicate::ColumnGreaterThan {
+                            left_idx,
+                            right_idx,
+                        }),
+                        BinaryOperator::GreaterEquals => {
+                            Ok(FilterPredicate::ColumnGreaterThanOrEqual {
+                                left_idx,
+                                right_idx,
+                            })
+                        }
+                        BinaryOperator::Less => Ok(FilterPredicate::ColumnLessThan {
+                            left_idx,
+                            right_idx,
+                        }),
+                        BinaryOperator::LessEquals => Ok(FilterPredicate::ColumnLessThanOrEqual {
+                            left_idx,
+                            right_idx,
+                        }),
+                        BinaryOperator::And | BinaryOperator::Or => {
+                            // Handle logical operators recursively
+                            let left_pred = Self::compile_filter_predicate(left, schema)?;
+                            let right_pred = Self::compile_filter_predicate(right, schema)?;
+                            match op {
+                                BinaryOperator::And => Ok(FilterPredicate::And(
+                                    Box::new(left_pred),
+                                    Box::new(right_pred),
+                                )),
+                                BinaryOperator::Or => Ok(FilterPredicate::Or(
+                                    Box::new(left_pred),
+                                    Box::new(right_pred),
+                                )),
+                                _ => unreachable!(),
+                            }
+                        }
+                        _ => Err(LimboError::ParseError(format!(
+                            "Unsupported operator in filter: {op:?}"
+                        ))),
+                    }
+                } else if let (LogicalExpr::Column(col), LogicalExpr::Literal(val)) =
+                    (left.as_ref(), right.as_ref())
+                {
+                    // Column-to-literal comparisons
+                    let column_idx = schema
+                        .columns
+                        .iter()
+                        .position(|c| c.name == col.name)
+                        .ok_or_else(|| {
+                            crate::LimboError::ParseError(format!(
+                                "Column '{}' not found in schema for filter",
+                                col.name
+                            ))
+                        })?;
+
                     match op {
                         BinaryOperator::Equals => Ok(FilterPredicate::Equals {
-                            column: col.name.clone(),
+                            column_idx,
                             value: val.clone(),
                         }),
                         BinaryOperator::NotEquals => Ok(FilterPredicate::NotEquals {
-                            column: col.name.clone(),
+                            column_idx,
                             value: val.clone(),
                         }),
                         BinaryOperator::Greater => Ok(FilterPredicate::GreaterThan {
-                            column: col.name.clone(),
+                            column_idx,
                             value: val.clone(),
                         }),
                         BinaryOperator::GreaterEquals => Ok(FilterPredicate::GreaterThanOrEqual {
-                            column: col.name.clone(),
+                            column_idx,
                             value: val.clone(),
                         }),
                         BinaryOperator::Less => Ok(FilterPredicate::LessThan {
-                            column: col.name.clone(),
+                            column_idx,
                             value: val.clone(),
                         }),
                         BinaryOperator::LessEquals => Ok(FilterPredicate::LessThanOrEqual {
-                            column: col.name.clone(),
+                            column_idx,
                             value: val.clone(),
                         }),
                         BinaryOperator::And => {
                             // Handle AND of two predicates
-                            let left_pred = Self::compile_filter_predicate(left)?;
-                            let right_pred = Self::compile_filter_predicate(right)?;
+                            let left_pred = Self::compile_filter_predicate(left, schema)?;
+                            let right_pred = Self::compile_filter_predicate(right, schema)?;
                             Ok(FilterPredicate::And(
                                 Box::new(left_pred),
                                 Box::new(right_pred),
@@ -1269,8 +1739,8 @@ impl DbspCompiler {
                         }
                         BinaryOperator::Or => {
                             // Handle OR of two predicates
-                            let left_pred = Self::compile_filter_predicate(left)?;
-                            let right_pred = Self::compile_filter_predicate(right)?;
+                            let left_pred = Self::compile_filter_predicate(left, schema)?;
+                            let right_pred = Self::compile_filter_predicate(right, schema)?;
                             Ok(FilterPredicate::Or(
                                 Box::new(left_pred),
                                 Box::new(right_pred),
@@ -1282,8 +1752,8 @@ impl DbspCompiler {
                     }
                 } else if matches!(op, BinaryOperator::And | BinaryOperator::Or) {
                     // Handle logical operators
-                    let left_pred = Self::compile_filter_predicate(left)?;
-                    let right_pred = Self::compile_filter_predicate(right)?;
+                    let left_pred = Self::compile_filter_predicate(left, schema)?;
+                    let right_pred = Self::compile_filter_predicate(right, schema)?;
                     match op {
                         BinaryOperator::And => Ok(FilterPredicate::And(
                             Box::new(left_pred),
@@ -1297,7 +1767,7 @@ impl DbspCompiler {
                     }
                 } else {
                     Err(LimboError::ParseError(
-                        "Filter predicate must be column op value".to_string(),
+                        "Filter predicate must be column op value or column op column".to_string(),
                     ))
                 }
             }
@@ -1315,8 +1785,7 @@ mod tests {
     use crate::incremental::operator::{FilterOperator, FilterPredicate};
     use crate::schema::{BTreeTable, Column as SchemaColumn, Schema, Type};
     use crate::storage::pager::CreateBTreeFlags;
-    use crate::translate::logical::LogicalPlanBuilder;
-    use crate::translate::logical::LogicalSchema;
+    use crate::translate::logical::{ColumnInfo, LogicalPlanBuilder, LogicalSchema};
     use crate::util::IOExt;
     use crate::{Database, MemoryIO, Pager, IO};
     use std::sync::Arc;
@@ -1375,6 +1844,270 @@ mod tests {
                 unique_sets: vec![],
             };
             schema.add_btree_table(Arc::new(users_table));
+
+            // Add products table for join tests
+            let products_table = BTreeTable {
+                name: "products".to_string(),
+                root_page: 3,
+                primary_key_columns: vec![(
+                    "product_id".to_string(),
+                    turso_parser::ast::SortOrder::Asc,
+                )],
+                columns: vec![
+                    SchemaColumn {
+                        name: Some("product_id".to_string()),
+                        ty: Type::Integer,
+                        ty_str: "INTEGER".to_string(),
+                        primary_key: true,
+                        is_rowid_alias: true,
+                        notnull: true,
+                        default: None,
+                        unique: false,
+                        collation: None,
+                        hidden: false,
+                    },
+                    SchemaColumn {
+                        name: Some("product_name".to_string()),
+                        ty: Type::Text,
+                        ty_str: "TEXT".to_string(),
+                        primary_key: false,
+                        is_rowid_alias: false,
+                        notnull: false,
+                        default: None,
+                        unique: false,
+                        collation: None,
+                        hidden: false,
+                    },
+                    SchemaColumn {
+                        name: Some("price".to_string()),
+                        ty: Type::Integer,
+                        ty_str: "INTEGER".to_string(),
+                        primary_key: false,
+                        is_rowid_alias: false,
+                        notnull: false,
+                        default: None,
+                        unique: false,
+                        collation: None,
+                        hidden: false,
+                    },
+                ],
+                has_rowid: true,
+                is_strict: false,
+                unique_sets: vec![],
+            };
+            schema.add_btree_table(Arc::new(products_table));
+
+            // Add orders table for join tests
+            let orders_table = BTreeTable {
+                name: "orders".to_string(),
+                root_page: 4,
+                primary_key_columns: vec![(
+                    "order_id".to_string(),
+                    turso_parser::ast::SortOrder::Asc,
+                )],
+                columns: vec![
+                    SchemaColumn {
+                        name: Some("order_id".to_string()),
+                        ty: Type::Integer,
+                        ty_str: "INTEGER".to_string(),
+                        primary_key: true,
+                        is_rowid_alias: true,
+                        notnull: true,
+                        default: None,
+                        unique: false,
+                        collation: None,
+                        hidden: false,
+                    },
+                    SchemaColumn {
+                        name: Some("user_id".to_string()),
+                        ty: Type::Integer,
+                        ty_str: "INTEGER".to_string(),
+                        primary_key: false,
+                        is_rowid_alias: false,
+                        notnull: false,
+                        default: None,
+                        unique: false,
+                        collation: None,
+                        hidden: false,
+                    },
+                    SchemaColumn {
+                        name: Some("product_id".to_string()),
+                        ty: Type::Integer,
+                        ty_str: "INTEGER".to_string(),
+                        primary_key: false,
+                        is_rowid_alias: false,
+                        notnull: false,
+                        default: None,
+                        unique: false,
+                        collation: None,
+                        hidden: false,
+                    },
+                    SchemaColumn {
+                        name: Some("quantity".to_string()),
+                        ty: Type::Integer,
+                        ty_str: "INTEGER".to_string(),
+                        primary_key: false,
+                        is_rowid_alias: false,
+                        notnull: false,
+                        default: None,
+                        unique: false,
+                        collation: None,
+                        hidden: false,
+                    },
+                ],
+                has_rowid: true,
+                is_strict: false,
+                unique_sets: vec![],
+            };
+            schema.add_btree_table(Arc::new(orders_table));
+
+            // Add customers table with id and name for testing column ambiguity
+            let customers_table = BTreeTable {
+                name: "customers".to_string(),
+                root_page: 6,
+                primary_key_columns: vec![("id".to_string(), turso_parser::ast::SortOrder::Asc)],
+                columns: vec![
+                    SchemaColumn {
+                        name: Some("id".to_string()),
+                        ty: Type::Integer,
+                        ty_str: "INTEGER".to_string(),
+                        primary_key: true,
+                        is_rowid_alias: true,
+                        notnull: true,
+                        default: None,
+                        unique: false,
+                        collation: None,
+                        hidden: false,
+                    },
+                    SchemaColumn {
+                        name: Some("name".to_string()),
+                        ty: Type::Text,
+                        ty_str: "TEXT".to_string(),
+                        primary_key: false,
+                        is_rowid_alias: false,
+                        notnull: false,
+                        default: None,
+                        unique: false,
+                        collation: None,
+                        hidden: false,
+                    },
+                ],
+                has_rowid: true,
+                is_strict: false,
+                unique_sets: vec![],
+            };
+            schema.add_btree_table(Arc::new(customers_table));
+
+            // Add purchases table (junction table for three-way join)
+            let purchases_table = BTreeTable {
+                name: "purchases".to_string(),
+                root_page: 7,
+                primary_key_columns: vec![("id".to_string(), turso_parser::ast::SortOrder::Asc)],
+                columns: vec![
+                    SchemaColumn {
+                        name: Some("id".to_string()),
+                        ty: Type::Integer,
+                        ty_str: "INTEGER".to_string(),
+                        primary_key: true,
+                        is_rowid_alias: true,
+                        notnull: true,
+                        default: None,
+                        unique: false,
+                        collation: None,
+                        hidden: false,
+                    },
+                    SchemaColumn {
+                        name: Some("customer_id".to_string()),
+                        ty: Type::Integer,
+                        ty_str: "INTEGER".to_string(),
+                        primary_key: false,
+                        is_rowid_alias: false,
+                        notnull: false,
+                        default: None,
+                        unique: false,
+                        collation: None,
+                        hidden: false,
+                    },
+                    SchemaColumn {
+                        name: Some("vendor_id".to_string()),
+                        ty: Type::Integer,
+                        ty_str: "INTEGER".to_string(),
+                        primary_key: false,
+                        is_rowid_alias: false,
+                        notnull: false,
+                        default: None,
+                        unique: false,
+                        collation: None,
+                        hidden: false,
+                    },
+                    SchemaColumn {
+                        name: Some("quantity".to_string()),
+                        ty: Type::Integer,
+                        ty_str: "INTEGER".to_string(),
+                        primary_key: false,
+                        is_rowid_alias: false,
+                        notnull: false,
+                        default: None,
+                        unique: false,
+                        collation: None,
+                        hidden: false,
+                    },
+                ],
+                has_rowid: true,
+                is_strict: false,
+                unique_sets: vec![],
+            };
+            schema.add_btree_table(Arc::new(purchases_table));
+
+            // Add vendors table with id, name, and price (ambiguous columns with customers)
+            let vendors_table = BTreeTable {
+                name: "vendors".to_string(),
+                root_page: 8,
+                primary_key_columns: vec![("id".to_string(), turso_parser::ast::SortOrder::Asc)],
+                columns: vec![
+                    SchemaColumn {
+                        name: Some("id".to_string()),
+                        ty: Type::Integer,
+                        ty_str: "INTEGER".to_string(),
+                        primary_key: true,
+                        is_rowid_alias: true,
+                        notnull: true,
+                        default: None,
+                        unique: false,
+                        collation: None,
+                        hidden: false,
+                    },
+                    SchemaColumn {
+                        name: Some("name".to_string()),
+                        ty: Type::Text,
+                        ty_str: "TEXT".to_string(),
+                        primary_key: false,
+                        is_rowid_alias: false,
+                        notnull: false,
+                        default: None,
+                        unique: false,
+                        collation: None,
+                        hidden: false,
+                    },
+                    SchemaColumn {
+                        name: Some("price".to_string()),
+                        ty: Type::Integer,
+                        ty_str: "INTEGER".to_string(),
+                        primary_key: false,
+                        is_rowid_alias: false,
+                        notnull: false,
+                        default: None,
+                        unique: false,
+                        collation: None,
+                        hidden: false,
+                    },
+                ],
+                has_rowid: true,
+                is_strict: false,
+                unique_sets: vec![],
+            };
+            schema.add_btree_table(Arc::new(vendors_table));
+
             let sales_table = BTreeTable {
                 name: "sales".to_string(),
                 root_page: 2,
@@ -3344,8 +4077,20 @@ mod tests {
 
         // Create a simple filter node
         let schema = Arc::new(LogicalSchema::new(vec![
-            ("id".to_string(), Type::Integer),
-            ("value".to_string(), Type::Integer),
+            ColumnInfo {
+                name: "id".to_string(),
+                ty: Type::Integer,
+                database: None,
+                table: None,
+                table_alias: None,
+            },
+            ColumnInfo {
+                name: "value".to_string(),
+                ty: Type::Integer,
+                database: None,
+                table: None,
+                table_alias: None,
+            },
         ]));
 
         // First create an input node with InputOperator
@@ -3358,13 +4103,10 @@ mod tests {
             Box::new(InputOperator::new("test".to_string())),
         );
 
-        let filter_op = FilterOperator::new(
-            FilterPredicate::GreaterThan {
-                column: "value".to_string(),
-                value: Value::Integer(10),
-            },
-            vec!["id".to_string(), "value".to_string()],
-        );
+        let filter_op = FilterOperator::new(FilterPredicate::GreaterThan {
+            column_idx: 1, // "value" is at index 1
+            value: Value::Integer(10),
+        });
 
         // Create the filter predicate using DbspExpr
         let predicate = DbspExpr::BinaryExpr {
@@ -3487,5 +4229,1141 @@ mod tests {
             1,
             "Row should still exist with multiplicity 1"
         );
+    }
+
+    #[test]
+    fn test_join_with_aggregation() {
+        // Test join followed by aggregation - verifying actual output
+        let (mut circuit, pager) = compile_sql!(
+            "SELECT u.name, SUM(o.quantity) as total_quantity
+             FROM users u
+             JOIN orders o ON u.id = o.user_id
+             GROUP BY u.name"
+        );
+
+        // Create test data for users
+        let mut users_delta = Delta::new();
+        users_delta.insert(
+            1,
+            vec![
+                Value::Integer(1),
+                Value::Text("Alice".into()),
+                Value::Integer(30),
+            ],
+        );
+        users_delta.insert(
+            2,
+            vec![
+                Value::Integer(2),
+                Value::Text("Bob".into()),
+                Value::Integer(25),
+            ],
+        );
+
+        // Create test data for orders (order_id, user_id, product_id, quantity)
+        let mut orders_delta = Delta::new();
+        orders_delta.insert(
+            1,
+            vec![
+                Value::Integer(1),
+                Value::Integer(1),
+                Value::Integer(101),
+                Value::Integer(5),
+            ],
+        ); // Alice: 5
+        orders_delta.insert(
+            2,
+            vec![
+                Value::Integer(2),
+                Value::Integer(1),
+                Value::Integer(102),
+                Value::Integer(3),
+            ],
+        ); // Alice: 3
+        orders_delta.insert(
+            3,
+            vec![
+                Value::Integer(3),
+                Value::Integer(2),
+                Value::Integer(101),
+                Value::Integer(7),
+            ],
+        ); // Bob: 7
+        orders_delta.insert(
+            4,
+            vec![
+                Value::Integer(4),
+                Value::Integer(1),
+                Value::Integer(103),
+                Value::Integer(2),
+            ],
+        ); // Alice: 2
+
+        let inputs = HashMap::from([
+            ("users".to_string(), users_delta),
+            ("orders".to_string(), orders_delta),
+        ]);
+
+        let result = test_execute(&mut circuit, inputs.clone(), pager.clone()).unwrap();
+
+        // Should have 2 results: Alice with total 10, Bob with total 7
+        assert_eq!(
+            result.len(),
+            2,
+            "Should have aggregated results for Alice and Bob"
+        );
+
+        // Check the results
+        let mut results_map: HashMap<String, i64> = HashMap::new();
+        for (row, weight) in result.changes {
+            assert_eq!(weight, 1);
+            assert_eq!(row.values.len(), 2); // name and total_quantity
+
+            if let (Value::Text(name), Value::Integer(total)) = (&row.values[0], &row.values[1]) {
+                results_map.insert(name.to_string(), *total);
+            } else {
+                panic!("Unexpected value types in result");
+            }
+        }
+
+        assert_eq!(
+            results_map.get("Alice"),
+            Some(&10),
+            "Alice should have total quantity 10"
+        );
+        assert_eq!(
+            results_map.get("Bob"),
+            Some(&7),
+            "Bob should have total quantity 7"
+        );
+    }
+
+    #[test]
+    fn test_join_aggregate_with_filter() {
+        // Test complex query with join, filter, and aggregation - verifying output
+        let (mut circuit, pager) = compile_sql!(
+            "SELECT u.name, SUM(o.quantity) as total
+             FROM users u
+             JOIN orders o ON u.id = o.user_id
+             WHERE u.age > 18
+             GROUP BY u.name"
+        );
+
+        // Create test data for users
+        let mut users_delta = Delta::new();
+        users_delta.insert(
+            1,
+            vec![
+                Value::Integer(1),
+                Value::Text("Alice".into()),
+                Value::Integer(30),
+            ],
+        ); // age > 18
+        users_delta.insert(
+            2,
+            vec![
+                Value::Integer(2),
+                Value::Text("Bob".into()),
+                Value::Integer(17),
+            ],
+        ); // age <= 18
+        users_delta.insert(
+            3,
+            vec![
+                Value::Integer(3),
+                Value::Text("Charlie".into()),
+                Value::Integer(25),
+            ],
+        ); // age > 18
+
+        // Create test data for orders (order_id, user_id, product_id, quantity)
+        let mut orders_delta = Delta::new();
+        orders_delta.insert(
+            1,
+            vec![
+                Value::Integer(1),
+                Value::Integer(1),
+                Value::Integer(101),
+                Value::Integer(5),
+            ],
+        ); // Alice: 5
+        orders_delta.insert(
+            2,
+            vec![
+                Value::Integer(2),
+                Value::Integer(2),
+                Value::Integer(102),
+                Value::Integer(10),
+            ],
+        ); // Bob: 10 (should be filtered)
+        orders_delta.insert(
+            3,
+            vec![
+                Value::Integer(3),
+                Value::Integer(3),
+                Value::Integer(101),
+                Value::Integer(7),
+            ],
+        ); // Charlie: 7
+        orders_delta.insert(
+            4,
+            vec![
+                Value::Integer(4),
+                Value::Integer(1),
+                Value::Integer(103),
+                Value::Integer(3),
+            ],
+        ); // Alice: 3
+
+        let inputs = HashMap::from([
+            ("users".to_string(), users_delta),
+            ("orders".to_string(), orders_delta),
+        ]);
+
+        let result = test_execute(&mut circuit, inputs.clone(), pager.clone()).unwrap();
+
+        // Should only have results for Alice and Charlie (Bob filtered out due to age <= 18)
+        assert_eq!(
+            result.len(),
+            2,
+            "Should only have results for users with age > 18"
+        );
+
+        // Check the results
+        let mut results_map: HashMap<String, i64> = HashMap::new();
+        for (row, weight) in result.changes {
+            assert_eq!(weight, 1);
+            assert_eq!(row.values.len(), 2); // name and total
+
+            if let (Value::Text(name), Value::Integer(total)) = (&row.values[0], &row.values[1]) {
+                results_map.insert(name.to_string(), *total);
+            }
+        }
+
+        assert_eq!(
+            results_map.get("Alice"),
+            Some(&8),
+            "Alice should have total 8"
+        );
+        assert_eq!(
+            results_map.get("Charlie"),
+            Some(&7),
+            "Charlie should have total 7"
+        );
+        assert_eq!(results_map.get("Bob"), None, "Bob should be filtered out");
+    }
+
+    #[test]
+    fn test_three_way_join_execution() {
+        // Test executing a 3-way join with aggregation
+        let (mut circuit, pager) = compile_sql!(
+            "SELECT u.name, p.product_name, SUM(o.quantity) as total
+             FROM users u
+             JOIN orders o ON u.id = o.user_id
+             JOIN products p ON o.product_id = p.product_id
+             GROUP BY u.name, p.product_name"
+        );
+
+        // Create test data for users
+        let mut users_delta = Delta::new();
+        users_delta.insert(
+            1,
+            vec![
+                Value::Integer(1),
+                Value::Text("Alice".into()),
+                Value::Integer(25),
+            ],
+        );
+        users_delta.insert(
+            2,
+            vec![
+                Value::Integer(2),
+                Value::Text("Bob".into()),
+                Value::Integer(30),
+            ],
+        );
+
+        // Create test data for products
+        let mut products_delta = Delta::new();
+        products_delta.insert(
+            100,
+            vec![
+                Value::Integer(100),
+                Value::Text("Widget".into()),
+                Value::Integer(50),
+            ],
+        );
+        products_delta.insert(
+            101,
+            vec![
+                Value::Integer(101),
+                Value::Text("Gadget".into()),
+                Value::Integer(75),
+            ],
+        );
+        products_delta.insert(
+            102,
+            vec![
+                Value::Integer(102),
+                Value::Text("Doohickey".into()),
+                Value::Integer(25),
+            ],
+        );
+
+        // Create test data for orders joining users and products
+        let mut orders_delta = Delta::new();
+        // Alice orders 5 Widgets
+        orders_delta.insert(
+            1,
+            vec![
+                Value::Integer(1),
+                Value::Integer(1),
+                Value::Integer(100),
+                Value::Integer(5),
+            ],
+        );
+        // Alice orders 3 Gadgets
+        orders_delta.insert(
+            2,
+            vec![
+                Value::Integer(2),
+                Value::Integer(1),
+                Value::Integer(101),
+                Value::Integer(3),
+            ],
+        );
+        // Bob orders 7 Widgets
+        orders_delta.insert(
+            3,
+            vec![
+                Value::Integer(3),
+                Value::Integer(2),
+                Value::Integer(100),
+                Value::Integer(7),
+            ],
+        );
+        // Bob orders 2 Doohickeys
+        orders_delta.insert(
+            4,
+            vec![
+                Value::Integer(4),
+                Value::Integer(2),
+                Value::Integer(102),
+                Value::Integer(2),
+            ],
+        );
+        // Alice orders 4 more Widgets
+        orders_delta.insert(
+            5,
+            vec![
+                Value::Integer(5),
+                Value::Integer(1),
+                Value::Integer(100),
+                Value::Integer(4),
+            ],
+        );
+
+        let mut inputs = HashMap::new();
+        inputs.insert("users".to_string(), users_delta);
+        inputs.insert("products".to_string(), products_delta);
+        inputs.insert("orders".to_string(), orders_delta);
+
+        // Execute the 3-way join with aggregation
+        let result = test_execute(&mut circuit, inputs.clone(), pager.clone()).unwrap();
+
+        // We should get aggregated results for each user-product combination
+        // Expected results:
+        // - Alice, Widget: 9 (5 + 4)
+        // - Alice, Gadget: 3
+        // - Bob, Widget: 7
+        // - Bob, Doohickey: 2
+        assert_eq!(result.len(), 4, "Should have 4 aggregated results");
+
+        // Verify aggregation results
+        let mut found_results = std::collections::HashSet::new();
+        for (row, weight) in result.changes.iter() {
+            assert_eq!(*weight, 1);
+            // Row should have name, product_name, and sum columns
+            assert_eq!(row.values.len(), 3);
+
+            if let (Value::Text(name), Value::Text(product), Value::Integer(total)) =
+                (&row.values[0], &row.values[1], &row.values[2])
+            {
+                let key = format!("{}-{}", name.as_ref(), product.as_ref());
+                found_results.insert(key.clone());
+
+                match key.as_str() {
+                    "Alice-Widget" => {
+                        assert_eq!(*total, 9, "Alice should have ordered 9 Widgets total")
+                    }
+                    "Alice-Gadget" => assert_eq!(*total, 3, "Alice should have ordered 3 Gadgets"),
+                    "Bob-Widget" => assert_eq!(*total, 7, "Bob should have ordered 7 Widgets"),
+                    "Bob-Doohickey" => {
+                        assert_eq!(*total, 2, "Bob should have ordered 2 Doohickeys")
+                    }
+                    _ => panic!("Unexpected result: {key}"),
+                }
+            } else {
+                panic!("Unexpected value types in result");
+            }
+        }
+
+        // Ensure we found all expected combinations
+        assert!(found_results.contains("Alice-Widget"));
+        assert!(found_results.contains("Alice-Gadget"));
+        assert!(found_results.contains("Bob-Widget"));
+        assert!(found_results.contains("Bob-Doohickey"));
+    }
+
+    #[test]
+    fn test_join_execution() {
+        let (mut circuit, pager) = compile_sql!(
+            "SELECT u.name, o.quantity FROM users u JOIN orders o ON u.id = o.user_id"
+        );
+
+        // Create test data for users
+        let mut users_delta = Delta::new();
+        users_delta.insert(
+            1,
+            vec![
+                Value::Integer(1),
+                Value::Text("Alice".into()),
+                Value::Integer(25),
+            ],
+        );
+        users_delta.insert(
+            2,
+            vec![
+                Value::Integer(2),
+                Value::Text("Bob".into()),
+                Value::Integer(30),
+            ],
+        );
+
+        // Create test data for orders
+        let mut orders_delta = Delta::new();
+        orders_delta.insert(
+            1,
+            vec![
+                Value::Integer(1),
+                Value::Integer(1),
+                Value::Integer(100),
+                Value::Integer(5),
+            ],
+        );
+        orders_delta.insert(
+            2,
+            vec![
+                Value::Integer(2),
+                Value::Integer(1),
+                Value::Integer(101),
+                Value::Integer(3),
+            ],
+        );
+        orders_delta.insert(
+            3,
+            vec![
+                Value::Integer(3),
+                Value::Integer(2),
+                Value::Integer(102),
+                Value::Integer(7),
+            ],
+        );
+
+        let mut inputs = HashMap::new();
+        inputs.insert("users".to_string(), users_delta);
+        inputs.insert("orders".to_string(), orders_delta);
+
+        // Execute the join
+        let result = test_execute(&mut circuit, inputs.clone(), pager.clone()).unwrap();
+
+        // We should get 3 results (2 orders for Alice, 1 for Bob)
+        assert_eq!(result.len(), 3, "Should have 3 join results");
+
+        // Verify the join results contain the correct data
+        let results: Vec<_> = result.changes.iter().collect();
+
+        // Check that we have the expected joined rows
+        for (row, weight) in results {
+            assert_eq!(*weight, 1); // All weights should be 1 for insertions
+                                    // Row should have name and quantity columns
+            assert_eq!(row.values.len(), 2);
+        }
+    }
+
+    #[test]
+    fn test_three_way_join_with_column_ambiguity() {
+        // Test three-way join with aggregation where multiple tables have columns with the same name
+        // Ensures that column references are correctly resolved to their respective tables
+        // Tables: customers(id, name), purchases(id, customer_id, vendor_id, quantity), vendors(id, name, price)
+        // Note: both customers and vendors have 'id' and 'name' columns which can cause ambiguity
+
+        let sql = "SELECT c.name as customer_name, v.name as vendor_name,
+                          SUM(p.quantity) as total_quantity,
+                          SUM(p.quantity * v.price) as total_value
+                   FROM customers c
+                   JOIN purchases p ON c.id = p.customer_id
+                   JOIN vendors v ON p.vendor_id = v.id
+                   GROUP BY c.name, v.name";
+
+        let (mut circuit, pager) = compile_sql!(sql);
+
+        // Create test data for customers (id, name)
+        let mut customers_delta = Delta::new();
+        customers_delta.insert(1, vec![Value::Integer(1), Value::Text("Alice".into())]);
+        customers_delta.insert(2, vec![Value::Integer(2), Value::Text("Bob".into())]);
+
+        // Create test data for vendors (id, name, price)
+        let mut vendors_delta = Delta::new();
+        vendors_delta.insert(
+            1,
+            vec![
+                Value::Integer(1),
+                Value::Text("Widget Co".into()),
+                Value::Integer(10),
+            ],
+        );
+        vendors_delta.insert(
+            2,
+            vec![
+                Value::Integer(2),
+                Value::Text("Gadget Inc".into()),
+                Value::Integer(20),
+            ],
+        );
+
+        // Create test data for purchases (id, customer_id, vendor_id, quantity)
+        let mut purchases_delta = Delta::new();
+        // Alice purchases 5 units from Widget Co
+        purchases_delta.insert(
+            1,
+            vec![
+                Value::Integer(1),
+                Value::Integer(1), // customer_id: Alice
+                Value::Integer(1), // vendor_id: Widget Co
+                Value::Integer(5),
+            ],
+        );
+        // Alice purchases 3 units from Gadget Inc
+        purchases_delta.insert(
+            2,
+            vec![
+                Value::Integer(2),
+                Value::Integer(1), // customer_id: Alice
+                Value::Integer(2), // vendor_id: Gadget Inc
+                Value::Integer(3),
+            ],
+        );
+        // Bob purchases 2 units from Widget Co
+        purchases_delta.insert(
+            3,
+            vec![
+                Value::Integer(3),
+                Value::Integer(2), // customer_id: Bob
+                Value::Integer(1), // vendor_id: Widget Co
+                Value::Integer(2),
+            ],
+        );
+        // Alice purchases 4 more units from Widget Co
+        purchases_delta.insert(
+            4,
+            vec![
+                Value::Integer(4),
+                Value::Integer(1), // customer_id: Alice
+                Value::Integer(1), // vendor_id: Widget Co
+                Value::Integer(4),
+            ],
+        );
+
+        let inputs = HashMap::from([
+            ("customers".to_string(), customers_delta),
+            ("purchases".to_string(), purchases_delta),
+            ("vendors".to_string(), vendors_delta),
+        ]);
+
+        let result = test_execute(&mut circuit, inputs.clone(), pager.clone()).unwrap();
+
+        // Expected results:
+        // Alice|Gadget Inc|3|60    (3 units * 20 price = 60)
+        // Alice|Widget Co|9|90     (9 units * 10 price = 90)
+        // Bob|Widget Co|2|20       (2 units * 10 price = 20)
+
+        assert_eq!(result.len(), 3, "Should have 3 aggregated results");
+
+        // Sort results for consistent testing
+        let mut results: Vec<_> = result.changes.into_iter().collect();
+        results.sort_by(|a, b| {
+            let a_cust = &a.0.values[0];
+            let a_vend = &a.0.values[1];
+            let b_cust = &b.0.values[0];
+            let b_vend = &b.0.values[1];
+            (a_cust, a_vend).cmp(&(b_cust, b_vend))
+        });
+
+        // Verify Alice's Gadget Inc purchases
+        assert_eq!(results[0].0.values[0], Value::Text("Alice".into()));
+        assert_eq!(results[0].0.values[1], Value::Text("Gadget Inc".into()));
+        assert_eq!(results[0].0.values[2], Value::Integer(3)); // total_quantity
+        assert_eq!(results[0].0.values[3], Value::Integer(60)); // total_value
+
+        // Verify Alice's Widget Co purchases
+        assert_eq!(results[1].0.values[0], Value::Text("Alice".into()));
+        assert_eq!(results[1].0.values[1], Value::Text("Widget Co".into()));
+        assert_eq!(results[1].0.values[2], Value::Integer(9)); // total_quantity
+        assert_eq!(results[1].0.values[3], Value::Integer(90)); // total_value
+
+        // Verify Bob's Widget Co purchases
+        assert_eq!(results[2].0.values[0], Value::Text("Bob".into()));
+        assert_eq!(results[2].0.values[1], Value::Text("Widget Co".into()));
+        assert_eq!(results[2].0.values[2], Value::Integer(2)); // total_quantity
+        assert_eq!(results[2].0.values[3], Value::Integer(20)); // total_value
+    }
+
+    #[test]
+    fn test_projection_with_function_and_ambiguous_columns() {
+        // Test projection with functions operating on potentially ambiguous columns
+        // Uses HEX() function on sum of columns from different tables with same names
+        // Tables: customers(id, name), vendors(id, name, price), purchases(id, customer_id, vendor_id, quantity)
+        // This test ensures column references are correctly resolved to their respective tables
+
+        let sql = "SELECT HEX(c.id + v.id) as hex_sum,
+                          UPPER(c.name) as customer_upper,
+                          LOWER(v.name) as vendor_lower,
+                          c.id * v.price as product_value
+                   FROM customers c
+                   JOIN vendors v ON c.id = v.id";
+
+        let (mut circuit, pager) = compile_sql!(sql);
+
+        // Create test data for customers (id, name)
+        let mut customers_delta = Delta::new();
+        customers_delta.insert(1, vec![Value::Integer(1), Value::Text("Alice".into())]);
+        customers_delta.insert(2, vec![Value::Integer(2), Value::Text("Bob".into())]);
+        customers_delta.insert(3, vec![Value::Integer(3), Value::Text("Charlie".into())]);
+
+        // Create test data for vendors (id, name, price)
+        let mut vendors_delta = Delta::new();
+        vendors_delta.insert(
+            1,
+            vec![
+                Value::Integer(1),
+                Value::Text("Widget Co".into()),
+                Value::Integer(10),
+            ],
+        );
+        vendors_delta.insert(
+            2,
+            vec![
+                Value::Integer(2),
+                Value::Text("Gadget Inc".into()),
+                Value::Integer(20),
+            ],
+        );
+        vendors_delta.insert(
+            3,
+            vec![
+                Value::Integer(3),
+                Value::Text("Tool Corp".into()),
+                Value::Integer(30),
+            ],
+        );
+
+        let inputs = HashMap::from([
+            ("customers".to_string(), customers_delta),
+            ("vendors".to_string(), vendors_delta),
+        ]);
+
+        let result = test_execute(&mut circuit, inputs.clone(), pager.clone()).unwrap();
+
+        // Expected results:
+        // For customer 1 (Alice) + vendor 1:
+        //   - HEX(1 + 1) = HEX(2) = "32"
+        //   - UPPER("Alice") = "ALICE"
+        //   - LOWER("Widget Co") = "widget co"
+        //   - 1 * 10 = 10
+        assert_eq!(result.len(), 3, "Should have 3 join results");
+
+        let mut results = result.changes.clone();
+        results.sort_by_key(|(row, _)| {
+            // Sort by the product_value column for predictable ordering
+            match &row.values[3] {
+                Value::Integer(n) => *n,
+                _ => 0,
+            }
+        });
+
+        // First result: Alice + Widget Co
+        assert_eq!(results[0].0.values[0], Value::Text("32".into())); // HEX(2)
+        assert_eq!(results[0].0.values[1], Value::Text("ALICE".into()));
+        assert_eq!(results[0].0.values[2], Value::Text("widget co".into()));
+        assert_eq!(results[0].0.values[3], Value::Integer(10)); // 1 * 10
+
+        // Second result: Bob + Gadget Inc
+        assert_eq!(results[1].0.values[0], Value::Text("34".into())); // HEX(4)
+        assert_eq!(results[1].0.values[1], Value::Text("BOB".into()));
+        assert_eq!(results[1].0.values[2], Value::Text("gadget inc".into()));
+        assert_eq!(results[1].0.values[3], Value::Integer(40)); // 2 * 20
+
+        // Third result: Charlie + Tool Corp
+        assert_eq!(results[2].0.values[0], Value::Text("36".into())); // HEX(6)
+        assert_eq!(results[2].0.values[1], Value::Text("CHARLIE".into()));
+        assert_eq!(results[2].0.values[2], Value::Text("tool corp".into()));
+        assert_eq!(results[2].0.values[3], Value::Integer(90)); // 3 * 30
+    }
+
+    #[test]
+    fn test_projection_column_selection_after_join() {
+        // Test selecting specific columns after a join, especially with overlapping column names
+        // This ensures the projection correctly picks columns by their qualified references
+
+        let sql = "SELECT c.id as customer_id,
+                          c.name as customer_name,
+                          o.order_id,
+                          o.quantity,
+                          p.product_name
+                   FROM users c
+                   JOIN orders o ON c.id = o.user_id
+                   JOIN products p ON o.product_id = p.product_id
+                   WHERE o.quantity > 2";
+
+        let (mut circuit, pager) = compile_sql!(sql);
+
+        // Create test data for users (id, name, age)
+        let mut users_delta = Delta::new();
+        users_delta.insert(
+            1,
+            vec![
+                Value::Integer(1),
+                Value::Text("Alice".into()),
+                Value::Integer(25),
+            ],
+        );
+        users_delta.insert(
+            2,
+            vec![
+                Value::Integer(2),
+                Value::Text("Bob".into()),
+                Value::Integer(30),
+            ],
+        );
+
+        // Create test data for orders (order_id, user_id, product_id, quantity)
+        let mut orders_delta = Delta::new();
+        orders_delta.insert(
+            1,
+            vec![
+                Value::Integer(101),
+                Value::Integer(1),   // Alice
+                Value::Integer(201), // Widget
+                Value::Integer(5),   // quantity > 2
+            ],
+        );
+        orders_delta.insert(
+            2,
+            vec![
+                Value::Integer(102),
+                Value::Integer(2),   // Bob
+                Value::Integer(202), // Gadget
+                Value::Integer(1),   // quantity <= 2, filtered out
+            ],
+        );
+        orders_delta.insert(
+            3,
+            vec![
+                Value::Integer(103),
+                Value::Integer(1),   // Alice
+                Value::Integer(202), // Gadget
+                Value::Integer(3),   // quantity > 2
+            ],
+        );
+
+        // Create test data for products (product_id, product_name, price)
+        let mut products_delta = Delta::new();
+        products_delta.insert(
+            201,
+            vec![
+                Value::Integer(201),
+                Value::Text("Widget".into()),
+                Value::Integer(10),
+            ],
+        );
+        products_delta.insert(
+            202,
+            vec![
+                Value::Integer(202),
+                Value::Text("Gadget".into()),
+                Value::Integer(20),
+            ],
+        );
+
+        let inputs = HashMap::from([
+            ("users".to_string(), users_delta),
+            ("orders".to_string(), orders_delta),
+            ("products".to_string(), products_delta),
+        ]);
+
+        let result = test_execute(&mut circuit, inputs.clone(), pager.clone()).unwrap();
+
+        // Should have 2 results (orders with quantity > 2)
+        assert_eq!(result.len(), 2, "Should have 2 results after filtering");
+
+        let mut results = result.changes.clone();
+        results.sort_by_key(|(row, _)| {
+            match &row.values[2] {
+                // Sort by order_id
+                Value::Integer(n) => *n,
+                _ => 0,
+            }
+        });
+
+        // First result: Alice's order 101 for Widget
+        assert_eq!(results[0].0.values[0], Value::Integer(1)); // customer_id
+        assert_eq!(results[0].0.values[1], Value::Text("Alice".into())); // customer_name
+        assert_eq!(results[0].0.values[2], Value::Integer(101)); // order_id
+        assert_eq!(results[0].0.values[3], Value::Integer(5)); // quantity
+        assert_eq!(results[0].0.values[4], Value::Text("Widget".into())); // product_name
+
+        // Second result: Alice's order 103 for Gadget
+        assert_eq!(results[1].0.values[0], Value::Integer(1)); // customer_id
+        assert_eq!(results[1].0.values[1], Value::Text("Alice".into())); // customer_name
+        assert_eq!(results[1].0.values[2], Value::Integer(103)); // order_id
+        assert_eq!(results[1].0.values[3], Value::Integer(3)); // quantity
+        assert_eq!(results[1].0.values[4], Value::Text("Gadget".into())); // product_name
+    }
+
+    #[test]
+    fn test_projection_column_reordering_and_duplication() {
+        // Test that projection can reorder columns and select the same column multiple times
+        // This is important for views that need specific column arrangements
+
+        let sql = "SELECT o.quantity,
+                          u.name,
+                          u.id,
+                          o.quantity * 2 as double_quantity,
+                          u.id as user_id_again
+                   FROM users u
+                   JOIN orders o ON u.id = o.user_id
+                   WHERE u.id = 1";
+
+        let (mut circuit, pager) = compile_sql!(sql);
+
+        // Create test data for users
+        let mut users_delta = Delta::new();
+        users_delta.insert(
+            1,
+            vec![
+                Value::Integer(1),
+                Value::Text("Alice".into()),
+                Value::Integer(25),
+            ],
+        );
+
+        // Create test data for orders
+        let mut orders_delta = Delta::new();
+        orders_delta.insert(
+            1,
+            vec![
+                Value::Integer(101),
+                Value::Integer(1),   // user_id
+                Value::Integer(201), // product_id
+                Value::Integer(5),   // quantity
+            ],
+        );
+        orders_delta.insert(
+            2,
+            vec![
+                Value::Integer(102),
+                Value::Integer(1),   // user_id
+                Value::Integer(202), // product_id
+                Value::Integer(3),   // quantity
+            ],
+        );
+
+        let inputs = HashMap::from([
+            ("users".to_string(), users_delta),
+            ("orders".to_string(), orders_delta),
+        ]);
+
+        let result = test_execute(&mut circuit, inputs.clone(), pager.clone()).unwrap();
+
+        assert_eq!(result.len(), 2, "Should have 2 results for user 1");
+
+        // Check that columns are in the right order and values are correct
+        for (row, _) in &result.changes {
+            // Column 0: o.quantity (5 or 3)
+            assert!(matches!(
+                row.values[0],
+                Value::Integer(5) | Value::Integer(3)
+            ));
+            // Column 1: u.name
+            assert_eq!(row.values[1], Value::Text("Alice".into()));
+            // Column 2: u.id
+            assert_eq!(row.values[2], Value::Integer(1));
+            // Column 3: o.quantity * 2 (10 or 6)
+            assert!(matches!(
+                row.values[3],
+                Value::Integer(10) | Value::Integer(6)
+            ));
+            // Column 4: u.id again
+            assert_eq!(row.values[4], Value::Integer(1));
+        }
+    }
+
+    #[test]
+    fn test_join_with_aggregate_execution() {
+        let (mut circuit, pager) = compile_sql!(
+            "SELECT u.name, SUM(o.quantity) as total_quantity
+             FROM users u
+             JOIN orders o ON u.id = o.user_id
+             GROUP BY u.name"
+        );
+
+        // Create test data for users
+        let mut users_delta = Delta::new();
+        users_delta.insert(
+            1,
+            vec![
+                Value::Integer(1),
+                Value::Text("Alice".into()),
+                Value::Integer(25),
+            ],
+        );
+        users_delta.insert(
+            2,
+            vec![
+                Value::Integer(2),
+                Value::Text("Bob".into()),
+                Value::Integer(30),
+            ],
+        );
+
+        // Create test data for orders
+        let mut orders_delta = Delta::new();
+        orders_delta.insert(
+            1,
+            vec![
+                Value::Integer(1),
+                Value::Integer(1),
+                Value::Integer(100),
+                Value::Integer(5),
+            ],
+        );
+        orders_delta.insert(
+            2,
+            vec![
+                Value::Integer(2),
+                Value::Integer(1),
+                Value::Integer(101),
+                Value::Integer(3),
+            ],
+        );
+        orders_delta.insert(
+            3,
+            vec![
+                Value::Integer(3),
+                Value::Integer(2),
+                Value::Integer(102),
+                Value::Integer(7),
+            ],
+        );
+
+        let mut inputs = HashMap::new();
+        inputs.insert("users".to_string(), users_delta);
+        inputs.insert("orders".to_string(), orders_delta);
+
+        // Execute the join with aggregation
+        let result = test_execute(&mut circuit, inputs.clone(), pager.clone()).unwrap();
+
+        // We should get 2 aggregated results (one for Alice, one for Bob)
+        assert_eq!(result.len(), 2, "Should have 2 aggregated results");
+
+        // Verify aggregation results
+        for (row, weight) in result.changes.iter() {
+            assert_eq!(*weight, 1);
+            // Row should have name and sum columns
+            assert_eq!(row.values.len(), 2);
+
+            // Check the aggregated values
+            if let Value::Text(name) = &row.values[0] {
+                if name.as_ref() == "Alice" {
+                    // Alice should have total quantity of 8 (5 + 3)
+                    assert_eq!(row.values[1], Value::Integer(8));
+                } else if name.as_ref() == "Bob" {
+                    // Bob should have total quantity of 7
+                    assert_eq!(row.values[1], Value::Integer(7));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_filter_with_qualified_columns_in_join() {
+        // Test that filters correctly handle qualified column names in joins
+        // when multiple tables have columns with the SAME names.
+        // Both users and customers tables have 'id' and 'name' columns which can be ambiguous.
+
+        let (mut circuit, pager) = compile_sql!(
+            "SELECT users.id, users.name, customers.id, customers.name
+             FROM users
+             JOIN customers ON users.id = customers.id
+             WHERE users.id > 1 AND customers.id < 100"
+        );
+
+        // Create test data
+        let mut users_delta = Delta::new();
+        let mut customers_delta = Delta::new();
+
+        // Users data: (id, name, age)
+        users_delta.insert(
+            1,
+            vec![
+                Value::Integer(1),
+                Value::Text("Alice".into()),
+                Value::Integer(30),
+            ],
+        ); // id = 1
+        users_delta.insert(
+            2,
+            vec![
+                Value::Integer(2),
+                Value::Text("Bob".into()),
+                Value::Integer(25),
+            ],
+        ); // id = 2
+        users_delta.insert(
+            3,
+            vec![
+                Value::Integer(3),
+                Value::Text("Charlie".into()),
+                Value::Integer(35),
+            ],
+        ); // id = 3
+
+        // Customers data: (id, name, email)
+        customers_delta.insert(
+            1,
+            vec![
+                Value::Integer(1),
+                Value::Text("Customer Alice".into()),
+                Value::Text("alice@example.com".into()),
+            ],
+        ); // id = 1
+        customers_delta.insert(
+            2,
+            vec![
+                Value::Integer(2),
+                Value::Text("Customer Bob".into()),
+                Value::Text("bob@example.com".into()),
+            ],
+        ); // id = 2
+        customers_delta.insert(
+            3,
+            vec![
+                Value::Integer(3),
+                Value::Text("Customer Charlie".into()),
+                Value::Text("charlie@example.com".into()),
+            ],
+        ); // id = 3
+
+        let mut inputs = HashMap::new();
+        inputs.insert("users".to_string(), users_delta);
+        inputs.insert("customers".to_string(), customers_delta);
+
+        let result = test_execute(&mut circuit, inputs.clone(), pager.clone()).unwrap();
+
+        // Should get rows where users.id > 1 AND customers.id < 100
+        // - users.id=2 (> 1) AND customers.id=2 (< 100) ✓
+        // - users.id=3 (> 1) AND customers.id=3 (< 100) ✓
+        // Alice excluded: users.id=1 (NOT > 1)
+        assert_eq!(result.len(), 2, "Should have 2 filtered results");
+
+        let (row, weight) = &result.changes[0];
+        assert_eq!(*weight, 1);
+        assert_eq!(row.values.len(), 4, "Should have 4 columns");
+
+        // Verify the filter correctly used qualified columns for Bob
+        assert_eq!(row.values[0], Value::Integer(2), "users.id should be 2");
+        assert_eq!(
+            row.values[1],
+            Value::Text("Bob".into()),
+            "users.name should be Bob"
+        );
+        assert_eq!(row.values[2], Value::Integer(2), "customers.id should be 2");
+        assert_eq!(
+            row.values[3],
+            Value::Text("Customer Bob".into()),
+            "customers.name should be Customer Bob"
+        );
+    }
+
+    #[test]
+    fn test_expression_in_where_clause() {
+        // Test expressions in WHERE clauses like (quantity * price) >= 400
+        let (mut circuit, pager) = compile_sql!("SELECT * FROM users WHERE (age * 2) > 30");
+
+        // Create test data
+        let mut input_delta = Delta::new();
+        input_delta.insert(
+            1,
+            vec![
+                Value::Integer(1),
+                Value::Text("Alice".into()),
+                Value::Integer(20), // age * 2 = 40 > 30, should pass
+            ],
+        );
+        input_delta.insert(
+            2,
+            vec![
+                Value::Integer(2),
+                Value::Text("Bob".into()),
+                Value::Integer(10), // age * 2 = 20 <= 30, should be filtered out
+            ],
+        );
+        input_delta.insert(
+            3,
+            vec![
+                Value::Integer(3),
+                Value::Text("Charlie".into()),
+                Value::Integer(16), // age * 2 = 32 > 30, should pass
+            ],
+        );
+
+        // Create input map
+        let mut inputs = HashMap::new();
+        inputs.insert("users".to_string(), input_delta);
+
+        let result = test_execute(&mut circuit, inputs.clone(), pager.clone()).unwrap();
+
+        // Should only have Alice and Charlie (age * 2 > 30)
+        assert_eq!(
+            result.changes.len(),
+            2,
+            "Should have 2 rows after filtering"
+        );
+
+        // Check Alice
+        let alice = result
+            .changes
+            .iter()
+            .find(|(row, _)| row.values[0] == Value::Integer(1))
+            .expect("Alice should be in result");
+        assert_eq!(alice.0.values[1], Value::Text("Alice".into()));
+        assert_eq!(alice.0.values[2], Value::Integer(20));
+
+        // Check Charlie
+        let charlie = result
+            .changes
+            .iter()
+            .find(|(row, _)| row.values[0] == Value::Integer(3))
+            .expect("Charlie should be in result");
+        assert_eq!(charlie.0.values[1], Value::Text("Charlie".into()));
+        assert_eq!(charlie.0.values[2], Value::Integer(16));
+
+        // Bob should not be in result
+        let bob = result
+            .changes
+            .iter()
+            .find(|(row, _)| row.values[0] == Value::Integer(2));
+        assert!(bob.is_none(), "Bob should be filtered out");
     }
 }

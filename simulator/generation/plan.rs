@@ -30,7 +30,7 @@ use super::property::{Property, remaining};
 
 pub(crate) type ResultSet = Result<Vec<Vec<SimValue>>>;
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct InteractionPlan {
     pub(crate) plan: Vec<Interactions>,
 }

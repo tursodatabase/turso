@@ -3631,6 +3631,7 @@ impl BTreeCursor {
                         );
                         let divider_cell_insert_idx_in_parent =
                             balance_info.first_divider_cell + sibling_page_idx;
+                        #[cfg(debug_assertions)]
                         let overflow_cell_count_before = parent_contents.overflow_cells.len();
                         insert_into_cell(
                             parent_contents,
@@ -3638,9 +3639,9 @@ impl BTreeCursor {
                             divider_cell_insert_idx_in_parent,
                             usable_space,
                         )?;
-                        let overflow_cell_count_after = parent_contents.overflow_cells.len();
                         #[cfg(debug_assertions)]
                         {
+                            let overflow_cell_count_after = parent_contents.overflow_cells.len();
                             let divider_cell_is_overflow_cell =
                                 overflow_cell_count_after > overflow_cell_count_before;
 
@@ -4633,7 +4634,7 @@ impl BTreeCursor {
     /// If record was not parsed yet, then we have to parse it and in case of I/O we yield control
     /// back.
     #[instrument(skip(self), level = Level::DEBUG)]
-    pub fn record(&self) -> Result<IOResult<Option<Ref<ImmutableRecord>>>> {
+    pub fn record(&self) -> Result<IOResult<Option<Ref<'_, ImmutableRecord>>>> {
         if !self.has_record.get() && self.mv_cursor.is_none() {
             return Ok(IOResult::Done(None));
         }
@@ -6664,6 +6665,20 @@ pub fn btree_init_page(page: &PageRef, page_type: PageType, offset: usize, usabl
 
     contents.write_fragmented_bytes_count(0);
     contents.write_rightmost_ptr(0);
+
+    #[cfg(debug_assertions)]
+    {
+        // we might get already used page from the pool. generally this is not a problem because
+        // b tree access is very controlled. However, for encrypted pages (and also checksums) we want
+        // to ensure that there are no reserved bytes that contain old data.
+        let buffer_len = contents.buffer.len();
+        turso_assert!(
+            usable_space <= buffer_len,
+            "usable_space must be <= buffer_len"
+        );
+        // this is no op if usable_space == buffer_len
+        contents.as_ptr()[usable_space..buffer_len].fill(0);
+    }
 }
 
 fn to_static_buf(buf: &mut [u8]) -> &'static mut [u8] {

@@ -11,23 +11,23 @@ use super::{
     select::prepare_select_plan,
     SymbolTable,
 };
-use crate::function::{AggFunc, ExtFunc};
 use crate::translate::expr::WalkControl;
 use crate::translate::plan::{Window, WindowFunction};
 use crate::{
     ast::Limit,
     function::Func,
     schema::{Schema, Table},
-    translate::expr::walk_expr_mut,
     util::{exprs_are_equivalent, normalize_ident},
     vdbe::builder::TableRefIdCounter,
     Result,
 };
-use turso_macros::match_ignore_ascii_case;
+use crate::{
+    function::{AggFunc, ExtFunc},
+    translate::expr::{bind_and_rewrite_expr, ParamState},
+};
 use turso_parser::ast::Literal::Null;
 use turso_parser::ast::{
-    self, As, Expr, FromClause, JoinType, Literal, Materialized, Over, QualifiedName,
-    TableInternalId, With,
+    self, As, Expr, FromClause, JoinType, Materialized, Over, QualifiedName, TableInternalId, With,
 };
 
 pub const ROWID: &str = "rowid";
@@ -262,231 +262,6 @@ fn add_aggregate_if_not_exists(
     Ok(())
 }
 
-pub fn bind_column_references(
-    top_level_expr: &mut Expr,
-    referenced_tables: &mut TableReferences,
-    result_columns: Option<&[ResultSetColumn]>,
-    connection: &Arc<crate::Connection>,
-) -> Result<WalkControl> {
-    walk_expr_mut(
-        top_level_expr,
-        &mut |expr: &mut Expr| -> Result<WalkControl> {
-            match expr {
-                Expr::Id(id) => {
-                    // true and false are special constants that are effectively aliases for 1 and 0
-                    // and not identifiers of columns
-                    let id_bytes = id.as_str().as_bytes();
-                    match_ignore_ascii_case!(match id_bytes {
-                        b"true" | b"false" => {
-                            return Ok(WalkControl::Continue);
-                        }
-                        _ => {}
-                    });
-                    let normalized_id = normalize_ident(id.as_str());
-
-                    if !referenced_tables.joined_tables().is_empty() {
-                        if let Some(row_id_expr) = parse_row_id(
-                            &normalized_id,
-                            referenced_tables.joined_tables()[0].internal_id,
-                            || referenced_tables.joined_tables().len() != 1,
-                        )? {
-                            *expr = row_id_expr;
-
-                            return Ok(WalkControl::Continue);
-                        }
-                    }
-                    let mut match_result = None;
-
-                    // First check joined tables
-                    for joined_table in referenced_tables.joined_tables().iter() {
-                        let col_idx = joined_table.table.columns().iter().position(|c| {
-                            c.name
-                                .as_ref()
-                                .is_some_and(|name| name.eq_ignore_ascii_case(&normalized_id))
-                        });
-                        if col_idx.is_some() {
-                            if match_result.is_some() {
-                                crate::bail_parse_error!("Column {} is ambiguous", id.as_str());
-                            }
-                            let col = joined_table.table.columns().get(col_idx.unwrap()).unwrap();
-                            match_result = Some((
-                                joined_table.internal_id,
-                                col_idx.unwrap(),
-                                col.is_rowid_alias,
-                            ));
-                        }
-                    }
-
-                    // Then check outer query references, if we still didn't find something.
-                    // Normally finding multiple matches for a non-qualified column is an error (column x is ambiguous)
-                    // but in the case of subqueries, the inner query takes precedence.
-                    // For example:
-                    // SELECT * FROM t WHERE x = (SELECT x FROM t2)
-                    // In this case, there is no ambiguity:
-                    // - x in the outer query refers to t.x,
-                    // - x in the inner query refers to t2.x.
-                    if match_result.is_none() {
-                        for outer_ref in referenced_tables.outer_query_refs().iter() {
-                            let col_idx = outer_ref.table.columns().iter().position(|c| {
-                                c.name
-                                    .as_ref()
-                                    .is_some_and(|name| name.eq_ignore_ascii_case(&normalized_id))
-                            });
-                            if col_idx.is_some() {
-                                if match_result.is_some() {
-                                    crate::bail_parse_error!("Column {} is ambiguous", id.as_str());
-                                }
-                                let col = outer_ref.table.columns().get(col_idx.unwrap()).unwrap();
-                                match_result = Some((
-                                    outer_ref.internal_id,
-                                    col_idx.unwrap(),
-                                    col.is_rowid_alias,
-                                ));
-                            }
-                        }
-                    }
-
-                    if let Some((table_id, col_idx, is_rowid_alias)) = match_result {
-                        *expr = Expr::Column {
-                            database: None, // TODO: support different databases
-                            table: table_id,
-                            column: col_idx,
-                            is_rowid_alias,
-                        };
-                        referenced_tables.mark_column_used(table_id, col_idx);
-                        return Ok(WalkControl::Continue);
-                    }
-
-                    if let Some(result_columns) = result_columns {
-                        for result_column in result_columns.iter() {
-                            if result_column
-                                .name(referenced_tables)
-                                .is_some_and(|name| name.eq_ignore_ascii_case(&normalized_id))
-                            {
-                                *expr = result_column.expr.clone();
-                                return Ok(WalkControl::Continue);
-                            }
-                        }
-                    }
-                    // SQLite behavior: Only double-quoted identifiers get fallback to string literals
-                    // Single quotes are handled as literals earlier, unquoted identifiers must resolve to columns
-                    if id.is_double_quoted() {
-                        // Convert failed double-quoted identifier to string literal
-                        *expr = Expr::Literal(Literal::String(id.as_str().to_string()));
-                        Ok(WalkControl::Continue)
-                    } else {
-                        // Unquoted identifiers must resolve to columns - no fallback
-                        crate::bail_parse_error!("no such column: {}", id.as_str())
-                    }
-                }
-                Expr::Qualified(tbl, id) => {
-                    let normalized_table_name = normalize_ident(tbl.as_str());
-                    let matching_tbl = referenced_tables
-                        .find_table_and_internal_id_by_identifier(&normalized_table_name);
-                    if matching_tbl.is_none() {
-                        crate::bail_parse_error!("no such table: {}", normalized_table_name);
-                    }
-                    let (tbl_id, tbl) = matching_tbl.unwrap();
-                    let normalized_id = normalize_ident(id.as_str());
-
-                    if let Some(row_id_expr) = parse_row_id(&normalized_id, tbl_id, || false)? {
-                        *expr = row_id_expr;
-
-                        return Ok(WalkControl::Continue);
-                    }
-                    let col_idx = tbl.columns().iter().position(|c| {
-                        c.name
-                            .as_ref()
-                            .is_some_and(|name| name.eq_ignore_ascii_case(&normalized_id))
-                    });
-                    let Some(col_idx) = col_idx else {
-                        crate::bail_parse_error!("no such column: {}", normalized_id);
-                    };
-                    let col = tbl.columns().get(col_idx).unwrap();
-                    *expr = Expr::Column {
-                        database: None, // TODO: support different databases
-                        table: tbl_id,
-                        column: col_idx,
-                        is_rowid_alias: col.is_rowid_alias,
-                    };
-                    referenced_tables.mark_column_used(tbl_id, col_idx);
-                    Ok(WalkControl::Continue)
-                }
-                Expr::DoublyQualified(db_name, tbl_name, col_name) => {
-                    let normalized_col_name = normalize_ident(col_name.as_str());
-
-                    // Create a QualifiedName and use existing resolve_database_id method
-                    let qualified_name = ast::QualifiedName {
-                        db_name: Some(db_name.clone()),
-                        name: tbl_name.clone(),
-                        alias: None,
-                    };
-                    let database_id = connection.resolve_database_id(&qualified_name)?;
-
-                    // Get the table from the specified database
-                    let table = connection
-                        .with_schema(database_id, |schema| schema.get_table(tbl_name.as_str()))
-                        .ok_or_else(|| {
-                            crate::LimboError::ParseError(format!(
-                                "no such table: {}.{}",
-                                db_name.as_str(),
-                                tbl_name.as_str()
-                            ))
-                        })?;
-
-                    // Find the column in the table
-                    let col_idx = table
-                        .columns()
-                        .iter()
-                        .position(|c| {
-                            c.name
-                                .as_ref()
-                                .is_some_and(|name| name.eq_ignore_ascii_case(&normalized_col_name))
-                        })
-                        .ok_or_else(|| {
-                            crate::LimboError::ParseError(format!(
-                                "Column: {}.{}.{} not found",
-                                db_name.as_str(),
-                                tbl_name.as_str(),
-                                col_name.as_str()
-                            ))
-                        })?;
-
-                    let col = table.columns().get(col_idx).unwrap();
-
-                    // Check if this is a rowid alias
-                    let is_rowid_alias = col.is_rowid_alias;
-
-                    // Convert to Column expression - since this is a cross-database reference,
-                    // we need to create a synthetic table reference for it
-                    // For now, we'll error if the table isn't already in the referenced tables
-                    let normalized_tbl_name = normalize_ident(tbl_name.as_str());
-                    let matching_tbl = referenced_tables
-                        .find_table_and_internal_id_by_identifier(&normalized_tbl_name);
-
-                    if let Some((tbl_id, _)) = matching_tbl {
-                        // Table is already in referenced tables, use existing internal ID
-                        *expr = Expr::Column {
-                            database: Some(database_id),
-                            table: tbl_id,
-                            column: col_idx,
-                            is_rowid_alias,
-                        };
-                        referenced_tables.mark_column_used(tbl_id, col_idx);
-                    } else {
-                        return Err(crate::LimboError::ParseError(format!(
-                            "table {normalized_tbl_name} is not in FROM clause - cross-database column references require the table to be explicitly joined"
-                        )));
-                    }
-
-                    Ok(WalkControl::Continue)
-                }
-                _ => Ok(WalkControl::Continue),
-            }
-        },
-    )
-}
-
 #[allow(clippy::too_many_arguments)]
 fn parse_from_clause_table(
     schema: &Schema,
@@ -663,7 +438,7 @@ fn parse_table(
         let btree_table = Arc::new(crate::schema::BTreeTable {
             name: view_guard.name().to_string(),
             root_page,
-            columns: view_guard.columns.clone(),
+            columns: view_guard.column_schema.flat_columns(),
             primary_key_columns: Vec::new(),
             has_rowid: true,
             is_strict: false,
@@ -778,6 +553,7 @@ pub fn parse_from(
     table_references: &mut TableReferences,
     table_ref_counter: &mut TableRefIdCounter,
     connection: &Arc<crate::Connection>,
+    param_ctx: &mut ParamState,
 ) -> Result<()> {
     if from.is_none() {
         return Ok(());
@@ -876,6 +652,7 @@ pub fn parse_from(
             table_references,
             table_ref_counter,
             connection,
+            param_ctx,
         )?;
     }
 
@@ -888,12 +665,19 @@ pub fn parse_where(
     result_columns: Option<&[ResultSetColumn]>,
     out_where_clause: &mut Vec<WhereTerm>,
     connection: &Arc<crate::Connection>,
+    param_ctx: &mut ParamState,
 ) -> Result<()> {
     if let Some(where_expr) = where_clause {
         let start_idx = out_where_clause.len();
         break_predicate_at_and_boundaries(where_expr, out_where_clause);
         for expr in out_where_clause[start_idx..].iter_mut() {
-            bind_column_references(&mut expr.expr, table_references, result_columns, connection)?;
+            bind_and_rewrite_expr(
+                &mut expr.expr,
+                Some(table_references),
+                result_columns,
+                connection,
+                param_ctx,
+            )?;
         }
         Ok(())
     } else {
@@ -1086,6 +870,7 @@ fn parse_join(
     table_references: &mut TableReferences,
     table_ref_counter: &mut TableRefIdCounter,
     connection: &Arc<crate::Connection>,
+    param_ctx: &mut ParamState,
 ) -> Result<()> {
     let ast::JoinedSelectTable {
         operator: join_operator,
@@ -1173,11 +958,12 @@ fn parse_join(
                     } else {
                         None
                     };
-                    bind_column_references(
+                    bind_and_rewrite_expr(
                         &mut predicate.expr,
-                        table_references,
+                        Some(table_references),
                         None,
                         connection,
+                        param_ctx,
                     )?;
                 }
             }
@@ -1292,7 +1078,7 @@ pub fn break_predicate_at_and_boundaries<T: From<Expr>>(
     }
 }
 
-fn parse_row_id<F>(
+pub fn parse_row_id<F>(
     column_name: &str,
     table_id: TableInternalId,
     fn_check: F,
@@ -1317,11 +1103,11 @@ where
 pub fn parse_limit(
     limit: &mut Limit,
     connection: &std::sync::Arc<crate::Connection>,
+    param_ctx: &mut ParamState,
 ) -> Result<(Option<Box<Expr>>, Option<Box<Expr>>)> {
-    let mut empty_refs = TableReferences::new(Vec::new(), Vec::new());
-    bind_column_references(&mut limit.expr, &mut empty_refs, None, connection)?;
+    bind_and_rewrite_expr(&mut limit.expr, None, None, connection, param_ctx)?;
     if let Some(ref mut off_expr) = limit.offset {
-        bind_column_references(off_expr, &mut empty_refs, None, connection)?;
+        bind_and_rewrite_expr(off_expr, None, None, connection, param_ctx)?;
     }
     Ok((Some(limit.expr.clone()), limit.offset.clone()))
 }

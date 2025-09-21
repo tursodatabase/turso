@@ -2,21 +2,21 @@
 // Operator DAG for DBSP-style incremental computation
 // Based on Feldera DBSP design but adapted for Turso's architecture
 
-use crate::function::{AggFunc, Func};
-use crate::incremental::dbsp::{Delta, DeltaPair, HashableRow};
-use crate::incremental::expr_compiler::CompiledExpression;
-use crate::incremental::persistence::{MinMaxPersistState, ReadRecord, RecomputeMinMax, WriteRow};
+pub use crate::incremental::aggregate_operator::{
+    AggregateEvalState, AggregateFunction, AggregateState,
+};
+pub use crate::incremental::filter_operator::{FilterOperator, FilterPredicate};
+pub use crate::incremental::input_operator::InputOperator;
+pub use crate::incremental::join_operator::{JoinEvalState, JoinOperator, JoinType};
+pub use crate::incremental::project_operator::{ProjectColumn, ProjectOperator};
+
+use crate::incremental::dbsp::{Delta, DeltaPair};
 use crate::schema::{Index, IndexColumn};
 use crate::storage::btree::BTreeCursor;
-use crate::types::{IOResult, ImmutableRecord, SeekKey, SeekOp, SeekResult, Text};
-use crate::{
-    return_and_restore_if_io, return_if_io, Connection, Database, Result, SymbolTable, Value,
-};
-use std::collections::{BTreeMap, HashMap};
-use std::fmt::{self, Debug, Display};
+use crate::types::IOResult;
+use crate::Result;
+use std::fmt::Debug;
 use std::sync::{Arc, Mutex};
-use turso_macros::match_ignore_ascii_case;
-use turso_parser::ast::{As, Expr, Literal, Name, OneSelect, Operator, ResultColumn};
 
 /// Struct to hold both table and index cursors for DBSP state operations
 pub struct DbspStateCursors {
@@ -72,12 +72,6 @@ pub fn create_dbsp_state_index(root_page: usize) -> Index {
     }
 }
 
-/// Constants for aggregate type encoding in storage IDs (2 bits)
-pub const AGG_TYPE_REGULAR: u8 = 0b00; // COUNT/SUM/AVG
-pub const AGG_TYPE_MINMAX: u8 = 0b01; // MIN/MAX (BTree ordering gives both)
-pub const AGG_TYPE_RESERVED1: u8 = 0b10; // Reserved for future use
-pub const AGG_TYPE_RESERVED2: u8 = 0b11; // Reserved for future use
-
 /// Generate a storage ID with column index and operation type encoding
 /// Storage ID = (operator_id << 16) | (column_index << 2) | operation_type
 /// Bit layout (64-bit integer):
@@ -91,64 +85,13 @@ pub fn generate_storage_id(operator_id: usize, column_index: usize, op_type: u8)
     ((operator_id as i64) << 16) | ((column_index as i64) << 2) | (op_type as i64)
 }
 
-// group_key_str -> (group_key, state)
-type ComputedStates = HashMap<String, (Vec<Value>, AggregateState)>;
-// group_key_str -> (column_name, value_as_hashable_row) -> accumulated_weight
-pub type MinMaxDeltas = HashMap<String, HashMap<(String, HashableRow), isize>>;
-
-#[derive(Debug)]
-enum AggregateCommitState {
-    Idle,
-    Eval {
-        eval_state: EvalState,
-    },
-    PersistDelta {
-        delta: Delta,
-        computed_states: ComputedStates,
-        current_idx: usize,
-        write_row: WriteRow,
-        min_max_deltas: MinMaxDeltas,
-    },
-    PersistMinMax {
-        delta: Delta,
-        min_max_persist_state: MinMaxPersistState,
-    },
-    Done {
-        delta: Delta,
-    },
-    Invalid,
-}
-
-// eval() has uncommitted data, so it can't be a member attribute of the Operator.
-// The state has to be kept by the caller
+// Generic eval state that delegates to operator-specific states
 #[derive(Debug)]
 pub enum EvalState {
     Uninitialized,
-    Init {
-        deltas: DeltaPair,
-    },
-    FetchKey {
-        delta: Delta, // Keep original delta for merge operation
-        current_idx: usize,
-        groups_to_read: Vec<(String, Vec<Value>)>, // Changed to Vec for index-based access
-        existing_groups: HashMap<String, AggregateState>,
-        old_values: HashMap<String, Vec<Value>>,
-    },
-    FetchData {
-        delta: Delta, // Keep original delta for merge operation
-        current_idx: usize,
-        groups_to_read: Vec<(String, Vec<Value>)>, // Changed to Vec for index-based access
-        existing_groups: HashMap<String, AggregateState>,
-        old_values: HashMap<String, Vec<Value>>,
-        rowid: Option<i64>, // Rowid found by FetchKey (None if not found)
-        read_record_state: Box<ReadRecord>,
-    },
-    RecomputeMinMax {
-        delta: Delta,
-        existing_groups: HashMap<String, AggregateState>,
-        old_values: HashMap<String, Vec<Value>>,
-        recompute_state: Box<RecomputeMinMax>,
-    },
+    Init { deltas: DeltaPair },
+    Aggregate(Box<AggregateEvalState>),
+    Join(Box<JoinEvalState>),
     Done,
 }
 
@@ -187,182 +130,6 @@ impl EvalState {
                 extracted
             }
             _ => panic!("extract_delta() can only be called when in Init state"),
-        }
-    }
-
-    fn advance(&mut self, groups_to_read: BTreeMap<String, Vec<Value>>) {
-        let delta = match self {
-            EvalState::Init { deltas } => std::mem::take(&mut deltas.left),
-            _ => panic!("advance() can only be called when in Init state, current state: {self:?}"),
-        };
-
-        let _ = std::mem::replace(
-            self,
-            EvalState::FetchKey {
-                delta,
-                current_idx: 0,
-                groups_to_read: groups_to_read.into_iter().collect(), // Convert BTreeMap to Vec
-                existing_groups: HashMap::new(),
-                old_values: HashMap::new(),
-            },
-        );
-    }
-    fn process_delta(
-        &mut self,
-        operator: &mut AggregateOperator,
-        cursors: &mut DbspStateCursors,
-    ) -> Result<IOResult<(Delta, ComputedStates)>> {
-        loop {
-            match self {
-                EvalState::Uninitialized => {
-                    panic!("Cannot process_delta with Uninitialized state");
-                }
-                EvalState::Init { .. } => {
-                    panic!("State machine not supposed to reach the init state! advance() should have been called");
-                }
-                EvalState::FetchKey {
-                    delta,
-                    current_idx,
-                    groups_to_read,
-                    existing_groups,
-                    old_values,
-                } => {
-                    if *current_idx >= groups_to_read.len() {
-                        // All groups have been fetched, move to RecomputeMinMax
-                        // Extract MIN/MAX deltas from the input delta
-                        let min_max_deltas = operator.extract_min_max_deltas(delta);
-
-                        let recompute_state = Box::new(RecomputeMinMax::new(
-                            min_max_deltas,
-                            existing_groups,
-                            operator,
-                        ));
-
-                        *self = EvalState::RecomputeMinMax {
-                            delta: std::mem::take(delta),
-                            existing_groups: std::mem::take(existing_groups),
-                            old_values: std::mem::take(old_values),
-                            recompute_state,
-                        };
-                    } else {
-                        // Get the current group to read
-                        let (group_key_str, _group_key) = &groups_to_read[*current_idx];
-
-                        // Build the key for the index: (operator_id, zset_id, element_id)
-                        // For regular aggregates, use column_index=0 and AGG_TYPE_REGULAR
-                        let operator_storage_id =
-                            generate_storage_id(operator.operator_id, 0, AGG_TYPE_REGULAR);
-                        let zset_id = operator.generate_group_rowid(group_key_str);
-                        let element_id = 0i64; // Always 0 for aggregators
-
-                        // Create index key values
-                        let index_key_values = vec![
-                            Value::Integer(operator_storage_id),
-                            Value::Integer(zset_id),
-                            Value::Integer(element_id),
-                        ];
-
-                        // Create an immutable record for the index key
-                        let index_record =
-                            ImmutableRecord::from_values(&index_key_values, index_key_values.len());
-
-                        // Seek in the index to find if this row exists
-                        let seek_result = return_if_io!(cursors.index_cursor.seek(
-                            SeekKey::IndexKey(&index_record),
-                            SeekOp::GE { eq_only: true }
-                        ));
-
-                        let rowid = if matches!(seek_result, SeekResult::Found) {
-                            // Found in index, get the table rowid
-                            // The btree code handles extracting the rowid from the index record for has_rowid indexes
-                            return_if_io!(cursors.index_cursor.rowid())
-                        } else {
-                            // Not found in index, no existing state
-                            None
-                        };
-
-                        // Always transition to FetchData
-                        let taken_existing = std::mem::take(existing_groups);
-                        let taken_old_values = std::mem::take(old_values);
-                        let next_state = EvalState::FetchData {
-                            delta: std::mem::take(delta),
-                            current_idx: *current_idx,
-                            groups_to_read: std::mem::take(groups_to_read),
-                            existing_groups: taken_existing,
-                            old_values: taken_old_values,
-                            rowid,
-                            read_record_state: Box::new(ReadRecord::new()),
-                        };
-                        *self = next_state;
-                    }
-                }
-                EvalState::FetchData {
-                    delta,
-                    current_idx,
-                    groups_to_read,
-                    existing_groups,
-                    old_values,
-                    rowid,
-                    read_record_state,
-                } => {
-                    // Get the current group to read
-                    let (group_key_str, group_key) = &groups_to_read[*current_idx];
-
-                    // Only try to read if we have a rowid
-                    if let Some(rowid) = rowid {
-                        let key = SeekKey::TableRowId(*rowid);
-                        let state = return_if_io!(read_record_state.read_record(
-                            key,
-                            &operator.aggregates,
-                            &mut cursors.table_cursor
-                        ));
-                        // Process the fetched state
-                        if let Some(state) = state {
-                            let mut old_row = group_key.clone();
-                            old_row.extend(state.to_values(&operator.aggregates));
-                            old_values.insert(group_key_str.clone(), old_row);
-                            existing_groups.insert(group_key_str.clone(), state.clone());
-                        }
-                    } else {
-                        // No rowid for this group, skipping read
-                    }
-                    // If no rowid, there's no existing state for this group
-
-                    // Move to next group
-                    let next_idx = *current_idx + 1;
-                    let taken_existing = std::mem::take(existing_groups);
-                    let taken_old_values = std::mem::take(old_values);
-                    let next_state = EvalState::FetchKey {
-                        delta: std::mem::take(delta),
-                        current_idx: next_idx,
-                        groups_to_read: std::mem::take(groups_to_read),
-                        existing_groups: taken_existing,
-                        old_values: taken_old_values,
-                    };
-                    *self = next_state;
-                }
-                EvalState::RecomputeMinMax {
-                    delta,
-                    existing_groups,
-                    old_values,
-                    recompute_state,
-                } => {
-                    if operator.has_min_max() {
-                        // Process MIN/MAX recomputation - this will update existing_groups with correct MIN/MAX
-                        return_if_io!(recompute_state.process(existing_groups, operator, cursors));
-                    }
-
-                    // Now compute final output with updated MIN/MAX values
-                    let (output_delta, computed_states) =
-                        operator.merge_delta_with_existing(delta, existing_groups, old_values);
-
-                    *self = EvalState::Done;
-                    return Ok(IOResult::Done((output_delta, computed_states)));
-                }
-                EvalState::Done => {
-                    return Ok(IOResult::Done((Delta::new(), HashMap::new())));
-                }
-            }
         }
     }
 }
@@ -411,64 +178,6 @@ impl ComputationTracker {
     }
 }
 
-#[cfg(test)]
-mod dbsp_types_tests {
-    use super::*;
-
-    #[test]
-    fn test_hashable_row_delta_operations() {
-        let mut delta = Delta::new();
-
-        // Test INSERT
-        delta.insert(1, vec![Value::Integer(1), Value::Integer(100)]);
-        assert_eq!(delta.len(), 1);
-
-        // Test UPDATE (DELETE + INSERT) - order matters!
-        delta.delete(1, vec![Value::Integer(1), Value::Integer(100)]);
-        delta.insert(1, vec![Value::Integer(1), Value::Integer(200)]);
-        assert_eq!(delta.len(), 3); // Should have 3 operations before consolidation
-
-        // Verify order is preserved
-        let ops: Vec<_> = delta.changes.iter().collect();
-        assert_eq!(ops[0].1, 1); // First insert
-        assert_eq!(ops[1].1, -1); // Delete
-        assert_eq!(ops[2].1, 1); // Second insert
-
-        // Test consolidation
-        delta.consolidate();
-        // After consolidation, the first insert and delete should cancel out
-        // leaving only the second insert
-        assert_eq!(delta.len(), 1);
-
-        let final_row = &delta.changes[0];
-        assert_eq!(final_row.0.rowid, 1);
-        assert_eq!(
-            final_row.0.values,
-            vec![Value::Integer(1), Value::Integer(200)]
-        );
-        assert_eq!(final_row.1, 1);
-    }
-
-    #[test]
-    fn test_duplicate_row_consolidation() {
-        let mut delta = Delta::new();
-
-        // Insert same row twice
-        delta.insert(2, vec![Value::Integer(2), Value::Integer(300)]);
-        delta.insert(2, vec![Value::Integer(2), Value::Integer(300)]);
-
-        assert_eq!(delta.len(), 2);
-
-        delta.consolidate();
-        assert_eq!(delta.len(), 1);
-
-        // Weight should be 2 (sum of both inserts)
-        let final_row = &delta.changes[0];
-        assert_eq!(final_row.0.rowid, 2);
-        assert_eq!(final_row.1, 2);
-    }
-}
-
 /// Represents an operator in the dataflow graph
 #[derive(Debug, Clone)]
 pub enum QueryOperator {
@@ -506,198 +215,6 @@ pub enum QueryOperator {
     },
 }
 
-#[derive(Debug, Clone)]
-pub enum FilterPredicate {
-    /// Column = value
-    Equals { column: String, value: Value },
-    /// Column != value
-    NotEquals { column: String, value: Value },
-    /// Column > value
-    GreaterThan { column: String, value: Value },
-    /// Column >= value
-    GreaterThanOrEqual { column: String, value: Value },
-    /// Column < value
-    LessThan { column: String, value: Value },
-    /// Column <= value
-    LessThanOrEqual { column: String, value: Value },
-    /// Logical AND of two predicates
-    And(Box<FilterPredicate>, Box<FilterPredicate>),
-    /// Logical OR of two predicates
-    Or(Box<FilterPredicate>, Box<FilterPredicate>),
-    /// No predicate (accept all rows)
-    None,
-}
-
-impl FilterPredicate {
-    /// Parse a SQL AST expression into a FilterPredicate
-    /// This centralizes all SQL-to-predicate parsing logic
-    pub fn from_sql_expr(expr: &turso_parser::ast::Expr) -> crate::Result<Self> {
-        let Expr::Binary(lhs, op, rhs) = expr else {
-            return Err(crate::LimboError::ParseError(
-                "Unsupported WHERE clause for incremental views: not a binary expression"
-                    .to_string(),
-            ));
-        };
-
-        // Handle AND/OR logical operators
-        match op {
-            Operator::And => {
-                let left = Self::from_sql_expr(lhs)?;
-                let right = Self::from_sql_expr(rhs)?;
-                return Ok(FilterPredicate::And(Box::new(left), Box::new(right)));
-            }
-            Operator::Or => {
-                let left = Self::from_sql_expr(lhs)?;
-                let right = Self::from_sql_expr(rhs)?;
-                return Ok(FilterPredicate::Or(Box::new(left), Box::new(right)));
-            }
-            _ => {}
-        }
-
-        // Handle comparison operators
-        let Expr::Id(column_name) = &**lhs else {
-            return Err(crate::LimboError::ParseError(
-                "Unsupported WHERE clause for incremental views: left-hand-side is not a column reference".to_string(),
-            ));
-        };
-
-        let column = column_name.as_str().to_string();
-
-        // Parse the right-hand side value
-        let value = match &**rhs {
-            Expr::Literal(Literal::String(s)) => {
-                // Strip quotes from string literals
-                let cleaned = s.trim_matches('\'').trim_matches('"');
-                Value::Text(Text::new(cleaned))
-            }
-            Expr::Literal(Literal::Numeric(n)) => {
-                // Try to parse as integer first, then float
-                if let Ok(i) = n.parse::<i64>() {
-                    Value::Integer(i)
-                } else if let Ok(f) = n.parse::<f64>() {
-                    Value::Float(f)
-                } else {
-                    return Err(crate::LimboError::ParseError(
-                        "Unsupported WHERE clause for incremental views: right-hand-side is not a numeric literal".to_string(),
-                    ));
-                }
-            }
-            Expr::Literal(Literal::Null) => Value::Null,
-            Expr::Literal(Literal::Blob(_)) => {
-                // Blob comparison not yet supported
-                return Err(crate::LimboError::ParseError(
-                    "Unsupported WHERE clause for incremental views: comparison with blob literals is not supported".to_string(),
-                ));
-            }
-            other => {
-                // Complex expressions not yet supported
-                return Err(crate::LimboError::ParseError(
-                    format!("Unsupported WHERE clause for incremental views: comparison with {other:?} is not supported"),
-                ));
-            }
-        };
-
-        // Create the appropriate predicate based on operator
-        match op {
-            Operator::Equals => Ok(FilterPredicate::Equals { column, value }),
-            Operator::NotEquals => Ok(FilterPredicate::NotEquals { column, value }),
-            Operator::Greater => Ok(FilterPredicate::GreaterThan { column, value }),
-            Operator::GreaterEquals => Ok(FilterPredicate::GreaterThanOrEqual { column, value }),
-            Operator::Less => Ok(FilterPredicate::LessThan { column, value }),
-            Operator::LessEquals => Ok(FilterPredicate::LessThanOrEqual { column, value }),
-            other => Err(crate::LimboError::ParseError(
-                format!("Unsupported WHERE clause for incremental views: comparison operator {other:?} is not supported"),
-            )),
-        }
-    }
-
-    /// Parse a WHERE clause from a SELECT statement
-    pub fn from_select(select: &turso_parser::ast::Select) -> crate::Result<Self> {
-        if let OneSelect::Select {
-            ref where_clause, ..
-        } = select.body.select
-        {
-            if let Some(where_clause) = where_clause {
-                Self::from_sql_expr(where_clause)
-            } else {
-                Ok(FilterPredicate::None)
-            }
-        } else {
-            Err(crate::LimboError::ParseError(
-                "Unsupported WHERE clause for incremental views: not a single SELECT statement"
-                    .to_string(),
-            ))
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct ProjectColumn {
-    /// The original SQL expression (for debugging/fallback)
-    pub expr: turso_parser::ast::Expr,
-    /// Optional alias for the column
-    pub alias: Option<String>,
-    /// Compiled expression (handles both trivial columns and complex expressions)
-    pub compiled: CompiledExpression,
-}
-
-#[derive(Debug, Clone)]
-pub enum JoinType {
-    Inner,
-    Left,
-    Right,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum AggregateFunction {
-    Count,
-    Sum(String),
-    Avg(String),
-    Min(String),
-    Max(String),
-}
-
-impl Display for AggregateFunction {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            AggregateFunction::Count => write!(f, "COUNT(*)"),
-            AggregateFunction::Sum(col) => write!(f, "SUM({col})"),
-            AggregateFunction::Avg(col) => write!(f, "AVG({col})"),
-            AggregateFunction::Min(col) => write!(f, "MIN({col})"),
-            AggregateFunction::Max(col) => write!(f, "MAX({col})"),
-        }
-    }
-}
-
-impl AggregateFunction {
-    /// Get the default output column name for this aggregate function
-    #[inline]
-    pub fn default_output_name(&self) -> String {
-        self.to_string()
-    }
-
-    /// Create an AggregateFunction from a SQL function and its arguments
-    /// Returns None if the function is not a supported aggregate
-    pub fn from_sql_function(
-        func: &crate::function::Func,
-        input_column: Option<String>,
-    ) -> Option<Self> {
-        match func {
-            Func::Agg(agg_func) => {
-                match agg_func {
-                    AggFunc::Count | AggFunc::Count0 => Some(AggregateFunction::Count),
-                    AggFunc::Sum => input_column.map(AggregateFunction::Sum),
-                    AggFunc::Avg => input_column.map(AggregateFunction::Avg),
-                    AggFunc::Min => input_column.map(AggregateFunction::Min),
-                    AggFunc::Max => input_column.map(AggregateFunction::Max),
-                    _ => None, // Other aggregate functions not yet supported in DBSP
-                }
-            }
-            _ => None, // Not an aggregate function
-        }
-    }
-}
-
 /// Operator DAG (Directed Acyclic Graph)
 /// Base trait for incremental operators
 pub trait IncrementalOperator: Debug {
@@ -731,1506 +248,11 @@ pub trait IncrementalOperator: Debug {
     fn set_tracker(&mut self, tracker: Arc<Mutex<ComputationTracker>>);
 }
 
-/// Input operator - passes through input data unchanged
-/// This operator is used for input nodes in the circuit to provide a uniform interface
-#[derive(Debug)]
-pub struct InputOperator {
-    name: String,
-}
-
-impl InputOperator {
-    pub fn new(name: String) -> Self {
-        Self { name }
-    }
-
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-}
-
-impl IncrementalOperator for InputOperator {
-    fn eval(
-        &mut self,
-        state: &mut EvalState,
-        _cursors: &mut DbspStateCursors,
-    ) -> Result<IOResult<Delta>> {
-        match state {
-            EvalState::Init { deltas } => {
-                // Input operators only use left_delta, right_delta must be empty
-                assert!(
-                    deltas.right.is_empty(),
-                    "InputOperator expects right_delta to be empty"
-                );
-                let output = std::mem::take(&mut deltas.left);
-                *state = EvalState::Done;
-                Ok(IOResult::Done(output))
-            }
-            _ => unreachable!(
-                "InputOperator doesn't execute the state machine. Should be in Init state"
-            ),
-        }
-    }
-
-    fn commit(
-        &mut self,
-        deltas: DeltaPair,
-        _cursors: &mut DbspStateCursors,
-    ) -> Result<IOResult<Delta>> {
-        // Input operator only uses left delta, right must be empty
-        assert!(
-            deltas.right.is_empty(),
-            "InputOperator expects right delta to be empty in commit"
-        );
-        // Input operator passes through the delta unchanged during commit
-        Ok(IOResult::Done(deltas.left))
-    }
-
-    fn set_tracker(&mut self, _tracker: Arc<Mutex<ComputationTracker>>) {
-        // Input operator doesn't need tracking
-    }
-}
-
-/// Filter operator - filters rows based on predicate
-#[derive(Debug)]
-pub struct FilterOperator {
-    predicate: FilterPredicate,
-    column_names: Vec<String>,
-    tracker: Option<Arc<Mutex<ComputationTracker>>>,
-}
-
-impl FilterOperator {
-    pub fn new(predicate: FilterPredicate, column_names: Vec<String>) -> Self {
-        Self {
-            predicate,
-            column_names,
-            tracker: None,
-        }
-    }
-
-    /// Get the predicate for this filter
-    pub fn predicate(&self) -> &FilterPredicate {
-        &self.predicate
-    }
-
-    pub fn evaluate_predicate(&self, values: &[Value]) -> bool {
-        match &self.predicate {
-            FilterPredicate::None => true,
-            FilterPredicate::Equals { column, value } => {
-                if let Some(idx) = self.column_names.iter().position(|c| c == column) {
-                    if let Some(v) = values.get(idx) {
-                        return v == value;
-                    }
-                }
-                false
-            }
-            FilterPredicate::NotEquals { column, value } => {
-                if let Some(idx) = self.column_names.iter().position(|c| c == column) {
-                    if let Some(v) = values.get(idx) {
-                        return v != value;
-                    }
-                }
-                false
-            }
-            FilterPredicate::GreaterThan { column, value } => {
-                if let Some(idx) = self.column_names.iter().position(|c| c == column) {
-                    if let Some(v) = values.get(idx) {
-                        // Compare based on value types
-                        match (v, value) {
-                            (Value::Integer(a), Value::Integer(b)) => return a > b,
-                            (Value::Float(a), Value::Float(b)) => return a > b,
-                            (Value::Text(a), Value::Text(b)) => return a.as_str() > b.as_str(),
-                            _ => {}
-                        }
-                    }
-                }
-                false
-            }
-            FilterPredicate::GreaterThanOrEqual { column, value } => {
-                if let Some(idx) = self.column_names.iter().position(|c| c == column) {
-                    if let Some(v) = values.get(idx) {
-                        match (v, value) {
-                            (Value::Integer(a), Value::Integer(b)) => return a >= b,
-                            (Value::Float(a), Value::Float(b)) => return a >= b,
-                            (Value::Text(a), Value::Text(b)) => return a.as_str() >= b.as_str(),
-                            _ => {}
-                        }
-                    }
-                }
-                false
-            }
-            FilterPredicate::LessThan { column, value } => {
-                if let Some(idx) = self.column_names.iter().position(|c| c == column) {
-                    if let Some(v) = values.get(idx) {
-                        match (v, value) {
-                            (Value::Integer(a), Value::Integer(b)) => return a < b,
-                            (Value::Float(a), Value::Float(b)) => return a < b,
-                            (Value::Text(a), Value::Text(b)) => return a.as_str() < b.as_str(),
-                            _ => {}
-                        }
-                    }
-                }
-                false
-            }
-            FilterPredicate::LessThanOrEqual { column, value } => {
-                if let Some(idx) = self.column_names.iter().position(|c| c == column) {
-                    if let Some(v) = values.get(idx) {
-                        match (v, value) {
-                            (Value::Integer(a), Value::Integer(b)) => return a <= b,
-                            (Value::Float(a), Value::Float(b)) => return a <= b,
-                            (Value::Text(a), Value::Text(b)) => return a.as_str() <= b.as_str(),
-                            _ => {}
-                        }
-                    }
-                }
-                false
-            }
-            FilterPredicate::And(left, right) => {
-                // Temporarily create sub-filters to evaluate
-                let left_filter = FilterOperator::new((**left).clone(), self.column_names.clone());
-                let right_filter =
-                    FilterOperator::new((**right).clone(), self.column_names.clone());
-                left_filter.evaluate_predicate(values) && right_filter.evaluate_predicate(values)
-            }
-            FilterPredicate::Or(left, right) => {
-                let left_filter = FilterOperator::new((**left).clone(), self.column_names.clone());
-                let right_filter =
-                    FilterOperator::new((**right).clone(), self.column_names.clone());
-                left_filter.evaluate_predicate(values) || right_filter.evaluate_predicate(values)
-            }
-        }
-    }
-}
-
-impl IncrementalOperator for FilterOperator {
-    fn eval(
-        &mut self,
-        state: &mut EvalState,
-        _cursors: &mut DbspStateCursors,
-    ) -> Result<IOResult<Delta>> {
-        let delta = match state {
-            EvalState::Init { deltas } => {
-                // Filter operators only use left_delta, right_delta must be empty
-                assert!(
-                    deltas.right.is_empty(),
-                    "FilterOperator expects right_delta to be empty"
-                );
-                std::mem::take(&mut deltas.left)
-            }
-            _ => unreachable!(
-                "FilterOperator doesn't execute the state machine. Should be in Init state"
-            ),
-        };
-
-        let mut output_delta = Delta::new();
-
-        // Process the delta through the filter
-        for (row, weight) in delta.changes {
-            if let Some(tracker) = &self.tracker {
-                tracker.lock().unwrap().record_filter();
-            }
-
-            // Only pass through rows that satisfy the filter predicate
-            // For deletes (weight < 0), we only pass them if the row values
-            // would have passed the filter (meaning it was in the view)
-            if self.evaluate_predicate(&row.values) {
-                output_delta.changes.push((row, weight));
-            }
-        }
-
-        *state = EvalState::Done;
-        Ok(IOResult::Done(output_delta))
-    }
-
-    fn commit(
-        &mut self,
-        deltas: DeltaPair,
-        _cursors: &mut DbspStateCursors,
-    ) -> Result<IOResult<Delta>> {
-        // Filter operator only uses left delta, right must be empty
-        assert!(
-            deltas.right.is_empty(),
-            "FilterOperator expects right delta to be empty in commit"
-        );
-
-        let mut output_delta = Delta::new();
-
-        // Commit the delta to our internal state
-        // Only pass through and track rows that satisfy the filter predicate
-        for (row, weight) in deltas.left.changes {
-            if let Some(tracker) = &self.tracker {
-                tracker.lock().unwrap().record_filter();
-            }
-
-            // Only track and output rows that pass the filter
-            // For deletes, this means the row was in the view (its values pass the filter)
-            // For inserts, this means the row should be in the view
-            if self.evaluate_predicate(&row.values) {
-                output_delta.changes.push((row, weight));
-            }
-        }
-
-        Ok(IOResult::Done(output_delta))
-    }
-
-    fn set_tracker(&mut self, tracker: Arc<Mutex<ComputationTracker>>) {
-        self.tracker = Some(tracker);
-    }
-}
-
-/// Project operator - selects/transforms columns
-#[derive(Clone)]
-pub struct ProjectOperator {
-    columns: Vec<ProjectColumn>,
-    input_column_names: Vec<String>,
-    output_column_names: Vec<String>,
-    tracker: Option<Arc<Mutex<ComputationTracker>>>,
-    // Internal in-memory connection for expression evaluation
-    // Programs are very dependent on having a connection, so give it one.
-    //
-    // We could in theory pass the current connection, but there are a host of problems with that.
-    // For example: during a write transaction, where views are usually updated, we have autocommit
-    // on. When the program we are executing calls Halt, it will try to commit the current
-    // transaction, which is absolutely incorrect.
-    //
-    // There are other ways to solve this, but a read-only connection to an empty in-memory
-    // database gives us the closest environment we need to execute expressions.
-    internal_conn: Arc<Connection>,
-}
-
-impl std::fmt::Debug for ProjectOperator {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ProjectOperator")
-            .field("columns", &self.columns)
-            .field("input_column_names", &self.input_column_names)
-            .field("output_column_names", &self.output_column_names)
-            .field("tracker", &self.tracker)
-            .finish_non_exhaustive()
-    }
-}
-
-impl ProjectOperator {
-    /// Create a new ProjectOperator from a SELECT statement, extracting projection columns
-    pub fn from_select(
-        select: &turso_parser::ast::Select,
-        input_column_names: Vec<String>,
-        schema: &crate::schema::Schema,
-    ) -> crate::Result<Self> {
-        // Set up internal connection for expression evaluation
-        let io = Arc::new(crate::MemoryIO::new());
-        let db = Database::open_file(
-            io, ":memory:", false, // no MVCC needed for expression evaluation
-            false, // no indexes needed
-        )?;
-        let internal_conn = db.connect()?;
-        // Set to read-only mode and disable auto-commit since we're only evaluating expressions
-        internal_conn.query_only.set(true);
-        internal_conn.auto_commit.set(false);
-
-        let temp_syms = SymbolTable::new();
-
-        // Extract columns from SELECT statement
-        let columns = if let OneSelect::Select {
-            columns: ref select_columns,
-            ..
-        } = &select.body.select
-        {
-            let mut columns = Vec::new();
-            for result_col in select_columns {
-                match result_col {
-                    ResultColumn::Expr(expr, alias) => {
-                        let alias_str = if let Some(As::As(alias_name)) = alias {
-                            Some(alias_name.as_str().to_string())
-                        } else {
-                            None
-                        };
-                        // Try to compile the expression (handles both columns and complex expressions)
-                        let compiled = CompiledExpression::compile(
-                            expr,
-                            &input_column_names,
-                            schema,
-                            &temp_syms,
-                            internal_conn.clone(),
-                        )?;
-                        columns.push(ProjectColumn {
-                            expr: (**expr).clone(),
-                            alias: alias_str,
-                            compiled,
-                        });
-                    }
-                    ResultColumn::Star => {
-                        // Select all columns - create trivial column references
-                        for name in &input_column_names {
-                            // Create an Id expression for the column
-                            let expr = Expr::Id(Name::Ident(name.clone()));
-                            let compiled = CompiledExpression::compile(
-                                &expr,
-                                &input_column_names,
-                                schema,
-                                &temp_syms,
-                                internal_conn.clone(),
-                            )?;
-                            columns.push(ProjectColumn {
-                                expr,
-                                alias: None,
-                                compiled,
-                            });
-                        }
-                    }
-                    x => {
-                        return Err(crate::LimboError::ParseError(format!(
-                            "Unsupported {x:?} clause when compiling project operator",
-                        )));
-                    }
-                }
-            }
-
-            if columns.is_empty() {
-                return Err(crate::LimboError::ParseError(
-                    "No columns found when compiling project operator".to_string(),
-                ));
-            }
-            columns
-        } else {
-            return Err(crate::LimboError::ParseError(
-                "Expression is not a valid SELECT expression".to_string(),
-            ));
-        };
-
-        // Generate output column names based on aliases or expressions
-        let output_column_names = columns
-            .iter()
-            .map(|c| {
-                c.alias.clone().unwrap_or_else(|| match &c.expr {
-                    Expr::Id(name) => name.as_str().to_string(),
-                    Expr::Qualified(table, column) => {
-                        format!("{}.{}", table.as_str(), column.as_str())
-                    }
-                    Expr::DoublyQualified(db, table, column) => {
-                        format!("{}.{}.{}", db.as_str(), table.as_str(), column.as_str())
-                    }
-                    _ => c.expr.to_string(),
-                })
-            })
-            .collect();
-
-        Ok(Self {
-            columns,
-            input_column_names,
-            output_column_names,
-            tracker: None,
-            internal_conn,
-        })
-    }
-
-    /// Create a ProjectOperator from pre-compiled expressions
-    pub fn from_compiled(
-        compiled_exprs: Vec<CompiledExpression>,
-        aliases: Vec<Option<String>>,
-        input_column_names: Vec<String>,
-        output_column_names: Vec<String>,
-    ) -> crate::Result<Self> {
-        // Set up internal connection for expression evaluation
-        let io = Arc::new(crate::MemoryIO::new());
-        let db = Database::open_file(
-            io, ":memory:", false, // no MVCC needed for expression evaluation
-            false, // no indexes needed
-        )?;
-        let internal_conn = db.connect()?;
-        // Set to read-only mode and disable auto-commit since we're only evaluating expressions
-        internal_conn.query_only.set(true);
-        internal_conn.auto_commit.set(false);
-
-        // Create ProjectColumn structs from compiled expressions
-        let columns: Vec<ProjectColumn> = compiled_exprs
-            .into_iter()
-            .zip(aliases)
-            .map(|(compiled, alias)| ProjectColumn {
-                // Create a placeholder AST expression since we already have the compiled version
-                expr: turso_parser::ast::Expr::Literal(turso_parser::ast::Literal::Null),
-                alias,
-                compiled,
-            })
-            .collect();
-
-        Ok(Self {
-            columns,
-            input_column_names,
-            output_column_names,
-            tracker: None,
-            internal_conn,
-        })
-    }
-
-    /// Get the columns for this projection
-    pub fn columns(&self) -> &[ProjectColumn] {
-        &self.columns
-    }
-
-    fn project_values(&self, values: &[Value]) -> Vec<Value> {
-        let mut output = Vec::new();
-
-        for col in &self.columns {
-            // Use the internal connection's pager for expression evaluation
-            let internal_pager = self.internal_conn.pager.borrow().clone();
-
-            // Execute the compiled expression (handles both columns and complex expressions)
-            let result = col
-                .compiled
-                .execute(values, internal_pager)
-                .expect("Failed to execute compiled expression for the Project operator");
-            output.push(result);
-        }
-
-        output
-    }
-
-    fn evaluate_expression(&self, expr: &turso_parser::ast::Expr, values: &[Value]) -> Value {
-        match expr {
-            Expr::Id(name) => {
-                if let Some(idx) = self
-                    .input_column_names
-                    .iter()
-                    .position(|c| c == name.as_str())
-                {
-                    if let Some(v) = values.get(idx) {
-                        return v.clone();
-                    }
-                }
-                Value::Null
-            }
-            Expr::Literal(lit) => {
-                match lit {
-                    Literal::Numeric(n) => {
-                        if let Ok(i) = n.parse::<i64>() {
-                            Value::Integer(i)
-                        } else if let Ok(f) = n.parse::<f64>() {
-                            Value::Float(f)
-                        } else {
-                            Value::Null
-                        }
-                    }
-                    Literal::String(s) => {
-                        let cleaned = s.trim_matches('\'').trim_matches('"');
-                        Value::Text(Text::new(cleaned))
-                    }
-                    Literal::Null => Value::Null,
-                    Literal::Blob(_)
-                    | Literal::Keyword(_)
-                    | Literal::CurrentDate
-                    | Literal::CurrentTime
-                    | Literal::CurrentTimestamp => Value::Null, // Not supported yet
-                }
-            }
-            Expr::Binary(left, op, right) => {
-                let left_val = self.evaluate_expression(left, values);
-                let right_val = self.evaluate_expression(right, values);
-
-                match op {
-                    Operator::Add => match (&left_val, &right_val) {
-                        (Value::Integer(a), Value::Integer(b)) => Value::Integer(a + b),
-                        (Value::Float(a), Value::Float(b)) => Value::Float(a + b),
-                        (Value::Integer(a), Value::Float(b)) => Value::Float(*a as f64 + b),
-                        (Value::Float(a), Value::Integer(b)) => Value::Float(a + *b as f64),
-                        _ => Value::Null,
-                    },
-                    Operator::Subtract => match (&left_val, &right_val) {
-                        (Value::Integer(a), Value::Integer(b)) => Value::Integer(a - b),
-                        (Value::Float(a), Value::Float(b)) => Value::Float(a - b),
-                        (Value::Integer(a), Value::Float(b)) => Value::Float(*a as f64 - b),
-                        (Value::Float(a), Value::Integer(b)) => Value::Float(a - *b as f64),
-                        _ => Value::Null,
-                    },
-                    Operator::Multiply => match (&left_val, &right_val) {
-                        (Value::Integer(a), Value::Integer(b)) => Value::Integer(a * b),
-                        (Value::Float(a), Value::Float(b)) => Value::Float(a * b),
-                        (Value::Integer(a), Value::Float(b)) => Value::Float(*a as f64 * b),
-                        (Value::Float(a), Value::Integer(b)) => Value::Float(a * *b as f64),
-                        _ => Value::Null,
-                    },
-                    Operator::Divide => match (&left_val, &right_val) {
-                        (Value::Integer(a), Value::Integer(b)) => {
-                            if *b != 0 {
-                                Value::Integer(a / b)
-                            } else {
-                                Value::Null
-                            }
-                        }
-                        (Value::Float(a), Value::Float(b)) => {
-                            if *b != 0.0 {
-                                Value::Float(a / b)
-                            } else {
-                                Value::Null
-                            }
-                        }
-                        (Value::Integer(a), Value::Float(b)) => {
-                            if *b != 0.0 {
-                                Value::Float(*a as f64 / b)
-                            } else {
-                                Value::Null
-                            }
-                        }
-                        (Value::Float(a), Value::Integer(b)) => {
-                            if *b != 0 {
-                                Value::Float(a / *b as f64)
-                            } else {
-                                Value::Null
-                            }
-                        }
-                        _ => Value::Null,
-                    },
-                    _ => Value::Null, // Other operators not supported yet
-                }
-            }
-            Expr::FunctionCall { name, args, .. } => {
-                let name_bytes = name.as_str().as_bytes();
-                match_ignore_ascii_case!(match name_bytes {
-                    b"hex" => {
-                        if args.len() == 1 {
-                            let arg_val = self.evaluate_expression(&args[0], values);
-                            match arg_val {
-                                Value::Integer(i) => Value::Text(Text::new(&format!("{i:X}"))),
-                                _ => Value::Null,
-                            }
-                        } else {
-                            Value::Null
-                        }
-                    }
-                    _ => Value::Null, // Other functions not supported yet
-                })
-            }
-            Expr::Parenthesized(inner) => {
-                assert!(
-                    inner.len() <= 1,
-                    "Parenthesized expressions with multiple elements are not supported"
-                );
-                if !inner.is_empty() {
-                    self.evaluate_expression(&inner[0], values)
-                } else {
-                    Value::Null
-                }
-            }
-            _ => Value::Null, // Other expression types not supported yet
-        }
-    }
-}
-
-impl IncrementalOperator for ProjectOperator {
-    fn eval(
-        &mut self,
-        state: &mut EvalState,
-        _cursors: &mut DbspStateCursors,
-    ) -> Result<IOResult<Delta>> {
-        let delta = match state {
-            EvalState::Init { deltas } => {
-                // Project operators only use left_delta, right_delta must be empty
-                assert!(
-                    deltas.right.is_empty(),
-                    "ProjectOperator expects right_delta to be empty"
-                );
-                std::mem::take(&mut deltas.left)
-            }
-            _ => unreachable!(
-                "ProjectOperator doesn't execute the state machine. Should be in Init state"
-            ),
-        };
-
-        let mut output_delta = Delta::new();
-
-        for (row, weight) in delta.changes {
-            if let Some(tracker) = &self.tracker {
-                tracker.lock().unwrap().record_project();
-            }
-
-            let projected = self.project_values(&row.values);
-            let projected_row = HashableRow::new(row.rowid, projected);
-            output_delta.changes.push((projected_row, weight));
-        }
-
-        *state = EvalState::Done;
-        Ok(IOResult::Done(output_delta))
-    }
-
-    fn commit(
-        &mut self,
-        deltas: DeltaPair,
-        _cursors: &mut DbspStateCursors,
-    ) -> Result<IOResult<Delta>> {
-        // Project operator only uses left delta, right must be empty
-        assert!(
-            deltas.right.is_empty(),
-            "ProjectOperator expects right delta to be empty in commit"
-        );
-
-        let mut output_delta = Delta::new();
-
-        // Commit the delta to our internal state and build output
-        for (row, weight) in &deltas.left.changes {
-            if let Some(tracker) = &self.tracker {
-                tracker.lock().unwrap().record_project();
-            }
-            let projected = self.project_values(&row.values);
-            let projected_row = HashableRow::new(row.rowid, projected);
-            output_delta.changes.push((projected_row, *weight));
-        }
-
-        Ok(crate::types::IOResult::Done(output_delta))
-    }
-
-    fn set_tracker(&mut self, tracker: Arc<Mutex<ComputationTracker>>) {
-        self.tracker = Some(tracker);
-    }
-}
-
-/// Aggregate operator - performs incremental aggregation with GROUP BY
-/// Maintains running totals/counts that are updated incrementally
-///
-/// Information about a column that has MIN/MAX aggregations
-#[derive(Debug, Clone)]
-pub struct AggColumnInfo {
-    /// Index used for storage key generation
-    pub index: usize,
-    /// Whether this column has a MIN aggregate
-    pub has_min: bool,
-    /// Whether this column has a MAX aggregate
-    pub has_max: bool,
-}
-
-/// Note that the AggregateOperator essentially implements a ZSet, even
-/// though the ZSet structure is never used explicitly. The on-disk btree
-/// plays the role of the set!
-#[derive(Debug)]
-pub struct AggregateOperator {
-    // Unique operator ID for indexing in persistent storage
-    pub operator_id: usize,
-    // GROUP BY columns
-    group_by: Vec<String>,
-    // Aggregate functions to compute (including MIN/MAX)
-    pub aggregates: Vec<AggregateFunction>,
-    // Column names from input
-    pub input_column_names: Vec<String>,
-    // Map from column name to aggregate info for quick lookup
-    pub column_min_max: HashMap<String, AggColumnInfo>,
-    tracker: Option<Arc<Mutex<ComputationTracker>>>,
-
-    // State machine for commit operation
-    commit_state: AggregateCommitState,
-}
-
-/// State for a single group's aggregates
-#[derive(Debug, Clone, Default)]
-pub struct AggregateState {
-    // For COUNT: just the count
-    count: i64,
-    // For SUM: column_name -> sum value
-    sums: HashMap<String, f64>,
-    // For AVG: column_name -> (sum, count) for computing average
-    avgs: HashMap<String, (f64, i64)>,
-    // For MIN: column_name -> minimum value
-    pub mins: HashMap<String, Value>,
-    // For MAX: column_name -> maximum value
-    pub maxs: HashMap<String, Value>,
-}
-
-/// Serialize a Value using SQLite's serial type format
-/// This is used for MIN/MAX values that need to be stored in a compact, sortable format
-pub fn serialize_value(value: &Value, blob: &mut Vec<u8>) {
-    let serial_type = crate::types::SerialType::from(value);
-    let serial_type_u64: u64 = serial_type.into();
-    crate::storage::sqlite3_ondisk::write_varint_to_vec(serial_type_u64, blob);
-    value.serialize_serial(blob);
-}
-
-/// Deserialize a Value using SQLite's serial type format
-/// Returns the deserialized value and the number of bytes consumed
-pub fn deserialize_value(blob: &[u8]) -> Option<(Value, usize)> {
-    let mut cursor = 0;
-
-    // Read the serial type
-    let (serial_type, varint_size) = crate::storage::sqlite3_ondisk::read_varint(blob).ok()?;
-    cursor += varint_size;
-
-    let serial_type_obj = crate::types::SerialType::try_from(serial_type).ok()?;
-    let expected_size = serial_type_obj.size();
-
-    // Read the value
-    let (value, actual_size) =
-        crate::storage::sqlite3_ondisk::read_value(&blob[cursor..], serial_type_obj).ok()?;
-
-    // Verify that the actual size matches what we expected from the serial type
-    if actual_size != expected_size {
-        return None; // Data corruption - size mismatch
-    }
-
-    cursor += actual_size;
-
-    // Convert RefValue to Value
-    Some((value.to_owned(), cursor))
-}
-
-impl AggregateState {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    // Serialize the aggregate state to a binary blob including group key values
-    // The reason we serialize it like this, instead of just writing the actual values, is that
-    // The same table may have different aggregators in the circuit. They will all have different
-    // columns.
-    fn to_blob(&self, aggregates: &[AggregateFunction], group_key: &[Value]) -> Vec<u8> {
-        let mut blob = Vec::new();
-
-        // Write version byte for future compatibility
-        blob.push(1u8);
-
-        // Write number of group key values
-        blob.extend_from_slice(&(group_key.len() as u32).to_le_bytes());
-
-        // Write each group key value
-        for value in group_key {
-            // Write value type tag
-            match value {
-                Value::Null => blob.push(0u8),
-                Value::Integer(i) => {
-                    blob.push(1u8);
-                    blob.extend_from_slice(&i.to_le_bytes());
-                }
-                Value::Float(f) => {
-                    blob.push(2u8);
-                    blob.extend_from_slice(&f.to_le_bytes());
-                }
-                Value::Text(s) => {
-                    blob.push(3u8);
-                    let text_str = s.as_str();
-                    let bytes = text_str.as_bytes();
-                    blob.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-                    blob.extend_from_slice(bytes);
-                }
-                Value::Blob(b) => {
-                    blob.push(4u8);
-                    blob.extend_from_slice(&(b.len() as u32).to_le_bytes());
-                    blob.extend_from_slice(b);
-                }
-            }
-        }
-
-        // Write count as 8 bytes (little-endian)
-        blob.extend_from_slice(&self.count.to_le_bytes());
-
-        // Write each aggregate's state
-        for agg in aggregates {
-            match agg {
-                AggregateFunction::Sum(col_name) => {
-                    let sum = self.sums.get(col_name).copied().unwrap_or(0.0);
-                    blob.extend_from_slice(&sum.to_le_bytes());
-                }
-                AggregateFunction::Avg(col_name) => {
-                    let (sum, count) = self.avgs.get(col_name).copied().unwrap_or((0.0, 0));
-                    blob.extend_from_slice(&sum.to_le_bytes());
-                    blob.extend_from_slice(&count.to_le_bytes());
-                }
-                AggregateFunction::Count => {
-                    // Count is already written above
-                }
-                AggregateFunction::Min(col_name) => {
-                    // Write whether we have a MIN value (1 byte)
-                    if let Some(min_val) = self.mins.get(col_name) {
-                        blob.push(1u8); // Has value
-                        serialize_value(min_val, &mut blob);
-                    } else {
-                        blob.push(0u8); // No value
-                    }
-                }
-                AggregateFunction::Max(col_name) => {
-                    // Write whether we have a MAX value (1 byte)
-                    if let Some(max_val) = self.maxs.get(col_name) {
-                        blob.push(1u8); // Has value
-                        serialize_value(max_val, &mut blob);
-                    } else {
-                        blob.push(0u8); // No value
-                    }
-                }
-            }
-        }
-
-        blob
-    }
-
-    /// Deserialize aggregate state from a binary blob
-    /// Returns the aggregate state and the group key values
-    pub fn from_blob(blob: &[u8], aggregates: &[AggregateFunction]) -> Option<(Self, Vec<Value>)> {
-        let mut cursor = 0;
-
-        // Check version byte
-        if blob.get(cursor) != Some(&1u8) {
-            return None;
-        }
-        cursor += 1;
-
-        // Read number of group key values
-        let num_group_keys =
-            u32::from_le_bytes(blob.get(cursor..cursor + 4)?.try_into().ok()?) as usize;
-        cursor += 4;
-
-        // Read group key values
-        let mut group_key = Vec::new();
-        for _ in 0..num_group_keys {
-            let value_type = *blob.get(cursor)?;
-            cursor += 1;
-
-            let value = match value_type {
-                0 => Value::Null,
-                1 => {
-                    let i = i64::from_le_bytes(blob.get(cursor..cursor + 8)?.try_into().ok()?);
-                    cursor += 8;
-                    Value::Integer(i)
-                }
-                2 => {
-                    let f = f64::from_le_bytes(blob.get(cursor..cursor + 8)?.try_into().ok()?);
-                    cursor += 8;
-                    Value::Float(f)
-                }
-                3 => {
-                    let len =
-                        u32::from_le_bytes(blob.get(cursor..cursor + 4)?.try_into().ok()?) as usize;
-                    cursor += 4;
-                    let bytes = blob.get(cursor..cursor + len)?;
-                    cursor += len;
-                    let text_str = std::str::from_utf8(bytes).ok()?;
-                    Value::Text(text_str.to_string().into())
-                }
-                4 => {
-                    let len =
-                        u32::from_le_bytes(blob.get(cursor..cursor + 4)?.try_into().ok()?) as usize;
-                    cursor += 4;
-                    let bytes = blob.get(cursor..cursor + len)?;
-                    cursor += len;
-                    Value::Blob(bytes.to_vec())
-                }
-                _ => return None,
-            };
-            group_key.push(value);
-        }
-
-        // Read count
-        let count = i64::from_le_bytes(blob.get(cursor..cursor + 8)?.try_into().ok()?);
-        cursor += 8;
-
-        let mut state = Self::new();
-        state.count = count;
-
-        // Read each aggregate's state
-        for agg in aggregates {
-            match agg {
-                AggregateFunction::Sum(col_name) => {
-                    let sum = f64::from_le_bytes(blob.get(cursor..cursor + 8)?.try_into().ok()?);
-                    cursor += 8;
-                    state.sums.insert(col_name.clone(), sum);
-                }
-                AggregateFunction::Avg(col_name) => {
-                    let sum = f64::from_le_bytes(blob.get(cursor..cursor + 8)?.try_into().ok()?);
-                    cursor += 8;
-                    let count = i64::from_le_bytes(blob.get(cursor..cursor + 8)?.try_into().ok()?);
-                    cursor += 8;
-                    state.avgs.insert(col_name.clone(), (sum, count));
-                }
-                AggregateFunction::Count => {
-                    // Count was already read above
-                }
-                AggregateFunction::Min(col_name) => {
-                    // Read whether we have a MIN value
-                    let has_value = *blob.get(cursor)?;
-                    cursor += 1;
-
-                    if has_value == 1 {
-                        let (min_value, bytes_consumed) = deserialize_value(&blob[cursor..])?;
-                        cursor += bytes_consumed;
-                        state.mins.insert(col_name.clone(), min_value);
-                    }
-                }
-                AggregateFunction::Max(col_name) => {
-                    // Read whether we have a MAX value
-                    let has_value = *blob.get(cursor)?;
-                    cursor += 1;
-
-                    if has_value == 1 {
-                        let (max_value, bytes_consumed) = deserialize_value(&blob[cursor..])?;
-                        cursor += bytes_consumed;
-                        state.maxs.insert(col_name.clone(), max_value);
-                    }
-                }
-            }
-        }
-
-        Some((state, group_key))
-    }
-
-    /// Apply a delta to this aggregate state
-    fn apply_delta(
-        &mut self,
-        values: &[Value],
-        weight: isize,
-        aggregates: &[AggregateFunction],
-        column_names: &[String],
-    ) {
-        // Update COUNT
-        self.count += weight as i64;
-
-        // Update other aggregates
-        for agg in aggregates {
-            match agg {
-                AggregateFunction::Count => {
-                    // Already handled above
-                }
-                AggregateFunction::Sum(col_name) => {
-                    if let Some(idx) = column_names.iter().position(|c| c == col_name) {
-                        if let Some(val) = values.get(idx) {
-                            let num_val = match val {
-                                Value::Integer(i) => *i as f64,
-                                Value::Float(f) => *f,
-                                _ => 0.0,
-                            };
-                            *self.sums.entry(col_name.clone()).or_insert(0.0) +=
-                                num_val * weight as f64;
-                        }
-                    }
-                }
-                AggregateFunction::Avg(col_name) => {
-                    if let Some(idx) = column_names.iter().position(|c| c == col_name) {
-                        if let Some(val) = values.get(idx) {
-                            let num_val = match val {
-                                Value::Integer(i) => *i as f64,
-                                Value::Float(f) => *f,
-                                _ => 0.0,
-                            };
-                            let (sum, count) =
-                                self.avgs.entry(col_name.clone()).or_insert((0.0, 0));
-                            *sum += num_val * weight as f64;
-                            *count += weight as i64;
-                        }
-                    }
-                }
-                AggregateFunction::Min(_col_name) | AggregateFunction::Max(_col_name) => {
-                    // MIN/MAX cannot be handled incrementally in apply_delta because:
-                    //
-                    // 1. For insertions: We can't just keep the minimum/maximum value.
-                    //    We need to track ALL values to handle future deletions correctly.
-                    //
-                    // 2. For deletions (retractions): If we delete the current MIN/MAX,
-                    //    we need to find the next best value, which requires knowing all
-                    //    other values in the group.
-                    //
-                    // Example: Consider MIN(price) with values [10, 20, 30]
-                    // - Current MIN = 10
-                    // - Delete 10 (weight = -1)
-                    // - New MIN should be 20, but we can't determine this without
-                    //   having tracked all values [20, 30]
-                    //
-                    // Therefore, MIN/MAX processing is handled separately:
-                    // - All input values are persisted to the index via persist_min_max()
-                    // - When aggregates have MIN/MAX, we unconditionally transition to
-                    //   the RecomputeMinMax state machine (see EvalState::RecomputeMinMax)
-                    // - RecomputeMinMax checks if the current MIN/MAX was deleted, and if so,
-                    //   scans the index to find the new MIN/MAX from remaining values
-                    //
-                    // This ensures correctness for incremental computation at the cost of
-                    // additional I/O for MIN/MAX operations.
-                }
-            }
-        }
-    }
-
-    /// Convert aggregate state to output values
-    pub fn to_values(&self, aggregates: &[AggregateFunction]) -> Vec<Value> {
-        let mut result = Vec::new();
-
-        for agg in aggregates {
-            match agg {
-                AggregateFunction::Count => {
-                    result.push(Value::Integer(self.count));
-                }
-                AggregateFunction::Sum(col_name) => {
-                    let sum = self.sums.get(col_name).copied().unwrap_or(0.0);
-                    // Return as integer if it's a whole number, otherwise as float
-                    if sum.fract() == 0.0 {
-                        result.push(Value::Integer(sum as i64));
-                    } else {
-                        result.push(Value::Float(sum));
-                    }
-                }
-                AggregateFunction::Avg(col_name) => {
-                    if let Some((sum, count)) = self.avgs.get(col_name) {
-                        if *count > 0 {
-                            result.push(Value::Float(sum / *count as f64));
-                        } else {
-                            result.push(Value::Null);
-                        }
-                    } else {
-                        result.push(Value::Null);
-                    }
-                }
-                AggregateFunction::Min(col_name) => {
-                    // Return the MIN value from our state
-                    result.push(self.mins.get(col_name).cloned().unwrap_or(Value::Null));
-                }
-                AggregateFunction::Max(col_name) => {
-                    // Return the MAX value from our state
-                    result.push(self.maxs.get(col_name).cloned().unwrap_or(Value::Null));
-                }
-            }
-        }
-
-        result
-    }
-}
-
-impl AggregateOperator {
-    pub fn new(
-        operator_id: usize,
-        group_by: Vec<String>,
-        aggregates: Vec<AggregateFunction>,
-        input_column_names: Vec<String>,
-    ) -> Self {
-        // Build map of column names to their MIN/MAX info with indices
-        let mut column_min_max = HashMap::new();
-        let mut column_indices = HashMap::new();
-        let mut current_index = 0;
-
-        // First pass: assign indices to unique MIN/MAX columns
-        for agg in &aggregates {
-            match agg {
-                AggregateFunction::Min(col) | AggregateFunction::Max(col) => {
-                    column_indices.entry(col.clone()).or_insert_with(|| {
-                        let idx = current_index;
-                        current_index += 1;
-                        idx
-                    });
-                }
-                _ => {}
-            }
-        }
-
-        // Second pass: build the column info map
-        for agg in &aggregates {
-            match agg {
-                AggregateFunction::Min(col) => {
-                    let index = *column_indices.get(col).unwrap();
-                    let entry = column_min_max.entry(col.clone()).or_insert(AggColumnInfo {
-                        index,
-                        has_min: false,
-                        has_max: false,
-                    });
-                    entry.has_min = true;
-                }
-                AggregateFunction::Max(col) => {
-                    let index = *column_indices.get(col).unwrap();
-                    let entry = column_min_max.entry(col.clone()).or_insert(AggColumnInfo {
-                        index,
-                        has_min: false,
-                        has_max: false,
-                    });
-                    entry.has_max = true;
-                }
-                _ => {}
-            }
-        }
-
-        Self {
-            operator_id,
-            group_by,
-            aggregates,
-            input_column_names,
-            column_min_max,
-            tracker: None,
-            commit_state: AggregateCommitState::Idle,
-        }
-    }
-
-    pub fn has_min_max(&self) -> bool {
-        !self.column_min_max.is_empty()
-    }
-
-    fn eval_internal(
-        &mut self,
-        state: &mut EvalState,
-        cursors: &mut DbspStateCursors,
-    ) -> Result<IOResult<(Delta, ComputedStates)>> {
-        match state {
-            EvalState::Uninitialized => {
-                panic!("Cannot eval AggregateOperator with Uninitialized state");
-            }
-            EvalState::Init { deltas } => {
-                // Aggregate operators only use left_delta, right_delta must be empty
-                assert!(
-                    deltas.right.is_empty(),
-                    "AggregateOperator expects right_delta to be empty"
-                );
-
-                if deltas.left.changes.is_empty() {
-                    *state = EvalState::Done;
-                    return Ok(IOResult::Done((Delta::new(), HashMap::new())));
-                }
-
-                let mut groups_to_read = BTreeMap::new();
-                for (row, _weight) in &deltas.left.changes {
-                    // Extract group key using cloned fields
-                    let group_key = self.extract_group_key(&row.values);
-                    let group_key_str = Self::group_key_to_string(&group_key);
-                    groups_to_read.insert(group_key_str, group_key);
-                }
-                state.advance(groups_to_read);
-            }
-            EvalState::FetchKey { .. }
-            | EvalState::FetchData { .. }
-            | EvalState::RecomputeMinMax { .. } => {
-                // Already in progress, continue processing on process_delta below.
-            }
-            EvalState::Done => {
-                panic!("unreachable state! should have returned");
-            }
-        }
-
-        // Process the delta through the state machine
-        let result = return_if_io!(state.process_delta(self, cursors));
-        Ok(IOResult::Done(result))
-    }
-
-    fn merge_delta_with_existing(
-        &mut self,
-        delta: &Delta,
-        existing_groups: &mut HashMap<String, AggregateState>,
-        old_values: &mut HashMap<String, Vec<Value>>,
-    ) -> (Delta, HashMap<String, (Vec<Value>, AggregateState)>) {
-        let mut output_delta = Delta::new();
-        let mut temp_keys: HashMap<String, Vec<Value>> = HashMap::new();
-
-        // Process each change in the delta
-        for (row, weight) in &delta.changes {
-            if let Some(tracker) = &self.tracker {
-                tracker.lock().unwrap().record_aggregation();
-            }
-
-            // Extract group key
-            let group_key = self.extract_group_key(&row.values);
-            let group_key_str = Self::group_key_to_string(&group_key);
-
-            let state = existing_groups.entry(group_key_str.clone()).or_default();
-
-            temp_keys.insert(group_key_str.clone(), group_key.clone());
-
-            // Apply the delta to the temporary state
-            state.apply_delta(
-                &row.values,
-                *weight,
-                &self.aggregates,
-                &self.input_column_names,
-            );
-        }
-
-        // Generate output delta from temporary states and collect final states
-        let mut final_states = HashMap::new();
-
-        for (group_key_str, state) in existing_groups {
-            let group_key = temp_keys.get(group_key_str).cloned().unwrap_or_default();
-
-            // Generate a unique rowid for this group
-            let result_key = self.generate_group_rowid(group_key_str);
-
-            if let Some(old_row_values) = old_values.get(group_key_str) {
-                let old_row = HashableRow::new(result_key, old_row_values.clone());
-                output_delta.changes.push((old_row, -1));
-            }
-
-            // Always store the state for persistence (even if count=0, we need to delete it)
-            final_states.insert(group_key_str.clone(), (group_key.clone(), state.clone()));
-
-            // Only include groups with count > 0 in the output delta
-            if state.count > 0 {
-                // Build output row: group_by columns + aggregate values
-                let mut output_values = group_key.clone();
-                let aggregate_values = state.to_values(&self.aggregates);
-                output_values.extend(aggregate_values);
-
-                let output_row = HashableRow::new(result_key, output_values.clone());
-                output_delta.changes.push((output_row, 1));
-            }
-        }
-        (output_delta, final_states)
-    }
-
-    /// Extract MIN/MAX values from delta changes for persistence to index
-    fn extract_min_max_deltas(&self, delta: &Delta) -> MinMaxDeltas {
-        let mut min_max_deltas: MinMaxDeltas = HashMap::new();
-
-        for (row, weight) in &delta.changes {
-            let group_key = self.extract_group_key(&row.values);
-            let group_key_str = Self::group_key_to_string(&group_key);
-
-            for agg in &self.aggregates {
-                match agg {
-                    AggregateFunction::Min(col_name) | AggregateFunction::Max(col_name) => {
-                        if let Some(idx) =
-                            self.input_column_names.iter().position(|c| c == col_name)
-                        {
-                            if let Some(val) = row.values.get(idx) {
-                                // Skip NULL values - they don't participate in MIN/MAX
-                                if val == &Value::Null {
-                                    continue;
-                                }
-                                // Create a HashableRow with just this value
-                                // Use 0 as rowid since we only care about the value for comparison
-                                let hashable_value = HashableRow::new(0, vec![val.clone()]);
-                                let key = (col_name.clone(), hashable_value);
-
-                                let group_entry =
-                                    min_max_deltas.entry(group_key_str.clone()).or_default();
-
-                                let value_entry = group_entry.entry(key).or_insert(0);
-
-                                // Accumulate the weight
-                                *value_entry += weight;
-                            }
-                        }
-                    }
-                    _ => {} // Ignore non-MIN/MAX aggregates
-                }
-            }
-        }
-
-        min_max_deltas
-    }
-
-    pub fn set_tracker(&mut self, tracker: Arc<Mutex<ComputationTracker>>) {
-        self.tracker = Some(tracker);
-    }
-
-    /// Generate a rowid for a group
-    /// For no GROUP BY: always returns 0
-    /// For GROUP BY: returns a hash of the group key string
-    pub fn generate_group_rowid(&self, group_key_str: &str) -> i64 {
-        if self.group_by.is_empty() {
-            0
-        } else {
-            group_key_str
-                .bytes()
-                .fold(0i64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as i64))
-        }
-    }
-
-    /// Generate the composite key for BTree storage
-    /// Combines operator_id and group hash
-    fn generate_storage_key(&self, group_key_str: &str) -> i64 {
-        let group_hash = self.generate_group_rowid(group_key_str);
-        (self.operator_id as i64) << 32 | (group_hash & 0xFFFFFFFF)
-    }
-
-    /// Extract group key values from a row
-    pub fn extract_group_key(&self, values: &[Value]) -> Vec<Value> {
-        let mut key = Vec::new();
-
-        for group_col in &self.group_by {
-            if let Some(idx) = self.input_column_names.iter().position(|c| c == group_col) {
-                if let Some(val) = values.get(idx) {
-                    key.push(val.clone());
-                } else {
-                    key.push(Value::Null);
-                }
-            } else {
-                key.push(Value::Null);
-            }
-        }
-
-        key
-    }
-
-    /// Convert group key to string for indexing (since Value doesn't implement Hash)
-    pub fn group_key_to_string(key: &[Value]) -> String {
-        key.iter()
-            .map(|v| format!("{v:?}"))
-            .collect::<Vec<_>>()
-            .join(",")
-    }
-
-    fn seek_key_from_str(&self, group_key_str: &str) -> SeekKey {
-        // Calculate the composite key for seeking
-        let key_i64 = self.generate_storage_key(group_key_str);
-        SeekKey::TableRowId(key_i64)
-    }
-
-    fn seek_key(&self, row: HashableRow) -> SeekKey {
-        // Extract group key for first row
-        let group_key = self.extract_group_key(&row.values);
-        let group_key_str = Self::group_key_to_string(&group_key);
-        self.seek_key_from_str(&group_key_str)
-    }
-}
-
-impl IncrementalOperator for AggregateOperator {
-    fn eval(
-        &mut self,
-        state: &mut EvalState,
-        cursors: &mut DbspStateCursors,
-    ) -> Result<IOResult<Delta>> {
-        let (delta, _) = return_if_io!(self.eval_internal(state, cursors));
-        Ok(IOResult::Done(delta))
-    }
-
-    fn commit(
-        &mut self,
-        mut deltas: DeltaPair,
-        cursors: &mut DbspStateCursors,
-    ) -> Result<IOResult<Delta>> {
-        // Aggregate operator only uses left delta, right must be empty
-        assert!(
-            deltas.right.is_empty(),
-            "AggregateOperator expects right delta to be empty in commit"
-        );
-        let delta = std::mem::take(&mut deltas.left);
-        loop {
-            // Note: because we std::mem::replace here (without it, the borrow checker goes nuts,
-            // because we call self.eval_interval, which requires a mutable borrow), we have to
-            // restore the state if we return I/O. So we can't use return_if_io!
-            let mut state =
-                std::mem::replace(&mut self.commit_state, AggregateCommitState::Invalid);
-            match &mut state {
-                AggregateCommitState::Invalid => {
-                    panic!("Reached invalid state! State was replaced, and not replaced back");
-                }
-                AggregateCommitState::Idle => {
-                    let eval_state = EvalState::from_delta(delta.clone());
-                    self.commit_state = AggregateCommitState::Eval { eval_state };
-                }
-                AggregateCommitState::Eval { ref mut eval_state } => {
-                    // Extract input delta before eval for MIN/MAX processing
-                    let input_delta = eval_state.extract_delta();
-
-                    // Extract MIN/MAX deltas before any I/O operations
-                    let min_max_deltas = self.extract_min_max_deltas(&input_delta);
-
-                    // Create a new eval state with the same delta
-                    *eval_state = EvalState::from_delta(input_delta.clone());
-
-                    let (output_delta, computed_states) = return_and_restore_if_io!(
-                        &mut self.commit_state,
-                        state,
-                        self.eval_internal(eval_state, cursors)
-                    );
-
-                    self.commit_state = AggregateCommitState::PersistDelta {
-                        delta: output_delta,
-                        computed_states,
-                        current_idx: 0,
-                        write_row: WriteRow::new(),
-                        min_max_deltas, // Store for later use
-                    };
-                }
-                AggregateCommitState::PersistDelta {
-                    delta,
-                    computed_states,
-                    current_idx,
-                    write_row,
-                    min_max_deltas,
-                } => {
-                    let states_vec: Vec<_> = computed_states.iter().collect();
-
-                    if *current_idx >= states_vec.len() {
-                        // Use the min_max_deltas we extracted earlier from the input delta
-                        self.commit_state = AggregateCommitState::PersistMinMax {
-                            delta: delta.clone(),
-                            min_max_persist_state: MinMaxPersistState::new(min_max_deltas.clone()),
-                        };
-                    } else {
-                        let (group_key_str, (group_key, agg_state)) = states_vec[*current_idx];
-
-                        // Build the key components for the new table structure
-                        // For regular aggregates, use column_index=0 and AGG_TYPE_REGULAR
-                        let operator_storage_id =
-                            generate_storage_id(self.operator_id, 0, AGG_TYPE_REGULAR);
-                        let zset_id = self.generate_group_rowid(group_key_str);
-                        let element_id = 0i64;
-
-                        // Determine weight: -1 to delete (cancels existing weight=1), 1 to insert/update
-                        let weight = if agg_state.count == 0 { -1 } else { 1 };
-
-                        // Serialize the aggregate state with group key (even for deletion, we need a row)
-                        let state_blob = agg_state.to_blob(&self.aggregates, group_key);
-                        let blob_value = Value::Blob(state_blob);
-
-                        // Build the aggregate storage format: [operator_id, zset_id, element_id, value, weight]
-                        let operator_id_val = Value::Integer(operator_storage_id);
-                        let zset_id_val = Value::Integer(zset_id);
-                        let element_id_val = Value::Integer(element_id);
-                        let blob_val = blob_value.clone();
-
-                        // Create index key - the first 3 columns of our primary key
-                        let index_key = vec![
-                            operator_id_val.clone(),
-                            zset_id_val.clone(),
-                            element_id_val.clone(),
-                        ];
-
-                        // Record values (without weight)
-                        let record_values =
-                            vec![operator_id_val, zset_id_val, element_id_val, blob_val];
-
-                        return_and_restore_if_io!(
-                            &mut self.commit_state,
-                            state,
-                            write_row.write_row(cursors, index_key, record_values, weight)
-                        );
-
-                        let delta = std::mem::take(delta);
-                        let computed_states = std::mem::take(computed_states);
-                        let min_max_deltas = std::mem::take(min_max_deltas);
-
-                        self.commit_state = AggregateCommitState::PersistDelta {
-                            delta,
-                            computed_states,
-                            current_idx: *current_idx + 1,
-                            write_row: WriteRow::new(), // Reset for next write
-                            min_max_deltas,
-                        };
-                    }
-                }
-                AggregateCommitState::PersistMinMax {
-                    delta,
-                    min_max_persist_state,
-                } => {
-                    if !self.has_min_max() {
-                        let delta = std::mem::take(delta);
-                        self.commit_state = AggregateCommitState::Done { delta };
-                    } else {
-                        return_and_restore_if_io!(
-                            &mut self.commit_state,
-                            state,
-                            min_max_persist_state.persist_min_max(
-                                self.operator_id,
-                                &self.column_min_max,
-                                cursors,
-                                |group_key_str| self.generate_group_rowid(group_key_str)
-                            )
-                        );
-
-                        let delta = std::mem::take(delta);
-                        self.commit_state = AggregateCommitState::Done { delta };
-                    }
-                }
-                AggregateCommitState::Done { delta } => {
-                    self.commit_state = AggregateCommitState::Idle;
-                    let delta = std::mem::take(delta);
-                    return Ok(IOResult::Done(delta));
-                }
-            }
-        }
-    }
-
-    fn set_tracker(&mut self, tracker: Arc<Mutex<ComputationTracker>>) {
-        self.tracker = Some(tracker);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::incremental::aggregate_operator::{AggregateOperator, AGG_TYPE_REGULAR};
+    use crate::incremental::dbsp::HashableRow;
     use crate::storage::pager::CreateBTreeFlags;
     use crate::types::Text;
     use crate::util::IOExt;
@@ -2373,9 +395,9 @@ mod tests {
 
         // Create an aggregate operator for SUM(age) with no GROUP BY
         let mut agg = AggregateOperator::new(
-            1,      // operator_id for testing
-            vec![], // No GROUP BY
-            vec![AggregateFunction::Sum("age".to_string())],
+            1,                               // operator_id for testing
+            vec![],                          // No GROUP BY
+            vec![AggregateFunction::Sum(2)], // age is at index 2
             vec!["id".to_string(), "name".to_string(), "age".to_string()],
         );
 
@@ -2492,9 +514,9 @@ mod tests {
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         let mut agg = AggregateOperator::new(
-            1,                        // operator_id for testing
-            vec!["team".to_string()], // GROUP BY team
-            vec![AggregateFunction::Sum("score".to_string())],
+            1,                               // operator_id for testing
+            vec![1],                         // GROUP BY team (index 1)
+            vec![AggregateFunction::Sum(3)], // score is at index 3
             vec![
                 "id".to_string(),
                 "team".to_string(),
@@ -2644,8 +666,8 @@ mod tests {
 
         // Create COUNT(*) GROUP BY category
         let mut agg = AggregateOperator::new(
-            1, // operator_id for testing
-            vec!["category".to_string()],
+            1,       // operator_id for testing
+            vec![1], // category is at index 1
             vec![AggregateFunction::Count],
             vec![
                 "item_id".to_string(),
@@ -2724,9 +746,9 @@ mod tests {
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         let mut agg = AggregateOperator::new(
-            1, // operator_id for testing
-            vec!["product".to_string()],
-            vec![AggregateFunction::Sum("amount".to_string())],
+            1,                               // operator_id for testing
+            vec![1],                         // product is at index 1
+            vec![AggregateFunction::Sum(2)], // amount is at index 2
             vec![
                 "sale_id".to_string(),
                 "product".to_string(),
@@ -2821,11 +843,11 @@ mod tests {
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         let mut agg = AggregateOperator::new(
-            1, // operator_id for testing
-            vec!["user_id".to_string()],
+            1,       // operator_id for testing
+            vec![1], // user_id is at index 1
             vec![
                 AggregateFunction::Count,
-                AggregateFunction::Sum("amount".to_string()),
+                AggregateFunction::Sum(2), // amount is at index 2
             ],
             vec![
                 "order_id".to_string(),
@@ -2913,9 +935,9 @@ mod tests {
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         let mut agg = AggregateOperator::new(
-            1, // operator_id for testing
-            vec!["category".to_string()],
-            vec![AggregateFunction::Avg("value".to_string())],
+            1,                               // operator_id for testing
+            vec![1],                         // category is at index 1
+            vec![AggregateFunction::Avg(2)], // value is at index 2
             vec![
                 "id".to_string(),
                 "category".to_string(),
@@ -3013,11 +1035,11 @@ mod tests {
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         let mut agg = AggregateOperator::new(
-            1, // operator_id for testing
-            vec!["category".to_string()],
+            1,       // operator_id for testing
+            vec![1], // category is at index 1
             vec![
                 AggregateFunction::Count,
-                AggregateFunction::Sum("value".to_string()),
+                AggregateFunction::Sum(2), // value is at index 2
             ],
             vec![
                 "id".to_string(),
@@ -3086,7 +1108,7 @@ mod tests {
     #[test]
     fn test_count_aggregation_with_deletions() {
         let aggregates = vec![AggregateFunction::Count];
-        let group_by = vec!["category".to_string()];
+        let group_by = vec![0]; // category is at index 0
         let input_columns = vec!["category".to_string(), "value".to_string()];
 
         // Create a persistent pager for the test
@@ -3175,8 +1197,8 @@ mod tests {
 
     #[test]
     fn test_sum_aggregation_with_deletions() {
-        let aggregates = vec![AggregateFunction::Sum("value".to_string())];
-        let group_by = vec!["category".to_string()];
+        let aggregates = vec![AggregateFunction::Sum(1)]; // value is at index 1
+        let group_by = vec![0]; // category is at index 0
         let input_columns = vec!["category".to_string(), "value".to_string()];
 
         // Create a persistent pager for the test
@@ -3259,8 +1281,8 @@ mod tests {
 
     #[test]
     fn test_avg_aggregation_with_deletions() {
-        let aggregates = vec![AggregateFunction::Avg("value".to_string())];
-        let group_by = vec!["category".to_string()];
+        let aggregates = vec![AggregateFunction::Avg(1)]; // value is at index 1
+        let group_by = vec![0]; // category is at index 0
         let input_columns = vec!["category".to_string(), "value".to_string()];
 
         // Create a persistent pager for the test
@@ -3326,10 +1348,10 @@ mod tests {
         // Test COUNT, SUM, and AVG together
         let aggregates = vec![
             AggregateFunction::Count,
-            AggregateFunction::Sum("value".to_string()),
-            AggregateFunction::Avg("value".to_string()),
+            AggregateFunction::Sum(1), // value is at index 1
+            AggregateFunction::Avg(1), // value is at index 1
         ];
-        let group_by = vec!["category".to_string()];
+        let group_by = vec![0]; // category is at index 0
         let input_columns = vec!["category".to_string(), "value".to_string()];
 
         // Create a persistent pager for the test
@@ -3428,13 +1450,10 @@ mod tests {
             BTreeCursor::new_index(None, pager.clone(), index_root_page_id, &index_def, 4);
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
-        let mut filter = FilterOperator::new(
-            FilterPredicate::GreaterThan {
-                column: "b".to_string(),
-                value: Value::Integer(2),
-            },
-            vec!["a".to_string(), "b".to_string()],
-        );
+        let mut filter = FilterOperator::new(FilterPredicate::GreaterThan {
+            column_idx: 1, // "b" is at index 1
+            value: Value::Integer(2),
+        });
 
         // Initialize with a row (rowid=3, values=[3, 3])
         let mut init_data = Delta::new();
@@ -3490,13 +1509,10 @@ mod tests {
             BTreeCursor::new_index(None, pager.clone(), index_root_page_id, &index_def, 4);
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
-        let mut filter = FilterOperator::new(
-            FilterPredicate::GreaterThan {
-                column: "age".to_string(),
-                value: Value::Integer(25),
-            },
-            vec!["id".to_string(), "name".to_string(), "age".to_string()],
-        );
+        let mut filter = FilterOperator::new(FilterPredicate::GreaterThan {
+            column_idx: 2, // "age" is at index 2
+            value: Value::Integer(25),
+        });
 
         // Initialize with some data
         let mut init_data = Delta::new();
@@ -3585,11 +1601,11 @@ mod tests {
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         let mut agg = AggregateOperator::new(
-            1, // operator_id for testing
-            vec!["category".to_string()],
+            1,       // operator_id for testing
+            vec![1], // category is at index 1
             vec![
                 AggregateFunction::Count,
-                AggregateFunction::Sum("amount".to_string()),
+                AggregateFunction::Sum(2), // amount is at index 2
             ],
             vec![
                 "id".to_string(),
@@ -3759,7 +1775,7 @@ mod tests {
             vec![], // No GROUP BY
             vec![
                 AggregateFunction::Count,
-                AggregateFunction::Sum("value".to_string()),
+                AggregateFunction::Sum(1), // value is at index 1
             ],
             vec!["id".to_string(), "value".to_string()],
         );
@@ -3837,8 +1853,8 @@ mod tests {
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         let mut agg = AggregateOperator::new(
-            1, // operator_id for testing
-            vec!["type".to_string()],
+            1,       // operator_id for testing
+            vec![1], // type is at index 1
             vec![AggregateFunction::Count],
             vec!["id".to_string(), "type".to_string()],
         );
@@ -3954,8 +1970,8 @@ mod tests {
             1,      // operator_id
             vec![], // No GROUP BY
             vec![
-                AggregateFunction::Min("price".to_string()),
-                AggregateFunction::Max("price".to_string()),
+                AggregateFunction::Min(2), // price is at index 2
+                AggregateFunction::Max(2), // price is at index 2
             ],
             vec!["id".to_string(), "name".to_string(), "price".to_string()],
         );
@@ -4022,8 +2038,8 @@ mod tests {
             1,      // operator_id
             vec![], // No GROUP BY
             vec![
-                AggregateFunction::Min("price".to_string()),
-                AggregateFunction::Max("price".to_string()),
+                AggregateFunction::Min(2), // price is at index 2
+                AggregateFunction::Max(2), // price is at index 2
             ],
             vec!["id".to_string(), "name".to_string(), "price".to_string()],
         );
@@ -4112,8 +2128,8 @@ mod tests {
             1,      // operator_id
             vec![], // No GROUP BY
             vec![
-                AggregateFunction::Min("price".to_string()),
-                AggregateFunction::Max("price".to_string()),
+                AggregateFunction::Min(2), // price is at index 2
+                AggregateFunction::Max(2), // price is at index 2
             ],
             vec!["id".to_string(), "name".to_string(), "price".to_string()],
         );
@@ -4202,8 +2218,8 @@ mod tests {
             1,      // operator_id
             vec![], // No GROUP BY
             vec![
-                AggregateFunction::Min("price".to_string()),
-                AggregateFunction::Max("price".to_string()),
+                AggregateFunction::Min(2), // price is at index 2
+                AggregateFunction::Max(2), // price is at index 2
             ],
             vec!["id".to_string(), "name".to_string(), "price".to_string()],
         );
@@ -4284,8 +2300,8 @@ mod tests {
             1,      // operator_id
             vec![], // No GROUP BY
             vec![
-                AggregateFunction::Min("price".to_string()),
-                AggregateFunction::Max("price".to_string()),
+                AggregateFunction::Min(2), // price is at index 2
+                AggregateFunction::Max(2), // price is at index 2
             ],
             vec!["id".to_string(), "name".to_string(), "price".to_string()],
         );
@@ -4366,8 +2382,8 @@ mod tests {
             1,      // operator_id
             vec![], // No GROUP BY
             vec![
-                AggregateFunction::Min("price".to_string()),
-                AggregateFunction::Max("price".to_string()),
+                AggregateFunction::Min(2), // price is at index 2
+                AggregateFunction::Max(2), // price is at index 2
             ],
             vec!["id".to_string(), "name".to_string(), "price".to_string()],
         );
@@ -4453,11 +2469,11 @@ mod tests {
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         let mut agg = AggregateOperator::new(
-            1,                            // operator_id
-            vec!["category".to_string()], // GROUP BY category
+            1,       // operator_id
+            vec![1], // GROUP BY category (index 1)
             vec![
-                AggregateFunction::Min("price".to_string()),
-                AggregateFunction::Max("price".to_string()),
+                AggregateFunction::Min(3), // price is at index 3
+                AggregateFunction::Max(3), // price is at index 3
             ],
             vec![
                 "id".to_string(),
@@ -4558,8 +2574,8 @@ mod tests {
             1,      // operator_id
             vec![], // No GROUP BY
             vec![
-                AggregateFunction::Min("price".to_string()),
-                AggregateFunction::Max("price".to_string()),
+                AggregateFunction::Min(2), // price is at index 2
+                AggregateFunction::Max(2), // price is at index 2
             ],
             vec!["id".to_string(), "name".to_string(), "price".to_string()],
         );
@@ -4634,8 +2650,8 @@ mod tests {
             1,      // operator_id
             vec![], // No GROUP BY
             vec![
-                AggregateFunction::Min("score".to_string()),
-                AggregateFunction::Max("score".to_string()),
+                AggregateFunction::Min(2), // score is at index 2
+                AggregateFunction::Max(2), // score is at index 2
             ],
             vec!["id".to_string(), "name".to_string(), "score".to_string()],
         );
@@ -4702,8 +2718,8 @@ mod tests {
             1,      // operator_id
             vec![], // No GROUP BY
             vec![
-                AggregateFunction::Min("name".to_string()),
-                AggregateFunction::Max("name".to_string()),
+                AggregateFunction::Min(1), // name is at index 1
+                AggregateFunction::Max(1), // name is at index 1
             ],
             vec!["id".to_string(), "name".to_string()],
         );
@@ -4742,10 +2758,10 @@ mod tests {
             vec![], // No GROUP BY
             vec![
                 AggregateFunction::Count,
-                AggregateFunction::Sum("value".to_string()),
-                AggregateFunction::Min("value".to_string()),
-                AggregateFunction::Max("value".to_string()),
-                AggregateFunction::Avg("value".to_string()),
+                AggregateFunction::Sum(1), // value is at index 1
+                AggregateFunction::Min(1), // value is at index 1
+                AggregateFunction::Max(1), // value is at index 1
+                AggregateFunction::Avg(1), // value is at index 1
             ],
             vec!["id".to_string(), "value".to_string()],
         );
@@ -4833,9 +2849,9 @@ mod tests {
             1,      // operator_id
             vec![], // No GROUP BY
             vec![
-                AggregateFunction::Min("col1".to_string()),
-                AggregateFunction::Max("col2".to_string()),
-                AggregateFunction::Min("col3".to_string()),
+                AggregateFunction::Min(0), // col1 is at index 0
+                AggregateFunction::Max(1), // col2 is at index 1
+                AggregateFunction::Min(2), // col3 is at index 2
             ],
             vec!["col1".to_string(), "col2".to_string(), "col3".to_string()],
         );
@@ -4896,5 +2912,766 @@ mod tests {
         assert_eq!(row_ins.values[0], Value::Integer(10)); // New MIN(col1)
         assert_eq!(row_ins.values[1], Value::Integer(150)); // New MAX(col2)
         assert_eq!(row_ins.values[2], Value::Integer(500)); // MIN(col3) unchanged
+    }
+
+    #[test]
+    fn test_join_operator_inner() {
+        // Test INNER JOIN with incremental updates
+        let (pager, table_page_id, index_page_id) = create_test_pager();
+        let table_cursor = BTreeCursor::new_table(None, pager.clone(), table_page_id, 10);
+        let index_def = create_dbsp_state_index(index_page_id);
+        let index_cursor =
+            BTreeCursor::new_index(None, pager.clone(), index_page_id, &index_def, 10);
+        let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
+
+        let mut join = JoinOperator::new(
+            1, // operator_id
+            JoinType::Inner,
+            vec![0], // Join on first column
+            vec![0],
+            vec!["customer_id".to_string(), "amount".to_string()],
+            vec!["id".to_string(), "name".to_string()],
+        )
+        .unwrap();
+
+        // FIRST COMMIT: Initialize with data
+        let mut left_delta = Delta::new();
+        left_delta.insert(1, vec![Value::Integer(1), Value::Float(100.0)]);
+        left_delta.insert(2, vec![Value::Integer(2), Value::Float(200.0)]);
+        left_delta.insert(3, vec![Value::Integer(3), Value::Float(300.0)]); // No match initially
+
+        let mut right_delta = Delta::new();
+        right_delta.insert(1, vec![Value::Integer(1), Value::Text("Alice".into())]);
+        right_delta.insert(2, vec![Value::Integer(2), Value::Text("Bob".into())]);
+        right_delta.insert(4, vec![Value::Integer(4), Value::Text("David".into())]); // No match initially
+
+        let delta_pair = DeltaPair::new(left_delta, right_delta);
+        let result = pager
+            .io
+            .block(|| join.commit(delta_pair.clone(), &mut cursors))
+            .unwrap();
+
+        // Should have 2 matches (customer 1 and 2)
+        assert_eq!(
+            result.changes.len(),
+            2,
+            "First commit should produce 2 matches"
+        );
+
+        let mut results: Vec<_> = result.changes.clone();
+        results.sort_by_key(|r| r.0.values[0].clone());
+
+        assert_eq!(results[0].0.values[0], Value::Integer(1));
+        assert_eq!(results[0].0.values[3], Value::Text("Alice".into()));
+        assert_eq!(results[1].0.values[0], Value::Integer(2));
+        assert_eq!(results[1].0.values[3], Value::Text("Bob".into()));
+
+        // SECOND COMMIT: Add incremental data that should join with persisted state
+        // Add a new left row that should match existing right row (customer 4)
+        let mut left_delta2 = Delta::new();
+        left_delta2.insert(5, vec![Value::Integer(4), Value::Float(400.0)]); // Should match David from persisted state
+
+        // Add a new right row that should match existing left row (customer 3)
+        let mut right_delta2 = Delta::new();
+        right_delta2.insert(6, vec![Value::Integer(3), Value::Text("Charlie".into())]); // Should match customer 3 from persisted state
+
+        let delta_pair2 = DeltaPair::new(left_delta2, right_delta2);
+        let result2 = pager
+            .io
+            .block(|| join.commit(delta_pair2.clone(), &mut cursors))
+            .unwrap();
+
+        // The second commit should produce:
+        // 1. New left (customer_id=4) joins with persisted right (id=4, David)
+        // 2. Persisted left (customer_id=3) joins with new right (id=3, Charlie)
+
+        assert_eq!(
+            result2.changes.len(),
+            2,
+            "Second commit should produce 2 new matches from incremental join. Got: {:?}",
+            result2.changes
+        );
+
+        // Verify the incremental results
+        let mut results2: Vec<_> = result2.changes.clone();
+        results2.sort_by_key(|r| r.0.values[0].clone());
+
+        // Check for customer 3 joined with Charlie (existing left + new right)
+        let charlie_match = results2
+            .iter()
+            .find(|(row, _)| row.values[0] == Value::Integer(3))
+            .expect("Should find customer 3 joined with new Charlie");
+        assert_eq!(charlie_match.0.values[2], Value::Integer(3));
+        assert_eq!(charlie_match.0.values[3], Value::Text("Charlie".into()));
+
+        // Check for customer 4 joined with David (new left + existing right)
+        let david_match = results2
+            .iter()
+            .find(|(row, _)| row.values[0] == Value::Integer(4))
+            .expect("Should find new customer 4 joined with existing David");
+        assert_eq!(david_match.0.values[0], Value::Integer(4));
+        assert_eq!(david_match.0.values[3], Value::Text("David".into()));
+    }
+
+    #[test]
+    fn test_join_operator_with_deletions() {
+        // Test INNER JOIN with deletions (negative weights)
+        let (pager, table_page_id, index_page_id) = create_test_pager();
+        let table_cursor = BTreeCursor::new_table(None, pager.clone(), table_page_id, 10);
+        let index_def = create_dbsp_state_index(index_page_id);
+        let index_cursor =
+            BTreeCursor::new_index(None, pager.clone(), index_page_id, &index_def, 10);
+        let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
+
+        let mut join = JoinOperator::new(
+            1, // operator_id
+            JoinType::Inner,
+            vec![0], // Join on first column
+            vec![0],
+            vec!["customer_id".to_string(), "amount".to_string()],
+            vec!["id".to_string(), "name".to_string()],
+        )
+        .unwrap();
+
+        // FIRST COMMIT: Add initial data
+        let mut left_delta = Delta::new();
+        left_delta.insert(1, vec![Value::Integer(1), Value::Float(100.0)]);
+        left_delta.insert(2, vec![Value::Integer(2), Value::Float(200.0)]);
+        left_delta.insert(3, vec![Value::Integer(3), Value::Float(300.0)]);
+
+        let mut right_delta = Delta::new();
+        right_delta.insert(1, vec![Value::Integer(1), Value::Text("Alice".into())]);
+        right_delta.insert(2, vec![Value::Integer(2), Value::Text("Bob".into())]);
+        right_delta.insert(3, vec![Value::Integer(3), Value::Text("Charlie".into())]);
+
+        let delta_pair = DeltaPair::new(left_delta, right_delta);
+
+        let result = pager
+            .io
+            .block(|| join.commit(delta_pair.clone(), &mut cursors))
+            .unwrap();
+
+        assert_eq!(result.changes.len(), 3, "Should have 3 initial joins");
+
+        // SECOND COMMIT: Delete customer 2 from left side
+        let mut left_delta2 = Delta::new();
+        left_delta2.delete(2, vec![Value::Integer(2), Value::Float(200.0)]);
+
+        let empty_right = Delta::new();
+        let delta_pair2 = DeltaPair::new(left_delta2, empty_right);
+
+        let result2 = pager
+            .io
+            .block(|| join.commit(delta_pair2.clone(), &mut cursors))
+            .unwrap();
+
+        // Should produce 1 deletion (retraction) of the join for customer 2
+        assert_eq!(
+            result2.changes.len(),
+            1,
+            "Should produce 1 retraction for deleted customer 2"
+        );
+        assert_eq!(
+            result2.changes[0].1, -1,
+            "Should have weight -1 for deletion"
+        );
+        assert_eq!(result2.changes[0].0.values[0], Value::Integer(2));
+        assert_eq!(result2.changes[0].0.values[3], Value::Text("Bob".into()));
+
+        // THIRD COMMIT: Delete customer 3 from right side
+        let empty_left = Delta::new();
+        let mut right_delta3 = Delta::new();
+        right_delta3.delete(3, vec![Value::Integer(3), Value::Text("Charlie".into())]);
+
+        let delta_pair3 = DeltaPair::new(empty_left, right_delta3);
+
+        let result3 = pager
+            .io
+            .block(|| join.commit(delta_pair3.clone(), &mut cursors))
+            .unwrap();
+
+        // Should produce 1 deletion (retraction) of the join for customer 3
+        assert_eq!(
+            result3.changes.len(),
+            1,
+            "Should produce 1 retraction for deleted customer 3"
+        );
+        assert_eq!(
+            result3.changes[0].1, -1,
+            "Should have weight -1 for deletion"
+        );
+        assert_eq!(result3.changes[0].0.values[0], Value::Integer(3));
+        assert_eq!(result3.changes[0].0.values[2], Value::Integer(3));
+    }
+
+    #[test]
+    fn test_join_operator_one_to_many() {
+        // Test one-to-many relationship: one customer with multiple orders
+        let (pager, table_page_id, index_page_id) = create_test_pager();
+        let table_cursor = BTreeCursor::new_table(None, pager.clone(), table_page_id, 10);
+        let index_def = create_dbsp_state_index(index_page_id);
+        let index_cursor =
+            BTreeCursor::new_index(None, pager.clone(), index_page_id, &index_def, 10);
+        let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
+
+        let mut join = JoinOperator::new(
+            1, // operator_id
+            JoinType::Inner,
+            vec![0], // Join on first column (customer_id for orders)
+            vec![0], // Join on first column (id for customers)
+            vec![
+                "customer_id".to_string(),
+                "order_id".to_string(),
+                "amount".to_string(),
+            ],
+            vec!["id".to_string(), "name".to_string()],
+        )
+        .unwrap();
+
+        // FIRST COMMIT: Add one customer
+        let left_delta = Delta::new(); // Empty orders initially
+        let mut right_delta = Delta::new();
+        right_delta.insert(1, vec![Value::Integer(100), Value::Text("Alice".into())]);
+
+        let delta_pair = DeltaPair::new(left_delta, right_delta);
+        let result = pager
+            .io
+            .block(|| join.commit(delta_pair.clone(), &mut cursors))
+            .unwrap();
+
+        // No joins yet (customer exists but no orders)
+        assert_eq!(
+            result.changes.len(),
+            0,
+            "Should have no joins with customer but no orders"
+        );
+
+        // SECOND COMMIT: Add multiple orders for the same customer
+        let mut left_delta2 = Delta::new();
+        left_delta2.insert(
+            1,
+            vec![
+                Value::Integer(100),
+                Value::Integer(1001),
+                Value::Float(50.0),
+            ],
+        ); // order 1001
+        left_delta2.insert(
+            2,
+            vec![
+                Value::Integer(100),
+                Value::Integer(1002),
+                Value::Float(75.0),
+            ],
+        ); // order 1002
+        left_delta2.insert(
+            3,
+            vec![
+                Value::Integer(100),
+                Value::Integer(1003),
+                Value::Float(100.0),
+            ],
+        ); // order 1003
+
+        let right_delta2 = Delta::new(); // No new customers
+
+        let delta_pair2 = DeltaPair::new(left_delta2, right_delta2);
+        let result2 = pager
+            .io
+            .block(|| join.commit(delta_pair2.clone(), &mut cursors))
+            .unwrap();
+
+        // Should produce 3 joins (3 orders × 1 customer)
+        assert_eq!(
+            result2.changes.len(),
+            3,
+            "Should produce 3 joins for 3 orders with same customer. Got: {:?}",
+            result2.changes
+        );
+
+        // Verify all three joins have the same customer but different orders
+        for (row, weight) in &result2.changes {
+            assert_eq!(*weight, 1, "Weight should be 1 for insertion");
+            assert_eq!(
+                row.values[0],
+                Value::Integer(100),
+                "Customer ID should be 100"
+            );
+            assert_eq!(
+                row.values[4],
+                Value::Text("Alice".into()),
+                "Customer name should be Alice"
+            );
+
+            // Check order IDs are different
+            let order_id = match &row.values[1] {
+                Value::Integer(id) => *id,
+                _ => panic!("Expected integer order ID"),
+            };
+            assert!(
+                (1001..=1003).contains(&order_id),
+                "Order ID {order_id} should be between 1001 and 1003"
+            );
+        }
+
+        // THIRD COMMIT: Delete one order
+        let mut left_delta3 = Delta::new();
+        left_delta3.delete(
+            2,
+            vec![
+                Value::Integer(100),
+                Value::Integer(1002),
+                Value::Float(75.0),
+            ],
+        );
+
+        let delta_pair3 = DeltaPair::new(left_delta3, Delta::new());
+        let result3 = pager
+            .io
+            .block(|| join.commit(delta_pair3.clone(), &mut cursors))
+            .unwrap();
+
+        // Should produce 1 retraction for the deleted order
+        assert_eq!(result3.changes.len(), 1, "Should produce 1 retraction");
+        assert_eq!(result3.changes[0].1, -1, "Should be a deletion");
+        assert_eq!(
+            result3.changes[0].0.values[1],
+            Value::Integer(1002),
+            "Should delete order 1002"
+        );
+    }
+
+    #[test]
+    fn test_join_operator_many_to_many() {
+        // Test many-to-many: multiple rows with same key on both sides
+        let (pager, table_page_id, index_page_id) = create_test_pager();
+        let table_cursor = BTreeCursor::new_table(None, pager.clone(), table_page_id, 10);
+        let index_def = create_dbsp_state_index(index_page_id);
+        let index_cursor =
+            BTreeCursor::new_index(None, pager.clone(), index_page_id, &index_def, 10);
+        let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
+
+        let mut join = JoinOperator::new(
+            1, // operator_id
+            JoinType::Inner,
+            vec![0], // Join on category_id
+            vec![0], // Join on id
+            vec![
+                "category_id".to_string(),
+                "product_name".to_string(),
+                "price".to_string(),
+            ],
+            vec!["id".to_string(), "category_name".to_string()],
+        )
+        .unwrap();
+
+        // FIRST COMMIT: Add multiple products in same category
+        let mut left_delta = Delta::new();
+        left_delta.insert(
+            1,
+            vec![
+                Value::Integer(10),
+                Value::Text("Laptop".into()),
+                Value::Float(1000.0),
+            ],
+        );
+        left_delta.insert(
+            2,
+            vec![
+                Value::Integer(10),
+                Value::Text("Mouse".into()),
+                Value::Float(50.0),
+            ],
+        );
+        left_delta.insert(
+            3,
+            vec![
+                Value::Integer(10),
+                Value::Text("Keyboard".into()),
+                Value::Float(100.0),
+            ],
+        );
+
+        // Add multiple categories with same ID (simulating denormalized data or versioning)
+        let mut right_delta = Delta::new();
+        right_delta.insert(
+            1,
+            vec![Value::Integer(10), Value::Text("Electronics".into())],
+        );
+        right_delta.insert(2, vec![Value::Integer(10), Value::Text("Computers".into())]); // Same category ID, different name
+
+        let delta_pair = DeltaPair::new(left_delta, right_delta);
+        let result = pager
+            .io
+            .block(|| join.commit(delta_pair.clone(), &mut cursors))
+            .unwrap();
+
+        // Should produce 3 products × 2 categories = 6 joins
+        assert_eq!(
+            result.changes.len(),
+            6,
+            "Should produce 6 joins (3 products × 2 category records). Got: {:?}",
+            result.changes
+        );
+
+        // Verify we have all combinations
+        let mut found_combinations = std::collections::HashSet::new();
+        for (row, weight) in &result.changes {
+            assert_eq!(*weight, 1);
+            let product = row.values[1].to_string();
+            let category = row.values[4].to_string();
+            found_combinations.insert((product, category));
+        }
+
+        assert_eq!(
+            found_combinations.len(),
+            6,
+            "Should have 6 unique combinations"
+        );
+
+        // SECOND COMMIT: Add one more product in the same category
+        let mut left_delta2 = Delta::new();
+        left_delta2.insert(
+            4,
+            vec![
+                Value::Integer(10),
+                Value::Text("Monitor".into()),
+                Value::Float(500.0),
+            ],
+        );
+
+        let delta_pair2 = DeltaPair::new(left_delta2, Delta::new());
+        let result2 = pager
+            .io
+            .block(|| join.commit(delta_pair2.clone(), &mut cursors))
+            .unwrap();
+
+        // New product should join with both existing category records
+        assert_eq!(
+            result2.changes.len(),
+            2,
+            "New product should join with 2 existing category records"
+        );
+
+        for (row, _) in &result2.changes {
+            assert_eq!(row.values[1], Value::Text("Monitor".into()));
+        }
+    }
+
+    #[test]
+    fn test_join_operator_update_in_one_to_many() {
+        // Test updates in one-to-many scenarios
+        let (pager, table_page_id, index_page_id) = create_test_pager();
+        let table_cursor = BTreeCursor::new_table(None, pager.clone(), table_page_id, 10);
+        let index_def = create_dbsp_state_index(index_page_id);
+        let index_cursor =
+            BTreeCursor::new_index(None, pager.clone(), index_page_id, &index_def, 10);
+        let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
+
+        let mut join = JoinOperator::new(
+            1, // operator_id
+            JoinType::Inner,
+            vec![0], // Join on customer_id
+            vec![0], // Join on id
+            vec![
+                "customer_id".to_string(),
+                "order_id".to_string(),
+                "amount".to_string(),
+            ],
+            vec!["id".to_string(), "name".to_string()],
+        )
+        .unwrap();
+
+        // FIRST COMMIT: Setup one customer with multiple orders
+        let mut left_delta = Delta::new();
+        left_delta.insert(
+            1,
+            vec![
+                Value::Integer(100),
+                Value::Integer(1001),
+                Value::Float(50.0),
+            ],
+        );
+        left_delta.insert(
+            2,
+            vec![
+                Value::Integer(100),
+                Value::Integer(1002),
+                Value::Float(75.0),
+            ],
+        );
+        left_delta.insert(
+            3,
+            vec![
+                Value::Integer(100),
+                Value::Integer(1003),
+                Value::Float(100.0),
+            ],
+        );
+
+        let mut right_delta = Delta::new();
+        right_delta.insert(1, vec![Value::Integer(100), Value::Text("Alice".into())]);
+
+        let delta_pair = DeltaPair::new(left_delta, right_delta);
+        let result = pager
+            .io
+            .block(|| join.commit(delta_pair.clone(), &mut cursors))
+            .unwrap();
+
+        assert_eq!(result.changes.len(), 3, "Should have 3 initial joins");
+
+        // SECOND COMMIT: Update the customer name (affects all 3 joins)
+        let mut right_delta2 = Delta::new();
+        // Delete old customer record
+        right_delta2.delete(1, vec![Value::Integer(100), Value::Text("Alice".into())]);
+        // Insert updated customer record
+        right_delta2.insert(
+            1,
+            vec![Value::Integer(100), Value::Text("Alice Smith".into())],
+        );
+
+        let delta_pair2 = DeltaPair::new(Delta::new(), right_delta2);
+        let result2 = pager
+            .io
+            .block(|| join.commit(delta_pair2.clone(), &mut cursors))
+            .unwrap();
+
+        // Should produce 3 deletions and 3 insertions (one for each order)
+        assert_eq!(result2.changes.len(), 6,
+            "Should produce 6 changes (3 deletions + 3 insertions) when updating customer with 3 orders");
+
+        let deletions: Vec<_> = result2.changes.iter().filter(|(_, w)| *w == -1).collect();
+        let insertions: Vec<_> = result2.changes.iter().filter(|(_, w)| *w == 1).collect();
+
+        assert_eq!(deletions.len(), 3, "Should have 3 deletions");
+        assert_eq!(insertions.len(), 3, "Should have 3 insertions");
+
+        // Check all deletions have old name
+        for (row, _) in &deletions {
+            assert_eq!(
+                row.values[4],
+                Value::Text("Alice".into()),
+                "Deletions should have old name"
+            );
+        }
+
+        // Check all insertions have new name
+        for (row, _) in &insertions {
+            assert_eq!(
+                row.values[4],
+                Value::Text("Alice Smith".into()),
+                "Insertions should have new name"
+            );
+        }
+
+        // Verify we still have all three order IDs in the insertions
+        let mut order_ids = std::collections::HashSet::new();
+        for (row, _) in &insertions {
+            if let Value::Integer(order_id) = &row.values[1] {
+                order_ids.insert(*order_id);
+            }
+        }
+        assert_eq!(
+            order_ids.len(),
+            3,
+            "Should still have all 3 order IDs after update"
+        );
+        assert!(order_ids.contains(&1001));
+        assert!(order_ids.contains(&1002));
+        assert!(order_ids.contains(&1003));
+    }
+
+    #[test]
+    fn test_join_operator_weight_accumulation_complex() {
+        // Test complex weight accumulation with multiple identical rows
+        let (pager, table_page_id, index_page_id) = create_test_pager();
+        let table_cursor = BTreeCursor::new_table(None, pager.clone(), table_page_id, 10);
+        let index_def = create_dbsp_state_index(index_page_id);
+        let index_cursor =
+            BTreeCursor::new_index(None, pager.clone(), index_page_id, &index_def, 10);
+        let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
+
+        let mut join = JoinOperator::new(
+            1, // operator_id
+            JoinType::Inner,
+            vec![0], // Join on first column
+            vec![0],
+            vec!["key".to_string(), "val_left".to_string()],
+            vec!["key".to_string(), "val_right".to_string()],
+        )
+        .unwrap();
+
+        // FIRST COMMIT: Add identical rows multiple times (simulating duplicates)
+        let mut left_delta = Delta::new();
+        // Same key-value pair inserted 3 times with different rowids
+        left_delta.insert(1, vec![Value::Integer(10), Value::Text("A".into())]);
+        left_delta.insert(2, vec![Value::Integer(10), Value::Text("A".into())]);
+        left_delta.insert(3, vec![Value::Integer(10), Value::Text("A".into())]);
+
+        let mut right_delta = Delta::new();
+        // Same key-value pair inserted 2 times
+        right_delta.insert(4, vec![Value::Integer(10), Value::Text("B".into())]);
+        right_delta.insert(5, vec![Value::Integer(10), Value::Text("B".into())]);
+
+        let delta_pair = DeltaPair::new(left_delta, right_delta);
+        let result = pager
+            .io
+            .block(|| join.commit(delta_pair.clone(), &mut cursors))
+            .unwrap();
+
+        // Should produce 3 × 2 = 6 join results (cartesian product)
+        assert_eq!(
+            result.changes.len(),
+            6,
+            "Should produce 6 joins (3 left rows × 2 right rows)"
+        );
+
+        // All should have weight 1
+        for (_, weight) in &result.changes {
+            assert_eq!(*weight, 1);
+        }
+
+        // SECOND COMMIT: Delete one instance from left
+        let mut left_delta2 = Delta::new();
+        left_delta2.delete(2, vec![Value::Integer(10), Value::Text("A".into())]);
+
+        let delta_pair2 = DeltaPair::new(left_delta2, Delta::new());
+        let result2 = pager
+            .io
+            .block(|| join.commit(delta_pair2.clone(), &mut cursors))
+            .unwrap();
+
+        // Should produce 2 retractions (1 deleted left row × 2 right rows)
+        assert_eq!(
+            result2.changes.len(),
+            2,
+            "Should produce 2 retractions when deleting 1 of 3 identical left rows"
+        );
+
+        for (_, weight) in &result2.changes {
+            assert_eq!(*weight, -1, "Should be retractions");
+        }
+    }
+
+    #[test]
+    fn test_join_produces_all_expected_results() {
+        // Test that a join produces ALL expected output rows
+        // This reproduces the issue where only 1 of 3 expected rows appears in the final result
+
+        // Create a join operator similar to: SELECT u.name, o.quantity FROM users u JOIN orders o ON u.id = o.user_id
+        let mut join = JoinOperator::new(
+            0,
+            JoinType::Inner,
+            vec![0], // Join on first column (id)
+            vec![0], // Join on first column (user_id)
+            vec!["id".to_string(), "name".to_string()],
+            vec![
+                "user_id".to_string(),
+                "product_id".to_string(),
+                "quantity".to_string(),
+            ],
+        )
+        .unwrap();
+
+        // Create test data matching the example that fails:
+        // users: (1, 'Alice'), (2, 'Bob')
+        // orders: (1, 5), (1, 3), (2, 7)  -- user_id, quantity
+        let left_delta = Delta {
+            changes: vec![
+                (
+                    HashableRow::new(1, vec![Value::Integer(1), Value::Text(Text::from("Alice"))]),
+                    1,
+                ),
+                (
+                    HashableRow::new(2, vec![Value::Integer(2), Value::Text(Text::from("Bob"))]),
+                    1,
+                ),
+            ],
+        };
+
+        // Orders: Alice has 2 orders, Bob has 1
+        let right_delta = Delta {
+            changes: vec![
+                (
+                    HashableRow::new(
+                        1,
+                        vec![Value::Integer(1), Value::Integer(100), Value::Integer(5)],
+                    ),
+                    1,
+                ),
+                (
+                    HashableRow::new(
+                        2,
+                        vec![Value::Integer(1), Value::Integer(101), Value::Integer(3)],
+                    ),
+                    1,
+                ),
+                (
+                    HashableRow::new(
+                        3,
+                        vec![Value::Integer(2), Value::Integer(100), Value::Integer(7)],
+                    ),
+                    1,
+                ),
+            ],
+        };
+
+        // Evaluate the join
+        let delta_pair = DeltaPair::new(left_delta, right_delta);
+        let mut state = EvalState::Init { deltas: delta_pair };
+
+        let (pager, table_root, index_root) = create_test_pager();
+        let table_cursor = BTreeCursor::new_table(None, pager.clone(), table_root, 5);
+        let index_def = create_dbsp_state_index(index_root);
+        let index_cursor = BTreeCursor::new_index(None, pager.clone(), index_root, &index_def, 4);
+        let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
+
+        let result = pager
+            .io
+            .block(|| join.eval(&mut state, &mut cursors))
+            .unwrap();
+
+        // Should produce 3 results: Alice with 2 orders, Bob with 1 order
+        assert_eq!(
+            result.changes.len(),
+            3,
+            "Should produce 3 joined rows (Alice×2 + Bob×1)"
+        );
+
+        // Verify the actual content of the results
+        let mut expected_results = std::collections::HashSet::new();
+        // Expected: (Alice, 5), (Alice, 3), (Bob, 7)
+        expected_results.insert(("Alice".to_string(), 5));
+        expected_results.insert(("Alice".to_string(), 3));
+        expected_results.insert(("Bob".to_string(), 7));
+
+        let mut actual_results = std::collections::HashSet::new();
+        for (row, weight) in &result.changes {
+            assert_eq!(*weight, 1, "All results should have weight 1");
+
+            // Extract name (column 1 from left) and quantity (column 3 from right)
+            let name = match &row.values[1] {
+                Value::Text(t) => t.as_str().to_string(),
+                _ => panic!("Expected text value for name"),
+            };
+            let quantity = match &row.values[4] {
+                Value::Integer(q) => *q,
+                _ => panic!("Expected integer value for quantity"),
+            };
+
+            actual_results.insert((name, quantity));
+        }
+
+        assert_eq!(
+            expected_results, actual_results,
+            "Join should produce all expected results. Expected: {expected_results:?}, Got: {actual_results:?}",
+        );
+
+        // Also verify that rowids are unique (this is important for btree storage)
+        let mut seen_rowids = std::collections::HashSet::new();
+        for (row, _) in &result.changes {
+            let was_new = seen_rowids.insert(row.rowid);
+            assert!(was_new, "Duplicate rowid found: {}. This would cause rows to overwrite each other in btree storage!", row.rowid);
+        }
     }
 }

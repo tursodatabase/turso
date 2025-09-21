@@ -355,7 +355,7 @@ mod tests {
                 "View not materialized".to_string(),
             ));
         }
-        let num_columns = view.columns.len();
+        let num_columns = view.column_schema.columns.len();
         drop(view);
 
         // Create a btree cursor

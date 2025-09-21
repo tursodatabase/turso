@@ -393,10 +393,9 @@ impl Database {
         let shared_wal = WalFileShared::open_shared_if_exists(&io, wal_path)?;
 
         let mv_store = if opts.enable_mvcc {
-            Some(Arc::new(MvStore::new(
-                mvcc::LocalClock::new(),
-                mvcc::persistent_storage::Storage::new_noop(),
-            )))
+            let file = io.open_file(&format!("{path}-lg"), OpenFlags::default(), false)?;
+            let storage = mvcc::persistent_storage::Storage::new(file);
+            Some(Arc::new(MvStore::new(mvcc::LocalClock::new(), storage)))
         } else {
             None
         };
@@ -484,7 +483,7 @@ impl Database {
             .unwrap_or_default()
             .get();
         let conn = Arc::new(Connection {
-            _db: self.clone(),
+            db: self.clone(),
             pager: RefCell::new(Arc::new(pager)),
             schema: RefCell::new(
                 self.schema
@@ -967,7 +966,7 @@ impl DatabaseCatalog {
 }
 
 pub struct Connection {
-    _db: Arc<Database>,
+    db: Arc<Database>,
     pager: RefCell<Arc<Pager>>,
     schema: RefCell<Arc<Schema>>,
     /// Per-database schema cache (database_index -> schema)
@@ -1015,7 +1014,7 @@ impl Drop for Connection {
     fn drop(&mut self) {
         if !self.closed.get() {
             // if connection wasn't properly closed, decrement the connection counter
-            self._db
+            self.db
                 .n_connections
                 .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         }
@@ -1059,7 +1058,7 @@ impl Connection {
         )?;
         Ok(Statement::new(
             program,
-            self._db.mv_store.clone(),
+            self.db.mv_store.clone(),
             pager,
             mode,
         ))
@@ -1090,10 +1089,10 @@ impl Connection {
         };
         pager.end_read_tx().expect("read txn must be finished");
 
-        let db_schema_version = self._db.schema.lock().unwrap().schema_version;
+        let db_schema_version = self.db.schema.lock().unwrap().schema_version;
         tracing::debug!(
             "path: {}, db_schema_version={} vs on_disk_schema_version={}",
-            self._db.path,
+            self.db.path,
             db_schema_version,
             on_disk_schema_version
         );
@@ -1130,7 +1129,7 @@ impl Connection {
         reparse_result?;
 
         let schema = self.schema.borrow().clone();
-        self._db.update_schema_if_newer(schema)
+        self.db.update_schema_if_newer(schema)
     }
 
     fn reparse_schema(self: &Arc<Connection>) -> Result<()> {
@@ -1162,7 +1161,14 @@ impl Connection {
         let stmt = self.prepare("SELECT * FROM sqlite_schema")?;
 
         // TODO: This function below is synchronous, make it async
-        parse_schema_rows(stmt, &mut fresh, &self.syms.read(), None, existing_views)?;
+        parse_schema_rows(
+            stmt,
+            &mut fresh,
+            &self.syms.read(),
+            None,
+            existing_views,
+            self.db.mv_store.as_ref(),
+        )?;
 
         tracing::debug!(
             "reparse_schema: schema_version={}, tables={:?}",
@@ -1207,7 +1213,7 @@ impl Connection {
                 mode,
                 input,
             )?;
-            Statement::new(program, self._db.mv_store.clone(), pager.clone(), mode)
+            Statement::new(program, self.db.mv_store.clone(), pager.clone(), mode)
                 .run_ignore_rows()?;
         }
         Ok(())
@@ -1255,7 +1261,7 @@ impl Connection {
             mode,
             input,
         )?;
-        let stmt = Statement::new(program, self._db.mv_store.clone(), pager, mode);
+        let stmt = Statement::new(program, self.db.mv_store.clone(), pager, mode);
         Ok(Some(stmt))
     }
 
@@ -1291,7 +1297,7 @@ impl Connection {
                 mode,
                 input,
             )?;
-            Statement::new(program, self._db.mv_store.clone(), pager.clone(), mode)
+            Statement::new(program, self.db.mv_store.clone(), pager.clone(), mode)
                 .run_ignore_rows()?;
         }
         Ok(())
@@ -1394,7 +1400,7 @@ impl Connection {
     pub fn maybe_update_schema(&self) -> Result<()> {
         let current_schema_version = self.schema.borrow().schema_version;
         let schema = self
-            ._db
+            .db
             .schema
             .lock()
             .map_err(|_| LimboError::SchemaLocked)?;
@@ -1496,7 +1502,7 @@ impl Connection {
         use crate::storage::sqlite3_ondisk::parse_wal_frame_header;
 
         let c = self.pager.borrow().wal_get_frame(frame_no, frame)?;
-        self._db.io.wait_for_completion(c)?;
+        self.db.io.wait_for_completion(c)?;
         let (header, _) = parse_wal_frame_header(frame);
         Ok(WalFrameInfo {
             page_no: header.page_number,
@@ -1626,7 +1632,7 @@ impl Connection {
         }
 
         if self
-            ._db
+            .db
             .n_connections
             .fetch_sub(1, std::sync::atomic::Ordering::SeqCst)
             .eq(&1)
@@ -1682,14 +1688,14 @@ impl Connection {
     }
 
     pub fn get_database_canonical_path(&self) -> String {
-        if self._db.path == ":memory:" {
+        if self.db.path == ":memory:" {
             // For in-memory databases, SQLite shows empty string
             String::new()
         } else {
             // For file databases, try show the full absolute path if that doesn't fail
-            match std::fs::canonicalize(&self._db.path) {
+            match std::fs::canonicalize(&self.db.path) {
                 Ok(abs_path) => abs_path.to_string_lossy().to_string(),
-                Err(_) => self._db.path.to_string(),
+                Err(_) => self.db.path.to_string(),
             }
         }
     }
@@ -1697,7 +1703,7 @@ impl Connection {
     /// Check if a specific attached database is read only or not, by its index
     pub fn is_readonly(&self, index: usize) -> bool {
         if index == 0 {
-            self._db.is_readonly()
+            self.db.is_readonly()
         } else {
             let db = self
                 .attached_databases
@@ -1720,17 +1726,17 @@ impl Connection {
         };
 
         self.page_size.set(size);
-        if self._db.db_state.get() != DbState::Uninitialized {
+        if self.db.db_state.get() != DbState::Uninitialized {
             return Ok(());
         }
 
         {
-            let mut shared_wal = self._db.shared_wal.write();
+            let mut shared_wal = self.db.shared_wal.write();
             shared_wal.enabled.store(false, Ordering::SeqCst);
             shared_wal.file = None;
         }
         self.pager.borrow_mut().clear_page_cache();
-        let pager = self._db.init_pager(Some(size.get() as usize))?;
+        let pager = self.db.init_pager(Some(size.get() as usize))?;
         self.pager.replace(Arc::new(pager));
         self.pager.borrow().set_initial_page_size(size);
 
@@ -1739,7 +1745,7 @@ impl Connection {
 
     #[cfg(feature = "fs")]
     pub fn open_new(&self, path: &str, vfs: &str) -> Result<(Arc<dyn IO>, Arc<Database>)> {
-        Database::open_with_vfs(&self._db, path, vfs)
+        Database::open_with_vfs(&self.db, path, vfs)
     }
 
     pub fn list_vfs(&self) -> Vec<String> {
@@ -1774,9 +1780,14 @@ impl Connection {
         let syms = self.syms.read();
         self.with_schema_mut(|schema| {
             let existing_views = schema.incremental_views.clone();
-            if let Err(LimboError::ExtensionError(e)) =
-                parse_schema_rows(rows, schema, &syms, None, existing_views)
-            {
+            if let Err(LimboError::ExtensionError(e)) = parse_schema_rows(
+                rows,
+                schema,
+                &syms,
+                None,
+                existing_views,
+                self.db.mv_store.as_ref(),
+            ) {
                 // this means that a vtab exists and we no longer have the module loaded. we print
                 // a warning to the user to load the module
                 eprintln!("Warning: {e}");
@@ -1814,11 +1825,11 @@ impl Connection {
     }
 
     pub fn experimental_views_enabled(&self) -> bool {
-        self._db.experimental_views_enabled()
+        self.db.experimental_views_enabled()
     }
 
     pub fn experimental_strict_enabled(&self) -> bool {
-        self._db.experimental_strict_enabled()
+        self.db.experimental_strict_enabled()
     }
 
     /// Query the current value(s) of `pragma_name` associated to
@@ -1862,7 +1873,7 @@ impl Connection {
     }
 
     pub fn is_db_initialized(&self) -> bool {
-        self._db.db_state.is_initialized()
+        self.db.db_state.is_initialized()
     }
 
     fn get_pager_from_database_index(&self, index: &usize) -> Arc<Pager> {
@@ -1910,21 +1921,21 @@ impl Connection {
         }
 
         let use_indexes = self
-            ._db
+            .db
             .schema
             .lock()
             .map_err(|_| LimboError::SchemaLocked)?
             .indexes_enabled();
-        let use_mvcc = self._db.mv_store.is_some();
-        let use_views = self._db.experimental_views_enabled();
-        let use_strict = self._db.experimental_strict_enabled();
+        let use_mvcc = self.db.mv_store.is_some();
+        let use_views = self.db.experimental_views_enabled();
+        let use_strict = self.db.experimental_strict_enabled();
 
         let db_opts = DatabaseOpts::new()
             .with_mvcc(use_mvcc)
             .with_indexes(use_indexes)
             .with_views(use_views)
             .with_strict(use_strict);
-        let db = Self::from_uri_attached(path, db_opts, self._db.io.clone())?;
+        let db = Self::from_uri_attached(path, db_opts, self.db.io.clone())?;
         let pager = Arc::new(db.init_pager(None)?);
 
         self.attached_databases
@@ -2060,7 +2071,7 @@ impl Connection {
         let mut databases = Vec::new();
 
         // Add main database (always seq=0, name="main")
-        let main_path = Self::get_canonical_path_for_database(&self._db);
+        let main_path = Self::get_canonical_path_for_database(&self.db);
         databases.push((0, "main".to_string(), main_path));
 
         // Add attached databases
@@ -2164,9 +2175,13 @@ impl Connection {
     /// 5. Step through query -> returns Busy -> return Busy to user
     ///
     /// This slight api change demonstrated a better throughtput in `perf/throughput/turso` benchmark
-    pub fn busy_timeout(&self, mut duration: Option<std::time::Duration>) {
+    pub fn set_busy_timeout(&self, mut duration: Option<std::time::Duration>) {
         duration = duration.filter(|duration| !duration.is_zero());
         self.busy_timeout.set(duration);
+    }
+
+    pub fn get_busy_timeout(&self) -> Option<std::time::Duration> {
+        self.busy_timeout.get()
     }
 }
 
@@ -2387,7 +2402,7 @@ impl Statement {
     fn reprepare(&mut self) -> Result<()> {
         tracing::trace!("repreparing statement");
         let conn = self.program.connection.clone();
-        *conn.schema.borrow_mut() = conn._db.clone_schema()?;
+        *conn.schema.borrow_mut() = conn.db.clone_schema()?;
         self.program = {
             let mut parser = Parser::new(self.program.sql.as_bytes());
             let cmd = parser.next_cmd()?;
@@ -2454,7 +2469,7 @@ impl Statement {
         }
     }
 
-    pub fn get_column_name(&self, idx: usize) -> Cow<str> {
+    pub fn get_column_name(&self, idx: usize) -> Cow<'_, str> {
         match self.query_mode {
             QueryMode::Normal => {
                 let column = &self.program.result_columns.get(idx).expect("No column");
@@ -2468,7 +2483,7 @@ impl Statement {
         }
     }
 
-    pub fn get_column_table_name(&self, idx: usize) -> Option<Cow<str>> {
+    pub fn get_column_table_name(&self, idx: usize) -> Option<Cow<'_, str>> {
         let column = &self.program.result_columns.get(idx).expect("No column");
         match &column.expr {
             turso_parser::ast::Expr::Column { table, .. } => self

@@ -4,11 +4,12 @@ use super::plan::{
     Search, TableReferences, WhereTerm, Window,
 };
 use crate::schema::Table;
+use crate::translate::expr::{bind_and_rewrite_expr, ParamState};
 use crate::translate::optimizer::optimize_plan;
 use crate::translate::plan::{GroupBy, Plan, ResultSetColumn, SelectPlan};
 use crate::translate::planner::{
-    bind_column_references, break_predicate_at_and_boundaries, parse_from, parse_limit,
-    parse_where, resolve_window_and_aggregate_functions,
+    break_predicate_at_and_boundaries, parse_from, parse_limit, parse_where,
+    resolve_window_and_aggregate_functions,
 };
 use crate::translate::window::plan_windows;
 use crate::util::normalize_ident;
@@ -98,6 +99,7 @@ pub fn prepare_select_plan(
     connection: &Arc<crate::Connection>,
 ) -> Result<Plan> {
     let compounds = select.body.compounds;
+    let mut param_ctx = ParamState::default();
     match compounds.is_empty() {
         true => Ok(Plan::Select(prepare_one_select_plan(
             schema,
@@ -110,6 +112,7 @@ pub fn prepare_select_plan(
             table_ref_counter,
             query_destination,
             connection,
+            &mut param_ctx,
         )?)),
         false => {
             let mut last = prepare_one_select_plan(
@@ -123,6 +126,7 @@ pub fn prepare_select_plan(
                 table_ref_counter,
                 query_destination.clone(),
                 connection,
+                &mut param_ctx,
             )?;
 
             let mut left = Vec::with_capacity(compounds.len());
@@ -139,6 +143,7 @@ pub fn prepare_select_plan(
                     table_ref_counter,
                     query_destination.clone(),
                     connection,
+                    &mut param_ctx,
                 )?;
             }
 
@@ -149,9 +154,9 @@ pub fn prepare_select_plan(
                     crate::bail_parse_error!("SELECTs to the left and right of {} do not have the same number of result columns", operator);
                 }
             }
-            let (limit, offset) = select
-                .limit
-                .map_or(Ok((None, None)), |mut l| parse_limit(&mut l, connection))?;
+            let (limit, offset) = select.limit.map_or(Ok((None, None)), |mut l| {
+                parse_limit(&mut l, connection, &mut param_ctx)
+            })?;
 
             // FIXME: handle ORDER BY for compound selects
             if !select.order_by.is_empty() {
@@ -184,6 +189,7 @@ fn prepare_one_select_plan(
     table_ref_counter: &mut TableRefIdCounter,
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
+    param_ctx: &mut ParamState,
 ) -> Result<SelectPlan> {
     match select {
         ast::OneSelect::Select {
@@ -230,6 +236,7 @@ fn prepare_one_select_plan(
                 &mut table_references,
                 table_ref_counter,
                 connection,
+                param_ctx,
             )?;
 
             // Preallocate space for the result columns
@@ -255,7 +262,6 @@ fn prepare_one_select_plan(
                     })
                     .sum(),
             );
-
             let mut plan = SelectPlan {
                 join_order: table_references
                     .joined_tables()
@@ -288,19 +294,21 @@ fn prepare_one_select_plan(
                 let mut window = Window::new(Some(name), &window_def.window)?;
 
                 for expr in window.partition_by.iter_mut() {
-                    bind_column_references(
+                    bind_and_rewrite_expr(
                         expr,
-                        &mut plan.table_references,
-                        Some(&plan.result_columns),
+                        Some(&mut plan.table_references),
+                        None,
                         connection,
+                        param_ctx,
                     )?;
                 }
                 for (expr, _) in window.order_by.iter_mut() {
-                    bind_column_references(
+                    bind_and_rewrite_expr(
                         expr,
-                        &mut plan.table_references,
-                        Some(&plan.result_columns),
+                        Some(&mut plan.table_references),
+                        None,
                         connection,
+                        param_ctx,
                     )?;
                 }
 
@@ -357,11 +365,12 @@ fn prepare_one_select_plan(
                         }
                     }
                     ResultColumn::Expr(ref mut expr, maybe_alias) => {
-                        bind_column_references(
+                        bind_and_rewrite_expr(
                             expr,
-                            &mut plan.table_references,
-                            Some(&plan.result_columns),
+                            Some(&mut plan.table_references),
+                            None,
                             connection,
+                            param_ctx,
                         )?;
                         let contains_aggregates = resolve_window_and_aggregate_functions(
                             schema,
@@ -385,7 +394,12 @@ fn prepare_one_select_plan(
             // This step can only be performed at this point, because all table references are now available.
             // Virtual table predicates may depend on column bindings from tables to the right in the join order,
             // so we must wait until the full set of references has been collected.
-            add_vtab_predicates_to_where_clause(&mut vtab_predicates, &mut plan, connection)?;
+            add_vtab_predicates_to_where_clause(
+                &mut vtab_predicates,
+                &mut plan,
+                connection,
+                param_ctx,
+            )?;
 
             // Parse the actual WHERE clause and add its conditions to the plan WHERE clause that already contains the join conditions.
             parse_where(
@@ -394,16 +408,18 @@ fn prepare_one_select_plan(
                 Some(&plan.result_columns),
                 &mut plan.where_clause,
                 connection,
+                param_ctx,
             )?;
 
             if let Some(mut group_by) = group_by {
                 for expr in group_by.exprs.iter_mut() {
                     replace_column_number_with_copy_of_column_expr(expr, &plan.result_columns)?;
-                    bind_column_references(
+                    bind_and_rewrite_expr(
                         expr,
-                        &mut plan.table_references,
+                        Some(&mut plan.table_references),
                         Some(&plan.result_columns),
                         connection,
+                        param_ctx,
                     )?;
                 }
 
@@ -414,11 +430,12 @@ fn prepare_one_select_plan(
                         let mut predicates = vec![];
                         break_predicate_at_and_boundaries(&having, &mut predicates);
                         for expr in predicates.iter_mut() {
-                            bind_column_references(
+                            bind_and_rewrite_expr(
                                 expr,
-                                &mut plan.table_references,
+                                Some(&mut plan.table_references),
                                 Some(&plan.result_columns),
                                 connection,
+                                param_ctx,
                             )?;
                             let contains_aggregates = resolve_window_and_aggregate_functions(
                                 schema,
@@ -452,11 +469,12 @@ fn prepare_one_select_plan(
             for mut o in order_by {
                 replace_column_number_with_copy_of_column_expr(&mut o.expr, &plan.result_columns)?;
 
-                bind_column_references(
+                bind_and_rewrite_expr(
                     &mut o.expr,
-                    &mut plan.table_references,
+                    Some(&mut plan.table_references),
                     Some(&plan.result_columns),
                     connection,
+                    param_ctx,
                 )?;
                 resolve_window_and_aggregate_functions(
                     schema,
@@ -471,8 +489,9 @@ fn prepare_one_select_plan(
             plan.order_by = key;
 
             // Parse the LIMIT/OFFSET clause
-            (plan.limit, plan.offset) =
-                limit.map_or(Ok((None, None)), |mut l| parse_limit(&mut l, connection))?;
+            (plan.limit, plan.offset) = limit.map_or(Ok((None, None)), |mut l| {
+                parse_limit(&mut l, connection, param_ctx)
+            })?;
 
             if !windows.is_empty() {
                 plan_windows(schema, syms, &mut plan, table_ref_counter, &mut windows)?;
@@ -521,13 +540,15 @@ fn add_vtab_predicates_to_where_clause(
     vtab_predicates: &mut Vec<Expr>,
     plan: &mut SelectPlan,
     connection: &Arc<Connection>,
+    param_ctx: &mut ParamState,
 ) -> Result<()> {
     for expr in vtab_predicates.iter_mut() {
-        bind_column_references(
+        bind_and_rewrite_expr(
             expr,
-            &mut plan.table_references,
+            Some(&mut plan.table_references),
             Some(&plan.result_columns),
             connection,
+            param_ctx,
         )?;
     }
     for expr in vtab_predicates.drain(..) {

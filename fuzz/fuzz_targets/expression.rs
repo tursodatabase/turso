@@ -118,6 +118,14 @@ impl rusqlite::types::FromSql for Value {
 
 str_enum! {
     enum UnaryFunc {
+        Round => "round",
+        Hex => "hex",
+        Unhex => "unhex",
+        Abs => "abs",
+        Lower => "lower",
+        Upper => "upper",
+        Sign => "sign",
+
         Ceil => "ceil",
         Floor => "floor",
         Trunc => "trunc",
@@ -149,9 +157,11 @@ str_enum! {
 
 str_enum! {
     enum BinaryFunc {
+        Round => "round",
         Power => "pow",
         Mod => "mod",
         Atan2 => "atan2",
+        Log => "log",
     }
 }
 
