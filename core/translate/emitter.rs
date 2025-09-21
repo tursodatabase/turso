@@ -1,6 +1,7 @@
 // This module contains code for emitting bytecode instructions for SQL query execution.
 // It handles translating high-level SQL operations into low-level bytecode that can be executed by the virtual machine.
 
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use tracing::{instrument, Level};
@@ -25,8 +26,8 @@ use crate::function::Func;
 use crate::schema::{BTreeTable, Column, Schema, Table};
 use crate::translate::compound_select::emit_program_for_compound_select;
 use crate::translate::expr::{
-    emit_returning_results, translate_condition_expr, translate_expr_no_constant_opt,
-    walk_expr_mut, ConditionMetadata, NoConstantOptReason, ReturningValueRegisters, WalkControl,
+    emit_returning_results, translate_expr_no_constant_opt, walk_expr_mut, NoConstantOptReason,
+    ReturningValueRegisters, WalkControl,
 };
 use crate::translate::plan::{DeletePlan, JoinedTable, Plan, QueryDestination, Search};
 use crate::translate::result_row::try_fold_expr_to_i64;
@@ -578,17 +579,20 @@ fn emit_delete_insns(
                     .bind_where_expr(Some(table_references), connection)
                     .expect("where clause to exist");
                 let skip_label = program.allocate_label();
-                translate_condition_expr(
+                let reg = program.alloc_register();
+                translate_expr_no_constant_opt(
                     program,
-                    table_references,
+                    Some(table_references),
                     &where_copy,
-                    ConditionMetadata {
-                        jump_if_condition_is_true: false,
-                        jump_target_when_false: skip_label,
-                        jump_target_when_true: BranchOffset::Placeholder,
-                    },
+                    reg,
                     &t_ctx.resolver,
+                    NoConstantOptReason::RegisterReuse,
                 )?;
+                program.emit_insn(Insn::IfNot {
+                    reg,
+                    jump_if_null: true,
+                    target_pc: skip_label,
+                });
                 Some(skip_label)
             } else {
                 None
@@ -1075,7 +1079,7 @@ fn emit_update_insns(
                 .bind_where_expr(Some(&mut plan.table_references), connection)
                 .expect("where clause to exist");
             let old_satisfied_reg = program.alloc_register();
-            let old_satisfied_reg = translate_expr_no_constant_opt(
+            translate_expr_no_constant_opt(
                 program,
                 Some(&plan.table_references),
                 &where_clause,
@@ -1100,12 +1104,13 @@ fn emit_update_insns(
             )?;
 
             let new_satisfied_reg = program.alloc_register();
-            translate_expr(
+            translate_expr_no_constant_opt(
                 program,
                 None,
                 &new_where,
                 new_satisfied_reg,
                 &t_ctx.resolver,
+                NoConstantOptReason::RegisterReuse,
             )?;
 
             // now we have two registers that tell us whether or not the old and new values satisfy
@@ -1204,6 +1209,20 @@ fn emit_update_insns(
 
         // Handle unique constraint
         if index.unique {
+            let aff = index
+                .columns
+                .iter()
+                .map(|ic| {
+                    unsafe { &*table_ref }.columns()[ic.pos_in_table]
+                        .affinity()
+                        .aff_mask()
+                })
+                .collect::<String>();
+            program.emit_insn(Insn::Affinity {
+                start_reg: idx_start_reg,
+                count: NonZeroUsize::new(num_cols).expect("nonzero col count"),
+                affinities: aff,
+            });
             let constraint_check = program.allocate_label();
             // check if the record already exists in the index for unique indexes and abort if so
             program.emit_insn(Insn::NoConflict {
@@ -1782,24 +1801,32 @@ fn rewrite_where_for_update_registers(
         match e {
             Expr::Qualified(_, col) | Expr::DoublyQualified(_, _, col) => {
                 let normalized = normalize_ident(col.as_str());
-                if let Some((idx, _)) = columns.iter().enumerate().find(|(_, c)| {
+                if let Some((idx, c)) = columns.iter().enumerate().find(|(_, c)| {
                     c.name
                         .as_ref()
                         .is_some_and(|n| n.eq_ignore_ascii_case(&normalized))
                 }) {
-                    *e = Expr::Register(columns_start_reg + idx);
+                    if c.is_rowid_alias {
+                        *e = Expr::Register(rowid_reg);
+                    } else {
+                        *e = Expr::Register(columns_start_reg + idx);
+                    }
                 }
             }
             Expr::Id(ast::Name::Ident(name)) | Expr::Id(ast::Name::Quoted(name)) => {
                 let normalized = normalize_ident(name.as_str());
                 if normalized.eq_ignore_ascii_case("rowid") {
                     *e = Expr::Register(rowid_reg);
-                } else if let Some((idx, _)) = columns.iter().enumerate().find(|(_, c)| {
+                } else if let Some((idx, c)) = columns.iter().enumerate().find(|(_, c)| {
                     c.name
                         .as_ref()
                         .is_some_and(|n| n.eq_ignore_ascii_case(&normalized))
                 }) {
-                    *e = Expr::Register(columns_start_reg + idx);
+                    if c.is_rowid_alias {
+                        *e = Expr::Register(rowid_reg);
+                    } else {
+                        *e = Expr::Register(columns_start_reg + idx);
+                    }
                 }
             }
             Expr::RowId { .. } => {
