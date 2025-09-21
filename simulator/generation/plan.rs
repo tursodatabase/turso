@@ -25,7 +25,7 @@ use turso_core::{Connection, Result, StepResult};
 
 use crate::{
     SimulatorEnv,
-    generation::{PanicGenerationContext, Shadow},
+    generation::Shadow,
     model::Query,
     runner::env::{ShadowTablesMut, SimConnection, SimulationType},
 };
@@ -226,8 +226,12 @@ impl InteractionPlan {
 
         while plan.len() < num_interactions {
             tracing::debug!("Generating interaction {}/{}", plan.len(), num_interactions);
-            let interactions =
-                Interactions::arbitrary_from(rng, &PanicGenerationContext, (env, plan.stats()));
+            let interactions = {
+                let conn_index = env.choose_conn(rng);
+                let conn_ctx = &env.connection_context(conn_index);
+                Interactions::arbitrary_from(rng, conn_ctx, (env, plan.stats(), conn_index))
+            };
+
             interactions.shadow(&mut env.get_conn_tables_mut(interactions.connection_index));
             plan.push(interactions);
         }
@@ -1000,11 +1004,11 @@ fn random_fault<R: rand::Rng>(rng: &mut R, env: &SimulatorEnv) -> Interactions {
     Interactions::new(env.choose_conn(rng), InteractionsType::Fault(fault))
 }
 
-impl ArbitraryFrom<(&SimulatorEnv, InteractionStats)> for Interactions {
+impl ArbitraryFrom<(&SimulatorEnv, InteractionStats, usize)> for Interactions {
     fn arbitrary_from<R: rand::Rng, C: GenerationContext>(
         rng: &mut R,
-        _context: &C,
-        (env, stats): (&SimulatorEnv, InteractionStats),
+        conn_ctx: &C,
+        (env, stats, conn_index): (&SimulatorEnv, InteractionStats, usize),
     ) -> Self {
         let remaining_ = remaining(
             env.opts.max_interactions,
@@ -1012,7 +1016,6 @@ impl ArbitraryFrom<(&SimulatorEnv, InteractionStats)> for Interactions {
             &stats,
             env.profile.experimental_mvcc,
         );
-        let conn_index = env.choose_conn(rng);
         frequency(
             vec![
                 (
@@ -1022,8 +1025,8 @@ impl ArbitraryFrom<(&SimulatorEnv, InteractionStats)> for Interactions {
                             conn_index,
                             InteractionsType::Property(Property::arbitrary_from(
                                 rng,
-                                &PanicGenerationContext,
-                                (env, &stats, conn_index),
+                                conn_ctx,
+                                (env, &stats),
                             )),
                         )
                     }),

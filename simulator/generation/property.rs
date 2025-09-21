@@ -1514,13 +1514,12 @@ fn property_faulty_query<R: rand::Rng>(
     }
 }
 
-impl ArbitraryFrom<(&SimulatorEnv, &InteractionStats, usize)> for Property {
+impl ArbitraryFrom<(&SimulatorEnv, &InteractionStats)> for Property {
     fn arbitrary_from<R: rand::Rng, C: GenerationContext>(
         rng: &mut R,
-        _context: &C,
-        (env, stats, conn_index): (&SimulatorEnv, &InteractionStats, usize),
+        conn_ctx: &C,
+        (env, stats): (&SimulatorEnv, &InteractionStats),
     ) -> Self {
-        let conn_ctx = &env.connection_context(conn_index);
         let opts = conn_ctx.opts();
         let remaining_ = remaining(
             env.opts.max_interactions,

@@ -1,5 +1,3 @@
-use sql_generation::generation::GenerationContext;
-
 use crate::runner::env::ShadowTablesMut;
 
 pub mod plan;
@@ -18,18 +16,4 @@ pub mod query;
 pub(crate) trait Shadow {
     type Result;
     fn shadow(&self, tables: &mut ShadowTablesMut<'_>) -> Self::Result;
-}
-
-/// Generation context that will always panic when called
-/// This is meant to be used when want to ensure that no downstream arbitrary fn will use this context
-pub struct PanicGenerationContext;
-
-impl GenerationContext for PanicGenerationContext {
-    fn tables(&self) -> &Vec<sql_generation::model::table::Table> {
-        unimplemented!("you are not supposed to use this context")
-    }
-
-    fn opts(&self) -> &sql_generation::generation::Opts {
-        unimplemented!("you are not supposed to use this context")
-    }
 }
