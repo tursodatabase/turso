@@ -1325,6 +1325,7 @@ mod tests {
             ],
             has_rowid: true, // Has implicit rowid but no alias
             is_strict: false,
+            has_autoincrement: false,
             unique_sets: vec![],
         };
 
