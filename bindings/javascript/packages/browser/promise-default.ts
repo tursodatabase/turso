@@ -1,6 +1,6 @@
 import { DatabaseOpts, SqliteError, } from "@tursodatabase/database-common"
-import { connect as promiseConnect, Database } from "./promise.js";
-import { connect as nativeConnect, initThreadPool, MainWorker } from "./index-default.js";
+import { Database, connect as promiseConnect } from "./promise.js";
+import { initThreadPool, MainWorker, connectDbAsync } from "./index-default.js";
 
 /**
  * Creates a new database connection asynchronously.
@@ -10,13 +10,19 @@ import { connect as nativeConnect, initThreadPool, MainWorker } from "./index-de
  * @returns {Promise<Database>} - A promise that resolves to a Database instance.
  */
 async function connect(path: string, opts: DatabaseOpts = {}): Promise<Database> {
-    return await promiseConnect(path, opts, nativeConnect, async () => {
+    const init = async () => {
         await initThreadPool();
         if (MainWorker == null) {
             throw new Error("panic: MainWorker is not initialized");
         }
         return MainWorker;
-    });
+    };
+    return await promiseConnect(
+        path,
+        opts,
+        connectDbAsync,
+        init
+    );
 }
 
 export { connect, Database, SqliteError }

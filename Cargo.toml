@@ -34,7 +34,6 @@ members = [
     "perf/throughput/rusqlite",
     "perf/encryption"
 ]
-
 exclude = [
     "perf/latency/limbo",
 ]
@@ -62,7 +61,7 @@ limbo_percentile = { path = "extensions/percentile", version = "0.2.0-pre.3" }
 limbo_regexp = { path = "extensions/regexp", version = "0.2.0-pre.3" }
 turso_sqlite3_parser = { path = "vendored/sqlite3-parser", version = "0.2.0-pre.3" }
 limbo_uuid = { path = "extensions/uuid", version = "0.2.0-pre.3" }
-turso_parser = { path = "parser", version = "0.2.0-pre.3"  }
+turso_parser = { path = "parser", version = "0.2.0-pre.3" }
 sql_generation = { path = "sql_generation" }
 strum = { version = "0.26", features = ["derive"] }
 strum_macros = "0.26"

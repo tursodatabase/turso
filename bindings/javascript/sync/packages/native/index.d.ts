@@ -16,26 +16,6 @@ export declare class Database {
   /** Returns whether the database connection is open. */
   get open(): boolean
   /**
-   * Executes a batch of SQL statements on main thread
-   *
-   * # Arguments
-   *
-   * * `sql` - The SQL statements to execute.
-   *
-   * # Returns
-   */
-  batchSync(sql: string): void
-  /**
-   * Executes a batch of SQL statements outside of main thread
-   *
-   * # Arguments
-   *
-   * * `sql` - The SQL statements to execute.
-   *
-   * # Returns
-   */
-  batchAsync(sql: string): Promise<void>
-  /**
    * Prepares a statement for execution.
    *
    * # Arguments
@@ -178,13 +158,17 @@ export declare class SyncEngine {
   /** Runs the I/O loop asynchronously, returning a Promise. */
   ioLoopAsync(): Promise<void>
   protocolIo(): JsProtocolRequestBytes | null
-  sync(): GeneratorHolder
   push(): GeneratorHolder
   stats(): GeneratorHolder
-  pull(): GeneratorHolder
+  wait(): GeneratorHolder
+  apply(changes: SyncEngineChanges): GeneratorHolder
   checkpoint(): GeneratorHolder
   open(): Database
   close(): void
+}
+
+export declare class SyncEngineChanges {
+
 }
 
 export declare const enum DatabaseChangeTypeJs {
@@ -220,7 +204,8 @@ export type DatabaseRowTransformResultJs =
 export type GeneratorResponse =
   | { type: 'IO' }
   | { type: 'Done' }
-  | { type: 'SyncEngineStats', operations: number, mainWal: number, revertWal: number, lastPullUnixTime: number, lastPushUnixTime?: number }
+  | { type: 'SyncEngineStats', operations: number, mainWal: number, revertWal: number, lastPullUnixTime: number, lastPushUnixTime?: number, revision?: string }
+  | { type: 'SyncEngineChanges', changes: SyncEngineChanges }
 
 export type JsProtocolRequest =
   | { type: 'Http', method: string, path: string, body?: Array<number>, headers: Array<[string, string]> }
@@ -232,6 +217,7 @@ export interface SyncEngineOpts {
   path: string
   clientName?: string
   walPullBatchSize?: number
+  longPollTimeoutMs?: number
   tracing?: string
   tablesIgnore?: Array<string>
   useTransform: boolean

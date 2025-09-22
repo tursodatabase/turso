@@ -260,6 +260,130 @@ test('persistence-pull-push', async () => {
     expect(rows2.sort(localeCompare)).toEqual(expected.sort(localeCompare))
 })
 
+test('pull-push-concurrent', async () => {
+    {
+        const db = await connect({ path: ':memory:', url: process.env.VITE_TURSO_DB_URL, longPollTimeoutMs: 5000 });
+        await db.exec("CREATE TABLE IF NOT EXISTS q(x TEXT PRIMARY KEY, y)");
+        await db.exec("DELETE FROM q");
+        await db.push();
+        await db.close();
+    }
+    let pullResolve = null;
+    const pullFinish = new Promise(resolve => pullResolve = resolve);
+    let pushResolve = null;
+    const pushFinish = new Promise(resolve => pushResolve = resolve);
+    let stopPull = false;
+    let stopPush = false;
+    const db = await connect({ path: ':memory:', url: process.env.VITE_TURSO_DB_URL });
+    let pull = async () => {
+        try {
+            await db.pull();
+        } catch (e) {
+            console.error('pull', e);
+        } finally {
+            if (!stopPull) {
+                setTimeout(pull, 0);
+            } else {
+                pullResolve()
+            }
+        }
+    }
+    let push = async () => {
+        try {
+            if ((await db.stats()).operations > 0) {
+                await db.push();
+            }
+        } catch (e) {
+            console.error('push', e);
+        } finally {
+            if (!stopPush) {
+                setTimeout(push, 0);
+            } else {
+                pushResolve();
+            }
+        }
+    }
+    setTimeout(pull, 0);
+    setTimeout(push, 0);
+    for (let i = 0; i < 1000; i++) {
+        await db.exec(`INSERT INTO q VALUES ('k${i}', 'v${i}')`);
+    }
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    stopPush = true;
+    await pushFinish;
+    stopPull = true;
+    await pullFinish;
+    console.info(await db.stats());
+})
+
+test('concurrent-updates', { timeout: 60000 }, async () => {
+    {
+        const db = await connect({ path: ':memory:', url: process.env.VITE_TURSO_DB_URL, longPollTimeoutMs: 10 });
+        await db.exec("CREATE TABLE IF NOT EXISTS three(x TEXT PRIMARY KEY, y, z)");
+        await db.exec("DELETE FROM three");
+        await db.push();
+        await db.close();
+    }
+    let stop = false;
+    const dbs = [];
+    for (let i = 0; i < 8; i++) {
+        dbs.push(await connect({ path: ':memory:', url: process.env.VITE_TURSO_DB_URL }));
+    }
+    async function pull(db, i) {
+        try {
+            console.info('pull', i);
+            await db.pull();
+        } catch (e) {
+            console.error('pull', i, e);
+        } finally {
+            if (!stop) {
+                setTimeout(async () => await pull(db, i), 0);
+            }
+        }
+    }
+    async function push(db, i) {
+        try {
+            console.info('push', i);
+            await db.push();
+        } catch (e) {
+            console.error('push', i, e);
+        } finally {
+            if (!stop) {
+                setTimeout(async () => await push(db, i), 0);
+            }
+        }
+    }
+    for (let i = 0; i < dbs.length; i++) {
+        setTimeout(async () => await pull(dbs[i], i), 0)
+        setTimeout(async () => await push(dbs[i], i), 0)
+    }
+    for (let i = 0; i < 1000; i++) {
+        try {
+            const tasks = [];
+            for (let s = 0; s < dbs.length; s++) {
+                tasks.push(dbs[s].exec(`INSERT INTO three VALUES ('${s}', 0, randomblob(128)) ON CONFLICT DO UPDATE SET y = y + 1, z = randomblob(128)`));
+            }
+            await Promise.all(tasks);
+        } catch (e) {
+            // ignore
+        }
+        await new Promise(resolve => setTimeout(resolve, 1));
+    }
+    stop = true;
+    await Promise.all(dbs.map(db => db.push()));
+    await Promise.all(dbs.map(db => db.pull()));
+    let results = [];
+    for (let i = 0; i < dbs.length; i++) {
+        results.push(await dbs[i].prepare('SELECT x, y FROM three').all());
+    }
+    for (let i = 0; i < dbs.length; i++) {
+        expect(results[i]).toEqual(results[0]);
+        for (let s = 0; s < dbs.length; s++) {
+            expect(results[i][s].y).toBeGreaterThan(500);
+        }
+    }
+})
+
 test('transform', async () => {
     {
         const db = await connect({

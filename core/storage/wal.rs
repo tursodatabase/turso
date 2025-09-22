@@ -1639,11 +1639,41 @@ impl WalFile {
     }
 
     fn get_shared_mut(&self) -> parking_lot::RwLockWriteGuard<'_, WalFileShared> {
-        self.shared.write()
+        // WASM in browser main thread doesn't have a way to "park" a thread
+        // so, we spin way here instead of calling blocking lock
+        #[cfg(target_family = "wasm")]
+        {
+            loop {
+                let Some(lock) = self.shared.try_write() else {
+                    std::hint::spin_loop();
+                    continue;
+                };
+                return lock;
+            }
+        }
+        #[cfg(not(target_family = "wasm"))]
+        {
+            self.shared.write()
+        }
     }
 
     fn get_shared(&self) -> parking_lot::RwLockReadGuard<'_, WalFileShared> {
-        self.shared.read()
+        // WASM in browser main thread doesn't have a way to "park" a thread
+        // so, we spin way here instead of calling blocking lock
+        #[cfg(target_family = "wasm")]
+        {
+            loop {
+                let Some(lock) = self.shared.try_read() else {
+                    std::hint::spin_loop();
+                    continue;
+                };
+                return lock;
+            }
+        }
+        #[cfg(not(target_family = "wasm"))]
+        {
+            self.shared.read()
+        }
     }
 
     fn complete_append_frame(&mut self, page_id: u64, frame_id: u64, checksums: (u32, u32)) {

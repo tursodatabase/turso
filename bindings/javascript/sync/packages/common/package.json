@@ -21,5 +21,8 @@
     "tsc-build": "npm exec tsc",
     "build": "npm run tsc-build",
     "test": "echo 'no tests'"
+  },
+  "dependencies": {
+    "@tursodatabase/database-common": "^0.2.0-pre.3"
   }
 }

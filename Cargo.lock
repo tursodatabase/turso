@@ -4233,6 +4233,7 @@ dependencies = [
 name = "turso_node"
 version = "0.2.0-pre.3"
 dependencies = [
+ "chrono",
  "napi",
  "napi-build",
  "napi-derive",
@@ -4335,10 +4336,10 @@ name = "turso_sync_js"
 version = "0.2.0-pre.3"
 dependencies = [
  "genawaiter",
- "http",
  "napi",
  "napi-build",
  "napi-derive",
+ "tracing",
  "tracing-subscriber",
  "turso_core",
  "turso_node",

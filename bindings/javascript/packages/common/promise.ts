@@ -1,3 +1,4 @@
+import { AsyncLock } from "./async-lock.js";
 import { bindParams } from "./bind.js";
 import { SqliteError } from "./sqlite-error.js";
 import { NativeDatabase, NativeStatement, STEP_IO, STEP_ROW, STEP_DONE, DatabaseOpts } from "./types.js";
@@ -32,6 +33,7 @@ class Database {
   db: NativeDatabase;
   memory: boolean;
   open: boolean;
+  execLock: AsyncLock;
   private _inTransaction: boolean = false;
   /**
    * Creates a new database connection. If the database file pointed to by `path` does not exists, it will be created.
@@ -57,6 +59,7 @@ class Database {
   initialize(db: NativeDatabase, name, readonly) {
     this.db = db;
     this.memory = db.memory;
+    this.execLock = new AsyncLock();
     Object.defineProperties(this, {
       inTransaction: {
         get: () => this._inTransaction,
@@ -195,10 +198,11 @@ class Database {
       throw new TypeError("The database connection is not open");
     }
 
+    const stmt = this.prepare(sql);
     try {
-      await this.db.batchAsync(sql);
-    } catch (err) {
-      throw convertError(err);
+      await stmt.run();
+    } finally {
+      stmt.close();
     }
   }
 
@@ -297,25 +301,30 @@ class Statement {
     this.stmt.reset();
     bindParams(this.stmt, bindParameters);
 
-    while (true) {
-      const stepResult = await this.stmt.stepAsync();
-      if (stepResult === STEP_IO) {
-        await this.db.db.ioLoopAsync();
-        continue;
+    await this.db.execLock.acquire();
+    try {
+      while (true) {
+        const stepResult = await this.stmt.stepSync();
+        if (stepResult === STEP_IO) {
+          await this.db.db.ioLoopAsync();
+          continue;
+        }
+        if (stepResult === STEP_DONE) {
+          break;
+        }
+        if (stepResult === STEP_ROW) {
+          // For run(), we don't need the row data, just continue
+          continue;
+        }
       }
-      if (stepResult === STEP_DONE) {
-        break;
-      }
-      if (stepResult === STEP_ROW) {
-        // For run(), we don't need the row data, just continue
-        continue;
-      }
+
+      const lastInsertRowid = this.db.db.lastInsertRowid();
+      const changes = this.db.db.totalChanges() === totalChangesBefore ? 0 : this.db.db.changes();
+
+      return { changes, lastInsertRowid };
+    } finally {
+      this.db.execLock.release();
     }
-
-    const lastInsertRowid = this.db.db.lastInsertRowid();
-    const changes = this.db.db.totalChanges() === totalChangesBefore ? 0 : this.db.db.changes();
-
-    return { changes, lastInsertRowid };
   }
 
   /**
@@ -327,18 +336,23 @@ class Statement {
     this.stmt.reset();
     bindParams(this.stmt, bindParameters);
 
-    while (true) {
-      const stepResult = await this.stmt.stepAsync();
-      if (stepResult === STEP_IO) {
-        await this.db.db.ioLoopAsync();
-        continue;
+    await this.db.execLock.acquire();
+    try {
+      while (true) {
+        const stepResult = await this.stmt.stepSync();
+        if (stepResult === STEP_IO) {
+          await this.db.db.ioLoopAsync();
+          continue;
+        }
+        if (stepResult === STEP_DONE) {
+          return undefined;
+        }
+        if (stepResult === STEP_ROW) {
+          return this.stmt.row();
+        }
       }
-      if (stepResult === STEP_DONE) {
-        return undefined;
-      }
-      if (stepResult === STEP_ROW) {
-        return this.stmt.row();
-      }
+    } finally {
+      this.db.execLock.release();
     }
   }
 
@@ -351,18 +365,23 @@ class Statement {
     this.stmt.reset();
     bindParams(this.stmt, bindParameters);
 
-    while (true) {
-      const stepResult = await this.stmt.stepAsync();
-      if (stepResult === STEP_IO) {
-        await this.db.db.ioLoopAsync();
-        continue;
+    await this.db.execLock.acquire();
+    try {
+      while (true) {
+        const stepResult = await this.stmt.stepSync();
+        if (stepResult === STEP_IO) {
+          await this.db.db.ioLoopAsync();
+          continue;
+        }
+        if (stepResult === STEP_DONE) {
+          break;
+        }
+        if (stepResult === STEP_ROW) {
+          yield this.stmt.row();
+        }
       }
-      if (stepResult === STEP_DONE) {
-        break;
-      }
-      if (stepResult === STEP_ROW) {
-        yield this.stmt.row();
-      }
+    } finally {
+      this.db.execLock.release();
     }
   }
 
@@ -376,20 +395,26 @@ class Statement {
     bindParams(this.stmt, bindParameters);
     const rows: any[] = [];
 
-    while (true) {
-      const stepResult = await this.stmt.stepAsync();
-      if (stepResult === STEP_IO) {
-        await this.db.db.ioLoopAsync();
-        continue;
+    await this.db.execLock.acquire();
+    try {
+      while (true) {
+        const stepResult = await this.stmt.stepSync();
+        if (stepResult === STEP_IO) {
+          await this.db.db.ioLoopAsync();
+          continue;
+        }
+        if (stepResult === STEP_DONE) {
+          break;
+        }
+        if (stepResult === STEP_ROW) {
+          rows.push(this.stmt.row());
+        }
       }
-      if (stepResult === STEP_DONE) {
-        break;
-      }
-      if (stepResult === STEP_ROW) {
-        rows.push(this.stmt.row());
-      }
+      return rows;
     }
-    return rows;
+    finally {
+      this.db.execLock.release();
+    }
   }
 
   /**

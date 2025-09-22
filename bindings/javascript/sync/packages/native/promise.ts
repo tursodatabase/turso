@@ -1,5 +1,5 @@
 import { DatabasePromise, DatabaseOpts, NativeDatabase } from "@tursodatabase/database-common"
-import { ProtocolIo, run, SyncOpts, RunOpts, DatabaseRowMutation, DatabaseRowStatement, DatabaseRowTransformResult, SyncEngineStats } from "@tursodatabase/sync-common";
+import { ProtocolIo, run, SyncOpts, RunOpts, DatabaseRowMutation, DatabaseRowStatement, DatabaseRowTransformResult, SyncEngineStats, SyncEngineGuards } from "@tursodatabase/sync-common";
 import { Database as NativeDB, SyncEngine } from "#index";
 import { promises } from "node:fs";
 
@@ -43,23 +43,27 @@ class Database extends DatabasePromise {
     runOpts: RunOpts;
     engine: any;
     io: ProtocolIo;
+    guards: SyncEngineGuards
     constructor(db: NativeDatabase, io: ProtocolIo, runOpts: RunOpts, engine: any, opts: DatabaseOpts = {}) {
         super(db, opts)
         this.runOpts = runOpts;
         this.engine = engine;
         this.io = io;
+        this.guards = new SyncEngineGuards();
     }
     async sync() {
-        await run(this.runOpts, this.io, this.engine, this.engine.sync());
+        await this.push();
+        await this.pull();
     }
     async pull() {
-        await run(this.runOpts, this.io, this.engine, this.engine.pull());
+        const changes = await this.guards.wait(async () => await run(this.runOpts, this.io, this.engine, this.engine.wait()));
+        await this.guards.apply(async () => await run(this.runOpts, this.io, this.engine, this.engine.apply(changes)));
     }
     async push() {
-        await run(this.runOpts, this.io, this.engine, this.engine.push());
+        await this.guards.push(async () => await run(this.runOpts, this.io, this.engine, this.engine.push()));
     }
     async checkpoint() {
-        await run(this.runOpts, this.io, this.engine, this.engine.checkpoint());
+        await this.guards.checkpoint(async () => await run(this.runOpts, this.io, this.engine, this.engine.checkpoint()));
     }
     async stats(): Promise<SyncEngineStats> {
         return (await run(this.runOpts, this.io, this.engine, this.engine.stats()));
@@ -83,7 +87,8 @@ async function connect(opts: SyncOpts): Promise<Database> {
         tablesIgnore: opts.tablesIgnore,
         useTransform: opts.transform != null,
         tracing: opts.tracing,
-        protocolVersion: 1
+        protocolVersion: 1,
+        longPollTimeoutMs: opts.longPollTimeoutMs,
     });
     const runOpts: RunOpts = {
         url: opts.url,
