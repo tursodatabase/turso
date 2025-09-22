@@ -676,6 +676,7 @@ mod tests {
             "ss", "tt", "uu", "vv", "ww", "xx", "yy", "zz",
         ];
         for outer in 0..OUTER_ITERS {
+            println!("");
             println!(
                 "partial_index_mutation_and_upsert_fuzz iteration {}/{}",
                 outer + 1,
@@ -696,6 +697,7 @@ mod tests {
                 cols.push(format!("c{i} INT"));
             }
             let create = format!("CREATE TABLE t ({})", cols.join(", "));
+            println!("{create};");
             limbo_exec_rows(&limbo_db, &limbo_conn, &create);
             sqlite.execute(&create, rusqlite::params![]).unwrap();
 
@@ -780,6 +782,7 @@ mod tests {
                 );
                 idx_ddls.push(ddl.clone());
                 // Create in both engines
+                println!("{ddl};");
                 limbo_exec_rows(&limbo_db, &limbo_conn, &ddl);
                 sqlite.execute(&ddl, rusqlite::params![]).unwrap();
             }
@@ -930,6 +933,7 @@ mod tests {
 
                 match (sqlite_res, limbo_res) {
                     (Ok(_), Ok(_)) => {
+                        println!("{stmt};");
                         // Compare canonical table state
                         let verify = format!(
                             "SELECT id, k{} FROM t ORDER BY id, k{}",
@@ -953,6 +957,7 @@ mod tests {
                     }
                     // Mismatch: dump context
                     (ok_sqlite, ok_turso) => {
+                        println!("{stmt};");
                         eprintln!("Schema: {create};");
                         for d in idx_ddls.iter() {
                             eprintln!("{d};");
