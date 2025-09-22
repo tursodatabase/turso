@@ -528,7 +528,7 @@ pub struct Pager {
     header_ref_state: RwLock<HeaderRefState>,
     #[cfg(not(feature = "omit_autovacuum"))]
     vacuum_state: RwLock<VacuumState>,
-    pub(crate) io_ctx: RefCell<IOContext>,
+    pub(crate) io_ctx: RwLock<IOContext>,
 }
 
 #[cfg(not(feature = "omit_autovacuum"))]
@@ -638,7 +638,7 @@ impl Pager {
                 ptrmap_put_state: PtrMapPutState::Start,
                 btree_create_vacuum_full_state: BtreeCreateVacuumFullState::Start,
             }),
-            io_ctx: RefCell::new(IOContext::default()),
+            io_ctx: RwLock::new(IOContext::default()),
         })
     }
 
@@ -1178,7 +1178,7 @@ impl Pager {
     ) -> Result<(PageRef, Completion)> {
         tracing::trace!("read_page_no_cache(page_idx = {})", page_idx);
         let page = Arc::new(Page::new(page_idx));
-        let io_ctx = &self.io_ctx.borrow();
+        let io_ctx = self.io_ctx.read();
         let Some(wal) = self.wal.as_ref() else {
             turso_assert!(
                 matches!(frame_watermark, Some(0) | None),
@@ -1186,7 +1186,7 @@ impl Pager {
             );
 
             page.set_locked();
-            let c = self.begin_read_disk_page(page_idx, page.clone(), allow_empty_read, io_ctx)?;
+            let c = self.begin_read_disk_page(page_idx, page.clone(), allow_empty_read, &io_ctx)?;
             return Ok((page, c));
         };
 
@@ -1199,7 +1199,7 @@ impl Pager {
             return Ok((page, c));
         }
 
-        let c = self.begin_read_disk_page(page_idx, page.clone(), allow_empty_read, io_ctx)?;
+        let c = self.begin_read_disk_page(page_idx, page.clone(), allow_empty_read, &io_ctx)?;
         Ok((page, c))
     }
 
@@ -1993,7 +1993,7 @@ impl Pager {
                 // based on the IOContext set, we will set the reserved space bytes as required by
                 // either the encryption or checksum, or None if they are not set.
                 let reserved_space_bytes = {
-                    let io_ctx = self.io_ctx.borrow();
+                    let io_ctx = self.io_ctx.read();
                     io_ctx.get_reserved_space_bytes()
                 };
                 default_header.reserved_space = reserved_space_bytes;
@@ -2366,7 +2366,7 @@ impl Pager {
     }
 
     pub fn is_encryption_ctx_set(&self) -> bool {
-        self.io_ctx.borrow_mut().encryption_context().is_some()
+        self.io_ctx.write().encryption_context().is_some()
     }
 
     pub fn set_encryption_context(
@@ -2377,25 +2377,23 @@ impl Pager {
         let page_size = self.get_page_size_unchecked().get() as usize;
         let encryption_ctx = EncryptionContext::new(cipher_mode, key, page_size)?;
         {
-            let mut io_ctx = self.io_ctx.borrow_mut();
+            let mut io_ctx = self.io_ctx.write();
             io_ctx.set_encryption(encryption_ctx);
         }
         let Some(wal) = self.wal.as_ref() else {
             return Ok(());
         };
-        wal.borrow_mut()
-            .set_io_context(self.io_ctx.borrow().clone());
+        wal.borrow_mut().set_io_context(self.io_ctx.read().clone());
         Ok(())
     }
 
     pub fn reset_checksum_context(&self) {
         {
-            let mut io_ctx = self.io_ctx.borrow_mut();
+            let mut io_ctx = self.io_ctx.write();
             io_ctx.reset_checksum();
         }
         let Some(wal) = self.wal.as_ref() else { return };
-        wal.borrow_mut()
-            .set_io_context(self.io_ctx.borrow().clone())
+        wal.borrow_mut().set_io_context(self.io_ctx.read().clone())
     }
 
     pub fn set_reserved_space_bytes(&self, value: u8) {
