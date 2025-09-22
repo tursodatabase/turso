@@ -83,6 +83,7 @@ pub(crate) fn execute_interactions(
         last_execution.interaction_index = state.interaction_pointer;
 
         let mut turso_state = state.clone();
+        let mut rusqlite_state = state.clone();
 
         // first execute turso
         let turso_res = super::execution::execute_plan(
@@ -91,8 +92,6 @@ pub(crate) fn execute_interactions(
             turso_conn_state,
             &mut turso_state,
         );
-
-        let mut rusqlite_state = state.clone();
 
         // second execute rusqlite
         let rusqlite_res = super::execution::execute_plan(
@@ -112,7 +111,9 @@ pub(crate) fn execute_interactions(
             return ExecutionResult::new(history, Some(err));
         }
 
-        state.interaction_pointer += 1;
+        assert_eq!(turso_state, rusqlite_state);
+
+        *state = turso_state;
 
         // Check if the maximum time for the simulation has been reached
         if now.elapsed().as_secs() >= env.opts.max_time_simulation as u64 {

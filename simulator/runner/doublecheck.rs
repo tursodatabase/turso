@@ -142,7 +142,9 @@ pub(crate) fn execute_plans(
             return ExecutionResult::new(history, Some(err));
         }
 
-        state.interaction_pointer += 1;
+        assert_eq!(turso_state, doublecheck_state);
+
+        *state = turso_state;
 
         // Check if the maximum time for the simulation has been reached
         if now.elapsed().as_secs() >= env.opts.max_time_simulation as u64 {
