@@ -391,14 +391,19 @@ cursor.executemany(
 print("Creating indexes...")
 cursor.execute("CREATE INDEX age_idx on users (age)")
 cursor.execute("CREATE INDEX IF NOT EXISTS idx_orders_user_id ON orders(user_id)")
-cursor.execute("CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status)")
-cursor.execute("CREATE INDEX IF NOT EXISTS idx_order_items_order_id ON order_items(order_id)")
+cursor.execute(
+    "CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status) where status IN ('shipped', 'delivered')"
+)
+cursor.execute("CREATE INDEX IF NOT EXISTS idx_order_items_order_id ON order_items(order_id) where quantity >= 5")
 cursor.execute("CREATE INDEX IF NOT EXISTS idx_order_items_product_id ON order_items(product_id)")
 cursor.execute("CREATE INDEX IF NOT EXISTS idx_reviews_product_id ON reviews(product_id)")
-cursor.execute("CREATE INDEX IF NOT EXISTS idx_reviews_user_id ON reviews(user_id)")
+cursor.execute("CREATE INDEX IF NOT EXISTS idx_reviews_user_id ON reviews(user_id) WHERE rating >= 4")
 cursor.execute("CREATE INDEX IF NOT EXISTS idx_inventory_product_id ON inventory_transactions(product_id)")
 cursor.execute("CREATE INDEX IF NOT EXISTS idx_tickets_user_id ON customer_support_tickets(user_id)")
-cursor.execute("CREATE INDEX IF NOT EXISTS idx_tickets_status ON customer_support_tickets(status)")
+cursor.execute(
+    """CREATE INDEX IF NOT EXISTS idx_tickets_status ON customer_support_tickets(status)
+        where status IN ('resolved', 'open')"""
+)
 
 conn.commit()
 
