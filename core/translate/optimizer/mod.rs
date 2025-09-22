@@ -1,4 +1,9 @@
-use std::{cell::RefCell, cmp::Ordering, collections::HashMap, sync::Arc};
+use std::{
+    cell::RefCell,
+    cmp::Ordering,
+    collections::{HashMap, VecDeque},
+    sync::Arc,
+};
 
 use constraints::{
     constraints_from_where_clause, usable_constraints_for_join_order, Constraint, ConstraintRef,
@@ -178,7 +183,7 @@ fn optimize_subqueries(plan: &mut SelectPlan, schema: &Schema) -> Result<()> {
 fn optimize_table_access(
     schema: &Schema,
     table_references: &mut TableReferences,
-    available_indexes: &HashMap<String, Vec<Arc<Index>>>,
+    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
     where_clause: &mut [WhereTerm],
     order_by: &mut Vec<(Box<ast::Expr>, SortOrder)>,
     group_by: &mut Option<GroupBy>,
@@ -899,6 +904,7 @@ fn ephemeral_index_build(
         ephemeral: true,
         table_name: table_reference.table.get_name().to_string(),
         root_page: 0,
+        where_clause: None,
         has_rowid: table_reference
             .table
             .btree()

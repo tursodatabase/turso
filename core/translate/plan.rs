@@ -577,6 +577,12 @@ impl TableReferences {
             outer_query_refs,
         }
     }
+    pub fn new_empty() -> Self {
+        Self {
+            joined_tables: Vec::new(),
+            outer_query_refs: Vec::new(),
+        }
+    }
 
     pub fn is_empty(&self) -> bool {
         self.joined_tables.is_empty() && self.outer_query_refs.is_empty()

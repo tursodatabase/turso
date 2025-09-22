@@ -1,8 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::schema::{BTreeTable, Column, Type};
-use crate::translate::expr::{bind_and_rewrite_expr, ParamState};
+use crate::translate::expr::{bind_and_rewrite_expr, walk_expr, ParamState, WalkControl};
 use crate::translate::optimizer::optimize_select_plan;
 use crate::translate::plan::{Operation, QueryDestination, Scan, Search, SelectPlan};
 use crate::translate::planner::parse_limit;
@@ -62,14 +62,13 @@ pub fn translate_update(
 ) -> crate::Result<ProgramBuilder> {
     let mut plan = prepare_update_plan(&mut program, schema, body, connection, false)?;
     optimize_plan(&mut plan, schema)?;
-    // TODO: freestyling these numbers
     let opts = ProgramBuilderOpts {
         num_cursors: 1,
         approx_num_insns: 20,
         approx_num_labels: 4,
     };
     program.extend(&opts);
-    emit_program(&mut program, plan, schema, syms, |_| {})?;
+    emit_program(connection, &mut program, plan, schema, syms, |_| {})?;
     Ok(program)
 }
 
@@ -97,7 +96,7 @@ pub fn translate_update_for_schema_change(
         approx_num_labels: 4,
     };
     program.extend(&opts);
-    emit_program(&mut program, plan, schema, syms, after)?;
+    emit_program(connection, &mut program, plan, schema, syms, after)?;
     Ok(program)
 }
 
@@ -372,24 +371,49 @@ pub fn prepare_update_plan(
     // Check what indexes will need to be updated by checking set_clauses and see
     // if a column is contained in an index.
     let indexes = schema.get_indices(table_name);
+    let updated_cols: HashSet<usize> = set_clauses.iter().map(|(i, _)| *i).collect();
     let rowid_alias_used = set_clauses
         .iter()
         .any(|(idx, _)| columns[*idx].is_rowid_alias);
     let indexes_to_update = if rowid_alias_used {
         // If the rowid alias is used in the SET clause, we need to update all indexes
-        indexes.to_vec()
+        indexes.cloned().collect()
     } else {
-        // otherwise we need to update the indexes whose columns are set in the SET clause
+        // otherwise we need to update the indexes whose columns are set in the SET clause,
+        // or if the colunns used in the partial index WHERE clause are being updated
         indexes
-            .iter()
-            .filter(|index| {
-                index.columns.iter().any(|index_column| {
-                    set_clauses
-                        .iter()
-                        .any(|(set_index_column, _)| index_column.pos_in_table == *set_index_column)
-                })
+            .filter_map(|idx| {
+                let mut needs = idx
+                    .columns
+                    .iter()
+                    .any(|c| updated_cols.contains(&c.pos_in_table));
+
+                if !needs {
+                    if let Some(w) = &idx.where_clause {
+                        let mut where_copy = w.as_ref().clone();
+                        let mut param = ParamState::disallow();
+                        let mut tr =
+                            TableReferences::new(table_references.joined_tables().to_vec(), vec![]);
+                        bind_and_rewrite_expr(
+                            &mut where_copy,
+                            Some(&mut tr),
+                            None,
+                            connection,
+                            &mut param,
+                        )
+                        .ok()?;
+                        let cols_used = collect_cols_used_in_expr(&where_copy);
+                        // if any of the columns used in the partial index WHERE clause is being
+                        // updated, we need to update this index
+                        needs = cols_used.iter().any(|c| updated_cols.contains(c));
+                    }
+                }
+                if needs {
+                    Some(idx.clone())
+                } else {
+                    None
+                }
             })
-            .cloned()
             .collect()
     };
 
@@ -421,4 +445,18 @@ fn build_scan_op(table: &Table, iter_dir: IterationDirection) -> Operation {
         Table::Virtual(_) => Operation::default_scan_for(table),
         _ => unreachable!(),
     }
+}
+
+/// Returns a set of column indices used in the expression.
+/// *Must* be used on an Expr already processed by `bind_and_rewrite_expr`
+fn collect_cols_used_in_expr(expr: &Expr) -> HashSet<usize> {
+    let mut acc = HashSet::new();
+    let _ = walk_expr(expr, &mut |expr| match expr {
+        Expr::Column { column, .. } => {
+            acc.insert(*column);
+            Ok(WalkControl::Continue)
+        }
+        _ => Ok(WalkControl::Continue),
+    });
+    acc
 }

@@ -333,8 +333,6 @@ pub fn check_literal_equivalency(lhs: &Literal, rhs: &Literal) -> bool {
 /// This function is used to determine whether two expressions are logically
 /// equivalent in the context of queries, even if their representations
 /// differ. e.g.: `SUM(x)` and `sum(x)`, `x + y` and `y + x`
-///
-/// *Note*: doesn't attempt to evaluate/compute "constexpr" results
 pub fn exprs_are_equivalent(expr1: &Expr, expr2: &Expr) -> bool {
     match (expr1, expr2) {
         (
