@@ -1528,107 +1528,102 @@ impl ArbitraryFrom<(&SimulatorEnv, &InteractionStats)> for Property {
             env.profile.experimental_mvcc,
         );
 
-        frequency(
-            vec![
-                (
-                    if !env.opts.disable_insert_values_select {
-                        u32::min(remaining_.select, remaining_.insert)
-                    } else {
-                        0
-                    },
-                    Box::new(|rng: &mut R| {
-                        property_insert_values_select(rng, &remaining_, conn_ctx)
-                    }),
-                ),
-                (
-                    remaining_.select,
-                    Box::new(|rng: &mut R| property_table_has_expected_content(rng, conn_ctx)),
-                ),
-                (
-                    u32::min(remaining_.select, remaining_.insert),
-                    Box::new(|rng: &mut R| property_read_your_updates_back(rng, conn_ctx)),
-                ),
-                (
-                    if !env.opts.disable_double_create_failure {
-                        remaining_.create / 2
-                    } else {
-                        0
-                    },
-                    Box::new(|rng: &mut R| {
-                        property_double_create_failure(rng, &remaining_, conn_ctx)
-                    }),
-                ),
-                (
-                    if !env.opts.disable_select_limit {
-                        remaining_.select
-                    } else {
-                        0
-                    },
-                    Box::new(|rng: &mut R| property_select_limit(rng, conn_ctx)),
-                ),
-                (
-                    if !env.opts.disable_delete_select {
-                        u32::min(remaining_.select, remaining_.insert).min(remaining_.delete)
-                    } else {
-                        0
-                    },
-                    Box::new(|rng: &mut R| property_delete_select(rng, &remaining_, conn_ctx)),
-                ),
-                (
-                    if !env.opts.disable_drop_select {
-                        // remaining_.drop
-                        0
-                    } else {
-                        0
-                    },
-                    Box::new(|rng: &mut R| property_drop_select(rng, &remaining_, conn_ctx)),
-                ),
-                (
-                    if !env.opts.disable_select_optimizer {
-                        remaining_.select / 2
-                    } else {
-                        0
-                    },
-                    Box::new(|rng: &mut R| property_select_select_optimizer(rng, conn_ctx)),
-                ),
-                (
-                    if opts.indexes && !env.opts.disable_where_true_false_null {
-                        remaining_.select / 2
-                    } else {
-                        0
-                    },
-                    Box::new(|rng: &mut R| property_where_true_false_null(rng, conn_ctx)),
-                ),
-                (
-                    if opts.indexes && !env.opts.disable_union_all_preserves_cardinality {
-                        remaining_.select / 3
-                    } else {
-                        0
-                    },
-                    Box::new(|rng: &mut R| property_union_all_preserves_cardinality(rng, conn_ctx)),
-                ),
-                (
-                    if env.profile.io.enable && !env.opts.disable_fsync_no_wait {
-                        50 // Freestyle number
-                    } else {
-                        0
-                    },
-                    Box::new(|rng: &mut R| property_fsync_no_wait(rng, &remaining_, conn_ctx)),
-                ),
-                (
-                    if env.profile.io.enable
-                        && env.profile.io.fault.enable
-                        && !env.opts.disable_faulty_query
-                    {
-                        20
-                    } else {
-                        0
-                    },
-                    Box::new(|rng: &mut R| property_faulty_query(rng, &remaining_, conn_ctx)),
-                ),
-            ],
-            rng,
-        )
+        let choices: Vec<(_, Box<dyn Fn(&mut R) -> Property>)> = vec![
+            (
+                if !env.opts.disable_insert_values_select {
+                    u32::min(remaining_.select, remaining_.insert).max(1)
+                } else {
+                    0
+                },
+                Box::new(|rng: &mut R| property_insert_values_select(rng, &remaining_, conn_ctx)),
+            ),
+            (
+                remaining_.select.max(1),
+                Box::new(|rng: &mut R| property_table_has_expected_content(rng, conn_ctx)),
+            ),
+            (
+                u32::min(remaining_.select, remaining_.insert).max(1),
+                Box::new(|rng: &mut R| property_read_your_updates_back(rng, conn_ctx)),
+            ),
+            (
+                if !env.opts.disable_double_create_failure {
+                    remaining_.create / 2
+                } else {
+                    0
+                },
+                Box::new(|rng: &mut R| property_double_create_failure(rng, &remaining_, conn_ctx)),
+            ),
+            (
+                if !env.opts.disable_select_limit {
+                    remaining_.select
+                } else {
+                    0
+                },
+                Box::new(|rng: &mut R| property_select_limit(rng, conn_ctx)),
+            ),
+            (
+                if !env.opts.disable_delete_select {
+                    u32::min(remaining_.select, remaining_.insert).min(remaining_.delete)
+                } else {
+                    0
+                },
+                Box::new(|rng: &mut R| property_delete_select(rng, &remaining_, conn_ctx)),
+            ),
+            (
+                if !env.opts.disable_drop_select {
+                    // remaining_.drop
+                    0
+                } else {
+                    0
+                },
+                Box::new(|rng: &mut R| property_drop_select(rng, &remaining_, conn_ctx)),
+            ),
+            (
+                if !env.opts.disable_select_optimizer {
+                    remaining_.select / 2
+                } else {
+                    0
+                },
+                Box::new(|rng: &mut R| property_select_select_optimizer(rng, conn_ctx)),
+            ),
+            (
+                if opts.indexes && !env.opts.disable_where_true_false_null {
+                    remaining_.select / 2
+                } else {
+                    0
+                },
+                Box::new(|rng: &mut R| property_where_true_false_null(rng, conn_ctx)),
+            ),
+            (
+                if opts.indexes && !env.opts.disable_union_all_preserves_cardinality {
+                    remaining_.select / 3
+                } else {
+                    0
+                },
+                Box::new(|rng: &mut R| property_union_all_preserves_cardinality(rng, conn_ctx)),
+            ),
+            (
+                if env.profile.io.enable && !env.opts.disable_fsync_no_wait {
+                    50 // Freestyle number
+                } else {
+                    0
+                },
+                Box::new(|rng: &mut R| property_fsync_no_wait(rng, &remaining_, conn_ctx)),
+            ),
+            (
+                if env.profile.io.enable
+                    && env.profile.io.fault.enable
+                    && !env.opts.disable_faulty_query
+                {
+                    20
+                } else {
+                    0
+                },
+                Box::new(|rng: &mut R| property_faulty_query(rng, &remaining_, conn_ctx)),
+            ),
+        ];
+
+        frequency(choices, rng)
     }
 }
 
