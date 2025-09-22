@@ -527,14 +527,17 @@ pub struct Pager {
     max_page_count: AtomicU32,
     header_ref_state: RwLock<HeaderRefState>,
     #[cfg(not(feature = "omit_autovacuum"))]
+    vacuum_state: VacuumState,
+    pub(crate) io_ctx: RefCell<IOContext>,
+}
+
+#[cfg(not(feature = "omit_autovacuum"))]
+pub struct VacuumState {
     /// State machine for [Pager::ptrmap_get]
     ptrmap_get_state: RefCell<PtrMapGetState>,
-    #[cfg(not(feature = "omit_autovacuum"))]
     /// State machine for [Pager::ptrmap_put]
     ptrmap_put_state: RefCell<PtrMapPutState>,
-    #[cfg(not(feature = "omit_autovacuum"))]
     btree_create_vacuum_full_state: Cell<BtreeCreateVacuumFullState>,
-    pub(crate) io_ctx: RefCell<IOContext>,
 }
 
 #[derive(Debug, Clone)]
@@ -628,13 +631,13 @@ impl Pager {
             free_page_state: RwLock::new(FreePageState::Start),
             allocate_page_state: RwLock::new(AllocatePageState::Start),
             max_page_count: AtomicU32::new(DEFAULT_MAX_PAGE_COUNT),
-            #[cfg(not(feature = "omit_autovacuum"))]
-            ptrmap_get_state: RefCell::new(PtrMapGetState::Start),
-            #[cfg(not(feature = "omit_autovacuum"))]
-            ptrmap_put_state: RefCell::new(PtrMapPutState::Start),
             header_ref_state: RwLock::new(HeaderRefState::Start),
             #[cfg(not(feature = "omit_autovacuum"))]
-            btree_create_vacuum_full_state: Cell::new(BtreeCreateVacuumFullState::Start),
+            vacuum_state: VacuumState {
+                ptrmap_get_state: RefCell::new(PtrMapGetState::Start),
+                ptrmap_put_state: RefCell::new(PtrMapPutState::Start),
+                btree_create_vacuum_full_state: Cell::new(BtreeCreateVacuumFullState::Start),
+            },
             io_ctx: RefCell::new(IOContext::default()),
         })
     }
@@ -675,7 +678,7 @@ impl Pager {
     #[cfg(not(feature = "omit_autovacuum"))]
     pub fn ptrmap_get(&self, target_page_num: u32) -> Result<IOResult<Option<PtrmapEntry>>> {
         loop {
-            let ptrmap_get_state = self.ptrmap_get_state.borrow().clone();
+            let ptrmap_get_state = self.vacuum_state.ptrmap_get_state.borrow().clone();
             match ptrmap_get_state {
                 PtrMapGetState::Start => {
                     tracing::trace!("ptrmap_get(page_idx = {})", target_page_num);
@@ -702,7 +705,7 @@ impl Pager {
                     );
 
                     let (ptrmap_page, c) = self.read_page(ptrmap_pg_no as usize)?;
-                    self.ptrmap_get_state.replace(PtrMapGetState::Deserialize {
+                    self.vacuum_state.ptrmap_get_state.replace(PtrMapGetState::Deserialize {
                         ptrmap_page,
                         offset_in_ptrmap_page,
                     });
@@ -749,7 +752,7 @@ impl Pager {
 
                     let entry_slice = &ptrmap_page_data_slice
                         [offset_in_ptrmap_page..offset_in_ptrmap_page + PTRMAP_ENTRY_SIZE];
-                    self.ptrmap_get_state.replace(PtrMapGetState::Start);
+                    self.vacuum_state.ptrmap_get_state.replace(PtrMapGetState::Start);
                     break match PtrmapEntry::deserialize(entry_slice) {
                         Some(entry) => Ok(IOResult::Done(Some(entry))),
                         None => Err(LimboError::Corrupt(format!(
@@ -778,7 +781,7 @@ impl Pager {
             parent_page_no
         );
         loop {
-            let ptrmap_put_state = self.ptrmap_put_state.borrow().clone();
+            let ptrmap_put_state = self.vacuum_state.ptrmap_put_state.borrow().clone();
             match ptrmap_put_state {
                 PtrMapPutState::Start => {
                     let page_size =
@@ -806,7 +809,7 @@ impl Pager {
                     );
 
                     let (ptrmap_page, c) = self.read_page(ptrmap_pg_no as usize)?;
-                    self.ptrmap_put_state.replace(PtrMapPutState::Deserialize {
+                    self.vacuum_state.ptrmap_put_state.replace(PtrMapPutState::Deserialize {
                         ptrmap_page,
                         offset_in_ptrmap_page,
                     });
@@ -857,7 +860,7 @@ impl Pager {
                         "ptrmap page has unexpected number"
                     );
                     self.add_dirty(&ptrmap_page);
-                    self.ptrmap_put_state.replace(PtrMapPutState::Start);
+                    self.vacuum_state.ptrmap_put_state.replace(PtrMapPutState::Start);
                     break Ok(IOResult::Done(()));
                 }
             }
@@ -892,7 +895,7 @@ impl Pager {
                 }
                 AutoVacuumMode::Full => {
                     loop {
-                        match self.btree_create_vacuum_full_state.get() {
+                        match self.vacuum_state.btree_create_vacuum_full_state.get() {
                             BtreeCreateVacuumFullState::Start => {
                                 let (mut root_page_num, page_size) = return_if_io!(self
                                     .with_header(|header| {
@@ -910,7 +913,7 @@ impl Pager {
                                     root_page_num += 1;
                                 }
                                 assert!(root_page_num >= 3); //  the very first root page is page 3
-                                self.btree_create_vacuum_full_state.set(
+                                self.vacuum_state.btree_create_vacuum_full_state.set(
                                     BtreeCreateVacuumFullState::AllocatePage { root_page_num },
                                 );
                             }
@@ -927,7 +930,7 @@ impl Pager {
                                 }
 
                                 //  TODO(Zaid): Update the header metadata to reflect the new root page number
-                                self.btree_create_vacuum_full_state.set(
+                                self.vacuum_state.btree_create_vacuum_full_state.set(
                                     BtreeCreateVacuumFullState::PtrMapPut { allocated_page_id },
                                 );
                             }
@@ -938,7 +941,7 @@ impl Pager {
                                     PtrmapType::RootPage,
                                     0,
                                 ));
-                                self.btree_create_vacuum_full_state
+                                self.vacuum_state.btree_create_vacuum_full_state
                                     .set(BtreeCreateVacuumFullState::Start);
                                 return Ok(IOResult::Done(allocated_page_id));
                             }
@@ -2333,9 +2336,9 @@ impl Pager {
         *self.free_page_state.write() = FreePageState::Start;
         #[cfg(not(feature = "omit_autovacuum"))]
         {
-            self.ptrmap_get_state.replace(PtrMapGetState::Start);
-            self.ptrmap_put_state.replace(PtrMapPutState::Start);
-            self.btree_create_vacuum_full_state
+            self.vacuum_state.ptrmap_get_state.replace(PtrMapGetState::Start);
+            self.vacuum_state.ptrmap_put_state.replace(PtrMapPutState::Start);
+            self.vacuum_state.btree_create_vacuum_full_state
                 .replace(BtreeCreateVacuumFullState::Start);
         }
 
