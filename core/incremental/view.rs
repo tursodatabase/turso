@@ -8,7 +8,7 @@ use crate::types::{IOResult, Value};
 use crate::util::{extract_view_columns, ViewColumnSchema};
 use crate::{return_if_io, LimboError, Pager, Result, Statement};
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -195,6 +195,9 @@ pub struct IncrementalView {
     // Mapping from table name to fully qualified name (e.g., "customers" -> "main.customers")
     // This preserves database qualification from the original query
     qualified_table_names: HashMap<String, String>,
+    // WHERE conditions for each table (accumulated from all occurrences)
+    // Multiple conditions from UNION branches or duplicate references are stored as a vector
+    table_conditions: HashMap<String, Vec<Option<ast::Expr>>>,
     // The view's column schema with table relationships
     pub column_schema: ViewColumnSchema,
     // State machine for population
@@ -312,9 +315,18 @@ impl IncrementalView {
         // Extract output columns using the shared function
         let column_schema = extract_view_columns(&select, schema)?;
 
-        // Get all tables from FROM clause and JOINs, along with their aliases
-        let (referenced_tables, table_aliases, qualified_table_names) =
-            Self::extract_all_tables(&select, schema)?;
+        let mut referenced_tables = Vec::new();
+        let mut table_aliases = HashMap::new();
+        let mut qualified_table_names = HashMap::new();
+        let mut table_conditions = HashMap::new();
+        Self::extract_all_tables(
+            &select,
+            schema,
+            &mut referenced_tables,
+            &mut table_aliases,
+            &mut qualified_table_names,
+            &mut table_conditions,
+        )?;
 
         Self::new(
             name,
@@ -322,6 +334,7 @@ impl IncrementalView {
             referenced_tables,
             table_aliases,
             qualified_table_names,
+            table_conditions,
             column_schema,
             schema,
             main_data_root,
@@ -337,6 +350,7 @@ impl IncrementalView {
         referenced_tables: Vec<Arc<BTreeTable>>,
         table_aliases: HashMap<String, String>,
         qualified_table_names: HashMap<String, String>,
+        table_conditions: HashMap<String, Vec<Option<ast::Expr>>>,
         column_schema: ViewColumnSchema,
         schema: &Schema,
         main_data_root: usize,
@@ -362,6 +376,7 @@ impl IncrementalView {
             referenced_tables,
             table_aliases,
             qualified_table_names,
+            table_conditions,
             column_schema,
             populate_state: PopulateState::Start,
             tracker,
@@ -405,97 +420,249 @@ impl IncrementalView {
         self.referenced_tables.clone()
     }
 
-    /// Extract all tables and their aliases from the SELECT statement
-    /// Returns a tuple of (tables, alias_map, qualified_names)
-    /// where alias_map is alias -> table_name
-    /// and qualified_names is table_name -> fully_qualified_name
-    #[allow(clippy::type_complexity)]
-    fn extract_all_tables(
-        select: &ast::Select,
+    /// Process a single table reference from a FROM or JOIN clause
+    fn process_table_reference(
+        name: &ast::QualifiedName,
+        alias: &Option<ast::As>,
         schema: &Schema,
-    ) -> Result<(
-        Vec<Arc<BTreeTable>>,
-        HashMap<String, String>,
-        HashMap<String, String>,
-    )> {
-        let mut tables = Vec::new();
-        let mut aliases = HashMap::new();
-        let mut qualified_names = HashMap::new();
+        table_map: &mut HashMap<String, Arc<BTreeTable>>,
+        aliases: &mut HashMap<String, String>,
+        qualified_names: &mut HashMap<String, String>,
+        cte_names: &HashSet<String>,
+    ) -> Result<()> {
+        let table_name = name.name.as_str();
 
+        // Build the fully qualified name
+        let qualified_name = if let Some(ref db) = name.db_name {
+            format!("{db}.{table_name}")
+        } else {
+            table_name.to_string()
+        };
+
+        // Skip CTEs - they're not real tables
+        if !cte_names.contains(table_name) {
+            if let Some(table) = schema.get_btree_table(table_name) {
+                table_map.insert(table_name.to_string(), table.clone());
+                qualified_names.insert(table_name.to_string(), qualified_name);
+
+                // Store the alias mapping if there is an alias
+                if let Some(alias_enum) = alias {
+                    let alias_name = match alias_enum {
+                        ast::As::As(name) | ast::As::Elided(name) => match name {
+                            ast::Name::Ident(s) | ast::Name::Quoted(s) => s,
+                        },
+                    };
+                    aliases.insert(alias_name.to_string(), table_name.to_string());
+                }
+            } else {
+                return Err(LimboError::ParseError(format!(
+                    "Table '{table_name}' not found in schema"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn extract_one_statement(
+        select: &ast::OneSelect,
+        schema: &Schema,
+        table_map: &mut HashMap<String, Arc<BTreeTable>>,
+        aliases: &mut HashMap<String, String>,
+        qualified_names: &mut HashMap<String, String>,
+        table_conditions: &mut HashMap<String, Vec<Option<ast::Expr>>>,
+        cte_names: &HashSet<String>,
+    ) -> Result<()> {
         if let ast::OneSelect::Select {
             from: Some(ref from),
             ..
-        } = select.body.select
+        } = select
         {
             // Get the main table from FROM clause
             if let ast::SelectTable::Table(name, alias, _) = from.select.as_ref() {
-                let table_name = name.name.as_str();
-
-                // Build the fully qualified name
-                let qualified_name = if let Some(ref db) = name.db_name {
-                    format!("{db}.{table_name}")
-                } else {
-                    table_name.to_string()
-                };
-
-                if let Some(table) = schema.get_btree_table(table_name) {
-                    tables.push(table.clone());
-                    qualified_names.insert(table_name.to_string(), qualified_name);
-
-                    // Store the alias mapping if there is an alias
-                    if let Some(alias_name) = alias {
-                        aliases.insert(alias_name.to_string(), table_name.to_string());
-                    }
-                } else {
-                    return Err(LimboError::ParseError(format!(
-                        "Table '{table_name}' not found in schema"
-                    )));
-                }
+                Self::process_table_reference(
+                    name,
+                    alias,
+                    schema,
+                    table_map,
+                    aliases,
+                    qualified_names,
+                    cte_names,
+                )?;
             }
 
             // Get all tables from JOIN clauses
             for join in &from.joins {
                 if let ast::SelectTable::Table(name, alias, _) = join.table.as_ref() {
-                    let table_name = name.name.as_str();
-
-                    // Build the fully qualified name
-                    let qualified_name = if let Some(ref db) = name.db_name {
-                        format!("{db}.{table_name}")
-                    } else {
-                        table_name.to_string()
-                    };
-
-                    if let Some(table) = schema.get_btree_table(table_name) {
-                        tables.push(table.clone());
-                        qualified_names.insert(table_name.to_string(), qualified_name);
-
-                        // Store the alias mapping if there is an alias
-                        if let Some(alias_name) = alias {
-                            aliases.insert(alias_name.to_string(), table_name.to_string());
-                        }
-                    } else {
-                        return Err(LimboError::ParseError(format!(
-                            "Table '{table_name}' not found in schema"
-                        )));
-                    }
+                    Self::process_table_reference(
+                        name,
+                        alias,
+                        schema,
+                        table_map,
+                        aliases,
+                        qualified_names,
+                        cte_names,
+                    )?;
                 }
             }
         }
+        // Extract WHERE conditions for this SELECT
+        let where_expr = if let ast::OneSelect::Select {
+            where_clause: Some(ref where_expr),
+            ..
+        } = select
+        {
+            Some(where_expr.as_ref().clone())
+        } else {
+            None
+        };
 
-        if tables.is_empty() {
-            return Err(LimboError::ParseError(
-                "No tables found in SELECT statement".to_string(),
-            ));
+        // Ensure all tables have an entry in table_conditions (even if empty)
+        for table_name in table_map.keys() {
+            table_conditions.entry(table_name.clone()).or_default();
         }
 
-        Ok((tables, aliases, qualified_names))
+        // Extract and store table-specific conditions from the WHERE clause
+        if let Some(ref where_expr) = where_expr {
+            for table_name in table_map.keys() {
+                let all_tables: Vec<String> = table_map.keys().cloned().collect();
+                let table_specific_condition = Self::extract_conditions_for_table(
+                    where_expr,
+                    table_name,
+                    aliases,
+                    &all_tables,
+                    schema,
+                );
+                // Only add if there's actually a condition for this table
+                if let Some(condition) = table_specific_condition {
+                    let conditions = table_conditions.get_mut(table_name).unwrap();
+                    conditions.push(Some(condition));
+                }
+            }
+        } else {
+            // No WHERE clause - push None for all tables in this SELECT. It is a way
+            // of signaling that we need all rows in the table. It is important we signal this
+            // explicitly, because the same table may appear in many conditions - some of which
+            // have filters that would otherwise be applied.
+            for table_name in table_map.keys() {
+                let conditions = table_conditions.get_mut(table_name).unwrap();
+                conditions.push(None);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Extract all tables and their aliases from the SELECT statement, handling CTEs
+    /// Deduplicates tables and accumulates WHERE conditions
+    fn extract_all_tables(
+        select: &ast::Select,
+        schema: &Schema,
+        tables: &mut Vec<Arc<BTreeTable>>,
+        aliases: &mut HashMap<String, String>,
+        qualified_names: &mut HashMap<String, String>,
+        table_conditions: &mut HashMap<String, Vec<Option<ast::Expr>>>,
+    ) -> Result<()> {
+        let mut table_map = HashMap::new();
+        Self::extract_all_tables_inner(
+            select,
+            schema,
+            &mut table_map,
+            aliases,
+            qualified_names,
+            table_conditions,
+            &HashSet::new(),
+        )?;
+
+        // Convert deduplicated table map to vector
+        for (_name, table) in table_map {
+            tables.push(table);
+        }
+
+        Ok(())
+    }
+
+    fn extract_all_tables_inner(
+        select: &ast::Select,
+        schema: &Schema,
+        table_map: &mut HashMap<String, Arc<BTreeTable>>,
+        aliases: &mut HashMap<String, String>,
+        qualified_names: &mut HashMap<String, String>,
+        table_conditions: &mut HashMap<String, Vec<Option<ast::Expr>>>,
+        parent_cte_names: &HashSet<String>,
+    ) -> Result<()> {
+        let mut cte_names = parent_cte_names.clone();
+
+        // First, collect CTE names and process any CTEs (WITH clauses)
+        if let Some(ref with) = select.with {
+            // First pass: collect all CTE names (needed for recursive CTEs)
+            for cte in &with.ctes {
+                cte_names.insert(cte.tbl_name.as_str().to_string());
+            }
+
+            // Second pass: extract tables from each CTE's SELECT statement
+            for cte in &with.ctes {
+                // Recursively extract tables from each CTE's SELECT statement
+                Self::extract_all_tables_inner(
+                    &cte.select,
+                    schema,
+                    table_map,
+                    aliases,
+                    qualified_names,
+                    table_conditions,
+                    &cte_names,
+                )?;
+            }
+        }
+
+        // Then process the main SELECT body
+        Self::extract_one_statement(
+            &select.body.select,
+            schema,
+            table_map,
+            aliases,
+            qualified_names,
+            table_conditions,
+            &cte_names,
+        )?;
+
+        // Process any compound selects (UNION, etc.)
+        for c in &select.body.compounds {
+            let ast::CompoundSelect { select, .. } = c;
+            Self::extract_one_statement(
+                select,
+                schema,
+                table_map,
+                aliases,
+                qualified_names,
+                table_conditions,
+                &cte_names,
+            )?;
+        }
+
+        Ok(())
     }
 
     /// Generate SQL queries for populating the view from each source table
     /// Returns a vector of SQL statements, one for each referenced table
-    /// Each query includes only the WHERE conditions relevant to that specific table
+    /// Each query includes the WHERE conditions accumulated from all occurrences
     fn sql_for_populate(&self) -> crate::Result<Vec<String>> {
-        if self.referenced_tables.is_empty() {
+        Self::generate_populate_queries(
+            &self.select_stmt,
+            &self.referenced_tables,
+            &self.table_aliases,
+            &self.qualified_table_names,
+            &self.table_conditions,
+        )
+    }
+
+    pub fn generate_populate_queries(
+        select_stmt: &ast::Select,
+        referenced_tables: &[Arc<BTreeTable>],
+        table_aliases: &HashMap<String, String>,
+        qualified_table_names: &HashMap<String, String>,
+        table_conditions: &HashMap<String, Vec<Option<ast::Expr>>>,
+    ) -> crate::Result<Vec<String>> {
+        if referenced_tables.is_empty() {
             return Err(LimboError::ParseError(
                 "No tables to populate from".to_string(),
             ));
@@ -503,12 +670,11 @@ impl IncrementalView {
 
         let mut queries = Vec::new();
 
-        for table in &self.referenced_tables {
+        for table in referenced_tables {
             // Check if the table has a rowid alias (INTEGER PRIMARY KEY column)
             let has_rowid_alias = table.columns.iter().any(|col| col.is_rowid_alias);
 
-            // For now, select all columns since we don't have the static operators
-            // The circuit will handle filtering and projection
+            // Select all columns. The circuit will handle filtering and projection
             // If there's a rowid alias, we don't need to select rowid separately
             let select_clause = if has_rowid_alias {
                 "*".to_string()
@@ -516,12 +682,22 @@ impl IncrementalView {
                 "*, rowid".to_string()
             };
 
-            // Extract WHERE conditions for this specific table
-            let where_clause = self.extract_where_clause_for_table(&table.name)?;
+            // Get accumulated WHERE conditions for this table
+            let where_clause = if let Some(conditions) = table_conditions.get(&table.name) {
+                // Combine multiple conditions with OR if there are multiple occurrences
+                Self::combine_conditions(
+                    select_stmt,
+                    conditions,
+                    &table.name,
+                    referenced_tables,
+                    table_aliases,
+                )?
+            } else {
+                String::new()
+            };
 
             // Use the qualified table name if available, otherwise just the table name
-            let table_name = self
-                .qualified_table_names
+            let table_name = qualified_table_names
                 .get(&table.name)
                 .cloned()
                 .unwrap_or_else(|| table.name.clone());
@@ -532,347 +708,405 @@ impl IncrementalView {
             } else {
                 format!("SELECT {select_clause} FROM {table_name} WHERE {where_clause}")
             };
+            tracing::debug!("populating materialized view with `{query}`");
             queries.push(query);
         }
 
         Ok(queries)
     }
 
-    /// Extract WHERE conditions that apply to a specific table
-    /// This analyzes the WHERE clause in the SELECT statement and returns
-    /// only the conditions that reference the given table
-    fn extract_where_clause_for_table(&self, table_name: &str) -> crate::Result<String> {
-        // For single table queries, return the entire WHERE clause (already unqualified)
-        if self.referenced_tables.len() == 1 {
-            if let ast::OneSelect::Select {
-                where_clause: Some(ref where_expr),
-                ..
-            } = self.select_stmt.body.select
-            {
-                // For single table, the expression should already be unqualified or qualified with the single table
-                // We need to unqualify it for the single-table query
-                let unqualified = self.unqualify_expression(where_expr, table_name);
-                return Ok(unqualified.to_string());
-            }
+    fn combine_conditions(
+        _select_stmt: &ast::Select,
+        conditions: &[Option<ast::Expr>],
+        table_name: &str,
+        _referenced_tables: &[Arc<BTreeTable>],
+        table_aliases: &HashMap<String, String>,
+    ) -> crate::Result<String> {
+        // Check if any conditions are None (SELECTs without WHERE)
+        let has_none = conditions.iter().any(|c| c.is_none());
+        let non_empty: Vec<_> = conditions.iter().filter_map(|c| c.as_ref()).collect();
+
+        // If we have both Some and None conditions, that means in some of the expressions where
+        // this table appear we want all rows. So we need to fetch all rows.
+        if has_none && !non_empty.is_empty() {
             return Ok(String::new());
         }
 
-        // For multi-table queries (JOINs), extract conditions for the specific table
-        if let ast::OneSelect::Select {
-            where_clause: Some(ref where_expr),
-            ..
-        } = self.select_stmt.body.select
-        {
-            // Extract conditions that reference only the specified table
-            let table_conditions = self.extract_table_conditions(where_expr, table_name)?;
-            if let Some(conditions) = table_conditions {
-                // Unqualify the expression for single-table query
-                let unqualified = self.unqualify_expression(&conditions, table_name);
-                return Ok(unqualified.to_string());
-            }
+        if non_empty.is_empty() {
+            return Ok(String::new());
         }
 
-        Ok(String::new())
+        if non_empty.len() == 1 {
+            // Unqualify the expression before converting to string
+            let unqualified = Self::unqualify_expression(non_empty[0], table_name, table_aliases);
+            return Ok(unqualified.to_string());
+        }
+
+        // Multiple conditions - combine with OR
+        // This happens in UNION ALL when the same table appears multiple times
+        let mut combined_parts = Vec::new();
+        for condition in non_empty {
+            let unqualified = Self::unqualify_expression(condition, table_name, table_aliases);
+            // Wrap each condition in parentheses to preserve precedence
+            combined_parts.push(format!("({unqualified})"));
+        }
+
+        // Join all conditions with OR
+        Ok(combined_parts.join(" OR "))
+    }
+    /// Resolve a table alias to the actual table name
+    /// Check if an expression is a simple comparison that can be safely extracted
+    /// This excludes subqueries, CASE expressions, function calls, etc.
+    fn is_simple_comparison(expr: &ast::Expr) -> bool {
+        match expr {
+            // Simple column references and literals are OK
+            ast::Expr::Column { .. } | ast::Expr::Literal(_) => true,
+
+            // Simple binary operations between simple expressions are OK
+            ast::Expr::Binary(left, op, right) => {
+                match op {
+                    // Logical operators
+                    ast::Operator::And | ast::Operator::Or => {
+                        Self::is_simple_comparison(left) && Self::is_simple_comparison(right)
+                    }
+                    // Comparison operators
+                    ast::Operator::Equals
+                    | ast::Operator::NotEquals
+                    | ast::Operator::Less
+                    | ast::Operator::LessEquals
+                    | ast::Operator::Greater
+                    | ast::Operator::GreaterEquals
+                    | ast::Operator::Is
+                    | ast::Operator::IsNot => {
+                        Self::is_simple_comparison(left) && Self::is_simple_comparison(right)
+                    }
+                    // String concatenation and other operations are NOT simple
+                    ast::Operator::Concat => false,
+                    // Arithmetic might be OK if operands are simple
+                    ast::Operator::Add
+                    | ast::Operator::Subtract
+                    | ast::Operator::Multiply
+                    | ast::Operator::Divide
+                    | ast::Operator::Modulus => {
+                        Self::is_simple_comparison(left) && Self::is_simple_comparison(right)
+                    }
+                    _ => false,
+                }
+            }
+
+            // Unary operations might be OK
+            ast::Expr::Unary(
+                ast::UnaryOperator::Not
+                | ast::UnaryOperator::Negative
+                | ast::UnaryOperator::Positive,
+                inner,
+            ) => Self::is_simple_comparison(inner),
+            ast::Expr::Unary(_, _) => false,
+
+            // Complex expressions are NOT simple
+            ast::Expr::Case { .. } => false,
+            ast::Expr::Cast { .. } => false,
+            ast::Expr::Collate { .. } => false,
+            ast::Expr::Exists(_) => false,
+            ast::Expr::FunctionCall { .. } => false,
+            ast::Expr::InList { .. } => false,
+            ast::Expr::InSelect { .. } => false,
+            ast::Expr::Like { .. } => false,
+            ast::Expr::NotNull(_) => true, // IS NOT NULL is simple enough
+            ast::Expr::Parenthesized(exprs) => {
+                // Parenthesized expression can contain multiple expressions
+                // Only consider it simple if it has exactly one simple expression
+                exprs.len() == 1 && Self::is_simple_comparison(&exprs[0])
+            }
+            ast::Expr::Subquery(_) => false,
+
+            // BETWEEN might be OK if all operands are simple
+            ast::Expr::Between { .. } => {
+                // BETWEEN has a different structure, for safety just exclude it
+                false
+            }
+
+            // Qualified references are simple
+            ast::Expr::DoublyQualified(..) => true,
+            ast::Expr::Qualified(_, _) => true,
+
+            // These are simple
+            ast::Expr::Id(_) => true,
+            ast::Expr::Name(_) => true,
+
+            // Anything else is not simple
+            _ => false,
+        }
     }
 
-    /// Extract conditions from an expression that reference only the specified table
-    fn extract_table_conditions(
-        &self,
+    /// Extract conditions from a WHERE clause that apply to a specific table
+    fn extract_conditions_for_table(
         expr: &ast::Expr,
         table_name: &str,
-    ) -> crate::Result<Option<ast::Expr>> {
+        aliases: &HashMap<String, String>,
+        all_tables: &[String],
+        schema: &Schema,
+    ) -> Option<ast::Expr> {
         match expr {
             ast::Expr::Binary(left, op, right) => {
                 match op {
                     ast::Operator::And => {
                         // For AND, we can extract conditions independently
-                        let left_cond = self.extract_table_conditions(left, table_name)?;
-                        let right_cond = self.extract_table_conditions(right, table_name)?;
+                        let left_cond = Self::extract_conditions_for_table(
+                            left, table_name, aliases, all_tables, schema,
+                        );
+                        let right_cond = Self::extract_conditions_for_table(
+                            right, table_name, aliases, all_tables, schema,
+                        );
 
                         match (left_cond, right_cond) {
-                            (Some(l), Some(r)) => {
-                                // Both conditions apply to this table
-                                Ok(Some(ast::Expr::Binary(
-                                    Box::new(l),
-                                    ast::Operator::And,
-                                    Box::new(r),
-                                )))
-                            }
-                            (Some(l), None) => Ok(Some(l)),
-                            (None, Some(r)) => Ok(Some(r)),
-                            (None, None) => Ok(None),
+                            (Some(l), Some(r)) => Some(ast::Expr::Binary(
+                                Box::new(l),
+                                ast::Operator::And,
+                                Box::new(r),
+                            )),
+                            (Some(l), None) => Some(l),
+                            (None, Some(r)) => Some(r),
+                            (None, None) => None,
                         }
                     }
                     ast::Operator::Or => {
-                        // For OR, both sides must reference the same table(s)
-                        // If either side references multiple tables, we can't extract it
-                        let left_tables = self.get_referenced_tables_in_expr(left)?;
-                        let right_tables = self.get_referenced_tables_in_expr(right)?;
+                        // For OR, both sides must reference only our table
+                        let left_tables =
+                            Self::get_tables_in_expr(left, aliases, all_tables, schema);
+                        let right_tables =
+                            Self::get_tables_in_expr(right, aliases, all_tables, schema);
 
-                        // If both sides only reference our table, include the whole OR
                         if left_tables.len() == 1
                             && left_tables.contains(&table_name.to_string())
                             && right_tables.len() == 1
                             && right_tables.contains(&table_name.to_string())
+                            && Self::is_simple_comparison(expr)
                         {
-                            Ok(Some(expr.clone()))
+                            Some(expr.clone())
                         } else {
-                            // OR condition involves multiple tables, can't extract
-                            Ok(None)
+                            None
                         }
                     }
                     _ => {
-                        // For comparison operators, check if this condition references only our table
-                        // AND is simple enough to be pushed down (no complex expressions)
-                        let referenced_tables = self.get_referenced_tables_in_expr(expr)?;
+                        // For comparison operators, check if this condition only references our table
+                        let referenced_tables =
+                            Self::get_tables_in_expr(expr, aliases, all_tables, schema);
                         if referenced_tables.len() == 1
                             && referenced_tables.contains(&table_name.to_string())
+                            && Self::is_simple_comparison(expr)
                         {
-                            // Check if this is a simple comparison that can be pushed down
-                            // Complex expressions like (a * b) >= c should be handled by the circuit
-                            if self.is_simple_comparison(expr) {
-                                Ok(Some(expr.clone()))
-                            } else {
-                                // Complex expression - let the circuit handle it
-                                Ok(None)
-                            }
+                            Some(expr.clone())
                         } else {
-                            Ok(None)
+                            None
                         }
                     }
                 }
             }
-            ast::Expr::Parenthesized(exprs) => {
-                if exprs.len() == 1 {
-                    self.extract_table_conditions(&exprs[0], table_name)
-                } else {
-                    Ok(None)
-                }
-            }
             _ => {
-                // For other expressions, check if they reference only our table
-                // AND are simple enough to be pushed down
-                let referenced_tables = self.get_referenced_tables_in_expr(expr)?;
+                // For other expressions, check if they only reference our table
+                let referenced_tables = Self::get_tables_in_expr(expr, aliases, all_tables, schema);
                 if referenced_tables.len() == 1
                     && referenced_tables.contains(&table_name.to_string())
-                    && self.is_simple_comparison(expr)
+                    && Self::is_simple_comparison(expr)
                 {
-                    Ok(Some(expr.clone()))
+                    Some(expr.clone())
                 } else {
-                    Ok(None)
+                    None
                 }
             }
         }
     }
 
-    /// Check if an expression is a simple comparison that can be pushed down to table scan
-    /// Returns true for simple comparisons like "column = value" or "column > value"
-    /// Returns false for complex expressions like "(a * b) > value"
-    fn is_simple_comparison(&self, expr: &ast::Expr) -> bool {
-        match expr {
-            ast::Expr::Binary(left, op, right) => {
-                // Check if it's a comparison operator
-                matches!(
-                    op,
-                    ast::Operator::Equals
-                        | ast::Operator::NotEquals
-                        | ast::Operator::Greater
-                        | ast::Operator::GreaterEquals
-                        | ast::Operator::Less
-                        | ast::Operator::LessEquals
-                ) && self.is_simple_operand(left)
-                    && self.is_simple_operand(right)
-            }
-            _ => false,
-        }
-    }
-
-    /// Check if an operand is simple (column reference or literal)
-    fn is_simple_operand(&self, expr: &ast::Expr) -> bool {
-        matches!(
-            expr,
-            ast::Expr::Id(_)
-                | ast::Expr::Qualified(_, _)
-                | ast::Expr::DoublyQualified(_, _, _)
-                | ast::Expr::Literal(_)
-        )
-    }
-
-    /// Get the set of table names referenced in an expression
-    fn get_referenced_tables_in_expr(&self, expr: &ast::Expr) -> crate::Result<Vec<String>> {
-        let mut tables = Vec::new();
-        self.collect_referenced_tables(expr, &mut tables)?;
-        // Deduplicate
-        tables.sort();
-        tables.dedup();
-        Ok(tables)
-    }
-
-    /// Recursively collect table references from an expression
-    fn collect_referenced_tables(
-        &self,
+    /// Unqualify column references in an expression
+    /// Removes table/alias prefixes from qualified column names
+    fn unqualify_expression(
         expr: &ast::Expr,
-        tables: &mut Vec<String>,
-    ) -> crate::Result<()> {
+        table_name: &str,
+        aliases: &HashMap<String, String>,
+    ) -> ast::Expr {
         match expr {
-            ast::Expr::Binary(left, _, right) => {
-                self.collect_referenced_tables(left, tables)?;
-                self.collect_referenced_tables(right, tables)?;
-            }
-            ast::Expr::Qualified(table, _) => {
-                // This is a qualified column reference (table.column or alias.column)
-                // We need to resolve aliases to actual table names
-                let actual_table = self.resolve_table_alias(table.as_str());
-                tables.push(actual_table);
-            }
-            ast::Expr::Id(column) => {
-                // Unqualified column reference
-                if self.referenced_tables.len() > 1 {
-                    // In a JOIN context, check which tables have this column
-                    let mut tables_with_column = Vec::new();
-                    for table in &self.referenced_tables {
-                        if table
-                            .columns
-                            .iter()
-                            .any(|c| c.name.as_ref() == Some(&column.to_string()))
-                        {
-                            tables_with_column.push(table.name.clone());
-                        }
-                    }
-
-                    if tables_with_column.len() > 1 {
-                        // Ambiguous column - this should have been caught earlier
-                        // Return error to be safe
-                        return Err(crate::LimboError::ParseError(format!(
-                            "Ambiguous column name '{}' in WHERE clause - exists in tables: {}",
-                            column,
-                            tables_with_column.join(", ")
-                        )));
-                    } else if tables_with_column.len() == 1 {
-                        // Unambiguous - only one table has this column
-                        // This is allowed by SQLite
-                        tables.push(tables_with_column[0].clone());
-                    } else {
-                        // Column doesn't exist in any table - this is an error
-                        // but should be caught during compilation
-                        return Err(crate::LimboError::ParseError(format!(
-                            "Column '{column}' not found in any table"
-                        )));
-                    }
-                } else {
-                    // Single table context - unqualified columns belong to that table
-                    if let Some(table) = self.referenced_tables.first() {
-                        tables.push(table.name.clone());
-                    }
-                }
-            }
-            ast::Expr::DoublyQualified(_database, table, _column) => {
-                // For database.table.column, resolve the table name
-                let table_str = table.as_str();
-                let actual_table = self.resolve_table_alias(table_str);
-                tables.push(actual_table);
-            }
-            ast::Expr::Parenthesized(exprs) => {
-                for e in exprs {
-                    self.collect_referenced_tables(e, tables)?;
-                }
-            }
-            _ => {
-                // Literals and other expressions don't reference tables
-            }
-        }
-        Ok(())
-    }
-
-    /// Convert a qualified expression to unqualified for single-table queries
-    /// This removes table prefixes from column references since they're not needed
-    /// when querying a single table
-    fn unqualify_expression(&self, expr: &ast::Expr, table_name: &str) -> ast::Expr {
-        match expr {
-            ast::Expr::Binary(left, op, right) => {
-                // Recursively unqualify both sides
-                ast::Expr::Binary(
-                    Box::new(self.unqualify_expression(left, table_name)),
-                    *op,
-                    Box::new(self.unqualify_expression(right, table_name)),
-                )
-            }
-            ast::Expr::Qualified(table, column) => {
-                // Convert qualified column to unqualified if it's for our table
-                // Handle both "table.column" and "database.table.column" cases
-                let table_str = table.as_str();
-
-                // Check if this is a database.table reference
-                let actual_table = if table_str.contains('.') {
-                    // Split on '.' and take the last part as the table name
+            ast::Expr::Binary(left, op, right) => ast::Expr::Binary(
+                Box::new(Self::unqualify_expression(left, table_name, aliases)),
+                *op,
+                Box::new(Self::unqualify_expression(right, table_name, aliases)),
+            ),
+            ast::Expr::Qualified(table_or_alias, column) => {
+                // Check if this qualification refers to our table
+                let table_str = table_or_alias.as_str();
+                let actual_table = if let Some(actual) = aliases.get(table_str) {
+                    actual.clone()
+                } else if table_str.contains('.') {
+                    // Handle database.table format
                     table_str
                         .split('.')
                         .next_back()
                         .unwrap_or(table_str)
                         .to_string()
                 } else {
-                    // Could be an alias or direct table name
-                    self.resolve_table_alias(table_str)
+                    table_str.to_string()
                 };
 
                 if actual_table == table_name {
-                    // Just return the column name without qualification
+                    // Remove the qualification
                     ast::Expr::Id(column.clone())
                 } else {
-                    // This shouldn't happen if extract_table_conditions worked correctly
-                    // but keep it qualified just in case
+                    // Keep the qualification (shouldn't happen if extraction worked correctly)
                     expr.clone()
                 }
             }
             ast::Expr::DoublyQualified(_database, table, column) => {
-                // This is database.table.column format
-                // Check if the table matches our target table
-                let table_str = table.as_str();
-                let actual_table = self.resolve_table_alias(table_str);
-
-                if actual_table == table_name {
-                    // Just return the column name without qualification
+                // Check if this refers to our table
+                if table.as_str() == table_name {
+                    // Remove the qualification, keep just the column
                     ast::Expr::Id(column.clone())
                 } else {
-                    // Keep it qualified if it's for a different table
+                    // Keep the qualification (shouldn't happen if extraction worked correctly)
                     expr.clone()
                 }
             }
-            ast::Expr::Parenthesized(exprs) => {
-                // Recursively unqualify expressions in parentheses
-                let unqualified_exprs: Vec<Box<ast::Expr>> = exprs
+            ast::Expr::Unary(op, inner) => ast::Expr::Unary(
+                *op,
+                Box::new(Self::unqualify_expression(inner, table_name, aliases)),
+            ),
+            ast::Expr::FunctionCall {
+                name,
+                args,
+                distinctness,
+                filter_over,
+                order_by,
+            } => ast::Expr::FunctionCall {
+                name: name.clone(),
+                args: args
                     .iter()
-                    .map(|e| Box::new(self.unqualify_expression(e, table_name)))
-                    .collect();
-                ast::Expr::Parenthesized(unqualified_exprs)
+                    .map(|arg| Box::new(Self::unqualify_expression(arg, table_name, aliases)))
+                    .collect(),
+                distinctness: *distinctness,
+                filter_over: filter_over.clone(),
+                order_by: order_by.clone(),
+            },
+            ast::Expr::InList { lhs, not, rhs } => ast::Expr::InList {
+                lhs: Box::new(Self::unqualify_expression(lhs, table_name, aliases)),
+                not: *not,
+                rhs: rhs
+                    .iter()
+                    .map(|item| Box::new(Self::unqualify_expression(item, table_name, aliases)))
+                    .collect(),
+            },
+            ast::Expr::Between {
+                lhs,
+                not,
+                start,
+                end,
+            } => ast::Expr::Between {
+                lhs: Box::new(Self::unqualify_expression(lhs, table_name, aliases)),
+                not: *not,
+                start: Box::new(Self::unqualify_expression(start, table_name, aliases)),
+                end: Box::new(Self::unqualify_expression(end, table_name, aliases)),
+            },
+            _ => expr.clone(),
+        }
+    }
+
+    /// Get all tables referenced in an expression
+    fn get_tables_in_expr(
+        expr: &ast::Expr,
+        aliases: &HashMap<String, String>,
+        all_tables: &[String],
+        schema: &Schema,
+    ) -> Vec<String> {
+        let mut tables = Vec::new();
+        Self::collect_tables_in_expr(expr, aliases, all_tables, schema, &mut tables);
+        tables.sort();
+        tables.dedup();
+        tables
+    }
+
+    /// Recursively collect table references from an expression
+    fn collect_tables_in_expr(
+        expr: &ast::Expr,
+        aliases: &HashMap<String, String>,
+        all_tables: &[String],
+        schema: &Schema,
+        tables: &mut Vec<String>,
+    ) {
+        match expr {
+            ast::Expr::Binary(left, _, right) => {
+                Self::collect_tables_in_expr(left, aliases, all_tables, schema, tables);
+                Self::collect_tables_in_expr(right, aliases, all_tables, schema, tables);
+            }
+            ast::Expr::Qualified(table_or_alias, _) => {
+                // Handle database.table or just table/alias
+                let table_str = table_or_alias.as_str();
+                let table_name = if let Some(actual_table) = aliases.get(table_str) {
+                    // It's an alias
+                    actual_table.clone()
+                } else if table_str.contains('.') {
+                    // It might be database.table format, extract just the table name
+                    table_str
+                        .split('.')
+                        .next_back()
+                        .unwrap_or(table_str)
+                        .to_string()
+                } else {
+                    // It's a direct table name
+                    table_str.to_string()
+                };
+                tables.push(table_name);
+            }
+            ast::Expr::DoublyQualified(_database, table, _column) => {
+                // For database.table.column, extract the table name
+                tables.push(table.to_string());
+            }
+            ast::Expr::Id(column) => {
+                // Unqualified column - try to find which table has this column
+                if all_tables.len() == 1 {
+                    tables.push(all_tables[0].clone());
+                } else {
+                    // Check which table has this column
+                    for table_name in all_tables {
+                        if let Some(table) = schema.get_btree_table(table_name) {
+                            if table
+                                .columns
+                                .iter()
+                                .any(|col| col.name.as_deref() == Some(column.as_str()))
+                            {
+                                tables.push(table_name.clone());
+                                break; // Found the table, stop looking
+                            }
+                        }
+                    }
+                }
+            }
+            ast::Expr::FunctionCall { args, .. } => {
+                for arg in args {
+                    Self::collect_tables_in_expr(arg, aliases, all_tables, schema, tables);
+                }
+            }
+            ast::Expr::InList { lhs, rhs, .. } => {
+                Self::collect_tables_in_expr(lhs, aliases, all_tables, schema, tables);
+                for item in rhs {
+                    Self::collect_tables_in_expr(item, aliases, all_tables, schema, tables);
+                }
+            }
+            ast::Expr::InSelect { lhs, .. } => {
+                Self::collect_tables_in_expr(lhs, aliases, all_tables, schema, tables);
+            }
+            ast::Expr::Between {
+                lhs, start, end, ..
+            } => {
+                Self::collect_tables_in_expr(lhs, aliases, all_tables, schema, tables);
+                Self::collect_tables_in_expr(start, aliases, all_tables, schema, tables);
+                Self::collect_tables_in_expr(end, aliases, all_tables, schema, tables);
+            }
+            ast::Expr::Unary(_, expr) => {
+                Self::collect_tables_in_expr(expr, aliases, all_tables, schema, tables);
             }
             _ => {
-                // Other expression types (literals, unqualified columns, etc.) stay as-is
-                expr.clone()
+                // Literals, etc. don't reference tables
             }
         }
     }
-
-    /// Resolve a table alias to the actual table name
-    fn resolve_table_alias(&self, alias: &str) -> String {
-        // Check if there's an alias mapping in the FROM/JOIN clauses
-        // For now, we'll do a simple check - if the alias matches a table name, use it
-        // Otherwise, try to find it in the FROM clause
-
-        // First check if it's an actual table name
-        if self.referenced_tables.iter().any(|t| t.name == alias) {
-            return alias.to_string();
-        }
-
-        // Check if it's an alias that maps to a table
-        if let Some(table_name) = self.table_aliases.get(alias) {
-            return table_name.clone();
-        }
-
-        // If we can't resolve it, return as-is (it might be a table name we don't know about)
-        alias.to_string()
-    }
-
     /// Populate the view by scanning the source table using a state machine
     /// This can be called multiple times and will resume from where it left off
     /// This method is only for materialized views and will persist data to the btree
@@ -1342,15 +1576,56 @@ mod tests {
         }
     }
 
+    // Type alias for the complex return type of extract_all_tables
+    type ExtractedTableInfo = (
+        Vec<Arc<BTreeTable>>,
+        HashMap<String, String>,
+        HashMap<String, String>,
+        HashMap<String, Vec<Option<ast::Expr>>>,
+    );
+
+    fn extract_all_tables(select: &ast::Select, schema: &Schema) -> Result<ExtractedTableInfo> {
+        let mut referenced_tables = Vec::new();
+        let mut table_aliases = HashMap::new();
+        let mut qualified_table_names = HashMap::new();
+        let mut table_conditions = HashMap::new();
+        IncrementalView::extract_all_tables(
+            select,
+            schema,
+            &mut referenced_tables,
+            &mut table_aliases,
+            &mut qualified_table_names,
+            &mut table_conditions,
+        )?;
+        Ok((
+            referenced_tables,
+            table_aliases,
+            qualified_table_names,
+            table_conditions,
+        ))
+    }
+
     #[test]
     fn test_extract_single_table() {
         let schema = create_test_schema();
         let select = parse_select("SELECT * FROM customers");
 
-        let (tables, _, _) = IncrementalView::extract_all_tables(&select, &schema).unwrap();
+        let (tables, _, _, _table_conditions) = extract_all_tables(&select, &schema).unwrap();
 
         assert_eq!(tables.len(), 1);
         assert_eq!(tables[0].name, "customers");
+    }
+
+    #[test]
+    fn test_tables_from_union() {
+        let schema = create_test_schema();
+        let select = parse_select("SELECT name FROM customers union SELECT name from products");
+
+        let (tables, _, _, table_conditions) = extract_all_tables(&select, &schema).unwrap();
+
+        assert_eq!(tables.len(), 2);
+        assert!(table_conditions.contains_key("customers"));
+        assert!(table_conditions.contains_key("products"));
     }
 
     #[test]
@@ -1360,11 +1635,11 @@ mod tests {
             "SELECT * FROM customers INNER JOIN orders ON customers.id = orders.customer_id",
         );
 
-        let (tables, _, _) = IncrementalView::extract_all_tables(&select, &schema).unwrap();
+        let (tables, _, _, table_conditions) = extract_all_tables(&select, &schema).unwrap();
 
         assert_eq!(tables.len(), 2);
-        assert_eq!(tables[0].name, "customers");
-        assert_eq!(tables[1].name, "orders");
+        assert!(table_conditions.contains_key("customers"));
+        assert!(table_conditions.contains_key("orders"));
     }
 
     #[test]
@@ -1376,12 +1651,12 @@ mod tests {
              INNER JOIN products ON orders.id = products.id",
         );
 
-        let (tables, _, _) = IncrementalView::extract_all_tables(&select, &schema).unwrap();
+        let (tables, _, _, table_conditions) = extract_all_tables(&select, &schema).unwrap();
 
         assert_eq!(tables.len(), 3);
-        assert_eq!(tables[0].name, "customers");
-        assert_eq!(tables[1].name, "orders");
-        assert_eq!(tables[2].name, "products");
+        assert!(table_conditions.contains_key("customers"));
+        assert!(table_conditions.contains_key("orders"));
+        assert!(table_conditions.contains_key("products"));
     }
 
     #[test]
@@ -1391,11 +1666,11 @@ mod tests {
             "SELECT * FROM customers LEFT JOIN orders ON customers.id = orders.customer_id",
         );
 
-        let (tables, _, _) = IncrementalView::extract_all_tables(&select, &schema).unwrap();
+        let (tables, _, _, table_conditions) = extract_all_tables(&select, &schema).unwrap();
 
         assert_eq!(tables.len(), 2);
-        assert_eq!(tables[0].name, "customers");
-        assert_eq!(tables[1].name, "orders");
+        assert!(table_conditions.contains_key("customers"));
+        assert!(table_conditions.contains_key("orders"));
     }
 
     #[test]
@@ -1403,11 +1678,11 @@ mod tests {
         let schema = create_test_schema();
         let select = parse_select("SELECT * FROM customers CROSS JOIN orders");
 
-        let (tables, _, _) = IncrementalView::extract_all_tables(&select, &schema).unwrap();
+        let (tables, _, _, table_conditions) = extract_all_tables(&select, &schema).unwrap();
 
         assert_eq!(tables.len(), 2);
-        assert_eq!(tables[0].name, "customers");
-        assert_eq!(tables[1].name, "orders");
+        assert!(table_conditions.contains_key("customers"));
+        assert!(table_conditions.contains_key("orders"));
     }
 
     #[test]
@@ -1416,12 +1691,17 @@ mod tests {
         let select =
             parse_select("SELECT * FROM customers c INNER JOIN orders o ON c.id = o.customer_id");
 
-        let (tables, _, _) = IncrementalView::extract_all_tables(&select, &schema).unwrap();
+        let (tables, aliases, _, _table_conditions) = extract_all_tables(&select, &schema).unwrap();
 
         // Should still extract the actual table names, not aliases
         assert_eq!(tables.len(), 2);
-        assert_eq!(tables[0].name, "customers");
-        assert_eq!(tables[1].name, "orders");
+        let table_names: Vec<&str> = tables.iter().map(|t| t.name.as_str()).collect();
+        assert!(table_names.contains(&"customers"));
+        assert!(table_names.contains(&"orders"));
+
+        // Check that aliases are correctly mapped
+        assert_eq!(aliases.get("c"), Some(&"customers".to_string()));
+        assert_eq!(aliases.get("o"), Some(&"orders".to_string()));
     }
 
     #[test]
@@ -1429,8 +1709,7 @@ mod tests {
         let schema = create_test_schema();
         let select = parse_select("SELECT * FROM nonexistent");
 
-        let result =
-            IncrementalView::extract_all_tables(&select, &schema).map(|(tables, _, _)| tables);
+        let result = extract_all_tables(&select, &schema).map(|(tables, _, _, _)| tables);
 
         assert!(result.is_err());
         assert!(result
@@ -1446,8 +1725,7 @@ mod tests {
             "SELECT * FROM customers INNER JOIN nonexistent ON customers.id = nonexistent.id",
         );
 
-        let result =
-            IncrementalView::extract_all_tables(&select, &schema).map(|(tables, _, _)| tables);
+        let result = extract_all_tables(&select, &schema).map(|(tables, _, _, _)| tables);
 
         assert!(result.is_err());
         assert!(result
@@ -1462,14 +1740,15 @@ mod tests {
         let schema = create_test_schema();
         let select = parse_select("SELECT * FROM customers");
 
-        let (tables, aliases, qualified_names) =
-            IncrementalView::extract_all_tables(&select, &schema).unwrap();
+        let (tables, aliases, qualified_names, table_conditions) =
+            extract_all_tables(&select, &schema).unwrap();
         let view = IncrementalView::new(
             "test_view".to_string(),
             select.clone(),
             tables,
             aliases,
             qualified_names,
+            table_conditions,
             extract_view_columns(&select, &schema).unwrap(),
             &schema,
             1, // main_data_root
@@ -1491,14 +1770,15 @@ mod tests {
         let schema = create_test_schema();
         let select = parse_select("SELECT * FROM customers WHERE id > 10");
 
-        let (tables, aliases, qualified_names) =
-            IncrementalView::extract_all_tables(&select, &schema).unwrap();
+        let (tables, aliases, qualified_names, table_conditions) =
+            extract_all_tables(&select, &schema).unwrap();
         let view = IncrementalView::new(
             "test_view".to_string(),
             select.clone(),
             tables,
             aliases,
             qualified_names,
+            table_conditions,
             extract_view_columns(&select, &schema).unwrap(),
             &schema,
             1, // main_data_root
@@ -1524,14 +1804,15 @@ mod tests {
              WHERE c.id > 10 AND o.total > 100",
         );
 
-        let (tables, aliases, qualified_names) =
-            IncrementalView::extract_all_tables(&select, &schema).unwrap();
+        let (tables, aliases, qualified_names, table_conditions) =
+            extract_all_tables(&select, &schema).unwrap();
         let view = IncrementalView::new(
             "test_view".to_string(),
             select.clone(),
             tables,
             aliases,
             qualified_names,
+            table_conditions,
             extract_view_columns(&select, &schema).unwrap(),
             &schema,
             1, // main_data_root
@@ -1547,8 +1828,12 @@ mod tests {
         // With per-table WHERE extraction:
         // - customers table gets: c.id > 10
         // - orders table gets: o.total > 100
-        assert_eq!(queries[0], "SELECT * FROM customers WHERE id > 10");
-        assert_eq!(queries[1], "SELECT * FROM orders WHERE total > 100");
+        assert!(queries
+            .iter()
+            .any(|q| q == "SELECT * FROM customers WHERE id > 10"));
+        assert!(queries
+            .iter()
+            .any(|q| q == "SELECT * FROM orders WHERE total > 100"));
     }
 
     #[test]
@@ -1562,14 +1847,15 @@ mod tests {
              AND o.customer_id = 5 AND (c.id = 15 OR o.total = 200)",
         );
 
-        let (tables, aliases, qualified_names) =
-            IncrementalView::extract_all_tables(&select, &schema).unwrap();
+        let (tables, aliases, qualified_names, table_conditions) =
+            extract_all_tables(&select, &schema).unwrap();
         let view = IncrementalView::new(
             "test_view".to_string(),
             select.clone(),
             tables,
             aliases,
             qualified_names,
+            table_conditions,
             extract_view_columns(&select, &schema).unwrap(),
             &schema,
             1, // main_data_root
@@ -1587,152 +1873,27 @@ mod tests {
         // - orders gets: o.total > 100 AND o.customer_id = 5
         // Note: The OR condition (c.id = 15 OR o.total = 200) involves both tables,
         // so it cannot be extracted to either table individually
-        assert_eq!(
-            queries[0],
-            "SELECT * FROM customers WHERE id > 10 AND name = 'John'"
-        );
-        assert_eq!(
-            queries[1],
-            "SELECT * FROM orders WHERE total > 100 AND customer_id = 5"
-        );
-    }
-
-    #[test]
-    fn test_where_extraction_for_three_tables() {
-        // Test that WHERE clause extraction correctly separates conditions for 3+ tables
-        // This addresses the concern about conditions "piling up" as joins increase
-
-        // Simulate a three-table scenario
-        let schema = create_test_schema();
-
-        // Parse a WHERE clause with conditions for three different tables
-        let select = parse_select(
-            "SELECT * FROM customers WHERE c.id > 10 AND o.total > 100 AND p.price > 50",
-        );
-
-        // Get the WHERE expression
-        if let ast::OneSelect::Select {
-            where_clause: Some(ref where_expr),
-            ..
-        } = select.body.select
-        {
-            // Create a view with three tables to test extraction
-            let tables = vec![
-                schema.get_btree_table("customers").unwrap(),
-                schema.get_btree_table("orders").unwrap(),
-                schema.get_btree_table("products").unwrap(),
-            ];
-
-            let mut aliases = HashMap::new();
-            aliases.insert("c".to_string(), "customers".to_string());
-            aliases.insert("o".to_string(), "orders".to_string());
-            aliases.insert("p".to_string(), "products".to_string());
-
-            // Create a minimal view just to test extraction logic
-            let view = IncrementalView {
-                name: "test".to_string(),
-                select_stmt: select.clone(),
-                circuit: DbspCircuit::new(1, 2, 3),
-                referenced_tables: tables,
-                table_aliases: aliases,
-                qualified_table_names: HashMap::new(),
-                column_schema: ViewColumnSchema {
-                    columns: vec![],
-                    tables: vec![],
-                },
-                populate_state: PopulateState::Start,
-                tracker: Arc::new(Mutex::new(ComputationTracker::new())),
-                root_page: 0,
-            };
-
-            // Test extraction for each table
-            let customers_conds = view
-                .extract_table_conditions(where_expr, "customers")
-                .unwrap();
-            let orders_conds = view.extract_table_conditions(where_expr, "orders").unwrap();
-            let products_conds = view
-                .extract_table_conditions(where_expr, "products")
-                .unwrap();
-
-            // Verify each table only gets its conditions
-            if let Some(cond) = customers_conds {
-                let sql = cond.to_string();
-                assert!(sql.contains("id > 10"));
-                assert!(!sql.contains("total"));
-                assert!(!sql.contains("price"));
-            }
-
-            if let Some(cond) = orders_conds {
-                let sql = cond.to_string();
-                assert!(sql.contains("total > 100"));
-                assert!(!sql.contains("id > 10")); // From customers
-                assert!(!sql.contains("price"));
-            }
-
-            if let Some(cond) = products_conds {
-                let sql = cond.to_string();
-                assert!(sql.contains("price > 50"));
-                assert!(!sql.contains("id > 10")); // From customers
-                assert!(!sql.contains("total"));
-            }
-        } else {
-            panic!("Failed to parse WHERE clause");
-        }
-    }
-
-    #[test]
-    fn test_alias_resolution_works_correctly() {
-        // Test that alias resolution properly maps aliases to table names
-        let schema = create_test_schema();
-        let select = parse_select(
-            "SELECT * FROM customers c \
-             JOIN orders o ON c.id = o.customer_id \
-             WHERE c.id > 10 AND o.total > 100",
-        );
-
-        let (tables, aliases, qualified_names) =
-            IncrementalView::extract_all_tables(&select, &schema).unwrap();
-        let view = IncrementalView::new(
-            "test_view".to_string(),
-            select.clone(),
-            tables,
-            aliases,
-            qualified_names,
-            extract_view_columns(&select, &schema).unwrap(),
-            &schema,
-            1, // main_data_root
-            2, // internal_state_root
-            3, // internal_state_index_root
-        )
-        .unwrap();
-
-        // Verify that alias mappings were extracted correctly
-        assert_eq!(view.table_aliases.get("c"), Some(&"customers".to_string()));
-        assert_eq!(view.table_aliases.get("o"), Some(&"orders".to_string()));
-
-        // Verify that SQL generation uses the aliases correctly
-        let queries = view.sql_for_populate().unwrap();
-        assert_eq!(queries.len(), 2);
-
-        // Each query should use the actual table name, not the alias
-        assert!(queries[0].contains("FROM customers") || queries[1].contains("FROM customers"));
-        assert!(queries[0].contains("FROM orders") || queries[1].contains("FROM orders"));
+        // Check both queries exist (order doesn't matter)
+        assert!(queries
+            .contains(&"SELECT * FROM customers WHERE id > 10 AND name = 'John'".to_string()));
+        assert!(queries
+            .contains(&"SELECT * FROM orders WHERE total > 100 AND customer_id = 5".to_string()));
     }
 
     #[test]
     fn test_sql_for_populate_table_without_rowid_alias() {
-        // Test that tables without a rowid alias properly include rowid in SELECT
         let schema = create_test_schema();
         let select = parse_select("SELECT * FROM logs WHERE level > 2");
 
-        let (tables, aliases, qualified_names) =
-            IncrementalView::extract_all_tables(&select, &schema).unwrap();
+        let (tables, aliases, qualified_names, table_conditions) =
+            extract_all_tables(&select, &schema).unwrap();
         let view = IncrementalView::new(
             "test_view".to_string(),
             select.clone(),
             tables,
             aliases,
             qualified_names,
+            table_conditions,
             extract_view_columns(&select, &schema).unwrap(),
             &schema,
             1, // main_data_root
@@ -1758,14 +1919,15 @@ mod tests {
              WHERE c.id > 10 AND l.level > 2",
         );
 
-        let (tables, aliases, qualified_names) =
-            IncrementalView::extract_all_tables(&select, &schema).unwrap();
+        let (tables, aliases, qualified_names, table_conditions) =
+            extract_all_tables(&select, &schema).unwrap();
         let view = IncrementalView::new(
             "test_view".to_string(),
             select.clone(),
             tables,
             aliases,
             qualified_names,
+            table_conditions,
             extract_view_columns(&select, &schema).unwrap(),
             &schema,
             1, // main_data_root
@@ -1778,8 +1940,8 @@ mod tests {
 
         assert_eq!(queries.len(), 2);
         // customers has rowid alias (id), logs doesn't
-        assert_eq!(queries[0], "SELECT * FROM customers WHERE id > 10");
-        assert_eq!(queries[1], "SELECT *, rowid FROM logs WHERE level > 2");
+        assert!(queries.contains(&"SELECT * FROM customers WHERE id > 10".to_string()));
+        assert!(queries.contains(&"SELECT *, rowid FROM logs WHERE level > 2".to_string()));
     }
 
     #[test]
@@ -1792,14 +1954,15 @@ mod tests {
         // Test with single table using database qualification
         let select = parse_select("SELECT * FROM main.customers WHERE main.customers.id > 10");
 
-        let (tables, aliases, qualified_names) =
-            IncrementalView::extract_all_tables(&select, &schema).unwrap();
+        let (tables, aliases, qualified_names, table_conditions) =
+            extract_all_tables(&select, &schema).unwrap();
         let view = IncrementalView::new(
             "test_view".to_string(),
             select.clone(),
             tables,
             aliases,
             qualified_names,
+            table_conditions,
             extract_view_columns(&select, &schema).unwrap(),
             &schema,
             1, // main_data_root
@@ -1827,14 +1990,15 @@ mod tests {
              WHERE main.customers.id > 10 AND main.orders.total > 100",
         );
 
-        let (tables, aliases, qualified_names) =
-            IncrementalView::extract_all_tables(&select, &schema).unwrap();
+        let (tables, aliases, qualified_names, table_conditions) =
+            extract_all_tables(&select, &schema).unwrap();
         let view = IncrementalView::new(
             "test_view".to_string(),
             select.clone(),
             tables,
             aliases,
             qualified_names,
+            table_conditions,
             extract_view_columns(&select, &schema).unwrap(),
             &schema,
             1, // main_data_root
@@ -1848,8 +2012,93 @@ mod tests {
         assert_eq!(queries.len(), 2);
         // The FROM clauses should preserve database qualification,
         // but WHERE clauses should have unqualified column names
-        assert_eq!(queries[0], "SELECT * FROM main.customers WHERE id > 10");
-        assert_eq!(queries[1], "SELECT * FROM main.orders WHERE total > 100");
+        assert!(queries.contains(&"SELECT * FROM main.customers WHERE id > 10".to_string()));
+        assert!(queries.contains(&"SELECT * FROM main.orders WHERE total > 100".to_string()));
+    }
+
+    #[test]
+    fn test_where_extraction_for_three_tables_with_aliases() {
+        // Test that WHERE clause extraction correctly separates conditions for 3+ tables
+        // This addresses the concern about conditions "piling up" as joins increase
+        let schema = create_test_schema();
+        let select = parse_select(
+            "SELECT * FROM customers c
+             JOIN orders o ON c.id = o.customer_id
+             JOIN products p ON p.id = o.product_id
+             WHERE c.id > 10 AND o.total > 100 AND p.price > 50",
+        );
+
+        let (tables, aliases, qualified_names, table_conditions) =
+            extract_all_tables(&select, &schema).unwrap();
+
+        // Verify we extracted all three tables
+        assert_eq!(tables.len(), 3);
+        let table_names: Vec<&str> = tables.iter().map(|t| t.name.as_str()).collect();
+        assert!(table_names.contains(&"customers"));
+        assert!(table_names.contains(&"orders"));
+        assert!(table_names.contains(&"products"));
+
+        // Verify aliases are correctly mapped
+        assert_eq!(aliases.get("c"), Some(&"customers".to_string()));
+        assert_eq!(aliases.get("o"), Some(&"orders".to_string()));
+        assert_eq!(aliases.get("p"), Some(&"products".to_string()));
+
+        // Generate populate queries to verify each table gets its own conditions
+        let queries = IncrementalView::generate_populate_queries(
+            &select,
+            &tables,
+            &aliases,
+            &qualified_names,
+            &table_conditions,
+        )
+        .unwrap();
+
+        assert_eq!(queries.len(), 3);
+
+        // Verify the exact queries generated for each table
+        // The order might vary, so check all possibilities
+        let expected_queries = vec![
+            "SELECT * FROM customers WHERE id > 10",
+            "SELECT * FROM orders WHERE total > 100",
+            "SELECT * FROM products WHERE price > 50",
+        ];
+
+        for expected in &expected_queries {
+            assert!(
+                queries.contains(&expected.to_string()),
+                "Missing expected query: {expected}. Got: {queries:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_sql_for_populate_complex_expressions_not_included() {
+        // Test that complex expressions (subqueries, CASE, string concat) are NOT included in populate queries
+        let schema = create_test_schema();
+        let select = parse_select(
+            "SELECT * FROM customers
+             WHERE id > (SELECT MAX(customer_id) FROM orders)
+               AND name || ' Customer' = 'John Customer'
+               AND CASE WHEN id > 10 THEN 1 ELSE 0 END = 1
+               AND EXISTS (SELECT 1 FROM orders WHERE customer_id = customers.id)",
+        );
+
+        let (tables, aliases, qualified_names, table_conditions) =
+            extract_all_tables(&select, &schema).unwrap();
+
+        let queries = IncrementalView::generate_populate_queries(
+            &select,
+            &tables,
+            &aliases,
+            &qualified_names,
+            &table_conditions,
+        )
+        .unwrap();
+
+        assert_eq!(queries.len(), 1);
+        // Since customers table has an INTEGER PRIMARY KEY (id), we should get SELECT *
+        // without rowid and without WHERE clause (all conditions are complex)
+        assert_eq!(queries[0], "SELECT * FROM customers");
     }
 
     #[test]
@@ -1862,14 +2111,15 @@ mod tests {
              WHERE total > 100", // 'total' only exists in orders table
         );
 
-        let (tables, aliases, qualified_names) =
-            IncrementalView::extract_all_tables(&select, &schema).unwrap();
+        let (tables, aliases, qualified_names, table_conditions) =
+            extract_all_tables(&select, &schema).unwrap();
         let view = IncrementalView::new(
             "test_view".to_string(),
             select.clone(),
             tables,
             aliases,
             qualified_names,
+            table_conditions,
             extract_view_columns(&select, &schema).unwrap(),
             &schema,
             1, // main_data_root
@@ -1883,8 +2133,8 @@ mod tests {
         assert_eq!(queries.len(), 2);
 
         // 'total' is unambiguous (only in orders), so it should be extracted
-        assert_eq!(queries[0], "SELECT * FROM customers");
-        assert_eq!(queries[1], "SELECT * FROM orders WHERE total > 100");
+        assert!(queries.contains(&"SELECT * FROM customers".to_string()));
+        assert!(queries.contains(&"SELECT * FROM orders WHERE total > 100".to_string()));
     }
 
     #[test]
@@ -1899,8 +2149,8 @@ mod tests {
              WHERE c.id > 10",
         );
 
-        let (tables, aliases, qualified_names) =
-            IncrementalView::extract_all_tables(&select, &schema).unwrap();
+        let (tables, aliases, qualified_names, table_conditions) =
+            extract_all_tables(&select, &schema).unwrap();
 
         // Check that qualified names are preserved
         assert!(qualified_names.contains_key("customers"));
@@ -1914,6 +2164,7 @@ mod tests {
             tables,
             aliases,
             qualified_names.clone(),
+            table_conditions,
             extract_view_columns(&select, &schema).unwrap(),
             &schema,
             1, // main_data_root
@@ -1928,8 +2179,8 @@ mod tests {
 
         // The FROM clause should contain the database-qualified name
         // But the WHERE clause should use unqualified column names
-        assert_eq!(queries[0], "SELECT * FROM main.customers WHERE id > 10");
-        assert_eq!(queries[1], "SELECT * FROM main.orders");
+        assert!(queries.contains(&"SELECT * FROM main.customers WHERE id > 10".to_string()));
+        assert!(queries.contains(&"SELECT * FROM main.orders".to_string()));
     }
 
     #[test]
@@ -1944,8 +2195,8 @@ mod tests {
              WHERE c.id > 10 AND o.total < 1000",
         );
 
-        let (tables, aliases, qualified_names) =
-            IncrementalView::extract_all_tables(&select, &schema).unwrap();
+        let (tables, aliases, qualified_names, table_conditions) =
+            extract_all_tables(&select, &schema).unwrap();
 
         // Check that qualified names are preserved where specified
         assert_eq!(qualified_names.get("customers").unwrap(), "main.customers");
@@ -1961,6 +2212,7 @@ mod tests {
             tables,
             aliases,
             qualified_names.clone(),
+            table_conditions,
             extract_view_columns(&select, &schema).unwrap(),
             &schema,
             1, // main_data_root
@@ -1974,7 +2226,468 @@ mod tests {
         assert_eq!(queries.len(), 2);
 
         // The FROM clause should preserve qualification where specified
-        assert_eq!(queries[0], "SELECT * FROM main.customers WHERE id > 10");
-        assert_eq!(queries[1], "SELECT * FROM orders WHERE total < 1000");
+        assert!(queries.contains(&"SELECT * FROM main.customers WHERE id > 10".to_string()));
+        assert!(queries.contains(&"SELECT * FROM orders WHERE total < 1000".to_string()));
+    }
+
+    #[test]
+    fn test_extract_tables_with_simple_cte() {
+        let schema = create_test_schema();
+        let select = parse_select(
+            "WITH customer_totals AS (
+                SELECT c.id, c.name, SUM(o.total) as total_spent
+                FROM customers c
+                JOIN orders o ON c.id = o.customer_id
+                GROUP BY c.id, c.name
+            )
+            SELECT * FROM customer_totals WHERE total_spent > 1000",
+        );
+
+        let (tables, aliases, _qualified_names, _table_conditions) =
+            extract_all_tables(&select, &schema).unwrap();
+
+        // Check that we found both tables from the CTE
+        assert_eq!(tables.len(), 2);
+        let table_names: Vec<&str> = tables.iter().map(|t| t.name.as_str()).collect();
+        assert!(table_names.contains(&"customers"));
+        assert!(table_names.contains(&"orders"));
+
+        // Check aliases from the CTE
+        assert_eq!(aliases.get("c"), Some(&"customers".to_string()));
+        assert_eq!(aliases.get("o"), Some(&"orders".to_string()));
+    }
+
+    #[test]
+    fn test_extract_tables_with_multiple_ctes() {
+        let schema = create_test_schema();
+        let select = parse_select(
+            "WITH
+            high_value_customers AS (
+                SELECT id, name
+                FROM customers
+                WHERE id IN (SELECT customer_id FROM orders WHERE total > 500)
+            ),
+            recent_orders AS (
+                SELECT id, customer_id, total
+                FROM orders
+                WHERE id > 100
+            )
+            SELECT hvc.name, ro.total
+            FROM high_value_customers hvc
+            JOIN recent_orders ro ON hvc.id = ro.customer_id",
+        );
+
+        let (tables, _aliases, _qualified_names, _table_conditions) =
+            extract_all_tables(&select, &schema).unwrap();
+
+        // Check that we found both tables from both CTEs
+        assert_eq!(tables.len(), 2);
+        let table_names: Vec<&str> = tables.iter().map(|t| t.name.as_str()).collect();
+        assert!(table_names.contains(&"customers"));
+        assert!(table_names.contains(&"orders"));
+    }
+
+    #[test]
+    fn test_sql_for_populate_union_mixed_conditions() {
+        // Test UNION where same table appears with and without WHERE clause
+        // This should drop ALL conditions to ensure we get all rows
+        let schema = create_test_schema();
+
+        let select = parse_select(
+            "SELECT * FROM customers WHERE id > 10
+             UNION ALL
+             SELECT * FROM customers",
+        );
+
+        let (tables, aliases, qualified_names, table_conditions) =
+            extract_all_tables(&select, &schema).unwrap();
+
+        let view = IncrementalView::new(
+            "union_view".to_string(),
+            select.clone(),
+            tables,
+            aliases,
+            qualified_names,
+            table_conditions,
+            extract_view_columns(&select, &schema).unwrap(),
+            &schema,
+            1, // main_data_root
+            2, // internal_state_root
+            3, // internal_state_index_root
+        )
+        .unwrap();
+
+        let queries = view.sql_for_populate().unwrap();
+
+        assert_eq!(queries.len(), 1);
+        // When the same table appears with and without WHERE conditions in a UNION,
+        // we must fetch ALL rows (no WHERE clause) because the conditions are incompatible
+        assert_eq!(
+            queries[0], "SELECT * FROM customers",
+            "UNION with mixed conditions (some with WHERE, some without) should fetch ALL rows"
+        );
+    }
+
+    #[test]
+    fn test_extract_tables_with_nested_cte() {
+        let schema = create_test_schema();
+        let select = parse_select(
+            "WITH RECURSIVE customer_hierarchy AS (
+                SELECT id, name, 0 as level
+                FROM customers
+                WHERE id = 1
+                UNION ALL
+                SELECT c.id, c.name, ch.level + 1
+                FROM customers c
+                JOIN orders o ON c.id = o.customer_id
+                JOIN customer_hierarchy ch ON o.customer_id = ch.id
+                WHERE ch.level < 3
+            )
+            SELECT * FROM customer_hierarchy",
+        );
+
+        let (tables, _aliases, _qualified_names, _table_conditions) =
+            extract_all_tables(&select, &schema).unwrap();
+
+        // Check that we found the tables referenced in the recursive CTE
+        let table_names: Vec<&str> = tables.iter().map(|t| t.name.as_str()).collect();
+
+        // We're finding duplicates because "customers" appears twice in the recursive CTE
+        // Let's deduplicate
+        let unique_tables: std::collections::HashSet<&str> = table_names.iter().cloned().collect();
+        assert_eq!(unique_tables.len(), 2);
+        assert!(unique_tables.contains("customers"));
+        assert!(unique_tables.contains("orders"));
+    }
+
+    #[test]
+    fn test_extract_tables_with_cte_and_main_query() {
+        let schema = create_test_schema();
+        let select = parse_select(
+            "WITH customer_stats AS (
+                SELECT customer_id, COUNT(*) as order_count
+                FROM orders
+                GROUP BY customer_id
+            )
+            SELECT c.name, cs.order_count, p.name as product_name
+            FROM customers c
+            JOIN customer_stats cs ON c.id = cs.customer_id
+            JOIN products p ON p.id = 1",
+        );
+
+        let (tables, aliases, _qualified_names, _table_conditions) =
+            extract_all_tables(&select, &schema).unwrap();
+
+        // Check that we found tables from both the CTE and the main query
+        assert_eq!(tables.len(), 3);
+        let table_names: Vec<&str> = tables.iter().map(|t| t.name.as_str()).collect();
+        assert!(table_names.contains(&"customers"));
+        assert!(table_names.contains(&"orders"));
+        assert!(table_names.contains(&"products"));
+
+        // Check aliases from main query
+        assert_eq!(aliases.get("c"), Some(&"customers".to_string()));
+        assert_eq!(aliases.get("p"), Some(&"products".to_string()));
+    }
+
+    #[test]
+    fn test_sql_for_populate_simple_union() {
+        let schema = create_test_schema();
+        let select = parse_select(
+            "SELECT * FROM orders WHERE total > 1000
+             UNION ALL
+             SELECT * FROM orders WHERE total < 100",
+        );
+
+        let (tables, aliases, qualified_names, table_conditions) =
+            extract_all_tables(&select, &schema).unwrap();
+
+        // Generate populate queries
+        let queries = IncrementalView::generate_populate_queries(
+            &select,
+            &tables,
+            &aliases,
+            &qualified_names,
+            &table_conditions,
+        )
+        .unwrap();
+
+        // We should have deduplicated to a single table
+        assert_eq!(tables.len(), 1, "Should have one unique table");
+        assert_eq!(tables[0].name, "orders"); // Single table, order doesn't matter
+
+        // Should have collected two conditions
+        assert_eq!(table_conditions.get("orders").unwrap().len(), 2);
+
+        // Should combine multiple conditions with OR
+        assert_eq!(queries.len(), 1);
+        // Conditions are combined with OR
+        assert_eq!(
+            queries[0],
+            "SELECT * FROM orders WHERE (total > 1000) OR (total < 100)"
+        );
+    }
+
+    #[test]
+    fn test_sql_for_populate_with_union_and_filters() {
+        let schema = create_test_schema();
+
+        // Test UNION with different WHERE conditions on the same table
+        let select = parse_select(
+            "SELECT * FROM orders WHERE total > 1000
+             UNION ALL
+             SELECT * FROM orders WHERE total < 100",
+        );
+
+        let view = IncrementalView::from_stmt(
+            ast::QualifiedName {
+                db_name: None,
+                name: ast::Name::Ident("test_view".to_string()),
+                alias: None,
+            },
+            select,
+            &schema,
+            1,
+            2,
+            3,
+        )
+        .unwrap();
+
+        let queries = view.sql_for_populate().unwrap();
+
+        // We deduplicate tables, so we get 1 query for orders
+        assert_eq!(queries.len(), 1);
+
+        // Multiple conditions on the same table are combined with OR
+        assert_eq!(
+            queries[0],
+            "SELECT * FROM orders WHERE (total > 1000) OR (total < 100)"
+        );
+    }
+
+    #[test]
+    fn test_sql_for_populate_with_union_mixed_tables() {
+        let schema = create_test_schema();
+
+        // Test UNION with different tables
+        let select = parse_select(
+            "SELECT id, name FROM customers WHERE id > 10
+             UNION ALL
+             SELECT customer_id as id, 'Order' as name FROM orders WHERE total > 500",
+        );
+
+        let view = IncrementalView::from_stmt(
+            ast::QualifiedName {
+                db_name: None,
+                name: ast::Name::Ident("test_view".to_string()),
+                alias: None,
+            },
+            select,
+            &schema,
+            1,
+            2,
+            3,
+        )
+        .unwrap();
+
+        let queries = view.sql_for_populate().unwrap();
+
+        assert_eq!(queries.len(), 2, "Should have one query per table");
+
+        // Check that each table gets its appropriate WHERE clause
+        let customers_query = queries
+            .iter()
+            .find(|q| q.contains("FROM customers"))
+            .unwrap();
+        let orders_query = queries.iter().find(|q| q.contains("FROM orders")).unwrap();
+
+        assert!(customers_query.contains("WHERE id > 10"));
+        assert!(orders_query.contains("WHERE total > 500"));
+    }
+
+    #[test]
+    fn test_sql_for_populate_duplicate_tables_conflicting_filters() {
+        // This tests what happens when we have duplicate table references with different filters
+        // We need to manually construct a view to simulate what would happen with CTEs
+        let schema = create_test_schema();
+
+        // Get the orders table twice (simulating what would happen with CTEs)
+        let orders_table = schema.get_btree_table("orders").unwrap();
+
+        let referenced_tables = vec![orders_table.clone(), orders_table.clone()];
+
+        // Create a SELECT that would have conflicting WHERE conditions
+        let select = parse_select(
+            "SELECT * FROM orders WHERE total > 1000", // This is just for the AST
+        );
+
+        let view = IncrementalView::new(
+            "test_view".to_string(),
+            select.clone(),
+            referenced_tables,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            extract_view_columns(&select, &schema).unwrap(),
+            &schema,
+            1,
+            2,
+            3,
+        )
+        .unwrap();
+
+        let queries = view.sql_for_populate().unwrap();
+
+        // With duplicates, we should get 2 identical queries
+        assert_eq!(queries.len(), 2);
+
+        // Both should be the same since they're from the same table reference
+        assert_eq!(queries[0], queries[1]);
+    }
+
+    #[test]
+    fn test_table_extraction_with_nested_ctes_complex_conditions() {
+        let schema = create_test_schema();
+        let select = parse_select(
+            "WITH
+            customer_orders AS (
+                SELECT c.*, o.total
+                FROM customers c
+                JOIN orders o ON c.id = o.customer_id
+                WHERE c.name LIKE 'A%' AND o.total > 100
+            ),
+            top_customers AS (
+                SELECT * FROM customer_orders WHERE total > 500
+            )
+            SELECT * FROM top_customers",
+        );
+
+        // Test table extraction directly without creating a view
+        let mut tables = Vec::new();
+        let mut aliases = HashMap::new();
+        let mut qualified_names = HashMap::new();
+        let mut table_conditions = HashMap::new();
+
+        IncrementalView::extract_all_tables(
+            &select,
+            &schema,
+            &mut tables,
+            &mut aliases,
+            &mut qualified_names,
+            &mut table_conditions,
+        )
+        .unwrap();
+
+        let table_names: Vec<&str> = tables.iter().map(|t| t.name.as_str()).collect();
+
+        // Should have one reference to each table
+        assert_eq!(table_names.len(), 2, "Should have 2 table references");
+        assert!(table_names.contains(&"customers"));
+        assert!(table_names.contains(&"orders"));
+
+        // Check aliases
+        assert_eq!(aliases.get("c"), Some(&"customers".to_string()));
+        assert_eq!(aliases.get("o"), Some(&"orders".to_string()));
+    }
+
+    #[test]
+    fn test_union_all_populate_queries() {
+        // Test that UNION ALL generates correct populate queries
+        let schema = create_test_schema();
+
+        // Create a UNION ALL query that references the same table twice with different WHERE conditions
+        let sql = "
+            SELECT id, name FROM customers WHERE id < 5
+            UNION ALL
+            SELECT id, name FROM customers WHERE id > 10
+        ";
+
+        let mut parser = Parser::new(sql.as_bytes());
+        let cmd = parser.next_cmd().unwrap();
+        let select_stmt = match cmd.unwrap() {
+            turso_parser::ast::Cmd::Stmt(ast::Stmt::Select(select)) => select,
+            _ => panic!("Expected SELECT statement"),
+        };
+
+        // Extract tables and conditions
+        let (tables, aliases, qualified_names, conditions) =
+            extract_all_tables(&select_stmt, &schema).unwrap();
+
+        // Generate populate queries
+        let queries = IncrementalView::generate_populate_queries(
+            &select_stmt,
+            &tables,
+            &aliases,
+            &qualified_names,
+            &conditions,
+        )
+        .unwrap();
+
+        // Expected query - assuming customers table has INTEGER PRIMARY KEY
+        // so we don't need to select rowid separately
+        let expected = "SELECT * FROM customers WHERE (id < 5) OR (id > 10)";
+
+        assert_eq!(
+            queries.len(),
+            1,
+            "Should generate exactly 1 query for UNION ALL with same table"
+        );
+        assert_eq!(queries[0], expected, "Query should match expected format");
+    }
+
+    #[test]
+    fn test_union_all_different_tables_populate_queries() {
+        // Test UNION ALL with different tables
+        let schema = create_test_schema();
+
+        let sql = "
+            SELECT id, name FROM customers WHERE id < 5
+            UNION ALL
+            SELECT id, product_name FROM orders WHERE amount > 100
+        ";
+
+        let mut parser = Parser::new(sql.as_bytes());
+        let cmd = parser.next_cmd().unwrap();
+        let select_stmt = match cmd.unwrap() {
+            turso_parser::ast::Cmd::Stmt(ast::Stmt::Select(select)) => select,
+            _ => panic!("Expected SELECT statement"),
+        };
+
+        // Extract tables and conditions
+        let (tables, aliases, qualified_names, conditions) =
+            extract_all_tables(&select_stmt, &schema).unwrap();
+
+        // Generate populate queries
+        let queries = IncrementalView::generate_populate_queries(
+            &select_stmt,
+            &tables,
+            &aliases,
+            &qualified_names,
+            &conditions,
+        )
+        .unwrap();
+
+        // Should generate separate queries for each table
+        assert_eq!(
+            queries.len(),
+            2,
+            "Should generate 2 queries for different tables"
+        );
+
+        // Check we have queries for both tables
+        let has_customers = queries.iter().any(|q| q.contains("customers"));
+        let has_orders = queries.iter().any(|q| q.contains("orders"));
+        assert!(has_customers, "Should have a query for customers table");
+        assert!(has_orders, "Should have a query for orders table");
+
+        // Verify the customers query has its WHERE clause
+        let customers_query = queries
+            .iter()
+            .find(|q| q.contains("customers"))
+            .expect("Should have customers query");
+        assert!(
+            customers_query.contains("WHERE"),
+            "Customers query should have WHERE clause"
+        );
     }
 }
