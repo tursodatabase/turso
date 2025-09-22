@@ -676,7 +676,7 @@ mod tests {
             "ss", "tt", "uu", "vv", "ww", "xx", "yy", "zz",
         ];
         for outer in 0..OUTER_ITERS {
-            println!("");
+            println!(" ");
             println!(
                 "partial_index_mutation_and_upsert_fuzz iteration {}/{}",
                 outer + 1,
