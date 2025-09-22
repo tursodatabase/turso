@@ -65,7 +65,7 @@ pub(crate) fn execute_interactions(
     env.clear_poison();
     let mut env = env.lock().unwrap();
 
-    env.tables.clear();
+    env.clear_tables();
 
     for _tick in 0..env.opts.ticks {
         tracing::trace!("Executing tick {}", _tick);
@@ -186,7 +186,10 @@ pub fn execute_interaction_turso(
                 tracing::error!(?results);
             }
             stack.push(results);
-            limbo_integrity_check(conn)?;
+            // TODO: skip integrity check with mvcc
+            if !env.profile.experimental_mvcc {
+                limbo_integrity_check(conn)?;
+            }
         }
         InteractionType::FsyncQuery(query) => {
             let results = interaction.execute_fsync_query(conn.clone(), env);
@@ -227,10 +230,13 @@ pub fn execute_interaction_turso(
             stack.push(results);
             // Reset fault injection
             env.io.inject_fault(false);
-            limbo_integrity_check(&conn)?;
+            // TODO: skip integrity check with mvcc
+            if !env.profile.experimental_mvcc {
+                limbo_integrity_check(&conn)?;
+            }
         }
     }
-    let _ = interaction.shadow(&mut env.tables);
+    let _ = interaction.shadow(&mut env.get_conn_tables_mut(interaction.connection_index));
     Ok(ExecutionContinuation::NextInteraction)
 }
 
@@ -323,7 +329,7 @@ fn execute_interaction_rusqlite(
         }
     }
 
-    let _ = interaction.shadow(&mut env.tables);
+    let _ = interaction.shadow(&mut env.get_conn_tables_mut(interaction.connection_index));
     Ok(ExecutionContinuation::NextInteraction)
 }
 
