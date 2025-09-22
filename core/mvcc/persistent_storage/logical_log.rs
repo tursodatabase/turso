@@ -96,7 +96,6 @@ impl LogRowType {
             }
             LogRowType::Insert => {
                 write_varint_to_vec(row_version.row.id.row_id as u64, buffer);
-                write_varint_to_vec(row_version.row.column_count as u64, buffer);
 
                 let data = &row_version.row.data;
                 // Maybe this isn't needed? We already might infer data size with payload size
