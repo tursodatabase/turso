@@ -1294,7 +1294,7 @@ impl From<&ColumnDefinition> for Column {
         let ty_str = value
             .col_type
             .as_ref()
-            .map(|t| t.name.to_string())
+            .map(|t| t.to_string())
             .unwrap_or_default();
 
         let hidden = ty_str.contains("HIDDEN");
