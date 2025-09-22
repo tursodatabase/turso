@@ -499,7 +499,7 @@ impl Database {
                     .map_err(|_| LimboError::SchemaLocked)?
                     .clone(),
             ),
-            database_schemas: RefCell::new(std::collections::HashMap::new()),
+            database_schemas: RwLock::new(std::collections::HashMap::new()),
             auto_commit: Cell::new(true),
             transaction_state: Cell::new(TransactionState::None),
             last_insert_rowid: Cell::new(0),
@@ -983,7 +983,7 @@ pub struct Connection {
     schema: RwLock<Arc<Schema>>,
     /// Per-database schema cache (database_index -> schema)
     /// Loaded lazily to avoid copying all schemas on connection open
-    database_schemas: RefCell<std::collections::HashMap<usize, Arc<Schema>>>,
+    database_schemas: RwLock<std::collections::HashMap<usize, Arc<Schema>>>,
     /// Whether to automatically commit transaction
     auto_commit: Cell<bool>,
     transaction_state: Cell<TransactionState>,
@@ -2037,7 +2037,7 @@ impl Connection {
             f(&schema)
         } else {
             // Attached database - check cache first, then load from database
-            let mut schemas = self.database_schemas.borrow_mut();
+            let mut schemas = self.database_schemas.write();
 
             if let Some(cached_schema) = schemas.get(&database_id) {
                 return f(cached_schema);
