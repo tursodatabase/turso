@@ -7,7 +7,10 @@ use itertools::Itertools;
 use similar_asserts::SimpleDiff;
 use sql_generation::model::table::SimValue;
 
-use crate::generation::plan::{ConnectionState, Interaction, InteractionPlanState};
+use crate::{
+    generation::plan::{ConnectionState, InteractionPlanIterator, InteractionPlanState},
+    runner::execution::ExecutionContinuation,
+};
 
 use super::{
     env::SimulatorEnv,
@@ -17,7 +20,7 @@ use super::{
 pub fn run_simulation(
     env: Arc<Mutex<SimulatorEnv>>,
     rusqlite_env: Arc<Mutex<SimulatorEnv>>,
-    plan: Vec<Interaction>,
+    plan: impl InteractionPlanIterator,
     last_execution: Arc<Mutex<Execution>>,
 ) -> ExecutionResult {
     tracing::info!("Executing database interaction plan...");
@@ -55,7 +58,7 @@ pub fn run_simulation(
 pub(crate) fn execute_interactions(
     env: Arc<Mutex<SimulatorEnv>>,
     rusqlite_env: Arc<Mutex<SimulatorEnv>>,
-    interactions: Vec<Interaction>,
+    mut plan: impl InteractionPlanIterator,
     state: &mut InteractionPlanState,
     conn_states: &mut [ConnectionState],
     rusqlite_states: &mut [ConnectionState],
@@ -69,15 +72,13 @@ pub(crate) fn execute_interactions(
     env.clear_tables();
     rusqlite_env.clear_tables();
 
+    let mut interaction = plan
+        .next(&mut env)
+        .expect("we should always have at least 1 interaction to start");
+
     let now = std::time::Instant::now();
 
     for _tick in 0..env.opts.ticks {
-        if state.interaction_pointer >= interactions.len() {
-            break;
-        }
-
-        let interaction = &interactions[state.interaction_pointer];
-
         let connection_index = interaction.connection_index;
         let turso_conn_state = &mut conn_states[connection_index];
         let rusqlite_conn_state = &mut rusqlite_states[connection_index];
@@ -89,38 +90,34 @@ pub(crate) fn execute_interactions(
         last_execution.connection_index = connection_index;
         last_execution.interaction_index = state.interaction_pointer;
 
-        let mut turso_state = state.clone();
-        let mut rusqlite_state = state.clone();
-
         // first execute turso
-        let turso_res = super::execution::execute_plan(
-            &mut env,
-            interaction,
-            turso_conn_state,
-            &mut turso_state,
-        );
+        let turso_res = super::execution::execute_plan(&mut env, &interaction, turso_conn_state);
 
         // second execute rusqlite
-        let rusqlite_res = super::execution::execute_plan(
-            &mut rusqlite_env,
-            interaction,
-            rusqlite_conn_state,
-            &mut rusqlite_state,
-        );
+        let rusqlite_res =
+            super::execution::execute_plan(&mut rusqlite_env, &interaction, rusqlite_conn_state);
 
         // Compare results
-        if let Err(err) = compare_results(
+        let next = match compare_results(
             turso_res,
             turso_conn_state,
             rusqlite_res,
             rusqlite_conn_state,
         ) {
-            return ExecutionResult::new(history, Some(err));
+            Ok(next) => next,
+            Err(err) => return ExecutionResult::new(history, Some(err)),
+        };
+
+        match next {
+            ExecutionContinuation::Stay => {}
+            ExecutionContinuation::NextInteraction => {
+                state.interaction_pointer += 1;
+                let Some(new_interaction) = plan.next(&mut env) else {
+                    break;
+                };
+                interaction = new_interaction;
+            }
         }
-
-        assert_eq!(turso_state, rusqlite_state);
-
-        *state = turso_state;
 
         // Check if the maximum time for the simulation has been reached
         if now.elapsed().as_secs() >= env.opts.max_time_simulation as u64 {
@@ -137,13 +134,14 @@ pub(crate) fn execute_interactions(
 }
 
 fn compare_results(
-    turso_res: turso_core::Result<()>,
+    turso_res: turso_core::Result<ExecutionContinuation>,
     turso_conn_state: &mut ConnectionState,
-    rusqlite_res: turso_core::Result<()>,
+    rusqlite_res: turso_core::Result<ExecutionContinuation>,
     rusqlite_conn_state: &mut ConnectionState,
-) -> turso_core::Result<()> {
-    match (turso_res, rusqlite_res) {
-        (Ok(..), Ok(..)) => {
+) -> turso_core::Result<ExecutionContinuation> {
+    let next = match (turso_res, rusqlite_res) {
+        (Ok(v1), Ok(v2)) => {
+            assert_eq!(v1, v2);
             let turso_values = turso_conn_state.stack.last();
             let rusqlite_values = rusqlite_conn_state.stack.last();
             match (turso_values, rusqlite_values) {
@@ -222,8 +220,9 @@ fn compare_results(
                             ));
                         }
                     }
+                    v1
                 }
-                (None, None) => {}
+                (None, None) => v1,
                 _ => {
                     tracing::error!("limbo and rusqlite results do not match");
                     return Err(turso_core::LimboError::InternalError(
@@ -251,9 +250,10 @@ fn compare_results(
             //       The problem is that the errors might be different, and we cannot
             //       just assume both of them being errors has the same semantics.
             // return Err(err);
+            ExecutionContinuation::NextInteraction
         }
-    }
-    Ok(())
+    };
+    Ok(next)
 }
 
 fn count_rows(values: &[Vec<SimValue>]) -> BTreeMap<&Vec<SimValue>, i32> {

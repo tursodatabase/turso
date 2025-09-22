@@ -1,7 +1,7 @@
 #![allow(clippy::arc_with_non_send_sync, dead_code)]
 use anyhow::anyhow;
 use clap::Parser;
-use generation::plan::{Interaction, InteractionPlan, InteractionPlanState};
+use generation::plan::{InteractionPlan, InteractionPlanState};
 use notify::event::{DataChange, ModifyKind};
 use notify::{EventKind, RecursiveMode, Watcher};
 use rand::prelude::*;
@@ -15,13 +15,14 @@ use std::backtrace::Backtrace;
 use std::fs::OpenOptions;
 use std::io::{IsTerminal, Write};
 use std::path::Path;
+use std::rc::Rc;
 use std::sync::{Arc, Mutex, mpsc};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::field::MakeExt;
 use tracing_subscriber::fmt::format;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use crate::generation::plan::ConnectionState;
+use crate::generation::plan::{ConnectionState, InteractionPlanIterator};
 use crate::profiles::Profile;
 use crate::runner::doublecheck;
 use crate::runner::env::{Paths, SimulationPhase, SimulationType};
@@ -179,15 +180,9 @@ fn watch_mode(env: SimulatorEnv) -> notify::Result<()> {
                     let result = SandboxedResult::from(
                         std::panic::catch_unwind(move || {
                             let mut env = env;
-                            let plan = InteractionPlan::compute_via_diff(&env.get_plan_path());
-                            tracing::error!("plan_len: {}", plan.len());
+                            let plan_path = env.get_plan_path();
+                            let plan = InteractionPlan::compute_via_diff(&plan_path);
                             env.clear();
-
-                            // plan.iter().for_each(|is| {
-                            //     is.iter().for_each(|i| {
-                            //         let _ = i.shadow(&mut env.tables);
-                            //     });
-                            // });
 
                             let env = Arc::new(Mutex::new(env.clone_without_connections()));
                             run_simulation_default(env, plan, last_execution_.clone())
@@ -236,16 +231,30 @@ fn run_simulator(
     }));
 
     let last_execution = Arc::new(Mutex::new(Execution::new(0, 0)));
+    let mut gen_rng = env.gen_rng();
+
     let env = Arc::new(Mutex::new(env));
-    let result = SandboxedResult::from(
-        std::panic::catch_unwind(|| {
-            let interactions = plan.interactions_list();
-            run_simulation(env.clone(), interactions, last_execution.clone())
-        }),
-        last_execution.clone(),
-    );
+    // Need to wrap in Rc Mutex due to the UnwindSafe barrier
+    let plan = Rc::new(Mutex::new(plan));
+
+    let result = {
+        let sim_execution = last_execution.clone();
+        let sim_plan = plan.clone();
+        let sim_env = env.clone();
+
+        SandboxedResult::from(
+            std::panic::catch_unwind(move || {
+                let mut sim_plan = sim_plan.lock().unwrap();
+                let plan = sim_plan.generator(&mut gen_rng);
+                run_simulation(sim_env, plan, sim_execution)
+            }),
+            last_execution.clone(),
+        )
+    };
     env.clear_poison();
+    plan.clear_poison();
     let env = env.lock().unwrap();
+    let plan = plan.lock().unwrap();
 
     // No doublecheck, run shrinking if panicking or found a bug.
     match &result {
@@ -306,9 +315,9 @@ fn run_simulator(
                 let env = Arc::new(Mutex::new(env));
                 let shrunk = SandboxedResult::from(
                     std::panic::catch_unwind(|| {
-                        let interactions = shrunk_plan.interactions_list();
+                        let plan = shrunk_plan.static_iterator();
 
-                        run_simulation(env.clone(), interactions, last_execution.clone())
+                        run_simulation(env.clone(), plan, last_execution.clone())
                     }),
                     last_execution,
                 );
@@ -520,9 +529,9 @@ fn setup_simulation(
 
         tracing::info!("Generating database interaction plan...");
 
-        let plan = InteractionPlan::generate_plan(&mut env.rng.clone(), &mut env);
+        let plan = InteractionPlan::init_plan(&mut env);
 
-        // todo: for now, we only use 1 connection, so it's safe to use the first plan.
+        // TODO: move this code to the end of the simulation
         tracing::info!("{}", plan.stats());
         std::fs::write(env.get_plan_path(), plan.to_string()).unwrap();
         std::fs::write(
@@ -537,7 +546,7 @@ fn setup_simulation(
 
 fn run_simulation(
     env: Arc<Mutex<SimulatorEnv>>,
-    plan: Vec<Interaction>,
+    plan: impl InteractionPlanIterator,
     last_execution: Arc<Mutex<Execution>>,
 ) -> ExecutionResult {
     let simulation_type = {
@@ -570,7 +579,7 @@ fn run_simulation(
 
 fn run_simulation_default(
     env: Arc<Mutex<SimulatorEnv>>,
-    plan: Vec<Interaction>,
+    plan: impl InteractionPlanIterator,
     last_execution: Arc<Mutex<Execution>>,
 ) -> ExecutionResult {
     tracing::info!("Executing database interaction plan...");
