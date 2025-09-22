@@ -3,6 +3,7 @@ import os
 import random
 import sqlite3
 from pathlib import Path
+
 from faker import Faker
 
 seed = os.getenv("SEED", None)
