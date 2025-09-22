@@ -864,7 +864,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
             }
             CommitState::EndCommitLogicalLog { end_ts } => {
                 let connection = self.connection.clone();
-                let schema_did_change = match connection.transaction_state.get() {
+                let schema_did_change = match connection.get_tx_state() {
                     crate::TransactionState::Write { schema_did_change } => schema_did_change,
                     _ => false,
                 };

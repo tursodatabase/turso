@@ -531,7 +531,7 @@ impl Program {
         debug_assert!(state.column_count() == EXPLAIN_COLUMNS.len());
         if self.connection.closed.get() {
             // Connection is closed for whatever reason, rollback the transaction.
-            let state = self.connection.transaction_state.get();
+            let state = self.connection.get_tx_state();
             if let TransactionState::Write { .. } = state {
                 pager.io.block(|| pager.end_tx(true, &self.connection))?;
             }
@@ -586,7 +586,7 @@ impl Program {
         loop {
             if self.connection.closed.get() {
                 // Connection is closed for whatever reason, rollback the transaction.
-                let state = self.connection.transaction_state.get();
+                let state = self.connection.get_tx_state();
                 if let TransactionState::Write { .. } = state {
                     pager.io.block(|| pager.end_tx(true, &self.connection))?;
                 }
@@ -634,7 +634,7 @@ impl Program {
         loop {
             if self.connection.closed.get() {
                 // Connection is closed for whatever reason, rollback the transaction.
-                let state = self.connection.transaction_state.get();
+                let state = self.connection.get_tx_state();
                 if let TransactionState::Write { .. } = state {
                     pager.io.block(|| pager.end_tx(true, &self.connection))?;
                 }
@@ -819,7 +819,7 @@ impl Program {
         // Reset state for next use
         program_state.view_delta_state = ViewDeltaCommitState::NotStarted;
 
-        if self.connection.transaction_state.get() == TransactionState::None {
+        if self.connection.get_tx_state() == TransactionState::None {
             // No need to do any work here if not in tx. Current MVCC logic doesn't work with this assumption,
             // hence the mv_store.is_none() check.
             return Ok(IOResult::Done(()));
@@ -848,7 +848,7 @@ impl Program {
                     IOResult::Done(_) => {
                         assert!(state_machine.is_finalized());
                         conn.mv_tx.set(None);
-                        conn.transaction_state.replace(TransactionState::None);
+                        conn.set_tx_state(TransactionState::None);
                         program_state.commit_state = CommitState::Ready;
                         return Ok(IOResult::Done(()));
                     }
@@ -867,7 +867,7 @@ impl Program {
                 program_state.commit_state
             );
             if matches!(program_state.commit_state, CommitState::Committing) {
-                let TransactionState::Write { .. } = connection.transaction_state.get() else {
+                let TransactionState::Write { .. } = connection.get_tx_state() else {
                     unreachable!("invalid state for write commit step")
                 };
                 self.step_end_write_txn(
@@ -877,7 +877,7 @@ impl Program {
                     rollback,
                 )
             } else if auto_commit {
-                let current_state = connection.transaction_state.get();
+                let current_state = connection.get_tx_state();
                 tracing::trace!("Auto-commit state: {:?}", current_state);
                 match current_state {
                     TransactionState::Write { .. } => self.step_end_write_txn(
@@ -887,7 +887,7 @@ impl Program {
                         rollback,
                     ),
                     TransactionState::Read => {
-                        connection.transaction_state.replace(TransactionState::None);
+                        connection.set_tx_state(TransactionState::None);
                         pager.end_read_tx()?;
                         Ok(IOResult::Done(()))
                     }
@@ -919,7 +919,7 @@ impl Program {
                 if self.change_cnt_on {
                     self.connection.set_changes(self.n_change.get());
                 }
-                connection.transaction_state.replace(TransactionState::None);
+                connection.set_tx_state(TransactionState::None);
                 *commit_state = CommitState::Ready;
             }
             IOResult::IO(io) => {
@@ -1083,7 +1083,7 @@ pub fn handle_program_error(
         _ => {
             if let Some(mv_store) = mv_store {
                 if let Some((tx_id, _)) = connection.mv_tx.get() {
-                    connection.transaction_state.replace(TransactionState::None);
+                    connection.set_tx_state(TransactionState::None);
                     connection.auto_commit.store(true, Ordering::SeqCst);
                     mv_store.rollback_tx(tx_id, pager.clone(), connection)?;
                 }
@@ -1095,7 +1095,7 @@ pub fn handle_program_error(
                         tracing::error!("end_tx failed: {e}");
                     })?;
             }
-            connection.transaction_state.replace(TransactionState::None);
+            connection.set_tx_state(TransactionState::None);
         }
     }
     Ok(())

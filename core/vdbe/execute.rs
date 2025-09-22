@@ -2206,7 +2206,7 @@ pub fn op_transaction_inner(
                 }
 
                 // 1. We try to upgrade current version
-                let current_state = conn.transaction_state.get();
+                let current_state = conn.get_tx_state();
                 let (new_transaction_state, updated) = if conn.is_nested_stmt.get() {
                     (current_state, false)
                 } else {
@@ -2313,9 +2313,9 @@ pub fn op_transaction_inner(
                             // start a new one.
                             if matches!(current_state, TransactionState::None) {
                                 pager.end_read_tx()?;
-                                conn.transaction_state.replace(TransactionState::None);
+                                conn.set_tx_state(TransactionState::None);
                             }
-                            assert_eq!(conn.transaction_state.get(), current_state);
+                            assert_eq!(conn.get_tx_state(), current_state);
                             return Err(LimboError::Busy);
                         }
                         if let IOResult::IO(io) = begin_w_tx_res? {
@@ -2323,8 +2323,7 @@ pub fn op_transaction_inner(
                             // end the read transaction.
                             program
                                 .connection
-                                .transaction_state
-                                .replace(TransactionState::PendingUpgrade);
+                                .set_tx_state(TransactionState::PendingUpgrade);
                             return Ok(InsnFunctionStepResult::IO(io));
                         }
                     }
@@ -2332,7 +2331,7 @@ pub fn op_transaction_inner(
 
                 // 3. Transaction state should be updated before checking for Schema cookie so that the tx is ended properly on error
                 if updated {
-                    conn.transaction_state.replace(new_transaction_state);
+                    conn.set_tx_state(new_transaction_state);
                 }
                 state.op_transaction_state = OpTransactionState::CheckSchemaCookie;
                 continue;
@@ -2401,7 +2400,7 @@ pub fn op_auto_commit(
             } else {
                 return_if_io!(pager.end_tx(true, &conn));
             }
-            conn.transaction_state.replace(TransactionState::None);
+            conn.set_tx_state(TransactionState::None);
             conn.auto_commit.store(true, Ordering::SeqCst);
         } else {
             conn.auto_commit.store(*auto_commit, Ordering::SeqCst);
@@ -6965,9 +6964,9 @@ pub fn op_set_cookie(
             Cookie::IncrementalVacuum => header.incremental_vacuum_enabled = (*value as u32).into(),
             Cookie::SchemaVersion => {
                 // we update transaction state to indicate that the schema has changed
-                match program.connection.transaction_state.get() {
+                match program.connection.get_tx_state() {
                     TransactionState::Write { schema_did_change } => {
-                        program.connection.transaction_state.set(TransactionState::Write { schema_did_change: true });
+                        program.connection.set_tx_state(TransactionState::Write { schema_did_change: true });
                     },
                     TransactionState::Read => unreachable!("invalid transaction state for SetCookie: TransactionState::Read, should be write"),
                     TransactionState::None => unreachable!("invalid transaction state for SetCookie: TransactionState::None, should be write"),

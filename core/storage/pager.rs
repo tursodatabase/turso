@@ -1131,7 +1131,7 @@ impl Pager {
             // TODO: Unsure what the semantics of "end_tx" is for in-memory databases, ephemeral tables and ephemeral indexes.
             return Ok(IOResult::Done(PagerCommitResult::Rollback));
         };
-        let (is_write, schema_did_change) = match connection.transaction_state.get() {
+        let (is_write, schema_did_change) = match connection.get_tx_state() {
             TransactionState::Write { schema_did_change } => (true, schema_did_change),
             _ => (false, false),
         };
