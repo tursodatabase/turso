@@ -70,7 +70,7 @@ use std::{
     ops::Deref,
     rc::Rc,
     sync::{
-        atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicUsize, Ordering},
         Arc, LazyLock, Mutex, Weak,
     },
     time::Duration,
@@ -507,7 +507,7 @@ impl Database {
             total_changes: AtomicI64::new(0),
             syms: RwLock::new(SymbolTable::new()),
             _shared_cache: false,
-            cache_size: Cell::new(default_cache_size),
+            cache_size: AtomicI32::new(default_cache_size),
             page_size: Cell::new(page_size),
             wal_auto_checkpoint_disabled: Cell::new(false),
             capture_data_changes: RefCell::new(CaptureDataChangesMode::Off),
@@ -992,7 +992,7 @@ pub struct Connection {
     total_changes: AtomicI64,
     syms: RwLock<SymbolTable>,
     _shared_cache: bool,
-    cache_size: Cell<i32>,
+    cache_size: AtomicI32,
     /// page size used for an uninitialized database or the next vacuum command.
     /// it's not always equal to the current page size of the database
     page_size: Cell<PageSize>,
@@ -1683,10 +1683,10 @@ impl Connection {
     }
 
     pub fn get_cache_size(&self) -> i32 {
-        self.cache_size.get()
+        self.cache_size.load(Ordering::SeqCst)
     }
     pub fn set_cache_size(&self, size: i32) {
-        self.cache_size.set(size);
+        self.cache_size.store(size, Ordering::SeqCst);
     }
 
     pub fn get_capture_data_changes(&self) -> std::cell::Ref<'_, CaptureDataChangesMode> {
