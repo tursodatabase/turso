@@ -138,6 +138,7 @@ impl LogicalLog {
         buffer.extend_from_slice(&tx.tx_timestamp.to_be_bytes());
         // TODO: checksum
         buffer.extend_from_slice(&[0; 8]);
+        let buffer_pos_for_rows_size = buffer.len();
 
         // 3. Serialize rows
         tx.row_versions.iter().for_each(|row_version| {
@@ -145,8 +146,13 @@ impl LogicalLog {
             row_type.serialize(&mut buffer, row_version);
         });
 
-        // 4. Serialize transaction's end marker. This marker will be the position of the offset
+        // 4. Serialize transaction's end marker and rows size. This marker will be the position of the offset
         //    after writing the buffer.
+        let rows_size = (buffer.len() - buffer_pos_for_rows_size) as u64;
+        buffer.splice(
+            buffer_pos_for_rows_size..buffer_pos_for_rows_size,
+            rows_size.to_be_bytes(),
+        );
         let offset_after_buffer = self.offset + buffer.len() as u64 + size_of::<u64>() as u64;
         buffer.extend_from_slice(&offset_after_buffer.to_be_bytes());
 
