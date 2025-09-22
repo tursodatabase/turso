@@ -975,8 +975,8 @@ pub fn begin_write_btree_page(pager: &Pager, page: &PageRef) -> Result<Completio
         })
     };
     let c = Completion::new_write(write_complete);
-    let io_ctx = &pager.io_ctx.borrow();
-    page_source.write_page(page_id, buffer.clone(), io_ctx, c)
+    let io_ctx = pager.io_ctx.read();
+    page_source.write_page(page_id, buffer.clone(), &io_ctx, c)
 }
 
 #[instrument(skip_all, level = Level::DEBUG)]
@@ -1044,12 +1044,12 @@ pub fn write_pages_vectored(
                 }
             });
 
-            let io_ctx = &pager.io_ctx.borrow();
+            let io_ctx = pager.io_ctx.read();
             match pager.db_file.write_pages(
                 start_id,
                 page_sz,
                 std::mem::replace(&mut run_bufs, Vec::with_capacity(EST_BUFF_CAPACITY)),
-                io_ctx,
+                &io_ctx,
                 cmp,
             ) {
                 Ok(c) => completions.push(c),
