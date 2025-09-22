@@ -377,12 +377,11 @@ pub fn prepare_update_plan(
         .any(|(idx, _)| columns[*idx].is_rowid_alias);
     let indexes_to_update = if rowid_alias_used {
         // If the rowid alias is used in the SET clause, we need to update all indexes
-        indexes.to_vec()
+        indexes.cloned().collect()
     } else {
         // otherwise we need to update the indexes whose columns are set in the SET clause,
         // or if the colunns used in the partial index WHERE clause are being updated
         indexes
-            .iter()
             .filter_map(|idx| {
                 let mut needs = idx
                     .columns

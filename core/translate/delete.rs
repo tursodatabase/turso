@@ -96,7 +96,7 @@ pub fn prepare_delete_plan(
     } else {
         crate::bail_parse_error!("Table is neither a virtual table nor a btree table");
     };
-    let indexes = schema.get_indices(table.get_name()).to_vec();
+    let indexes = schema.get_indices(table.get_name()).cloned().collect();
     let joined_tables = vec![JoinedTable {
         op: Operation::default_scan_for(&table),
         table,

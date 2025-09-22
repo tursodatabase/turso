@@ -1,4 +1,8 @@
-use std::{cmp::Ordering, collections::HashMap, sync::Arc};
+use std::{
+    cmp::Ordering,
+    collections::{HashMap, VecDeque},
+    sync::Arc,
+};
 
 use crate::{
     schema::{Column, Index},
@@ -175,7 +179,7 @@ fn estimate_selectivity(column: &Column, op: ast::Operator) -> f64 {
 pub fn constraints_from_where_clause(
     where_clause: &[WhereTerm],
     table_references: &TableReferences,
-    available_indexes: &HashMap<String, Vec<Arc<Index>>>,
+    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
 ) -> Result<Vec<TableConstraints>> {
     let mut constraints = Vec::new();
 
@@ -315,7 +319,7 @@ pub fn constraints_from_where_clause(
             }
             for index in available_indexes
                 .get(table_reference.table.get_name())
-                .unwrap_or(&Vec::new())
+                .unwrap_or(&VecDeque::new())
             {
                 if let Some(position_in_index) =
                     index.column_table_pos_to_index_pos(constraint.table_col_pos)

@@ -31,6 +31,38 @@ use crate::{
     },
 };
 
+// The following comment is copied directly from SQLite source and should be used as a guiding light
+// whenever we encounter compatibility bugs related to conflict clause handling:
+
+/* UNIQUE and PRIMARY KEY constraints should be handled in the following
+** order:
+**
+**   (1)  OE_Update
+**   (2)  OE_Abort, OE_Fail, OE_Rollback, OE_Ignore
+**   (3)  OE_Replace
+**
+** OE_Fail and OE_Ignore must happen before any changes are made.
+** OE_Update guarantees that only a single row will change, so it
+** must happen before OE_Replace.  Technically, OE_Abort and OE_Rollback
+** could happen in any order, but they are grouped up front for
+** convenience.
+**
+** 2018-08-14: Ticket https://www.sqlite.org/src/info/908f001483982c43
+** The order of constraints used to have OE_Update as (2) and OE_Abort
+** and so forth as (1). But apparently PostgreSQL checks the OE_Update
+** constraint before any others, so it had to be moved.
+**
+** Constraint checking code is generated in this order:
+**   (A)  The rowid constraint
+**   (B)  Unique index constraints that do not have OE_Replace as their
+**        default conflict resolution strategy
+**   (C)  Unique index that do use OE_Replace by default.
+**
+** The ordering of (2) and (3) is accomplished by making sure the linked
+** list of indexes attached to a table puts all OE_Replace indexes last
+** in the list.  See sqlite3CreateIndex() for where that happens.
+*/
+
 /// A ConflictTarget is extracted from each ON CONFLICT target,
 // e.g. INSERT INTO x(a) ON CONFLICT  *(a COLLATE nocase)*
 #[derive(Debug, Clone)]

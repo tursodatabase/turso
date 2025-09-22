@@ -364,7 +364,6 @@ pub fn translate_insert(
     // (idx name, root_page, idx cursor id)
     let idx_cursors = schema
         .get_indices(table_name.as_str())
-        .iter()
         .map(|idx| {
             (
                 &idx.name,

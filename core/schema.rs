@@ -27,7 +27,7 @@ use crate::{
 };
 use crate::{util::normalize_ident, Result};
 use core::fmt;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -64,7 +64,7 @@ pub struct Schema {
     pub views: ViewsMap,
 
     /// table_name to list of indexes for the table
-    pub indexes: HashMap<String, Vec<Arc<Index>>>,
+    pub indexes: HashMap<String, VecDeque<Arc<Index>>>,
     pub has_indexes: std::collections::HashSet<String>,
     pub indexes_enabled: bool,
     pub schema_version: u32,
@@ -77,7 +77,7 @@ impl Schema {
     pub fn new(indexes_enabled: bool) -> Self {
         let mut tables: HashMap<String, Arc<Table>> = HashMap::new();
         let has_indexes = std::collections::HashSet::new();
-        let indexes: HashMap<String, Vec<Arc<Index>>> = HashMap::new();
+        let indexes: HashMap<String, VecDeque<Arc<Index>>> = HashMap::new();
         #[allow(clippy::arc_with_non_send_sync)]
         tables.insert(
             SCHEMA_TABLE_NAME.to_string(),
@@ -244,17 +244,23 @@ impl Schema {
 
     pub fn add_index(&mut self, index: Arc<Index>) {
         let table_name = normalize_ident(&index.table_name);
+        // We must add the new index to the front of the deque, because SQLite stores index definitions as a linked list
+        // where the newest parsed index entry is at the head of list. If we would add it to the back of a regular Vec for example,
+        // then we would evaluate ON CONFLICT DO UPDATE clauses in the wrong index iteration order and UPDATE the wrong row. One might
+        // argue that this is an implementation detail and we should not care about this, but it makes e.g. the fuzz test 'partial_index_mutation_and_upsert_fuzz'
+        // fail, so let's just be compatible.
         self.indexes
             .entry(table_name)
             .or_default()
-            .push(index.clone())
+            .push_front(index.clone())
     }
 
-    pub fn get_indices(&self, table_name: &str) -> &[Arc<Index>] {
+    pub fn get_indices(&self, table_name: &str) -> impl Iterator<Item = &Arc<Index>> {
         let name = normalize_ident(table_name);
         self.indexes
             .get(&name)
-            .map_or_else(|| &[] as &[Arc<Index>], |v| v.as_slice())
+            .map(|v| v.iter())
+            .unwrap_or_default()
     }
 
     pub fn get_index(&self, table_name: &str, index_name: &str) -> Option<&Arc<Index>> {
