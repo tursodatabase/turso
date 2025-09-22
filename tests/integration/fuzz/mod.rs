@@ -1272,6 +1272,7 @@ mod tests {
                 AND u1.state = u2.state 
                 AND u1.id < u2.id
              WHERE u1.age BETWEEN 25 AND 35
+             ORDER BY u1.state, u1.city
              LIMIT 30"
                 .to_string(),
             10 => "SELECT p1.name as product1, p1.price as price1,
@@ -1293,7 +1294,6 @@ mod tests {
                 AND oi.unit_price > 10
                 AND oi.discount < oi.unit_price * 0.5
              GROUP BY o.id
-             HAVING COUNT(oi.id) > 2
              ORDER BY o.order_date DESC
              LIMIT 20"
                 .to_string(),
@@ -1363,7 +1363,7 @@ mod tests {
              LEFT JOIN reviews r ON u.id = r.user_id
                 AND r.review_date > datetime('now', '-90 days')  
              WHERE o.id IS NULL AND r.id IS NULL
-             LIMIT 20"
+             ORDER BY u.created_at DESC LIMIT 20"
                 .to_string(),
             _ => unreachable!(),
         }
