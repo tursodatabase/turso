@@ -2174,9 +2174,13 @@ impl Connection {
     /// 5. Step through query -> returns Busy -> return Busy to user
     ///
     /// This slight api change demonstrated a better throughtput in `perf/throughput/turso` benchmark
-    pub fn busy_timeout(&self, mut duration: Option<std::time::Duration>) {
+    pub fn set_busy_timeout(&self, mut duration: Option<std::time::Duration>) {
         duration = duration.filter(|duration| !duration.is_zero());
         self.busy_timeout.set(duration);
+    }
+
+    pub fn get_busy_timeout(&self) -> Option<std::time::Duration> {
+        self.busy_timeout.get()
     }
 }
 

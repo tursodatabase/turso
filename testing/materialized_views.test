@@ -44,13 +44,13 @@ do_execsql_test_on_specific_db {:memory:} matview-aggregation-population {
 do_execsql_test_on_specific_db {:memory:} matview-filter-with-groupby {
     CREATE TABLE t(a INTEGER, b INTEGER);
     INSERT INTO t(a,b) VALUES (2,2), (3,3), (6,6), (7,7);
-    
+
     CREATE MATERIALIZED VIEW v AS 
         SELECT b as yourb, SUM(a) as mysum, COUNT(a) as mycount 
         FROM t 
         WHERE b > 2 
         GROUP BY b;
-    
+
     SELECT * FROM v ORDER BY yourb;
 } {3|3|1
 6|6|1
@@ -63,13 +63,13 @@ do_execsql_test_on_specific_db {:memory:} matview-insert-maintenance {
         FROM t 
         WHERE b > 2 
         GROUP BY b;
-    
+
     INSERT INTO t VALUES (3,3), (6,6);
     SELECT * FROM v ORDER BY b;
-    
+
     INSERT INTO t VALUES (4,3), (5,6);
     SELECT * FROM v ORDER BY b;
-    
+
     INSERT INTO t VALUES (1,1), (2,2);
     SELECT * FROM v ORDER BY b;
 } {3|3|1
@@ -87,17 +87,17 @@ do_execsql_test_on_specific_db {:memory:} matview-delete-maintenance {
         (3, 'A', 30),
         (4, 'B', 40),
         (5, 'A', 50);
-    
+
     CREATE MATERIALIZED VIEW category_sums AS
         SELECT category, SUM(amount) as total, COUNT(*) as cnt
         FROM items
         GROUP BY category;
-    
+
     SELECT * FROM category_sums ORDER BY category;
-    
+
     DELETE FROM items WHERE id = 3;
     SELECT * FROM category_sums ORDER BY category;
-    
+
     DELETE FROM items WHERE category = 'B';
     SELECT * FROM category_sums ORDER BY category;
 } {A|90|3
@@ -113,17 +113,17 @@ do_execsql_test_on_specific_db {:memory:} matview-update-maintenance {
         (2, 200, 2),
         (3, 300, 1),
         (4, 400, 2);
-    
+
     CREATE MATERIALIZED VIEW status_totals AS
         SELECT status, SUM(value) as total, COUNT(*) as cnt
         FROM records
         GROUP BY status;
-    
+
     SELECT * FROM status_totals ORDER BY status;
-    
+
     UPDATE records SET value = 150 WHERE id = 1;
     SELECT * FROM status_totals ORDER BY status;
-    
+
     UPDATE records SET status = 2 WHERE id = 3;
     SELECT * FROM status_totals ORDER BY status;
 } {1|400|2
@@ -136,10 +136,10 @@ do_execsql_test_on_specific_db {:memory:} matview-update-maintenance {
 do_execsql_test_on_specific_db {:memory:} matview-integer-primary-key-basic {
     CREATE TABLE t(a INTEGER PRIMARY KEY, b INTEGER);
     INSERT INTO t(a,b) VALUES (2,2), (3,3), (6,6), (7,7);
-    
+
     CREATE MATERIALIZED VIEW v AS 
         SELECT * FROM t WHERE b > 2;
-    
+
     SELECT * FROM v ORDER BY a;
 } {3|3
 6|6
@@ -148,15 +148,15 @@ do_execsql_test_on_specific_db {:memory:} matview-integer-primary-key-basic {
 do_execsql_test_on_specific_db {:memory:} matview-integer-primary-key-update-rowid {
     CREATE TABLE t(a INTEGER PRIMARY KEY, b INTEGER);
     INSERT INTO t(a,b) VALUES (2,2), (3,3), (6,6), (7,7);
-    
+
     CREATE MATERIALIZED VIEW v AS 
         SELECT * FROM t WHERE b > 2;
-    
+
     SELECT * FROM v ORDER BY a;
-    
+
     UPDATE t SET a = 1 WHERE b = 3;
     SELECT * FROM v ORDER BY a;
-    
+
     UPDATE t SET a = 10 WHERE a = 6;
     SELECT * FROM v ORDER BY a;
 } {3|3
@@ -172,15 +172,15 @@ do_execsql_test_on_specific_db {:memory:} matview-integer-primary-key-update-row
 do_execsql_test_on_specific_db {:memory:} matview-integer-primary-key-update-value {
     CREATE TABLE t(a INTEGER PRIMARY KEY, b INTEGER);
     INSERT INTO t(a,b) VALUES (2,2), (3,3), (6,6), (7,7);
-    
+
     CREATE MATERIALIZED VIEW v AS 
         SELECT * FROM t WHERE b > 2;
-    
+
     SELECT * FROM v ORDER BY a;
-    
+
     UPDATE t SET b = 1 WHERE a = 6;
     SELECT * FROM v ORDER BY a;
-    
+
     UPDATE t SET b = 5 WHERE a = 2;
     SELECT * FROM v ORDER BY a;
 } {3|3
@@ -200,18 +200,18 @@ do_execsql_test_on_specific_db {:memory:} matview-integer-primary-key-with-aggre
         (3, 20, 300),
         (4, 20, 400),
         (5, 10, 500);
-    
+
     CREATE MATERIALIZED VIEW v AS
         SELECT b, SUM(c) as total, COUNT(*) as cnt
         FROM t
         WHERE a > 2
         GROUP BY b;
-    
+
     SELECT * FROM v ORDER BY b;
-    
+
     UPDATE t SET a = 6 WHERE a = 1;
     SELECT * FROM v ORDER BY b;
-    
+
     DELETE FROM t WHERE a = 3;
     SELECT * FROM v ORDER BY b;
 } {10|500|1
@@ -228,7 +228,7 @@ do_execsql_test_on_specific_db {:memory:} matview-complex-filter-aggregation {
         amount INTEGER,
         type INTEGER
     );
-    
+
     INSERT INTO transactions VALUES
         (1, 100, 50, 1),
         (2, 100, 30, 2),
@@ -236,21 +236,21 @@ do_execsql_test_on_specific_db {:memory:} matview-complex-filter-aggregation {
         (4, 100, 20, 1),
         (5, 200, 40, 2),
         (6, 300, 60, 1);
-    
+
     CREATE MATERIALIZED VIEW account_deposits AS
         SELECT account, SUM(amount) as total_deposits, COUNT(*) as deposit_count
         FROM transactions
         WHERE type = 1
         GROUP BY account;
-    
+
     SELECT * FROM account_deposits ORDER BY account;
-    
+
     INSERT INTO transactions VALUES (7, 100, 25, 1);
     SELECT * FROM account_deposits ORDER BY account;
-    
+
     UPDATE transactions SET amount = 80 WHERE id = 1;
     SELECT * FROM account_deposits ORDER BY account;
-    
+
     DELETE FROM transactions WHERE id = 3;
     SELECT * FROM account_deposits ORDER BY account;
 } {100|70|2
@@ -273,19 +273,19 @@ do_execsql_test_on_specific_db {:memory:} matview-sum-count-only {
         (3, 30, 2),
         (4, 40, 2),
         (5, 50, 1);
-    
+
     CREATE MATERIALIZED VIEW category_stats AS
         SELECT category,
                SUM(value) as sum_val,
                COUNT(*) as cnt
         FROM data
         GROUP BY category;
-    
+
     SELECT * FROM category_stats ORDER BY category;
-    
+
     INSERT INTO data VALUES (6, 5, 1);
     SELECT * FROM category_stats ORDER BY category;
-    
+
     UPDATE data SET value = 35 WHERE id = 3;
     SELECT * FROM category_stats ORDER BY category;
 } {1|80|3
@@ -302,9 +302,9 @@ do_execsql_test_on_specific_db {:memory:} matview-empty-table-population {
         FROM t
         WHERE b > 5
         GROUP BY b;
-    
+
     SELECT COUNT(*) FROM v;
-    
+
     INSERT INTO t VALUES (1, 3), (2, 7), (3, 9);
     SELECT * FROM v ORDER BY b;
 } {0
@@ -314,15 +314,15 @@ do_execsql_test_on_specific_db {:memory:} matview-empty-table-population {
 do_execsql_test_on_specific_db {:memory:} matview-all-rows-filtered {
     CREATE TABLE t(a INTEGER, b INTEGER);
     INSERT INTO t VALUES (1, 1), (2, 2), (3, 3);
-    
+
     CREATE MATERIALIZED VIEW v AS
         SELECT * FROM t WHERE b > 10;
-    
+
     SELECT COUNT(*) FROM v;
-    
+
     INSERT INTO t VALUES (11, 11);
     SELECT * FROM v;
-    
+
     UPDATE t SET b = 1 WHERE a = 11;
     SELECT COUNT(*) FROM v;
 } {0
@@ -335,26 +335,26 @@ do_execsql_test_on_specific_db {:memory:} matview-mixed-operations-sequence {
         customer_id INTEGER,
         amount INTEGER
     );
-    
+
     INSERT INTO orders VALUES (1, 100, 50);
     INSERT INTO orders VALUES (2, 200, 75);
-    
+
     CREATE MATERIALIZED VIEW customer_totals AS
         SELECT customer_id, SUM(amount) as total, COUNT(*) as order_count
         FROM orders
         GROUP BY customer_id;
-    
+
     SELECT * FROM customer_totals ORDER BY customer_id;
-    
+
     INSERT INTO orders VALUES (3, 100, 25);
     SELECT * FROM customer_totals ORDER BY customer_id;
-    
+
     UPDATE orders SET amount = 100 WHERE order_id = 2;
     SELECT * FROM customer_totals ORDER BY customer_id;
-    
+
     DELETE FROM orders WHERE order_id = 1;
     SELECT * FROM customer_totals ORDER BY customer_id;
-    
+
     INSERT INTO orders VALUES (4, 300, 150);
     SELECT * FROM customer_totals ORDER BY customer_id;
 } {100|50|1
@@ -389,17 +389,17 @@ do_execsql_test_on_specific_db {:memory:} matview-projections {
 do_execsql_test_on_specific_db {:memory:} matview-rollback-insert {
     CREATE TABLE t(a INTEGER, b INTEGER);
     INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);
-   
+
     CREATE MATERIALIZED VIEW v AS
         SELECT * FROM t WHERE b > 15;
-   
+
     SELECT * FROM v ORDER BY a;
-   
+
     BEGIN;
     INSERT INTO t VALUES (4, 40), (5, 50);
     SELECT * FROM v ORDER BY a;
     ROLLBACK;
-   
+
     SELECT * FROM v ORDER BY a;
 } {2|20
 3|30
@@ -413,17 +413,17 @@ do_execsql_test_on_specific_db {:memory:} matview-rollback-insert {
 do_execsql_test_on_specific_db {:memory:} matview-rollback-delete {
     CREATE TABLE t(a INTEGER, b INTEGER);
     INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40);
-   
+
     CREATE MATERIALIZED VIEW v AS
         SELECT * FROM t WHERE b > 15;
-   
+
     SELECT * FROM v ORDER BY a;
-   
+
     BEGIN;
     DELETE FROM t WHERE a IN (2, 3);
     SELECT * FROM v ORDER BY a;
     ROLLBACK;
-   
+
     SELECT * FROM v ORDER BY a;
 } {2|20
 3|30
@@ -436,18 +436,18 @@ do_execsql_test_on_specific_db {:memory:} matview-rollback-delete {
 do_execsql_test_on_specific_db {:memory:} matview-rollback-update {
     CREATE TABLE t(a INTEGER, b INTEGER);
     INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);
-   
+
     CREATE MATERIALIZED VIEW v AS
         SELECT * FROM t WHERE b > 15;
-   
+
     SELECT * FROM v ORDER BY a;
-   
+
     BEGIN;
     UPDATE t SET b = 5 WHERE a = 2;
     UPDATE t SET b = 35 WHERE a = 1;
     SELECT * FROM v ORDER BY a;
     ROLLBACK;
-   
+
     SELECT * FROM v ORDER BY a;
 } {2|20
 3|30
@@ -459,19 +459,19 @@ do_execsql_test_on_specific_db {:memory:} matview-rollback-update {
 do_execsql_test_on_specific_db {:memory:} matview-rollback-aggregation {
     CREATE TABLE sales(product_id INTEGER, amount INTEGER);
     INSERT INTO sales VALUES (1, 100), (1, 200), (2, 150), (2, 250);
-   
+
     CREATE MATERIALIZED VIEW product_totals AS
         SELECT product_id, SUM(amount) as total, COUNT(*) as cnt
         FROM sales
         GROUP BY product_id;
-   
+
     SELECT * FROM product_totals ORDER BY product_id;
-   
+
     BEGIN;
     INSERT INTO sales VALUES (1, 50), (3, 300);
     SELECT * FROM product_totals ORDER BY product_id;
     ROLLBACK;
-   
+
     SELECT * FROM product_totals ORDER BY product_id;
 } {1|300|2
 2|400|2
@@ -484,21 +484,21 @@ do_execsql_test_on_specific_db {:memory:} matview-rollback-aggregation {
 do_execsql_test_on_specific_db {:memory:} matview-rollback-mixed-operations {
     CREATE TABLE orders(id INTEGER PRIMARY KEY, customer INTEGER, amount INTEGER);
     INSERT INTO orders VALUES (1, 100, 50), (2, 200, 75), (3, 100, 25);
-   
+
     CREATE MATERIALIZED VIEW customer_totals AS
         SELECT customer, SUM(amount) as total, COUNT(*) as cnt
         FROM orders
         GROUP BY customer;
-   
+
     SELECT * FROM customer_totals ORDER BY customer;
-   
+
     BEGIN;
     INSERT INTO orders VALUES (4, 100, 100);
     UPDATE orders SET amount = 150 WHERE id = 2;
     DELETE FROM orders WHERE id = 3;
     SELECT * FROM customer_totals ORDER BY customer;
     ROLLBACK;
-   
+
     SELECT * FROM customer_totals ORDER BY customer;
 } {100|75|2
 200|75|1
@@ -514,22 +514,22 @@ do_execsql_test_on_specific_db {:memory:} matview-rollback-filtered-aggregation 
         (2, 100, 30, 'withdraw'),
         (3, 200, 100, 'deposit'),
         (4, 200, 40, 'withdraw');
-   
+
     CREATE MATERIALIZED VIEW deposits AS
         SELECT account, SUM(amount) as total_deposits, COUNT(*) as cnt
         FROM transactions
         WHERE type = 'deposit'
         GROUP BY account;
-   
+
     SELECT * FROM deposits ORDER BY account;
-   
+
     BEGIN;
     INSERT INTO transactions VALUES (5, 100, 75, 'deposit');
     UPDATE transactions SET amount = 60 WHERE id = 1;
     DELETE FROM transactions WHERE id = 3;
     SELECT * FROM deposits ORDER BY account;
     ROLLBACK;
-   
+
     SELECT * FROM deposits ORDER BY account;
 } {100|50|1
 200|100|1
@@ -540,12 +540,12 @@ do_execsql_test_on_specific_db {:memory:} matview-rollback-filtered-aggregation 
 do_execsql_test_on_specific_db {:memory:} matview-rollback-empty-view {
     CREATE TABLE t(a INTEGER, b INTEGER);
     INSERT INTO t VALUES (1, 5), (2, 8);
-   
+
     CREATE MATERIALIZED VIEW v AS
         SELECT * FROM t WHERE b > 10;
-   
+
     SELECT COUNT(*) FROM v;
-   
+
     BEGIN;
     INSERT INTO t VALUES (3, 15), (4, 20);
     SELECT * FROM v ORDER BY a;
@@ -556,3 +556,538 @@ do_execsql_test_on_specific_db {:memory:} matview-rollback-empty-view {
 3|15
 4|20
 0}
+
+# Join tests for materialized views
+
+do_execsql_test_on_specific_db {:memory:} matview-simple-join {
+    CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT, age INTEGER);
+    CREATE TABLE orders(order_id INTEGER PRIMARY KEY, user_id INTEGER, product_id INTEGER, quantity INTEGER);
+
+    INSERT INTO users VALUES (1, 'Alice', 25), (2, 'Bob', 30), (3, 'Charlie', 35);
+    INSERT INTO orders VALUES (1, 1, 100, 5), (2, 1, 101, 3), (3, 2, 100, 7);
+
+    CREATE MATERIALIZED VIEW user_orders AS
+        SELECT u.name, o.quantity
+        FROM users u
+        JOIN orders o ON u.id = o.user_id;
+
+    SELECT * FROM user_orders ORDER BY name, quantity;
+} {Alice|3
+Alice|5
+Bob|7}
+
+do_execsql_test_on_specific_db {:memory:} matview-join-with-aggregation {
+    CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE orders(order_id INTEGER PRIMARY KEY, user_id INTEGER, amount INTEGER);
+
+    INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob');
+    INSERT INTO orders VALUES (1, 1, 100), (2, 1, 150), (3, 2, 200), (4, 2, 50);
+
+    CREATE MATERIALIZED VIEW user_totals AS
+        SELECT u.name, SUM(o.amount) as total_amount
+        FROM users u
+        JOIN orders o ON u.id = o.user_id
+        GROUP BY u.name;
+
+    SELECT * FROM user_totals ORDER BY name;
+} {Alice|250
+Bob|250}
+
+do_execsql_test_on_specific_db {:memory:} matview-three-way-join {
+    CREATE TABLE customers(id INTEGER PRIMARY KEY, name TEXT, city TEXT);
+    CREATE TABLE orders(id INTEGER PRIMARY KEY, customer_id INTEGER, product_id INTEGER, quantity INTEGER);
+    CREATE TABLE products(id INTEGER PRIMARY KEY, name TEXT, price INTEGER);
+
+    INSERT INTO customers VALUES (1, 'Alice', 'NYC'), (2, 'Bob', 'LA');
+    INSERT INTO products VALUES (1, 'Widget', 10), (2, 'Gadget', 20);
+    INSERT INTO orders VALUES (1, 1, 1, 5), (2, 1, 2, 3), (3, 2, 1, 2);
+
+    CREATE MATERIALIZED VIEW sales_summary AS
+        SELECT c.name as customer_name, p.name as product_name, o.quantity
+        FROM customers c
+        JOIN orders o ON c.id = o.customer_id
+        JOIN products p ON o.product_id = p.id;
+
+    SELECT * FROM sales_summary ORDER BY customer_name, product_name;
+} {Alice|Gadget|3
+Alice|Widget|5
+Bob|Widget|2}
+
+do_execsql_test_on_specific_db {:memory:} matview-three-way-join-with-aggregation {
+    CREATE TABLE customers(id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE orders(id INTEGER PRIMARY KEY, customer_id INTEGER, product_id INTEGER, quantity INTEGER);
+    CREATE TABLE products(id INTEGER PRIMARY KEY, name TEXT, price INTEGER);
+
+    INSERT INTO customers VALUES (1, 'Alice'), (2, 'Bob');
+    INSERT INTO products VALUES (1, 'Widget', 10), (2, 'Gadget', 20);
+    INSERT INTO orders VALUES (1, 1, 1, 5), (2, 1, 2, 3), (3, 2, 1, 2), (4, 1, 1, 4);
+
+    CREATE MATERIALIZED VIEW sales_totals AS
+        SELECT c.name as customer_name, p.name as product_name,
+               SUM(o.quantity) as total_quantity,
+               SUM(o.quantity * p.price) as total_value
+        FROM customers c
+        JOIN orders o ON c.id = o.customer_id
+        JOIN products p ON o.product_id = p.id
+        GROUP BY c.name, p.name;
+
+    SELECT * FROM sales_totals ORDER BY customer_name, product_name;
+} {Alice|Gadget|3|60
+Alice|Widget|9|90
+Bob|Widget|2|20}
+
+do_execsql_test_on_specific_db {:memory:} matview-join-incremental-insert {
+    CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE orders(order_id INTEGER PRIMARY KEY, user_id INTEGER, amount INTEGER);
+
+    INSERT INTO users VALUES (1, 'Alice');
+    INSERT INTO orders VALUES (1, 1, 100);
+
+    CREATE MATERIALIZED VIEW user_orders AS
+        SELECT u.name, o.amount
+        FROM users u
+        JOIN orders o ON u.id = o.user_id;
+
+    SELECT COUNT(*) FROM user_orders;
+
+    INSERT INTO orders VALUES (2, 1, 150);
+    SELECT COUNT(*) FROM user_orders;
+
+    INSERT INTO users VALUES (2, 'Bob');
+    INSERT INTO orders VALUES (3, 2, 200);
+    SELECT COUNT(*) FROM user_orders;
+} {1
+2
+3}
+
+do_execsql_test_on_specific_db {:memory:} matview-join-incremental-delete {
+    CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE orders(order_id INTEGER PRIMARY KEY, user_id INTEGER, amount INTEGER);
+
+    INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob');
+    INSERT INTO orders VALUES (1, 1, 100), (2, 1, 150), (3, 2, 200);
+
+    CREATE MATERIALIZED VIEW user_orders AS
+        SELECT u.name, o.amount
+        FROM users u
+        JOIN orders o ON u.id = o.user_id;
+
+    SELECT COUNT(*) FROM user_orders;
+
+    DELETE FROM orders WHERE order_id = 2;
+    SELECT COUNT(*) FROM user_orders;
+
+    DELETE FROM users WHERE id = 2;
+    SELECT COUNT(*) FROM user_orders;
+} {3
+2
+1}
+
+do_execsql_test_on_specific_db {:memory:} matview-join-incremental-update {
+    CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE orders(order_id INTEGER PRIMARY KEY, user_id INTEGER, amount INTEGER);
+
+    INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob');
+    INSERT INTO orders VALUES (1, 1, 100), (2, 2, 200);
+
+    CREATE MATERIALIZED VIEW user_orders AS
+        SELECT u.name, o.amount
+        FROM users u
+        JOIN orders o ON u.id = o.user_id;
+
+    SELECT * FROM user_orders ORDER BY name;
+
+    UPDATE orders SET amount = 150 WHERE order_id = 1;
+    SELECT * FROM user_orders ORDER BY name;
+
+    UPDATE users SET name = 'Robert' WHERE id = 2;
+    SELECT * FROM user_orders ORDER BY name;
+} {Alice|100
+Bob|200
+Alice|150
+Bob|200
+Alice|150
+Robert|200}
+
+do_execsql_test_on_specific_db {:memory:} matview-join-with-filter {
+    CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT, age INTEGER);
+    CREATE TABLE orders(order_id INTEGER PRIMARY KEY, user_id INTEGER, amount INTEGER);
+
+    INSERT INTO users VALUES (1, 'Alice', 25), (2, 'Bob', 35), (3, 'Charlie', 20);
+    INSERT INTO orders VALUES (1, 1, 100), (2, 2, 200), (3, 3, 150);
+
+    CREATE MATERIALIZED VIEW adult_orders AS
+        SELECT u.name, o.amount
+        FROM users u
+        JOIN orders o ON u.id = o.user_id
+        WHERE u.age > 21;
+
+    SELECT * FROM adult_orders ORDER BY name;
+} {Alice|100
+Bob|200}
+
+do_execsql_test_on_specific_db {:memory:} matview-join-rollback {
+    CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE orders(order_id INTEGER PRIMARY KEY, user_id INTEGER, amount INTEGER);
+
+    INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob');
+    INSERT INTO orders VALUES (1, 1, 100), (2, 2, 200);
+
+    CREATE MATERIALIZED VIEW user_orders AS
+        SELECT u.name, o.amount
+        FROM users u
+        JOIN orders o ON u.id = o.user_id;
+
+    SELECT COUNT(*) FROM user_orders;
+
+    BEGIN;
+    INSERT INTO users VALUES (3, 'Charlie');
+    INSERT INTO orders VALUES (3, 3, 300);
+    SELECT COUNT(*) FROM user_orders;
+    ROLLBACK;
+
+    SELECT COUNT(*) FROM user_orders;
+} {2
+3
+2}
+
+# ===== COMPREHENSIVE JOIN TESTS =====
+
+# Test 1: Join with filter BEFORE the join (on base tables)
+do_execsql_test_on_specific_db {:memory:} matview-join-with-pre-filter {
+    CREATE TABLE employees(id INTEGER PRIMARY KEY, name TEXT, department TEXT, salary INTEGER);
+    CREATE TABLE departments(id INTEGER PRIMARY KEY, dept_name TEXT, budget INTEGER);
+
+    INSERT INTO employees VALUES
+        (1, 'Alice', 'Engineering', 80000),
+        (2, 'Bob', 'Engineering', 90000),
+        (3, 'Charlie', 'Sales', 60000),
+        (4, 'David', 'Sales', 65000),
+        (5, 'Eve', 'HR', 70000);
+
+    INSERT INTO departments VALUES
+        (1, 'Engineering', 500000),
+        (2, 'Sales', 300000),
+        (3, 'HR', 200000);
+
+    -- View: Join only high-salary employees with their departments
+    CREATE MATERIALIZED VIEW high_earners_by_dept AS
+        SELECT e.name, e.salary, d.dept_name, d.budget
+        FROM employees e
+        JOIN departments d ON e.department = d.dept_name
+        WHERE e.salary > 70000;
+
+    SELECT * FROM high_earners_by_dept ORDER BY salary DESC;
+} {Bob|90000|Engineering|500000
+Alice|80000|Engineering|500000}
+
+# Test 2: Join with filter AFTER the join
+do_execsql_test_on_specific_db {:memory:} matview-join-with-post-filter {
+    CREATE TABLE products(id INTEGER PRIMARY KEY, name TEXT, category_id INTEGER, price INTEGER);
+    CREATE TABLE categories(id INTEGER PRIMARY KEY, name TEXT, min_price INTEGER);
+
+    INSERT INTO products VALUES
+        (1, 'Laptop', 1, 1200),
+        (2, 'Mouse', 1, 25),
+        (3, 'Shirt', 2, 50),
+        (4, 'Shoes', 2, 120);
+
+    INSERT INTO categories VALUES
+        (1, 'Electronics', 100),
+        (2, 'Clothing', 30);
+
+    -- View: Products that meet or exceed their category's minimum price
+    CREATE MATERIALIZED VIEW premium_products AS
+        SELECT p.name as product, c.name as category, p.price, c.min_price
+        FROM products p
+        JOIN categories c ON p.category_id = c.id
+        WHERE p.price >= c.min_price;
+
+    SELECT * FROM premium_products ORDER BY price DESC;
+} {Laptop|Electronics|1200|100
+Shoes|Clothing|120|30
+Shirt|Clothing|50|30}
+
+# Test 3: Join with aggregation BEFORE the join
+do_execsql_test_on_specific_db {:memory:} matview-aggregation-before-join {
+    CREATE TABLE orders(id INTEGER PRIMARY KEY, customer_id INTEGER, product_id INTEGER, quantity INTEGER, order_date INTEGER);
+    CREATE TABLE customers(id INTEGER PRIMARY KEY, name TEXT, tier TEXT);
+
+    INSERT INTO orders VALUES
+        (1, 1, 101, 2, 1),
+        (2, 1, 102, 1, 1),
+        (3, 2, 101, 5, 1),
+        (4, 1, 101, 3, 2),
+        (5, 2, 103, 2, 2),
+        (6, 3, 102, 1, 2);
+
+    INSERT INTO customers VALUES
+        (1, 'Alice', 'Gold'),
+        (2, 'Bob', 'Silver'),
+        (3, 'Charlie', 'Bronze');
+
+    -- View: Customer order counts joined with customer details
+    -- Note: Simplified to avoid subquery issues with DBSP compiler
+    CREATE MATERIALIZED VIEW customer_order_summary AS
+        SELECT c.name, c.tier, COUNT(o.id) as order_count, SUM(o.quantity) as total_quantity
+        FROM customers c
+        JOIN orders o ON c.id = o.customer_id
+        GROUP BY c.id, c.name, c.tier;
+
+    SELECT * FROM customer_order_summary ORDER BY total_quantity DESC;
+} {Bob|Silver|2|7
+Alice|Gold|3|6
+Charlie|Bronze|1|1}
+
+# Test 4: Join with aggregation AFTER the join
+do_execsql_test_on_specific_db {:memory:} matview-aggregation-after-join {
+    CREATE TABLE sales(id INTEGER PRIMARY KEY, product_id INTEGER, store_id INTEGER, units_sold INTEGER, revenue INTEGER);
+    CREATE TABLE stores(id INTEGER PRIMARY KEY, name TEXT, region TEXT);
+
+    INSERT INTO sales VALUES
+        (1, 1, 1, 10, 1000),
+        (2, 1, 2, 15, 1500),
+        (3, 2, 1, 5, 250),
+        (4, 2, 2, 8, 400),
+        (5, 1, 3, 12, 1200),
+        (6, 2, 3, 6, 300);
+
+    INSERT INTO stores VALUES
+        (1, 'StoreA', 'North'),
+        (2, 'StoreB', 'North'),
+        (3, 'StoreC', 'South');
+
+    -- View: Regional sales summary (aggregate after joining)
+    CREATE MATERIALIZED VIEW regional_sales AS
+        SELECT st.region, SUM(s.units_sold) as total_units, SUM(s.revenue) as total_revenue
+        FROM sales s
+        JOIN stores st ON s.store_id = st.id
+        GROUP BY st.region;
+
+    SELECT * FROM regional_sales ORDER BY total_revenue DESC;
+} {North|38|3150
+South|18|1500}
+
+# Test 5: Modifying both tables in same transaction
+do_execsql_test_on_specific_db {:memory:} matview-join-both-tables-modified {
+    CREATE TABLE authors(id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE books(id INTEGER PRIMARY KEY, title TEXT, author_id INTEGER, year INTEGER);
+
+    INSERT INTO authors VALUES (1, 'Orwell'), (2, 'Asimov');
+    INSERT INTO books VALUES (1, '1984', 1, 1949), (2, 'Foundation', 2, 1951);
+
+    CREATE MATERIALIZED VIEW author_books AS
+        SELECT a.name, b.title, b.year
+        FROM authors a
+        JOIN books b ON a.id = b.author_id;
+
+    SELECT COUNT(*) FROM author_books;
+
+    BEGIN;
+    INSERT INTO authors VALUES (3, 'Herbert');
+    INSERT INTO books VALUES (3, 'Dune', 3, 1965);
+    SELECT COUNT(*) FROM author_books;
+    COMMIT;
+
+    SELECT * FROM author_books ORDER BY year;
+} {2
+3
+Orwell|1984|1949
+Asimov|Foundation|1951
+Herbert|Dune|1965}
+
+# Test 6: Modifying only one table in transaction
+do_execsql_test_on_specific_db {:memory:} matview-join-single-table-modified {
+    CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT, active INTEGER);
+    CREATE TABLE posts(id INTEGER PRIMARY KEY, user_id INTEGER, content TEXT);
+
+    INSERT INTO users VALUES (1, 'Alice', 1), (2, 'Bob', 1), (3, 'Charlie', 0);
+    INSERT INTO posts VALUES (1, 1, 'Hello'), (2, 1, 'World'), (3, 2, 'Test');
+
+    CREATE MATERIALIZED VIEW active_user_posts AS
+        SELECT u.name, p.content
+        FROM users u
+        JOIN posts p ON u.id = p.user_id
+        WHERE u.active = 1;
+
+    SELECT COUNT(*) FROM active_user_posts;
+
+    -- Add posts for existing user (modify only posts table)
+    BEGIN;
+    INSERT INTO posts VALUES (4, 1, 'NewPost'), (5, 2, 'Another');
+    SELECT COUNT(*) FROM active_user_posts;
+    COMMIT;
+
+    SELECT * FROM active_user_posts ORDER BY name, content;
+} {3
+5
+Alice|Hello
+Alice|NewPost
+Alice|World
+Bob|Another
+Bob|Test}
+
+
+do_execsql_test_on_specific_db {:memory:} matview-three-way-incremental {
+    CREATE TABLE students(id INTEGER PRIMARY KEY, name TEXT, major TEXT);
+    CREATE TABLE courses(id INTEGER PRIMARY KEY, name TEXT, department TEXT, credits INTEGER);
+    CREATE TABLE enrollments(student_id INTEGER, course_id INTEGER, grade TEXT, PRIMARY KEY(student_id, course_id));
+
+    INSERT INTO students VALUES (1, 'Alice', 'CS'), (2, 'Bob', 'Math');
+    INSERT INTO courses VALUES (1, 'DatabaseSystems', 'CS', 3), (2, 'Calculus', 'Math', 4);
+    INSERT INTO enrollments VALUES (1, 1, 'A'), (2, 2, 'B');
+
+    CREATE MATERIALIZED VIEW student_transcripts AS
+        SELECT s.name as student, c.name as course, c.credits, e.grade
+        FROM students s
+        JOIN enrollments e ON s.id = e.student_id
+        JOIN courses c ON e.course_id = c.id;
+
+    SELECT COUNT(*) FROM student_transcripts;
+
+    -- Add new student
+    INSERT INTO students VALUES (3, 'Charlie', 'CS');
+    SELECT COUNT(*) FROM student_transcripts;
+
+    -- Enroll new student
+    INSERT INTO enrollments VALUES (3, 1, 'A'), (3, 2, 'A');
+    SELECT COUNT(*) FROM student_transcripts;
+
+    -- Add new course
+    INSERT INTO courses VALUES (3, 'Algorithms', 'CS', 3);
+    SELECT COUNT(*) FROM student_transcripts;
+
+    -- Enroll existing students in new course
+    INSERT INTO enrollments VALUES (1, 3, 'B'), (3, 3, 'A');
+    SELECT COUNT(*) FROM student_transcripts;
+
+    SELECT * FROM student_transcripts ORDER BY student, course;
+} {2
+2
+4
+4
+6
+Alice|Algorithms|3|B
+Alice|DatabaseSystems|3|A
+Bob|Calculus|4|B
+Charlie|Algorithms|3|A
+Charlie|Calculus|4|A
+Charlie|DatabaseSystems|3|A}
+
+do_execsql_test_on_specific_db {:memory:} matview-self-join {
+    CREATE TABLE employees(id INTEGER PRIMARY KEY, name TEXT, manager_id INTEGER, salary INTEGER);
+
+    INSERT INTO employees VALUES
+        (1, 'CEO', NULL, 150000),
+        (2, 'VPSales', 1, 120000),
+        (3, 'VPEngineering', 1, 130000),
+        (4, 'Engineer1', 3, 90000),
+        (5, 'Engineer2', 3, 85000),
+        (6, 'SalesRep', 2, 70000);
+
+    CREATE MATERIALIZED VIEW org_chart AS
+        SELECT e.name as employee, m.name as manager, e.salary
+        FROM employees e
+        JOIN employees m ON e.manager_id = m.id;
+
+    SELECT * FROM org_chart ORDER BY salary DESC;
+} {VPEngineering|CEO|130000
+VPSales|CEO|120000
+Engineer1|VPEngineering|90000
+Engineer2|VPEngineering|85000
+SalesRep|VPSales|70000}
+
+do_execsql_test_on_specific_db {:memory:} matview-join-cascade-update {
+    CREATE TABLE categories(id INTEGER PRIMARY KEY, name TEXT, discount_rate INTEGER);
+    CREATE TABLE products(id INTEGER PRIMARY KEY, name TEXT, category_id INTEGER, base_price INTEGER);
+
+    INSERT INTO categories VALUES (1, 'Electronics', 10), (2, 'Books', 5);
+    INSERT INTO products VALUES
+        (1, 'Laptop', 1, 1000),
+        (2, 'Phone', 1, 500),
+        (3, 'Novel', 2, 20),
+        (4, 'Textbook', 2, 80);
+
+    CREATE MATERIALIZED VIEW discounted_prices AS
+        SELECT p.name as product, c.name as category,
+               p.base_price, c.discount_rate,
+               (p.base_price * (100 - c.discount_rate) / 100) as final_price
+        FROM products p
+        JOIN categories c ON p.category_id = c.id;
+
+    SELECT * FROM discounted_prices ORDER BY final_price DESC;
+
+    -- Update discount rate for Electronics
+    UPDATE categories SET discount_rate = 20 WHERE id = 1;
+
+    SELECT * FROM discounted_prices ORDER BY final_price DESC;
+} {Laptop|Electronics|1000|10|900
+Phone|Electronics|500|10|450
+Textbook|Books|80|5|76
+Novel|Books|20|5|19
+Laptop|Electronics|1000|20|800
+Phone|Electronics|500|20|400
+Textbook|Books|80|5|76
+Novel|Books|20|5|19}
+
+do_execsql_test_on_specific_db {:memory:} matview-join-delete-cascade {
+    CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT, active INTEGER);
+    CREATE TABLE sessions(id INTEGER PRIMARY KEY, user_id INTEGER, duration INTEGER);
+
+    INSERT INTO users VALUES (1, 'Alice', 1), (2, 'Bob', 1), (3, 'Charlie', 0);
+    INSERT INTO sessions VALUES
+        (1, 1, 30),
+        (2, 1, 45),
+        (3, 2, 60),
+        (4, 3, 15),
+        (5, 2, 90);
+
+    CREATE MATERIALIZED VIEW active_sessions AS
+        SELECT u.name, s.duration
+        FROM users u
+        JOIN sessions s ON u.id = s.user_id
+        WHERE u.active = 1;
+
+    SELECT COUNT(*) FROM active_sessions;
+
+    -- Delete Bob's sessions
+    DELETE FROM sessions WHERE user_id = 2;
+
+    SELECT COUNT(*) FROM active_sessions;
+    SELECT * FROM active_sessions ORDER BY name, duration;
+} {4
+2
+Alice|30
+Alice|45}
+
+do_execsql_test_on_specific_db {:memory:} matview-join-complex-where {
+    CREATE TABLE orders(id INTEGER PRIMARY KEY, customer_id INTEGER, product_id INTEGER, quantity INTEGER, price INTEGER, order_date INTEGER);
+    CREATE TABLE customers(id INTEGER PRIMARY KEY, name TEXT, tier TEXT, country TEXT);
+
+    INSERT INTO customers VALUES
+        (1, 'Alice', 'Gold', 'USA'),
+        (2, 'Bob', 'Silver', 'Canada'),
+        (3, 'Charlie', 'Gold', 'USA'),
+        (4, 'David', 'Bronze', 'UK');
+
+    INSERT INTO orders VALUES
+        (1, 1, 1, 5, 100, 20240101),
+        (2, 2, 2, 3, 50, 20240102),
+        (3, 3, 1, 10, 100, 20240103),
+        (4, 4, 3, 2, 75, 20240104),
+        (5, 1, 2, 4, 50, 20240105),
+        (6, 3, 3, 6, 75, 20240106);
+
+    -- View: Gold tier USA customers with high-value orders
+    CREATE MATERIALIZED VIEW premium_usa_orders AS
+        SELECT c.name, o.quantity, o.price, (o.quantity * o.price) as total
+        FROM customers c
+        JOIN orders o ON c.id = o.customer_id
+        WHERE c.tier = 'Gold'
+          AND c.country = 'USA'
+          AND (o.quantity * o.price) >= 400;
+
+    SELECT * FROM premium_usa_orders ORDER by total DESC;
+} {Charlie|10|100|1000
+Alice|5|100|500
+Charlie|6|75|450}

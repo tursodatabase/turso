@@ -32,8 +32,11 @@ members = [
     "whopper",
     "perf/throughput/turso",
     "perf/throughput/rusqlite",
+    "perf/encryption"
 ]
-exclude = ["perf/latency/limbo"]
+exclude = [
+    "perf/latency/limbo",
+]
 
 [workspace.package]
 version = "0.2.0-pre.3"

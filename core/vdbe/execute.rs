@@ -2276,16 +2276,8 @@ pub fn op_transaction_inner(
                         if matches!(new_transaction_state, TransactionState::Write { .. })
                             && matches!(actual_tx_mode, TransactionMode::Write)
                         {
-                            let (tx_id, mv_tx_mode) = program.connection.mv_tx.get().unwrap();
-                            if mv_tx_mode == TransactionMode::Read {
-                                return_if_io!(
-                                    mv_store.upgrade_to_exclusive_tx(pager.clone(), Some(tx_id))
-                                );
-                            } else {
-                                return_if_io!(
-                                    mv_store.begin_exclusive_tx(pager.clone(), Some(tx_id))
-                                );
-                            }
+                            let (tx_id, _) = program.connection.mv_tx.get().unwrap();
+                            return_if_io!(mv_store.begin_exclusive_tx(pager.clone(), Some(tx_id)));
                         }
                     }
                 } else {

@@ -440,11 +440,19 @@ impl EncryptionContext {
         };
         let metadata_size = self.cipher_mode.metadata_size();
         let reserved_bytes = &page[self.page_size - metadata_size..];
-        let reserved_bytes_zeroed = reserved_bytes.iter().all(|&b| b == 0);
-        assert!(
-            reserved_bytes_zeroed,
-            "last reserved bytes must be empty/zero, but found non-zero bytes"
-        );
+
+        #[cfg(debug_assertions)]
+        {
+            use crate::turso_assert;
+            // In debug builds, ensure that the reserved bytes are zeroed out. So even when we are
+            // reusing a page from buffer pool, we zero out in debug build so that we can be
+            // sure that b tree layer is not writing any data into the reserved space.
+            let reserved_bytes_zeroed = reserved_bytes.iter().all(|&b| b == 0);
+            turso_assert!(
+                reserved_bytes_zeroed,
+                "last reserved bytes must be empty/zero, but found non-zero bytes"
+            );
+        }
 
         let payload = &page[encryption_start_offset..self.page_size - metadata_size];
         let (encrypted, nonce) = self.encrypt_raw(payload)?;

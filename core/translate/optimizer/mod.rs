@@ -8,15 +8,13 @@ use join::{compute_best_join_order, BestJoinOrderResult};
 use lift_common_subexpressions::lift_common_subexpressions_from_binary_or_terms;
 use order::{compute_order_target, plan_satisfies_order_target, EliminatesSortBy};
 use turso_ext::{ConstraintInfo, ConstraintUsage};
-use turso_macros::match_ignore_ascii_case;
 use turso_parser::ast::{self, Expr, SortOrder};
 
 use crate::{
-    parameters::PARAM_PREFIX,
     schema::{Index, IndexColumn, Schema, Table},
     translate::{
-        expr::walk_expr_mut, expr::WalkControl, optimizer::access_method::AccessMethodParams,
-        optimizer::constraints::TableConstraints, plan::Scan, plan::TerminationKey,
+        optimizer::access_method::AccessMethodParams, optimizer::constraints::TableConstraints,
+        plan::Scan, plan::TerminationKey,
     },
     types::SeekOp,
     LimboError, Result,
@@ -64,7 +62,7 @@ pub fn optimize_plan(plan: &mut Plan, schema: &Schema) -> Result<()> {
  */
 pub fn optimize_select_plan(plan: &mut SelectPlan, schema: &Schema) -> Result<()> {
     optimize_subqueries(plan, schema)?;
-    rewrite_exprs_select(plan)?;
+    lift_common_subexpressions_from_binary_or_terms(&mut plan.where_clause)?;
     if let ConstantConditionEliminationResult::ImpossibleCondition =
         eliminate_constant_conditions(&mut plan.where_clause)?
     {
@@ -89,7 +87,7 @@ pub fn optimize_select_plan(plan: &mut SelectPlan, schema: &Schema) -> Result<()
 }
 
 fn optimize_delete_plan(plan: &mut DeletePlan, schema: &Schema) -> Result<()> {
-    rewrite_exprs_delete(plan)?;
+    lift_common_subexpressions_from_binary_or_terms(&mut plan.where_clause)?;
     if let ConstantConditionEliminationResult::ImpossibleCondition =
         eliminate_constant_conditions(&mut plan.where_clause)?
     {
@@ -110,7 +108,7 @@ fn optimize_delete_plan(plan: &mut DeletePlan, schema: &Schema) -> Result<()> {
 }
 
 fn optimize_update_plan(plan: &mut UpdatePlan, schema: &Schema) -> Result<()> {
-    rewrite_exprs_update(plan)?;
+    lift_common_subexpressions_from_binary_or_terms(&mut plan.where_clause)?;
     if let ConstantConditionEliminationResult::ImpossibleCondition =
         eliminate_constant_conditions(&mut plan.where_clause)?
     {
@@ -556,62 +554,6 @@ fn eliminate_constant_conditions(
     }
 
     Ok(ConstantConditionEliminationResult::Continue)
-}
-
-fn rewrite_exprs_select(plan: &mut SelectPlan) -> Result<()> {
-    let mut param_count = 1;
-    for rc in plan.result_columns.iter_mut() {
-        rewrite_expr(&mut rc.expr, &mut param_count)?;
-    }
-    for agg in plan.aggregates.iter_mut() {
-        rewrite_expr(&mut agg.original_expr, &mut param_count)?;
-    }
-    lift_common_subexpressions_from_binary_or_terms(&mut plan.where_clause)?;
-    for cond in plan.where_clause.iter_mut() {
-        rewrite_expr(&mut cond.expr, &mut param_count)?;
-    }
-    if let Some(group_by) = &mut plan.group_by {
-        for expr in group_by.exprs.iter_mut() {
-            rewrite_expr(expr, &mut param_count)?;
-        }
-    }
-    for (expr, _) in plan.order_by.iter_mut() {
-        rewrite_expr(expr, &mut param_count)?;
-    }
-    if let Some(window) = &mut plan.window {
-        for func in window.functions.iter_mut() {
-            rewrite_expr(&mut func.original_expr, &mut param_count)?;
-        }
-    }
-
-    Ok(())
-}
-
-fn rewrite_exprs_delete(plan: &mut DeletePlan) -> Result<()> {
-    let mut param_idx = 1;
-    for cond in plan.where_clause.iter_mut() {
-        rewrite_expr(&mut cond.expr, &mut param_idx)?;
-    }
-    Ok(())
-}
-
-fn rewrite_exprs_update(plan: &mut UpdatePlan) -> Result<()> {
-    let mut param_idx = 1;
-    for (_, expr) in plan.set_clauses.iter_mut() {
-        rewrite_expr(expr, &mut param_idx)?;
-    }
-    for cond in plan.where_clause.iter_mut() {
-        rewrite_expr(&mut cond.expr, &mut param_idx)?;
-    }
-    for (expr, _) in plan.order_by.iter_mut() {
-        rewrite_expr(expr, &mut param_idx)?;
-    }
-    if let Some(rc) = plan.returning.as_mut() {
-        for rc in rc.iter_mut() {
-            rewrite_expr(&mut rc.expr, &mut param_idx)?;
-        }
-    }
-    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1449,77 +1391,7 @@ fn build_seek_def(
     })
 }
 
-pub fn rewrite_expr(top_level_expr: &mut ast::Expr, param_idx: &mut usize) -> Result<WalkControl> {
-    walk_expr_mut(
-        top_level_expr,
-        &mut |expr: &mut ast::Expr| -> Result<WalkControl> {
-            match expr {
-                ast::Expr::Id(id) => {
-                    // Convert "true" and "false" to 1 and 0
-                    let id_bytes = id.as_str().as_bytes();
-                    match_ignore_ascii_case!(match id_bytes {
-                        b"true" => {
-                            *expr = ast::Expr::Literal(ast::Literal::Numeric("1".to_owned()));
-                        }
-                        b"false" => {
-                            *expr = ast::Expr::Literal(ast::Literal::Numeric("0".to_owned()));
-                        }
-                        _ => {}
-                    })
-                }
-                ast::Expr::Variable(var) => {
-                    if var.is_empty() {
-                        // rewrite anonymous variables only, ensure that the `param_idx` starts at 1 and
-                        // all the expressions are rewritten in the order they come in the statement
-                        *expr = ast::Expr::Variable(format!("{PARAM_PREFIX}{param_idx}"));
-                        *param_idx += 1;
-                    }
-                }
-                ast::Expr::Between {
-                    lhs,
-                    not,
-                    start,
-                    end,
-                } => {
-                    // Convert `y NOT BETWEEN x AND z` to `x > y OR y > z`
-                    let (lower_op, upper_op) = if *not {
-                        (ast::Operator::Greater, ast::Operator::Greater)
-                    } else {
-                        // Convert `y BETWEEN x AND z` to `x <= y AND y <= z`
-                        (ast::Operator::LessEquals, ast::Operator::LessEquals)
-                    };
-
-                    let start = start.take_ownership();
-                    let lhs = lhs.take_ownership();
-                    let end = end.take_ownership();
-
-                    let lower_bound =
-                        ast::Expr::Binary(Box::new(start), lower_op, Box::new(lhs.clone()));
-                    let upper_bound = ast::Expr::Binary(Box::new(lhs), upper_op, Box::new(end));
-
-                    if *not {
-                        *expr = ast::Expr::Binary(
-                            Box::new(lower_bound),
-                            ast::Operator::Or,
-                            Box::new(upper_bound),
-                        );
-                    } else {
-                        *expr = ast::Expr::Binary(
-                            Box::new(lower_bound),
-                            ast::Operator::And,
-                            Box::new(upper_bound),
-                        );
-                    }
-                }
-                _ => {}
-            }
-
-            Ok(WalkControl::Continue)
-        },
-    )
-}
-
-trait TakeOwnership {
+pub trait TakeOwnership {
     fn take_ownership(&mut self) -> Self;
 }
 

@@ -413,7 +413,7 @@ impl Connection {
             .inner
             .lock()
             .map_err(|e| Error::MutexError(e.to_string()))?;
-        conn.busy_timeout(duration);
+        conn.set_busy_timeout(duration);
         Ok(())
     }
 }
