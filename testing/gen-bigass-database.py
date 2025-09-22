@@ -1,14 +1,28 @@
 #!/usr/bin/env python3
+import os
 import random
 import sqlite3
-
+from pathlib import Path
 from faker import Faker
 
-conn = sqlite3.connect("testing/testing-bigass.db")
+seed = os.getenv("SEED", None)
+db_path = os.getenv("DB_PATH", "testing/testing-bigass.db")
+
+if Path(db_path).exists():
+    print(f"Database file {db_path} already exists. Please remove it first if you want to regenerate.")
+    exit(0)
+
+conn = sqlite3.connect(db_path)
+
 cursor = conn.cursor()
 
-fake = Faker()
+if seed is None:
+    print("WARNING: No SEED provided, results will be non-deterministic!")
+    exit(1)
 
+fake = Faker(seed=int(seed))
+random.seed(int(seed))
+fake.seed_instance(int(seed))
 cursor.execute("""
     CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY,

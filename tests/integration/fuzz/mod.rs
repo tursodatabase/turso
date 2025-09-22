@@ -3,7 +3,7 @@ pub mod grammar_generator;
 #[cfg(test)]
 mod tests {
     use rand::seq::{IndexedRandom, SliceRandom};
-    use std::collections::HashSet;
+    use std::{collections::HashSet, path::PathBuf, sync::Arc};
 
     use rand::{Rng, SeedableRng};
     use rand_chacha::ChaCha8Rng;
@@ -668,6 +668,749 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    #[ignore]
+    /// **must** be manually run with `make fuzz-bigass-db SEED={seed}`
+    pub fn large_database_fuzz() {
+        let _ = env_logger::try_init();
+        let (mut rng, seed) = if let Ok(seed_str) = std::env::var("SEED") {
+            let seed = seed_str.parse::<u64>().expect("Invalid SEED value");
+            (ChaCha8Rng::seed_from_u64(seed), seed)
+        } else {
+            rng_from_time()
+        };
+
+        println!("large_database_fuzz seed: {seed}");
+        println!("Generating test databases with seed {seed}...");
+        let turso_path = PathBuf::from(format!("../testing-turso-{seed}.db"));
+        let sqlite_path = PathBuf::from(format!("../testing-sqlite-{seed}.db"));
+
+        let limbo_db = TempDatabase::new_with_existent(&turso_path, true);
+        let limbo_conn = limbo_db.connect_limbo();
+        let sqlite_conn =
+            rusqlite::Connection::open(&sqlite_path).expect("Failed to open SQLite database");
+
+        sqlite_conn
+            .pragma_update(None, "journal_mode", "wal")
+            .unwrap();
+        sqlite_conn
+            .pragma_update(None, "foreign_keys", "OFF")
+            .unwrap();
+        println!("Starting fuzzing operations...");
+
+        const NUM_OPERATIONS: usize = 1000;
+
+        for i in 0..NUM_OPERATIONS {
+            if i % 100 == 0 {
+                println!("Progress: {i}/{NUM_OPERATIONS}");
+            }
+
+            // Choose a random operation type
+            let op_type = rng.random_range(0..10);
+
+            let query = match op_type {
+                // SELECT queries with various complexities
+                0..=3 => generate_select_query(&mut rng),
+                // UPDATE operations
+                4..=5 => generate_update_query(&mut rng),
+                // INSERT operations
+                6..=7 => generate_insert_query(&mut rng),
+                // DELETE operations
+                8 => generate_delete_query(&mut rng),
+                // Complex JOIN queries
+                9 => generate_join_query(&mut rng),
+                _ => unreachable!(),
+            };
+
+            if query.trim_start().to_lowercase().starts_with("select") {
+                let sqlite_rows = sqlite_exec_rows(&sqlite_conn, &query);
+                let limbo_rows = limbo_exec_rows(&limbo_db, &limbo_conn, &query);
+                if sqlite_rows != limbo_rows {
+                    println!("=======Data mismatch detected=======");
+                    println!("Seed: {seed}");
+                    println!("SQLite rows: {sqlite_rows:?}");
+                    println!("Turso rows: {limbo_rows:?}");
+                    println!("Query that caused mismatch: {query}");
+                    panic!("Data mismatch detected");
+                }
+            } else {
+                let sqlite_result = sqlite_conn
+                    .execute(&query, rusqlite::params![])
+                    .map(|_| sqlite_exec_rows(&sqlite_conn, "SELECT changes()"))
+                    .map_err(|e| e.to_string());
+
+                let turso_result = limbo_exec_rows_fallible(&limbo_db, &limbo_conn, &query)
+                    .map(|_| limbo_exec_rows(&limbo_db, &limbo_conn, "SELECT changes()"));
+
+                match (sqlite_result, turso_result) {
+                    (Ok(sqlite_changes), Ok(limbo_changes)) => {
+                        if sqlite_changes != limbo_changes {
+                            println!("=======Data mismatch detected=======");
+                            println!("Seed: {seed}");
+                            println!("Query that caused mismatch: {query}");
+                            panic!("Change count mismatch for query: {query}\nSeed: {seed}");
+                        }
+                    }
+                    (Err(_), Err(_)) => {
+                        // Both failed - this is acceptable
+                        continue;
+                    }
+                    (sqlite_res, turso_res) => {
+                        // One succeeded, one failed - this is a problem
+                        panic!(
+                        "Execution mismatch!\nQuery: {query}\nSQLite: {sqlite_res:?}\nTurso: {turso_res:?}\nSeed: {seed}",
+                    );
+                    }
+                }
+            }
+
+            // Periodically verify data integrity
+            if i % 50 == 0 {
+                verify_data_integrity(&sqlite_conn, &limbo_db, &limbo_conn, seed);
+            }
+        }
+
+        // Final integrity check
+        println!("Running final integrity check...");
+        verify_data_integrity(&sqlite_conn, &limbo_db, &limbo_conn, seed);
+
+        println!("Fuzzing completed successfully!");
+
+        // Clean up
+        std::fs::remove_file(turso_path).ok();
+        std::fs::remove_file(sqlite_path).ok();
+    }
+
+    /// Generate a random SELECT query
+    fn generate_select_query(rng: &mut ChaCha8Rng) -> String {
+        let tables = ["users", "products", "orders", "order_items", "reviews"];
+        let table = tables.choose(rng).unwrap();
+        let operators = [">", ">=", "<>", "<", "<=", "="];
+        match rng.random_range(0..5) {
+            0 => {
+                // Simple select with limit
+                format!("SELECT * FROM {} LIMIT {}", table, rng.random_range(1..100))
+            }
+            1 => {
+                let conditions = match *table {
+                    "users" => {
+                        format!(
+                            "age {} {}",
+                            operators.choose(rng).unwrap(),
+                            rng.random_range(18..65)
+                        )
+                    }
+                    "products" => format!(
+                        "price {} {}",
+                        operators.choose(rng).unwrap(),
+                        rng.random_range(10..500)
+                    ),
+                    "orders" => "status = 'delivered'".to_string(),
+                    "order_items" => {
+                        let value = rng.random_range(1..1000);
+                        format!("order_id {} {}", operators.choose(rng).unwrap(), value)
+                    }
+                    "reviews" => {
+                        let rating = rng.random_range(1..=5);
+                        format!("rating {} {rating}", operators.choose(rng).unwrap())
+                    }
+                    "inventory_transactions" => {
+                        let qty = rng.random_range(1..100);
+                        format!("quantity {} {qty}", operators.choose(rng).unwrap())
+                    }
+                    "customer_support_tickets" => {
+                        let statuses = ["open", "closed", "pending"];
+                        let status = statuses.choose(rng).unwrap();
+                        format!("status = '{status}'")
+                    }
+                    _ => "1=1".to_string(),
+                };
+                format!(
+                    "SELECT * FROM {table} WHERE {conditions} LIMIT {}",
+                    rng.random_range(10..100)
+                )
+            }
+            2 => {
+                // Aggregate query
+                let agg_fn = ["COUNT(*)", "AVG(price)", "MAX(age)", "MIN(total_amount)"]
+                    .choose(rng)
+                    .unwrap();
+                format!("SELECT {agg_fn} FROM {table}")
+            }
+            3 => {
+                // Group by query
+                match *table {
+                    "orders" => "SELECT status, COUNT(*) FROM orders GROUP BY status".to_string(),
+                    "users" => {
+                        "SELECT state, COUNT(*) FROM users GROUP BY state LIMIT 10".to_string()
+                    }
+                    _ => format!("SELECT COUNT(*) FROM {table}"),
+                }
+            }
+            4 => {
+                // Order by query
+                let order = if rng.random_bool(0.5) { "ASC" } else { "DESC" };
+                match *table {
+                    "products" => {
+                        format!("SELECT * FROM products ORDER BY price {order} LIMIT 20")
+                    }
+                    "users" => format!("SELECT * FROM users ORDER BY age {order} LIMIT 20"),
+                    _ => format!("SELECT * FROM {table} ORDER BY id {order} LIMIT 20"),
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    /// Generate a random UPDATE query
+    fn generate_update_query(rng: &mut ChaCha8Rng) -> String {
+        match rng.random_range(0..5) {
+            0 => {
+                // Update product prices
+                let price = rng.random_range(10..200) as f64;
+                let id = rng.random_range(1..100);
+                format!("UPDATE products SET price = {price} WHERE id = {id}")
+            }
+            1 => {
+                let age = rng.random_range(20..70);
+                let id = rng.random_range(1..10000);
+                format!("UPDATE users SET age = {age} WHERE id = {id}")
+            }
+            2 => {
+                let statuses = ["pending", "processing", "shipped", "delivered"];
+                let status = statuses.choose(rng).unwrap();
+                let id = rng.random_range(1..10000);
+                format!("UPDATE orders SET status = '{status}' WHERE id = {id}")
+            }
+            3 => {
+                let new_status = if rng.random_bool(0.5) {
+                    "open"
+                } else {
+                    "closed"
+                };
+                let id = rng.random_range(1..10000);
+                format!(
+                    "UPDATE customer_support_tickets SET status = '{new_status}' WHERE id = {id}"
+                )
+            }
+            4 => {
+                let new_qty = rng.random_range(1..100);
+                let product_id = rng.random_range(1..10000);
+                let change_type = if rng.random_bool(0.5) {
+                    "restock"
+                } else {
+                    "sale"
+                };
+                format!(
+                    "UPDATE inventory_transactions SET quantity = {new_qty}, change_type = '{change_type}' WHERE product_id = {product_id}"
+                )
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    /// Generate a random INSERT query
+    fn generate_insert_query(rng: &mut ChaCha8Rng) -> String {
+        match rng.random_range(0..11) {
+            0 => {
+                let id = rng.random_range(20000..30000);
+                let name = format!("Product_{}", rng.random_range(1000..9999));
+                let price = rng.random_range(10..500) as f64;
+                format!("INSERT INTO products (id, name, price) VALUES ({id}, '{name}', {price})",)
+            }
+            1 => {
+                let mut values = Vec::new();
+                let num_rows = rng.random_range(2..10);
+                for i in 0..num_rows {
+                    let id = rng.random_range(30000..40000) + i;
+                    let name = format!("Bulk_Product_{}", rng.random_range(1000..9999));
+                    let price = rng.random_range(5..200) as f64;
+                    values.push(format!("({id}, '{name}', {price})"));
+                }
+                format!(
+                    "INSERT INTO products (id, name, price) VALUES {}",
+                    values.join(", ")
+                )
+            }
+            2 => {
+                let id = rng.random_range(40000..50000);
+                let name = if rng.random_bool(0.3) {
+                    "NULL".to_string()
+                } else {
+                    format!("'Nullable_Product_{}'", rng.random_range(100..999))
+                };
+                let price = if rng.random_bool(0.2) {
+                    "NULL".to_string()
+                } else {
+                    rng.random_range(1..1000).to_string()
+                };
+                format!("INSERT INTO products (id, name, price) VALUES ({id}, {name}, {price})",)
+            }
+            3 => {
+                let first_names = ["John", "Jane", "Bob", "Alice", "Charlie", "Eve"];
+                let last_names = ["Smith", "Johnson", "Williams", "Brown", "Jones"];
+                let states = ["CA", "NY", "TX", "FL", "WA", "OR", "AZ"];
+                let first = first_names.choose(rng).unwrap();
+                let last = last_names.choose(rng).unwrap();
+                let email = format!(
+                    "{}.{}{}@example.com",
+                    first.to_lowercase(),
+                    last.to_lowercase(),
+                    rng.random_range(1..999)
+                );
+                let age = rng.random_range(18..85);
+                let state = states.choose(rng).unwrap();
+                format!(
+                "INSERT INTO users (first_name, last_name, email, age, city, state, zipcode, created_at) 
+                 VALUES ('{}', '{}', '{}', {}, 'Test City', '{}', '{}', datetime('now'))",
+                first, last, email, age, state, rng.random_range(10000..99999)
+            )
+            }
+            4 => {
+                let product_id = rng.random_range(1..12000);
+                format!(
+                    "INSERT INTO reviews (product_id, user_id, rating, comment)
+                 VALUES ({product_id}, (SELECT id FROM users ORDER BY RANDOM() LIMIT 1), DEFAULT, DEFAULT)",
+                )
+            }
+            5 => {
+                let id = rng.random_range(1..15000);
+                let price = rng.random_range(10..500);
+                format!(
+                    "INSERT INTO products (id, name, price) 
+                 VALUES ({id}, 'Conflict_Product', {price})
+                 ON CONFLICT(id) DO UPDATE SET 
+                    price = excluded.price,
+                    name = excluded.name || '_updated'",
+                )
+            }
+            6 => {
+                let id = rng.random_range(1..10000);
+                format!(
+                    "INSERT INTO orders (id, user_id, total_amount, status)
+                 VALUES ({}, {}, {}, 'pending')
+                 ON CONFLICT(id) DO NOTHING",
+                    id,
+                    rng.random_range(1..15000),
+                    rng.random_range(10..5000)
+                )
+            }
+            7 => {
+                let base_price = rng.random_range(50..200) as f64;
+                let quantity = rng.random_range(1..10);
+                let order_id = rng.random_range(1..10000);
+                format!(
+                "INSERT INTO order_items (order_id, product_id, quantity, unit_price, tax, total_price)
+                 VALUES (
+                    {order_id},
+                    {},
+                    {},
+                    {quantity},
+                    {base_price} * 0.08,
+                    {base_price} * {quantity} * 1.08
+                 )",
+                rng.random_range(1..12000),
+                rng.random_range(1..5000),
+            )
+            }
+            8 => {
+                let base_name = ["product", "item", "gadget", "widget"].choose(rng).unwrap();
+                format!(
+                    "INSERT INTO products (name, price)
+                 VALUES (
+                    UPPER('{}') || '_' || LOWER('{}') || '_' || {},
+                    ROUND(RANDOM() % 900 + 100, 2)
+                 )",
+                    base_name,
+                    base_name,
+                    rng.random_range(1000..9999)
+                )
+            }
+            9 => {
+                let days_ago = rng.random_range(1..365);
+                format!(
+                    "INSERT INTO orders (user_id, order_date, total_amount, status)
+                 VALUES (
+                    {},
+                    datetime('now', '-{} days'),
+                    {},
+                    'delivered'
+                 )",
+                    rng.random_range(1..15000),
+                    days_ago,
+                    rng.random_range(50..2000)
+                )
+            }
+            10 => {
+                let rating = rng.random_range(1..=5);
+                format!(
+                    "INSERT INTO reviews (product_id, user_id, rating, title, verified_purchase)
+                 VALUES (
+                    {},
+                    {},
+                    {},
+                    CASE 
+                        WHEN {} >= 4 THEN 'Great product!'
+                        WHEN {} = 3 THEN 'Decent'
+                        ELSE 'Not satisfied'
+                    END,
+                    CASE WHEN RANDOM() % 100 < 70 THEN 1 ELSE 0 END
+                 )",
+                    rng.random_range(1..12000),
+                    rng.random_range(1..15000),
+                    rating,
+                    rating,
+                    rating
+                )
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    fn generate_delete_query(rng: &mut ChaCha8Rng) -> String {
+        let table = ["products", "users", "orders", "reviews"]
+            .choose(rng)
+            .unwrap();
+        match rng.random_range(0..2) {
+            0 => {
+                let id = rng.random_range(1..30000);
+                format!("DELETE FROM {table} WHERE id = {id}")
+            }
+            1 => {
+                let id_start = rng.random_range(1..10000);
+                let id_end = id_start + rng.random_range(1..100);
+                format!("DELETE FROM {table} WHERE id BETWEEN {id_start} AND {id_end}")
+            }
+            2 => {
+                let age = rng.random_range(18..85);
+                let state = ["CA", "NY", "TX", "FL", "WA"].choose(rng).unwrap();
+                format!("DELETE FROM users WHERE age < {age} AND state = '{state}' LIMIT 10",)
+            }
+            3 => {
+                let patterns = ["'Product_%'", "'%test%'", "'temp_%'", "'%_old'"];
+                let pattern = patterns.choose(rng).unwrap();
+                let id = rng.random_range(1..5000);
+                let id_max = id + rng.random_range(1..100);
+                format!(
+                    "DELETE FROM products WHERE name LIKE {pattern} AND id BETWEEN {id} AND {id_max}",
+                )
+            }
+            4 => {
+                let days = rng.random_range(30..365);
+                format!(
+                    "DELETE FROM orders 
+                 WHERE order_date < datetime('now', '-{days} days') 
+                 AND status = 'cancelled'",
+                )
+            }
+            8 => {
+                let min_price = rng.random_range(100..500);
+                let max_quantity = rng.random_range(1..5);
+                format!(
+                    "DELETE FROM order_items 
+                 WHERE unit_price > {min_price} 
+                 AND quantity < {max_quantity} 
+                 AND discount > unit_price * 0.5",
+                )
+            }
+            9 => {
+                let tables = [
+                    ("orders", "tracking_number"),
+                    ("users", "phone_number"),
+                    ("customer_support_tickets", "resolved_at"),
+                    ("inventory_transactions", "notes"),
+                ];
+                let (table, column) = tables.choose(rng).unwrap();
+                format!("DELETE FROM {table} WHERE {column} IS NULL")
+            }
+            10 => {
+                let modulo = rng.random_range(3..10);
+                let remainder = rng.random_range(0..modulo);
+                format!("DELETE FROM {table} WHERE id % {modulo} = {remainder}",)
+            }
+            11 => {
+                let operators = [">", "<", ">=", "<=", "="];
+                let op = operators.choose(rng).unwrap();
+                let threshold = rng.random_range(50..500);
+                format!(
+                    "DELETE FROM order_items 
+             WHERE (quantity * unit_price) - discount {op} {threshold}"
+                )
+            }
+            12 => "DELETE FROM inventory_transactions 
+             WHERE CASE 
+                WHEN transaction_type = 'damage' THEN 1 
+                WHEN quantity > 100 AND transaction_type = 'adjustment' THEN 1 
+                ELSE 0 
+             END = 1"
+                .to_string(),
+            13 => {
+                let length = rng.random_range(5..20);
+                format!(
+                    "DELETE FROM users 
+                 WHERE LENGTH(email) < {length} 
+                 OR LOWER(email) NOT LIKE '%@%.%'",
+                )
+            }
+            14 => "DELETE FROM orders o1 
+             WHERE total_amount < (
+                SELECT AVG(total_amount) * 0.1 
+                FROM orders o2 
+                WHERE o2.user_id = o1.user_id
+             )"
+            .to_string(),
+            15 => {
+                let probability = rng.random_range(1..100);
+                let table = ["products", "reviews", "inventory_transactions"]
+                    .choose(rng)
+                    .unwrap();
+                format!(
+                    "DELETE FROM {table} 
+                 WHERE ABS(RANDOM()) % 100 < {probability}",
+                )
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    /// Generate a random JOIN query
+    fn generate_join_query(rng: &mut ChaCha8Rng) -> String {
+        match rng.random_range(0..18) {
+            0 => "SELECT u.id, u.first_name, u.last_name, o.id as order_id, o.total_amount 
+             FROM users u 
+             INNER JOIN orders o ON u.id = o.user_id 
+             LIMIT 50"
+                .to_string(),
+            1 => "SELECT u.email, COUNT(o.id) as order_count, SUM(o.total_amount) as total_spent
+             FROM users u 
+             LEFT JOIN orders o ON u.id = o.user_id 
+             GROUP BY u.id, u.email 
+             ORDER BY total_spent DESC NULLS LAST
+             LIMIT 25"
+                .to_string(),
+            2 => "SELECT p.name, COUNT(oi.id) as times_ordered, SUM(oi.quantity) as total_quantity
+             FROM order_items oi
+             RIGHT JOIN products p ON oi.product_id = p.id
+             GROUP BY p.id, p.name
+             HAVING COUNT(oi.id) > 0
+             ORDER BY times_ordered DESC
+             LIMIT 20"
+                .to_string(),
+            3 => "SELECT u.first_name, p.name, p.price
+             FROM users u
+             CROSS JOIN products p
+             WHERE u.age > 50 AND p.price < 20
+             LIMIT 100"
+                .to_string(),
+
+            4 => "SELECT u.first_name, u.last_name, p.name as product_name, 
+                    oi.quantity, oi.unit_price, o.order_date
+             FROM order_items oi
+             JOIN orders o ON oi.order_id = o.id
+             JOIN users u ON o.user_id = u.id
+             JOIN products p ON oi.product_id = p.id
+             WHERE o.status = 'delivered'
+             ORDER BY o.order_date DESC
+             LIMIT 40"
+                .to_string(),
+            5 => "SELECT r.rating, r.comment, u.first_name || ' ' || u.last_name as reviewer,
+                    p.name as product, p.price
+             FROM reviews r
+             LEFT JOIN users u ON r.user_id = u.id
+             LEFT JOIN products p ON r.product_id = p.id
+             WHERE r.verified_purchase = 1
+             ORDER BY r.review_date DESC
+             LIMIT 30"
+                .to_string(),
+            6 => "SELECT t.ticket_number, t.subject, t.priority,
+                    u.email, o.order_date, o.total_amount
+             FROM customer_support_tickets t
+             JOIN users u ON t.user_id = u.id
+             LEFT JOIN orders o ON t.order_id = o.id
+             WHERE t.status IN ('open', 'in_progress')
+             ORDER BY 
+                CASE t.priority 
+                    WHEN 'urgent' THEN 1 
+                    WHEN 'high' THEN 2 
+                    WHEN 'medium' THEN 3 
+                    ELSE 4 
+                END
+             LIMIT 25"
+                .to_string(),
+            7 => "SELECT u.email, o.id as order_id, p.name, oi.quantity,
+                    it.new_quantity as inventory_after
+             FROM users u
+             JOIN orders o ON u.id = o.user_id
+             JOIN order_items oi ON o.id = oi.order_id
+             JOIN products p ON oi.product_id = p.id
+             LEFT JOIN inventory_transactions it ON it.product_id = p.id 
+                AND it.reference_id = o.id AND it.reference_type = 'order'
+             WHERE o.order_date >= datetime('now', '-30 days')
+             LIMIT 50"
+                .to_string(),
+            8 => "SELECT u.id, u.first_name, u.last_name,
+                    COUNT(DISTINCT o.id) as order_count,
+                    COUNT(DISTINCT r.id) as review_count,
+                    AVG(r.rating) as avg_rating,
+                    SUM(o.total_amount) as lifetime_value
+             FROM users u
+             LEFT JOIN orders o ON u.id = o.user_id
+             LEFT JOIN reviews r ON u.id = r.user_id
+             LEFT JOIN customer_support_tickets t ON u.id = t.user_id
+             GROUP BY u.id, u.first_name, u.last_name
+             HAVING COUNT(o.id) > 0
+             ORDER BY lifetime_value DESC
+             LIMIT 20"
+                .to_string(),
+            9 => "SELECT u1.first_name || ' ' || u1.last_name as user1,
+                    u2.first_name || ' ' || u2.last_name as user2,
+                    u1.city, u1.state
+             FROM users u1
+             JOIN users u2 ON u1.city = u2.city 
+                AND u1.state = u2.state 
+                AND u1.id < u2.id
+             WHERE u1.age BETWEEN 25 AND 35
+             LIMIT 30"
+                .to_string(),
+            10 => "SELECT p1.name as product1, p1.price as price1,
+                    p2.name as product2, p2.price as price2
+             FROM products p1
+             JOIN products p2 ON ABS(p1.price - p2.price) < 5
+                AND p1.id < p2.id
+             WHERE p1.price BETWEEN 50 AND 100
+             LIMIT 25"
+                .to_string(),
+            11 => "SELECT o.*, u.email, 
+                    COUNT(oi.id) as item_count,
+                    SUM(oi.quantity) as total_items
+             FROM orders o
+             JOIN users u ON o.user_id = u.id 
+                AND u.age >= 18 
+                AND u.created_at < o.order_date
+             LEFT JOIN order_items oi ON o.id = oi.order_id
+                AND oi.unit_price > 10
+                AND oi.discount < oi.unit_price * 0.5
+             GROUP BY o.id
+             HAVING COUNT(oi.id) > 2
+             ORDER BY o.order_date DESC
+             LIMIT 20"
+                .to_string(),
+            12 => "SELECT *
+             FROM orders o
+             JOIN order_items USING (id)
+             LIMIT 30"
+                .to_string(),
+            13 => "SELECT u.id, u.email, u.created_at,
+                    o.id as order_id
+             FROM users u
+             LEFT JOIN orders o ON u.id = o.user_id
+             WHERE o.id IS NULL
+             ORDER BY u.created_at DESC
+             LIMIT 50"
+                .to_string(),
+            14 => "SELECT p.*, r.id as review_id
+             FROM products p
+             LEFT JOIN reviews r ON p.id = r.product_id
+             WHERE r.id IS NULL
+                OR r.rating < 3
+             ORDER BY p.price DESC
+             LIMIT 30"
+                .to_string(),
+            15 => "SELECT p.id, p.name, p.price as list_price,
+                    AVG(oi.unit_price) as avg_sold_price,
+                    MIN(oi.unit_price) as min_price,
+                    MAX(oi.unit_price) as max_price,
+                    COUNT(*) as sales_count
+             FROM products p
+             JOIN order_items oi ON p.id = oi.product_id
+             GROUP BY p.id, p.name, p.price
+             HAVING ABS(p.price - AVG(oi.unit_price)) > p.price * 0.1
+             ORDER BY sales_count DESC
+             LIMIT 20"
+                .to_string(),
+            16 => "SELECT DISTINCT u.state, 
+                    COUNT(DISTINCT u.id) as users,
+                    COUNT(DISTINCT o.id) as orders,
+                    COUNT(DISTINCT p.id) as unique_products
+             FROM users u
+             INNER JOIN orders o ON u.id = o.user_id
+             INNER JOIN order_items oi ON o.id = oi.order_id
+             LEFT JOIN products p ON oi.product_id = p.id
+             LEFT JOIN reviews r ON p.id = r.product_id AND r.user_id = u.id
+             WHERE o.status = 'delivered'
+             GROUP BY u.state
+             ORDER BY orders DESC
+             LIMIT 10"
+                .to_string(),
+            17 => "SELECT o.id, o.order_date, 
+                    r.review_date,
+                    JULIANDAY(r.review_date) - JULIANDAY(o.order_date) as days_to_review
+             FROM orders o
+             JOIN order_items oi ON o.id = oi.order_id
+             JOIN reviews r ON oi.product_id = r.product_id 
+                AND r.user_id = o.user_id
+                AND r.review_date > o.order_date
+             WHERE o.status = 'delivered'
+             ORDER BY days_to_review ASC
+             LIMIT 30"
+                .to_string(),
+            18 => "SELECT u.*
+             FROM users u
+             LEFT JOIN orders o ON u.id = o.user_id 
+                AND o.order_date > datetime('now', '-90 days')
+             LEFT JOIN reviews r ON u.id = r.user_id
+                AND r.review_date > datetime('now', '-90 days')  
+             WHERE o.id IS NULL AND r.id IS NULL
+             LIMIT 20"
+                .to_string(),
+            _ => unreachable!(),
+        }
+    }
+
+    /// Verify data integrity between databases
+    fn verify_data_integrity(
+        sqlite_conn: &rusqlite::Connection,
+        turso_db: &TempDatabase,
+        turso_conn: &Arc<turso_core::Connection>,
+        seed: u64,
+    ) {
+        // Check row counts for all tables
+        let tables = [
+            "users",
+            "products",
+            "orders",
+            "order_items",
+            "reviews",
+            "inventory_transactions",
+            "customer_support_tickets",
+        ];
+
+        for table in &tables {
+            let query = format!("SELECT COUNT(*) FROM {table}");
+            let sqlite_count = sqlite_exec_rows(sqlite_conn, &query);
+            let limbo_count = limbo_exec_rows(turso_db, turso_conn, &query);
+
+            assert_eq!(
+                sqlite_count, limbo_count,
+                "Row count mismatch in table {table}\nSeed: {seed}",
+            );
+        }
+        let sqlite_indexes = sqlite_exec_rows(
+            sqlite_conn,
+            "SELECT name FROM sqlite_master WHERE type='index' ORDER BY name",
+        );
+        let turso_indexes = limbo_exec_rows(
+            turso_db,
+            turso_conn,
+            "SELECT name FROM sqlite_master WHERE type='index' ORDER BY name",
+        );
+
+        assert_eq!(
+            sqlite_indexes, turso_indexes,
+            "Index mismatch\nSeed: {seed}",
+        );
     }
 
     #[test]
