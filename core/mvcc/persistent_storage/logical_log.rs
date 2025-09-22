@@ -42,12 +42,12 @@ impl LogHeader {
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum LogRowType {
+enum LogRecordType {
     Delete = 0,
     Insert = 1,
 }
 
-impl LogRowType {
+impl LogRecordType {
     fn from_row_version(row_version: &RowVersion) -> Self {
         if row_version.end.is_some() {
             Self::Delete
@@ -59,8 +59,8 @@ impl LogRowType {
     #[allow(dead_code)]
     fn from_u8(value: u8) -> Option<Self> {
         match value {
-            0 => Some(LogRowType::Delete),
-            1 => Some(LogRowType::Insert),
+            0 => Some(LogRecordType::Delete),
+            1 => Some(LogRecordType::Insert),
             _ => None,
         }
     }
@@ -91,10 +91,10 @@ impl LogRowType {
         buffer.extend_from_slice(&self.as_u8().to_be_bytes());
         let size_before_payload = buffer.len();
         match self {
-            LogRowType::Delete => {
+            LogRecordType::Delete => {
                 write_varint_to_vec(row_version.row.id.row_id as u64, buffer);
             }
-            LogRowType::Insert => {
+            LogRecordType::Insert => {
                 write_varint_to_vec(row_version.row.id.row_id as u64, buffer);
 
                 let data = &row_version.row.data;
@@ -141,7 +141,7 @@ impl LogicalLog {
 
         // 3. Serialize rows
         tx.row_versions.iter().for_each(|row_version| {
-            let row_type = LogRowType::from_row_version(row_version);
+            let row_type = LogRecordType::from_row_version(row_version);
             row_type.serialize(&mut buffer, row_version);
         });
 
