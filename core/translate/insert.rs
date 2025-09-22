@@ -501,7 +501,7 @@ pub fn translate_insert(
     }
 
     program.preassign_label_to_next_insn(key_generation_label);
-if let Some((_, r_seq, _,_)) = autoincrement_meta {
+    if let Some((_, r_seq, _, _)) = autoincrement_meta {
         let r_max = program.alloc_register();
 
         let dummy_reg = program.alloc_register();
@@ -556,17 +556,6 @@ if let Some((_, r_seq, _,_)) = autoincrement_meta {
     }
 
     program.preassign_label_to_next_insn(key_ready_for_uniqueness_check_label);
-
-    let emit_halt_with_constraint = |program: &mut ProgramBuilder, col_name: &str| {
-        let mut description = String::with_capacity(table_name.as_str().len() + col_name.len() + 2);
-        description.push_str(table_name.as_str());
-        description.push('.');
-        description.push_str(col_name);
-        program.emit_insn(Insn::Halt {
-            err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
-            description,
-        });
-    };
 
     // Check uniqueness constraint for rowid if it was provided by user.
     // When the DB allocates it there are no need for separate uniqueness checks.
