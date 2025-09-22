@@ -133,15 +133,24 @@ impl LogicalLog {
             };
             header.serialize(&mut buffer);
         }
+
         // 2. Serialize Transaction
+        buffer.extend_from_slice(&tx.tx_timestamp.to_be_bytes());
+        // TODO: checksum
+        buffer.extend_from_slice(&[0; 8]);
 
         // 3. Serialize rows
-        buffer.extend_from_slice(&tx.tx_timestamp.to_be_bytes());
         tx.row_versions.iter().for_each(|row_version| {
             let row_type = LogRowType::from_row_version(row_version);
             row_type.serialize(&mut buffer, row_version);
         });
 
+        // 4. Serialize transaction's end marker. This marker will be the position of the offset
+        //    after writing the buffer.
+        let offset_after_buffer = self.offset + buffer.len() as u64 + size_of::<u64>() as u64;
+        buffer.extend_from_slice(&offset_after_buffer.to_be_bytes());
+
+        // 5. Write to disk
         let buffer = Arc::new(Buffer::new(buffer));
         let c = Completion::new_write({
             let buffer = buffer.clone();
@@ -156,6 +165,7 @@ impl LogicalLog {
                 );
             }
         });
+
         let buffer_len = buffer.len();
         let c = self.file.pwrite(self.offset, buffer, c)?;
         self.offset += buffer_len as u64;
