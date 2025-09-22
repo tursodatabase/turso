@@ -13,6 +13,8 @@ pub mod memory;
 pub const FAULT_ERROR_MSG: &str = "Injected Fault";
 
 pub trait SimIO: turso_core::IO {
+    fn inject_short_write(&self, short_write: bool);
+
     fn inject_fault(&self, fault: bool);
 
     fn print_stats(&self);

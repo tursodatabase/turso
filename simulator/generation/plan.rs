@@ -885,6 +885,12 @@ impl InteractionType {
                 if inject_fault && !syncing {
                     env.io.inject_fault(true);
                 }
+                // Short writes are only available when memory IO is enabled
+                let inject_short_write = env.profile.io.fault.short_write && env.memory_io;
+                // TODO: I don't know if its ok to inject short writes when syncing
+                if inject_short_write && !syncing {
+                    env.io.inject_short_write(true);
+                }
 
                 match rows.step()? {
                     StepResult::Row => {

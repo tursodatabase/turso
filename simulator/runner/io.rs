@@ -51,6 +51,10 @@ impl SimulatorIO {
 }
 
 impl SimIO for SimulatorIO {
+    fn inject_short_write(&self, _short_write: bool) {
+        unreachable!("Only memory io sim has support for short writes")
+    }
+
     fn inject_fault(&self, fault: bool) {
         self.fault.replace(fault);
         for file in self.files.borrow().iter() {

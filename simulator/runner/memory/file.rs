@@ -55,6 +55,7 @@ pub struct MemorySimFile {
     pub latency_probability: usize,
     clock: Arc<SimulatorClock>,
     fault: Cell<bool>,
+    short_write: Cell<bool>,
 }
 
 unsafe impl Send for MemorySimFile {}
@@ -78,7 +79,11 @@ impl MemorySimFile {
             latency_probability,
             clock,
             fault: Cell::new(false),
+            short_write: Cell::new(false),
         }
+    }
+    pub fn inject_short_write(&self, short_write: bool) {
+        self.short_write.set(short_write);
     }
 
     pub fn inject_fault(&self, fault: bool) {
@@ -152,12 +157,23 @@ impl MemorySimFile {
         });
     }
 
-    pub fn write_buf(&self, buf: &[u8], offset: usize) -> usize {
-        let mut file_buf = self.buffer.borrow_mut();
-        let more_space = if file_buf.len() < offset {
-            (offset + buf.len()) - file_buf.len()
+    pub fn write_buf(&self, buf: &[u8], offset: usize, short_write: bool) -> usize {
+        let buf_to_write = if short_write && buf.len() > 1 {
+            let mut rng = self.rng.borrow_mut();
+            let short_len = rng.random_range(1..buf.len());
+            &buf[..short_len]
         } else {
-            buf.len().saturating_sub(file_buf.len() - offset)
+            // If no short write, use the original buffer
+            buf
+        };
+
+        let mut file_buf = self.buffer.borrow_mut();
+        let len_to_write = buf_to_write.len();
+
+        let more_space = if file_buf.len() < offset {
+            (offset + len_to_write) - file_buf.len()
+        } else {
+            len_to_write.saturating_sub(file_buf.len() - offset)
         };
         if more_space > 0 {
             file_buf.reserve(more_space);
@@ -166,8 +182,8 @@ impl MemorySimFile {
             }
         }
 
-        file_buf[offset..][0..buf.len()].copy_from_slice(buf);
-        buf.len()
+        file_buf[offset..][0..len_to_write].copy_from_slice(buf_to_write);
+        len_to_write
     }
 }
 
@@ -202,6 +218,7 @@ impl File for MemorySimFile {
             buffer,
             completion: c.clone(),
             offset: pos as usize,
+            short_write: self.short_write.get(),
         };
         self.insert_op(op);
         Ok(c)
@@ -221,6 +238,7 @@ impl File for MemorySimFile {
             buffers,
             completion: c.clone(),
             offset: pos as usize,
+            short_write: self.short_write.get(),
         };
         self.insert_op(op);
         Ok(c)

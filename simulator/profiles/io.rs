@@ -65,6 +65,8 @@ pub struct FaultProfile {
     pub write: bool,
     #[garde(skip)]
     pub sync: bool,
+    #[garde(skip)]
+    pub short_write: bool,
 }
 
 impl Default for FaultProfile {
@@ -74,6 +76,7 @@ impl Default for FaultProfile {
             read: true,
             write: true,
             sync: true,
+            short_write: false,
         }
     }
 }
