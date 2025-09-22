@@ -1,6 +1,6 @@
 {
   "name": "@tursodatabase/wasm-runtime",
-  "version": "0.2.0-pre.3",
+  "version": "0.2.0-pre.4",
   "type": "module",
   "description": "Runtime and polyfill for wasm targets",
   "author": {
