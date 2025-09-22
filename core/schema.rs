@@ -1125,12 +1125,6 @@ pub fn create_table(
                                 is_primary_key: true,
                             });
                         }
-                        // ast::ColumnConstraint::PrimaryKey { order: o, .. } => {
-                        //     primary_key = true;
-                        //     if let Some(o) = o {
-                        //         order = o;
-                        //     }
-                        // }
                         ast::ColumnConstraint::NotNull { nullable, .. } => {
                             notnull = !nullable;
                         }
