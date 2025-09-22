@@ -342,7 +342,7 @@ mod tests {
         // Get the schema and view
         let view_mutex = conn
             .schema
-            .borrow()
+            .read()
             .get_materialized_view("test_view")
             .ok_or(crate::LimboError::InternalError(
                 "View not found".to_string(),

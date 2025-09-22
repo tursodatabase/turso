@@ -718,7 +718,7 @@ impl Program {
                     }
 
                     // Not a rollback - proceed with processing
-                    let schema = self.connection.schema.borrow();
+                    let schema = self.connection.schema.read();
 
                     // Collect materialized views - they should all have storage
                     let mut views = Vec::new();
@@ -764,7 +764,7 @@ impl Program {
                         .unwrap()
                         .get_table_deltas();
 
-                    let schema = self.connection.schema.borrow();
+                    let schema = self.connection.schema.read();
                     if let Some(view_mutex) = schema.get_materialized_view(view_name) {
                         let mut view = view_mutex.lock().unwrap();
 

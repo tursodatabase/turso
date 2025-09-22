@@ -1153,7 +1153,7 @@ impl Pager {
         wal.borrow().end_read_tx();
 
         if schema_did_change {
-            let schema = connection.schema.borrow().clone();
+            let schema = connection.schema.read().clone();
             connection.db.update_schema_if_newer(schema)?;
         }
         Ok(IOResult::Done(commit_status))
@@ -2324,7 +2324,7 @@ impl Pager {
         }
         self.reset_internal_states();
         if schema_did_change {
-            connection.schema.replace(connection.db.clone_schema()?);
+            *connection.schema.write() = connection.db.clone_schema()?;
         }
         if is_write {
             if let Some(wal) = self.wal.as_ref() {
