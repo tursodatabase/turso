@@ -8,7 +8,7 @@ use crate::incremental::operator::{
 };
 use crate::types::IOResult;
 use crate::{Connection, Database, Result, Value};
-use std::sync::{Arc, Mutex};
+use std::sync::{atomic::Ordering, Arc, Mutex};
 
 #[derive(Debug, Clone)]
 pub struct ProjectColumn {
@@ -63,7 +63,7 @@ impl ProjectOperator {
         let internal_conn = db.connect()?;
         // Set to read-only mode and disable auto-commit since we're only evaluating expressions
         internal_conn.query_only.set(true);
-        internal_conn.auto_commit.set(false);
+        internal_conn.auto_commit.store(false, Ordering::SeqCst);
 
         // Create ProjectColumn structs from compiled expressions
         let columns: Vec<ProjectColumn> = compiled_exprs
