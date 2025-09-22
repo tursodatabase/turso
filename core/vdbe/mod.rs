@@ -29,7 +29,7 @@ use crate::{
     error::LimboError,
     function::{AggFunc, FuncCtx},
     mvcc::{database::CommitStateMachine, LocalClock},
-    state_machine::{StateMachine, StateTransition, TransitionResult},
+    state_machine::StateMachine,
     storage::sqlite3_ondisk::SmallVec,
     translate::{collate::CollationSeq, plan::TableReferences},
     types::{IOCompletions, IOResult, RawSlice, TextRef},
@@ -932,17 +932,7 @@ impl Program {
         commit_state: &mut StateMachine<CommitStateMachine<LocalClock>>,
         mv_store: &Arc<MvStore>,
     ) -> Result<IOResult<()>> {
-        loop {
-            match commit_state.step(mv_store)? {
-                TransitionResult::Continue => {}
-                TransitionResult::Io(iocompletions) => {
-                    return Ok(IOResult::IO(iocompletions));
-                }
-                TransitionResult::Done(_) => {
-                    return Ok(IOResult::Done(()));
-                }
-            }
-        }
+        commit_state.step(mv_store)
     }
 }
 

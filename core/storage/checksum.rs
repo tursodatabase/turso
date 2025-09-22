@@ -92,7 +92,6 @@ impl Default for ChecksumContext {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::CompletionError;
 
     fn get_random_page() -> [u8; CHECKSUM_PAGE_SIZE] {
         let mut page = [0u8; CHECKSUM_PAGE_SIZE];
