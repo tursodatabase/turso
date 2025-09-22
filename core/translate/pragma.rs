@@ -2,7 +2,6 @@
 //! More info: https://www.sqlite.org/pragma.html.
 
 use chrono::Datelike;
-use std::rc::Rc;
 use std::sync::Arc;
 use turso_macros::match_ignore_ascii_case;
 use turso_parser::ast::{self, ColumnDefinition, Expr, Literal, Name};
@@ -39,7 +38,7 @@ pub fn translate_pragma(
     syms: &SymbolTable,
     name: &ast::QualifiedName,
     body: Option<ast::PragmaBody>,
-    pager: Rc<Pager>,
+    pager: Arc<Pager>,
     connection: Arc<crate::Connection>,
     mut program: ProgramBuilder,
 ) -> crate::Result<ProgramBuilder> {
@@ -90,7 +89,7 @@ fn update_pragma(
     schema: &Schema,
     syms: &SymbolTable,
     value: ast::Expr,
-    pager: Rc<Pager>,
+    pager: Arc<Pager>,
     connection: Arc<crate::Connection>,
     mut program: ProgramBuilder,
 ) -> crate::Result<(ProgramBuilder, TransactionMode)> {
@@ -100,7 +99,7 @@ fn update_pragma(
             let app_id_value = match data {
                 Value::Integer(i) => i as i32,
                 Value::Float(f) => f as i32,
-                _ => unreachable!(),
+                _ => bail_parse_error!("expected integer, got {:?}", data),
             };
 
             program.emit_insn(Insn::SetCookie {
@@ -109,6 +108,17 @@ fn update_pragma(
                 value: app_id_value,
                 p5: 1,
             });
+            Ok((program, TransactionMode::Write))
+        }
+        PragmaName::BusyTimeout => {
+            let data = parse_signed_number(&value)?;
+            let busy_timeout_ms = match data {
+                Value::Integer(i) => i as i32,
+                Value::Float(f) => f as i32,
+                _ => bail_parse_error!("expected integer, got {:?}", data),
+            };
+            let busy_timeout_ms = busy_timeout_ms.max(0);
+            connection.set_busy_timeout(std::time::Duration::from_millis(busy_timeout_ms as u64));
             Ok((program, TransactionMode::Write))
         }
         PragmaName::CacheSize => {
@@ -373,7 +383,7 @@ fn query_pragma(
     pragma: PragmaName,
     schema: &Schema,
     value: Option<ast::Expr>,
-    pager: Rc<Pager>,
+    pager: Arc<Pager>,
     connection: Arc<crate::Connection>,
     mut program: ProgramBuilder,
 ) -> crate::Result<(ProgramBuilder, TransactionMode)> {
@@ -388,6 +398,12 @@ fn query_pragma(
             program.add_pragma_result_column(pragma.to_string());
             program.emit_result_row(register, 1);
             Ok((program, TransactionMode::Read))
+        }
+        PragmaName::BusyTimeout => {
+            program.emit_int(connection.get_busy_timeout().as_millis() as i64, register);
+            program.emit_result_row(register, 1);
+            program.add_pragma_result_column(pragma.to_string());
+            Ok((program, TransactionMode::None))
         }
         PragmaName::CacheSize => {
             program.emit_int(connection.get_cache_size() as i64, register);
@@ -509,7 +525,8 @@ fn query_pragma(
                     emit_columns_for_table_info(&mut program, table.columns(), base_reg);
                 } else if let Some(view_mutex) = schema.get_materialized_view(&name) {
                     let view = view_mutex.lock().unwrap();
-                    emit_columns_for_table_info(&mut program, &view.columns, base_reg);
+                    let flat_columns = view.column_schema.flat_columns();
+                    emit_columns_for_table_info(&mut program, &flat_columns, base_reg);
                 } else if let Some(view) = schema.get_view(&name) {
                     emit_columns_for_table_info(&mut program, &view.columns, base_reg);
                 }
@@ -710,7 +727,7 @@ fn emit_columns_for_table_info(
 fn update_auto_vacuum_mode(
     auto_vacuum_mode: AutoVacuumMode,
     largest_root_page_number: u32,
-    pager: Rc<Pager>,
+    pager: Arc<Pager>,
 ) -> crate::Result<()> {
     pager.io.block(|| {
         pager.with_header_mut(|header| {
@@ -723,7 +740,7 @@ fn update_auto_vacuum_mode(
 
 fn update_cache_size(
     value: i64,
-    pager: Rc<Pager>,
+    pager: Arc<Pager>,
     connection: Arc<crate::Connection>,
 ) -> crate::Result<()> {
     let mut cache_size_unformatted: i64 = value;

@@ -23,6 +23,8 @@ COPY ./extensions ./extensions/
 COPY ./macros ./macros/
 COPY ./packages ./packages/
 COPY ./parser ./parser/
+COPY ./perf/encryption ./perf/encryption
+COPY ./perf/throughput/rusqlite ./perf/throughput/rusqlite/
 COPY ./perf/throughput/turso ./perf/throughput/turso/
 COPY ./simulator ./simulator/
 COPY ./sql_generation ./sql_generation
@@ -64,7 +66,9 @@ COPY --from=planner /app/extensions ./extensions/
 COPY --from=planner /app/macros ./macros/
 COPY --from=planner /app/packages ./packages/
 COPY --from=planner /app/parser ./parser/
-COPY --from=planner /perf/throughput/turso ./perf/throughput/turso/
+COPY --from=planner /app/perf/encryption ./perf/encryption
+COPY --from=planner /app/perf/throughput/rusqlite ./perf/throughput/rusqlite/
+COPY --from=planner /app/perf/throughput/turso ./perf/throughput/turso/
 COPY --from=planner /app/simulator ./simulator/
 COPY --from=planner /app/sql_generation ./sql_generation
 COPY --from=planner /app/sqlite3 ./sqlite3/

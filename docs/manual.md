@@ -531,6 +531,19 @@ $ cargo run --features encryption -- database.db
 PRAGMA cipher = 'aegis256'; -- or 'aes256gcm'
 PRAGMA hexkey = '2d7a30108d3eb3e45c90a732041fe54778bdcf707c76749fab7da335d1b39c1d';
 ```
+Alternatively you can provide the encryption parameters directly in a **URI**. For example:
+```shell
+$ cargo run --features encryption \
+"file:database.db?cipher=aegis256&hexkey=2d7a30108d3eb3e45c90a732041fe54778bdcf707c76749fab7da335d1b39c1d"
+```
+
+
+> **Note:**  To reopen an already *encrypted database*,the file **must** opened in URI format with the `cipher` and `hexkey` passed as URI parameters. Now, to reopen `database.db` the command below must be run:
+
+```shell
+$ cargo run --features encryption \
+   "file:database.db?cipher=aegis256hexkey=2d7a30108d3eb3e45c90a732041fe54778bdcf707c76749fab7da335d1b39c1d"
+```
 
 
 ## CDC (Early Preview)

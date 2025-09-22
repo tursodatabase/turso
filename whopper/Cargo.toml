@@ -25,6 +25,8 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 turso_core = { workspace = true, features = ["simulator"]}
 turso_parser = { workspace = true }
+hex = "0.4.3"
 
 [features]
 checksum = ["turso_core/checksum"]
+encryption = ["turso_core/encryption"]

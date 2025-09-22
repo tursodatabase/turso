@@ -749,7 +749,7 @@ impl<'a> Parser<'a> {
 
     fn parse_create_materialized_view(&mut self) -> Result<Stmt> {
         eat_assert!(self, TK_MATERIALIZED);
-        eat_assert!(self, TK_VIEW);
+        eat_expect!(self, TK_VIEW);
         let if_not_exists = self.parse_if_not_exists()?;
         let view_name = self.parse_fullname(false)?;
         let columns = self.parse_eid_list(false)?;

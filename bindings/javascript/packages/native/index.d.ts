@@ -16,26 +16,6 @@ export declare class Database {
   /** Returns whether the database connection is open. */
   get open(): boolean
   /**
-   * Executes a batch of SQL statements on main thread
-   *
-   * # Arguments
-   *
-   * * `sql` - The SQL statements to execute.
-   *
-   * # Returns
-   */
-  batchSync(sql: string): void
-  /**
-   * Executes a batch of SQL statements outside of main thread
-   *
-   * # Arguments
-   *
-   * * `sql` - The SQL statements to execute.
-   *
-   * # Returns
-   */
-  batchAsync(sql: string): Promise<void>
-  /**
    * Prepares a statement for execution.
    *
    * # Arguments

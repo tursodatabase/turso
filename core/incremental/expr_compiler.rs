@@ -12,7 +12,6 @@ use crate::vdbe::insn::Insn;
 use crate::vdbe::{Program, ProgramState, Register};
 use crate::SymbolTable;
 use crate::{CaptureDataChangesMode, Connection, QueryMode, Result, Value};
-use std::rc::Rc;
 use std::sync::Arc;
 use turso_parser::ast::{Expr, Literal, Operator};
 
@@ -386,7 +385,7 @@ impl CompiledExpression {
     }
 
     /// Execute the compiled expression with the given input values
-    pub fn execute(&self, values: &[Value], pager: Rc<Pager>) -> Result<Value> {
+    pub fn execute(&self, values: &[Value], pager: Arc<Pager>) -> Result<Value> {
         match &self.executor {
             ExpressionExecutor::Trivial(trivial) => {
                 // Fast path: evaluate trivial expression inline
@@ -412,7 +411,8 @@ impl CompiledExpression {
                 // Execute the program
                 let mut pc = 0usize;
                 while pc < program.insns.len() {
-                    let (insn, insn_fn) = &program.insns[pc];
+                    let (insn, _) = &program.insns[pc];
+                    let insn_fn = insn.to_function();
                     state.pc = pc as u32;
 
                     // Execute the instruction
@@ -433,11 +433,6 @@ impl CompiledExpression {
                         crate::vdbe::execute::InsnFunctionStepResult::Interrupt => {
                             return Err(crate::LimboError::InternalError(
                                 "Expression evaluation was interrupted".to_string(),
-                            ));
-                        }
-                        crate::vdbe::execute::InsnFunctionStepResult::Busy => {
-                            return Err(crate::LimboError::InternalError(
-                                "Expression evaluation encountered busy state".to_string(),
                             ));
                         }
                         crate::vdbe::execute::InsnFunctionStepResult::Step => {

@@ -1,7 +1,7 @@
 use memmap2::{MmapMut, MmapOptions};
 use rand::{Rng, RngCore};
 use rand_chacha::ChaCha8Rng;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File as StdFile, OpenOptions};
 use std::sync::{Arc, Mutex, Weak};
 use tracing::debug;
@@ -23,6 +23,7 @@ impl Default for IOFaultConfig {
 
 pub struct SimulatorIO {
     files: Mutex<Vec<(String, Weak<SimulatorFile>)>>,
+    file_sizes: Arc<Mutex<HashMap<String, u64>>>,
     keep_files: bool,
     rng: Mutex<ChaCha8Rng>,
     fault_config: IOFaultConfig,
@@ -33,10 +34,15 @@ impl SimulatorIO {
         debug!("SimulatorIO fault config: {:?}", fault_config);
         Self {
             files: Mutex::new(Vec::new()),
+            file_sizes: Arc::new(Mutex::new(HashMap::new())),
             keep_files,
             rng: Mutex::new(rng),
             fault_config,
         }
+    }
+
+    pub fn file_sizes(&self) -> Arc<Mutex<HashMap<String, u64>>> {
+        self.file_sizes.clone()
     }
 }
 
@@ -47,6 +53,10 @@ impl Drop for SimulatorIO {
         if !self.keep_files {
             for path in paths.iter() {
                 let _ = std::fs::remove_file(path);
+                {
+                    let mut sizes = self.file_sizes.lock().unwrap();
+                    sizes.remove(path);
+                }
             }
         } else {
             for path in paths.iter() {
@@ -64,7 +74,7 @@ impl Clock for SimulatorIO {
 
 impl IO for SimulatorIO {
     fn open_file(&self, path: &str, _flags: OpenFlags, _create_new: bool) -> Result<Arc<dyn File>> {
-        let file = Arc::new(SimulatorFile::new(path));
+        let file = Arc::new(SimulatorFile::new(path, self.file_sizes.clone()));
 
         // Store weak reference to avoid keeping files open forever
         let mut files = self.files.lock().unwrap();
@@ -134,16 +144,19 @@ impl IO for SimulatorIO {
     }
 }
 
-const FILE_SIZE: usize = 1 << 30; // 1 GiB
+const MAX_FILE_SIZE: usize = 1 << 33; // 8 GiB
+pub(crate) const FILE_SIZE_SOFT_LIMIT: u64 = 6 * (1 << 30); // 6 GiB (75% of MAX_FILE_SIZE)
 
 struct SimulatorFile {
     mmap: Mutex<MmapMut>,
     size: Mutex<usize>,
+    file_sizes: Arc<Mutex<HashMap<String, u64>>>,
+    path: String,
     _file: StdFile,
 }
 
 impl SimulatorFile {
-    fn new(file_path: &str) -> Self {
+    fn new(file_path: &str, file_sizes: Arc<Mutex<HashMap<String, u64>>>) -> Self {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -152,19 +165,26 @@ impl SimulatorFile {
             .open(file_path)
             .unwrap_or_else(|e| panic!("Failed to create file {file_path}: {e}"));
 
-        file.set_len(FILE_SIZE as u64)
+        file.set_len(MAX_FILE_SIZE as u64)
             .unwrap_or_else(|e| panic!("Failed to truncate file {file_path}: {e}"));
 
         let mmap = unsafe {
             MmapOptions::new()
-                .len(FILE_SIZE)
+                .len(MAX_FILE_SIZE)
                 .map_mut(&file)
                 .unwrap_or_else(|e| panic!("mmap failed for file {file_path}: {e}"))
         };
 
+        {
+            let mut sizes = file_sizes.lock().unwrap();
+            sizes.insert(file_path.to_string(), 0);
+        }
+
         Self {
             mmap: Mutex::new(mmap),
             size: Mutex::new(0),
+            file_sizes,
+            path: file_path.to_string(),
             _file: file,
         }
     }
@@ -184,7 +204,7 @@ impl File for SimulatorFile {
         let buffer = read_completion.buf_arc();
         let len = buffer.len();
 
-        if pos + len <= FILE_SIZE {
+        if pos + len <= MAX_FILE_SIZE {
             let mmap = self.mmap.lock().unwrap();
             buffer.as_mut_slice().copy_from_slice(&mmap[pos..pos + len]);
             c.complete(len as i32);
@@ -203,12 +223,16 @@ impl File for SimulatorFile {
         let pos = pos as usize;
         let len = buffer.len();
 
-        if pos + len <= FILE_SIZE {
+        if pos + len <= MAX_FILE_SIZE {
             let mut mmap = self.mmap.lock().unwrap();
             mmap[pos..pos + len].copy_from_slice(buffer.as_slice());
             let mut size = self.size.lock().unwrap();
             if pos + len > *size {
                 *size = pos + len;
+                {
+                    let mut sizes = self.file_sizes.lock().unwrap();
+                    sizes.insert(self.path.clone(), *size as u64);
+                }
             }
             c.complete(len as i32);
         } else {
@@ -230,7 +254,7 @@ impl File for SimulatorFile {
             let mut mmap = self.mmap.lock().unwrap();
             for buffer in buffers {
                 let len = buffer.len();
-                if offset + len <= FILE_SIZE {
+                if offset + len <= MAX_FILE_SIZE {
                     mmap[offset..offset + len].copy_from_slice(buffer.as_slice());
                     offset += len;
                     total_written += len;
@@ -246,6 +270,10 @@ impl File for SimulatorFile {
             let end_pos = (pos as usize) + total_written;
             if end_pos > *size {
                 *size = end_pos;
+                {
+                    let mut sizes = self.file_sizes.lock().unwrap();
+                    sizes.insert(self.path.clone(), *size as u64);
+                }
             }
         }
 
@@ -262,6 +290,8 @@ impl File for SimulatorFile {
     fn truncate(&self, len: u64, c: Completion) -> Result<Completion> {
         let mut size = self.size.lock().unwrap();
         *size = len as usize;
+        let mut sizes = self.file_sizes.lock().unwrap();
+        sizes.insert(self.path.clone(), len);
         c.complete(0);
         Ok(c)
     }

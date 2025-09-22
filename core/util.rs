@@ -10,7 +10,7 @@ use crate::{
     types::{Value, ValueType},
     LimboError, OpenFlags, Result, Statement, StepResult, SymbolTable,
 };
-use crate::{Connection, IO};
+use crate::{Connection, MvStore, IO};
 use std::{
     collections::HashMap,
     rc::Rc,
@@ -103,17 +103,6 @@ impl<I: ?Sized + IO> IOExt for I {
     }
 }
 
-pub trait RoundToPrecision {
-    fn round_to_precision(self, precision: i32) -> f64;
-}
-
-impl RoundToPrecision for f64 {
-    fn round_to_precision(self, precision: i32) -> f64 {
-        let factor = 10f64.powi(precision);
-        (self * factor).round() / factor
-    }
-}
-
 // https://sqlite.org/lang_keywords.html
 const QUOTE_PAIRS: &[(char, char)] = &[
     ('"', '"'),
@@ -153,6 +142,7 @@ pub fn parse_schema_rows(
     syms: &SymbolTable,
     mv_tx: Option<(u64, TransactionMode)>,
     mut existing_views: HashMap<String, Arc<Mutex<IncrementalView>>>,
+    mv_store: Option<&Arc<MvStore>>,
 ) -> Result<()> {
     rows.set_mv_tx(mv_tx);
     // TODO: if we IO, this unparsed indexes is lost. Will probably need some state between
@@ -162,6 +152,9 @@ pub fn parse_schema_rows(
 
     // Store DBSP state table root pages: view_name -> dbsp_state_root_page
     let mut dbsp_state_roots: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    // Store DBSP state table index root pages: view_name -> dbsp_state_index_root_page
+    let mut dbsp_state_index_roots: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
     // Store materialized view info (SQL and root page) for later creation
     let mut materialized_view_info: std::collections::HashMap<String, (String, usize)> =
@@ -185,8 +178,10 @@ pub fn parse_schema_rows(
                     &mut from_sql_indexes,
                     &mut automatic_indices,
                     &mut dbsp_state_roots,
+                    &mut dbsp_state_index_roots,
                     &mut materialized_view_info,
-                )?;
+                    mv_store,
+                )?
             }
             StepResult::IO => {
                 // TODO: How do we ensure that the I/O we submitted to
@@ -200,7 +195,11 @@ pub fn parse_schema_rows(
     }
 
     schema.populate_indices(from_sql_indexes, automatic_indices)?;
-    schema.populate_materialized_views(materialized_view_info, dbsp_state_roots)?;
+    schema.populate_materialized_views(
+        materialized_view_info,
+        dbsp_state_roots,
+        dbsp_state_index_roots,
+    )?;
 
     Ok(())
 }
@@ -1060,14 +1059,66 @@ pub fn parse_pragma_bool(expr: &Expr) -> Result<bool> {
 pub fn extract_column_name_from_expr(expr: impl AsRef<ast::Expr>) -> Option<String> {
     match expr.as_ref() {
         ast::Expr::Id(name) => Some(name.as_str().to_string()),
-        ast::Expr::Qualified(_, name) => Some(name.as_str().to_string()),
+        ast::Expr::DoublyQualified(_, _, name) | ast::Expr::Qualified(_, name) => {
+            Some(normalize_ident(name.as_str()))
+        }
         _ => None,
     }
 }
 
+/// Information about a table referenced in a view
+#[derive(Debug, Clone)]
+pub struct ViewTable {
+    /// The full table name (potentially including database qualifier like "main.customers")
+    pub name: String,
+    /// Optional alias (e.g., "c" in "FROM customers c")
+    pub alias: Option<String>,
+}
+
+/// Information about a column in the view's output
+#[derive(Debug, Clone)]
+pub struct ViewColumn {
+    /// Index into ViewColumnSchema.tables indicating which table this column comes from
+    /// For computed columns or constants, this will be usize::MAX
+    pub table_index: usize,
+    /// The actual column definition
+    pub column: Column,
+}
+
+/// Schema information for a view, tracking which columns come from which tables
+#[derive(Debug, Clone)]
+pub struct ViewColumnSchema {
+    /// All tables referenced by the view (in order of appearance)
+    pub tables: Vec<ViewTable>,
+    /// The view's output columns with their table associations
+    pub columns: Vec<ViewColumn>,
+}
+
+impl ViewColumnSchema {
+    /// Get all columns as a flat vector (without table association info)
+    pub fn flat_columns(&self) -> Vec<Column> {
+        self.columns.iter().map(|vc| vc.column.clone()).collect()
+    }
+
+    /// Get columns that belong to a specific table
+    pub fn table_columns(&self, table_index: usize) -> Vec<Column> {
+        self.columns
+            .iter()
+            .filter(|vc| vc.table_index == table_index)
+            .map(|vc| vc.column.clone())
+            .collect()
+    }
+}
+
 /// Extract column information from a SELECT statement for view creation
-pub fn extract_view_columns(select_stmt: &ast::Select, schema: &Schema) -> Vec<Column> {
+pub fn extract_view_columns(
+    select_stmt: &ast::Select,
+    schema: &Schema,
+) -> Result<ViewColumnSchema> {
+    let mut tables = Vec::new();
     let mut columns = Vec::new();
+    let mut column_name_counts: HashMap<String, usize> = HashMap::new();
+
     // Navigate to the first SELECT in the statement
     if let ast::OneSelect::Select {
         ref from,
@@ -1075,23 +1126,85 @@ pub fn extract_view_columns(select_stmt: &ast::Select, schema: &Schema) -> Vec<C
         ..
     } = &select_stmt.body.select
     {
-        // First, we need to figure out which table(s) are being selected from
-        let table_name = if let Some(from) = from {
-            if let ast::SelectTable::Table(qualified_name, _, _) = from.select.as_ref() {
-                Some(normalize_ident(qualified_name.name.as_str()))
-            } else {
-                None
+        // First, extract all tables (from FROM clause and JOINs)
+        if let Some(from) = from {
+            // Add the main table from FROM clause
+            match from.select.as_ref() {
+                ast::SelectTable::Table(qualified_name, alias, _) => {
+                    let table_name = if qualified_name.db_name.is_some() {
+                        // Include database qualifier if present
+                        qualified_name.to_string()
+                    } else {
+                        normalize_ident(qualified_name.name.as_str())
+                    };
+                    tables.push(ViewTable {
+                        name: table_name.clone(),
+                        alias: alias.as_ref().map(|a| match a {
+                            ast::As::As(name) => normalize_ident(name.as_str()),
+                            ast::As::Elided(name) => normalize_ident(name.as_str()),
+                        }),
+                    });
+                }
+                _ => {
+                    // Handle other types like subqueries if needed
+                }
             }
-        } else {
-            None
+
+            // Add tables from JOINs
+            for join in &from.joins {
+                match join.table.as_ref() {
+                    ast::SelectTable::Table(qualified_name, alias, _) => {
+                        let table_name = if qualified_name.db_name.is_some() {
+                            // Include database qualifier if present
+                            qualified_name.to_string()
+                        } else {
+                            normalize_ident(qualified_name.name.as_str())
+                        };
+                        tables.push(ViewTable {
+                            name: table_name.clone(),
+                            alias: alias.as_ref().map(|a| match a {
+                                ast::As::As(name) => normalize_ident(name.as_str()),
+                                ast::As::Elided(name) => normalize_ident(name.as_str()),
+                            }),
+                        });
+                    }
+                    _ => {
+                        // Handle other types like subqueries if needed
+                    }
+                }
+            }
+        }
+
+        // Helper function to find table index by name or alias
+        let find_table_index = |name: &str| -> Option<usize> {
+            tables
+                .iter()
+                .position(|t| t.name == name || t.alias.as_ref().is_some_and(|a| a == name))
         };
-        // Get the table for column resolution
-        let _table = table_name.as_ref().and_then(|name| schema.get_table(name));
+
         // Process each column in the SELECT list
-        for (i, result_col) in select_columns.iter().enumerate() {
+        for result_col in select_columns.iter() {
             match result_col {
                 ast::ResultColumn::Expr(expr, alias) => {
-                    let name = alias
+                    // Figure out which table this expression comes from
+                    let table_index = match expr.as_ref() {
+                        ast::Expr::Qualified(table_ref, _col_name) => {
+                            // Column qualified with table name
+                            find_table_index(table_ref.as_str())
+                        }
+                        ast::Expr::Id(_col_name) => {
+                            // Unqualified column - would need to resolve based on schema
+                            // For now, assume it's from the first table if there is one
+                            if !tables.is_empty() {
+                                Some(0)
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None, // Expression, literal, etc.
+                    };
+
+                    let col_name = alias
                         .as_ref()
                         .map(|a| match a {
                             ast::As::Elided(name) => name.as_str().to_string(),
@@ -1102,41 +1215,65 @@ pub fn extract_view_columns(select_stmt: &ast::Select, schema: &Schema) -> Vec<C
                             // If we can't extract a simple column name, use the expression itself
                             expr.to_string()
                         });
-                    columns.push(Column {
-                        name: Some(name),
-                        ty: Type::Text, // Default to TEXT, could be refined with type analysis
-                        ty_str: "TEXT".to_string(),
-                        primary_key: false, // Views don't have primary keys
-                        is_rowid_alias: false,
-                        notnull: false, // Views typically don't enforce NOT NULL
-                        default: None,  // Views don't have default values
-                        unique: false,
-                        collation: None,
-                        hidden: false,
+
+                    columns.push(ViewColumn {
+                        table_index: table_index.unwrap_or(usize::MAX),
+                        column: Column {
+                            name: Some(col_name),
+                            ty: Type::Text, // Default to TEXT, could be refined with type analysis
+                            ty_str: "TEXT".to_string(),
+                            primary_key: false,
+                            is_rowid_alias: false,
+                            notnull: false,
+                            default: None,
+                            unique: false,
+                            collation: None,
+                            hidden: false,
+                        },
                     });
                 }
                 ast::ResultColumn::Star => {
-                    // For SELECT *, expand to all columns from the table
-                    if let Some(ref table_name) = table_name {
-                        if let Some(table) = schema.get_table(table_name) {
-                            // Copy all columns from the table, but adjust for view constraints
-                            for table_column in table.columns() {
-                                columns.push(Column {
-                                    name: table_column.name.clone(),
-                                    ty: table_column.ty,
-                                    ty_str: table_column.ty_str.clone(),
-                                    primary_key: false, // Views don't have primary keys
-                                    is_rowid_alias: false,
-                                    notnull: false, // Views typically don't enforce NOT NULL
-                                    default: None,  // Views don't have default values
-                                    unique: false,
-                                    collation: table_column.collation,
-                                    hidden: false,
+                    // For SELECT *, expand to all columns from all tables
+                    for (table_idx, table) in tables.iter().enumerate() {
+                        if let Some(table_obj) = schema.get_table(&table.name) {
+                            for table_column in table_obj.columns() {
+                                let col_name =
+                                    table_column.name.clone().unwrap_or_else(|| "?".to_string());
+
+                                // Handle duplicate column names by adding suffix
+                                let final_name =
+                                    if let Some(count) = column_name_counts.get_mut(&col_name) {
+                                        *count += 1;
+                                        format!("{}:{}", col_name, *count - 1)
+                                    } else {
+                                        column_name_counts.insert(col_name.clone(), 1);
+                                        col_name.clone()
+                                    };
+
+                                columns.push(ViewColumn {
+                                    table_index: table_idx,
+                                    column: Column {
+                                        name: Some(final_name),
+                                        ty: table_column.ty,
+                                        ty_str: table_column.ty_str.clone(),
+                                        primary_key: false,
+                                        is_rowid_alias: false,
+                                        notnull: false,
+                                        default: None,
+                                        unique: false,
+                                        collation: table_column.collation,
+                                        hidden: false,
+                                    },
                                 });
                             }
-                        } else {
-                            // Table not found, create placeholder
-                            columns.push(Column {
+                        }
+                    }
+
+                    // If no tables, create a placeholder
+                    if tables.is_empty() {
+                        columns.push(ViewColumn {
+                            table_index: usize::MAX,
+                            column: Column {
                                 name: Some("*".to_string()),
                                 ty: Type::Text,
                                 ty_str: "TEXT".to_string(),
@@ -1147,63 +1284,70 @@ pub fn extract_view_columns(select_stmt: &ast::Select, schema: &Schema) -> Vec<C
                                 unique: false,
                                 collation: None,
                                 hidden: false,
-                            });
-                        }
-                    } else {
-                        // No FROM clause or couldn't determine table, create placeholder
-                        columns.push(Column {
-                            name: Some("*".to_string()),
-                            ty: Type::Text,
-                            ty_str: "TEXT".to_string(),
-                            primary_key: false,
-                            is_rowid_alias: false,
-                            notnull: false,
-                            default: None,
-                            unique: false,
-                            collation: None,
-                            hidden: false,
+                            },
                         });
                     }
                 }
-                ast::ResultColumn::TableStar(table_name) => {
+                ast::ResultColumn::TableStar(table_ref) => {
                     // For table.*, expand to all columns from the specified table
-                    let table_name_str = normalize_ident(table_name.as_str());
-                    if let Some(table) = schema.get_table(&table_name_str) {
-                        // Copy all columns from the table, but adjust for view constraints
-                        for table_column in table.columns() {
-                            columns.push(Column {
-                                name: table_column.name.clone(),
-                                ty: table_column.ty,
-                                ty_str: table_column.ty_str.clone(),
-                                primary_key: false,
-                                is_rowid_alias: false,
-                                notnull: false,
-                                default: None,
-                                unique: false,
-                                collation: table_column.collation,
-                                hidden: false,
+                    let table_name_str = normalize_ident(table_ref.as_str());
+                    if let Some(table_idx) = find_table_index(&table_name_str) {
+                        if let Some(table) = schema.get_table(&tables[table_idx].name) {
+                            for table_column in table.columns() {
+                                let col_name =
+                                    table_column.name.clone().unwrap_or_else(|| "?".to_string());
+
+                                // Handle duplicate column names by adding suffix
+                                let final_name =
+                                    if let Some(count) = column_name_counts.get_mut(&col_name) {
+                                        *count += 1;
+                                        format!("{}:{}", col_name, *count - 1)
+                                    } else {
+                                        column_name_counts.insert(col_name.clone(), 1);
+                                        col_name.clone()
+                                    };
+
+                                columns.push(ViewColumn {
+                                    table_index: table_idx,
+                                    column: Column {
+                                        name: Some(final_name),
+                                        ty: table_column.ty,
+                                        ty_str: table_column.ty_str.clone(),
+                                        primary_key: false,
+                                        is_rowid_alias: false,
+                                        notnull: false,
+                                        default: None,
+                                        unique: false,
+                                        collation: table_column.collation,
+                                        hidden: false,
+                                    },
+                                });
+                            }
+                        } else {
+                            // Table not found, create placeholder
+                            columns.push(ViewColumn {
+                                table_index: usize::MAX,
+                                column: Column {
+                                    name: Some(format!("{table_name_str}.*")),
+                                    ty: Type::Text,
+                                    ty_str: "TEXT".to_string(),
+                                    primary_key: false,
+                                    is_rowid_alias: false,
+                                    notnull: false,
+                                    default: None,
+                                    unique: false,
+                                    collation: None,
+                                    hidden: false,
+                                },
                             });
                         }
-                    } else {
-                        // Table not found, create placeholder
-                        columns.push(Column {
-                            name: Some(format!("{table_name_str}.*")),
-                            ty: Type::Text,
-                            ty_str: "TEXT".to_string(),
-                            primary_key: false,
-                            is_rowid_alias: false,
-                            notnull: false,
-                            default: None,
-                            unique: false,
-                            collation: None,
-                            hidden: false,
-                        });
                     }
                 }
             }
         }
     }
-    columns
+
+    Ok(ViewColumnSchema { tables, columns })
 }
 
 #[cfg(test)]

@@ -34,7 +34,6 @@ impl<T> DerefMut for SpinLockGuard<'_, T> {
     }
 }
 
-unsafe impl<T: Send> Send for SpinLock<T> {}
 unsafe impl<T> Sync for SpinLock<T> {}
 
 impl<T> SpinLock<T> {
@@ -45,7 +44,7 @@ impl<T> SpinLock<T> {
         }
     }
 
-    pub fn lock(&self) -> SpinLockGuard<T> {
+    pub fn lock(&self) -> SpinLockGuard<'_, T> {
         while self.locked.swap(true, Ordering::Acquire) {
             std::hint::spin_loop();
         }

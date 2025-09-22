@@ -75,6 +75,8 @@ pub struct Opts {
     pub tracing_output: Option<String>,
     #[clap(long, help = "Start MCP server instead of interactive shell")]
     pub mcp: bool,
+    #[clap(long, help = "Enable experimental logical log feature")]
+    pub experimental_logical_log: bool,
 }
 
 const PROMPT: &str = "turso> ";
@@ -183,6 +185,7 @@ impl Limbo {
                     .with_indexes(indexes_enabled)
                     .with_views(opts.experimental_views)
                     .with_strict(opts.experimental_strict),
+                None,
             )?;
             let conn = db.connect()?;
             (io, conn)
@@ -1101,7 +1104,7 @@ impl Limbo {
         table_name: &str,
     ) -> anyhow::Result<bool> {
         let sql = format!(
-            "SELECT sql, type, name FROM {db_prefix}.sqlite_schema WHERE type IN ('table', 'index', 'view') AND (tbl_name = '{table_name}' OR name = '{table_name}') AND name NOT LIKE 'sqlite_%' ORDER BY CASE type WHEN 'table' THEN 1 WHEN 'view' THEN 2 WHEN 'index' THEN 3 END, rowid"
+            "SELECT sql, type, name FROM {db_prefix}.sqlite_schema WHERE type IN ('table', 'index', 'view') AND (tbl_name = '{table_name}' OR name = '{table_name}') AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '__turso_internal_%' ORDER BY CASE type WHEN 'table' THEN 1 WHEN 'view' THEN 2 WHEN 'index' THEN 3 END, rowid"
         );
 
         let mut found = false;
@@ -1134,7 +1137,7 @@ impl Limbo {
         db_prefix: &str,
         db_display_name: &str,
     ) -> anyhow::Result<()> {
-        let sql = format!("SELECT sql, type, name FROM {db_prefix}.sqlite_schema WHERE type IN ('table', 'index', 'view') AND name NOT LIKE 'sqlite_%' ORDER BY CASE type WHEN 'table' THEN 1 WHEN 'view' THEN 2 WHEN 'index' THEN 3 END, rowid");
+        let sql = format!("SELECT sql, type, name FROM {db_prefix}.sqlite_schema WHERE type IN ('table', 'index', 'view') AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '__turso_internal_%' ORDER BY CASE type WHEN 'table' THEN 1 WHEN 'view' THEN 2 WHEN 'index' THEN 3 END, rowid");
 
         match self.conn.query(&sql) {
             Ok(Some(ref mut rows)) => loop {

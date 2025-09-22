@@ -1,4 +1,5 @@
 use crate::incremental::view::IncrementalView;
+use parking_lot::RwLock;
 
 /// Simple view structure for non-materialized views
 #[derive(Debug, Clone)]
@@ -12,7 +13,6 @@ pub struct View {
 /// Type alias for regular views collection
 pub type ViewsMap = HashMap<String, View>;
 
-use crate::result::LimboResult;
 use crate::storage::btree::BTreeCursor;
 use crate::translate::collate::CollationSeq;
 use crate::translate::plan::SelectPlan;
@@ -21,14 +21,12 @@ use crate::util::{
 };
 use crate::{
     contains_ignore_ascii_case, eq_ignore_ascii_case, match_ignore_ascii_case, LimboError,
-    MvCursor, Pager, RefValue, SymbolTable, VirtualTable,
+    MvCursor, MvStore, Pager, RefValue, SymbolTable, VirtualTable,
 };
 use crate::{util::normalize_ident, Result};
 use core::fmt;
-use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::ops::Deref;
-use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::Mutex;
 use tracing::trace;
@@ -294,11 +292,15 @@ impl Schema {
     /// Update [Schema] by scanning the first root page (sqlite_schema)
     pub fn make_from_btree(
         &mut self,
-        mv_cursor: Option<Rc<RefCell<MvCursor>>>,
-        pager: Rc<Pager>,
+        mv_cursor: Option<Arc<RwLock<MvCursor>>>,
+        pager: Arc<Pager>,
         syms: &SymbolTable,
     ) -> Result<()> {
-        let mut cursor = BTreeCursor::new_table(mv_cursor, pager.clone(), 1, 10);
+        assert!(
+            mv_cursor.is_none(),
+            "mvcc not yet supported for make_from_btree"
+        );
+        let mut cursor = BTreeCursor::new_table(mv_cursor, Arc::clone(&pager), 1, 10);
 
         let mut from_sql_indexes = Vec::with_capacity(10);
         let mut automatic_indices: HashMap<String, Vec<(String, usize)>> =
@@ -306,12 +308,12 @@ impl Schema {
 
         // Store DBSP state table root pages: view_name -> dbsp_state_root_page
         let mut dbsp_state_roots: HashMap<String, usize> = HashMap::new();
+        // Store DBSP state table index root pages: view_name -> dbsp_state_index_root_page
+        let mut dbsp_state_index_roots: HashMap<String, usize> = HashMap::new();
         // Store materialized view info (SQL and root page) for later creation
         let mut materialized_view_info: HashMap<String, (String, usize)> = HashMap::new();
 
-        if matches!(pager.begin_read_tx()?, LimboResult::Busy) {
-            return Err(LimboError::Busy);
-        }
+        pager.begin_read_tx()?;
 
         pager.io.block(|| cursor.rewind())?;
 
@@ -357,7 +359,9 @@ impl Schema {
                 &mut from_sql_indexes,
                 &mut automatic_indices,
                 &mut dbsp_state_roots,
+                &mut dbsp_state_index_roots,
                 &mut materialized_view_info,
+                None,
             )?;
             drop(record_cursor);
             drop(row);
@@ -369,7 +373,11 @@ impl Schema {
 
         self.populate_indices(from_sql_indexes, automatic_indices)?;
 
-        self.populate_materialized_views(materialized_view_info, dbsp_state_roots)?;
+        self.populate_materialized_views(
+            materialized_view_info,
+            dbsp_state_roots,
+            dbsp_state_index_roots,
+        )?;
 
         Ok(())
     }
@@ -492,6 +500,7 @@ impl Schema {
         &mut self,
         materialized_view_info: std::collections::HashMap<String, (String, usize)>,
         dbsp_state_roots: std::collections::HashMap<String, usize>,
+        dbsp_state_index_roots: std::collections::HashMap<String, usize>,
     ) -> Result<()> {
         for (view_name, (sql, main_root)) in materialized_view_info {
             // Look up the DBSP state root for this view - must exist for materialized views
@@ -501,16 +510,24 @@ impl Schema {
                 ))
             })?;
 
-            // Create the IncrementalView with both root pages
-            let incremental_view =
-                IncrementalView::from_sql(&sql, self, main_root, *dbsp_state_root)?;
+            // Look up the DBSP state index root (may not exist for older schemas)
+            let dbsp_state_index_root =
+                dbsp_state_index_roots.get(&view_name).copied().unwrap_or(0);
+            // Create the IncrementalView with all root pages
+            let incremental_view = IncrementalView::from_sql(
+                &sql,
+                self,
+                main_root,
+                *dbsp_state_root,
+                dbsp_state_index_root,
+            )?;
             let referenced_tables = incremental_view.get_referenced_table_names();
 
             // Create a BTreeTable for the materialized view
             let table = Arc::new(Table::BTree(Arc::new(BTreeTable {
                 name: view_name.clone(),
                 root_page: main_root,
-                columns: incremental_view.columns.clone(),
+                columns: incremental_view.column_schema.flat_columns(),
                 primary_key_columns: Vec::new(),
                 has_rowid: true,
                 is_strict: false,
@@ -539,7 +556,9 @@ impl Schema {
         from_sql_indexes: &mut Vec<UnparsedFromSqlIndex>,
         automatic_indices: &mut std::collections::HashMap<String, Vec<(String, usize)>>,
         dbsp_state_roots: &mut std::collections::HashMap<String, usize>,
+        dbsp_state_index_roots: &mut std::collections::HashMap<String, usize>,
         materialized_view_info: &mut std::collections::HashMap<String, (String, usize)>,
+        mv_store: Option<&Arc<MvStore>>,
     ) -> Result<()> {
         match ty {
             "table" => {
@@ -561,6 +580,9 @@ impl Schema {
                         )?
                     };
                     self.add_virtual_table(vtab);
+                    if let Some(mv_store) = mv_store {
+                        mv_store.mark_table_as_loaded(root_page as u64);
+                    }
                 } else {
                     let table = BTreeTable::from_sql(sql, root_page as usize)?;
 
@@ -575,10 +597,14 @@ impl Schema {
                         dbsp_state_roots.insert(view_name, root_page as usize);
                     }
 
+                    if let Some(mv_store) = mv_store {
+                        mv_store.mark_table_as_loaded(root_page as u64);
+                    }
                     self.add_btree_table(Arc::new(table));
                 }
             }
             "index" => {
+                assert!(mv_store.is_none(), "indexes not yet supported for mvcc");
                 match maybe_sql {
                     Some(sql) => {
                         from_sql_indexes.push(UnparsedFromSqlIndex {
@@ -593,12 +619,23 @@ impl Schema {
                         // index|sqlite_autoindex_foo_1|foo|3|
                         let index_name = name.to_string();
                         let table_name = table_name.to_string();
-                        match automatic_indices.entry(table_name) {
-                            std::collections::hash_map::Entry::Vacant(e) => {
-                                e.insert(vec![(index_name, root_page as usize)]);
-                            }
-                            std::collections::hash_map::Entry::Occupied(mut e) => {
-                                e.get_mut().push((index_name, root_page as usize));
+
+                        // Check if this is an index for a DBSP state table
+                        if table_name.starts_with(DBSP_TABLE_PREFIX) {
+                            // Extract the view name from __turso_internal_dbsp_state_<viewname>
+                            let view_name = table_name
+                                .strip_prefix(DBSP_TABLE_PREFIX)
+                                .unwrap()
+                                .to_string();
+                            dbsp_state_index_roots.insert(view_name, root_page as usize);
+                        } else {
+                            match automatic_indices.entry(table_name) {
+                                std::collections::hash_map::Entry::Vacant(e) => {
+                                    e.insert(vec![(index_name, root_page as usize)]);
+                                }
+                                std::collections::hash_map::Entry::Occupied(mut e) => {
+                                    e.get_mut().push((index_name, root_page as usize));
+                                }
                             }
                         }
                     }
@@ -611,6 +648,7 @@ impl Schema {
 
                 let sql = maybe_sql.expect("sql should be present for view");
                 let view_name = name.to_string();
+                assert!(mv_store.is_none(), "views not yet supported for mvcc");
 
                 // Parse the SQL to determine if it's a regular or materialized view
                 let mut parser = Parser::new(sql.as_bytes());
@@ -635,11 +673,12 @@ impl Schema {
                             ..
                         } => {
                             // Extract actual columns from the SELECT statement
-                            let view_columns = crate::util::extract_view_columns(&select, self);
+                            let view_column_schema =
+                                crate::util::extract_view_columns(&select, self)?;
 
                             // If column names were provided in CREATE VIEW (col1, col2, ...),
                             // use them to rename the columns
-                            let mut final_columns = view_columns;
+                            let mut final_columns = view_column_schema.flat_columns();
                             for (i, indexed_col) in column_names.iter().enumerate() {
                                 if let Some(col) = final_columns.get_mut(i) {
                                     col.name = Some(indexed_col.col_name.to_string());

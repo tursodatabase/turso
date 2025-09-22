@@ -1,4 +1,5 @@
-use std::{cell::RefCell, result::Result, sync::Arc};
+use parking_lot::RwLock;
+use std::{result::Result, sync::Arc};
 
 use turso_ext::{ConstraintOp, ConstraintUsage, ResultCode};
 
@@ -37,8 +38,8 @@ impl InternalVirtualTable for JsonEachVirtualTable {
     fn open(
         &self,
         _conn: Arc<Connection>,
-    ) -> crate::Result<std::sync::Arc<RefCell<(dyn InternalVirtualTableCursor + 'static)>>> {
-        Ok(Arc::new(RefCell::new(JsonEachCursor::default())))
+    ) -> crate::Result<std::sync::Arc<RwLock<dyn InternalVirtualTableCursor + 'static>>> {
+        Ok(Arc::new(RwLock::new(JsonEachCursor::default())))
     }
 
     fn best_index(

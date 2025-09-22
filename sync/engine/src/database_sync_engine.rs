@@ -1,5 +1,4 @@
 use std::{
-    cell::RefCell,
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
 };
@@ -37,6 +36,7 @@ pub struct DatabaseSyncEngineOpts {
     pub tables_ignore: Vec<String>,
     pub use_transform: bool,
     pub wal_pull_batch_size: u64,
+    pub long_poll_timeout: Option<std::time::Duration>,
     pub protocol_version_hint: DatabaseSyncEngineProtocolVersion,
 }
 
@@ -51,7 +51,7 @@ pub struct DatabaseSyncEngine<P: ProtocolIO> {
     meta_path: String,
     changes_file: Arc<Mutex<Option<Arc<dyn turso_core::File>>>>,
     opts: DatabaseSyncEngineOpts,
-    meta: RefCell<DatabaseMetadata>,
+    meta: Mutex<DatabaseMetadata>,
     client_unique_id: String,
 }
 
@@ -138,6 +138,7 @@ impl<P: ProtocolIO> DatabaseSyncEngine<P> {
             db_file.clone(),
             OpenFlags::Create,
             turso_core::DatabaseOpts::new().with_indexes(true),
+            None,
         )?;
         let tape_opts = DatabaseTapeOpts {
             cdc_table: None,
@@ -146,7 +147,7 @@ impl<P: ProtocolIO> DatabaseSyncEngine<P> {
         tracing::info!("initialize database tape connection: path={}", main_db_path);
         let main_tape = DatabaseTape::new_with_opts(main_db, tape_opts);
         let changes_file = io.open_file(&changes_path, OpenFlags::Create, false)?;
-        let mut db = Self {
+        let db = Self {
             io,
             protocol,
             db_file,
@@ -157,7 +158,7 @@ impl<P: ProtocolIO> DatabaseSyncEngine<P> {
             meta_path: format!("{main_db_path}-info"),
             changes_file: Arc::new(Mutex::new(Some(changes_file))),
             opts,
-            meta: RefCell::new(meta.clone()),
+            meta: Mutex::new(meta.clone()),
             client_unique_id: meta.client_unique_id.clone(),
         };
 
@@ -175,7 +176,7 @@ impl<P: ProtocolIO> DatabaseSyncEngine<P> {
         Ok(db)
     }
 
-    fn open_revert_db_conn(&mut self) -> Result<Arc<turso_core::Connection>> {
+    fn open_revert_db_conn(&self) -> Result<Arc<turso_core::Connection>> {
         let db = turso_core::Database::open_with_flags_bypass_registry(
             self.io.clone(),
             &self.main_db_path,
@@ -183,16 +184,14 @@ impl<P: ProtocolIO> DatabaseSyncEngine<P> {
             self.db_file.clone(),
             OpenFlags::Create,
             turso_core::DatabaseOpts::new().with_indexes(true),
+            None,
         )?;
         let conn = db.connect()?;
         conn.wal_auto_checkpoint_disable();
         Ok(conn)
     }
 
-    async fn checkpoint_passive<Ctx>(
-        &mut self,
-        coro: &Coro<Ctx>,
-    ) -> Result<(Option<Vec<u32>>, u64)> {
+    async fn checkpoint_passive<Ctx>(&self, coro: &Coro<Ctx>) -> Result<(Option<Vec<u32>>, u64)> {
         let watermark = self.meta().revert_since_wal_watermark;
         tracing::info!(
             "checkpoint(path={:?}): revert_since_wal_watermark={}",
@@ -271,9 +270,13 @@ impl<P: ProtocolIO> DatabaseSyncEngine<P> {
         })
     }
 
-    pub async fn checkpoint<Ctx>(&mut self, coro: &Coro<Ctx>) -> Result<()> {
+    pub async fn checkpoint<Ctx>(&self, coro: &Coro<Ctx>) -> Result<()> {
         let (main_wal_salt, watermark) = self.checkpoint_passive(coro).await?;
 
+        tracing::info!(
+            "checkpoint(path={:?}): passive checkpoint is done",
+            self.main_db_path
+        );
         let main_conn = connect_untracked(&self.main_tape)?;
         let revert_conn = self.open_revert_db_conn()?;
 
@@ -384,6 +387,7 @@ impl<P: ProtocolIO> DatabaseSyncEngine<P> {
             &file.value,
             &revision,
             self.opts.wal_pull_batch_size,
+            self.opts.long_poll_timeout,
         )
         .await?;
 
@@ -417,10 +421,17 @@ impl<P: ProtocolIO> DatabaseSyncEngine<P> {
     /// This method will **not** send local changed to the remote
     /// This method will block writes for the period of pull
     pub async fn apply_changes_from_remote<Ctx>(
-        &mut self,
+        &self,
         coro: &Coro<Ctx>,
         remote_changes: DbChangesStatus,
     ) -> Result<()> {
+        if remote_changes.file_slot.is_none() {
+            self.update_meta(coro, |m| {
+                m.last_pull_unix_time = remote_changes.time.secs;
+            })
+            .await?;
+            return Ok(());
+        }
         assert!(remote_changes.file_slot.is_some(), "file_slot must be set");
         let changes_file = remote_changes.file_slot.as_ref().unwrap().value.clone();
         let pull_result = self.apply_changes_internal(coro, &changes_file).await;
@@ -445,7 +456,7 @@ impl<P: ProtocolIO> DatabaseSyncEngine<P> {
         Ok(())
     }
     async fn apply_changes_internal<Ctx>(
-        &mut self,
+        &self,
         coro: &Coro<Ctx>,
         changes_file: &Arc<dyn turso_core::File>,
     ) -> Result<u64> {
@@ -650,7 +661,7 @@ impl<P: ProtocolIO> DatabaseSyncEngine<P> {
 
     /// Sync local changes to remote DB and bring new changes from remote to local
     /// This method will block writes for the period of sync
-    pub async fn sync<Ctx>(&mut self, coro: &Coro<Ctx>) -> Result<()> {
+    pub async fn sync<Ctx>(&self, coro: &Coro<Ctx>) -> Result<()> {
         // todo(sivukhin): this is bit suboptimal as both 'push' and 'pull' will call pull_synced_from_remote
         // but for now - keep it simple
         self.push_changes_to_remote(coro).await?;
@@ -658,21 +669,14 @@ impl<P: ProtocolIO> DatabaseSyncEngine<P> {
         Ok(())
     }
 
-    pub async fn pull_changes_from_remote<Ctx>(&mut self, coro: &Coro<Ctx>) -> Result<()> {
+    pub async fn pull_changes_from_remote<Ctx>(&self, coro: &Coro<Ctx>) -> Result<()> {
         let changes = self.wait_changes_from_remote(coro).await?;
-        if changes.file_slot.is_some() {
-            self.apply_changes_from_remote(coro, changes).await?;
-        } else {
-            self.update_meta(coro, |m| {
-                m.last_pull_unix_time = changes.time.secs;
-            })
-            .await?;
-        }
+        self.apply_changes_from_remote(coro, changes).await?;
         Ok(())
     }
 
-    fn meta(&self) -> std::cell::Ref<'_, DatabaseMetadata> {
-        self.meta.borrow()
+    fn meta(&self) -> std::sync::MutexGuard<'_, DatabaseMetadata> {
+        self.meta.lock().unwrap()
     }
 
     async fn update_meta<Ctx>(
@@ -686,7 +690,7 @@ impl<P: ProtocolIO> DatabaseSyncEngine<P> {
         let completion = self.protocol.full_write(&self.meta_path, meta.dump()?)?;
         // todo: what happen if we will actually update the metadata on disk but fail and so in memory state will not be updated
         wait_all_results(coro, &completion).await?;
-        self.meta.replace(meta);
+        *self.meta.lock().unwrap() = meta;
         Ok(())
     }
 }

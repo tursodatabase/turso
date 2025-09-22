@@ -425,10 +425,7 @@ impl EncryptionContext {
 
     #[cfg(feature = "encryption")]
     pub fn encrypt_page(&self, page: &[u8], page_id: usize) -> Result<Vec<u8>> {
-        if page_id == 1 {
-            tracing::debug!("skipping encryption for page 1 (database header)");
-            return Ok(page.to_vec());
-        }
+        use crate::storage::sqlite3_ondisk::DatabaseHeader;
         tracing::debug!("encrypting page {}", page_id);
         assert_eq!(
             page.len(),
@@ -437,26 +434,40 @@ impl EncryptionContext {
             self.page_size
         );
 
+        let encryption_start_offset = match page_id {
+            DatabaseHeader::PAGE_ID => DatabaseHeader::SIZE,
+            _ => 0,
+        };
         let metadata_size = self.cipher_mode.metadata_size();
         let reserved_bytes = &page[self.page_size - metadata_size..];
-        let reserved_bytes_zeroed = reserved_bytes.iter().all(|&b| b == 0);
-        assert!(
-            reserved_bytes_zeroed,
-            "last reserved bytes must be empty/zero, but found non-zero bytes"
-        );
 
-        let payload = &page[..self.page_size - metadata_size];
+        #[cfg(debug_assertions)]
+        {
+            use crate::turso_assert;
+            // In debug builds, ensure that the reserved bytes are zeroed out. So even when we are
+            // reusing a page from buffer pool, we zero out in debug build so that we can be
+            // sure that b tree layer is not writing any data into the reserved space.
+            let reserved_bytes_zeroed = reserved_bytes.iter().all(|&b| b == 0);
+            turso_assert!(
+                reserved_bytes_zeroed,
+                "last reserved bytes must be empty/zero, but found non-zero bytes"
+            );
+        }
+
+        let payload = &page[encryption_start_offset..self.page_size - metadata_size];
         let (encrypted, nonce) = self.encrypt_raw(payload)?;
 
         let nonce_size = self.cipher_mode.nonce_size();
         assert_eq!(
             encrypted.len(),
-            self.page_size - nonce_size,
+            self.page_size - nonce_size - encryption_start_offset,
             "Encrypted page must be exactly {} bytes",
-            self.page_size - nonce_size
+            self.page_size - nonce_size - encryption_start_offset
         );
 
         let mut result = Vec::with_capacity(self.page_size);
+
+        result.extend_from_slice(&page[..encryption_start_offset]);
         result.extend_from_slice(&encrypted);
         result.extend_from_slice(&nonce);
         assert_eq!(
@@ -470,10 +481,7 @@ impl EncryptionContext {
 
     #[cfg(feature = "encryption")]
     pub fn decrypt_page(&self, encrypted_page: &[u8], page_id: usize) -> Result<Vec<u8>> {
-        if page_id == 1 {
-            tracing::debug!("skipping decryption for page 1 (database header)");
-            return Ok(encrypted_page.to_vec());
-        }
+        use crate::storage::sqlite3_ondisk::DatabaseHeader;
         tracing::debug!("decrypting page {}", page_id);
         assert_eq!(
             encrypted_page.len(),
@@ -481,23 +489,30 @@ impl EncryptionContext {
             "Encrypted page data must be exactly {} bytes",
             self.page_size
         );
+        // for page 1, the encrypted page starts after the database header
+        // for other pages, the encrypted page starts at the beginning
+        let encrypted_page_offset = match page_id {
+            DatabaseHeader::PAGE_ID => DatabaseHeader::SIZE,
+            _ => 0,
+        };
 
         let nonce_size = self.cipher_mode.nonce_size();
-        let nonce_start = encrypted_page.len() - nonce_size;
-        let payload = &encrypted_page[..nonce_start];
-        let nonce = &encrypted_page[nonce_start..];
+        let nonce_offset = encrypted_page.len() - nonce_size;
+        let payload = &encrypted_page[encrypted_page_offset..nonce_offset];
+        let nonce = &encrypted_page[nonce_offset..];
 
         let decrypted_data = self.decrypt_raw(payload, nonce)?;
 
         let metadata_size = self.cipher_mode.metadata_size();
         assert_eq!(
             decrypted_data.len(),
-            self.page_size - metadata_size,
+            self.page_size - metadata_size - encrypted_page_offset,
             "Decrypted page data must be exactly {} bytes",
-            self.page_size - metadata_size
+            self.page_size - metadata_size - encrypted_page_offset
         );
 
         let mut result = Vec::with_capacity(self.page_size);
+        result.extend_from_slice(&encrypted_page[..encrypted_page_offset]);
         result.extend_from_slice(&decrypted_data);
         result.resize(self.page_size, 0);
         assert_eq!(
@@ -620,6 +635,7 @@ impl From<CipherError> for LimboError {
 }
 
 #[cfg(test)]
+#[cfg(feature = "encryption")]
 mod tests {
     use super::*;
     use rand::Rng;
@@ -628,7 +644,6 @@ mod tests {
     macro_rules! test_cipher_wrapper {
         ($test_name:ident, $cipher_type:ty, $key_gen:expr, $nonce_size:literal, $message:literal) => {
             #[test]
-            #[cfg(feature = "encryption")]
             fn $test_name() {
                 let key = EncryptionKey::from_hex_string(&$key_gen()).unwrap();
                 let cipher = <$cipher_type>::new(&key);
@@ -649,7 +664,6 @@ mod tests {
     macro_rules! test_aes_cipher_wrapper {
         ($test_name:ident, $cipher_type:ty, $key_gen:expr, $nonce_size:literal, $message:literal) => {
             #[test]
-            #[cfg(feature = "encryption")]
             fn $test_name() {
                 let key = EncryptionKey::from_hex_string(&$key_gen()).unwrap();
                 let cipher = <$cipher_type>::new(&key).unwrap();
@@ -670,7 +684,6 @@ mod tests {
     macro_rules! test_raw_encryption {
         ($test_name:ident, $cipher_mode:expr, $key_gen:expr, $nonce_size:literal, $message:literal) => {
             #[test]
-            #[cfg(feature = "encryption")]
             fn $test_name() {
                 let key = EncryptionKey::from_hex_string(&$key_gen()).unwrap();
                 let ctx = EncryptionContext::new($cipher_mode, &key, DEFAULT_ENCRYPTED_PAGE_SIZE)
@@ -719,7 +732,6 @@ mod tests {
     );
 
     #[test]
-    #[cfg(feature = "encryption")]
     fn test_aes128gcm_encrypt_decrypt_round_trip() {
         let mut rng = rand::thread_rng();
         let cipher_mode = CipherMode::Aes128Gcm;
@@ -750,7 +762,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "encryption")]
     fn test_aes_encrypt_decrypt_round_trip() {
         let mut rng = rand::thread_rng();
         let cipher_mode = CipherMode::Aes256Gcm;
@@ -797,7 +808,6 @@ mod tests {
     );
 
     #[test]
-    #[cfg(feature = "encryption")]
     fn test_aegis256_encrypt_decrypt_round_trip() {
         let mut rng = rand::thread_rng();
         let cipher_mode = CipherMode::Aegis256;
@@ -843,7 +853,6 @@ mod tests {
     );
 
     #[test]
-    #[cfg(feature = "encryption")]
     fn test_aegis128x2_encrypt_decrypt_round_trip() {
         let mut rng = rand::thread_rng();
         let cipher_mode = CipherMode::Aegis128X2;
@@ -889,7 +898,6 @@ mod tests {
     );
 
     #[test]
-    #[cfg(feature = "encryption")]
     fn test_aegis128l_encrypt_decrypt_round_trip() {
         let mut rng = rand::thread_rng();
         let cipher_mode = CipherMode::Aegis128L;
@@ -935,7 +943,6 @@ mod tests {
     );
 
     #[test]
-    #[cfg(feature = "encryption")]
     fn test_aegis128x4_encrypt_decrypt_round_trip() {
         let mut rng = rand::thread_rng();
         let cipher_mode = CipherMode::Aegis128X4;
@@ -981,7 +988,6 @@ mod tests {
     );
 
     #[test]
-    #[cfg(feature = "encryption")]
     fn test_aegis256x2_encrypt_decrypt_round_trip() {
         let mut rng = rand::thread_rng();
         let cipher_mode = CipherMode::Aegis256X2;
@@ -1027,7 +1033,6 @@ mod tests {
     );
 
     #[test]
-    #[cfg(feature = "encryption")]
     fn test_aegis256x4_encrypt_decrypt_round_trip() {
         let mut rng = rand::thread_rng();
         let cipher_mode = CipherMode::Aegis256X4;

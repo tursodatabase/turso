@@ -2,6 +2,7 @@ use clap::{Parser, ValueEnum};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
+use tracing_subscriber::EnvFilter;
 use turso::{Builder, Database, Result};
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -9,6 +10,12 @@ enum TransactionMode {
     Legacy,
     Mvcc,
     Concurrent,
+    LogicalLog,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum IoOption {
+    IoUring,
 }
 
 #[derive(Parser)]
@@ -40,11 +47,18 @@ struct Args {
         help = "Busy timeout in milliseconds"
     )]
     timeout: u64,
+
+    #[arg(long = "io", help = "IO backend")]
+    io: Option<IoOption>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let _ = tracing_subscriber::fmt::try_init();
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .with_ansi(false)
+        .with_thread_ids(true)
+        .init();
     let args = Args::parse();
 
     println!(
@@ -61,7 +75,7 @@ async fn main() -> Result<()> {
         std::fs::remove_file(wal_path).expect("Failed to remove existing database");
     }
 
-    let db = setup_database(db_path, args.mode).await?;
+    let db = setup_database(db_path, args.mode, args.io).await?;
 
     let start_barrier = Arc::new(Barrier::new(args.threads));
     let mut handles = Vec::new();
@@ -125,13 +139,26 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn setup_database(db_path: &str, mode: TransactionMode) -> Result<Database> {
+async fn setup_database(
+    db_path: &str,
+    mode: TransactionMode,
+    io: Option<IoOption>,
+) -> Result<Database> {
     let builder = Builder::new_local(db_path);
+
+    let builder = if let Some(io) = io {
+        match io {
+            IoOption::IoUring => builder.with_io("io_uring".to_string()),
+        }
+    } else {
+        builder
+    };
     let db = match mode {
         TransactionMode::Legacy => builder.build().await?,
         TransactionMode::Mvcc | TransactionMode::Concurrent => {
             builder.with_mvcc(true).build().await?
         }
+        TransactionMode::LogicalLog => builder.with_mvcc(true).build().await?,
     };
     let conn = db.connect()?;
 
@@ -177,7 +204,7 @@ async fn worker_thread(
 
             let begin_stmt = match mode {
                 TransactionMode::Legacy | TransactionMode::Mvcc => "BEGIN",
-                TransactionMode::Concurrent => "BEGIN CONCURRENT",
+                TransactionMode::Concurrent | TransactionMode::LogicalLog => "BEGIN CONCURRENT",
             };
             conn.execute(begin_stmt, ()).await?;
 

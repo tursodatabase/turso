@@ -15,6 +15,11 @@ do_execsql_test_on_specific_db {:memory:} create_table_unique_contained_in_prima
     CREATE TABLE t4 (a,b, primary key(a,b), unique(a));
 } {}
 
+# https://github.com/tursodatabase/turso/issues/3187
+do_execsql_test_on_specific_db {:memory:} create_table_unique_constraint_and_autoinc_backticks { 
+	CREATE TABLE `databases` (`id` integer PRIMARY KEY AUTOINCREMENT,`created_at` datetime,`updated_at` datetime,`deleted_at` datetime,`hostname` text NOT NULL,`namespace` text,`address` text,`primary_address` text,`local` numeric,`allowed_ips` text, CONSTRAINT `uni_databases_hostname` UNIQUE (`hostname`));
+} {}
+
 # https://github.com/tursodatabase/turso/issues/2686
 do_execsql_test_on_specific_db {:memory:} create_table_rowid_unique_regression_test {
   create table u(x integer unique primary key);

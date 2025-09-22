@@ -264,13 +264,12 @@ impl DatabaseReplayGenerator {
                         let update = self.update_query(coro, table_name, &columns).await?;
                         Ok(update)
                     } else {
-                        let columns = [true].repeat(after.len());
-                        let update = self.update_query(coro, table_name, &columns).await?;
-                        Ok(update)
+                        let upsert = self.upsert_query(coro, table_name, after.len()).await?;
+                        Ok(upsert)
                     }
                 }
                 DatabaseTapeRowChangeType::Insert { after } => {
-                    let insert = self.insert_query(coro, table_name, after.len()).await?;
+                    let insert = self.upsert_query(coro, table_name, after.len()).await?;
                     Ok(insert)
                 }
             }
@@ -320,7 +319,7 @@ impl DatabaseReplayGenerator {
             is_ddl_replay: false,
         })
     }
-    pub(crate) async fn insert_query<Ctx>(
+    pub(crate) async fn upsert_query<Ctx>(
         &self,
         coro: &Coro<Ctx>,
         table_name: &str,

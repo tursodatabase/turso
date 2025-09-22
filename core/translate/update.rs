@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::schema::{BTreeTable, Column, Type};
+use crate::translate::expr::{bind_and_rewrite_expr, ParamState};
 use crate::translate::optimizer::optimize_select_plan;
 use crate::translate::plan::{Operation, QueryDestination, Scan, Search, SelectPlan};
 use crate::translate::planner::parse_limit;
@@ -22,7 +23,7 @@ use super::plan::{
     ColumnUsedMask, IterationDirection, JoinedTable, Plan, ResultSetColumn, TableReferences,
     UpdatePlan,
 };
-use super::planner::{bind_column_references, parse_where};
+use super::planner::parse_where;
 /*
 * Update is simple. By default we scan the table, and for each row, we check the WHERE
 * clause. If it evaluates to true, we build the new record with the updated value and insert.
@@ -90,7 +91,6 @@ pub fn translate_update_for_schema_change(
     }
 
     optimize_plan(&mut plan, schema)?;
-    // TODO: freestyling these numbers
     let opts = ProgramBuilderOpts {
         num_cursors: 1,
         approx_num_insns: 20,
@@ -181,11 +181,18 @@ pub fn prepare_update_plan(
         .collect();
 
     let mut set_clauses = Vec::with_capacity(body.sets.len());
+    let mut param_idx = ParamState::default();
 
     // Process each SET assignment and map column names to expressions
     // e.g the statement `SET x = 1, y = 2, z = 3` has 3 set assigments
     for set in &mut body.sets {
-        bind_column_references(&mut set.expr, &mut table_references, None, connection)?;
+        bind_and_rewrite_expr(
+            &mut set.expr,
+            Some(&mut table_references),
+            None,
+            connection,
+            &mut param_idx,
+        )?;
 
         let values = match set.expr.as_ref() {
             Expr::Parenthesized(vals) => vals.clone(),
@@ -222,12 +229,22 @@ pub fn prepare_update_plan(
         body.tbl_name.name.as_str(),
         program,
         connection,
+        &mut param_idx,
     )?;
 
     let order_by = body
         .order_by
-        .iter()
-        .map(|o| (o.expr.clone(), o.order.unwrap_or(SortOrder::Asc)))
+        .iter_mut()
+        .map(|o| {
+            let _ = bind_and_rewrite_expr(
+                &mut o.expr,
+                Some(&mut table_references),
+                Some(&result_columns),
+                connection,
+                &mut param_idx,
+            );
+            (o.expr.clone(), o.order.unwrap_or(SortOrder::Asc))
+        })
         .collect();
 
     // Sqlite determines we should create an ephemeral table if we do not have a FROM clause
@@ -266,6 +283,7 @@ pub fn prepare_update_plan(
             Some(&result_columns),
             &mut where_clause,
             connection,
+            &mut param_idx,
         )?;
 
         let table = Arc::new(BTreeTable {
@@ -315,6 +333,7 @@ pub fn prepare_update_plan(
             contains_constant_false_condition: false,
             distinctness: super::plan::Distinctness::NonDistinct,
             values: vec![],
+            window: None,
         };
 
         optimize_select_plan(&mut ephemeral_plan, schema)?;
@@ -341,14 +360,14 @@ pub fn prepare_update_plan(
             Some(&result_columns),
             &mut where_clause,
             connection,
+            &mut param_idx,
         )?;
     };
 
     // Parse the LIMIT/OFFSET clause
-    let (limit, offset) = body
-        .limit
-        .as_mut()
-        .map_or(Ok((None, None)), |l| parse_limit(l, connection))?;
+    let (limit, offset) = body.limit.as_mut().map_or(Ok((None, None)), |l| {
+        parse_limit(l, connection, &mut param_idx)
+    })?;
 
     // Check what indexes will need to be updated by checking set_clauses and see
     // if a column is contained in an index.

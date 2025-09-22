@@ -459,6 +459,40 @@ impl ToTokens for SelectPlan {
             }
         }
 
+        if let Some(window) = &self.window {
+            if let Some(window_name) = &window.name {
+                s.append(TokenType::TK_WINDOW, None)?;
+                s.append(TokenType::TK_ID, Some(window_name))?;
+                s.append(TokenType::TK_AS, None)?;
+
+                s.append(TokenType::TK_LP, None)?;
+
+                if !window.partition_by.is_empty() {
+                    s.append(TokenType::TK_PARTITION, None)?;
+                    s.append(TokenType::TK_BY, None)?;
+                    s.comma(window.partition_by.iter(), context)?;
+                }
+
+                if !window.order_by.is_empty() {
+                    s.append(TokenType::TK_ORDER, None)?;
+                    s.append(TokenType::TK_BY, None)?;
+                    s.comma(
+                        window
+                            .order_by
+                            .iter()
+                            .map(|(expr, order)| ast::SortedColumn {
+                                expr: Box::new(expr.clone()),
+                                order: Some(*order),
+                                nulls: None,
+                            }),
+                        context,
+                    )?;
+                }
+
+                s.append(TokenType::TK_RP, None)?;
+            }
+        }
+
         if !self.order_by.is_empty() {
             s.append(TokenType::TK_ORDER, None)?;
             s.append(TokenType::TK_BY, None)?;

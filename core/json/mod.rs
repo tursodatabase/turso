@@ -540,7 +540,7 @@ pub fn json_type(value: &Value, path: Option<&Value>) -> crate::Result<Value> {
     }
 }
 
-fn json_path_from_db_value(path: &Value, strict: bool) -> crate::Result<Option<JsonPath>> {
+fn json_path_from_db_value(path: &Value, strict: bool) -> crate::Result<Option<JsonPath<'_>>> {
     let json_path = if strict {
         match path {
             Value::Text(t) => json_path(t.as_str())?,

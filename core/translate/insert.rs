@@ -10,7 +10,8 @@ use crate::translate::emitter::{
     emit_cdc_insns, emit_cdc_patch_record, prepare_cdc_if_necessary, OperationMode,
 };
 use crate::translate::expr::{
-    emit_returning_results, process_returning_clause, ReturningValueRegisters,
+    bind_and_rewrite_expr, emit_returning_results, process_returning_clause, ParamState,
+    ReturningValueRegisters,
 };
 use crate::translate::planner::ROWID;
 use crate::translate::upsert::{
@@ -31,7 +32,6 @@ use crate::{Result, SymbolTable, VirtualTable};
 
 use super::emitter::Resolver;
 use super::expr::{translate_expr, translate_expr_no_constant_opt, NoConstantOptReason};
-use super::optimizer::rewrite_expr;
 use super::plan::QueryDestination;
 use super::select::translate_select;
 
@@ -118,45 +118,54 @@ pub fn translate_insert(
     let mut values: Option<Vec<Box<Expr>>> = None;
     let mut upsert_opt: Option<Upsert> = None;
 
-    let inserting_multiple_rows = match &mut body {
-        InsertBody::Select(select, upsert) => {
-            upsert_opt = upsert.as_deref().cloned();
-            match &mut select.body.select {
-                // TODO see how to avoid clone
-                OneSelect::Values(values_expr) if values_expr.len() <= 1 => {
-                    if values_expr.is_empty() {
-                        crate::bail_parse_error!("no values to insert");
-                    }
-                    let mut param_idx = 1;
-                    for expr in values_expr.iter_mut().flat_map(|v| v.iter_mut()) {
-                        match expr.as_mut() {
-                            Expr::Id(name) => {
-                                if name.is_double_quoted() {
-                                    *expr = Expr::Literal(ast::Literal::String(name.to_string()))
-                                        .into();
-                                } else {
-                                    // an INSERT INTO ... VALUES (...) cannot reference columns
-                                    crate::bail_parse_error!("no such column: {name}");
-                                }
-                            }
-                            Expr::Qualified(first_name, second_name) => {
-                                // an INSERT INTO ... VALUES (...) cannot reference columns
-                                crate::bail_parse_error!(
-                                    "no such column: {first_name}.{second_name}"
-                                );
-                            }
-                            _ => {}
-                        }
-                        rewrite_expr(expr, &mut param_idx)?;
-                    }
-                    values = values_expr.pop();
-                    false
+    let mut param_ctx = ParamState::default();
+    let mut inserting_multiple_rows = false;
+    if let InsertBody::Select(select, upsert) = &mut body {
+        match &mut select.body.select {
+            // TODO see how to avoid clone
+            OneSelect::Values(values_expr) if values_expr.len() <= 1 => {
+                if values_expr.is_empty() {
+                    crate::bail_parse_error!("no values to insert");
                 }
-                _ => true,
+                for expr in values_expr.iter_mut().flat_map(|v| v.iter_mut()) {
+                    match expr.as_mut() {
+                        Expr::Id(name) => {
+                            if name.is_double_quoted() {
+                                *expr =
+                                    Expr::Literal(ast::Literal::String(name.to_string())).into();
+                            } else {
+                                // an INSERT INTO ... VALUES (...) cannot reference columns
+                                crate::bail_parse_error!("no such column: {name}");
+                            }
+                        }
+                        Expr::Qualified(first_name, second_name) => {
+                            // an INSERT INTO ... VALUES (...) cannot reference columns
+                            crate::bail_parse_error!("no such column: {first_name}.{second_name}");
+                        }
+                        _ => {}
+                    }
+                    bind_and_rewrite_expr(expr, None, None, connection, &mut param_ctx)?;
+                }
+                values = values_expr.pop();
+            }
+            _ => inserting_multiple_rows = true,
+        }
+        if let Some(ref mut upsert) = upsert {
+            if let UpsertDo::Set {
+                ref mut sets,
+                ref mut where_clause,
+            } = &mut upsert.do_clause
+            {
+                for set in sets.iter_mut() {
+                    bind_and_rewrite_expr(&mut set.expr, None, None, connection, &mut param_ctx)?;
+                }
+                if let Some(ref mut where_expr) = where_clause {
+                    bind_and_rewrite_expr(where_expr, None, None, connection, &mut param_ctx)?;
+                }
             }
         }
-        InsertBody::DefaultValues => false,
-    };
+        upsert_opt = upsert.as_deref().cloned();
+    }
 
     let halt_label = program.allocate_label();
     let loop_start_label = program.allocate_label();
@@ -171,12 +180,8 @@ pub fn translate_insert(
         table_name.as_str(),
         &mut program,
         connection,
+        &mut param_ctx,
     )?;
-
-    // Set up the program to return result columns if RETURNING is specified
-    if !result_columns.is_empty() {
-        program.result_columns = result_columns.clone();
-    }
 
     let mut yield_reg_opt = None;
     let mut temp_table_ctx = None;
@@ -338,6 +343,11 @@ pub fn translate_insert(
             program.alloc_cursor_id(CursorType::BTreeTable(btree_table.clone())),
         ),
     };
+
+    // Set up the program to return result columns if RETURNING is specified
+    if !result_columns.is_empty() {
+        program.result_columns = result_columns.clone();
+    }
 
     // allocate cursor id's for each btree index cursor we'll need to populate the indexes
     // (idx name, root_page, idx cursor id)

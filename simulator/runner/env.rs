@@ -173,6 +173,10 @@ impl SimulatorEnv {
         env.clear();
         env
     }
+
+    pub fn choose_conn(&self, rng: &mut impl Rng) -> usize {
+        rng.random_range(0..self.connections.len())
+    }
 }
 
 impl SimulatorEnv {
@@ -188,8 +192,6 @@ impl SimulatorEnv {
         let opts = SimulatorOpts {
             seed,
             ticks: rng.random_range(cli_opts.minimum_tests..=cli_opts.maximum_tests),
-            max_connections: 1, // TODO: for now let's use one connection as we didn't implement
-            // correct transactions processing
             max_tables: rng.random_range(0..128),
             disable_select_optimizer: cli_opts.disable_select_optimizer,
             disable_insert_values_select: cli_opts.disable_insert_values_select,
@@ -276,7 +278,7 @@ impl SimulatorEnv {
             }
         };
 
-        let connections = (0..opts.max_connections)
+        let connections = (0..profile.max_connections)
             .map(|_| SimConnection::Disconnected)
             .collect::<Vec<_>>();
 
@@ -383,7 +385,6 @@ impl Display for SimConnection {
 pub(crate) struct SimulatorOpts {
     pub(crate) seed: u64,
     pub(crate) ticks: usize,
-    pub(crate) max_connections: usize,
     pub(crate) max_tables: usize,
 
     pub(crate) disable_select_optimizer: bool,
