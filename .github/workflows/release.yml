@@ -185,6 +185,7 @@ jobs:
         with:
           persist-credentials: false
           submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
       - name: Install cached dist
         uses: actions/download-artifact@v4
         with:
