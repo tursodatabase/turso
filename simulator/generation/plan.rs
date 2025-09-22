@@ -82,7 +82,7 @@ impl InteractionPlan {
     /// delete interactions from the human readable file, and this function uses the JSON file as
     /// a baseline to detect with interactions were deleted and constructs the plan from the
     /// remaining interactions.
-    pub(crate) fn compute_via_diff(plan_path: &Path) -> Vec<Interaction> {
+    pub(crate) fn compute_via_diff(plan_path: &Path) -> impl InteractionPlanIterator {
         let interactions = std::fs::read_to_string(plan_path).unwrap();
         let interactions = interactions.lines().collect::<Vec<_>>();
 
@@ -137,7 +137,9 @@ impl InteractionPlan {
             }
         }
         let _ = plan.split_off(j);
-        plan.into_iter().flatten().collect()
+        PlanIterator {
+            iter: plan.into_iter().flatten(),
+        }
     }
 
     pub fn interactions_list(&self) -> Vec<Interaction> {
@@ -209,13 +211,11 @@ impl InteractionPlan {
         stats
     }
 
-    pub fn generate_plan<R: rand::Rng>(rng: &mut R, env: &mut SimulatorEnv) -> Self {
+    pub fn init_plan(env: &mut SimulatorEnv) -> Self {
         let mut plan = InteractionPlan::new(env.profile.experimental_mvcc);
 
-        let num_interactions = env.opts.max_interactions as usize;
-
         // First create at least one table
-        let create_query = Create::arbitrary(rng, &env.connection_context(0));
+        let create_query = Create::arbitrary(&mut env.rng.clone(), &env.connection_context(0));
         env.committed_tables.push(create_query.table.clone());
 
         // initial query starts at 0th connection
@@ -224,21 +224,51 @@ impl InteractionPlan {
             InteractionsType::Query(Query::Create(create_query)),
         ));
 
-        while plan.len() < num_interactions {
-            tracing::debug!("Generating interaction {}/{}", plan.len(), num_interactions);
+        plan
+    }
+
+    /// Appends a new [Interactions] and outputs the next set of [Interaction] to take
+    pub fn generate_next_interaction(
+        &mut self,
+        rng: &mut impl rand::Rng,
+        env: &mut SimulatorEnv,
+    ) -> Option<Vec<Interaction>> {
+        let num_interactions = env.opts.max_interactions as usize;
+        if self.len() < num_interactions {
+            tracing::debug!("Generating interaction {}/{}", self.len(), num_interactions);
             let interactions = {
                 let conn_index = env.choose_conn(rng);
                 let conn_ctx = &env.connection_context(conn_index);
-                Interactions::arbitrary_from(rng, conn_ctx, (env, plan.stats(), conn_index))
+                Interactions::arbitrary_from(rng, conn_ctx, (env, self.stats(), conn_index))
             };
 
             interactions.shadow(&mut env.get_conn_tables_mut(interactions.connection_index));
-            plan.push(interactions);
+            let out_interactions = interactions.interactions();
+            assert!(!out_interactions.is_empty());
+            self.push(interactions);
+            Some(out_interactions)
+        } else {
+            None
         }
+    }
 
-        tracing::info!("Generated plan with {} interactions", plan.plan.len());
+    pub fn generator<'a>(
+        &'a mut self,
+        rng: &'a mut impl rand::Rng,
+    ) -> impl InteractionPlanIterator {
+        let interactions = self.interactions_list();
+        let iter = interactions.into_iter();
+        PlanGenerator {
+            plan: self,
+            iter,
+            rng,
+        }
+    }
 
-        plan
+    pub fn static_iterator(&self) -> impl InteractionPlanIterator {
+        PlanIterator {
+            iter: self.interactions_list().into_iter(),
+        }
     }
 }
 
@@ -263,6 +293,56 @@ impl IntoIterator for InteractionPlan {
 
     fn into_iter(self) -> Self::IntoIter {
         self.plan.into_iter()
+    }
+}
+
+pub trait InteractionPlanIterator {
+    fn next(&mut self, env: &mut SimulatorEnv) -> Option<Interaction>;
+}
+
+impl<T: InteractionPlanIterator> InteractionPlanIterator for &mut T {
+    fn next(&mut self, env: &mut SimulatorEnv) -> Option<Interaction> {
+        T::next(self, env)
+    }
+}
+
+pub struct PlanGenerator<'a, R: rand::Rng> {
+    plan: &'a mut InteractionPlan,
+    iter: <Vec<Interaction> as IntoIterator>::IntoIter,
+    rng: &'a mut R,
+}
+
+impl<'a, R: rand::Rng> InteractionPlanIterator for PlanGenerator<'a, R> {
+    /// try to generate the next [Interactions] and store it
+    fn next(&mut self, env: &mut SimulatorEnv) -> Option<Interaction> {
+        self.iter.next().or_else(|| {
+            // Iterator ended, try to create a new iterator
+            // This will not be an infinte sequence because generate_next_interaction will eventually
+            // stop generating
+            let mut iter = self
+                .plan
+                .generate_next_interaction(self.rng, env)
+                .map_or(Vec::new().into_iter(), |interactions| {
+                    interactions.into_iter()
+                });
+            let next = iter.next();
+            self.iter = iter;
+
+            next
+        })
+    }
+}
+
+pub struct PlanIterator<I: Iterator<Item = Interaction>> {
+    iter: I,
+}
+
+impl<I> InteractionPlanIterator for PlanIterator<I>
+where
+    I: Iterator<Item = Interaction>,
+{
+    fn next(&mut self, _env: &mut SimulatorEnv) -> Option<Interaction> {
+        self.iter.next()
     }
 }
 
