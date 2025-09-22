@@ -70,7 +70,7 @@ use std::{
     ops::Deref,
     rc::Rc,
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering},
         Arc, LazyLock, Mutex, Weak,
     },
     time::Duration,
@@ -502,9 +502,9 @@ impl Database {
             database_schemas: RwLock::new(std::collections::HashMap::new()),
             auto_commit: AtomicBool::new(true),
             transaction_state: RwLock::new(TransactionState::None),
-            last_insert_rowid: Cell::new(0),
-            last_change: Cell::new(0),
-            total_changes: Cell::new(0),
+            last_insert_rowid: AtomicI64::new(0),
+            last_change: AtomicI64::new(0),
+            total_changes: AtomicI64::new(0),
             syms: RwLock::new(SymbolTable::new()),
             _shared_cache: false,
             cache_size: Cell::new(default_cache_size),
@@ -987,9 +987,9 @@ pub struct Connection {
     /// Whether to automatically commit transaction
     auto_commit: AtomicBool,
     transaction_state: RwLock<TransactionState>,
-    last_insert_rowid: Cell<i64>,
-    last_change: Cell<i64>,
-    total_changes: Cell<i64>,
+    last_insert_rowid: AtomicI64,
+    last_change: AtomicI64,
+    total_changes: AtomicI64,
     syms: RwLock<SymbolTable>,
     _shared_cache: bool,
     cache_size: Cell<i32>,
@@ -1662,25 +1662,24 @@ impl Connection {
     }
 
     pub fn last_insert_rowid(&self) -> i64 {
-        self.last_insert_rowid.get()
+        self.last_insert_rowid.load(Ordering::SeqCst)
     }
 
     fn update_last_rowid(&self, rowid: i64) {
-        self.last_insert_rowid.set(rowid);
+        self.last_insert_rowid.store(rowid, Ordering::SeqCst);
     }
 
     pub fn set_changes(&self, nchange: i64) {
-        self.last_change.set(nchange);
-        let prev_total_changes = self.total_changes.get();
-        self.total_changes.set(prev_total_changes + nchange);
+        self.last_change.store(nchange, Ordering::SeqCst);
+        self.total_changes.fetch_add(nchange, Ordering::SeqCst);
     }
 
     pub fn changes(&self) -> i64 {
-        self.last_change.get()
+        self.last_change.load(Ordering::SeqCst)
     }
 
     pub fn total_changes(&self) -> i64 {
-        self.total_changes.get()
+        self.total_changes.load(Ordering::SeqCst)
     }
 
     pub fn get_cache_size(&self) -> i32 {
