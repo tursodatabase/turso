@@ -3674,4 +3674,340 @@ mod tests {
             assert!(was_new, "Duplicate rowid found: {}. This would cause rows to overwrite each other in btree storage!", row.rowid);
         }
     }
+
+    // Merge operator tests
+    use crate::incremental::merge_operator::{MergeOperator, UnionMode};
+
+    #[test]
+    fn test_merge_operator_basic() {
+        let (_pager, table_root_page_id, index_root_page_id) = create_test_pager();
+        let table_cursor = BTreeCursor::new_table(None, _pager.clone(), table_root_page_id, 5);
+        let index_def = create_dbsp_state_index(index_root_page_id);
+        let index_cursor =
+            BTreeCursor::new_index(None, _pager.clone(), index_root_page_id, &index_def, 4);
+        let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
+
+        let mut merge_op = MergeOperator::new(
+            1,
+            UnionMode::All {
+                left_table: "table1".to_string(),
+                right_table: "table2".to_string(),
+            },
+        );
+
+        // Create two deltas
+        let mut left_delta = Delta::new();
+        left_delta.insert(1, vec![Value::Integer(1)]);
+        left_delta.insert(2, vec![Value::Integer(2)]);
+
+        let mut right_delta = Delta::new();
+        right_delta.insert(3, vec![Value::Integer(3)]);
+        right_delta.insert(4, vec![Value::Integer(4)]);
+
+        let delta_pair = DeltaPair::new(left_delta, right_delta);
+
+        // Evaluate merge
+        let result = merge_op.commit(delta_pair, &mut cursors).unwrap();
+
+        if let IOResult::Done(merged) = result {
+            // Should have all 4 entries
+            assert_eq!(merged.len(), 4);
+
+            // Check that all values are present
+            let values: Vec<i64> = merged
+                .changes
+                .iter()
+                .filter_map(|(row, weight)| {
+                    if *weight > 0 && !row.values.is_empty() {
+                        if let Value::Integer(n) = &row.values[0] {
+                            Some(*n)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            assert!(values.contains(&1));
+            assert!(values.contains(&2));
+            assert!(values.contains(&3));
+            assert!(values.contains(&4));
+        } else {
+            panic!("Expected Done result");
+        }
+    }
+
+    #[test]
+    fn test_merge_operator_stateful_distinct() {
+        let (_pager, table_root_page_id, index_root_page_id) = create_test_pager();
+        let table_cursor = BTreeCursor::new_table(None, _pager.clone(), table_root_page_id, 5);
+        let index_def = create_dbsp_state_index(index_root_page_id);
+        let index_cursor =
+            BTreeCursor::new_index(None, _pager.clone(), index_root_page_id, &index_def, 4);
+        let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
+
+        // Test that UNION (distinct) properly deduplicates across multiple operations
+        let mut merge_op = MergeOperator::new(7, UnionMode::Distinct);
+
+        // First operation: insert values 1, 2, 3 from left and 2, 3, 4 from right
+        let mut left_delta1 = Delta::new();
+        left_delta1.insert(1, vec![Value::Integer(1)]);
+        left_delta1.insert(2, vec![Value::Integer(2)]);
+        left_delta1.insert(3, vec![Value::Integer(3)]);
+
+        let mut right_delta1 = Delta::new();
+        right_delta1.insert(4, vec![Value::Integer(2)]); // Duplicate value 2
+        right_delta1.insert(5, vec![Value::Integer(3)]); // Duplicate value 3
+        right_delta1.insert(6, vec![Value::Integer(4)]);
+
+        let result1 = merge_op
+            .commit(DeltaPair::new(left_delta1, right_delta1), &mut cursors)
+            .unwrap();
+        if let IOResult::Done(merged1) = result1 {
+            // Should have 4 unique values (1, 2, 3, 4)
+            // But 6 total entries (3 from left + 3 from right)
+            assert_eq!(merged1.len(), 6);
+
+            // Collect unique rowids - should be 4
+            let unique_rowids: std::collections::HashSet<i64> =
+                merged1.changes.iter().map(|(row, _)| row.rowid).collect();
+            assert_eq!(
+                unique_rowids.len(),
+                4,
+                "Should have 4 unique rowids for 4 unique values"
+            );
+        } else {
+            panic!("Expected Done result");
+        }
+
+        // Second operation: insert value 2 again from left, and value 5 from right
+        let mut left_delta2 = Delta::new();
+        left_delta2.insert(7, vec![Value::Integer(2)]); // Duplicate of existing value
+
+        let mut right_delta2 = Delta::new();
+        right_delta2.insert(8, vec![Value::Integer(5)]); // New value
+
+        let result2 = merge_op
+            .commit(DeltaPair::new(left_delta2, right_delta2), &mut cursors)
+            .unwrap();
+        if let IOResult::Done(merged2) = result2 {
+            assert_eq!(merged2.len(), 2, "Should have 2 entries in delta");
+
+            // Check that value 2 got the same rowid as before
+            let has_existing_rowid = merged2
+                .changes
+                .iter()
+                .any(|(row, _)| row.values == vec![Value::Integer(2)] && row.rowid <= 4);
+            assert!(has_existing_rowid, "Value 2 should reuse existing rowid");
+
+            // Check that value 5 got a new rowid
+            let has_new_rowid = merged2
+                .changes
+                .iter()
+                .any(|(row, _)| row.values == vec![Value::Integer(5)] && row.rowid > 4);
+            assert!(has_new_rowid, "Value 5 should get a new rowid");
+        } else {
+            panic!("Expected Done result");
+        }
+    }
+
+    #[test]
+    fn test_merge_operator_single_sided_inputs_union_all() {
+        let (_pager, table_root_page_id, index_root_page_id) = create_test_pager();
+        let table_cursor = BTreeCursor::new_table(None, _pager.clone(), table_root_page_id, 5);
+        let index_def = create_dbsp_state_index(index_root_page_id);
+        let index_cursor =
+            BTreeCursor::new_index(None, _pager.clone(), index_root_page_id, &index_def, 4);
+        let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
+
+        // Test UNION ALL with inputs coming from only one side at a time
+        let mut merge_op = MergeOperator::new(
+            10,
+            UnionMode::All {
+                left_table: "orders".to_string(),
+                right_table: "archived_orders".to_string(),
+            },
+        );
+
+        // First: only left side (orders) has data
+        let mut left_delta1 = Delta::new();
+        left_delta1.insert(100, vec![Value::Integer(1001)]);
+        left_delta1.insert(101, vec![Value::Integer(1002)]);
+
+        let right_delta1 = Delta::new(); // Empty right side
+
+        let result1 = merge_op
+            .commit(DeltaPair::new(left_delta1, right_delta1), &mut cursors)
+            .unwrap();
+
+        let first_rowids = if let IOResult::Done(ref merged1) = result1 {
+            assert_eq!(merged1.len(), 2, "Should have 2 entries from left only");
+            merged1
+                .changes
+                .iter()
+                .map(|(row, _)| row.rowid)
+                .collect::<Vec<_>>()
+        } else {
+            panic!("Expected Done result");
+        };
+
+        // Second: only right side (archived_orders) has data
+        let left_delta2 = Delta::new(); // Empty left side
+
+        let mut right_delta2 = Delta::new();
+        right_delta2.insert(100, vec![Value::Integer(2001)]); // Same rowid as left, different table
+        right_delta2.insert(102, vec![Value::Integer(2002)]);
+
+        let result2 = merge_op
+            .commit(DeltaPair::new(left_delta2, right_delta2), &mut cursors)
+            .unwrap();
+        let second_result_rowid_100 = if let IOResult::Done(ref merged2) = result2 {
+            assert_eq!(merged2.len(), 2, "Should have 2 entries from right only");
+
+            // Rowids should be different from the left side even though original rowid 100 is the same
+            let second_rowids: Vec<i64> =
+                merged2.changes.iter().map(|(row, _)| row.rowid).collect();
+            for rowid in &second_rowids {
+                assert!(
+                    !first_rowids.contains(rowid),
+                    "Right side rowids should be different from left side rowids"
+                );
+            }
+
+            // Save rowid for archived_orders.100
+            merged2
+                .changes
+                .iter()
+                .find(|(row, _)| row.values == vec![Value::Integer(2001)])
+                .map(|(row, _)| row.rowid)
+                .unwrap()
+        } else {
+            panic!("Expected Done result");
+        };
+
+        // Third: left side again with same rowids as before
+        let mut left_delta3 = Delta::new();
+        left_delta3.insert(100, vec![Value::Integer(1003)]); // Same rowid 100 from orders
+        left_delta3.insert(101, vec![Value::Integer(1004)]); // Same rowid 101 from orders
+
+        let right_delta3 = Delta::new(); // Empty right side
+
+        let result3 = merge_op
+            .commit(DeltaPair::new(left_delta3, right_delta3), &mut cursors)
+            .unwrap();
+        if let IOResult::Done(merged3) = result3 {
+            assert_eq!(merged3.len(), 2, "Should have 2 entries from left");
+
+            // Should get the same assigned rowids as the first operation
+            let third_rowids: Vec<i64> = merged3.changes.iter().map(|(row, _)| row.rowid).collect();
+            assert_eq!(
+                first_rowids, third_rowids,
+                "Same (table, rowid) pairs should get same assigned rowids"
+            );
+        } else {
+            panic!("Expected Done result");
+        }
+
+        // Fourth: right side again with rowid 100
+        let left_delta4 = Delta::new(); // Empty left side
+
+        let mut right_delta4 = Delta::new();
+        right_delta4.insert(100, vec![Value::Integer(2003)]); // Same rowid 100 from archived_orders
+
+        let result4 = merge_op
+            .commit(DeltaPair::new(left_delta4, right_delta4), &mut cursors)
+            .unwrap();
+        if let IOResult::Done(merged4) = result4 {
+            assert_eq!(merged4.len(), 1, "Should have 1 entry from right");
+
+            // Should get same assigned rowid as second operation for archived_orders.100
+            let fourth_rowid = merged4.changes[0].0.rowid;
+            assert_eq!(
+                fourth_rowid, second_result_rowid_100,
+                "archived_orders rowid 100 should consistently map to same assigned rowid"
+            );
+        } else {
+            panic!("Expected Done result");
+        }
+    }
+
+    #[test]
+    fn test_merge_operator_both_sides_empty() {
+        let (_pager, table_root_page_id, index_root_page_id) = create_test_pager();
+        let table_cursor = BTreeCursor::new_table(None, _pager.clone(), table_root_page_id, 5);
+        let index_def = create_dbsp_state_index(index_root_page_id);
+        let index_cursor =
+            BTreeCursor::new_index(None, _pager.clone(), index_root_page_id, &index_def, 4);
+        let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
+
+        // Test that both sides being empty works correctly
+        let mut merge_op = MergeOperator::new(
+            12,
+            UnionMode::All {
+                left_table: "t1".to_string(),
+                right_table: "t2".to_string(),
+            },
+        );
+
+        // First: insert some data to establish state
+        let mut left_delta1 = Delta::new();
+        left_delta1.insert(1, vec![Value::Integer(100)]);
+        let mut right_delta1 = Delta::new();
+        right_delta1.insert(1, vec![Value::Integer(200)]);
+
+        let result1 = merge_op
+            .commit(DeltaPair::new(left_delta1, right_delta1), &mut cursors)
+            .unwrap();
+        let original_t1_rowid = if let IOResult::Done(ref merged1) = result1 {
+            assert_eq!(merged1.len(), 2, "Should have 2 entries initially");
+            // Save the rowid for t1.rowid=1
+            merged1
+                .changes
+                .iter()
+                .find(|(row, _)| row.values == vec![Value::Integer(100)])
+                .map(|(row, _)| row.rowid)
+                .unwrap()
+        } else {
+            panic!("Expected Done result");
+        };
+
+        // Second: both sides empty - should produce empty output
+        let empty_left = Delta::new();
+        let empty_right = Delta::new();
+
+        let result2 = merge_op
+            .commit(DeltaPair::new(empty_left, empty_right), &mut cursors)
+            .unwrap();
+        if let IOResult::Done(merged2) = result2 {
+            assert_eq!(
+                merged2.len(),
+                0,
+                "Both empty sides should produce empty output"
+            );
+        } else {
+            panic!("Expected Done result");
+        }
+
+        // Third: add more data to verify state is still intact
+        let mut left_delta3 = Delta::new();
+        left_delta3.insert(1, vec![Value::Integer(101)]); // Same rowid as before
+        let right_delta3 = Delta::new();
+
+        let result3 = merge_op
+            .commit(DeltaPair::new(left_delta3, right_delta3), &mut cursors)
+            .unwrap();
+        if let IOResult::Done(merged3) = result3 {
+            assert_eq!(merged3.len(), 1, "Should have 1 entry");
+            // Should reuse the same assigned rowid for t1.rowid=1
+            let rowid = merged3.changes[0].0.rowid;
+            assert_eq!(
+                rowid, original_t1_rowid,
+                "Should maintain consistent rowid mapping after empty operation"
+            );
+        } else {
+            panic!("Expected Done result");
+        }
+    }
 }

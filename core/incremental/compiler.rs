@@ -298,6 +298,8 @@ pub enum DbspOperator {
     },
     /// Input operator - source of data
     Input { name: String, schema: SchemaRef },
+    /// Merge operator for combining streams (used in recursive CTEs and UNION)
+    Merge { schema: SchemaRef },
 }
 
 /// Represents an expression in DBSP
@@ -807,6 +809,13 @@ impl DbspCircuit {
                 DbspOperator::Input { name, .. } => {
                     writeln!(f, "{indent}Input[{node_id}]: {name}")?;
                 }
+                DbspOperator::Merge { schema } => {
+                    writeln!(
+                        f,
+                        "{indent}Merge[{node_id}]: UNION/Recursive (schema: {} columns)",
+                        schema.columns.len()
+                    )?;
+                }
             }
 
             for input_id in &node.inputs {
@@ -1300,8 +1309,12 @@ impl DbspCompiler {
                 );
                 Ok(node_id)
             }
+            LogicalPlan::Union(union) => {
+                // Handle UNION and UNION ALL
+                self.compile_union(union)
+            }
             _ => Err(LimboError::ParseError(
-                format!("Unsupported operator in DBSP compiler: only Filter, Projection, Join and Aggregate are supported, got: {:?}",
+                format!("Unsupported operator in DBSP compiler: only Filter, Projection, Join, Aggregate, and Union are supported, got: {:?}",
                     match plan {
                         LogicalPlan::Sort(_) => "Sort",
                         LogicalPlan::Limit(_) => "Limit",
@@ -1316,6 +1329,116 @@ impl DbspCompiler {
                 )
             )),
         }
+    }
+
+    /// Extract a representative table name from a logical plan (for UNION ALL identification)
+    /// Returns a string that uniquely identifies the source of the data
+    fn extract_source_identifier(plan: &LogicalPlan) -> String {
+        match plan {
+            LogicalPlan::TableScan(scan) => {
+                // Direct table scan - use the table name
+                scan.table_name.clone()
+            }
+            LogicalPlan::Projection(proj) => {
+                // Pass through to input
+                Self::extract_source_identifier(&proj.input)
+            }
+            LogicalPlan::Filter(filter) => {
+                // Pass through to input
+                Self::extract_source_identifier(&filter.input)
+            }
+            LogicalPlan::Aggregate(agg) => {
+                // Aggregate of a table
+                format!("agg_{}", Self::extract_source_identifier(&agg.input))
+            }
+            LogicalPlan::Sort(sort) => {
+                // Pass through to input
+                Self::extract_source_identifier(&sort.input)
+            }
+            LogicalPlan::Limit(limit) => {
+                // Pass through to input
+                Self::extract_source_identifier(&limit.input)
+            }
+            LogicalPlan::Join(join) => {
+                // Join of two sources - combine their identifiers
+                let left_id = Self::extract_source_identifier(&join.left);
+                let right_id = Self::extract_source_identifier(&join.right);
+                format!("join_{left_id}_{right_id}")
+            }
+            LogicalPlan::Union(union) => {
+                // Union of multiple sources
+                if union.inputs.is_empty() {
+                    "union_empty".to_string()
+                } else {
+                    let identifiers: Vec<String> = union
+                        .inputs
+                        .iter()
+                        .map(|input| Self::extract_source_identifier(input))
+                        .collect();
+                    format!("union_{}", identifiers.join("_"))
+                }
+            }
+            LogicalPlan::Distinct(distinct) => {
+                // Distinct of a source
+                format!(
+                    "distinct_{}",
+                    Self::extract_source_identifier(&distinct.input)
+                )
+            }
+            LogicalPlan::WithCTE(with_cte) => {
+                // CTE body
+                Self::extract_source_identifier(&with_cte.body)
+            }
+            LogicalPlan::CTERef(cte_ref) => {
+                // CTE reference - use the CTE name
+                format!("cte_{}", cte_ref.name)
+            }
+            LogicalPlan::EmptyRelation(_) => "empty".to_string(),
+            LogicalPlan::Values(_) => "values".to_string(),
+        }
+    }
+
+    /// Compile a UNION operator
+    fn compile_union(&mut self, union: &crate::translate::logical::Union) -> Result<usize> {
+        if union.inputs.len() != 2 {
+            return Err(LimboError::ParseError(format!(
+                "UNION requires exactly 2 inputs, got {}",
+                union.inputs.len()
+            )));
+        }
+
+        // Extract source identifiers from each input (for UNION ALL)
+        let left_source = Self::extract_source_identifier(&union.inputs[0]);
+        let right_source = Self::extract_source_identifier(&union.inputs[1]);
+
+        // Compile left and right inputs
+        let left_id = self.compile_plan(&union.inputs[0])?;
+        let right_id = self.compile_plan(&union.inputs[1])?;
+
+        use crate::incremental::merge_operator::{MergeOperator, UnionMode};
+
+        // Create a merge operator that handles the rowid transformation
+        let operator_id = self.circuit.next_id;
+        let mode = if union.all {
+            // For UNION ALL, pass the source identifiers
+            UnionMode::All {
+                left_table: left_source,
+                right_table: right_source,
+            }
+        } else {
+            UnionMode::Distinct
+        };
+        let merge_operator = Box::new(MergeOperator::new(operator_id, mode));
+
+        let merge_id = self.circuit.add_node(
+            DbspOperator::Merge {
+                schema: union.schema.clone(),
+            },
+            vec![left_id, right_id],
+            merge_operator,
+        );
+
+        Ok(merge_id)
     }
 
     /// Convert a logical expression to a DBSP expression
