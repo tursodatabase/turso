@@ -556,7 +556,6 @@ pub fn translate_insert(
         });
     }
 
-
     program.preassign_label_to_next_insn(key_ready_for_uniqueness_check_label);
 
     let emit_halt_with_constraint = |program: &mut ProgramBuilder, col_name: &str| {
@@ -569,7 +568,6 @@ pub fn translate_insert(
             description,
         });
     };
-
 
     // Check uniqueness constraint for rowid if it was provided by user.
     // When the DB allocates it there are no need for separate uniqueness checks.
@@ -1584,7 +1582,6 @@ fn translate_virtual_table_insert(
     Ok(program)
 }
 
-
 ///  makes sure that an AUTOINCREMENT table has a sequence row in `sqlite_sequence`, inserting one with 0 if missing.
 fn ensure_sequence_initialized(
     program: &mut ProgramBuilder,
@@ -1690,7 +1687,7 @@ fn ensure_sequence_initialized(
     });
 
     Ok(())
-
+}
 #[inline]
 /// Build the UNIQUE constraint error description to match sqlite
 /// single column: `t.c1`
@@ -1759,5 +1756,4 @@ pub fn rewrite_partial_index_where(
             Ok(WalkControl::Continue)
         },
     )
-
 }
