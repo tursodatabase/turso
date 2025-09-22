@@ -5927,8 +5927,6 @@ pub fn op_idx_delete(
                 }
                 // Increment metrics for index write (delete is a write operation)
                 state.metrics.rows_written = state.metrics.rows_written.saturating_add(1);
-                let n_change = program.n_change.get();
-                program.n_change.set(n_change + 1);
                 state.pc += 1;
                 state.op_idx_delete_state = None;
                 return Ok(InsnFunctionStepResult::Step);
