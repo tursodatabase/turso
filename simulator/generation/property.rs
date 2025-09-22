@@ -1528,6 +1528,7 @@ impl ArbitraryFrom<(&SimulatorEnv, &InteractionStats)> for Property {
             env.profile.experimental_mvcc,
         );
 
+        #[allow(clippy::type_complexity)]
         let choices: Vec<(_, Box<dyn Fn(&mut R) -> Property>)> = vec![
             (
                 if !env.opts.disable_insert_values_select {

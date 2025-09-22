@@ -269,7 +269,7 @@ impl SimulatorEnv {
     ) -> Self {
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
 
-        let opts = SimulatorOpts {
+        let mut opts = SimulatorOpts {
             seed,
             ticks: rng.random_range(cli_opts.minimum_tests..=cli_opts.maximum_tests),
             max_tables: rng.random_range(0..128),
@@ -323,6 +323,8 @@ impl SimulatorEnv {
         if cli_opts.differential {
             // Disable faults when running against sqlite as we cannot control faults on it
             profile.io.enable = false;
+            // Disable limits due to differences in return order from turso and rusqlite
+            opts.disable_select_limit = true;
         }
 
         profile.validate().unwrap();
