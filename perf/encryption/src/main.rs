@@ -352,7 +352,7 @@ async fn worker_thread(
                 .await?;
         }
 
-        conn.busy_timeout(Some(timeout))?;
+        conn.busy_timeout(timeout)?;
 
         let mut insert_stmt = conn
             .prepare("INSERT INTO test_table (id, data) VALUES (?, ?)")

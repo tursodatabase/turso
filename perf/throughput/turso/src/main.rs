@@ -195,7 +195,7 @@ async fn worker_thread(
 
     for iteration in 0..iterations {
         let conn = db.connect()?;
-        conn.busy_timeout(Some(timeout))?;
+        conn.busy_timeout(timeout)?;
         let total_inserts = Arc::clone(&total_inserts);
         let tx_fut = async move {
             let mut stmt = conn
