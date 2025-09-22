@@ -83,8 +83,8 @@ impl LogRecordType {
     ///
     /// Insert:
     /// * Payload length -> u64
-    /// * Data size -> varint
     /// * Rowid -> varint
+    /// * Data size -> varint
     /// * Data -> [u8] (data size length)
     fn serialize(&self, buffer: &mut Vec<u8>, row_version: &RowVersion) {
         buffer.extend_from_slice(&row_version.row.id.table_id.to_be_bytes());
