@@ -3,7 +3,13 @@ pub mod grammar_generator;
 #[cfg(test)]
 mod tests {
     use rand::seq::{IndexedRandom, SliceRandom};
-    use std::{collections::HashSet, path::PathBuf, sync::Arc};
+    use std::{
+        collections::{HashSet, VecDeque},
+        fs::OpenOptions,
+        io::{BufWriter, Write},
+        path::PathBuf,
+        sync::Arc,
+    };
 
     use rand::{Rng, SeedableRng};
     use rand_chacha::ChaCha8Rng;
@@ -670,6 +676,107 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy, Debug)]
+    enum QueryKind {
+        Select,
+        Update,
+        Insert,
+        Delete,
+        Join,
+        Other,
+    }
+
+    #[derive(Debug)]
+    struct QueryEntry {
+        idx: usize,
+        seed: u64,
+        kind: QueryKind,
+        returns_rows: bool,
+        sql: String,
+    }
+
+    impl QueryEntry {
+        fn new(idx: usize, seed: u64, kind: QueryKind, returns_rows: bool, sql: String) -> Self {
+            Self {
+                idx,
+                seed,
+                kind,
+                returns_rows,
+                sql,
+            }
+        }
+
+        fn to_jsonl(&self) -> String {
+            let s = self
+                .sql
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('\n', "\\n");
+            format!(
+                r#"{{"idx":{},"seed":{},"kind":"{:?}","returns_rows":{},"sql":"{}"}}"#,
+                self.idx, self.seed, self.kind, self.returns_rows, s
+            )
+        }
+    }
+
+    struct QueryLog {
+        // Last N queries for immediate debug output
+        recent: VecDeque<QueryEntry>,
+        cap: usize,
+        // Append-only JSONL file
+        file: BufWriter<std::fs::File>,
+    }
+
+    impl QueryLog {
+        fn to_file(path: impl Into<PathBuf>, cap: usize) -> std::io::Result<Self> {
+            let f = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path.into())?;
+            Ok(Self {
+                recent: VecDeque::with_capacity(cap.min(8192)),
+                cap,
+                file: BufWriter::new(f),
+            })
+        }
+
+        fn record(&mut self, entry: QueryEntry) {
+            let _ = writeln!(self.file, "{}", entry.to_jsonl());
+            let _ = self.file.flush();
+            if self.recent.len() == self.cap {
+                self.recent.pop_front();
+            }
+            self.recent.push_back(entry);
+        }
+
+        /// Print a compact summary + the last `n` queries verbatim.
+        fn emit_last(&self, n: usize) {
+            eprintln!(
+                "======= Fuzz run: dumping last {} of {} queries =======",
+                n.min(self.recent.len()),
+                self.recent.len()
+            );
+            let start = self.recent.len().saturating_sub(n);
+            for q in self.recent.iter().skip(start) {
+                eprintln!(
+                    "-- idx={} seed={} kind={:?} rows={}",
+                    q.idx, q.seed, q.kind, q.returns_rows
+                );
+                eprintln!("{}", q.sql);
+                eprintln!();
+            }
+            eprintln!("========================================================");
+        }
+    }
+
+    fn sqlite_returns_rows(
+        conn: &rusqlite::Connection,
+        sql: &str,
+    ) -> Result<bool, rusqlite::Error> {
+        let stmt = conn.prepare(sql)?;
+        Ok(stmt.column_count() > 0)
+    }
+
     #[test]
     #[ignore]
     /// **must** be manually run with `make fuzz-bigass-db SEED={seed}`
@@ -681,6 +788,9 @@ mod tests {
         } else {
             rng_from_time()
         };
+
+        let mut qlog = QueryLog::to_file(format!("../fuzz-queries-{seed}.jsonl"), 50_000)
+            .expect("open query log");
 
         println!("large_database_fuzz seed: {seed}");
         println!("Generating test databases with seed {seed}...");
@@ -723,11 +833,28 @@ mod tests {
                 9 => generate_join_query(&mut rng),
                 _ => unreachable!(),
             };
+            let kind = match op_type {
+                0..=3 => QueryKind::Select,
+                4..=5 => QueryKind::Update,
+                6..=7 => QueryKind::Insert,
+                8 => QueryKind::Delete,
+                9 => QueryKind::Join,
+                _ => QueryKind::Other,
+            };
+            let returns_rows = sqlite_returns_rows(&sqlite_conn, &query).unwrap_or_else(|_| {
+                // If prepare fails on SQLite, fall back to a simple heuristic; we’ll still log the failure.
+                query
+                    .trim_start()
+                    .to_ascii_lowercase()
+                    .starts_with("select")
+            });
+            qlog.record(QueryEntry::new(i, seed, kind, returns_rows, query.clone()));
 
             if query.trim_start().to_lowercase().starts_with("select") {
                 let sqlite_rows = sqlite_exec_rows(&sqlite_conn, &query);
                 let limbo_rows = limbo_exec_rows(&limbo_db, &limbo_conn, &query);
                 if sqlite_rows != limbo_rows {
+                    qlog.emit_last(100);
                     println!("=======Data mismatch detected=======");
                     println!("Seed: {seed}");
                     println!("SQLite rows: {sqlite_rows:?}");
@@ -745,11 +872,14 @@ mod tests {
                     .map(|_| limbo_exec_rows(&limbo_db, &limbo_conn, "SELECT changes()"));
 
                 match (sqlite_result, turso_result) {
-                    (Ok(sqlite_changes), Ok(limbo_changes)) => {
-                        if sqlite_changes != limbo_changes {
+                    (Ok(sqlite_changes), Ok(turso_changes)) => {
+                        if sqlite_changes != turso_changes {
                             println!("=======Data mismatch detected=======");
                             println!("Seed: {seed}");
                             println!("Query that caused mismatch: {query}");
+                            qlog.emit_last(100);
+                            println!("SQLite changes: {sqlite_changes:?}");
+                            println!("Turso changes: {turso_changes:?}");
                             panic!("Change count mismatch for query: {query}\nSeed: {seed}");
                         }
                     }
@@ -759,6 +889,7 @@ mod tests {
                     }
                     (sqlite_res, turso_res) => {
                         // One succeeded, one failed - this is a problem
+                        qlog.emit_last(100);
                         panic!(
                         "Execution mismatch!\nQuery: {query}\nSQLite: {sqlite_res:?}\nTurso: {turso_res:?}\nSeed: {seed}",
                     );
@@ -785,7 +916,15 @@ mod tests {
 
     /// Generate a random SELECT query
     fn generate_select_query(rng: &mut ChaCha8Rng) -> String {
-        let tables = ["users", "products", "orders", "order_items", "reviews"];
+        let tables = [
+            "users",
+            "customer_support_tickets",
+            "products",
+            "orders",
+            "order_items",
+            "reviews",
+            "inventory_transactions",
+        ];
         let table = tables.choose(rng).unwrap();
         let operators = [">", ">=", "<>", "<", "<=", "="];
         match rng.random_range(0..5) {
@@ -833,11 +972,41 @@ mod tests {
                 )
             }
             2 => {
-                // Aggregate query
-                let agg_fn = ["COUNT(*)", "AVG(price)", "MAX(age)", "MIN(total_amount)"]
-                    .choose(rng)
-                    .unwrap();
-                format!("SELECT {agg_fn} FROM {table}")
+                let aggs = ["COUNT", "SUM", "AVG", "MAX", "MIN"];
+                format!(
+                    "SELECT {}(id) FROM {table} WHERE {}",
+                    aggs.choose(rng).unwrap(),
+                    match *table {
+                        "products" => {
+                            let price = rng.random_range(20..300);
+                            format!("price > {price}")
+                        }
+                        "users" => {
+                            let age = rng.random_range(18..70);
+                            format!("age < {age}")
+                        }
+                        "orders" => "status = 'shipped'".to_string(),
+                        "order_items" => {
+                            let qty = rng.random_range(1..50);
+                            format!("quantity >= {qty}")
+                        }
+                        "reviews" => {
+                            let rating = rng.random_range(1..=5);
+                            format!("rating <= {rating}")
+                        }
+                        "customer_support_tickets" => {
+                            let statuses = ["open", "closed", "pending"];
+                            let status = statuses.choose(rng).unwrap();
+                            format!("status = '{status}'")
+                        }
+                        "inventory_transactions" => {
+                            let change_types = ["restock", "sale"];
+                            let change_type = change_types.choose(rng).unwrap();
+                            format!("change_type = '{change_type}'")
+                        }
+                        _ => unreachable!(),
+                    }
+                )
             }
             3 => {
                 // Group by query
