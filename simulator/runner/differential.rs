@@ -1,5 +1,8 @@
 use std::sync::{Arc, Mutex};
 
+use similar_asserts::SimpleDiff;
+use sql_generation::model::table::SimValue;
+
 use crate::generation::plan::{ConnectionState, Interaction, InteractionPlanState};
 
 use super::{
@@ -147,43 +150,41 @@ fn compare_results(
                                 tracing::error!(
                                     "returned values from limbo and rusqlite results do not match"
                                 );
-                                let diff = limbo_values
-                                    .iter()
-                                    .zip(rusqlite_values.iter())
-                                    .enumerate()
-                                    .filter(|(_, (l, r))| l != r)
-                                    .collect::<Vec<_>>();
 
-                                let diff = diff
-                                    .iter()
-                                    .flat_map(|(i, (l, r))| {
-                                        let mut diffs = vec![];
-                                        for (j, (l, r)) in l.iter().zip(r.iter()).enumerate() {
-                                            if l != r {
-                                                tracing::debug!(
-                                                    "difference at index {}, {}: {} != {}",
-                                                    i,
-                                                    j,
-                                                    l.to_string(),
-                                                    r.to_string()
-                                                );
-                                                diffs.push(((i, j), (l.clone(), r.clone())));
-                                            }
+                                fn val_to_string(sim_val: &SimValue) -> String {
+                                    match &sim_val.0 {
+                                        turso_core::Value::Blob(blob) => {
+                                            let convert_blob = || -> anyhow::Result<String> {
+                                                let val = String::from_utf8(blob.clone())?;
+                                                Ok(val)
+                                            };
+
+                                            convert_blob().unwrap_or_else(|_| sim_val.to_string())
                                         }
-                                        diffs
-                                    })
-                                    .collect::<Vec<_>>();
-                                tracing::debug!("limbo values {:?}", limbo_values);
-                                tracing::debug!("rusqlite values {:?}", rusqlite_values);
-                                tracing::debug!(
-                                    "differences: {}",
-                                    diff.iter()
-                                        .map(|((i, j), (l, r))| format!(
-                                            "\t({i}, {j}): ({l}) != ({r})"
-                                        ))
-                                        .collect::<Vec<_>>()
-                                        .join("\n")
+                                        _ => sim_val.to_string(),
+                                    }
+                                }
+
+                                let limbo_string_values: Vec<Vec<_>> = limbo_values
+                                    .iter()
+                                    .map(|rows| rows.iter().map(|row| val_to_string(row)).collect())
+                                    .collect();
+
+                                let rusqlite_string_values: Vec<Vec<_>> = rusqlite_values
+                                    .iter()
+                                    .map(|rows| rows.iter().map(|row| val_to_string(row)).collect())
+                                    .collect();
+
+                                let turso_string = format!("{limbo_string_values:#?}");
+                                let rusqlite_string = format!("{rusqlite_string_values:#?}");
+                                let diff = SimpleDiff::from_str(
+                                    &turso_string,
+                                    &rusqlite_string,
+                                    "turso",
+                                    "rusqlite",
                                 );
+                                tracing::error!(%diff);
+
                                 return Err(turso_core::LimboError::InternalError(
                                     "returned values from limbo and rusqlite results do not match"
                                         .into(),

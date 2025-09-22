@@ -45,3 +45,5 @@ strum = { workspace = true }
 parking_lot = { workspace = true }
 indexmap = { workspace = true }
 either = "1.15.0"
+similar = { workspace = true }
+similar-asserts = { workspace = true }

@@ -96,6 +96,11 @@ tracing-appender = "0.2.3"
 env_logger = { version = "0.11.6", default-features = false }
 regex = "1.11.1"
 regex-syntax = { version = "0.8.5", default-features = false }
+similar = { version = "2.7.0" }
+similar-asserts = { version = "1.7.0" }
+
+[profile.dev.package.similar]
+opt-level = 3
 
 [profile.release]
 debug = "line-tables-only"
