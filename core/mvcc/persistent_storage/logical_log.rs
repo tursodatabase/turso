@@ -1,6 +1,6 @@
 use crate::{
     mvcc::database::{LogRecord, RowVersion},
-    storage::sqlite3_ondisk::{write_varint, write_varint_to_vec},
+    storage::sqlite3_ondisk::write_varint_to_vec,
     turso_assert,
     types::IOCompletions,
     Buffer, Completion, CompletionError, Result,
@@ -14,8 +14,31 @@ pub struct LogicalLog {
     offset: u64,
 }
 
-const TOMBSTONE: u8 = 1;
-const NOT_TOMBSTONE: u8 = 0;
+/// Log's Header, this will be the 64 bytes in any logical log file.
+/// Log header is 64 bytes at maximum, fields added must not exceed that size. If it doesn't exceed
+/// it, any bytes missing will be padded with zeroes.
+struct LogHeader {
+    version: u8,
+    salt: u64,
+    encrypted: u8, // 0 is no
+}
+
+const LOG_HEADER_MAX_SIZE: usize = 64;
+const LOG_HEADER_PADDING: [u8; LOG_HEADER_MAX_SIZE] = [0; LOG_HEADER_MAX_SIZE];
+
+impl LogHeader {
+    pub fn serialize(&self, buffer: &mut Vec<u8>) {
+        let buffer_size_start = buffer.len();
+        buffer.push(self.version);
+        buffer.extend_from_slice(&self.salt.to_be_bytes());
+        buffer.push(self.encrypted);
+
+        let header_size_before_padding = buffer.len() - buffer_size_start;
+        let padding = 64 - header_size_before_padding;
+        debug_assert!(header_size_before_padding <= LOG_HEADER_MAX_SIZE);
+        buffer.extend_from_slice(&LOG_HEADER_PADDING[0..padding]);
+    }
+}
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -99,6 +122,20 @@ impl LogicalLog {
 
     pub fn log_tx(&mut self, tx: &LogRecord) -> Result<IOResult<()>> {
         let mut buffer = Vec::new();
+
+        // 1. Serialize log header if it's first write
+        let is_first_write = self.offset == 0;
+        if is_first_write {
+            let header = LogHeader {
+                version: 1,
+                salt: 0, // TODO: add checksums!
+                encrypted: 0,
+            };
+            header.serialize(&mut buffer);
+        }
+        // 2. Serialize Transaction
+
+        // 3. Serialize rows
         buffer.extend_from_slice(&tx.tx_timestamp.to_be_bytes());
         tx.row_versions.iter().for_each(|row_version| {
             let row_type = LogRowType::from_row_version(row_version);
