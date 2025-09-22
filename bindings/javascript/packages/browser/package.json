@@ -1,6 +1,6 @@
 {
   "name": "@tursodatabase/database-browser",
-  "version": "0.2.0-pre.5",
+  "version": "0.2.0-pre.6",
   "repository": {
     "type": "git",
     "url": "https://github.com/tursodatabase/turso"
@@ -51,7 +51,7 @@
     ]
   },
   "dependencies": {
-    "@tursodatabase/database-browser-common": "^0.2.0-pre.5",
-    "@tursodatabase/database-common": "^0.2.0-pre.5"
+    "@tursodatabase/database-browser-common": "^0.2.0-pre.6",
+    "@tursodatabase/database-common": "^0.2.0-pre.6"
   }
 }

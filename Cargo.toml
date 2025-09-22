@@ -39,29 +39,29 @@ exclude = [
 ]
 
 [workspace.package]
-version = "0.2.0-pre.5"
+version = "0.2.0-pre.6"
 authors = ["the Limbo authors"]
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/tursodatabase/turso"
 
 [workspace.dependencies]
-turso = { path = "bindings/rust", version = "0.2.0-pre.5" }
-turso_node = { path = "bindings/javascript", version = "0.2.0-pre.5" }
-limbo_completion = { path = "extensions/completion", version = "0.2.0-pre.5" }
-turso_core = { path = "core", version = "0.2.0-pre.5" }
-turso_sync_engine = { path = "sync/engine", version = "0.2.0-pre.5" }
-limbo_crypto = { path = "extensions/crypto", version = "0.2.0-pre.5" }
-limbo_csv = { path = "extensions/csv", version = "0.2.0-pre.5" }
-turso_ext = { path = "extensions/core", version = "0.2.0-pre.5" }
-turso_ext_tests = { path = "extensions/tests", version = "0.2.0-pre.5" }
-limbo_ipaddr = { path = "extensions/ipaddr", version = "0.2.0-pre.5" }
-turso_macros = { path = "macros", version = "0.2.0-pre.5" }
-limbo_percentile = { path = "extensions/percentile", version = "0.2.0-pre.5" }
-limbo_regexp = { path = "extensions/regexp", version = "0.2.0-pre.5" }
-turso_sqlite3_parser = { path = "vendored/sqlite3-parser", version = "0.2.0-pre.5" }
-limbo_uuid = { path = "extensions/uuid", version = "0.2.0-pre.5" }
-turso_parser = { path = "parser", version = "0.2.0-pre.5" }
+turso = { path = "bindings/rust", version = "0.2.0-pre.6" }
+turso_node = { path = "bindings/javascript", version = "0.2.0-pre.6" }
+limbo_completion = { path = "extensions/completion", version = "0.2.0-pre.6" }
+turso_core = { path = "core", version = "0.2.0-pre.6" }
+turso_sync_engine = { path = "sync/engine", version = "0.2.0-pre.6" }
+limbo_crypto = { path = "extensions/crypto", version = "0.2.0-pre.6" }
+limbo_csv = { path = "extensions/csv", version = "0.2.0-pre.6" }
+turso_ext = { path = "extensions/core", version = "0.2.0-pre.6" }
+turso_ext_tests = { path = "extensions/tests", version = "0.2.0-pre.6" }
+limbo_ipaddr = { path = "extensions/ipaddr", version = "0.2.0-pre.6" }
+turso_macros = { path = "macros", version = "0.2.0-pre.6" }
+limbo_percentile = { path = "extensions/percentile", version = "0.2.0-pre.6" }
+limbo_regexp = { path = "extensions/regexp", version = "0.2.0-pre.6" }
+turso_sqlite3_parser = { path = "vendored/sqlite3-parser", version = "0.2.0-pre.6" }
+limbo_uuid = { path = "extensions/uuid", version = "0.2.0-pre.6" }
+turso_parser = { path = "parser", version = "0.2.0-pre.6" }
 sql_generation = { path = "sql_generation" }
 strum = { version = "0.26", features = ["derive"] }
 strum_macros = "0.26"
