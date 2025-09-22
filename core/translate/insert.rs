@@ -501,8 +501,7 @@ pub fn translate_insert(
     }
 
     program.preassign_label_to_next_insn(key_generation_label);
-    if btree_table.has_autoincrement {
-        let (_, r_seq, _, _) = autoincrement_meta.unwrap();
+if let Some((_, r_seq, _,_)) = autoincrement_meta {
         let r_max = program.alloc_register();
 
         let dummy_reg = program.alloc_register();
