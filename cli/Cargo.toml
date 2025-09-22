@@ -28,7 +28,7 @@ ctrlc = "3.4.4"
 dirs = "5.0.1"
 env_logger = { workspace = true }
 libc = "0.2.172"
-turso_core = { path = "../core", default-features = true, features = [] }
+turso_core = { path = "../core", default-features = true, features = ["cli_only"] }
 limbo_completion = { path = "../extensions/completion", features = ["static"] }
 miette = { workspace = true, features = ["fancy"] }
 nu-ansi-term = {version = "0.50.1", features = ["serde", "derive_serde_style"]}
