@@ -708,11 +708,8 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
             } => {
                 let write_row_state_machine = self.write_row_state_machine.as_mut().unwrap();
                 match write_row_state_machine.step(&())? {
-                    TransitionResult::Io(io) => return Ok(TransitionResult::Io(io)),
-                    TransitionResult::Continue => {
-                        return Ok(TransitionResult::Continue);
-                    }
-                    TransitionResult::Done(_) => {
+                    IOResult::IO(io) => return Ok(TransitionResult::Io(io)),
+                    IOResult::Done(_) => {
                         let requires_seek = {
                             if let Some(next_id) = self.write_set.get(*write_set_index + 1) {
                                 let current_id = &self.write_set[*write_set_index];
@@ -744,11 +741,8 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
             } => {
                 let delete_row_state_machine = self.delete_row_state_machine.as_mut().unwrap();
                 match delete_row_state_machine.step(&())? {
-                    TransitionResult::Io(io) => return Ok(TransitionResult::Io(io)),
-                    TransitionResult::Continue => {
-                        return Ok(TransitionResult::Continue);
-                    }
-                    TransitionResult::Done(_) => {
+                    IOResult::IO(io) => return Ok(TransitionResult::Io(io)),
+                    IOResult::Done(_) => {
                         self.state = CommitState::WriteRow {
                             end_ts: *end_ts,
                             write_set_index: *write_set_index + 1,

@@ -1,4 +1,7 @@
-use crate::{types::IOCompletions, Result};
+use crate::{
+    types::{IOCompletions, IOResult},
+    Result,
+};
 
 pub enum TransitionResult<Result> {
     Io(IOCompletions),
@@ -41,20 +44,15 @@ impl<State: StateTransition> StateMachine<State> {
             is_finalized: false,
         }
     }
-}
 
-impl<State: StateTransition> StateTransition for StateMachine<State> {
-    type Context = State::Context;
-    type SMResult = State::SMResult;
-
-    fn step<'a>(&mut self, context: &Self::Context) -> Result<TransitionResult<Self::SMResult>> {
+    pub fn step(&mut self, context: &State::Context) -> Result<IOResult<State::SMResult>> {
         loop {
             if self.is_finalized {
                 unreachable!("StateMachine::transition: state machine is finalized");
             }
             match self.state.step(context)? {
                 TransitionResult::Io(io) => {
-                    return Ok(TransitionResult::Io(io));
+                    return Ok(IOResult::IO(io));
                 }
                 TransitionResult::Continue => {
                     continue;
@@ -62,19 +60,19 @@ impl<State: StateTransition> StateTransition for StateMachine<State> {
                 TransitionResult::Done(result) => {
                     assert!(self.state.is_finalized());
                     self.is_finalized = true;
-                    return Ok(TransitionResult::Done(result));
+                    return Ok(IOResult::Done(result));
                 }
             }
         }
     }
 
-    fn finalize(&mut self, context: &Self::Context) -> Result<()> {
+    pub fn finalize(&mut self, context: &State::Context) -> Result<()> {
         self.state.finalize(context)?;
         self.is_finalized = true;
         Ok(())
     }
 
-    fn is_finalized(&self) -> bool {
+    pub fn is_finalized(&self) -> bool {
         self.is_finalized
     }
 }
