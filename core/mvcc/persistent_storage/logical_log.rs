@@ -43,24 +43,24 @@ impl LogHeader {
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum LogRecordType {
-    Delete = 0,
-    Insert = 1,
+    DeleteRow = 0,
+    InsertRow = 1,
 }
 
 impl LogRecordType {
     fn from_row_version(row_version: &RowVersion) -> Self {
         if row_version.end.is_some() {
-            Self::Delete
+            Self::DeleteRow
         } else {
-            Self::Insert
+            Self::InsertRow
         }
     }
 
     #[allow(dead_code)]
     fn from_u8(value: u8) -> Option<Self> {
         match value {
-            0 => Some(LogRecordType::Delete),
-            1 => Some(LogRecordType::Insert),
+            0 => Some(LogRecordType::DeleteRow),
+            1 => Some(LogRecordType::InsertRow),
             _ => None,
         }
     }
@@ -91,10 +91,10 @@ impl LogRecordType {
         buffer.extend_from_slice(&self.as_u8().to_be_bytes());
         let size_before_payload = buffer.len();
         match self {
-            LogRecordType::Delete => {
+            LogRecordType::DeleteRow => {
                 write_varint_to_vec(row_version.row.id.row_id as u64, buffer);
             }
-            LogRecordType::Insert => {
+            LogRecordType::InsertRow => {
                 write_varint_to_vec(row_version.row.id.row_id as u64, buffer);
 
                 let data = &row_version.row.data;
