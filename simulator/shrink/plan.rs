@@ -33,7 +33,7 @@ impl InteractionPlan {
                     break;
                 }
                 match &all_interactions[idx].1.interaction {
-                    InteractionType::Query(query) => {
+                    InteractionType::Query(query) | InteractionType::FaultyQuery(query) => {
                         depending_tables = query.dependencies();
                         break;
                     }
@@ -54,77 +54,126 @@ impl InteractionPlan {
             }
         }
 
-        let before = self.plan.len();
+        let before = self.len();
 
         // Remove all properties after the failing one
         plan.plan.truncate(secondary_interactions_index + 1);
 
-        let mut idx = 0;
-        // Remove all properties that do not use the failing tables
-        plan.plan.retain_mut(|interactions| {
-            let retain = if idx == secondary_interactions_index {
-                if let InteractionsType::Property(
-                    Property::FsyncNoWait { tables, .. } | Property::FaultyQuery { tables, .. },
-                ) = &mut interactions.interactions
-                {
-                    tables.retain(|table| depending_tables.contains(table));
-                }
-                true
-            } else {
-                let mut has_table = interactions
-                    .uses()
-                    .iter()
-                    .any(|t| depending_tables.contains(t));
-
-                if has_table {
-                    // Remove the extensional parts of the properties
-                    if let InteractionsType::Property(p) = &mut interactions.interactions {
-                        match p {
-                            Property::InsertValuesSelect { queries, .. }
-                            | Property::DoubleCreateFailure { queries, .. }
-                            | Property::DeleteSelect { queries, .. }
-                            | Property::DropSelect { queries, .. } => {
-                                queries.clear();
-                            }
-                            Property::FsyncNoWait { tables, query }
-                            | Property::FaultyQuery { tables, query } => {
-                                if !query.uses().iter().any(|t| depending_tables.contains(t)) {
-                                    tables.clear();
-                                } else {
-                                    tables.retain(|table| depending_tables.contains(table));
-                                }
-                            }
-                            Property::SelectLimit { .. }
-                            | Property::SelectSelectOptimizer { .. }
-                            | Property::WhereTrueFalseNull { .. }
-                            | Property::UNIONAllPreservesCardinality { .. }
-                            | Property::ReadYourUpdatesBack { .. }
-                            | Property::TableHasExpectedContent { .. } => {}
-                        }
+        // means we errored in some fault on transaction statement so just maintain the statements from before the failing one
+        if !depending_tables.is_empty() {
+            let mut idx = 0;
+            // Remove all properties that do not use the failing tables
+            plan.plan.retain_mut(|interactions| {
+                let retain = if idx == secondary_interactions_index {
+                    if let InteractionsType::Property(
+                        Property::FsyncNoWait { tables, .. } | Property::FaultyQuery { tables, .. },
+                    ) = &mut interactions.interactions
+                    {
+                        tables.retain(|table| depending_tables.contains(table));
                     }
-                    // Check again after query clear if the interactions still uses the failing table
-                    has_table = interactions
+                    true
+                } else if matches!(
+                    interactions.interactions,
+                    InteractionsType::Query(Query::Begin(..))
+                        | InteractionsType::Query(Query::Commit(..))
+                        | InteractionsType::Query(Query::Rollback(..))
+                ) {
+                    true
+                } else {
+                    let mut has_table = interactions
                         .uses()
                         .iter()
                         .any(|t| depending_tables.contains(t));
-                }
-                let is_fault = matches!(interactions.interactions, InteractionsType::Fault(..));
-                is_fault
-                    || (has_table
-                        && !matches!(
-                            interactions.interactions,
-                            InteractionsType::Query(Query::Select(_))
-                                | InteractionsType::Property(Property::SelectLimit { .. })
-                                | InteractionsType::Property(
-                                    Property::SelectSelectOptimizer { .. }
-                                )
-                        ))
-            };
-            idx += 1;
-            retain
-        });
 
-        let after = plan.plan.len();
+                    if has_table {
+                        // Remove the extensional parts of the properties
+                        if let InteractionsType::Property(p) = &mut interactions.interactions {
+                            match p {
+                                Property::InsertValuesSelect { queries, .. }
+                                | Property::DoubleCreateFailure { queries, .. }
+                                | Property::DeleteSelect { queries, .. }
+                                | Property::DropSelect { queries, .. } => {
+                                    queries.clear();
+                                }
+                                Property::FsyncNoWait { tables, query }
+                                | Property::FaultyQuery { tables, query } => {
+                                    if !query.uses().iter().any(|t| depending_tables.contains(t)) {
+                                        tables.clear();
+                                    } else {
+                                        tables.retain(|table| depending_tables.contains(table));
+                                    }
+                                }
+                                Property::SelectLimit { .. }
+                                | Property::SelectSelectOptimizer { .. }
+                                | Property::WhereTrueFalseNull { .. }
+                                | Property::UNIONAllPreservesCardinality { .. }
+                                | Property::ReadYourUpdatesBack { .. }
+                                | Property::TableHasExpectedContent { .. } => {}
+                            }
+                        }
+                        // Check again after query clear if the interactions still uses the failing table
+                        has_table = interactions
+                            .uses()
+                            .iter()
+                            .any(|t| depending_tables.contains(t));
+                    }
+                    let is_fault = matches!(interactions.interactions, InteractionsType::Fault(..));
+                    is_fault
+                        || (has_table
+                            && !matches!(
+                                interactions.interactions,
+                                InteractionsType::Query(Query::Select(_))
+                                    | InteractionsType::Property(Property::SelectLimit { .. })
+                                    | InteractionsType::Property(
+                                        Property::SelectSelectOptimizer { .. }
+                                    )
+                            ))
+                };
+                idx += 1;
+                retain
+            });
+
+            // Comprise of idxs of Begin interactions
+            let mut begin_idx = Vec::new();
+            // Comprise of idxs of the intereactions Commit and Rollback
+            let mut end_tx_idx = Vec::new();
+
+            for (idx, interactions) in plan.plan.iter().enumerate() {
+                match &interactions.interactions {
+                    InteractionsType::Query(Query::Begin(..)) => {
+                        begin_idx.push(idx);
+                    }
+                    InteractionsType::Query(Query::Commit(..))
+                    | InteractionsType::Query(Query::Rollback(..)) => {
+                        let last_begin = begin_idx.last().unwrap() + 1;
+                        if last_begin == idx {
+                            end_tx_idx.push(idx);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            // remove interactions if its just a Begin Commit/Rollback with no queries in the middle
+            let mut range_transactions = end_tx_idx.into_iter().peekable();
+            let mut idx = 0;
+            plan.plan.retain_mut(|_| {
+                let mut retain = true;
+
+                if let Some(txn_interaction_idx) = range_transactions.peek().copied() {
+                    if txn_interaction_idx == idx {
+                        range_transactions.next();
+                    }
+                    if txn_interaction_idx == idx || txn_interaction_idx.saturating_sub(1) == idx {
+                        retain = false;
+                    }
+                }
+                idx += 1;
+                retain
+            });
+        }
+
+        let after = plan.len();
 
         tracing::info!(
             "Shrinking interaction plan from {} to {} properties",
@@ -184,7 +233,7 @@ impl InteractionPlan {
             }
         }
 
-        let before = self.plan.len();
+        let before = self.len();
 
         plan.plan.truncate(secondary_interactions_index + 1);
 
@@ -196,8 +245,8 @@ impl InteractionPlan {
                     | Property::DoubleCreateFailure { queries, .. }
                     | Property::DeleteSelect { queries, .. }
                     | Property::DropSelect { queries, .. } => {
-                        let mut temp_plan = InteractionPlan {
-                            plan: queries
+                        let mut temp_plan = InteractionPlan::new_with(
+                            queries
                                 .iter()
                                 .map(|q| {
                                     Interactions::new(
@@ -206,7 +255,8 @@ impl InteractionPlan {
                                     )
                                 })
                                 .collect(),
-                        };
+                            self.mvcc,
+                        );
 
                         temp_plan = InteractionPlan::iterative_shrink(
                             temp_plan,
@@ -218,7 +268,6 @@ impl InteractionPlan {
                         //temp_plan = Self::shrink_queries(temp_plan, failing_execution, result, env);
 
                         *queries = temp_plan
-                            .plan
                             .into_iter()
                             .filter_map(|i| match i.interactions {
                                 InteractionsType::Query(q) => Some(q),
@@ -247,7 +296,7 @@ impl InteractionPlan {
             secondary_interactions_index,
         );
 
-        let after = plan.plan.len();
+        let after = plan.len();
 
         tracing::info!(
             "Shrinking interaction plan from {} to {} properties",
@@ -266,7 +315,7 @@ impl InteractionPlan {
         env: Arc<Mutex<SimulatorEnv>>,
         secondary_interaction_index: usize,
     ) -> InteractionPlan {
-        for i in (0..plan.plan.len()).rev() {
+        for i in (0..plan.len()).rev() {
             if i == secondary_interaction_index {
                 continue;
             }

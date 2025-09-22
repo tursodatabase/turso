@@ -192,7 +192,12 @@ class Database {
     }
 
     try {
-      this.db.batchSync(sql);
+      let stmt = this.prepare(sql);
+      try {
+        stmt.run();
+      } finally {
+        stmt.close();
+      }
     } catch (err) {
       throw convertError(err);
     }
@@ -407,6 +412,10 @@ class Statement {
     } catch (err) {
       throw convertError(err);
     }
+  }
+
+  close() {
+    this.stmt.finalize();
   }
 }
 

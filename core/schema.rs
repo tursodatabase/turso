@@ -1,4 +1,6 @@
+use crate::function::Func;
 use crate::incremental::view::IncrementalView;
+use crate::translate::expr::{bind_and_rewrite_expr, walk_expr, ParamState, WalkControl};
 use parking_lot::RwLock;
 
 /// Simple view structure for non-materialized views
@@ -15,24 +17,24 @@ pub type ViewsMap = HashMap<String, View>;
 
 use crate::storage::btree::BTreeCursor;
 use crate::translate::collate::CollationSeq;
-use crate::translate::plan::SelectPlan;
+use crate::translate::plan::{SelectPlan, TableReferences};
 use crate::util::{
     module_args_from_sql, module_name_from_sql, type_from_name, IOExt, UnparsedFromSqlIndex,
 };
 use crate::{
-    contains_ignore_ascii_case, eq_ignore_ascii_case, match_ignore_ascii_case, LimboError,
-    MvCursor, MvStore, Pager, RefValue, SymbolTable, VirtualTable,
+    contains_ignore_ascii_case, eq_ignore_ascii_case, match_ignore_ascii_case, Connection,
+    LimboError, MvCursor, MvStore, Pager, RefValue, SymbolTable, VirtualTable,
 };
 use crate::{util::normalize_ident, Result};
 use core::fmt;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::Mutex;
 use tracing::trace;
 use turso_parser::ast::{self, ColumnDefinition, Expr, Literal, SortOrder, TableOptions};
 use turso_parser::{
-    ast::{Cmd, CreateTableBody, ResultColumn, Stmt},
+    ast::{Cmd, CreateTableBody, Name, ResultColumn, Stmt},
     parser::Parser,
 };
 
@@ -62,7 +64,7 @@ pub struct Schema {
     pub views: ViewsMap,
 
     /// table_name to list of indexes for the table
-    pub indexes: HashMap<String, Vec<Arc<Index>>>,
+    pub indexes: HashMap<String, VecDeque<Arc<Index>>>,
     pub has_indexes: std::collections::HashSet<String>,
     pub indexes_enabled: bool,
     pub schema_version: u32,
@@ -75,7 +77,7 @@ impl Schema {
     pub fn new(indexes_enabled: bool) -> Self {
         let mut tables: HashMap<String, Arc<Table>> = HashMap::new();
         let has_indexes = std::collections::HashSet::new();
-        let indexes: HashMap<String, Vec<Arc<Index>>> = HashMap::new();
+        let indexes: HashMap<String, VecDeque<Arc<Index>>> = HashMap::new();
         #[allow(clippy::arc_with_non_send_sync)]
         tables.insert(
             SCHEMA_TABLE_NAME.to_string(),
@@ -242,17 +244,23 @@ impl Schema {
 
     pub fn add_index(&mut self, index: Arc<Index>) {
         let table_name = normalize_ident(&index.table_name);
+        // We must add the new index to the front of the deque, because SQLite stores index definitions as a linked list
+        // where the newest parsed index entry is at the head of list. If we would add it to the back of a regular Vec for example,
+        // then we would evaluate ON CONFLICT DO UPDATE clauses in the wrong index iteration order and UPDATE the wrong row. One might
+        // argue that this is an implementation detail and we should not care about this, but it makes e.g. the fuzz test 'partial_index_mutation_and_upsert_fuzz'
+        // fail, so let's just be compatible.
         self.indexes
             .entry(table_name)
             .or_default()
-            .push(index.clone())
+            .push_front(index.clone())
     }
 
-    pub fn get_indices(&self, table_name: &str) -> &[Arc<Index>] {
+    pub fn get_indices(&self, table_name: &str) -> impl Iterator<Item = &Arc<Index>> {
         let name = normalize_ident(table_name);
         self.indexes
             .get(&name)
-            .map_or_else(|| &[] as &[Arc<Index>], |v| v.as_slice())
+            .map(|v| v.iter())
+            .unwrap_or_default()
     }
 
     pub fn get_index(&self, table_name: &str, index_name: &str) -> Option<&Arc<Index>> {
@@ -447,11 +455,13 @@ impl Schema {
                     )?));
                 } else {
                     // Add single column unique index
-                    self.add_index(Arc::new(Index::automatic_from_unique(
-                        table.as_ref(),
-                        automatic_indexes.pop().unwrap(),
-                        vec![(pos_in_table, unique_set.columns.first().unwrap().1)],
-                    )?));
+                    if let Some(autoidx) = automatic_indexes.pop() {
+                        self.add_index(Arc::new(Index::automatic_from_unique(
+                            table.as_ref(),
+                            autoidx,
+                            vec![(pos_in_table, unique_set.columns.first().unwrap().1)],
+                        )?));
+                    }
                 }
             }
             for unique_set in table.unique_sets.iter().filter(|us| us.columns.len() > 1) {
@@ -1630,6 +1640,7 @@ pub struct Index {
     /// For example, WITHOUT ROWID tables (not supported in Limbo yet),
     /// and  SELECT DISTINCT ephemeral indexes will not have a rowid.
     pub has_rowid: bool,
+    pub where_clause: Option<Box<Expr>>,
 }
 
 #[allow(dead_code)]
@@ -1657,6 +1668,7 @@ impl Index {
                 tbl_name,
                 columns,
                 unique,
+                where_clause,
                 ..
             })) => {
                 let index_name = normalize_ident(idx_name.name.as_str());
@@ -1686,6 +1698,7 @@ impl Index {
                     unique,
                     ephemeral: false,
                     has_rowid: table.has_rowid,
+                    where_clause,
                 })
             }
             _ => todo!("Expected create index statement"),
@@ -1730,6 +1743,7 @@ impl Index {
             unique: true,
             ephemeral: false,
             has_rowid: table.has_rowid,
+            where_clause: None,
         })
     }
 
@@ -1766,6 +1780,7 @@ impl Index {
             unique: true,
             ephemeral: false,
             has_rowid: table.has_rowid,
+            where_clause: None,
         })
     }
 
@@ -1779,6 +1794,102 @@ impl Index {
         self.columns
             .iter()
             .position(|c| c.pos_in_table == table_pos)
+    }
+
+    /// Walk the where_clause Expr of a partial index and validate that it doesn't reference any other
+    /// tables or use any disallowed constructs.
+    pub fn validate_where_expr(&self, table: &Table) -> bool {
+        let Some(where_clause) = &self.where_clause else {
+            return true;
+        };
+
+        let tbl_norm = normalize_ident(self.table_name.as_str());
+        let has_col = |name: &str| {
+            let n = normalize_ident(name);
+            table
+                .columns()
+                .iter()
+                .any(|c| c.name.as_ref().is_some_and(|cn| normalize_ident(cn) == n))
+        };
+        let is_tbl = |ns: &str| normalize_ident(ns).eq_ignore_ascii_case(&tbl_norm);
+        let is_deterministic_fn = |name: &str, argc: usize| {
+            let n = normalize_ident(name);
+            Func::resolve_function(&n, argc).is_ok_and(|f| f.is_deterministic())
+        };
+
+        let mut ok = true;
+        let _ = walk_expr(where_clause.as_ref(), &mut |e: &Expr| -> crate::Result<
+            WalkControl,
+        > {
+            if !ok {
+                return Ok(WalkControl::SkipChildren);
+            }
+            match e {
+                Expr::Literal(_) | Expr::RowId { .. } => {}
+                // Unqualified identifier: must be a column of the target table or ROWID
+                Expr::Id(Name::Ident(n)) | Expr::Id(Name::Quoted(n)) => {
+                    let n = n.as_str();
+                    if !n.eq_ignore_ascii_case("rowid") && !has_col(n) {
+                        ok = false;
+                    }
+                }
+                // Qualified: qualifier must match this index's table; column must exist
+                Expr::Qualified(ns, col) | Expr::DoublyQualified(_, ns, col) => {
+                    if !is_tbl(ns.as_str()) || !has_col(col.as_str()) {
+                        ok = false;
+                    }
+                }
+                Expr::FunctionCall {
+                    name, filter_over, ..
+                }
+                | Expr::FunctionCallStar {
+                    name, filter_over, ..
+                } => {
+                    // reject windowed
+                    if filter_over.over_clause.is_some() {
+                        ok = false;
+                    } else {
+                        let argc = match e {
+                            Expr::FunctionCall { args, .. } => args.len(),
+                            Expr::FunctionCallStar { .. } => 0,
+                            _ => unreachable!(),
+                        };
+                        if !is_deterministic_fn(name.as_str(), argc) {
+                            ok = false;
+                        }
+                    }
+                }
+                // Explicitly disallowed constructs
+                Expr::Exists(_)
+                | Expr::InSelect { .. }
+                | Expr::Subquery(_)
+                | Expr::Raise { .. }
+                | Expr::Variable(_) => {
+                    ok = false;
+                }
+                _ => {}
+            }
+            Ok(if ok {
+                WalkControl::Continue
+            } else {
+                WalkControl::SkipChildren
+            })
+        });
+        ok
+    }
+
+    pub fn bind_where_expr(
+        &self,
+        table_refs: Option<&mut TableReferences>,
+        connection: &Arc<Connection>,
+    ) -> Option<ast::Expr> {
+        let Some(where_clause) = &self.where_clause else {
+            return None;
+        };
+        let mut params = ParamState::disallow();
+        let mut expr = where_clause.clone();
+        bind_and_rewrite_expr(&mut expr, table_refs, None, connection, &mut params).ok()?;
+        Some(*expr)
     }
 }
 

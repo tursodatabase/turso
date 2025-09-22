@@ -3,8 +3,9 @@
     "skipLibCheck": true,
     "declaration": true,
     "declarationMap": true,
-    "module": "esnext",
+    "module": "nodenext",
     "target": "esnext",
+    "moduleResolution": "nodenext",
     "outDir": "dist/",
     "lib": [
       "es2020",

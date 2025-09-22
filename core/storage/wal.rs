@@ -2,7 +2,6 @@
 
 use std::array;
 use std::borrow::Cow;
-use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use strum::EnumString;
 use tracing::{instrument, Level};
@@ -588,7 +587,7 @@ pub struct WalFile {
     /// Manages locks needed for checkpointing
     checkpoint_guard: Option<CheckpointLocks>,
 
-    io_ctx: RefCell<IOContext>,
+    io_ctx: RwLock<IOContext>,
 }
 
 impl fmt::Debug for WalFile {
@@ -1124,7 +1123,7 @@ impl Wal for WalFile {
             buffer_pool,
             complete,
             page_idx,
-            &self.io_ctx.borrow(),
+            &self.io_ctx.read(),
         )
     }
 
@@ -1135,7 +1134,7 @@ impl Wal for WalFile {
         let (frame_ptr, frame_len) = (frame.as_mut_ptr(), frame.len());
 
         let encryption_ctx = {
-            let io_ctx = self.io_ctx.borrow();
+            let io_ctx = self.io_ctx.read();
             io_ctx.encryption_context().cloned()
         };
         let complete = Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
@@ -1243,7 +1242,7 @@ impl Wal for WalFile {
                 buffer_pool,
                 complete,
                 page_id as usize,
-                &self.io_ctx.borrow(),
+                &self.io_ctx.read(),
             )?;
             self.io.wait_for_completion(c)?;
             return if conflict.get() {
@@ -1493,7 +1492,7 @@ impl Wal for WalFile {
             let plain = page.get_contents().as_ptr();
 
             let data_to_write: std::borrow::Cow<[u8]> = {
-                let io_ctx = self.io_ctx.borrow();
+                let io_ctx = self.io_ctx.read();
                 match &io_ctx.encryption_or_checksum() {
                     EncryptionOrChecksum::Encryption(ctx) => {
                         Cow::Owned(ctx.encrypt_page(plain, page_id)?)
@@ -1573,7 +1572,7 @@ impl Wal for WalFile {
     }
 
     fn set_io_context(&mut self, ctx: IOContext) {
-        self.io_ctx.replace(ctx);
+        *self.io_ctx.write() = ctx;
     }
 
     fn update_max_frame(&mut self) {
@@ -1624,7 +1623,7 @@ impl WalFile {
             prev_checkpoint: CheckpointResult::default(),
             checkpoint_guard: None,
             header,
-            io_ctx: RefCell::new(IOContext::default()),
+            io_ctx: RwLock::new(IOContext::default()),
         }
     }
 
@@ -1639,11 +1638,41 @@ impl WalFile {
     }
 
     fn get_shared_mut(&self) -> parking_lot::RwLockWriteGuard<'_, WalFileShared> {
-        self.shared.write()
+        // WASM in browser main thread doesn't have a way to "park" a thread
+        // so, we spin way here instead of calling blocking lock
+        #[cfg(target_family = "wasm")]
+        {
+            loop {
+                let Some(lock) = self.shared.try_write() else {
+                    std::hint::spin_loop();
+                    continue;
+                };
+                return lock;
+            }
+        }
+        #[cfg(not(target_family = "wasm"))]
+        {
+            self.shared.write()
+        }
     }
 
     fn get_shared(&self) -> parking_lot::RwLockReadGuard<'_, WalFileShared> {
-        self.shared.read()
+        // WASM in browser main thread doesn't have a way to "park" a thread
+        // so, we spin way here instead of calling blocking lock
+        #[cfg(target_family = "wasm")]
+        {
+            loop {
+                let Some(lock) = self.shared.try_read() else {
+                    std::hint::spin_loop();
+                    continue;
+                };
+                return lock;
+            }
+        }
+        #[cfg(not(target_family = "wasm"))]
+        {
+            self.shared.read()
+        }
     }
 
     fn complete_append_frame(&mut self, page_id: u64, frame_id: u64, checksums: (u32, u32)) {
@@ -2203,7 +2232,7 @@ impl WalFile {
             self.buffer_pool.clone(),
             complete,
             page_id,
-            &self.io_ctx.borrow(),
+            &self.io_ctx.read(),
         )?;
 
         Ok(InflightRead {

@@ -89,8 +89,8 @@ pub(crate) fn execute_plans(
     let mut env = env.lock().unwrap();
     let mut doublecheck_env = doublecheck_env.lock().unwrap();
 
-    env.tables.clear();
-    doublecheck_env.tables.clear();
+    env.clear_tables();
+    doublecheck_env.clear_tables();
 
     let now = std::time::Instant::now();
 

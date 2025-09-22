@@ -1,4 +1,5 @@
 #![allow(unused_variables)]
+use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::AlterTableFunc;
 use crate::numeric::{NullableInteger, Numeric};
 use crate::schema::Table;
@@ -2115,6 +2116,11 @@ pub fn halt(
         SQLITE_CONSTRAINT_NOTNULL => {
             return Err(LimboError::Constraint(format!(
                 "NOT NULL constraint failed: {description} (19)"
+            )));
+        }
+        SQLITE_CONSTRAINT_UNIQUE => {
+            return Err(LimboError::Constraint(format!(
+                "UNIQUE constraint failed: {description} (19)"
             )));
         }
         _ => {

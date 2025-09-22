@@ -5,8 +5,7 @@ use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use pprof::criterion::{Output, PProfProfiler};
 use turso_core::mvcc::clock::LocalClock;
 use turso_core::mvcc::database::{MvStore, Row, RowID};
-use turso_core::state_machine::{StateTransition, TransitionResult};
-use turso_core::types::{ImmutableRecord, Text};
+use turso_core::types::{IOResult, ImmutableRecord, Text};
 use turso_core::{Connection, Database, MemoryIO, Value};
 
 struct BenchDb {
@@ -55,9 +54,8 @@ fn bench(c: &mut Criterion) {
             loop {
                 let res = sm.step(mv_store).unwrap();
                 match res {
-                    TransitionResult::Io(io) => io.wait(db._db.io.as_ref()).unwrap(),
-                    TransitionResult::Continue => continue,
-                    TransitionResult::Done(_) => break,
+                    IOResult::IO(io) => io.wait(db._db.io.as_ref()).unwrap(),
+                    IOResult::Done(_) => break,
                 }
             }
         })
@@ -85,9 +83,8 @@ fn bench(c: &mut Criterion) {
             loop {
                 let res = sm.step(mv_store).unwrap();
                 match res {
-                    TransitionResult::Io(io) => io.wait(db._db.io.as_ref()).unwrap(),
-                    TransitionResult::Continue => continue,
-                    TransitionResult::Done(_) => break,
+                    IOResult::IO(io) => io.wait(db._db.io.as_ref()).unwrap(),
+                    IOResult::Done(_) => break,
                 }
             }
         })
@@ -121,9 +118,8 @@ fn bench(c: &mut Criterion) {
             loop {
                 let res = sm.step(mv_store).unwrap();
                 match res {
-                    TransitionResult::Io(io) => io.wait(db._db.io.as_ref()).unwrap(),
-                    TransitionResult::Continue => continue,
-                    TransitionResult::Done(_) => break,
+                    IOResult::IO(io) => io.wait(db._db.io.as_ref()).unwrap(),
+                    IOResult::Done(_) => break,
                 }
             }
         })

@@ -657,6 +657,322 @@ mod tests {
     }
 
     #[test]
+    pub fn partial_index_mutation_and_upsert_fuzz() {
+        let _ = env_logger::try_init();
+        const OUTER_ITERS: usize = 5;
+        const INNER_ITERS: usize = 500;
+
+        let (mut rng, seed) = if std::env::var("SEED").is_ok() {
+            let seed = std::env::var("SEED").unwrap().parse::<u64>().unwrap();
+            (ChaCha8Rng::seed_from_u64(seed), seed)
+        } else {
+            rng_from_time()
+        };
+        println!("partial_index_mutation_and_upsert_fuzz seed: {seed}");
+        // we want to hit unique constraints fairly often so limit the insert values
+        const K_POOL: [&str; 35] = [
+            "a", "aa", "abc", "A", "B", "zzz", "foo", "bar", "baz", "fizz", "buzz", "bb", "cc",
+            "dd", "ee", "ff", "gg", "hh", "jj", "kk", "ll", "mm", "nn", "oo", "pp", "qq", "rr",
+            "ss", "tt", "uu", "vv", "ww", "xx", "yy", "zz",
+        ];
+        for outer in 0..OUTER_ITERS {
+            println!(" ");
+            println!(
+                "partial_index_mutation_and_upsert_fuzz iteration {}/{}",
+                outer + 1,
+                OUTER_ITERS
+            );
+
+            // Columns: id (rowid PK), plus a few data columns we can reference in predicates/keys.
+            let limbo_db = TempDatabase::new_empty(true);
+            let sqlite_db = TempDatabase::new_empty(true);
+            let limbo_conn = limbo_db.connect_limbo();
+            let sqlite = rusqlite::Connection::open(sqlite_db.path.clone()).unwrap();
+
+            let num_cols = rng.random_range(2..=4);
+            // We'll always include a TEXT "k" and a couple INT columns to give predicates variety.
+            // Build: id INTEGER PRIMARY KEY, k TEXT, c0 INT, c1 INT, ...
+            let mut cols: Vec<String> = vec!["id INTEGER PRIMARY KEY".into(), "k TEXT".into()];
+            for i in 0..(num_cols - 1) {
+                cols.push(format!("c{i} INT"));
+            }
+            let create = format!("CREATE TABLE t ({})", cols.join(", "));
+            println!("{create};");
+            limbo_exec_rows(&limbo_db, &limbo_conn, &create);
+            sqlite.execute(&create, rusqlite::params![]).unwrap();
+
+            // Helper to list usable columns for keys/predicates
+            let int_cols: Vec<String> = (0..(num_cols - 1)).map(|i| format!("c{i}")).collect();
+            let functions = ["lower", "upper", "length"];
+
+            let num_pidx = rng.random_range(0..=3);
+            let mut idx_ddls: Vec<String> = Vec::new();
+            for i in 0..num_pidx {
+                // Pick 1 or 2 key columns; always include "k" sometimes to get frequent conflicts.
+                let mut key_cols = Vec::new();
+                if rng.random_bool(0.7) {
+                    key_cols.push("k".to_string());
+                }
+                if key_cols.is_empty() || rng.random_bool(0.5) {
+                    // Add one INT col to make compound keys common
+                    if !int_cols.is_empty() {
+                        let c = int_cols[rng.random_range(0..int_cols.len())].clone();
+                        if !key_cols.contains(&c) {
+                            key_cols.push(c);
+                        }
+                    }
+                }
+                // Ensure at least one key column
+                if key_cols.is_empty() {
+                    key_cols.push("k".to_string());
+                }
+                // Build a simple deterministic partial predicate:
+                // Examples:
+                //   c0 > 10 AND c1 < 50
+                //   c0 IS NOT NULL
+                //   id > 5 AND c0 >= 0
+                //   lower(k) = k
+                let pred = {
+                    // parts we can AND/OR (we’ll only AND for stability)
+                    let mut parts: Vec<String> = Vec::new();
+
+                    // Maybe include rowid (id) bound
+                    if rng.random_bool(0.4) {
+                        let n = rng.random_range(0..20);
+                        let op = *["<", "<=", ">", ">="].choose(&mut rng).unwrap();
+                        parts.push(format!("id {op} {n}"));
+                    }
+
+                    // Maybe include int column comparison
+                    if !int_cols.is_empty() && rng.random_bool(0.8) {
+                        let c = &int_cols[rng.random_range(0..int_cols.len())];
+                        match rng.random_range(0..3) {
+                            0 => parts.push(format!("{c} IS NOT NULL")),
+                            1 => {
+                                let n = rng.random_range(-10..=20);
+                                let op = *["<", "<=", "=", ">=", ">"].choose(&mut rng).unwrap();
+                                parts.push(format!("{c} {op} {n}"));
+                            }
+                            _ => {
+                                let n = rng.random_range(0..=1);
+                                parts.push(format!(
+                                    "{c} IS {}",
+                                    if n == 0 { "NULL" } else { "NOT NULL" }
+                                ));
+                            }
+                        }
+                    }
+
+                    if rng.random_bool(0.2) {
+                        parts.push(format!("{}(k) = k", functions.choose(&mut rng).unwrap()));
+                    }
+                    // Guarantee at least one part
+                    if parts.is_empty() {
+                        parts.push("1".to_string());
+                    }
+                    parts.join(" AND ")
+                };
+
+                let ddl = format!(
+                    "CREATE UNIQUE INDEX idx_p{}_{} ON t({}) WHERE {}",
+                    outer,
+                    i,
+                    key_cols.join(","),
+                    pred
+                );
+                idx_ddls.push(ddl.clone());
+                // Create in both engines
+                println!("{ddl};");
+                limbo_exec_rows(&limbo_db, &limbo_conn, &ddl);
+                sqlite.execute(&ddl, rusqlite::params![]).unwrap();
+            }
+
+            let seed_rows = rng.random_range(10..=80);
+            for _ in 0..seed_rows {
+                let k = *K_POOL.choose(&mut rng).unwrap();
+                let mut vals: Vec<String> = vec!["NULL".into(), format!("'{k}'")]; // id NULL -> auto
+                for _ in 0..(num_cols - 1) {
+                    // bias a bit toward small ints & NULL to make predicate flipping common
+                    let v = match rng.random_range(0..6) {
+                        0 => "NULL".into(),
+                        _ => rng.random_range(-5..=15).to_string(),
+                    };
+                    vals.push(v);
+                }
+                let ins = format!("INSERT INTO t VALUES ({})", vals.join(", "));
+                // Execute on both; ignore errors due to partial unique conflicts (keep seeding going)
+                let _ = sqlite.execute(&ins, rusqlite::params![]);
+                let _ = limbo_exec_rows_fallible(&limbo_db, &limbo_conn, &ins);
+            }
+
+            for _ in 0..INNER_ITERS {
+                let action = rng.random_range(0..4); // 0: INSERT, 1: UPDATE, 2: DELETE, 3: UPSERT (catch-all)
+                let stmt = match action {
+                    // INSERT
+                    0 => {
+                        let k = *K_POOL.choose(&mut rng).unwrap();
+                        let mut cols_list = vec!["k".to_string()];
+                        let mut vals_list = vec![format!("'{k}'")];
+                        for i in 0..(num_cols - 1) {
+                            if rng.random_bool(0.8) {
+                                cols_list.push(format!("c{i}"));
+                                vals_list.push(if rng.random_bool(0.15) {
+                                    "NULL".into()
+                                } else {
+                                    rng.random_range(-5..=15).to_string()
+                                });
+                            }
+                        }
+                        format!(
+                            "INSERT INTO t({}) VALUES({})",
+                            cols_list.join(","),
+                            vals_list.join(",")
+                        )
+                    }
+
+                    // UPDATE (randomly touch either key or predicate column)
+                    1 => {
+                        // choose a column
+                        let col_pick = if rng.random_bool(0.5) {
+                            "k".to_string()
+                        } else {
+                            format!("c{}", rng.random_range(0..(num_cols - 1)))
+                        };
+                        let new_val = if col_pick == "k" {
+                            format!("'{}'", K_POOL.choose(&mut rng).unwrap())
+                        } else if rng.random_bool(0.2) {
+                            "NULL".into()
+                        } else {
+                            rng.random_range(-5..=15).to_string()
+                        };
+                        // predicate to affect some rows
+                        let wc = if rng.random_bool(0.6) {
+                            let pred_col = format!("c{}", rng.random_range(0..(num_cols - 1)));
+                            let op = *["<", "<=", "=", ">=", ">"].choose(&mut rng).unwrap();
+                            let n = rng.random_range(-5..=15);
+                            format!("WHERE {pred_col} {op} {n}")
+                        } else {
+                            // toggle rows by id parity
+                            "WHERE (id % 2) = 0".into()
+                        };
+                        format!("UPDATE t SET {col_pick} = {new_val} {wc}")
+                    }
+
+                    // DELETE
+                    2 => {
+                        let wc = if rng.random_bool(0.5) {
+                            // delete rows inside partial predicate zones
+                            match int_cols.len() {
+                                0 => "WHERE lower(k) = k".to_string(),
+                                _ => {
+                                    let c = &int_cols[rng.random_range(0..int_cols.len())];
+                                    let n = rng.random_range(-5..=15);
+                                    let op = *["<", "<=", "=", ">=", ">"].choose(&mut rng).unwrap();
+                                    format!("WHERE {c} {op} {n}")
+                                }
+                            }
+                        } else {
+                            "WHERE id % 3 = 1".to_string()
+                        };
+                        format!("DELETE FROM t {wc}")
+                    }
+
+                    // UPSERT catch-all is allowed even if only partial unique constraints exist
+                    3 => {
+                        let k = *K_POOL.choose(&mut rng).unwrap();
+                        let mut cols_list = vec!["k".to_string()];
+                        let mut vals_list = vec![format!("'{k}'")];
+                        for i in 0..(num_cols - 1) {
+                            if rng.random_bool(0.8) {
+                                cols_list.push(format!("c{i}"));
+                                vals_list.push(if rng.random_bool(0.2) {
+                                    "NULL".into()
+                                } else {
+                                    rng.random_range(-5..=15).to_string()
+                                });
+                            }
+                        }
+                        if rng.random_bool(0.3) {
+                            // 30% chance ON CONFLICT DO UPDATE SET ...
+                            let mut set_list = Vec::new();
+                            let num_set = rng.random_range(1..=cols_list.len());
+                            let set_cols = cols_list
+                                .choose_multiple(&mut rng, num_set)
+                                .cloned()
+                                .collect::<Vec<_>>();
+                            for c in set_cols.iter() {
+                                let v = if c == "k" {
+                                    format!("'{}'", K_POOL.choose(&mut rng).unwrap())
+                                } else if rng.random_bool(0.2) {
+                                    "NULL".into()
+                                } else {
+                                    rng.random_range(-5..=15).to_string()
+                                };
+                                set_list.push(format!("{c} = {v}"));
+                            }
+                            format!(
+                                "INSERT INTO t({}) VALUES({}) ON CONFLICT DO UPDATE SET {}",
+                                cols_list.join(","),
+                                vals_list.join(","),
+                                set_list.join(", ")
+                            )
+                        } else {
+                            format!(
+                                "INSERT INTO t({}) VALUES({}) ON CONFLICT DO NOTHING",
+                                cols_list.join(","),
+                                vals_list.join(",")
+                            )
+                        }
+                    }
+                    _ => unreachable!(),
+                };
+
+                // Execute on SQLite first; capture success/error, then run on turso and demand same outcome.
+                let sqlite_res = sqlite.execute(&stmt, rusqlite::params![]);
+                let limbo_res = limbo_exec_rows_fallible(&limbo_db, &limbo_conn, &stmt);
+
+                match (sqlite_res, limbo_res) {
+                    (Ok(_), Ok(_)) => {
+                        println!("{stmt};");
+                        // Compare canonical table state
+                        let verify = format!(
+                            "SELECT id, k{} FROM t ORDER BY id, k{}",
+                            (0..(num_cols - 1))
+                                .map(|i| format!(", c{i}"))
+                                .collect::<String>(),
+                            (0..(num_cols - 1))
+                                .map(|i| format!(", c{i}"))
+                                .collect::<String>(),
+                        );
+                        let s = sqlite_exec_rows(&sqlite, &verify);
+                        let l = limbo_exec_rows(&limbo_db, &limbo_conn, &verify);
+                        assert_eq!(
+                            l, s,
+                            "stmt: {stmt}, seed: {seed}, create: {create}, idx: {idx_ddls:?}"
+                        );
+                    }
+                    (Err(_), Err(_)) => {
+                        // Both errored
+                        continue;
+                    }
+                    // Mismatch: dump context
+                    (ok_sqlite, ok_turso) => {
+                        println!("{stmt};");
+                        eprintln!("Schema: {create};");
+                        for d in idx_ddls.iter() {
+                            eprintln!("{d};");
+                        }
+                        panic!(
+                            "DML outcome mismatch (sqlite: {ok_sqlite:?}, turso ok: {ok_turso:?}) \n
+                         stmt: {stmt}, seed: {seed}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     pub fn compound_select_fuzz() {
         let _ = env_logger::try_init();
         let (mut rng, seed) = rng_from_time();

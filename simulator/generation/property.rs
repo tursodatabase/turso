@@ -226,7 +226,8 @@ impl Property {
                 let assumption = InteractionType::Assumption(Assertion::new(
                     format!("table {} exists", table.clone()),
                     move |_: &Vec<ResultSet>, env: &mut SimulatorEnv| {
-                        if env.tables.iter().any(|t| t.name == table_name) {
+                        let conn_tables = env.get_conn_tables(connection_index);
+                        if conn_tables.iter().any(|t| t.name == table_name) {
                             Ok(Ok(()))
                         } else {
                             Ok(Err(format!("table {table_name} does not exist")))
@@ -246,8 +247,8 @@ impl Property {
                         let Ok(rows) = rows else {
                             return Ok(Err(format!("expected rows but got error: {rows:?}")));
                         };
-                        let sim_table = env
-                            .tables
+                        let conn_tables = env.get_conn_tables(connection_index);
+                        let sim_table = conn_tables
                             .iter()
                             .find(|t| t.name == table)
                             .expect("table should be in enviroment");
@@ -283,7 +284,8 @@ impl Property {
                 let assumption = InteractionType::Assumption(Assertion::new(
                     format!("table {} exists", table.clone()),
                     move |_: &Vec<ResultSet>, env: &mut SimulatorEnv| {
-                        if env.tables.iter().any(|t| t.name == table.clone()) {
+                        let conn_tables = env.get_conn_tables(connection_index);
+                        if conn_tables.iter().any(|t| t.name == table.clone()) {
                             Ok(Ok(()))
                         } else {
                             Ok(Err(format!("table {} does not exist", table.clone())))
@@ -360,7 +362,8 @@ impl Property {
                     {
                         let table_name = table.clone();
                         move |_: &Vec<ResultSet>, env: &mut SimulatorEnv| {
-                            if env.tables.iter().any(|t| t.name == table_name) {
+                            let conn_tables = env.get_conn_tables(connection_index);
+                            if conn_tables.iter().any(|t| t.name == table_name) {
                                 Ok(Ok(()))
                             } else {
                                 Ok(Err(format!("table {table_name} does not exist")))
@@ -429,7 +432,8 @@ impl Property {
                 let assumption = InteractionType::Assumption(Assertion::new(
                     "Double-Create-Failure should not be called on an existing table".to_string(),
                     move |_: &Vec<ResultSet>, env: &mut SimulatorEnv| {
-                        if !env.tables.iter().any(|t| t.name == table_name) {
+                        let conn_tables = env.get_conn_tables(connection_index);
+                        if !conn_tables.iter().any(|t| t.name == table_name) {
                             Ok(Ok(()))
                         } else {
                             Ok(Err(format!("table {table_name} already exists")))
@@ -484,15 +488,16 @@ impl Property {
                     {
                         let table_name = select.dependencies();
                         move |_: &Vec<ResultSet>, env: &mut SimulatorEnv| {
+                            let conn_tables = env.get_conn_tables(connection_index);
                             if table_name
                                 .iter()
-                                .all(|table| env.tables.iter().any(|t| t.name == *table))
+                                .all(|table| conn_tables.iter().any(|t| t.name == *table))
                             {
                                 Ok(Ok(()))
                             } else {
                                 let missing_tables = table_name
                                     .iter()
-                                    .filter(|t| !env.tables.iter().any(|t2| t2.name == **t))
+                                    .filter(|t| !conn_tables.iter().any(|t2| t2.name == **t))
                                     .collect::<Vec<&String>>();
                                 Ok(Err(format!("missing tables: {missing_tables:?}")))
                             }
@@ -544,12 +549,13 @@ impl Property {
                     {
                         let table = table.clone();
                         move |_: &Vec<ResultSet>, env: &mut SimulatorEnv| {
-                            if env.tables.iter().any(|t| t.name == table) {
+                            let conn_tables = env.get_conn_tables(connection_index);
+                            if conn_tables.iter().any(|t| t.name == table) {
                                 Ok(Ok(()))
                             } else {
                                 {
                                     let available_tables: Vec<String> =
-                                        env.tables.iter().map(|t| t.name.clone()).collect();
+                                        conn_tables.iter().map(|t| t.name.clone()).collect();
                                     Ok(Err(format!(
                                         "table \'{table}\' not found. Available tables: {available_tables:?}"
                                     )))
@@ -617,12 +623,13 @@ impl Property {
                     {
                         let table = table.clone();
                         move |_, env: &mut SimulatorEnv| {
-                            if env.tables.iter().any(|t| t.name == table) {
+                            let conn_tables = env.get_conn_tables(connection_index);
+                            if conn_tables.iter().any(|t| t.name == table) {
                                 Ok(Ok(()))
                             } else {
                                 {
                                     let available_tables: Vec<String> =
-                                        env.tables.iter().map(|t| t.name.clone()).collect();
+                                        conn_tables.iter().map(|t| t.name.clone()).collect();
                                     Ok(Err(format!(
                                         "table \'{table}\' not found. Available tables: {available_tables:?}"
                                     )))
@@ -684,12 +691,13 @@ impl Property {
                     {
                         let table = table.clone();
                         move |_: &Vec<ResultSet>, env: &mut SimulatorEnv| {
-                            if env.tables.iter().any(|t| t.name == table) {
+                            let conn_tables = env.get_conn_tables(connection_index);
+                            if conn_tables.iter().any(|t| t.name == table) {
                                 Ok(Ok(()))
                             } else {
                                 {
                                     let available_tables: Vec<String> =
-                                        env.tables.iter().map(|t| t.name.clone()).collect();
+                                        conn_tables.iter().map(|t| t.name.clone()).collect();
                                     Ok(Err(format!(
                                         "table \'{table}\' not found. Available tables: {available_tables:?}"
                                     )))
@@ -788,7 +796,8 @@ impl Property {
                         let last = stack.last().unwrap();
                         match last {
                             Ok(_) => {
-                                let _ = query_clone.shadow(&mut env.tables);
+                                let _ = query_clone
+                                    .shadow(&mut env.get_conn_tables_mut(connection_index));
                                 Ok(Ok(()))
                             }
                             Err(err) => {
@@ -821,15 +830,16 @@ impl Property {
                     {
                         let tables = select.dependencies();
                         move |_: &Vec<ResultSet>, env: &mut SimulatorEnv| {
+                            let conn_tables = env.get_conn_tables(connection_index);
                             if tables
                                 .iter()
-                                .all(|table| env.tables.iter().any(|t| t.name == *table))
+                                .all(|table| conn_tables.iter().any(|t| t.name == *table))
                             {
                                 Ok(Ok(()))
                             } else {
                                 let missing_tables = tables
                                     .iter()
-                                    .filter(|t| !env.tables.iter().any(|t2| t2.name == **t))
+                                    .filter(|t| !conn_tables.iter().any(|t2| t2.name == **t))
                                     .collect::<Vec<&String>>();
                                 Ok(Err(format!("missing tables: {missing_tables:?}")))
                             }
@@ -1030,7 +1040,8 @@ fn assert_all_table_values(
         let assertion = InteractionType::Assertion(Assertion::new(format!("table {table} should contain all of its expected values"), {
                 let table = table.clone();
                 move |stack: &Vec<ResultSet>, env: &mut SimulatorEnv| {
-                    let table = env.tables.iter().find(|t| t.name == table).ok_or_else(|| {
+                    let conn_ctx = env.get_conn_tables(connection_index);
+                    let table = conn_ctx.iter().find(|t| t.name == table).ok_or_else(|| {
                         LimboError::InternalError(format!(
                             "table {table} should exist in simulator env"
                         ))
@@ -1090,6 +1101,7 @@ pub(crate) fn remaining(
     max_interactions: u32,
     opts: &QueryProfile,
     stats: &InteractionStats,
+    mvcc: bool,
 ) -> Remaining {
     let total_weight = opts.select_weight
         + opts.create_table_weight
@@ -1116,7 +1128,7 @@ pub(crate) fn remaining(
     let remaining_create = total_create
         .checked_sub(stats.create_count)
         .unwrap_or_default();
-    let remaining_create_index = total_create_index
+    let mut remaining_create_index = total_create_index
         .checked_sub(stats.create_index_count)
         .unwrap_or_default();
     let remaining_delete = total_delete
@@ -1126,6 +1138,11 @@ pub(crate) fn remaining(
         .checked_sub(stats.update_count)
         .unwrap_or_default();
     let remaining_drop = total_drop.checked_sub(stats.drop_count).unwrap_or_default();
+
+    if mvcc {
+        // TODO: index not supported yet for mvcc
+        remaining_create_index = 0;
+    }
 
     Remaining {
         select: remaining_select,
@@ -1140,14 +1157,14 @@ pub(crate) fn remaining(
 
 fn property_insert_values_select<R: rand::Rng>(
     rng: &mut R,
-    env: &SimulatorEnv,
     remaining: &Remaining,
+    ctx: &impl GenerationContext,
 ) -> Property {
     // Get a random table
-    let table = pick(&env.tables, rng);
+    let table = pick(ctx.tables(), rng);
     // Generate rows to insert
     let rows = (0..rng.random_range(1..=5))
-        .map(|_| Vec::<SimValue>::arbitrary_from(rng, env, table))
+        .map(|_| Vec::<SimValue>::arbitrary_from(rng, ctx, table))
         .collect::<Vec<_>>();
 
     // Pick a random row to select
@@ -1176,12 +1193,14 @@ fn property_insert_values_select<R: rand::Rng>(
     // - [x] The inserted row will not be updated.
     // - [ ] The table `t` will not be renamed, dropped, or altered. (todo: add this constraint once ALTER or DROP is implemented)
     if let Some(ref interactive) = interactive {
-        queries.push(Query::Begin(Begin {
-            immediate: interactive.start_with_immediate,
+        queries.push(Query::Begin(if interactive.start_with_immediate {
+            Begin::Immediate
+        } else {
+            Begin::Deferred
         }));
     }
     for _ in 0..rng.random_range(0..3) {
-        let query = Query::arbitrary_from(rng, env, remaining);
+        let query = Query::arbitrary_from(rng, ctx, remaining);
         match &query {
             Query::Delete(Delete {
                 table: t,
@@ -1224,7 +1243,7 @@ fn property_insert_values_select<R: rand::Rng>(
     // Select the row
     let select_query = Select::simple(
         table.name.clone(),
-        Predicate::arbitrary_from(rng, env, (table, &row)),
+        Predicate::arbitrary_from(rng, ctx, (table, &row)),
     );
 
     Property::InsertValuesSelect {
@@ -1236,9 +1255,12 @@ fn property_insert_values_select<R: rand::Rng>(
     }
 }
 
-fn property_read_your_updates_back<R: rand::Rng>(rng: &mut R, env: &SimulatorEnv) -> Property {
+fn property_read_your_updates_back<R: rand::Rng>(
+    rng: &mut R,
+    ctx: &impl GenerationContext,
+) -> Property {
     // e.g. UPDATE t SET a=1, b=2 WHERE c=1;
-    let update = Update::arbitrary(rng, env);
+    let update = Update::arbitrary(rng, ctx);
     // e.g. SELECT a, b FROM t WHERE c=1;
     let select = Select::single(
         update.table().to_string(),
@@ -1255,22 +1277,25 @@ fn property_read_your_updates_back<R: rand::Rng>(rng: &mut R, env: &SimulatorEnv
     Property::ReadYourUpdatesBack { update, select }
 }
 
-fn property_table_has_expected_content<R: rand::Rng>(rng: &mut R, env: &SimulatorEnv) -> Property {
+fn property_table_has_expected_content<R: rand::Rng>(
+    rng: &mut R,
+    ctx: &impl GenerationContext,
+) -> Property {
     // Get a random table
-    let table = pick(&env.tables, rng);
+    let table = pick(ctx.tables(), rng);
     Property::TableHasExpectedContent {
         table: table.name.clone(),
     }
 }
 
-fn property_select_limit<R: rand::Rng>(rng: &mut R, env: &SimulatorEnv) -> Property {
+fn property_select_limit<R: rand::Rng>(rng: &mut R, ctx: &impl GenerationContext) -> Property {
     // Get a random table
-    let table = pick(&env.tables, rng);
+    let table = pick(ctx.tables(), rng);
     // Select the table
     let select = Select::single(
         table.name.clone(),
         vec![ResultColumn::Star],
-        Predicate::arbitrary_from(rng, env, table),
+        Predicate::arbitrary_from(rng, ctx, table),
         Some(rng.random_range(1..=5)),
         Distinctness::All,
     );
@@ -1279,11 +1304,11 @@ fn property_select_limit<R: rand::Rng>(rng: &mut R, env: &SimulatorEnv) -> Prope
 
 fn property_double_create_failure<R: rand::Rng>(
     rng: &mut R,
-    env: &SimulatorEnv,
     remaining: &Remaining,
+    ctx: &impl GenerationContext,
 ) -> Property {
     // Create the table
-    let create_query = Create::arbitrary(rng, env);
+    let create_query = Create::arbitrary(rng, ctx);
     let table = &create_query.table;
 
     // Create random queries respecting the constraints
@@ -1292,7 +1317,7 @@ fn property_double_create_failure<R: rand::Rng>(
     // - [x] There will be no errors in the middle interactions.(best effort)
     // - [ ] Table `t` will not be renamed or dropped.(todo: add this constraint once ALTER or DROP is implemented)
     for _ in 0..rng.random_range(0..3) {
-        let query = Query::arbitrary_from(rng, env, remaining);
+        let query = Query::arbitrary_from(rng, ctx, remaining);
         if let Query::Create(Create { table: t }) = &query {
             // There will be no errors in the middle interactions.
             // - Creating the same table is an error
@@ -1311,13 +1336,13 @@ fn property_double_create_failure<R: rand::Rng>(
 
 fn property_delete_select<R: rand::Rng>(
     rng: &mut R,
-    env: &SimulatorEnv,
     remaining: &Remaining,
+    ctx: &impl GenerationContext,
 ) -> Property {
     // Get a random table
-    let table = pick(&env.tables, rng);
+    let table = pick(ctx.tables(), rng);
     // Generate a random predicate
-    let predicate = Predicate::arbitrary_from(rng, env, table);
+    let predicate = Predicate::arbitrary_from(rng, ctx, table);
 
     // Create random queries respecting the constraints
     let mut queries = Vec::new();
@@ -1325,7 +1350,7 @@ fn property_delete_select<R: rand::Rng>(
     // - [x] A row that holds for the predicate will not be inserted.
     // - [ ] The table `t` will not be renamed, dropped, or altered. (todo: add this constraint once ALTER or DROP is implemented)
     for _ in 0..rng.random_range(0..3) {
-        let query = Query::arbitrary_from(rng, env, remaining);
+        let query = Query::arbitrary_from(rng, ctx, remaining);
         match &query {
             Query::Insert(Insert::Values { table: t, values }) => {
                 // A row that holds for the predicate will not be inserted.
@@ -1369,18 +1394,18 @@ fn property_delete_select<R: rand::Rng>(
 
 fn property_drop_select<R: rand::Rng>(
     rng: &mut R,
-    env: &SimulatorEnv,
     remaining: &Remaining,
+    ctx: &impl GenerationContext,
 ) -> Property {
     // Get a random table
-    let table = pick(&env.tables, rng);
+    let table = pick(ctx.tables(), rng);
 
     // Create random queries respecting the constraints
     let mut queries = Vec::new();
     // - [x] There will be no errors in the middle interactions. (this constraint is impossible to check, so this is just best effort)
     // - [-] The table `t` will not be created, no table will be renamed to `t`. (todo: update this constraint once ALTER is implemented)
     for _ in 0..rng.random_range(0..3) {
-        let query = Query::arbitrary_from(rng, env, remaining);
+        let query = Query::arbitrary_from(rng, ctx, remaining);
         if let Query::Create(Create { table: t }) = &query {
             // - The table `t` will not be created
             if t.name == table.name {
@@ -1392,7 +1417,7 @@ fn property_drop_select<R: rand::Rng>(
 
     let select = Select::simple(
         table.name.clone(),
-        Predicate::arbitrary_from(rng, env, table),
+        Predicate::arbitrary_from(rng, ctx, table),
     );
 
     Property::DropSelect {
@@ -1402,11 +1427,14 @@ fn property_drop_select<R: rand::Rng>(
     }
 }
 
-fn property_select_select_optimizer<R: rand::Rng>(rng: &mut R, env: &SimulatorEnv) -> Property {
+fn property_select_select_optimizer<R: rand::Rng>(
+    rng: &mut R,
+    ctx: &impl GenerationContext,
+) -> Property {
     // Get a random table
-    let table = pick(&env.tables, rng);
+    let table = pick(ctx.tables(), rng);
     // Generate a random predicate
-    let predicate = Predicate::arbitrary_from(rng, env, table);
+    let predicate = Predicate::arbitrary_from(rng, ctx, table);
     // Transform into a Binary predicate to force values to be casted to a bool
     let expr = ast::Expr::Binary(
         Box::new(predicate.0),
@@ -1420,12 +1448,15 @@ fn property_select_select_optimizer<R: rand::Rng>(rng: &mut R, env: &SimulatorEn
     }
 }
 
-fn property_where_true_false_null<R: rand::Rng>(rng: &mut R, env: &SimulatorEnv) -> Property {
+fn property_where_true_false_null<R: rand::Rng>(
+    rng: &mut R,
+    ctx: &impl GenerationContext,
+) -> Property {
     // Get a random table
-    let table = pick(&env.tables, rng);
+    let table = pick(ctx.tables(), rng);
     // Generate a random predicate
-    let p1 = Predicate::arbitrary_from(rng, env, table);
-    let p2 = Predicate::arbitrary_from(rng, env, table);
+    let p1 = Predicate::arbitrary_from(rng, ctx, table);
+    let p2 = Predicate::arbitrary_from(rng, ctx, table);
 
     // Create the select query
     let select = Select::simple(table.name.clone(), p1);
@@ -1438,13 +1469,13 @@ fn property_where_true_false_null<R: rand::Rng>(rng: &mut R, env: &SimulatorEnv)
 
 fn property_union_all_preserves_cardinality<R: rand::Rng>(
     rng: &mut R,
-    env: &SimulatorEnv,
+    ctx: &impl GenerationContext,
 ) -> Property {
     // Get a random table
-    let table = pick(&env.tables, rng);
+    let table = pick(ctx.tables(), rng);
     // Generate a random predicate
-    let p1 = Predicate::arbitrary_from(rng, env, table);
-    let p2 = Predicate::arbitrary_from(rng, env, table);
+    let p1 = Predicate::arbitrary_from(rng, ctx, table);
+    let p2 = Predicate::arbitrary_from(rng, ctx, table);
 
     // Create the select query
     let select = Select::single(
@@ -1463,34 +1494,39 @@ fn property_union_all_preserves_cardinality<R: rand::Rng>(
 
 fn property_fsync_no_wait<R: rand::Rng>(
     rng: &mut R,
-    env: &SimulatorEnv,
     remaining: &Remaining,
+    ctx: &impl GenerationContext,
 ) -> Property {
     Property::FsyncNoWait {
-        query: Query::arbitrary_from(rng, env, remaining),
-        tables: env.tables.iter().map(|t| t.name.clone()).collect(),
+        query: Query::arbitrary_from(rng, ctx, remaining),
+        tables: ctx.tables().iter().map(|t| t.name.clone()).collect(),
     }
 }
 
 fn property_faulty_query<R: rand::Rng>(
     rng: &mut R,
-    env: &SimulatorEnv,
     remaining: &Remaining,
+    ctx: &impl GenerationContext,
 ) -> Property {
     Property::FaultyQuery {
-        query: Query::arbitrary_from(rng, env, remaining),
-        tables: env.tables.iter().map(|t| t.name.clone()).collect(),
+        query: Query::arbitrary_from(rng, ctx, remaining),
+        tables: ctx.tables().iter().map(|t| t.name.clone()).collect(),
     }
 }
 
 impl ArbitraryFrom<(&SimulatorEnv, &InteractionStats)> for Property {
     fn arbitrary_from<R: rand::Rng, C: GenerationContext>(
         rng: &mut R,
-        context: &C,
+        conn_ctx: &C,
         (env, stats): (&SimulatorEnv, &InteractionStats),
     ) -> Self {
-        let opts = context.opts();
-        let remaining_ = remaining(env.opts.max_interactions, &env.profile.query, stats);
+        let opts = conn_ctx.opts();
+        let remaining_ = remaining(
+            env.opts.max_interactions,
+            &env.profile.query,
+            stats,
+            env.profile.experimental_mvcc,
+        );
 
         frequency(
             vec![
@@ -1500,15 +1536,17 @@ impl ArbitraryFrom<(&SimulatorEnv, &InteractionStats)> for Property {
                     } else {
                         0
                     },
-                    Box::new(|rng: &mut R| property_insert_values_select(rng, env, &remaining_)),
+                    Box::new(|rng: &mut R| {
+                        property_insert_values_select(rng, &remaining_, conn_ctx)
+                    }),
                 ),
                 (
                     remaining_.select,
-                    Box::new(|rng: &mut R| property_table_has_expected_content(rng, env)),
+                    Box::new(|rng: &mut R| property_table_has_expected_content(rng, conn_ctx)),
                 ),
                 (
                     u32::min(remaining_.select, remaining_.insert),
-                    Box::new(|rng: &mut R| property_read_your_updates_back(rng, env)),
+                    Box::new(|rng: &mut R| property_read_your_updates_back(rng, conn_ctx)),
                 ),
                 (
                     if !env.opts.disable_double_create_failure {
@@ -1516,7 +1554,9 @@ impl ArbitraryFrom<(&SimulatorEnv, &InteractionStats)> for Property {
                     } else {
                         0
                     },
-                    Box::new(|rng: &mut R| property_double_create_failure(rng, env, &remaining_)),
+                    Box::new(|rng: &mut R| {
+                        property_double_create_failure(rng, &remaining_, conn_ctx)
+                    }),
                 ),
                 (
                     if !env.opts.disable_select_limit {
@@ -1524,7 +1564,7 @@ impl ArbitraryFrom<(&SimulatorEnv, &InteractionStats)> for Property {
                     } else {
                         0
                     },
-                    Box::new(|rng: &mut R| property_select_limit(rng, env)),
+                    Box::new(|rng: &mut R| property_select_limit(rng, conn_ctx)),
                 ),
                 (
                     if !env.opts.disable_delete_select {
@@ -1532,7 +1572,7 @@ impl ArbitraryFrom<(&SimulatorEnv, &InteractionStats)> for Property {
                     } else {
                         0
                     },
-                    Box::new(|rng: &mut R| property_delete_select(rng, env, &remaining_)),
+                    Box::new(|rng: &mut R| property_delete_select(rng, &remaining_, conn_ctx)),
                 ),
                 (
                     if !env.opts.disable_drop_select {
@@ -1541,7 +1581,7 @@ impl ArbitraryFrom<(&SimulatorEnv, &InteractionStats)> for Property {
                     } else {
                         0
                     },
-                    Box::new(|rng: &mut R| property_drop_select(rng, env, &remaining_)),
+                    Box::new(|rng: &mut R| property_drop_select(rng, &remaining_, conn_ctx)),
                 ),
                 (
                     if !env.opts.disable_select_optimizer {
@@ -1549,7 +1589,7 @@ impl ArbitraryFrom<(&SimulatorEnv, &InteractionStats)> for Property {
                     } else {
                         0
                     },
-                    Box::new(|rng: &mut R| property_select_select_optimizer(rng, env)),
+                    Box::new(|rng: &mut R| property_select_select_optimizer(rng, conn_ctx)),
                 ),
                 (
                     if opts.indexes && !env.opts.disable_where_true_false_null {
@@ -1557,7 +1597,7 @@ impl ArbitraryFrom<(&SimulatorEnv, &InteractionStats)> for Property {
                     } else {
                         0
                     },
-                    Box::new(|rng: &mut R| property_where_true_false_null(rng, env)),
+                    Box::new(|rng: &mut R| property_where_true_false_null(rng, conn_ctx)),
                 ),
                 (
                     if opts.indexes && !env.opts.disable_union_all_preserves_cardinality {
@@ -1565,7 +1605,7 @@ impl ArbitraryFrom<(&SimulatorEnv, &InteractionStats)> for Property {
                     } else {
                         0
                     },
-                    Box::new(|rng: &mut R| property_union_all_preserves_cardinality(rng, env)),
+                    Box::new(|rng: &mut R| property_union_all_preserves_cardinality(rng, conn_ctx)),
                 ),
                 (
                     if env.profile.io.enable && !env.opts.disable_fsync_no_wait {
@@ -1573,7 +1613,7 @@ impl ArbitraryFrom<(&SimulatorEnv, &InteractionStats)> for Property {
                     } else {
                         0
                     },
-                    Box::new(|rng: &mut R| property_fsync_no_wait(rng, env, &remaining_)),
+                    Box::new(|rng: &mut R| property_fsync_no_wait(rng, &remaining_, conn_ctx)),
                 ),
                 (
                     if env.profile.io.enable
@@ -1584,7 +1624,7 @@ impl ArbitraryFrom<(&SimulatorEnv, &InteractionStats)> for Property {
                     } else {
                         0
                     },
-                    Box::new(|rng: &mut R| property_faulty_query(rng, env, &remaining_)),
+                    Box::new(|rng: &mut R| property_faulty_query(rng, &remaining_, conn_ctx)),
                 ),
             ],
             rng,

@@ -92,7 +92,6 @@ impl Default for ChecksumContext {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::CompletionError;
 
     fn get_random_page() -> [u8; CHECKSUM_PAGE_SIZE] {
         let mut page = [0u8; CHECKSUM_PAGE_SIZE];
@@ -107,6 +106,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "checksum")]
     fn test_add_checksum_to_page() {
         let ctx = ChecksumContext::new();
         let mut page = get_random_page();
@@ -135,6 +135,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "checksum")]
     fn test_verify_and_strip_checksum_mismatch() {
         let ctx = ChecksumContext::new();
         let mut page = get_random_page();
@@ -160,6 +161,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "checksum")]
     fn test_verify_and_strip_checksum_corrupted_checksum() {
         let ctx = ChecksumContext::new();
         let mut page = get_random_page();

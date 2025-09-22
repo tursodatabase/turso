@@ -10,7 +10,7 @@ use crate::{
     database_sync_operations::WAL_FRAME_HEADER,
     errors::Error,
     types::{
-        Coro, DatabaseChange, DatabaseTapeOperation, DatabaseTapeRowChange,
+        Coro, DatabaseChange, DatabaseChangeType, DatabaseTapeOperation, DatabaseTapeRowChange,
         DatabaseTapeRowChangeType, ProtocolCommand,
     },
     wal_session::WalSession,
@@ -584,7 +584,7 @@ impl DatabaseReplaySession {
                             cached.stmt.reset();
                             let values = self.generator.replay_values(
                                 &cached.info,
-                                change_type,
+                                DatabaseChangeType::Delete,
                                 change.id,
                                 before,
                                 None,
@@ -600,7 +600,7 @@ impl DatabaseReplaySession {
                             cached.stmt.reset();
                             let values = self.generator.replay_values(
                                 &cached.info,
-                                change_type,
+                                DatabaseChangeType::Insert,
                                 change.id,
                                 after,
                                 None,
@@ -643,7 +643,7 @@ impl DatabaseReplaySession {
             table,
             columns
         );
-        let info = self.generator.insert_query(coro, table, columns).await?;
+        let info = self.generator.upsert_query(coro, table, columns).await?;
         let stmt = self.conn.prepare(&info.query)?;
         self.cached_insert_stmt
             .insert(key.clone(), CachedStmt { stmt, info });

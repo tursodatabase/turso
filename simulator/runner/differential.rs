@@ -59,8 +59,8 @@ pub(crate) fn execute_interactions(
     let mut env = env.lock().unwrap();
     let mut rusqlite_env = rusqlite_env.lock().unwrap();
 
-    env.tables.clear();
-    rusqlite_env.tables.clear();
+    env.clear_tables();
+    rusqlite_env.clear_tables();
 
     let now = std::time::Instant::now();
 

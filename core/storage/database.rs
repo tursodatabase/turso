@@ -89,11 +89,6 @@ pub struct DatabaseFile {
 }
 
 #[cfg(feature = "fs")]
-unsafe impl Send for DatabaseFile {}
-#[cfg(feature = "fs")]
-unsafe impl Sync for DatabaseFile {}
-
-#[cfg(feature = "fs")]
 impl DatabaseStorage for DatabaseFile {
     #[instrument(skip_all, level = Level::DEBUG)]
     fn read_header(&self, c: Completion) -> Result<Completion> {

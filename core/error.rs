@@ -165,3 +165,4 @@ pub const SQLITE_CONSTRAINT: usize = 19;
 pub const SQLITE_CONSTRAINT_PRIMARYKEY: usize = SQLITE_CONSTRAINT | (6 << 8);
 pub const SQLITE_CONSTRAINT_NOTNULL: usize = SQLITE_CONSTRAINT | (5 << 8);
 pub const SQLITE_FULL: usize = 13; // we want this in autoincrement - incase if user inserts max alloweed int
+pub const SQLITE_CONSTRAINT_UNIQUE: usize = 2067;
