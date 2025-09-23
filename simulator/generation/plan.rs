@@ -590,6 +590,7 @@ impl Display for Fault {
 pub struct Interaction {
     pub connection_index: usize,
     pub interaction: InteractionType,
+    pub ignore_error: bool,
 }
 
 impl Deref for Interaction {
@@ -611,6 +612,15 @@ impl Interaction {
         Self {
             connection_index,
             interaction,
+            ignore_error: false,
+        }
+    }
+
+    pub fn new_ignore_error(connection_index: usize, interaction: InteractionType) -> Self {
+        Self {
+            connection_index,
+            interaction,
+            ignore_error: true,
         }
     }
 }

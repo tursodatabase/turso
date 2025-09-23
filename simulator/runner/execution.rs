@@ -175,9 +175,14 @@ pub fn execute_interaction_turso(
     match &interaction.interaction {
         InteractionType::Query(_) => {
             tracing::debug!(?interaction);
-            let results = interaction.execute_query(conn);
-            if results.is_err() {
-                tracing::error!(?results);
+            let results = interaction
+                .execute_query(conn)
+                .inspect_err(|err| tracing::error!(?err));
+
+            if let Err(err) = &results
+                && !interaction.ignore_error
+            {
+                return Err(err.clone());
             }
             stack.push(results);
             // TODO: skip integrity check with mvcc
@@ -186,10 +191,10 @@ pub fn execute_interaction_turso(
             }
         }
         InteractionType::FsyncQuery(query) => {
-            let results = interaction.execute_fsync_query(conn.clone(), env);
-            if results.is_err() {
-                tracing::error!(?results);
-            }
+            let results = interaction
+                .execute_fsync_query(conn.clone(), env)
+                .inspect_err(|err| tracing::error!(?err));
+
             stack.push(results);
 
             let query_interaction = Interaction::new(
@@ -217,10 +222,10 @@ pub fn execute_interaction_turso(
         }
         InteractionType::FaultyQuery(_) => {
             let conn = conn.clone();
-            let results = interaction.execute_faulty_query(&conn, env);
-            if results.is_err() {
-                tracing::error!(?results);
-            }
+            let results = interaction
+                .execute_faulty_query(&conn, env)
+                .inspect_err(|err| tracing::error!(?err));
+
             stack.push(results);
             // Reset fault injection
             env.io.inject_fault(false);
@@ -296,6 +301,11 @@ fn execute_interaction_rusqlite(
             let results = execute_query_rusqlite(conn, query).map_err(|e| {
                 turso_core::LimboError::InternalError(format!("error executing query: {e}"))
             });
+            if let Err(err) = &results
+                && !interaction.ignore_error
+            {
+                return Err(err.clone());
+            }
             tracing::debug!("{:?}", results);
             stack.push(results);
         }
