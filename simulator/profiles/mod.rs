@@ -28,7 +28,7 @@ pub struct Profile {
     #[garde(skip)]
     /// Experimental MVCC feature
     pub experimental_mvcc: bool,
-    #[garde(range(min = 1))]
+    #[garde(range(min = 1, max = 64))]
     pub max_connections: usize,
     #[garde(dive)]
     pub io: IOProfile,

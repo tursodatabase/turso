@@ -57,25 +57,6 @@ impl InteractionPlan {
         &self.plan
     }
 
-    // TODO: this is just simplified logic so we can get something rolling with begin concurrent
-    // transactions in the simulator. Ideally when we generate the plan we will have begin and commits statements across interactions
-    pub fn push(&mut self, interactions: Interactions) {
-        if self.mvcc {
-            let conn_index = interactions.connection_index;
-            let begin = Interactions::new(
-                conn_index,
-                InteractionsType::Query(Query::Begin(Begin::Concurrent)),
-            );
-            let commit =
-                Interactions::new(conn_index, InteractionsType::Query(Query::Commit(Commit)));
-            self.plan.push(begin);
-            self.plan.push(interactions);
-            self.plan.push(commit);
-        } else {
-            self.plan.push(interactions);
-        }
-    }
-
     /// Compute via diff computes a a plan from a given `.plan` file without the need to parse
     /// sql. This is possible because there are two versions of the plan file, one that is human
     /// readable and one that is serialized as JSON. Under watch mode, the users will be able to
@@ -234,16 +215,32 @@ impl InteractionPlan {
     ) -> Option<Vec<Interaction>> {
         let num_interactions = env.opts.max_interactions as usize;
         if self.len() < num_interactions {
-            tracing::debug!("Generating interaction {}/{}", self.len(), num_interactions);
-            let interactions = {
-                let conn_index = env.choose_conn(rng);
+            let conn_index = env.choose_conn(rng);
+            dbg!(self.mvcc, env.conn_in_transaction(conn_index));
+            let interactions = if self.mvcc && !env.conn_in_transaction(conn_index) {
+                let query = Query::Begin(Begin::Concurrent);
+                env.update_conn_last_interaction(conn_index, Some(&query));
+                Interactions::new(conn_index, InteractionsType::Query(query))
+            } else if self.mvcc
+                && env.conn_in_transaction(conn_index)
+                && env.has_conn_executed_query_after_transaction(conn_index)
+                && rng.random_bool(0.4)
+            {
+                let query = Query::Commit(Commit);
+                env.update_conn_last_interaction(conn_index, Some(&query));
+                Interactions::new(conn_index, InteractionsType::Query(query))
+            } else {
+                env.update_conn_last_interaction(conn_index, None);
                 let conn_ctx = &env.connection_context(conn_index);
                 Interactions::arbitrary_from(rng, conn_ctx, (env, self.stats(), conn_index))
             };
 
+            tracing::debug!("Generating interaction {}/{}", self.len(), num_interactions);
+
             let out_interactions = interactions.interactions();
+
             assert!(!out_interactions.is_empty());
-            self.push(interactions);
+            self.plan.push(interactions);
             Some(out_interactions)
         } else {
             None
