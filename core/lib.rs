@@ -509,7 +509,7 @@ impl Database {
             _shared_cache: false,
             cache_size: AtomicI32::new(default_cache_size),
             page_size: AtomicU16::new(page_size.get_raw()),
-            wal_auto_checkpoint_disabled: Cell::new(false),
+            wal_auto_checkpoint_disabled: AtomicBool::new(false),
             capture_data_changes: RefCell::new(CaptureDataChangesMode::Off),
             closed: Cell::new(false),
             attached_databases: RefCell::new(DatabaseCatalog::new()),
@@ -998,7 +998,7 @@ pub struct Connection {
     page_size: AtomicU16,
     /// Disable automatic checkpoint behaviour when DB is shutted down or WAL reach certain size
     /// Client still can manually execute PRAGMA wal_checkpoint(...) commands
-    wal_auto_checkpoint_disabled: Cell<bool>,
+    wal_auto_checkpoint_disabled: AtomicBool,
     capture_data_changes: RefCell<CaptureDataChangesMode>,
     closed: Cell<bool>,
     /// Attached databases
@@ -1652,13 +1652,18 @@ impl Connection {
         {
             self.pager
                 .read()
-                .checkpoint_shutdown(self.wal_auto_checkpoint_disabled.get())?;
+                .checkpoint_shutdown(self.is_wal_auto_checkpoint_disabled())?;
         };
         Ok(())
     }
 
     pub fn wal_auto_checkpoint_disable(&self) {
-        self.wal_auto_checkpoint_disabled.set(true);
+        self.wal_auto_checkpoint_disabled
+            .store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_wal_auto_checkpoint_disabled(&self) -> bool {
+        self.wal_auto_checkpoint_disabled.load(Ordering::SeqCst)
     }
 
     pub fn last_insert_rowid(&self) -> i64 {
