@@ -160,7 +160,7 @@ pub fn execute_interaction(
     }
 }
 
-#[instrument(skip(env, interaction, stack), fields(seed = %env.opts.seed, interaction = %interaction))]
+#[instrument(skip(env, interaction, stack), fields(conn_index = interaction.connection_index, interaction = %interaction))]
 pub fn execute_interaction_turso(
     env: &mut SimulatorEnv,
     interaction: &Interaction,
@@ -173,7 +173,7 @@ pub fn execute_interaction_turso(
     // Leave this empty info! here to print the span of the execution
     tracing::info!("");
     match &interaction.interaction {
-        InteractionType::Query(_) => {
+        InteractionType::Query(query) => {
             tracing::debug!(?interaction);
             let results = interaction
                 .execute_query(conn)
@@ -189,6 +189,7 @@ pub fn execute_interaction_turso(
             if !env.profile.experimental_mvcc {
                 limbo_integrity_check(conn)?;
             }
+            env.update_conn_last_interaction(interaction.connection_index, Some(query));
         }
         InteractionType::FsyncQuery(query) => {
             let results = interaction
@@ -308,6 +309,7 @@ fn execute_interaction_rusqlite(
             }
             tracing::debug!("{:?}", results);
             stack.push(results);
+            env.update_conn_last_interaction(interaction.connection_index, Some(query));
         }
         InteractionType::FsyncQuery(..) => {
             unimplemented!("cannot implement fsync query in rusqlite, as we do not control IO");

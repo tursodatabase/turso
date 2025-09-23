@@ -10,9 +10,11 @@ use garde::Validate;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use sql_generation::generation::GenerationContext;
+use sql_generation::model::query::transaction::Rollback;
 use sql_generation::model::table::Table;
 use turso_core::Database;
 
+use crate::generation::Shadow;
 use crate::model::Query;
 use crate::profiles::Profile;
 use crate::runner::SimIO;
@@ -493,6 +495,11 @@ impl SimulatorEnv {
             )
         });
         self.connection_last_query.set(conn_index, value);
+    }
+
+    pub fn rollback_conn(&mut self, conn_index: usize) {
+        Rollback.shadow(&mut self.get_conn_tables_mut(conn_index));
+        self.update_conn_last_interaction(conn_index, Some(&Query::Rollback(Rollback)));
     }
 
     pub fn get_conn_tables<'a>(&'a self, conn_index: usize) -> ShadowTables<'a> {
