@@ -30,6 +30,7 @@ serde = ["dep:serde"]
 series = []
 encryption = []
 checksum = []
+cli_only = []
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = { version = "0.7.5", optional = true }

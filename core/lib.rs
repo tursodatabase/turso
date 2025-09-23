@@ -106,6 +106,7 @@ pub struct DatabaseOpts {
     pub enable_indexes: bool,
     pub enable_views: bool,
     pub enable_strict: bool,
+    enable_load_extension: bool,
 }
 
 impl Default for DatabaseOpts {
@@ -115,6 +116,7 @@ impl Default for DatabaseOpts {
             enable_indexes: true,
             enable_views: false,
             enable_strict: false,
+            enable_load_extension: false,
         }
     }
 }
@@ -122,6 +124,12 @@ impl Default for DatabaseOpts {
 impl DatabaseOpts {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    #[cfg(feature = "cli_only")]
+    pub fn turso_cli(mut self) -> Self {
+        self.enable_load_extension = true;
+        self
     }
 
     pub fn with_mvcc(mut self, enable: bool) -> Self {
@@ -753,6 +761,10 @@ impl Database {
             .unwrap();
         let db = Self::open_file_with_flags(io.clone(), path, flags, opts, encryption_opts)?;
         Ok((io, db))
+    }
+
+    pub(crate) fn can_load_extensions(&self) -> bool {
+        self.opts.enable_load_extension
     }
 
     #[inline]

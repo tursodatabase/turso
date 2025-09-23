@@ -316,6 +316,7 @@ mod tests {
                 enable_indexes: false,
                 enable_views: true,
                 enable_strict: false,
+                enable_load_extension: false,
             },
             None,
         )?;

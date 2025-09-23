@@ -184,7 +184,8 @@ impl Limbo {
                     .with_mvcc(opts.experimental_mvcc)
                     .with_indexes(indexes_enabled)
                     .with_views(opts.experimental_views)
-                    .with_strict(opts.experimental_strict),
+                    .with_strict(opts.experimental_strict)
+                    .turso_cli(),
                 None,
             )?;
             let conn = db.connect()?;
