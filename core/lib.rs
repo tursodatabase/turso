@@ -512,7 +512,7 @@ impl Database {
             wal_auto_checkpoint_disabled: AtomicBool::new(false),
             capture_data_changes: RwLock::new(CaptureDataChangesMode::Off),
             closed: AtomicBool::new(false),
-            attached_databases: RefCell::new(DatabaseCatalog::new()),
+            attached_databases: RwLock::new(DatabaseCatalog::new()),
             query_only: AtomicBool::new(false),
             mv_tx: Cell::new(None),
             view_transaction_states: AllViewsTxState::new(),
@@ -1002,7 +1002,7 @@ pub struct Connection {
     capture_data_changes: RwLock<CaptureDataChangesMode>,
     closed: AtomicBool,
     /// Attached databases
-    attached_databases: RefCell<DatabaseCatalog>,
+    attached_databases: RwLock<DatabaseCatalog>,
     query_only: AtomicBool,
     pub(crate) mv_tx: Cell<Option<(crate::mvcc::database::TxID, TransactionMode)>>,
 
@@ -1733,10 +1733,7 @@ impl Connection {
         if index == 0 {
             self.db.is_readonly()
         } else {
-            let db = self
-                .attached_databases
-                .borrow()
-                .get_database_by_index(index);
+            let db = self.attached_databases.read().get_database_by_index(index);
             db.expect("Should never have called this without being sure the database exists")
                 .is_readonly()
         }
@@ -1908,14 +1905,14 @@ impl Connection {
         if *index < 2 {
             self.pager.read().clone()
         } else {
-            self.attached_databases.borrow().get_pager_by_index(index)
+            self.attached_databases.read().get_pager_by_index(index)
         }
     }
 
     #[cfg(feature = "fs")]
     fn is_attached(&self, alias: &str) -> bool {
         self.attached_databases
-            .borrow()
+            .read()
             .name_to_index
             .contains_key(alias)
     }
@@ -1966,9 +1963,7 @@ impl Connection {
         let db = Self::from_uri_attached(path, db_opts, self.db.io.clone())?;
         let pager = Arc::new(db.init_pager(None)?);
 
-        self.attached_databases
-            .borrow_mut()
-            .insert(alias, (db, pager));
+        self.attached_databases.write().insert(alias, (db, pager));
 
         Ok(())
     }
@@ -1986,7 +1981,7 @@ impl Connection {
         }
 
         // Remove from attached databases
-        let mut attached_dbs = self.attached_databases.borrow_mut();
+        let mut attached_dbs = self.attached_databases.write();
         if attached_dbs.remove(alias).is_none() {
             return Err(LimboError::InvalidArgument(format!(
                 "no such database: {alias}"
@@ -1998,13 +1993,13 @@ impl Connection {
 
     // Get an attached database by alias name
     fn get_attached_database(&self, alias: &str) -> Option<(usize, Arc<Database>)> {
-        self.attached_databases.borrow().get_database_by_name(alias)
+        self.attached_databases.read().get_database_by_name(alias)
     }
 
     /// List all attached database aliases
     pub fn list_attached_databases(&self) -> Vec<String> {
         self.attached_databases
-            .borrow()
+            .read()
             .name_to_index
             .keys()
             .cloned()
@@ -2060,7 +2055,7 @@ impl Connection {
             }
 
             // Schema not cached, load it lazily from the attached database
-            let attached_dbs = self.attached_databases.borrow();
+            let attached_dbs = self.attached_databases.read();
             let (db, _pager) = attached_dbs
                 .index_to_data
                 .get(&database_id)
@@ -2103,7 +2098,7 @@ impl Connection {
         databases.push((0, "main".to_string(), main_path));
 
         // Add attached databases
-        let attached_dbs = self.attached_databases.borrow();
+        let attached_dbs = self.attached_databases.read();
         for (alias, &seq_number) in attached_dbs.name_to_index.iter() {
             let file_path = if let Some((db, _pager)) = attached_dbs.index_to_data.get(&seq_number)
             {
