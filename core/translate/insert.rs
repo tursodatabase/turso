@@ -547,6 +547,17 @@ pub fn translate_insert(
             register: insertion.key_register(),
             value: 1,
         });
+
+        if let Some((seq_cursor_id, _, r_seq_rowid, table_name_reg)) = autoincrement_meta {
+            emit_update_sqlite_sequence(
+                &mut program,
+                schema,
+                seq_cursor_id,
+                r_seq_rowid,
+                table_name_reg,
+                insertion.key_register(),
+            )?;
+        }
     } else {
         program.emit_insn(Insn::NewRowid {
             cursor: cursor_id,
@@ -962,65 +973,15 @@ pub fn translate_insert(
             collation: None,
         });
 
-        let record_reg = program.alloc_register();
-        let record_start_reg = program.alloc_registers(2);
-        program.emit_insn(Insn::Copy {
-            src_reg: table_name_reg,
-            dst_reg: record_start_reg,
-            extra_amount: 0,
-        });
-        program.emit_insn(Insn::Copy {
-            src_reg: insertion.key_register(),
-            dst_reg: record_start_reg + 1,
-            extra_amount: 0,
-        });
-        let seq_table = schema.get_btree_table("sqlite_sequence").unwrap();
-        let affinity_str = seq_table
-            .columns
-            .iter()
-            .map(|col| col.affinity().aff_mask())
-            .collect::<String>();
-        program.emit_insn(Insn::MakeRecord {
-            start_reg: record_start_reg,
-            count: 2,
-            dest_reg: record_reg,
-            index_name: None,
-            affinity_str: Some(affinity_str),
-        });
+        emit_update_sqlite_sequence(
+            &mut program,
+            schema,
+            seq_cursor_id,
+            r_seq_rowid,
+            table_name_reg,
+            insertion.key_register(),
+        )?;
 
-        let update_existing_label = program.allocate_label();
-        let end_update_label = program.allocate_label();
-        program.emit_insn(Insn::NotNull {
-            reg: r_seq_rowid,
-            target_pc: update_existing_label,
-        });
-
-        program.emit_insn(Insn::NewRowid {
-            cursor: seq_cursor_id,
-            rowid_reg: r_seq_rowid,
-            prev_largest_reg: 0,
-        });
-        program.emit_insn(Insn::Insert {
-            cursor: seq_cursor_id,
-            key_reg: r_seq_rowid,
-            record_reg,
-            flag: InsertFlags::new(),
-            table_name: "sqlite_sequence".to_string(),
-        });
-        program.emit_insn(Insn::Goto {
-            target_pc: end_update_label,
-        });
-
-        program.preassign_label_to_next_insn(update_existing_label);
-        program.emit_insn(Insn::Insert {
-            cursor: seq_cursor_id,
-            key_reg: r_seq_rowid,
-            record_reg,
-            flag: InsertFlags(turso_parser::ast::ResolveType::Replace.bit_value() as u8),
-            table_name: "sqlite_sequence".to_string(),
-        });
-
-        program.preassign_label_to_next_insn(end_update_label);
         program.preassign_label_to_next_insn(no_update_needed_label);
         program.emit_insn(Insn::Close {
             cursor_id: seq_cursor_id,
@@ -1744,4 +1705,76 @@ pub fn rewrite_partial_index_where(
             Ok(WalkControl::Continue)
         },
     )
+}
+
+fn emit_update_sqlite_sequence(
+    program: &mut ProgramBuilder,
+    schema: &Schema,
+    seq_cursor_id: usize,
+    r_seq_rowid: usize,
+    table_name_reg: usize,
+    new_key_reg: usize,
+) -> Result<()> {
+    let record_reg = program.alloc_register();
+    let record_start_reg = program.alloc_registers(2);
+    program.emit_insn(Insn::Copy {
+        src_reg: table_name_reg,
+        dst_reg: record_start_reg,
+        extra_amount: 0,
+    });
+    program.emit_insn(Insn::Copy {
+        src_reg: new_key_reg,
+        dst_reg: record_start_reg + 1,
+        extra_amount: 0,
+    });
+
+    let seq_table = schema.get_btree_table("sqlite_sequence").unwrap();
+    let affinity_str = seq_table
+        .columns
+        .iter()
+        .map(|col| col.affinity().aff_mask())
+        .collect::<String>();
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: record_start_reg,
+        count: 2,
+        dest_reg: record_reg,
+        index_name: None,
+        affinity_str: Some(affinity_str),
+    });
+
+    let update_existing_label = program.allocate_label();
+    let end_update_label = program.allocate_label();
+    program.emit_insn(Insn::NotNull {
+        reg: r_seq_rowid,
+        target_pc: update_existing_label,
+    });
+
+    program.emit_insn(Insn::NewRowid {
+        cursor: seq_cursor_id,
+        rowid_reg: r_seq_rowid,
+        prev_largest_reg: 0,
+    });
+    program.emit_insn(Insn::Insert {
+        cursor: seq_cursor_id,
+        key_reg: r_seq_rowid,
+        record_reg,
+        flag: InsertFlags::new(),
+        table_name: "sqlite_sequence".to_string(),
+    });
+    program.emit_insn(Insn::Goto {
+        target_pc: end_update_label,
+    });
+
+    program.preassign_label_to_next_insn(update_existing_label);
+    program.emit_insn(Insn::Insert {
+        cursor: seq_cursor_id,
+        key_reg: r_seq_rowid,
+        record_reg,
+        flag: InsertFlags(turso_parser::ast::ResolveType::Replace.bit_value() as u8),
+        table_name: "sqlite_sequence".to_string(),
+    });
+
+    program.preassign_label_to_next_insn(end_update_label);
+
+    Ok(())
 }

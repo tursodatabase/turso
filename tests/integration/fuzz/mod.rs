@@ -55,7 +55,10 @@ mod tests {
 
     #[test]
     pub fn rowid_seek_fuzz() {
-        let db = TempDatabase::new_with_rusqlite("CREATE TABLE t (x INTEGER PRIMARY KEY)", false); // INTEGER PRIMARY KEY is a rowid alias, so an index is not created
+        let db = TempDatabase::new_with_rusqlite(
+            "CREATE TABLE t (x INTEGER PRIMARY KEY autoincrement)",
+            false,
+        ); // INTEGER PRIMARY KEY is a rowid alias, so an index is not created
         let sqlite_conn = rusqlite::Connection::open(db.path.clone()).unwrap();
 
         let (mut rng, _seed) = rng_from_time_or_env();
@@ -576,7 +579,7 @@ mod tests {
             // Track executed statements in case we fail
             let mut dml_statements = Vec::new();
             let col_names = (0..num_cols)
-                .map(|i| format!("c{}", i))
+                .map(|i| format!("c{i}"))
                 .collect::<Vec<_>>()
                 .join(", ");
             let insert = format!(

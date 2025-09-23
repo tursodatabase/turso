@@ -163,3 +163,15 @@ do_execsql_test_on_specific_db {:memory:} autoinc-with-upsert {
         ON CONFLICT(b) DO UPDATE SET a=a+1000;
     SELECT seq FROM sqlite_sequence WHERE name='t11';
 } {5}
+
+
+# refer https://github.com/tursodatabase/turso/pull/2983#issuecomment-3322404270 was discovered while adding autoincr to fuzz tests
+do_execsql_test_on_specific_db {:memory:} autoinc-conflict-on-nothing {
+    CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, k TEXT);
+    CREATE UNIQUE INDEX idx_k_partial ON t(k) WHERE id > 1;
+    INSERT INTO t (k) VALUES ('a');
+    INSERT INTO t (k) VALUES ('a');
+    INSERT INTO t (k) VALUES ('a') ON CONFLICT DO NOTHING;
+    INSERT INTO t (k) VALUES ('b');
+    SELECT * FROM t ORDER BY id;
+} {1|a 2|a 4|b}
