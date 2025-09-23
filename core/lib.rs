@@ -513,7 +513,7 @@ impl Database {
             capture_data_changes: RwLock::new(CaptureDataChangesMode::Off),
             closed: AtomicBool::new(false),
             attached_databases: RefCell::new(DatabaseCatalog::new()),
-            query_only: Cell::new(false),
+            query_only: AtomicBool::new(false),
             mv_tx: Cell::new(None),
             view_transaction_states: AllViewsTxState::new(),
             metrics: RefCell::new(ConnectionMetrics::new()),
@@ -1003,7 +1003,7 @@ pub struct Connection {
     closed: AtomicBool,
     /// Attached databases
     attached_databases: RefCell<DatabaseCatalog>,
-    query_only: Cell<bool>,
+    query_only: AtomicBool,
     pub(crate) mv_tx: Cell<Option<(crate::mvcc::database::TxID, TransactionMode)>>,
 
     /// Per-connection view transaction states for uncommitted changes. This represents
@@ -1711,6 +1711,10 @@ impl Connection {
         self.closed.load(Ordering::SeqCst)
     }
 
+    pub fn is_query_only(&self) -> bool {
+        self.query_only.load(Ordering::SeqCst)
+    }
+
     pub fn get_database_canonical_path(&self) -> String {
         if self.db.path == ":memory:" {
             // For in-memory databases, SQLite shows empty string
@@ -2120,11 +2124,11 @@ impl Connection {
     }
 
     pub fn get_query_only(&self) -> bool {
-        self.query_only.get()
+        self.is_query_only()
     }
 
     pub fn set_query_only(&self, value: bool) {
-        self.query_only.set(value);
+        self.query_only.store(value, Ordering::SeqCst);
     }
 
     pub fn get_sync_mode(&self) -> SyncMode {
