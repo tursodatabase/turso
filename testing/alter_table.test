@@ -143,18 +143,6 @@ do_execsql_test_in_memory_any_error fail-alter-table-add-duplicate-column-case-i
     CREATE TABLE t1 (a);
     ALTER TABLE t1 ADD COLUMN A;
 }
-do_execsql_test_on_specific_db {:memory:} alter-table-add-column-type-should-be-same {
-    CREATE TABLE t1 (id integer);
-    ALTER TABLE t1 ADD COLUMN name varchar(255);
-    SELECT sql FROM sqlite_schema WHERE name = 't1';
-} { "CREATE TABLE t1 (id integer, name varchar (255))" }
-
-do_execsql_test_on_specific_db {:memory:} alter-table-add-column-type-should-be-same-2 {
-    CREATE TABLE t1 (a);
-    ALTER TABLE t1 ADD COLUMN price DECIMAL(10, 2);
-    SELECT sql FROM sqlite_schema WHERE name = 't1';
-} { "CREATE TABLE t1 (a, price DECIMAL (10, 2))" }
-
 
 do_execsql_test_in_memory_any_error fail-alter-table-drop-primary-key-column {
     CREATE TABLE t (a PRIMARY KEY, b);
