@@ -493,7 +493,7 @@ impl Database {
         let conn = Arc::new(Connection {
             db: self.clone(),
             pager: RwLock::new(Arc::new(pager)),
-            schema: RefCell::new(
+            schema: RwLock::new(
                 self.schema
                     .lock()
                     .map_err(|_| LimboError::SchemaLocked)?
@@ -980,7 +980,7 @@ impl DatabaseCatalog {
 pub struct Connection {
     db: Arc<Database>,
     pager: RwLock<Arc<Pager>>,
-    schema: RefCell<Arc<Schema>>,
+    schema: RwLock<Arc<Schema>>,
     /// Per-database schema cache (database_index -> schema)
     /// Loaded lazily to avoid copying all schemas on connection open
     database_schemas: RefCell<std::collections::HashMap<usize, Arc<Schema>>>,
@@ -1061,7 +1061,7 @@ impl Connection {
         let mode = QueryMode::new(&cmd);
         let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
         let program = translate::translate(
-            self.schema.borrow().deref(),
+            self.schema.read().deref(),
             stmt,
             pager.clone(),
             self.clone(),
@@ -1141,7 +1141,7 @@ impl Connection {
 
         reparse_result?;
 
-        let schema = self.schema.borrow().clone();
+        let schema = self.schema.read().clone();
         self.db.update_schema_if_newer(schema)
     }
 
@@ -1155,12 +1155,12 @@ impl Connection {
             .get();
 
         // create fresh schema as some objects can be deleted
-        let mut fresh = Schema::new(self.schema.borrow().indexes_enabled);
+        let mut fresh = Schema::new(self.schema.read().indexes_enabled);
         fresh.schema_version = cookie;
 
         // Preserve existing views to avoid expensive repopulation.
         // TODO: We may not need to do this if we materialize our views.
-        let existing_views = self.schema.borrow().incremental_views.clone();
+        let existing_views = self.schema.read().incremental_views.clone();
 
         // TODO: this is hack to avoid a cyclical problem with schema reprepare
         // The problem here is that we prepare a statement here, but when the statement tries
@@ -1218,7 +1218,7 @@ impl Connection {
             let mode = QueryMode::new(&cmd);
             let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
             let program = translate::translate(
-                self.schema.borrow().deref(),
+                self.schema.read().deref(),
                 stmt,
                 pager.clone(),
                 self.clone(),
@@ -1266,7 +1266,7 @@ impl Connection {
         let mode = QueryMode::new(&cmd);
         let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
         let program = translate::translate(
-            self.schema.borrow().deref(),
+            self.schema.read().deref(),
             stmt,
             pager.clone(),
             self.clone(),
@@ -1302,7 +1302,7 @@ impl Connection {
             let mode = QueryMode::new(&cmd);
             let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
             let program = translate::translate(
-                self.schema.borrow().deref(),
+                self.schema.read().deref(),
                 stmt,
                 pager.clone(),
                 self.clone(),
@@ -1411,7 +1411,7 @@ impl Connection {
     }
 
     pub fn maybe_update_schema(&self) -> Result<()> {
-        let current_schema_version = self.schema.borrow().schema_version;
+        let current_schema_version = self.schema.read().schema_version;
         let schema = self
             .db
             .schema
@@ -1420,7 +1420,7 @@ impl Connection {
         if matches!(self.transaction_state.get(), TransactionState::None)
             && current_schema_version != schema.schema_version
         {
-            self.schema.replace(schema.clone());
+            *self.schema.write() = schema.clone();
         }
 
         Ok(())
@@ -1879,7 +1879,7 @@ impl Connection {
 
     #[inline]
     pub fn with_schema_mut<T>(&self, f: impl FnOnce(&mut Schema) -> T) -> T {
-        let mut schema_ref = self.schema.borrow_mut();
+        let mut schema_ref = self.schema.write();
         let schema = Arc::make_mut(&mut *schema_ref);
         f(schema)
     }
@@ -2029,11 +2029,11 @@ impl Connection {
     pub(crate) fn with_schema<T>(&self, database_id: usize, f: impl FnOnce(&Schema) -> T) -> T {
         if database_id == 0 {
             // Main database - use connection's schema which should be kept in sync
-            let schema = self.schema.borrow();
+            let schema = self.schema.read();
             f(&schema)
         } else if database_id == 1 {
             // Temp database - uses same schema as main for now, but this will change later.
-            let schema = self.schema.borrow();
+            let schema = self.schema.read();
             f(&schema)
         } else {
             // Attached database - check cache first, then load from database
@@ -2430,7 +2430,7 @@ impl Statement {
     fn reprepare(&mut self) -> Result<()> {
         tracing::trace!("repreparing statement");
         let conn = self.program.connection.clone();
-        *conn.schema.borrow_mut() = conn.db.clone_schema()?;
+        *conn.schema.write() = conn.db.clone_schema()?;
         self.program = {
             let mut parser = Parser::new(self.program.sql.as_bytes());
             let cmd = parser.next_cmd()?;
@@ -2441,7 +2441,7 @@ impl Statement {
             debug_assert_eq!(QueryMode::new(&cmd), mode,);
             let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
             translate::translate(
-                conn.schema.borrow().deref(),
+                conn.schema.read().deref(),
                 stmt,
                 self.pager.clone(),
                 conn.clone(),

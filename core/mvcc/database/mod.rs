@@ -869,7 +869,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     _ => false,
                 };
                 if schema_did_change {
-                    let schema = connection.schema.borrow().clone();
+                    let schema = connection.schema.read().clone();
                     connection.db.update_schema_if_newer(schema)?;
                 }
                 let tx = mvcc_store.txs.get(&self.tx_id).unwrap();

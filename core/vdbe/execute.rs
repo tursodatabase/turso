@@ -4817,7 +4817,7 @@ pub fn op_function(
                         ));
                     };
                     let table = {
-                        let schema = program.connection.schema.borrow();
+                        let schema = program.connection.schema.read();
                         match schema.get_table(table.as_str()) {
                             Some(table) => table,
                             None => {
@@ -5483,7 +5483,7 @@ pub fn op_insert(
     loop {
         match &state.op_insert_state.sub_state {
             OpInsertSubState::MaybeCaptureRecord => {
-                let schema = program.connection.schema.borrow();
+                let schema = program.connection.schema.read();
                 let dependent_views = schema.get_dependent_materialized_views(table_name);
                 // If there are no dependent views, we don't need to capture the old record.
                 // We also don't need to do it if the rowid of the UPDATEd row was changed, because that means
@@ -5593,7 +5593,7 @@ pub fn op_insert(
                 if root_page != 1 {
                     state.op_insert_state.sub_state = OpInsertSubState::UpdateLastRowid;
                 } else {
-                    let schema = program.connection.schema.borrow();
+                    let schema = program.connection.schema.read();
                     let dependent_views = schema.get_dependent_materialized_views(table_name);
                     if !dependent_views.is_empty() {
                         state.op_insert_state.sub_state = OpInsertSubState::ApplyViewChange;
@@ -5614,7 +5614,7 @@ pub fn op_insert(
                     let prev_changes = program.n_change.get();
                     program.n_change.set(prev_changes + 1);
                 }
-                let schema = program.connection.schema.borrow();
+                let schema = program.connection.schema.read();
                 let dependent_views = schema.get_dependent_materialized_views(table_name);
                 if !dependent_views.is_empty() {
                     state.op_insert_state.sub_state = OpInsertSubState::ApplyViewChange;
@@ -5623,7 +5623,7 @@ pub fn op_insert(
                 break;
             }
             OpInsertSubState::ApplyViewChange => {
-                let schema = program.connection.schema.borrow();
+                let schema = program.connection.schema.read();
                 let dependent_views = schema.get_dependent_materialized_views(table_name);
                 assert!(!dependent_views.is_empty());
 
@@ -5658,7 +5658,7 @@ pub fn op_insert(
                         .collect::<Vec<_>>();
 
                     // Fix rowid alias columns: replace Null with actual rowid value
-                    let schema = program.connection.schema.borrow();
+                    let schema = program.connection.schema.read();
                     if let Some(table) = schema.get_table(table_name) {
                         for (i, col) in table.columns().iter().enumerate() {
                             if col.is_rowid_alias && i < new_values.len() {
@@ -5751,7 +5751,7 @@ pub fn op_delete(
     loop {
         match &state.op_delete_state.sub_state {
             OpDeleteSubState::MaybeCaptureRecord => {
-                let schema = program.connection.schema.borrow();
+                let schema = program.connection.schema.read();
                 let dependent_views = schema.get_dependent_materialized_views(table_name);
                 if dependent_views.is_empty() {
                     state.op_delete_state.sub_state = OpDeleteSubState::Delete;
@@ -5800,7 +5800,7 @@ pub fn op_delete(
                 }
                 // Increment metrics for row write (DELETE is a write operation)
                 state.metrics.rows_written = state.metrics.rows_written.saturating_add(1);
-                let schema = program.connection.schema.borrow();
+                let schema = program.connection.schema.read();
                 let dependent_views = schema.get_dependent_materialized_views(table_name);
                 if dependent_views.is_empty() {
                     break;
@@ -5809,7 +5809,7 @@ pub fn op_delete(
                 continue;
             }
             OpDeleteSubState::ApplyViewChange => {
-                let schema = program.connection.schema.borrow();
+                let schema = program.connection.schema.read();
                 let dependent_views = schema.get_dependent_materialized_views(table_name);
                 assert!(!dependent_views.is_empty());
                 let maybe_deleted_record = state.op_delete_state.deleted_record.take();
@@ -6507,7 +6507,7 @@ pub fn op_open_write(
     };
     if let Some(index) = maybe_index {
         let conn = program.connection.clone();
-        let schema = conn.schema.borrow();
+        let schema = conn.schema.read();
         let table = schema
             .get_table(&index.table_name)
             .and_then(|table| table.btree());
@@ -6866,7 +6866,7 @@ pub fn op_populate_materialized_views(
 
     // Now populate the views (after releasing the schema borrow)
     for (view_name, _root_page, cursor_id) in view_info {
-        let schema = conn.schema.borrow();
+        let schema = conn.schema.read();
         if let Some(view) = schema.get_materialized_view(&view_name) {
             let mut view = view.lock().unwrap();
             // Drop the schema borrow before calling populate_from_table
