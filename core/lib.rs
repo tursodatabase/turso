@@ -70,7 +70,7 @@ use std::{
     ops::Deref,
     rc::Rc,
     sync::{
-        atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU16, AtomicUsize, Ordering},
         Arc, LazyLock, Mutex, Weak,
     },
     time::Duration,
@@ -508,7 +508,7 @@ impl Database {
             syms: RwLock::new(SymbolTable::new()),
             _shared_cache: false,
             cache_size: AtomicI32::new(default_cache_size),
-            page_size: Cell::new(page_size),
+            page_size: AtomicU16::new(page_size.get_raw()),
             wal_auto_checkpoint_disabled: Cell::new(false),
             capture_data_changes: RefCell::new(CaptureDataChangesMode::Off),
             closed: Cell::new(false),
@@ -995,7 +995,7 @@ pub struct Connection {
     cache_size: AtomicI32,
     /// page size used for an uninitialized database or the next vacuum command.
     /// it's not always equal to the current page size of the database
-    page_size: Cell<PageSize>,
+    page_size: AtomicU16,
     /// Disable automatic checkpoint behaviour when DB is shutted down or WAL reach certain size
     /// Client still can manually execute PRAGMA wal_checkpoint(...) commands
     wal_auto_checkpoint_disabled: Cell<bool>,
@@ -1696,7 +1696,8 @@ impl Connection {
         self.capture_data_changes.replace(opts);
     }
     pub fn get_page_size(&self) -> PageSize {
-        self.page_size.get()
+        let value = self.page_size.load(Ordering::SeqCst);
+        PageSize::new_from_header_u16(value).unwrap_or_default()
     }
 
     pub fn get_database_canonical_path(&self) -> String {
@@ -1737,7 +1738,7 @@ impl Connection {
             return Ok(());
         };
 
-        self.page_size.set(size);
+        self.page_size.store(size.get_raw(), Ordering::SeqCst);
         if self.db.db_state.get() != DbState::Uninitialized {
             return Ok(());
         }
