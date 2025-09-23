@@ -62,7 +62,12 @@ use execute::{
 
 use explain::{insn_to_row_with_comment, EXPLAIN_COLUMNS, EXPLAIN_QUERY_PLAN_COLUMNS};
 use regex::Regex;
-use std::{cell::Cell, collections::HashMap, num::NonZero, sync::Arc};
+use std::{
+    cell::Cell,
+    collections::HashMap,
+    num::NonZero,
+    sync::{atomic::Ordering, Arc},
+};
 use tracing::{instrument, Level};
 
 /// State machine for committing view deltas with I/O handling
@@ -825,7 +830,7 @@ impl Program {
                 return Ok(IOResult::Done(()));
             }
             let conn = self.connection.clone();
-            let auto_commit = conn.auto_commit.get();
+            let auto_commit = conn.auto_commit.load(Ordering::SeqCst);
             if auto_commit {
                 // FIXME: we don't want to commit stuff from other programs.
                 if matches!(program_state.commit_state, CommitState::Ready) {
@@ -855,7 +860,7 @@ impl Program {
             Ok(IOResult::Done(()))
         } else {
             let connection = self.connection.clone();
-            let auto_commit = connection.auto_commit.get();
+            let auto_commit = connection.auto_commit.load(Ordering::SeqCst);
             tracing::trace!(
                 "Halt auto_commit {}, state={:?}",
                 auto_commit,
@@ -1079,7 +1084,7 @@ pub fn handle_program_error(
             if let Some(mv_store) = mv_store {
                 if let Some((tx_id, _)) = connection.mv_tx.get() {
                     connection.transaction_state.replace(TransactionState::None);
-                    connection.auto_commit.replace(true);
+                    connection.auto_commit.store(true, Ordering::SeqCst);
                     mv_store.rollback_tx(tx_id, pager.clone(), connection)?;
                 }
             } else {

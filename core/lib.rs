@@ -70,7 +70,7 @@ use std::{
     ops::Deref,
     rc::Rc,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, LazyLock, Mutex, Weak,
     },
     time::Duration,
@@ -500,7 +500,7 @@ impl Database {
                     .clone(),
             ),
             database_schemas: RwLock::new(std::collections::HashMap::new()),
-            auto_commit: Cell::new(true),
+            auto_commit: AtomicBool::new(true),
             transaction_state: Cell::new(TransactionState::None),
             last_insert_rowid: Cell::new(0),
             last_change: Cell::new(0),
@@ -985,7 +985,7 @@ pub struct Connection {
     /// Loaded lazily to avoid copying all schemas on connection open
     database_schemas: RwLock<std::collections::HashMap<usize, Arc<Schema>>>,
     /// Whether to automatically commit transaction
-    auto_commit: Cell<bool>,
+    auto_commit: AtomicBool,
     transaction_state: Cell<TransactionState>,
     last_insert_rowid: Cell<i64>,
     last_change: Cell<i64>,
@@ -1543,7 +1543,7 @@ impl Connection {
         self.transaction_state.replace(TransactionState::Write {
             schema_did_change: false,
         });
-        self.auto_commit.replace(false);
+        self.auto_commit.store(false, Ordering::SeqCst);
 
         Ok(())
     }
@@ -1576,7 +1576,7 @@ impl Connection {
                 None
             };
 
-            self.auto_commit.replace(true);
+            self.auto_commit.store(true, Ordering::SeqCst);
             self.transaction_state.replace(TransactionState::None);
             {
                 let wal = wal.borrow_mut();
@@ -1779,7 +1779,7 @@ impl Connection {
     }
 
     pub fn get_auto_commit(&self) -> bool {
-        self.auto_commit.get()
+        self.auto_commit.load(Ordering::SeqCst)
     }
 
     pub fn parse_schema_rows(self: &Arc<Connection>) -> Result<()> {

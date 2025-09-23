@@ -38,7 +38,7 @@ use std::env::temp_dir;
 use std::ops::DerefMut;
 use std::{
     borrow::BorrowMut,
-    sync::{Arc, Mutex},
+    sync::{atomic::Ordering, Arc, Mutex},
 };
 use turso_macros::match_ignore_ascii_case;
 
@@ -369,7 +369,7 @@ pub fn op_checkpoint_inner(
         },
         insn
     );
-    if !program.connection.auto_commit.get() {
+    if !program.connection.auto_commit.load(Ordering::SeqCst) {
         // TODO: sqlite returns "Runtime error: database table is locked (6)" when a table is in use
         // when a checkpoint is attempted. We don't have table locks, so return TableLocked for any
         // attempt to checkpoint in an interactive transaction. This does not end the transaction,
@@ -2107,7 +2107,7 @@ pub fn halt(
         }
     }
 
-    let auto_commit = program.connection.auto_commit.get();
+    let auto_commit = program.connection.auto_commit.load(Ordering::SeqCst);
     tracing::trace!("halt(auto_commit={})", auto_commit);
     if auto_commit {
         program
@@ -2391,7 +2391,7 @@ pub fn op_auto_commit(
             .map(Into::into);
     }
 
-    if *auto_commit != conn.auto_commit.get() {
+    if *auto_commit != conn.auto_commit.load(Ordering::SeqCst) {
         if *rollback {
             // TODO(pere): add rollback I/O logic once we implement rollback journal
             if let Some(mv_store) = mv_store {
@@ -2402,9 +2402,9 @@ pub fn op_auto_commit(
                 return_if_io!(pager.end_tx(true, &conn));
             }
             conn.transaction_state.replace(TransactionState::None);
-            conn.auto_commit.replace(true);
+            conn.auto_commit.store(true, Ordering::SeqCst);
         } else {
-            conn.auto_commit.replace(*auto_commit);
+            conn.auto_commit.store(*auto_commit, Ordering::SeqCst);
         }
     } else {
         let mvcc_tx_active = program.connection.mv_tx.get().is_some();
@@ -6784,8 +6784,8 @@ pub fn op_parse_schema(
     let conn = program.connection.clone();
     // set auto commit to false in order for parse schema to not commit changes as transaction state is stored in connection,
     // and we use the same connection for nested query.
-    let previous_auto_commit = conn.auto_commit.get();
-    conn.auto_commit.set(false);
+    let previous_auto_commit = conn.auto_commit.load(Ordering::SeqCst);
+    conn.auto_commit.store(false, Ordering::SeqCst);
 
     let maybe_nested_stmt_err = if let Some(where_clause) = where_clause {
         let stmt = conn.prepare(format!("SELECT * FROM sqlite_schema WHERE {where_clause}"))?;
@@ -6821,7 +6821,8 @@ pub fn op_parse_schema(
         })
     };
     conn.is_nested_stmt.set(false);
-    conn.auto_commit.set(previous_auto_commit);
+    conn.auto_commit
+        .store(previous_auto_commit, Ordering::SeqCst);
     maybe_nested_stmt_err?;
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
