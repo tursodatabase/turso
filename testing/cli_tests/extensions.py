@@ -614,7 +614,7 @@ def test_fuzzy():
         "SELECT fuzzy_editdist('abc', 'acb');",
         validate_fuzzy_editdist2,
         "fuzzy editdist2 function works",
-    )    
+    )
     limbo.run_test_fn(
         "SELECT fuzzy_jarowin('awesome', 'aewsme');",
         validate_fuzzy_jarowin,
