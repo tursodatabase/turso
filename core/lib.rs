@@ -511,7 +511,7 @@ impl Database {
             page_size: AtomicU16::new(page_size.get_raw()),
             wal_auto_checkpoint_disabled: AtomicBool::new(false),
             capture_data_changes: RwLock::new(CaptureDataChangesMode::Off),
-            closed: Cell::new(false),
+            closed: AtomicBool::new(false),
             attached_databases: RefCell::new(DatabaseCatalog::new()),
             query_only: Cell::new(false),
             mv_tx: Cell::new(None),
@@ -1000,7 +1000,7 @@ pub struct Connection {
     /// Client still can manually execute PRAGMA wal_checkpoint(...) commands
     wal_auto_checkpoint_disabled: AtomicBool,
     capture_data_changes: RwLock<CaptureDataChangesMode>,
-    closed: Cell<bool>,
+    closed: AtomicBool,
     /// Attached databases
     attached_databases: RefCell<DatabaseCatalog>,
     query_only: Cell<bool>,
@@ -1025,7 +1025,7 @@ pub struct Connection {
 
 impl Drop for Connection {
     fn drop(&mut self) {
-        if !self.closed.get() {
+        if !self.is_closed() {
             // if connection wasn't properly closed, decrement the connection counter
             self.db
                 .n_connections
@@ -1037,7 +1037,7 @@ impl Drop for Connection {
 impl Connection {
     #[instrument(skip_all, level = Level::INFO)]
     pub fn prepare(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<Statement> {
-        if self.closed.get() {
+        if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
         if sql.as_ref().is_empty() {
@@ -1197,7 +1197,7 @@ impl Connection {
 
     #[instrument(skip_all, level = Level::INFO)]
     pub fn prepare_execute_batch(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<()> {
-        if self.closed.get() {
+        if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
         if sql.as_ref().is_empty() {
@@ -1235,7 +1235,7 @@ impl Connection {
 
     #[instrument(skip_all, level = Level::INFO)]
     pub fn query(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<Option<Statement>> {
-        if self.closed.get() {
+        if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
         let sql = sql.as_ref();
@@ -1259,7 +1259,7 @@ impl Connection {
         cmd: Cmd,
         input: &str,
     ) -> Result<Option<Statement>> {
-        if self.closed.get() {
+        if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
         let syms = self.syms.read();
@@ -1287,7 +1287,7 @@ impl Connection {
     /// TODO: make this api async
     #[instrument(skip_all, level = Level::INFO)]
     pub fn execute(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<()> {
-        if self.closed.get() {
+        if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
         let sql = sql.as_ref();
@@ -1603,7 +1603,7 @@ impl Connection {
 
     /// Flush dirty pages to disk.
     pub fn cacheflush(&self) -> Result<Vec<Completion>> {
-        if self.closed.get() {
+        if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
         self.pager.read().cacheflush()
@@ -1615,7 +1615,7 @@ impl Connection {
     }
 
     pub fn checkpoint(&self, mode: CheckpointMode) -> Result<CheckpointResult> {
-        if self.closed.get() {
+        if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
         self.pager.read().wal_checkpoint(mode)
@@ -1623,10 +1623,10 @@ impl Connection {
 
     /// Close a connection and checkpoint.
     pub fn close(&self) -> Result<()> {
-        if self.closed.get() {
+        if self.is_closed() {
             return Ok(());
         }
-        self.closed.set(true);
+        self.closed.store(true, Ordering::SeqCst);
 
         match self.get_tx_state() {
             TransactionState::None => {
@@ -1705,6 +1705,10 @@ impl Connection {
     pub fn get_page_size(&self) -> PageSize {
         let value = self.page_size.load(Ordering::SeqCst);
         PageSize::new_from_header_u16(value).unwrap_or_default()
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
     }
 
     pub fn get_database_canonical_path(&self) -> String {
@@ -1791,7 +1795,7 @@ impl Connection {
     }
 
     pub fn parse_schema_rows(self: &Arc<Connection>) -> Result<()> {
-        if self.closed.get() {
+        if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
         let rows = self
@@ -1819,7 +1823,7 @@ impl Connection {
     // Clearly there is something to improve here, Vec<Vec<Value>> isn't a couple of tea
     /// Query the current rows/values of `pragma_name`.
     pub fn pragma_query(self: &Arc<Connection>, pragma_name: &str) -> Result<Vec<Vec<Value>>> {
-        if self.closed.get() {
+        if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
         let pragma = format!("PRAGMA {pragma_name}");
@@ -1836,7 +1840,7 @@ impl Connection {
         pragma_name: &str,
         pragma_value: V,
     ) -> Result<Vec<Vec<Value>>> {
-        if self.closed.get() {
+        if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
         let pragma = format!("PRAGMA {pragma_name} = {pragma_value}");
@@ -1863,7 +1867,7 @@ impl Connection {
         pragma_name: &str,
         pragma_value: V,
     ) -> Result<Vec<Vec<Value>>> {
-        if self.closed.get() {
+        if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
         let pragma = format!("PRAGMA {pragma_name}({pragma_value})");
@@ -1923,7 +1927,7 @@ impl Connection {
     /// Attach a database file with the given alias name
     #[cfg(feature = "fs")]
     pub(crate) fn attach_database(&self, path: &str, alias: &str) -> Result<()> {
-        if self.closed.get() {
+        if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
 
@@ -1967,7 +1971,7 @@ impl Connection {
 
     // Detach a database by alias name
     fn detach_database(&self, alias: &str) -> Result<()> {
-        if self.closed.get() {
+        if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
 
