@@ -899,13 +899,13 @@ mod tests {
 
             // Periodically verify data integrity
             if i % 50 == 0 {
-                verify_data_integrity(&sqlite_conn, &limbo_db, &limbo_conn, seed);
+                verify_data_integrity(&sqlite_conn, &limbo_db, &limbo_conn, seed, &mut qlog);
             }
         }
 
         // Final integrity check
         println!("Running final integrity check...");
-        verify_data_integrity(&sqlite_conn, &limbo_db, &limbo_conn, seed);
+        verify_data_integrity(&sqlite_conn, &limbo_db, &limbo_conn, seed, &mut qlog);
 
         println!("Fuzzing completed successfully!");
 
@@ -1000,9 +1000,10 @@ mod tests {
                             format!("status = '{status}'")
                         }
                         "inventory_transactions" => {
-                            let change_types = ["restock", "sale"];
+                            let change_types =
+                                ["restock", "sale", "adjustment", "manual", "return"];
                             let change_type = change_types.choose(rng).unwrap();
-                            format!("change_type = '{change_type}'")
+                            format!("reference_type = '{change_type}'")
                         }
                         _ => unreachable!(),
                     }
@@ -1080,7 +1081,6 @@ mod tests {
         }
     }
 
-    /// Generate a random INSERT query
     fn generate_insert_query(rng: &mut ChaCha8Rng) -> String {
         match rng.random_range(0..11) {
             0 => {
@@ -1242,7 +1242,7 @@ mod tests {
         let table = ["products", "users", "orders", "reviews"]
             .choose(rng)
             .unwrap();
-        match rng.random_range(0..2) {
+        match rng.random_range(0..13) {
             0 => {
                 let id = rng.random_range(1..30000);
                 format!("DELETE FROM {table} WHERE id = {id}")
@@ -1255,7 +1255,10 @@ mod tests {
             2 => {
                 let age = rng.random_range(18..85);
                 let state = ["CA", "NY", "TX", "FL", "WA"].choose(rng).unwrap();
-                format!("DELETE FROM users WHERE age < {age} AND state = '{state}' LIMIT 10",)
+                format!(
+                    "DELETE FROM users WHERE age BETWEEN {age} AND {} AND state = '{state}'",
+                    age + 1
+                )
             }
             3 => {
                 let patterns = ["'Product_%'", "'%test%'", "'temp_%'", "'%_old'"];
@@ -1274,7 +1277,7 @@ mod tests {
                  AND status = 'cancelled'",
                 )
             }
-            8 => {
+            5 => {
                 let min_price = rng.random_range(100..500);
                 let max_quantity = rng.random_range(1..5);
                 format!(
@@ -1284,7 +1287,7 @@ mod tests {
                  AND discount > unit_price * 0.5",
                 )
             }
-            9 => {
+            6 => {
                 let tables = [
                     ("orders", "tracking_number"),
                     ("users", "phone_number"),
@@ -1294,12 +1297,12 @@ mod tests {
                 let (table, column) = tables.choose(rng).unwrap();
                 format!("DELETE FROM {table} WHERE {column} IS NULL")
             }
-            10 => {
+            7 => {
                 let modulo = rng.random_range(3..10);
                 let remainder = rng.random_range(0..modulo);
                 format!("DELETE FROM {table} WHERE id % {modulo} = {remainder}",)
             }
-            11 => {
+            8 => {
                 let operators = [">", "<", ">=", "<=", "="];
                 let op = operators.choose(rng).unwrap();
                 let threshold = rng.random_range(50..500);
@@ -1308,14 +1311,14 @@ mod tests {
              WHERE (quantity * unit_price) - discount {op} {threshold}"
                 )
             }
-            12 => "DELETE FROM inventory_transactions 
+            9 => "DELETE FROM inventory_transactions 
              WHERE CASE 
                 WHEN transaction_type = 'damage' THEN 1 
                 WHEN quantity > 100 AND transaction_type = 'adjustment' THEN 1 
                 ELSE 0 
              END = 1"
                 .to_string(),
-            13 => {
+            10 => {
                 let length = rng.random_range(5..20);
                 format!(
                     "DELETE FROM users 
@@ -1323,14 +1326,14 @@ mod tests {
                  OR LOWER(email) NOT LIKE '%@%.%'",
                 )
             }
-            14 => "DELETE FROM orders o1 
+            11 => "DELETE FROM orders o1 
              WHERE total_amount < (
                 SELECT AVG(total_amount) * 0.1 
                 FROM orders o2 
                 WHERE o2.user_id = o1.user_id
              )"
             .to_string(),
-            15 => {
+            12 => {
                 let probability = rng.random_range(1..100);
                 let table = ["products", "reviews", "inventory_transactions"]
                     .choose(rng)
@@ -1369,11 +1372,11 @@ mod tests {
                 .to_string(),
             3 => "SELECT u.first_name, p.name, p.price
              FROM users u
-             CROSS JOIN products p
+             LEFT JOIN products p
              WHERE u.age > 50 AND p.price < 20
+             ORDER BY p.price ASC
              LIMIT 100"
                 .to_string(),
-
             4 => "SELECT u.first_name, u.last_name, p.name as product_name, 
                     oi.quantity, oi.unit_price, o.order_date
              FROM order_items oi
@@ -1410,30 +1413,16 @@ mod tests {
                 .to_string(),
             7 => "SELECT u.email, o.id as order_id, p.name, oi.quantity,
                     it.new_quantity as inventory_after
-             FROM users u
-             JOIN orders o ON u.id = o.user_id
-             JOIN order_items oi ON o.id = oi.order_id
-             JOIN products p ON oi.product_id = p.id
-             LEFT JOIN inventory_transactions it ON it.product_id = p.id 
-                AND it.reference_id = o.id AND it.reference_type = 'order'
-             WHERE o.order_date >= datetime('now', '-30 days')
-             LIMIT 50"
+                 FROM users u
+                 JOIN orders o ON u.id = o.user_id
+                 JOIN order_items oi ON o.id = oi.order_id
+                 JOIN products p ON oi.product_id = p.id
+                 LEFT JOIN inventory_transactions it ON it.product_id = p.id 
+                    AND it.reference_id = o.id AND it.reference_type = 'order'
+                 WHERE o.order_date >= datetime('now', '-30 days')
+                 LIMIT 50"
                 .to_string(),
-            8 => "SELECT u.id, u.first_name, u.last_name,
-                    COUNT(DISTINCT o.id) as order_count,
-                    COUNT(DISTINCT r.id) as review_count,
-                    AVG(r.rating) as avg_rating,
-                    SUM(o.total_amount) as lifetime_value
-             FROM users u
-             LEFT JOIN orders o ON u.id = o.user_id
-             LEFT JOIN reviews r ON u.id = r.user_id
-             LEFT JOIN customer_support_tickets t ON u.id = t.user_id
-             GROUP BY u.id, u.first_name, u.last_name
-             HAVING COUNT(o.id) > 0
-             ORDER BY lifetime_value DESC
-             LIMIT 20"
-                .to_string(),
-            9 => "SELECT u1.first_name || ' ' || u1.last_name as user1,
+            8 => "SELECT u1.first_name || ' ' || u1.last_name as user1,
                     u2.first_name || ' ' || u2.last_name as user2,
                     u1.city, u1.state
              FROM users u1
@@ -1444,15 +1433,15 @@ mod tests {
              ORDER BY u1.state, u1.city
              LIMIT 30"
                 .to_string(),
-            10 => "SELECT p1.name as product1, p1.price as price1,
+            9 => "SELECT p1.name as product1, p1.price as price1,
                     p2.name as product2, p2.price as price2
-             FROM products p1
-             JOIN products p2 ON ABS(p1.price - p2.price) < 5
-                AND p1.id < p2.id
-             WHERE p1.price BETWEEN 50 AND 100
-             LIMIT 25"
+                 FROM products p1
+                 JOIN products p2 ON ABS(p1.price - p2.price) < 5
+                    AND p1.id < p2.id
+                 WHERE p1.price BETWEEN 50 AND 100
+                 LIMIT 25"
                 .to_string(),
-            11 => "SELECT o.*, u.email, 
+            10 => "SELECT o.*, u.email, 
                     COUNT(oi.id) as item_count,
                     SUM(oi.quantity) as total_items
              FROM orders o
@@ -1466,12 +1455,12 @@ mod tests {
              ORDER BY o.order_date DESC
              LIMIT 20"
                 .to_string(),
-            12 => "SELECT *
+            11 => "SELECT *
              FROM orders o
              JOIN order_items USING (id)
              LIMIT 30"
                 .to_string(),
-            13 => "SELECT u.id, u.email, u.created_at,
+            12 => "SELECT u.id, u.email, u.created_at,
                     o.id as order_id
              FROM users u
              LEFT JOIN orders o ON u.id = o.user_id
@@ -1479,15 +1468,15 @@ mod tests {
              ORDER BY u.created_at DESC
              LIMIT 50"
                 .to_string(),
-            14 => "SELECT p.*, r.id as review_id
-             FROM products p
-             LEFT JOIN reviews r ON p.id = r.product_id
-             WHERE r.id IS NULL
-                OR r.rating < 3
-             ORDER BY p.price DESC
-             LIMIT 30"
+            13 => "SELECT p.*, r.id as review_id
+                 FROM products p
+                 LEFT JOIN reviews r ON p.id = r.product_id
+                 WHERE r.id IS NULL
+                    OR r.rating < 3
+                 ORDER BY p.price DESC
+                 LIMIT 30"
                 .to_string(),
-            15 => "SELECT p.id, p.name, p.price as list_price,
+            14 => "SELECT p.id, p.name, p.price as list_price,
                     AVG(oi.unit_price) as avg_sold_price,
                     MIN(oi.unit_price) as min_price,
                     MAX(oi.unit_price) as max_price,
@@ -1499,7 +1488,7 @@ mod tests {
              ORDER BY sales_count DESC
              LIMIT 20"
                 .to_string(),
-            16 => "SELECT DISTINCT u.state, 
+            15 => "SELECT DISTINCT u.state, 
                     COUNT(DISTINCT u.id) as users,
                     COUNT(DISTINCT o.id) as orders,
                     COUNT(DISTINCT p.id) as unique_products
@@ -1513,7 +1502,7 @@ mod tests {
              ORDER BY orders DESC
              LIMIT 10"
                 .to_string(),
-            17 => "SELECT o.id, o.order_date, 
+            16 => "SELECT o.id, o.order_date, 
                     r.review_date,
                     JULIANDAY(r.review_date) - JULIANDAY(o.order_date) as days_to_review
              FROM orders o
@@ -1525,7 +1514,7 @@ mod tests {
              ORDER BY days_to_review ASC
              LIMIT 30"
                 .to_string(),
-            18 => "SELECT u.*
+            17 => "SELECT u.*
              FROM users u
              LEFT JOIN orders o ON u.id = o.user_id 
                 AND o.order_date > datetime('now', '-90 days')
@@ -1544,6 +1533,7 @@ mod tests {
         turso_db: &TempDatabase,
         turso_conn: &Arc<turso_core::Connection>,
         seed: u64,
+        qlog: &mut QueryLog,
     ) {
         // Check row counts for all tables
         let tables = [
@@ -1576,10 +1566,10 @@ mod tests {
             "SELECT name FROM sqlite_master WHERE type='index' ORDER BY name",
         );
 
-        assert_eq!(
-            sqlite_indexes, turso_indexes,
-            "Index mismatch\nSeed: {seed}",
-        );
+        if sqlite_indexes != turso_indexes {
+            qlog.emit_last(100);
+            panic!("Index mismatch\nSeed: {seed}");
+        }
     }
 
     #[test]
