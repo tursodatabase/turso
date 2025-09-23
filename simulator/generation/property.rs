@@ -472,7 +472,7 @@ impl Property {
                         .into_iter()
                         .map(|q| Interaction::new(connection_index, InteractionType::Query(q))),
                 );
-                interactions.push(Interaction::new(connection_index, cq2));
+                interactions.push(Interaction::new_ignore_error(connection_index, cq2));
                 interactions.push(Interaction::new(connection_index, assertion));
 
                 interactions
