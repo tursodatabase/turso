@@ -447,12 +447,14 @@ impl Property {
                 let table_name = create.table.name.clone();
 
                 let assertion = InteractionType::Assertion(Assertion::new("creating two tables with the name should result in a failure for the second query"
-                                    .to_string(), move |stack: &Vec<ResultSet>, _| {
+                                    .to_string(), move |stack: &Vec<ResultSet>, env| {
                                 let last = stack.last().unwrap();
                                 match last {
                                     Ok(success) => Ok(Err(format!("expected table creation to fail but it succeeded: {success:?}"))),
                                     Err(e) => {
                                         if e.to_string().to_lowercase().contains(&format!("table {table_name} already exists")) {
+                                             // On error we rollback the transaction if there is any active here
+                                            Rollback.shadow(&mut env.get_conn_tables_mut(connection_index));
                                             Ok(Ok(()))
                                         } else {
                                             Ok(Err(format!("expected table already exists error, got: {e}")))
@@ -804,6 +806,9 @@ impl Property {
                                 // We cannot make any assumptions about the error content; all we are about is, if the statement errored,
                                 // we don't shadow the results into the simulator env, i.e. we assume whatever the statement did was rolled back.
                                 tracing::error!("Fault injection produced error: {err}");
+
+                                // On error we rollback the transaction if there is any active here
+                                Rollback.shadow(&mut env.get_conn_tables_mut(connection_index));
                                 Ok(Ok(()))
                             }
                         }
