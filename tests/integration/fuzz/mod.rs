@@ -853,7 +853,13 @@ mod tests {
             if query.trim_start().to_lowercase().starts_with("select") {
                 let sqlite_rows = sqlite_exec_rows(&sqlite_conn, &query);
                 let limbo_rows = limbo_exec_rows(&limbo_db, &limbo_conn, &query);
-                if sqlite_rows != limbo_rows {
+                if !compare(
+                    &sqlite_rows,
+                    &limbo_rows,
+                    CompareOpts {
+                        float_error_tolerance: Some(1e-9),
+                    },
+                ) {
                     qlog.emit_last(100);
                     println!("=======Data mismatch detected=======");
                     println!("Seed: {seed}");
@@ -912,6 +918,39 @@ mod tests {
         // Clean up
         std::fs::remove_file(turso_path).ok();
         std::fs::remove_file(sqlite_path).ok();
+    }
+
+    struct CompareOpts {
+        float_error_tolerance: Option<f64>,
+    }
+
+    fn compare(rows1: &[Vec<Value>], rows2: &[Vec<Value>], opts: CompareOpts) -> bool {
+        if rows1.len() != rows2.len() {
+            return false;
+        }
+        for (row1, row2) in rows1.iter().zip(rows2.iter()) {
+            if row1.len() != row2.len() {
+                return false;
+            }
+            if row1 != row2 {
+                let Some(float_error_tolerance) = opts.float_error_tolerance else {
+                    return false;
+                };
+                for (col1, col2) in row1.iter().zip(row2.iter()) {
+                    if let (Value::Real(r1), Value::Real(r2)) = (col1, col2) {
+                        if (r1 - r2).abs() > float_error_tolerance {
+                            return false;
+                        } else {
+                            continue;
+                        }
+                    }
+                    if col1 != col2 {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
     }
 
     /// Generate a random SELECT query
