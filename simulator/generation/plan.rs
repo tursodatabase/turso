@@ -216,10 +216,8 @@ impl InteractionPlan {
         let num_interactions = env.opts.max_interactions as usize;
         if self.len() < num_interactions {
             let conn_index = env.choose_conn(rng);
-            dbg!(self.mvcc, env.conn_in_transaction(conn_index));
             let interactions = if self.mvcc && !env.conn_in_transaction(conn_index) {
                 let query = Query::Begin(Begin::Concurrent);
-                env.update_conn_last_interaction(conn_index, Some(&query));
                 Interactions::new(conn_index, InteractionsType::Query(query))
             } else if self.mvcc
                 && env.conn_in_transaction(conn_index)
@@ -227,10 +225,8 @@ impl InteractionPlan {
                 && rng.random_bool(0.4)
             {
                 let query = Query::Commit(Commit);
-                env.update_conn_last_interaction(conn_index, Some(&query));
                 Interactions::new(conn_index, InteractionsType::Query(query))
             } else {
-                env.update_conn_last_interaction(conn_index, None);
                 let conn_ctx = &env.connection_context(conn_index);
                 Interactions::arbitrary_from(rng, conn_ctx, (env, self.stats(), conn_index))
             };
@@ -786,13 +782,15 @@ impl InteractionType {
                 match fault {
                     Fault::Disconnect => {
                         if env.connections[conn_index].is_connected() {
+                            if env.conn_in_transaction(conn_index) {
+                                env.rollback_conn(conn_index);
+                            }
                             env.connections[conn_index].disconnect();
                         } else {
                             return Err(turso_core::LimboError::InternalError(
                                 "connection already disconnected".into(),
                             ));
                         }
-                        env.connections[conn_index] = SimConnection::Disconnected;
                     }
                     Fault::ReopenDatabase => {
                         reopen_database(env);

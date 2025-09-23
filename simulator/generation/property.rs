@@ -454,7 +454,7 @@ impl Property {
                                     Err(e) => {
                                         if e.to_string().to_lowercase().contains(&format!("table {table_name} already exists")) {
                                              // On error we rollback the transaction if there is any active here
-                                            Rollback.shadow(&mut env.get_conn_tables_mut(connection_index));
+                                            env.rollback_conn(connection_index);
                                             Ok(Ok(()))
                                         } else {
                                             Ok(Err(format!("expected table already exists error, got: {e}")))
@@ -808,7 +808,7 @@ impl Property {
                                 tracing::error!("Fault injection produced error: {err}");
 
                                 // On error we rollback the transaction if there is any active here
-                                Rollback.shadow(&mut env.get_conn_tables_mut(connection_index));
+                                env.rollback_conn(connection_index);
                                 Ok(Ok(()))
                             }
                         }
