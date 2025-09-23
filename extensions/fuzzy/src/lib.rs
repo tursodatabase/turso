@@ -405,7 +405,7 @@ mod tests {
 
         for (s1, s2, expected) in cases {
             let got = damlev(s1, s2);
-            assert_eq!(got, expected, "damlev({}, {}) failed", s1, s2);
+            assert_eq!(got, expected, "damlev({s1}, {s2}) failed");
         }
     }
 
@@ -421,7 +421,7 @@ mod tests {
 
         for (s1, s2, expected) in cases {
             let got = hamming_dist(s1, s2);
-            assert_eq!(got, expected, "hamming({}, {}) failed", s1, s2);
+            assert_eq!(got, expected, "hamming({s1}, {s2}) failed");
         }
     }
 
@@ -442,20 +442,12 @@ mod tests {
                 let got_rounded = (got * 1000.0).round() / 1000.0;
                 assert!(
                     (got_rounded - expected).abs() < 1e-6,
-                    "jaro_winkler({}, {}) failed: got {}, expected {}",
-                    s1,
-                    s2,
-                    got_rounded,
-                    expected
+                    "jaro_winkler({s1}, {s2}) failed: got {got_rounded}, expected {expected}"
                 );
             } else {
                 assert!(
                     (got - expected).abs() < 1e-6,
-                    "jaro_winkler({}, {}) failed: got {}, expected {}",
-                    s1,
-                    s2,
-                    got,
-                    expected
+                    "jaro_winkler({s1}, {s2}) failed: got {got}, expected {expected}"
                 );
             }
         }
@@ -475,7 +467,7 @@ mod tests {
 
         for (s1, s2, expected) in cases {
             let got = leven(s1, s2);
-            assert_eq!(got, expected, "leven({}, {}) failed", s1, s2);
+            assert_eq!(got, expected, "leven({s1}, {s2}) failed");
         }
     }
 
@@ -498,7 +490,7 @@ mod tests {
         ];
         for (s1, s2, expected) in test_cases {
             let res = editdist::edit_distance(s1, s2).unwrap();
-            assert_eq!(res, expected, "edit_distance({}, {}) failed", s1, s2);
+            assert_eq!(res, expected, "edit_distance({s1}, {s2}) failed");
         }
     }
 
@@ -516,7 +508,7 @@ mod tests {
 
         for (s1, s2, expected) in cases {
             let got = optimal_string_alignment(s1, s2);
-            assert_eq!(got, expected, "osadist({}, {}) failed", s1, s2);
+            assert_eq!(got, expected, "osadist({s1}, {s2}) failed");
         }
     }
 }
