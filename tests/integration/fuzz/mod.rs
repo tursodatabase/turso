@@ -1388,35 +1388,31 @@ mod tests {
 
     /// Generate a random JOIN query
     fn generate_join_query(rng: &mut ChaCha8Rng) -> String {
-        match rng.random_range(0..18) {
-            0 => "SELECT u.id, u.first_name, u.last_name, o.id as order_id, o.total_amount 
+        const JOIN_QUERIES: [&str; 18] = [
+            "SELECT u.id, u.first_name, u.last_name, o.id as order_id, o.total_amount 
              FROM users u 
              INNER JOIN orders o ON u.id = o.user_id 
-             LIMIT 50"
-                .to_string(),
-            1 => "SELECT u.email, COUNT(o.id) as order_count, SUM(o.total_amount) as total_spent
+             LIMIT 50",
+            "SELECT u.email, COUNT(o.id) as order_count, SUM(o.total_amount) as total_spent
              FROM users u 
              LEFT JOIN orders o ON u.id = o.user_id 
              GROUP BY u.id, u.email 
              ORDER BY total_spent DESC NULLS LAST
-             LIMIT 25"
-                .to_string(),
-            2 => "SELECT p.name, COUNT(oi.id) as times_ordered, SUM(oi.quantity) as total_quantity
+             LIMIT 25",
+            "SELECT p.name, COUNT(oi.id) as times_ordered, SUM(oi.quantity) as total_quantity
              FROM order_items oi
              RIGHT JOIN products p ON oi.product_id = p.id
              GROUP BY p.id, p.name
              HAVING COUNT(oi.id) > 0
              ORDER BY times_ordered DESC
-             LIMIT 20"
-                .to_string(),
-            3 => "SELECT u.first_name, p.name, p.price
+             LIMIT 20",
+            "SELECT u.first_name, p.name, p.price
              FROM users u
              LEFT JOIN products p
              WHERE u.age > 50 AND p.price < 20
              ORDER BY p.price ASC
-             LIMIT 100"
-                .to_string(),
-            4 => "SELECT u.first_name, u.last_name, p.name as product_name, 
+             LIMIT 100",
+            "SELECT u.first_name, u.last_name, p.name as product_name, 
                     oi.quantity, oi.unit_price, o.order_date
              FROM order_items oi
              JOIN orders o ON oi.order_id = o.id
@@ -1424,18 +1420,16 @@ mod tests {
              JOIN products p ON oi.product_id = p.id
              WHERE o.status = 'delivered'
              ORDER BY o.order_date DESC
-             LIMIT 40"
-                .to_string(),
-            5 => "SELECT r.rating, r.comment, u.first_name || ' ' || u.last_name as reviewer,
+             LIMIT 40",
+            "SELECT r.rating, r.comment, u.first_name || ' ' || u.last_name as reviewer,
                     p.name as product, p.price
              FROM reviews r
              LEFT JOIN users u ON r.user_id = u.id
              LEFT JOIN products p ON r.product_id = p.id
              WHERE r.verified_purchase = 1
              ORDER BY r.review_date DESC
-             LIMIT 30"
-                .to_string(),
-            6 => "SELECT t.ticket_number, t.subject, t.priority,
+             LIMIT 30",
+            "SELECT t.ticket_number, t.subject, t.priority,
                     u.email, o.order_date, o.total_amount
              FROM customer_support_tickets t
              JOIN users u ON t.user_id = u.id
@@ -1448,9 +1442,8 @@ mod tests {
                     WHEN 'medium' THEN 3 
                     ELSE 4 
                 END
-             LIMIT 25"
-                .to_string(),
-            7 => "SELECT u.email, o.id as order_id, p.name, oi.quantity,
+             LIMIT 25",
+            "SELECT u.email, o.id as order_id, p.name, oi.quantity,
                     it.new_quantity as inventory_after
                  FROM users u
                  JOIN orders o ON u.id = o.user_id
@@ -1459,9 +1452,8 @@ mod tests {
                  LEFT JOIN inventory_transactions it ON it.product_id = p.id 
                     AND it.reference_id = o.id AND it.reference_type = 'order'
                  WHERE o.order_date >= datetime('now', '-30 days')
-                 LIMIT 50"
-                .to_string(),
-            8 => "SELECT u1.first_name || ' ' || u1.last_name as user1,
+                 LIMIT 50",
+            "SELECT u1.first_name || ' ' || u1.last_name as user1,
                     u2.first_name || ' ' || u2.last_name as user2,
                     u1.city, u1.state
              FROM users u1
@@ -1470,17 +1462,15 @@ mod tests {
                 AND u1.id < u2.id
              WHERE u1.age BETWEEN 25 AND 35
              ORDER BY u1.state, u1.city
-             LIMIT 30"
-                .to_string(),
-            9 => "SELECT p1.name as product1, p1.price as price1,
+             LIMIT 30",
+            "SELECT p1.name as product1, p1.price as price1,
                     p2.name as product2, p2.price as price2
                  FROM products p1
                  JOIN products p2 ON ABS(p1.price - p2.price) < 5
                     AND p1.id < p2.id
                  WHERE p1.price BETWEEN 50 AND 100
-                 LIMIT 25"
-                .to_string(),
-            10 => "SELECT o.*, u.email, 
+                 LIMIT 25",
+            "SELECT o.*, u.email, 
                     COUNT(oi.id) as item_count,
                     SUM(oi.quantity) as total_items
              FROM orders o
@@ -1492,30 +1482,26 @@ mod tests {
                 AND oi.discount < oi.unit_price * 0.5
              GROUP BY o.id
              ORDER BY o.order_date DESC
-             LIMIT 20"
-                .to_string(),
-            11 => "SELECT *
+             LIMIT 20",
+            "SELECT *
              FROM orders o
              JOIN order_items USING (id)
-             LIMIT 30"
-                .to_string(),
-            12 => "SELECT u.id, u.email, u.created_at,
+             LIMIT 30",
+            "SELECT u.id, u.email, u.created_at,
                     o.id as order_id
              FROM users u
              LEFT JOIN orders o ON u.id = o.user_id
              WHERE o.id IS NULL
              ORDER BY u.created_at DESC
-             LIMIT 50"
-                .to_string(),
-            13 => "SELECT p.*, r.id as review_id
+             LIMIT 50",
+            "SELECT p.*, r.id as review_id
                  FROM products p
                  LEFT JOIN reviews r ON p.id = r.product_id
                  WHERE r.id IS NULL
                     OR r.rating < 3
                  ORDER BY p.price DESC
-                 LIMIT 30"
-                .to_string(),
-            14 => "SELECT p.id, p.name, p.price as list_price,
+                 LIMIT 30",
+            "SELECT p.id, p.name, p.price as list_price,
                     AVG(oi.unit_price) as avg_sold_price,
                     MIN(oi.unit_price) as min_price,
                     MAX(oi.unit_price) as max_price,
@@ -1525,9 +1511,8 @@ mod tests {
              GROUP BY p.id, p.name, p.price
              HAVING ABS(p.price - AVG(oi.unit_price)) > p.price * 0.1
              ORDER BY sales_count DESC
-             LIMIT 20"
-                .to_string(),
-            15 => "SELECT DISTINCT u.state, 
+             LIMIT 20",
+            "SELECT DISTINCT u.state, 
                     COUNT(DISTINCT u.id) as users,
                     COUNT(DISTINCT o.id) as orders,
                     COUNT(DISTINCT p.id) as unique_products
@@ -1539,9 +1524,8 @@ mod tests {
              WHERE o.status = 'delivered'
              GROUP BY u.state
              ORDER BY orders DESC
-             LIMIT 10"
-                .to_string(),
-            16 => "SELECT o.id, o.order_date, 
+             LIMIT 10",
+            "SELECT o.id, o.order_date, 
                     r.review_date,
                     JULIANDAY(r.review_date) - JULIANDAY(o.order_date) as days_to_review
              FROM orders o
@@ -1551,19 +1535,18 @@ mod tests {
                 AND r.review_date > o.order_date
              WHERE o.status = 'delivered'
              ORDER BY days_to_review ASC
-             LIMIT 30"
-                .to_string(),
-            17 => "SELECT u.*
+             LIMIT 30",
+            "SELECT u.*
              FROM users u
              LEFT JOIN orders o ON u.id = o.user_id 
                 AND o.order_date > datetime('now', '-90 days')
              LEFT JOIN reviews r ON u.id = r.user_id
                 AND r.review_date > datetime('now', '-90 days')  
              WHERE o.id IS NULL AND r.id IS NULL
-             ORDER BY u.created_at DESC LIMIT 20"
-                .to_string(),
-            _ => unreachable!(),
-        }
+             ORDER BY u.created_at DESC LIMIT 20",
+        ];
+
+        JOIN_QUERIES[rng.random_range(0..JOIN_QUERIES.len())].to_string()
     }
 
     /// Verify data integrity between databases
