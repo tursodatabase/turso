@@ -6,7 +6,6 @@
     "test": "npm run test --workspaces"
   },
   "workspaces": [
-    "packages/wasm-runtime",
     "packages/common",
     "packages/native",
     "packages/browser-common",
