@@ -1180,17 +1180,13 @@ async fn sql_execute_http<C: ProtocolIO, Ctx>(
                     results.push(execute.result);
                 }
                 server_proto::StreamResponse::Batch(batch) => {
-                    for error in batch.result.step_errors {
-                        if let Some(error) = error {
-                            return Err(Error::DatabaseSyncEngineError(format!(
-                                "failed to execute sql: {error:?}"
-                            )));
-                        }
+                    if let Some(error) = batch.result.step_errors.into_iter().flatten().next() {
+                        return Err(Error::DatabaseSyncEngineError(format!(
+                            "failed to execute sql: {error:?}"
+                        )));
                     }
-                    for result in batch.result.step_results {
-                        if let Some(result) = result {
-                            results.push(result);
-                        }
+                    for result in batch.result.step_results.into_iter().flatten() {
+                        results.push(result);
                     }
                 }
             },
