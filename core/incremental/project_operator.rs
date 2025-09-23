@@ -86,7 +86,7 @@ impl ProjectOperator {
 
         for col in &self.columns {
             // Use the internal connection's pager for expression evaluation
-            let internal_pager = self.internal_conn.pager.borrow().clone();
+            let internal_pager = self.internal_conn.pager.read().clone();
 
             // Execute the compiled expression (handles both columns and complex expressions)
             let result = col
