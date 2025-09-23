@@ -23,6 +23,6 @@
     "test": "echo 'no tests'"
   },
   "dependencies": {
-    "@tursodatabase/wasm-runtime": "^0.2.0-pre.7"
+    "@napi-rs/wasm-runtime": "^1.0.5"
   }
 }
