@@ -560,6 +560,71 @@ def test_ipaddr():
     )
     limbo.quit()
 
+def validate_fuzzy_leven(a):
+    return a == "3"
+
+def validate_fuzzy_damlev1(a):
+    return a == "2"
+
+def validate_fuzzy_damlev2(a):
+    return a == "1"
+
+def validate_fuzzy_editdist1(a):
+    return a == "225"
+
+def validate_fuzzy_editdist2(a):
+    return a == "110"
+
+def validate_fuzzy_jarowin(a):
+    return a == "0.907142857142857"
+
+def validate_fuzzy_osadist(a):
+    return a == "3"
+
+def test_fuzzy():
+    limbo = TestTursoShell()
+    ext_path = "./target/debug/liblimbo_fuzzy"
+    limbo.run_test_fn(
+        "SELECT fuzzy_leven('awesome', 'aewsme');",
+        lambda res: "error: no such function: " in res,
+        "fuzzy levenshtein function returns null when ext not loaded",
+    )
+    limbo.execute_dot(f".load {ext_path}")
+    limbo.run_test_fn(
+        "SELECT fuzzy_leven('awesome', 'aewsme');",
+        validate_fuzzy_leven,
+        "fuzzy levenshtein function works",
+    )
+    limbo.run_test_fn(
+        "SELECT fuzzy_damlev('awesome', 'aewsme');",
+        validate_fuzzy_damlev1,
+        "fuzzy damerau levenshtein1 function works",
+    )
+    limbo.run_test_fn(
+        "SELECT fuzzy_damlev('Something', 'Smoething');",
+        validate_fuzzy_damlev2,
+        "fuzzy damerau levenshtein2 function works",
+    )
+    limbo.run_test_fn(
+        "SELECT fuzzy_editdist('abc', 'ca');",
+        validate_fuzzy_editdist1,
+        "fuzzy editdist1 function works",
+    )
+    limbo.run_test_fn(
+        "SELECT fuzzy_editdist('abc', 'acb');",
+        validate_fuzzy_editdist2,
+        "fuzzy editdist2 function works",
+    )    
+    limbo.run_test_fn(
+        "SELECT fuzzy_jarowin('awesome', 'aewsme');",
+        validate_fuzzy_jarowin,
+        "fuzzy jarowin function works",
+    )
+    limbo.run_test_fn(
+        "SELECT fuzzy_osadist('awesome', 'aewsme');",
+        validate_fuzzy_osadist,
+        "fuzzy osadist function works",
+    )
 
 def test_vfs():
     limbo = TestTursoShell()
@@ -822,6 +887,7 @@ def main():
         test_kv()
         test_csv()
         test_tablestats()
+        test_fuzzy()
     except Exception as e:
         console.error(f"Test FAILED: {e}")
         cleanup()

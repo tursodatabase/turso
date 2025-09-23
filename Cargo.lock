@@ -2138,6 +2138,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "limbo_fuzzy"
+version = "0.2.0-pre.7"
+dependencies = [
+ "mimalloc",
+ "turso_ext",
+]
+
+[[package]]
 name = "limbo_ipaddr"
 version = "0.2.0-pre.7"
 dependencies = [
