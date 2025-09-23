@@ -525,10 +525,13 @@ mod tests {
             let limbo_db = TempDatabase::new_empty(true);
             let sqlite_db = TempDatabase::new_empty(true);
             let num_cols = rng.random_range(1..=10);
-            let table_def = (0..num_cols)
-                .map(|i| format!("c{i} INTEGER"))
-                .collect::<Vec<_>>();
-            let table_def = table_def.join(", ");
+            let mut table_cols = vec!["id INTEGER PRIMARY KEY AUTOINCREMENT".to_string()];
+            table_cols.extend(
+                (0..num_cols)
+                    .map(|i| format!("c{i} INTEGER"))
+                    .collect::<Vec<_>>(),
+            );
+            let table_def = table_cols.join(", ");
             let table_def = format!("CREATE TABLE t ({table_def})");
 
             let num_indexes = rng.random_range(0..=num_cols);
@@ -572,7 +575,15 @@ mod tests {
             }
             // Track executed statements in case we fail
             let mut dml_statements = Vec::new();
-            let insert = format!("INSERT INTO t VALUES {}", insert_values.join(", "));
+            let col_names = (0..num_cols)
+                .map(|i| format!("c{}", i))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let insert = format!(
+                "INSERT INTO t ({}) VALUES {}",
+                col_names,
+                insert_values.join(", ")
+            );
             dml_statements.push(insert.clone());
 
             // Insert initial data into both databases
@@ -692,7 +703,10 @@ mod tests {
             let num_cols = rng.random_range(2..=4);
             // We'll always include a TEXT "k" and a couple INT columns to give predicates variety.
             // Build: id INTEGER PRIMARY KEY, k TEXT, c0 INT, c1 INT, ...
-            let mut cols: Vec<String> = vec!["id INTEGER PRIMARY KEY".into(), "k TEXT".into()];
+            let mut cols: Vec<String> = vec![
+                "id INTEGER PRIMARY KEY AUTOINCREMENT".into(),
+                "k TEXT".into(),
+            ];
             for i in 0..(num_cols - 1) {
                 cols.push(format!("c{i} INT"));
             }
