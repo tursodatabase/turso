@@ -326,3 +326,30 @@ sneakers|sneakers|sneakers
 boots|boots|boots
 coat|coat|coat
 accessories|accessories|accessories}
+
+#When the number of expressions are same in group by and order by, sqlite applies the sorter order of order by to group by.
+do_execsql_test group_by_sort_order_matches_order_by {
+  select u.first_name from users u group by u.city order by u.state desc limit 10;
+} {Michael
+Rachel
+Richard
+Sandra
+Stanley
+Ryan
+Jason
+Justin
+Maria
+Karen}
+
+do_execsql_test group_by_sort_order {
+  SELECT first_name,max(age) FROM users GROUP by state limit 10;
+} {Bianca|99
+John|100
+Kelli|100
+Alexander|100
+Dennis|100
+Tina|100
+Adam|100
+Virginia|100
+Ryan|100
+Mark|99}
