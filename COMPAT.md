@@ -395,8 +395,8 @@ Modifiers:
 | jsonb_group_object(name,value)     | Yes     |                                                                                                                                              |
 | json_each(json)                    | Yes     |                                                                                                                                              |
 | json_each(json,path)               | Yes     |                                                                                                                                              |
-| json_tree(json)                    | Yes     |                                                                                                                                              |
-| json_tree(json,path)               | Yes     |                                                                                                                                              |
+| json_tree(json)                    | Partial | see commented-out tests in json.test                                                                                                         |
+| json_tree(json,path)               | Partial | see commented-out tests in json.test                                                                                                         |
 
 ## SQLite C API
 
