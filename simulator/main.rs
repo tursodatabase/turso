@@ -256,6 +256,14 @@ fn run_simulator(
     let env = env.lock().unwrap();
     let plan = plan.lock().unwrap();
 
+    tracing::info!("{}", plan.stats());
+    std::fs::write(env.get_plan_path(), plan.to_string()).unwrap();
+    std::fs::write(
+        env.get_plan_path().with_extension("json"),
+        serde_json::to_string_pretty(&*plan).unwrap(),
+    )
+    .unwrap();
+
     // No doublecheck, run shrinking if panicking or found a bug.
     match &result {
         SandboxedResult::Correct => {
@@ -530,15 +538,6 @@ fn setup_simulation(
         tracing::info!("Generating database interaction plan...");
 
         let plan = InteractionPlan::init_plan(&mut env);
-
-        // TODO: move this code to the end of the simulation
-        tracing::info!("{}", plan.stats());
-        std::fs::write(env.get_plan_path(), plan.to_string()).unwrap();
-        std::fs::write(
-            env.get_plan_path().with_extension("json"),
-            serde_json::to_string_pretty(&plan).unwrap(),
-        )
-        .unwrap();
 
         (seed, env, plan)
     }

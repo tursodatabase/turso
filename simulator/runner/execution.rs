@@ -124,12 +124,11 @@ pub fn execute_plan(
     if let SimConnection::Disconnected = connection {
         tracing::debug!("connecting {}", connection_index);
         env.connect(connection_index);
+        Ok(ExecutionContinuation::Stay)
     } else {
         tracing::debug!("connection {} already connected", connection_index);
-        return execute_interaction(env, interaction, &mut conn_state.stack);
+        execute_interaction(env, interaction, &mut conn_state.stack)
     }
-
-    Ok(ExecutionContinuation::Stay)
 }
 
 /// The next point of control flow after executing an interaction.

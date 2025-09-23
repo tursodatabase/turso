@@ -216,7 +216,6 @@ impl InteractionPlan {
 
         // First create at least one table
         let create_query = Create::arbitrary(&mut env.rng.clone(), &env.connection_context(0));
-        env.committed_tables.push(create_query.table.clone());
 
         // initial query starts at 0th connection
         plan.plan.push(Interactions::new(
@@ -242,7 +241,6 @@ impl InteractionPlan {
                 Interactions::arbitrary_from(rng, conn_ctx, (env, self.stats(), conn_index))
             };
 
-            interactions.shadow(&mut env.get_conn_tables_mut(interactions.connection_index));
             let out_interactions = interactions.interactions();
             assert!(!out_interactions.is_empty());
             self.push(interactions);
