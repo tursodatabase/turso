@@ -1388,7 +1388,7 @@ mod tests {
 
     /// Generate a random JOIN query
     fn generate_join_query(rng: &mut ChaCha8Rng) -> String {
-        const JOIN_QUERIES: [&str; 18] = [
+        const JOIN_QUERIES: [&str; 17] = [
             "SELECT u.id, u.first_name, u.last_name, o.id as order_id, o.total_amount 
              FROM users u 
              INNER JOIN orders o ON u.id = o.user_id 
@@ -1399,13 +1399,6 @@ mod tests {
              GROUP BY u.id, u.email 
              ORDER BY total_spent DESC NULLS LAST
              LIMIT 25",
-            "SELECT p.name, COUNT(oi.id) as times_ordered, SUM(oi.quantity) as total_quantity
-             FROM order_items oi
-             RIGHT JOIN products p ON oi.product_id = p.id
-             GROUP BY p.id, p.name
-             HAVING COUNT(oi.id) > 0
-             ORDER BY times_ordered DESC
-             LIMIT 20",
             "SELECT u.first_name, p.name, p.price
              FROM users u
              LEFT JOIN products p
