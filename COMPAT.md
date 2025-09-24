@@ -539,7 +539,8 @@ Modifiers:
 | SeekLt         | Yes    |         |
 | SeekRowid      | Yes    |         |
 | SeekEnd        | Yes    |         |
-| Sequence       | No     |         |
+| Sequence       | Yes    |         |
+| SequenceTest   | Yes    |         |
 | SetCookie      | Yes    |         |
 | ShiftLeft      | Yes    |         |
 | ShiftRight     | Yes    |         |
