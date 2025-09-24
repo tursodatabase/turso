@@ -55,10 +55,7 @@ use crate::{
         AggContext, Cursor, ExternalAggState, IOResult, SeekKey, SeekOp, SumAggState, Value,
         ValueType,
     },
-    util::{
-        cast_real_to_integer, cast_text_to_integer, cast_text_to_numeric, cast_text_to_real,
-        checked_cast_text_to_numeric, parse_schema_rows,
-    },
+    util::{cast_real_to_integer, checked_cast_text_to_numeric, parse_schema_rows},
     vdbe::{
         builder::CursorType,
         insn::{IdxInsertFlags, Insn},
@@ -8180,11 +8177,16 @@ impl Value {
             }
             Affinity::Real => match self {
                 Value::Blob(b) => {
-                    // Convert BLOB to TEXT first
                     let text = String::from_utf8_lossy(b);
-                    cast_text_to_real(&text)
+                    Value::Float(
+                        crate::numeric::str_to_f64(&text)
+                            .map(f64::from)
+                            .unwrap_or(0.0),
+                    )
                 }
-                Value::Text(t) => cast_text_to_real(t.as_str()),
+                Value::Text(t) => {
+                    Value::Float(crate::numeric::str_to_f64(t).map(f64::from).unwrap_or(0.0))
+                }
                 Value::Integer(i) => Value::Float(*i as f64),
                 Value::Float(f) => Value::Float(*f),
                 _ => Value::Float(0.0),
@@ -8193,9 +8195,9 @@ impl Value {
                 Value::Blob(b) => {
                     // Convert BLOB to TEXT first
                     let text = String::from_utf8_lossy(b);
-                    cast_text_to_integer(&text)
+                    Value::Integer(crate::numeric::str_to_i64(&text).unwrap_or(0))
                 }
-                Value::Text(t) => cast_text_to_integer(t.as_str()),
+                Value::Text(t) => Value::Integer(crate::numeric::str_to_i64(t).unwrap_or(0)),
                 Value::Integer(i) => Value::Integer(*i),
                 // A cast of a REAL value into an INTEGER results in the integer between the REAL value and zero
                 // that is closest to the REAL value. If a REAL is greater than the greatest possible signed integer (+9223372036854775807)
@@ -8214,14 +8216,31 @@ impl Value {
                 _ => Value::Integer(0),
             },
             Affinity::Numeric => match self {
-                Value::Blob(b) => {
-                    let text = String::from_utf8_lossy(b);
-                    cast_text_to_numeric(&text)
+                Value::Null => Value::Null,
+                Value::Integer(v) => Value::Integer(*v),
+                Value::Float(v) => Self::Float(*v),
+                _ => {
+                    let s = match self {
+                        Value::Text(text) => text.to_string(),
+                        Value::Blob(blob) => String::from_utf8_lossy(blob.as_slice()).to_string(),
+                        _ => unreachable!(),
+                    };
+
+                    match crate::numeric::str_to_f64(&s) {
+                        Some(parsed) => {
+                            let Some(int) = crate::numeric::str_to_i64(&s) else {
+                                return Value::Integer(0);
+                            };
+
+                            if f64::from(parsed) == int as f64 {
+                                return Value::Integer(int);
+                            }
+
+                            Value::Float(parsed.into())
+                        }
+                        None => Value::Integer(0),
+                    }
                 }
-                Value::Text(t) => cast_text_to_numeric(t.as_str()),
-                Value::Integer(i) => Value::Integer(*i),
-                Value::Float(f) => Value::Float(*f),
-                _ => self.clone(), // TODO probably wrong
             },
         }
     }
