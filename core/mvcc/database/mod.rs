@@ -472,6 +472,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                         mvcc_store.release_exclusive_tx(&self.tx_id);
                         self.commit_coordinator.pager_commit_lock.unlock();
                     }
+                    mvcc_store.remove_tx(self.tx_id);
                     self.finalize(mvcc_store)?;
                     return Ok(TransitionResult::Done(()));
                 }
