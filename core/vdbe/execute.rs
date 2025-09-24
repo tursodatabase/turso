@@ -6890,9 +6890,6 @@ pub fn op_parse_schema(
         .store(previous_auto_commit, Ordering::SeqCst);
     maybe_nested_stmt_err?;
 
-    // let updated_local_schema = conn.schema.borrow().clone();
-    // conn._db.update_schema_if_newer(updated_local_schema)?;
-
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
