@@ -519,7 +519,7 @@ impl Database {
             metrics: RwLock::new(ConnectionMetrics::new()),
             is_nested_stmt: AtomicBool::new(false),
             encryption_key: RwLock::new(None),
-            encryption_cipher_mode: Cell::new(None),
+            encryption_cipher_mode: RwLock::new(None),
             sync_mode: Cell::new(SyncMode::Full),
             data_sync_retry: AtomicBool::new(false),
             busy_timeout: Cell::new(Duration::new(0, 0)),
@@ -1015,7 +1015,7 @@ pub struct Connection {
     /// Generally this is only true for ParseSchema.
     is_nested_stmt: AtomicBool,
     encryption_key: RwLock<Option<EncryptionKey>>,
-    encryption_cipher_mode: Cell<Option<CipherMode>>,
+    encryption_cipher_mode: RwLock<Option<CipherMode>>,
     sync_mode: Cell<SyncMode>,
     data_sync_retry: AtomicBool,
     /// User defined max accumulated Busy timeout duration
@@ -2157,12 +2157,12 @@ impl Connection {
 
     pub fn set_encryption_cipher(&self, cipher_mode: CipherMode) -> Result<()> {
         tracing::trace!("setting encryption cipher for connection");
-        self.encryption_cipher_mode.replace(Some(cipher_mode));
+        *self.encryption_cipher_mode.write() = Some(cipher_mode);
         self.set_encryption_context()
     }
 
     pub fn get_encryption_cipher_mode(&self) -> Option<CipherMode> {
-        self.encryption_cipher_mode.get()
+        *self.encryption_cipher_mode.read()
     }
 
     // if both key and cipher are set, set encryption context on pager
@@ -2171,7 +2171,8 @@ impl Connection {
         let Some(key) = key_guard.as_ref() else {
             return Ok(());
         };
-        let Some(cipher_mode) = self.encryption_cipher_mode.get() else {
+        let cipher_guard = self.encryption_cipher_mode.read();
+        let Some(cipher_mode) = *cipher_guard else {
             return Ok(());
         };
         tracing::trace!("setting encryption ctx for connection");
