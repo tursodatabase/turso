@@ -2207,7 +2207,8 @@ pub fn op_transaction_inner(
 
                 // 1. We try to upgrade current version
                 let current_state = conn.get_tx_state();
-                let (new_transaction_state, updated) = if conn.is_nested_stmt.get() {
+                let (new_transaction_state, updated) = if conn.is_nested_stmt.load(Ordering::SeqCst)
+                {
                     (current_state, false)
                 } else {
                     match (current_state, write) {
@@ -2295,7 +2296,7 @@ pub fn op_transaction_inner(
                     }
                     if updated && matches!(current_state, TransactionState::None) {
                         turso_assert!(
-                            !conn.is_nested_stmt.get(),
+                            !conn.is_nested_stmt.load(Ordering::SeqCst),
                             "nested stmt should not begin a new read transaction"
                         );
                         pager.begin_read_tx()?;
@@ -2303,7 +2304,7 @@ pub fn op_transaction_inner(
 
                     if updated && matches!(new_transaction_state, TransactionState::Write { .. }) {
                         turso_assert!(
-                            !conn.is_nested_stmt.get(),
+                            !conn.is_nested_stmt.load(Ordering::SeqCst),
                             "nested stmt should not begin a new write transaction"
                         );
                         let begin_w_tx_res = pager.begin_write_tx();
@@ -6837,7 +6838,7 @@ pub fn op_parse_schema(
         conn.with_schema_mut(|schema| {
             // TODO: This function below is synchronous, make it async
             let existing_views = schema.incremental_views.clone();
-            conn.is_nested_stmt.set(true);
+            conn.is_nested_stmt.store(true, Ordering::SeqCst);
             parse_schema_rows(
                 stmt,
                 schema,
@@ -6853,7 +6854,7 @@ pub fn op_parse_schema(
         conn.with_schema_mut(|schema| {
             // TODO: This function below is synchronous, make it async
             let existing_views = schema.incremental_views.clone();
-            conn.is_nested_stmt.set(true);
+            conn.is_nested_stmt.store(true, Ordering::SeqCst);
             parse_schema_rows(
                 stmt,
                 schema,
@@ -6864,7 +6865,7 @@ pub fn op_parse_schema(
             )
         })
     };
-    conn.is_nested_stmt.set(false);
+    conn.is_nested_stmt.store(false, Ordering::SeqCst);
     conn.auto_commit
         .store(previous_auto_commit, Ordering::SeqCst);
     maybe_nested_stmt_err?;

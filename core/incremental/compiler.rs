@@ -1506,7 +1506,7 @@ impl DbspCompiler {
         let io = Arc::new(MemoryIO::new());
         let db = Database::open_file(io, ":memory:", false, false)?;
         let internal_conn = db.connect()?;
-        internal_conn.query_only.set(true);
+        internal_conn.set_query_only(true);
         internal_conn.auto_commit.store(false, Ordering::SeqCst);
 
         // Create temporary symbol table

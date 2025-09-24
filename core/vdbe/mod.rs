@@ -529,7 +529,7 @@ impl Program {
         pager: Arc<Pager>,
     ) -> Result<StepResult> {
         debug_assert!(state.column_count() == EXPLAIN_COLUMNS.len());
-        if self.connection.closed.get() {
+        if self.connection.is_closed() {
             // Connection is closed for whatever reason, rollback the transaction.
             let state = self.connection.get_tx_state();
             if let TransactionState::Write { .. } = state {
@@ -584,7 +584,7 @@ impl Program {
     ) -> Result<StepResult> {
         debug_assert!(state.column_count() == EXPLAIN_QUERY_PLAN_COLUMNS.len());
         loop {
-            if self.connection.closed.get() {
+            if self.connection.is_closed() {
                 // Connection is closed for whatever reason, rollback the transaction.
                 let state = self.connection.get_tx_state();
                 if let TransactionState::Write { .. } = state {
@@ -632,7 +632,7 @@ impl Program {
     ) -> Result<StepResult> {
         let enable_tracing = tracing::enabled!(tracing::Level::TRACE);
         loop {
-            if self.connection.closed.get() {
+            if self.connection.is_closed() {
                 // Connection is closed for whatever reason, rollback the transaction.
                 let state = self.connection.get_tx_state();
                 if let TransactionState::Write { .. } = state {
@@ -825,7 +825,7 @@ impl Program {
             return Ok(IOResult::Done(()));
         }
         if let Some(mv_store) = mv_store {
-            if self.connection.is_nested_stmt.get() {
+            if self.connection.is_nested_stmt.load(Ordering::SeqCst) {
                 // We don't want to commit on nested statements. Let parent handle it.
                 return Ok(IOResult::Done(()));
             }
@@ -1069,7 +1069,7 @@ pub fn handle_program_error(
     err: &LimboError,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<()> {
-    if connection.is_nested_stmt.get() {
+    if connection.is_nested_stmt.load(Ordering::SeqCst) {
         // Errors from nested statements are handled by the parent statement.
         return Ok(());
     }
