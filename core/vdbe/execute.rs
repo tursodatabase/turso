@@ -5390,9 +5390,11 @@ pub fn op_sequence_test(
         insn
     );
     let cursor = state.get_cursor(*cursor_id).as_sorter_mut();
-    if cursor.seq_beginning() {
-        state.pc = target_pc.as_offset_int();
-    }
+    state.pc = if cursor.seq_beginning() {
+        target_pc.as_offset_int()
+    } else {
+        state.pc + 1
+    };
     Ok(InsnFunctionStepResult::Step)
 }
 
