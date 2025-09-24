@@ -42,9 +42,7 @@ function panicWorker(name): never {
     throw new Error(`method ${name} must be invoked only from the main thread`);
 }
 
-let completeOpfs: any = null;
-
-function mainImports(worker: Worker): BrowserImports {
+function mainImports(worker: Worker, completeOpfs: (c: any, r: any) => void): BrowserImports {
     return {
         is_web_worker(): boolean {
             return false;
@@ -410,6 +408,7 @@ function setupWebWorker() {
 
 async function setupMainThread(wasmFile: ArrayBuffer, factory: () => Worker): Promise<any> {
     const worker = factory();
+    let completeOpfs = null;
     const __emnapiContext = __emnapiGetDefaultContext()
     const __wasi = new __WASI({
         version: 'preview1',
@@ -433,7 +432,7 @@ async function setupMainThread(wasmFile: ArrayBuffer, factory: () => Worker): Pr
                 ...importObject.env,
                 ...importObject.napi,
                 ...importObject.emnapi,
-                ...mainImports(worker),
+                ...mainImports(worker, (c, res) => completeOpfs(c, res)),
                 memory: __sharedMemory,
             }
             return importObject
