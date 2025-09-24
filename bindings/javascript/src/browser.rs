@@ -2,9 +2,7 @@ use std::{cell::RefCell, collections::HashMap, sync::Arc};
 
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
-use turso_core::{Clock, Completion, File, Instant, MemoryIO, IO};
-
-use crate::{is_memory, Database, DatabaseOpts};
+use turso_core::{Clock, Completion, File, Instant, IO};
 
 pub struct NoopTask;
 
@@ -24,32 +22,6 @@ impl Task for NoopTask {
 /// so, we just put no-op task on the thread pool and force emnapi to allocate web worker
 pub fn init_thread_pool() -> napi::Result<AsyncTask<NoopTask>> {
     Ok(AsyncTask::new(NoopTask))
-}
-
-pub struct ConnectTask {
-    path: String,
-    io: Arc<dyn turso_core::IO>,
-    opts: Option<DatabaseOpts>,
-}
-
-pub struct ConnectResult {
-    db: Database,
-}
-
-unsafe impl Send for ConnectResult {}
-
-impl Task for ConnectTask {
-    type Output = ConnectResult;
-    type JsValue = Database;
-
-    fn compute(&mut self) -> Result<Self::Output> {
-        let db = Database::new_io(self.path.clone(), self.io.clone(), self.opts.clone())?;
-        Ok(ConnectResult { db })
-    }
-
-    fn resolve(&mut self, _: Env, result: Self::Output) -> Result<Self::JsValue> {
-        Ok(result.db)
-    }
 }
 
 #[napi]
@@ -76,23 +48,6 @@ struct OpfsFile {
 
 unsafe impl Send for Opfs {}
 unsafe impl Sync for Opfs {}
-
-#[napi]
-// we offload connect to the web-worker because
-// turso-db use blocking IO [io.wait_for_completion(c)] in few places during initialization path
-pub fn connect_db_async(
-    path: String,
-    opts: Option<DatabaseOpts>,
-) -> Result<AsyncTask<ConnectTask>> {
-    let io: Arc<dyn turso_core::IO> = if is_memory(&path) {
-        Arc::new(MemoryIO::new())
-    } else {
-        // we must create OPFS IO on the main thread
-        opfs()
-    };
-    let task = ConnectTask { path, io, opts };
-    Ok(AsyncTask::new(task))
-}
 
 #[napi]
 pub fn complete_opfs(completion_no: u32, result: i32) {
