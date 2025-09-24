@@ -1145,7 +1145,7 @@ impl Pager {
             return Ok(IOResult::Done(PagerCommitResult::Rollback));
         }
         let commit_status = return_if_io!(self.commit_dirty_pages(
-            connection.wal_auto_checkpoint_disabled.get(),
+            connection.is_wal_auto_checkpoint_disabled(),
             connection.get_sync_mode(),
             connection.get_data_sync_retry()
         ));

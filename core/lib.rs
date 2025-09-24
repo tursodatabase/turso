@@ -70,7 +70,7 @@ use std::{
     ops::Deref,
     rc::Rc,
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU16, AtomicUsize, Ordering},
         Arc, LazyLock, Mutex, Weak,
     },
     time::Duration,
@@ -502,14 +502,14 @@ impl Database {
             database_schemas: RwLock::new(std::collections::HashMap::new()),
             auto_commit: AtomicBool::new(true),
             transaction_state: RwLock::new(TransactionState::None),
-            last_insert_rowid: Cell::new(0),
-            last_change: Cell::new(0),
-            total_changes: Cell::new(0),
+            last_insert_rowid: AtomicI64::new(0),
+            last_change: AtomicI64::new(0),
+            total_changes: AtomicI64::new(0),
             syms: RwLock::new(SymbolTable::new()),
             _shared_cache: false,
-            cache_size: Cell::new(default_cache_size),
-            page_size: Cell::new(page_size),
-            wal_auto_checkpoint_disabled: Cell::new(false),
+            cache_size: AtomicI32::new(default_cache_size),
+            page_size: AtomicU16::new(page_size.get_raw()),
+            wal_auto_checkpoint_disabled: AtomicBool::new(false),
             capture_data_changes: RefCell::new(CaptureDataChangesMode::Off),
             closed: Cell::new(false),
             attached_databases: RefCell::new(DatabaseCatalog::new()),
@@ -987,18 +987,18 @@ pub struct Connection {
     /// Whether to automatically commit transaction
     auto_commit: AtomicBool,
     transaction_state: RwLock<TransactionState>,
-    last_insert_rowid: Cell<i64>,
-    last_change: Cell<i64>,
-    total_changes: Cell<i64>,
+    last_insert_rowid: AtomicI64,
+    last_change: AtomicI64,
+    total_changes: AtomicI64,
     syms: RwLock<SymbolTable>,
     _shared_cache: bool,
-    cache_size: Cell<i32>,
+    cache_size: AtomicI32,
     /// page size used for an uninitialized database or the next vacuum command.
     /// it's not always equal to the current page size of the database
-    page_size: Cell<PageSize>,
+    page_size: AtomicU16,
     /// Disable automatic checkpoint behaviour when DB is shutted down or WAL reach certain size
     /// Client still can manually execute PRAGMA wal_checkpoint(...) commands
-    wal_auto_checkpoint_disabled: Cell<bool>,
+    wal_auto_checkpoint_disabled: AtomicBool,
     capture_data_changes: RefCell<CaptureDataChangesMode>,
     closed: Cell<bool>,
     /// Attached databases
@@ -1652,42 +1652,46 @@ impl Connection {
         {
             self.pager
                 .read()
-                .checkpoint_shutdown(self.wal_auto_checkpoint_disabled.get())?;
+                .checkpoint_shutdown(self.is_wal_auto_checkpoint_disabled())?;
         };
         Ok(())
     }
 
     pub fn wal_auto_checkpoint_disable(&self) {
-        self.wal_auto_checkpoint_disabled.set(true);
+        self.wal_auto_checkpoint_disabled
+            .store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_wal_auto_checkpoint_disabled(&self) -> bool {
+        self.wal_auto_checkpoint_disabled.load(Ordering::SeqCst)
     }
 
     pub fn last_insert_rowid(&self) -> i64 {
-        self.last_insert_rowid.get()
+        self.last_insert_rowid.load(Ordering::SeqCst)
     }
 
     fn update_last_rowid(&self, rowid: i64) {
-        self.last_insert_rowid.set(rowid);
+        self.last_insert_rowid.store(rowid, Ordering::SeqCst);
     }
 
     pub fn set_changes(&self, nchange: i64) {
-        self.last_change.set(nchange);
-        let prev_total_changes = self.total_changes.get();
-        self.total_changes.set(prev_total_changes + nchange);
+        self.last_change.store(nchange, Ordering::SeqCst);
+        self.total_changes.fetch_add(nchange, Ordering::SeqCst);
     }
 
     pub fn changes(&self) -> i64 {
-        self.last_change.get()
+        self.last_change.load(Ordering::SeqCst)
     }
 
     pub fn total_changes(&self) -> i64 {
-        self.total_changes.get()
+        self.total_changes.load(Ordering::SeqCst)
     }
 
     pub fn get_cache_size(&self) -> i32 {
-        self.cache_size.get()
+        self.cache_size.load(Ordering::SeqCst)
     }
     pub fn set_cache_size(&self, size: i32) {
-        self.cache_size.set(size);
+        self.cache_size.store(size, Ordering::SeqCst);
     }
 
     pub fn get_capture_data_changes(&self) -> std::cell::Ref<'_, CaptureDataChangesMode> {
@@ -1697,7 +1701,8 @@ impl Connection {
         self.capture_data_changes.replace(opts);
     }
     pub fn get_page_size(&self) -> PageSize {
-        self.page_size.get()
+        let value = self.page_size.load(Ordering::SeqCst);
+        PageSize::new_from_header_u16(value).unwrap_or_default()
     }
 
     pub fn get_database_canonical_path(&self) -> String {
@@ -1738,7 +1743,7 @@ impl Connection {
             return Ok(());
         };
 
-        self.page_size.set(size);
+        self.page_size.store(size.get_raw(), Ordering::SeqCst);
         if self.db.db_state.get() != DbState::Uninitialized {
             return Ok(());
         }

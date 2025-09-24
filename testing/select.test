@@ -767,3 +767,23 @@ foreach {testname limit ans} {
   do_execsql_test limit-complex-exprs-$testname \
     "SELECT id FROM users ORDER BY id LIMIT $limit" $ans
 }
+
+do_execsql_test_on_specific_db {:memory:} rowid-references {
+  CREATE TABLE test_table (id INTEGER);
+  INSERT INTO test_table VALUES (5),(5);
+  SELECT
+    rowid, "rowid", `rowid`, [rowid], _rowid_, "_rowid_", `_rowid_`, [_rowid_], oid, "oid", `oid`, [oid]
+  FROM test_table
+    WHERE rowid = 2
+      AND "rowid" = 2
+      AND `rowid` = 2
+      AND [rowid] = 2
+      AND _rowid_ = 2
+      AND "_rowid_" = 2
+      AND `_rowid_` = 2
+      AND [_rowid_] = 2
+      AND oid = 2
+      AND "oid" = 2
+      AND `oid` = 2
+      AND [oid] = 2;
+} {2|2|2|2|2|2|2|2|2|2|2|2}
