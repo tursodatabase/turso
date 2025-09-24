@@ -7828,11 +7828,9 @@ mod tests {
         BufferPool, Completion, Connection, IOContext, StepResult, WalFile, WalFileShared,
     };
     use std::{
-        cell::RefCell,
         collections::HashSet,
         mem::transmute,
         ops::Deref,
-        rc::Rc,
         sync::{Arc, Mutex},
     };
 
@@ -9095,7 +9093,7 @@ mod tests {
 
         let wal_file = io.open_file("test.wal", OpenFlags::Create, false).unwrap();
         let wal_shared = WalFileShared::new_shared(wal_file).unwrap();
-        let wal = Rc::new(RefCell::new(WalFile::new(
+        let wal = Arc::new(Mutex::new(WalFile::new(
             io.clone(),
             wal_shared,
             buffer_pool.clone(),

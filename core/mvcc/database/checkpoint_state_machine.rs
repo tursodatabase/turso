@@ -229,7 +229,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
         let Some(wal) = &self.pager.wal else {
             panic!("No WAL to checkpoint");
         };
-        let mut wal_ref = wal.borrow_mut();
+        let mut wal_ref = wal.lock().unwrap();
         match wal_ref.checkpoint(
             &self.pager,
             CheckpointMode::Truncate {
