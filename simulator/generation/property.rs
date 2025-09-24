@@ -1164,6 +1164,7 @@ fn property_insert_values_select<R: rand::Rng>(
     rng: &mut R,
     remaining: &Remaining,
     ctx: &impl GenerationContext,
+    mvcc: bool,
 ) -> Property {
     // Get a random table
     let table = pick(ctx.tables(), rng);
@@ -1183,7 +1184,7 @@ fn property_insert_values_select<R: rand::Rng>(
     };
 
     // Choose if we want queries to be executed in an interactive transaction
-    let interactive = if rng.random_bool(0.5) {
+    let interactive = if !mvcc && rng.random_bool(0.5) {
         Some(InteractiveQueryInfo {
             start_with_immediate: rng.random_bool(0.5),
             end_with_commit: rng.random_bool(0.5),
@@ -1541,7 +1542,14 @@ impl ArbitraryFrom<(&SimulatorEnv, &InteractionStats)> for Property {
                 } else {
                     0
                 },
-                Box::new(|rng: &mut R| property_insert_values_select(rng, &remaining_, conn_ctx)),
+                Box::new(|rng: &mut R| {
+                    property_insert_values_select(
+                        rng,
+                        &remaining_,
+                        conn_ctx,
+                        env.profile.experimental_mvcc,
+                    )
+                }),
             ),
             (
                 remaining_.select.max(1),
