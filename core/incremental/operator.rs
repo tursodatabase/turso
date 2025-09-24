@@ -218,7 +218,7 @@ pub enum QueryOperator {
 
 /// Operator DAG (Directed Acyclic Graph)
 /// Base trait for incremental operators
-pub trait IncrementalOperator: Debug {
+pub trait IncrementalOperator: Debug + Send + Sync {
     /// Evaluate the operator with a state, without modifying internal state
     /// This is used during query execution to compute results
     /// May need to read from storage to get current state (e.g., for aggregates)
