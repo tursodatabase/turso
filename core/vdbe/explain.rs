@@ -1759,6 +1759,24 @@ pub fn insn_to_row(
                 0,
                 String::new(),
             ),
+        Insn::Sequence{ cursor_id, target_reg} => (
+                "Sequence",
+                *cursor_id as i32,
+                *target_reg as i32,
+                0,
+                Value::build_text(""),
+                0,
+                String::new(),
+          ),
+        Insn::SequenceTest{ cursor_id, target_pc, value_reg } => (
+            "SequenceTest",
+              *cursor_id as i32,
+            target_pc.as_debug_int(),
+            *value_reg as i32,
+            Value::build_text(""),
+            0,
+            String::new(),
+        ),
         }
 }
 
