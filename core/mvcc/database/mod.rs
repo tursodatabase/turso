@@ -28,6 +28,9 @@ use std::sync::Arc;
 use tracing::instrument;
 use tracing::Level;
 
+pub mod checkpoint_state_machine;
+pub use checkpoint_state_machine::{CheckpointState, CheckpointStateMachine};
+
 #[cfg(test)]
 pub mod tests;
 
@@ -814,6 +817,9 @@ pub struct MvStore<Clock: LogicalClock> {
     /// - Immediately TRUNCATE checkpoint the WAL into the database file.
     /// - Release the blocking_checkpoint_lock.
     blocking_checkpoint_lock: Arc<TursoRwLock>,
+    /// The highest transaction ID that has been checkpointed.
+    /// Used to skip checkpointing transactions that have already been checkpointed.
+    checkpointed_txid_max: AtomicU64,
 }
 
 impl<Clock: LogicalClock> MvStore<Clock> {
@@ -834,6 +840,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             }),
             global_header: Arc::new(RwLock::new(None)),
             blocking_checkpoint_lock: Arc::new(TursoRwLock::new()),
+            checkpointed_txid_max: AtomicU64::new(0),
         }
     }
 
