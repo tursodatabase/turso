@@ -518,7 +518,7 @@ impl Database {
             view_transaction_states: AllViewsTxState::new(),
             metrics: RwLock::new(ConnectionMetrics::new()),
             is_nested_stmt: AtomicBool::new(false),
-            encryption_key: RefCell::new(None),
+            encryption_key: RwLock::new(None),
             encryption_cipher_mode: Cell::new(None),
             sync_mode: Cell::new(SyncMode::Full),
             data_sync_retry: AtomicBool::new(false),
@@ -1014,7 +1014,7 @@ pub struct Connection {
     /// Whether the connection is executing a statement initiated by another statement.
     /// Generally this is only true for ParseSchema.
     is_nested_stmt: AtomicBool,
-    encryption_key: RefCell<Option<EncryptionKey>>,
+    encryption_key: RwLock<Option<EncryptionKey>>,
     encryption_cipher_mode: Cell<Option<CipherMode>>,
     sync_mode: Cell<SyncMode>,
     data_sync_retry: AtomicBool,
@@ -2151,7 +2151,7 @@ impl Connection {
 
     pub fn set_encryption_key(&self, key: EncryptionKey) -> Result<()> {
         tracing::trace!("setting encryption key for connection");
-        *self.encryption_key.borrow_mut() = Some(key.clone());
+        *self.encryption_key.write() = Some(key.clone());
         self.set_encryption_context()
     }
 
@@ -2167,8 +2167,8 @@ impl Connection {
 
     // if both key and cipher are set, set encryption context on pager
     fn set_encryption_context(&self) -> Result<()> {
-        let key_ref = self.encryption_key.borrow();
-        let Some(key) = key_ref.as_ref() else {
+        let key_guard = self.encryption_key.read();
+        let Some(key) = key_guard.as_ref() else {
             return Ok(());
         };
         let Some(cipher_mode) = self.encryption_cipher_mode.get() else {
