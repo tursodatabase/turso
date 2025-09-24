@@ -184,4 +184,15 @@ impl LogicalLog {
         let c = self.file.sync(completion)?;
         Ok(IOResult::IO(IOCompletions::Single(c)))
     }
+
+    pub fn truncate(&mut self) -> Result<IOResult<()>> {
+        let completion = Completion::new_trunc(move |result| {
+            if let Err(err) = result {
+                tracing::error!("logical_log_truncate failed: {}", err);
+            }
+        });
+        let c = self.file.truncate(0, completion)?;
+        self.offset = 0;
+        Ok(IOResult::IO(IOCompletions::Single(c)))
+    }
 }
