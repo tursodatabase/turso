@@ -130,6 +130,11 @@ impl PageSize {
             v => v as u32,
         }
     }
+
+    /// Get the raw u16 value stored internally
+    pub const fn get_raw(self) -> u16 {
+        self.0.get()
+    }
 }
 
 impl Default for PageSize {

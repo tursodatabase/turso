@@ -4458,7 +4458,7 @@ pub fn op_function(
             }
             ScalarFunc::Changes => {
                 let res = &program.connection.last_change;
-                let changes = res.get();
+                let changes = res.load(Ordering::SeqCst);
                 state.registers[*dest] = Register::Value(Value::Integer(changes));
             }
             ScalarFunc::Char => {
@@ -4717,7 +4717,7 @@ pub fn op_function(
             }
             ScalarFunc::TotalChanges => {
                 let res = &program.connection.total_changes;
-                let total_changes = res.get();
+                let total_changes = res.load(Ordering::SeqCst);
                 state.registers[*dest] = Register::Value(Value::Integer(total_changes));
             }
             ScalarFunc::DateTime => {
