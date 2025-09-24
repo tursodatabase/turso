@@ -825,7 +825,7 @@ impl Program {
             return Ok(IOResult::Done(()));
         }
         if let Some(mv_store) = mv_store {
-            if self.connection.is_nested_stmt.get() {
+            if self.connection.is_nested_stmt.load(Ordering::SeqCst) {
                 // We don't want to commit on nested statements. Let parent handle it.
                 return Ok(IOResult::Done(()));
             }
@@ -1069,7 +1069,7 @@ pub fn handle_program_error(
     err: &LimboError,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<()> {
-    if connection.is_nested_stmt.get() {
+    if connection.is_nested_stmt.load(Ordering::SeqCst) {
         // Errors from nested statements are handled by the parent statement.
         return Ok(());
     }

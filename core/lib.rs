@@ -517,7 +517,7 @@ impl Database {
             mv_tx: Cell::new(None),
             view_transaction_states: AllViewsTxState::new(),
             metrics: RefCell::new(ConnectionMetrics::new()),
-            is_nested_stmt: Cell::new(false),
+            is_nested_stmt: AtomicBool::new(false),
             encryption_key: RefCell::new(None),
             encryption_cipher_mode: Cell::new(None),
             sync_mode: Cell::new(SyncMode::Full),
@@ -1013,7 +1013,7 @@ pub struct Connection {
     pub metrics: RefCell<ConnectionMetrics>,
     /// Whether the connection is executing a statement initiated by another statement.
     /// Generally this is only true for ParseSchema.
-    is_nested_stmt: Cell<bool>,
+    is_nested_stmt: AtomicBool,
     encryption_key: RefCell<Option<EncryptionKey>>,
     encryption_cipher_mode: Cell<Option<CipherMode>>,
     sync_mode: Cell<SyncMode>,
@@ -2489,7 +2489,12 @@ impl Statement {
 
     pub fn run_once(&self) -> Result<()> {
         let res = self.pager.io.step();
-        if self.program.connection.is_nested_stmt.get() {
+        if self
+            .program
+            .connection
+            .is_nested_stmt
+            .load(Ordering::SeqCst)
+        {
             return res;
         }
         if res.is_err() {

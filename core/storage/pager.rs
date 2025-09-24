@@ -1122,7 +1122,7 @@ impl Pager {
         rollback: bool,
         connection: &Connection,
     ) -> Result<IOResult<PagerCommitResult>> {
-        if connection.is_nested_stmt.get() {
+        if connection.is_nested_stmt.load(Ordering::SeqCst) {
             // Parent statement will handle the transaction rollback.
             return Ok(IOResult::Done(PagerCommitResult::Rollback));
         }
