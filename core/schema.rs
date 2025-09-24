@@ -1,6 +1,7 @@
 use crate::function::Func;
 use crate::incremental::view::IncrementalView;
 use crate::translate::expr::{bind_and_rewrite_expr, walk_expr, ParamState, WalkControl};
+use crate::translate::planner::ROWID_STRS;
 use parking_lot::RwLock;
 
 /// Simple view structure for non-materialized views
@@ -1792,7 +1793,7 @@ impl Index {
                 // Unqualified identifier: must be a column of the target table or ROWID
                 Expr::Id(Name::Ident(n)) | Expr::Id(Name::Quoted(n)) => {
                     let n = n.as_str();
-                    if !n.eq_ignore_ascii_case("rowid") && !has_col(n) {
+                    if !ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(n)) && !has_col(n) {
                         ok = false;
                     }
                 }

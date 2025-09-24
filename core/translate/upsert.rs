@@ -7,6 +7,7 @@ use turso_parser::ast::{self, Upsert};
 use crate::error::SQLITE_CONSTRAINT_PRIMARYKEY;
 use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::insert::format_unique_violation_desc;
+use crate::translate::planner::ROWID_STRS;
 use crate::vdbe::insn::CmpInsFlags;
 use crate::{
     bail_parse_error,
@@ -895,7 +896,7 @@ fn rewrite_expr_to_registers(
 
     // Map a column name to a register within the row image at `base_start`.
     let col_reg_from_row_image = |name: &str| -> Option<usize> {
-        if name.eq_ignore_ascii_case("rowid") {
+        if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(name)) {
             return Some(rowid_reg);
         }
         let (idx, c) = table.get_column_by_name(name)?;
@@ -917,7 +918,7 @@ fn rewrite_expr_to_registers(
                     // Handle EXCLUDED.* if enabled
                     if allow_excluded && ns.eq_ignore_ascii_case("excluded") {
                         if let Some(ins) = insertion {
-                            if c.eq_ignore_ascii_case("rowid") {
+                            if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(&c)) {
                                 *expr = Expr::Register(ins.key_register());
                             } else if let Some(cm) = ins.get_col_mapping_by_name(&c) {
                                 *expr = Expr::Register(cm.register);
