@@ -1,6 +1,41 @@
-import { DatabaseOpts, SqliteError, } from "@tursodatabase/database-common"
-import { Database, connect as promiseConnect } from "./promise.js";
-import { initThreadPool, MainWorker, connectDbAsync } from "./index-vite-dev-hack.js";
+import { DatabasePromise, DatabaseOpts, SqliteError, } from "@tursodatabase/database-common"
+import { registerFileAtWorker, unregisterFileAtWorker } from "@tursodatabase/database-browser-common";
+import { initThreadPool, MainWorker, Database as NativeDatabase } from "./index-vite-dev-hack.js";
+
+async function init(): Promise<Worker> {
+    await initThreadPool();
+    if (MainWorker == null) {
+        throw new Error("panic: MainWorker is not initialized");
+    }
+    return MainWorker;
+}
+
+class Database extends DatabasePromise {
+    worker: Worker | null;
+    constructor(path: string, opts: DatabaseOpts = {}) {
+        super(new NativeDatabase(path, opts) as unknown as any)
+    }
+    override async connect() {
+        if (!this.db.memory) {
+            const worker = await init();
+            await Promise.all([
+                registerFileAtWorker(worker, this.name),
+                registerFileAtWorker(worker, `${this.name}-wal`)
+            ]);
+            this.worker = worker;
+        }
+        await super.connect();
+    }
+    async close() {
+        if (this.name != null && this.worker != null) {
+            await Promise.all([
+                unregisterFileAtWorker(this.worker, this.name),
+                unregisterFileAtWorker(this.worker, `${this.name}-wal`)
+            ]);
+        }
+        this.db.close();
+    }
+}
 
 /**
  * Creates a new database connection asynchronously.
@@ -10,19 +45,9 @@ import { initThreadPool, MainWorker, connectDbAsync } from "./index-vite-dev-hac
  * @returns {Promise<Database>} - A promise that resolves to a Database instance.
  */
 async function connect(path: string, opts: DatabaseOpts = {}): Promise<Database> {
-    const init = async () => {
-        await initThreadPool();
-        if (MainWorker == null) {
-            throw new Error("panic: MainWorker is not initialized");
-        }
-        return MainWorker;
-    };
-    return await promiseConnect(
-        path,
-        opts,
-        connectDbAsync,
-        init
-    );
+    const db = new Database(path, opts);
+    await db.connect();
+    return db;
 }
 
 export { connect, Database, SqliteError }

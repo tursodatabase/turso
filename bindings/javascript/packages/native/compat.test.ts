@@ -11,6 +11,32 @@ test('in-memory db', () => {
     expect(rows).toEqual([{ x: 1 }, { x: 3 }]);
 })
 
+test('readonly-db', () => {
+    const path = `test-${(Math.random() * 10000) | 0}.db`;
+    try {
+        {
+            const rw = new Database(path);
+            rw.exec("CREATE TABLE t(x)");
+            rw.exec("INSERT INTO t VALUES (1)");
+            rw.close();
+        }
+        {
+            const ro = new Database(path, { readonly: true });
+            expect(() => ro.exec("INSERT INTO t VALUES (2)")).toThrowError(/Resource is read-only/g);
+            expect(ro.prepare("SELECT * FROM t").all()).toEqual([{ x: 1 }])
+            ro.close();
+        }
+    } finally {
+        unlinkSync(path);
+        unlinkSync(`${path}-wal`);
+    }
+})
+
+test('file-must-exist', () => {
+    const path = `test-${(Math.random() * 10000) | 0}.db`;
+    expect(() => new Database(path, { fileMustExist: true })).toThrowError(/failed to open file/);
+})
+
 test('on-disk db', () => {
     const path = `test-${(Math.random() * 10000) | 0}.db`;
     try {

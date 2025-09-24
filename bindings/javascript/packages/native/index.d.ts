@@ -9,6 +9,18 @@ export declare class Database {
    * * `path` - The path to the database file.
    */
   constructor(path: string, opts?: DatabaseOpts | undefined | null)
+  /**
+   * Connect the database synchronously
+   * This method is idempotent and can be called multiple times safely until the database will be closed
+   */
+  connectSync(): void
+  /**
+   * Connect the database asynchronously
+   * This method is idempotent and can be called multiple times safely until the database will be closed
+   */
+  connectAsync(): Promise<void>
+  /** Returns whether the database is in readonly-only mode. */
+  get readonly(): boolean
   /** Returns whether the database is in memory-only mode. */
   get memory(): boolean
   /** Returns whether the database is in memory-only mode. */
@@ -101,11 +113,6 @@ export declare class Statement {
    * 1 = Row available, 2 = Done, 3 = I/O needed
    */
   stepSync(): number
-  /**
-   * Step the statement and return result code (executed on the background thread):
-   * 1 = Row available, 2 = Done, 3 = I/O needed
-   */
-  stepAsync(): Promise<number>
   /** Get the current row data according to the presentation mode */
   row(): unknown
   /** Sets the presentation mode to raw. */
@@ -126,6 +133,13 @@ export declare class Statement {
   finalize(): void
 }
 
+/**
+ * Most of the options are aligned with better-sqlite API
+ * (see https://github.com/WiseLibs/better-sqlite3/blob/master/docs/api.md#new-databasepath-options)
+ */
 export interface DatabaseOpts {
+  readonly?: boolean
+  timeout?: number
+  fileMustExist?: boolean
   tracing?: string
 }

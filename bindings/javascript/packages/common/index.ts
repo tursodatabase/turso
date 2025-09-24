@@ -4,4 +4,11 @@ import { Database as DatabasePromise, Statement as StatementPromise } from "./pr
 import { SqliteError } from "./sqlite-error.js";
 import { AsyncLock } from "./async-lock.js";
 
-export { DatabaseCompat, StatementCompat, DatabasePromise, StatementPromise, NativeDatabase, NativeStatement, SqliteError, DatabaseOpts, AsyncLock }
+export {
+    DatabaseOpts,
+    DatabaseCompat, StatementCompat,
+    DatabasePromise, StatementPromise,
+    NativeDatabase, NativeStatement,
+    SqliteError,
+    AsyncLock
+}

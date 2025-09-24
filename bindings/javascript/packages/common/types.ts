@@ -2,16 +2,18 @@ export interface DatabaseOpts {
     readonly?: boolean,
     fileMustExist?: boolean,
     timeout?: number
-    name?: string
     tracing?: 'info' | 'debug' | 'trace'
 }
 
 export interface NativeDatabase {
     memory: boolean,
     path: string,
+    readonly: boolean;
+    open: boolean;
     new(path: string): NativeDatabase;
-    batchSync(sql: string);
-    batchAsync(sql: string): Promise<void>;
+
+    connectSync();
+    connectAsync(): Promise<void>;
 
     ioLoopSync();
     ioLoopAsync(): Promise<void>;

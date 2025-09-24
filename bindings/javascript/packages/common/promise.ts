@@ -31,55 +31,22 @@ function createErrorByName(name, message) {
  */
 class Database {
   db: NativeDatabase;
-  memory: boolean;
-  open: boolean;
   execLock: AsyncLock;
+  name: string;
   private _inTransaction: boolean = false;
-  /**
-   * Creates a new database connection. If the database file pointed to by `path` does not exists, it will be created.
-   *
-   * @constructor
-   * @param {string} path - Path to the database file.
-   * @param {Object} opts - Options for database behavior.
-   * @param {boolean} [opts.readonly=false] - Open the database in read-only mode.
-   * @param {boolean} [opts.fileMustExist=false] - If true, throws if database file does not exist.
-   * @param {number} [opts.timeout=0] - Timeout duration in milliseconds for database operations. Defaults to 0 (no timeout).
-   */
-  constructor(db: NativeDatabase, opts: DatabaseOpts = {}) {
-    opts.readonly = opts.readonly === undefined ? false : opts.readonly;
-    opts.fileMustExist =
-      opts.fileMustExist === undefined ? false : opts.fileMustExist;
-    opts.timeout = opts.timeout === undefined ? 0 : opts.timeout;
-
-    this.initialize(db, opts.name, opts.readonly);
-  }
-  static create() {
-    return Object.create(this.prototype);
-  }
-  initialize(db: NativeDatabase, name, readonly) {
+  constructor(db: NativeDatabase) {
     this.db = db;
-    this.memory = db.memory;
     this.execLock = new AsyncLock();
     Object.defineProperties(this, {
-      inTransaction: {
-        get: () => this._inTransaction,
-      },
-      name: {
-        get() {
-          return name;
-        },
-      },
-      readonly: {
-        get() {
-          return readonly;
-        },
-      },
-      open: {
-        get() {
-          return this.db.open;
-        },
-      },
+      inTransaction: { get: () => this._inTransaction },
+      name: { get: () => this.db.path },
+      readonly: { get: () => this.db.readonly },
+      open: { get: () => this.db.open },
     });
+  }
+
+  async connect() {
+    await this.db.connectAsync();
   }
 
   /**
@@ -88,10 +55,6 @@ class Database {
    * @param {string} sql - The SQL statement string to prepare.
    */
   prepare(sql) {
-    if (!this.open) {
-      throw new TypeError("The database connection is not open");
-    }
-
     if (!sql) {
       throw new RangeError("The supplied SQL string contains no statements");
     }
@@ -154,10 +117,13 @@ class Database {
 
     const pragma = `PRAGMA ${source}`;
 
-    const stmt = await this.prepare(pragma);
-    const results = await stmt.all();
-
-    return results;
+    const stmt = this.prepare(pragma);
+    try {
+      const results = await stmt.all();
+      return results;
+    } finally {
+      await stmt.close();
+    }
   }
 
   backup(filename, options) {
@@ -194,15 +160,11 @@ class Database {
    * @param {string} sql - The SQL statement string to execute.
    */
   async exec(sql) {
-    if (!this.open) {
-      throw new TypeError("The database connection is not open");
-    }
-
     const stmt = this.prepare(sql);
     try {
       await stmt.run();
     } finally {
-      stmt.close();
+      await stmt.close();
     }
   }
 
@@ -444,4 +406,5 @@ class Statement {
     this.stmt.finalize();
   }
 }
+
 export { Database, Statement }
