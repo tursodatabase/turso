@@ -29,7 +29,13 @@ function createErrorByName(name, message) {
  * Database represents a connection that can prepare and execute SQL statements.
  */
 class Database {
-  db: NativeDatabase;
+  name: string;
+  readonly: boolean;
+  open: boolean;
+  memory: boolean;
+  inTransaction: boolean;
+
+  private db: NativeDatabase;
   private _inTransaction: boolean = false;
 
   /**
@@ -47,10 +53,11 @@ class Database {
     this.db.connectSync();
 
     Object.defineProperties(this, {
-      inTransaction: { get: () => this._inTransaction },
       name: { get: () => this.db.path },
       readonly: { get: () => this.db.readonly },
       open: { get: () => this.db.open },
+      memory: { get: () => this.db.memory },
+      inTransaction: { get: () => this._inTransaction },
     });
   }
 
@@ -65,7 +72,7 @@ class Database {
     }
 
     try {
-      return new Statement(this.db.prepare(sql), this);
+      return new Statement(this.db.prepare(sql), this.db);
     } catch (err) {
       throw convertError(err);
     }
@@ -202,11 +209,11 @@ class Database {
  */
 class Statement {
   stmt: NativeStatement;
-  db: Database;
+  db: NativeDatabase;
 
-  constructor(stmt: NativeStatement, database: Database) {
+  constructor(stmt: NativeStatement, db: NativeDatabase) {
     this.stmt = stmt;
-    this.db = database;
+    this.db = db;
   }
 
   /**
@@ -264,14 +271,14 @@ class Statement {
    * Executes the SQL statement and returns an info object.
    */
   run(...bindParameters) {
-    const totalChangesBefore = this.db.db.totalChanges();
+    const totalChangesBefore = this.db.totalChanges();
 
     this.stmt.reset();
     bindParams(this.stmt, bindParameters);
     for (; ;) {
       const stepResult = this.stmt.stepSync();
       if (stepResult === STEP_IO) {
-        this.db.db.ioLoopSync();
+        this.db.ioLoopSync();
         continue;
       }
       if (stepResult === STEP_DONE) {
@@ -283,8 +290,8 @@ class Statement {
       }
     }
 
-    const lastInsertRowid = this.db.db.lastInsertRowid();
-    const changes = this.db.db.totalChanges() === totalChangesBefore ? 0 : this.db.db.changes();
+    const lastInsertRowid = this.db.lastInsertRowid();
+    const changes = this.db.totalChanges() === totalChangesBefore ? 0 : this.db.changes();
 
     return { changes, lastInsertRowid };
   }
@@ -300,7 +307,7 @@ class Statement {
     for (; ;) {
       const stepResult = this.stmt.stepSync();
       if (stepResult === STEP_IO) {
-        this.db.db.ioLoopSync();
+        this.db.ioLoopSync();
         continue;
       }
       if (stepResult === STEP_DONE) {
@@ -324,7 +331,7 @@ class Statement {
     while (true) {
       const stepResult = this.stmt.stepSync();
       if (stepResult === STEP_IO) {
-        this.db.db.ioLoopSync();
+        this.db.ioLoopSync();
         continue;
       }
       if (stepResult === STEP_DONE) {
@@ -348,7 +355,7 @@ class Statement {
     for (; ;) {
       const stepResult = this.stmt.stepSync();
       if (stepResult === STEP_IO) {
-        this.db.db.ioLoopSync();
+        this.db.ioLoopSync();
         continue;
       }
       if (stepResult === STEP_DONE) {

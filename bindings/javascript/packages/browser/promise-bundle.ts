@@ -11,29 +11,29 @@ async function init(): Promise<Worker> {
 }
 
 class Database extends DatabasePromise {
-    worker: Worker | null;
+    #worker: Worker | null;
     constructor(path: string, opts: DatabaseOpts = {}) {
         super(new NativeDatabase(path, opts) as unknown as any)
     }
     override async connect() {
-        if (!this.db.memory) {
+        if (!this.memory) {
             const worker = await init();
             await Promise.all([
                 registerFileAtWorker(worker, this.name),
                 registerFileAtWorker(worker, `${this.name}-wal`)
             ]);
-            this.worker = worker;
+            this.#worker = worker;
         }
         await super.connect();
     }
     async close() {
-        if (this.name != null && this.worker != null) {
+        if (this.name != null && this.#worker != null) {
             await Promise.all([
-                unregisterFileAtWorker(this.worker, this.name),
-                unregisterFileAtWorker(this.worker, `${this.name}-wal`)
+                unregisterFileAtWorker(this.#worker, this.name),
+                unregisterFileAtWorker(this.#worker, `${this.name}-wal`)
             ]);
         }
-        this.db.close();
+        await super.close();
     }
 }
 

@@ -30,18 +30,25 @@ function createErrorByName(name, message) {
  * Database represents a connection that can prepare and execute SQL statements.
  */
 class Database {
-  db: NativeDatabase;
-  execLock: AsyncLock;
   name: string;
+  readonly: boolean;
+  open: boolean;
+  memory: boolean;
+  inTransaction: boolean;
+
+  private db: NativeDatabase;
+  private execLock: AsyncLock;
   private _inTransaction: boolean = false;
+
   constructor(db: NativeDatabase) {
     this.db = db;
     this.execLock = new AsyncLock();
     Object.defineProperties(this, {
-      inTransaction: { get: () => this._inTransaction },
       name: { get: () => this.db.path },
       readonly: { get: () => this.db.readonly },
       open: { get: () => this.db.open },
+      memory: { get: () => this.db.memory },
+      inTransaction: { get: () => this._inTransaction },
     });
   }
 
@@ -60,7 +67,7 @@ class Database {
     }
 
     try {
-      return new Statement(this.db.prepare(sql), this);
+      return new Statement(this.db.prepare(sql), this.db, this.execLock);
     } catch (err) {
       throw convertError(err);
     }
@@ -196,11 +203,14 @@ class Database {
  * Statement represents a prepared SQL statement that can be executed.
  */
 class Statement {
-  stmt: NativeStatement;
-  db: Database;
-  constructor(stmt, database) {
+  private stmt: NativeStatement;
+  private db: NativeDatabase;
+  private execLock: AsyncLock;
+
+  constructor(stmt: NativeStatement, db: NativeDatabase, execLock: AsyncLock) {
     this.stmt = stmt;
-    this.db = database;
+    this.db = db;
+    this.execLock = execLock;
   }
 
   /**
@@ -258,17 +268,17 @@ class Statement {
    * Executes the SQL statement and returns an info object.
    */
   async run(...bindParameters) {
-    const totalChangesBefore = this.db.db.totalChanges();
+    const totalChangesBefore = this.db.totalChanges();
 
     this.stmt.reset();
     bindParams(this.stmt, bindParameters);
 
-    await this.db.execLock.acquire();
+    await this.execLock.acquire();
     try {
       while (true) {
         const stepResult = await this.stmt.stepSync();
         if (stepResult === STEP_IO) {
-          await this.db.db.ioLoopAsync();
+          await this.db.ioLoopAsync();
           continue;
         }
         if (stepResult === STEP_DONE) {
@@ -280,12 +290,12 @@ class Statement {
         }
       }
 
-      const lastInsertRowid = this.db.db.lastInsertRowid();
-      const changes = this.db.db.totalChanges() === totalChangesBefore ? 0 : this.db.db.changes();
+      const lastInsertRowid = this.db.lastInsertRowid();
+      const changes = this.db.totalChanges() === totalChangesBefore ? 0 : this.db.changes();
 
       return { changes, lastInsertRowid };
     } finally {
-      this.db.execLock.release();
+      this.execLock.release();
     }
   }
 
@@ -298,12 +308,12 @@ class Statement {
     this.stmt.reset();
     bindParams(this.stmt, bindParameters);
 
-    await this.db.execLock.acquire();
+    await this.execLock.acquire();
     try {
       while (true) {
         const stepResult = await this.stmt.stepSync();
         if (stepResult === STEP_IO) {
-          await this.db.db.ioLoopAsync();
+          await this.db.ioLoopAsync();
           continue;
         }
         if (stepResult === STEP_DONE) {
@@ -314,7 +324,7 @@ class Statement {
         }
       }
     } finally {
-      this.db.execLock.release();
+      this.execLock.release();
     }
   }
 
@@ -327,12 +337,12 @@ class Statement {
     this.stmt.reset();
     bindParams(this.stmt, bindParameters);
 
-    await this.db.execLock.acquire();
+    await this.execLock.acquire();
     try {
       while (true) {
         const stepResult = await this.stmt.stepSync();
         if (stepResult === STEP_IO) {
-          await this.db.db.ioLoopAsync();
+          await this.db.ioLoopAsync();
           continue;
         }
         if (stepResult === STEP_DONE) {
@@ -343,7 +353,7 @@ class Statement {
         }
       }
     } finally {
-      this.db.execLock.release();
+      this.execLock.release();
     }
   }
 
@@ -357,12 +367,12 @@ class Statement {
     bindParams(this.stmt, bindParameters);
     const rows: any[] = [];
 
-    await this.db.execLock.acquire();
+    await this.execLock.acquire();
     try {
       while (true) {
         const stepResult = await this.stmt.stepSync();
         if (stepResult === STEP_IO) {
-          await this.db.db.ioLoopAsync();
+          await this.db.ioLoopAsync();
           continue;
         }
         if (stepResult === STEP_DONE) {
@@ -375,7 +385,7 @@ class Statement {
       return rows;
     }
     finally {
-      this.db.execLock.release();
+      this.execLock.release();
     }
   }
 
