@@ -5113,12 +5113,13 @@ pub fn op_function(
                         }
                     };
 
-                    let rename_to = {
+                    let original_rename_to = {
                         match &state.registers[*start_reg + 6].get_value() {
-                            Value::Text(rename_to) => normalize_ident(rename_to.as_str()),
+                            Value::Text(rename_to) => rename_to,
                             _ => panic!("rename_to parameter should be TEXT"),
                         }
                     };
+                    let rename_to = normalize_ident(original_rename_to.as_str());
 
                     let new_name = if let Some(column) =
                         &name.strip_prefix(&format!("sqlite_autoindex_{rename_from}_"))
@@ -5163,7 +5164,7 @@ pub fn op_function(
 
                                 Some(
                                     ast::Stmt::CreateIndex {
-                                        tbl_name: ast::Name::new(&rename_to),
+                                        tbl_name: ast::Name::new(original_rename_to),
                                         unique,
                                         if_not_exists,
                                         idx_name,
@@ -5189,7 +5190,7 @@ pub fn op_function(
                                     ast::Stmt::CreateTable {
                                         tbl_name: ast::QualifiedName {
                                             db_name: None,
-                                            name: ast::Name::new(&rename_to),
+                                            name: ast::Name::new(original_rename_to),
                                             alias: None,
                                         },
                                         temporary,
@@ -5213,12 +5214,13 @@ pub fn op_function(
                         }
                     };
 
-                    let rename_from = {
+                    let original_rename_from = {
                         match &state.registers[*start_reg + 6].get_value() {
-                            Value::Text(rename_from) => normalize_ident(rename_from.as_str()),
+                            Value::Text(rename_from) => rename_from,
                             _ => panic!("rename_from parameter should be TEXT"),
                         }
                     };
+                    let rename_from = normalize_ident(original_rename_from.as_str());
 
                     let column_def = {
                         match &state.registers[*start_reg + 7].get_value() {
@@ -5261,6 +5263,7 @@ pub fn op_function(
                                 for column in &mut columns {
                                     match column.expr.as_mut() {
                                         ast::Expr::Id(ast::Name::Ident(id))
+                                        | ast::Expr::Id(ast::Name::Quoted(id))
                                             if normalize_ident(id) == rename_from =>
                                         {
                                             *id = column_def.col_name.as_str().to_owned();
@@ -5302,7 +5305,9 @@ pub fn op_function(
 
                                 let column = columns
                                     .iter_mut()
-                                    .find(|column| column.col_name == ast::Name::new(&rename_from))
+                                    .find(|column| {
+                                        column.col_name == ast::Name::new(original_rename_from)
+                                    })
                                     .expect("column being renamed should be present");
 
                                 match alter_func {
@@ -7735,21 +7740,24 @@ pub fn op_rename_table(
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(RenameTable { from, to }, insn);
 
+    let normalized_from = normalize_ident(from.as_str());
+    let normalized_to = normalize_ident(to.as_str());
+
     let conn = program.connection.clone();
 
     conn.with_schema_mut(|schema| {
-        if let Some(mut indexes) = schema.indexes.remove(from) {
+        if let Some(mut indexes) = schema.indexes.remove(&normalized_from) {
             indexes.iter_mut().for_each(|index| {
                 let index = Arc::make_mut(index);
-                index.table_name = to.to_owned();
+                index.table_name = normalized_to.to_owned();
             });
 
-            schema.indexes.insert(to.to_owned(), indexes);
+            schema.indexes.insert(normalized_to.to_owned(), indexes);
         };
 
         let mut table = schema
             .tables
-            .remove(from)
+            .remove(&normalized_from)
             .expect("table being renamed should be in schema");
 
         {
@@ -7760,10 +7768,10 @@ pub fn op_rename_table(
             };
 
             let btree = Arc::make_mut(btree);
-            btree.name = to.to_owned();
+            btree.name = normalized_to.to_owned();
         }
 
-        schema.tables.insert(to.to_owned(), table);
+        schema.tables.insert(normalized_to.to_owned(), table);
     });
 
     state.pc += 1;
@@ -7857,12 +7865,13 @@ pub fn op_alter_column(
 
     let conn = program.connection.clone();
 
+    let normalized_table_name = normalize_ident(table_name.as_str());
     let new_column = crate::schema::Column::from(definition);
 
     conn.with_schema_mut(|schema| {
         let table = schema
             .tables
-            .get_mut(table_name)
+            .get_mut(&normalized_table_name)
             .expect("table being renamed should be in schema");
 
         let table = Arc::make_mut(table);
@@ -7878,7 +7887,7 @@ pub fn op_alter_column(
             .get_mut(*column_index)
             .expect("renamed column should be in schema");
 
-        if let Some(indexes) = schema.indexes.get_mut(table_name) {
+        if let Some(indexes) = schema.indexes.get_mut(&normalized_table_name) {
             for index in indexes {
                 let index = Arc::make_mut(index);
                 for index_column in &mut index.columns {
