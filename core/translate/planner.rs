@@ -30,7 +30,8 @@ use turso_parser::ast::{
     self, As, Expr, FromClause, JoinType, Materialized, Over, QualifiedName, TableInternalId, With,
 };
 
-pub const ROWID: &str = "rowid";
+/// Valid ways to refer to the rowid of a btree table.
+pub const ROWID_STRS: [&str; 3] = ["rowid", "_rowid_", "oid"];
 
 /// This function walks the expression tree and identifies aggregate
 /// and window functions.
@@ -1094,7 +1095,10 @@ pub fn parse_row_id<F>(
 where
     F: FnOnce() -> bool,
 {
-    if column_name.eq_ignore_ascii_case(ROWID) {
+    if ROWID_STRS
+        .iter()
+        .any(|s| s.eq_ignore_ascii_case(column_name))
+    {
         if fn_check() {
             crate::bail_parse_error!("ROWID is ambiguous");
         }
