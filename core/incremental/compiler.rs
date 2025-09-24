@@ -23,7 +23,7 @@ use crate::Pager;
 use crate::{return_and_restore_if_io, return_if_io, LimboError, Result};
 use std::collections::HashMap;
 use std::fmt::{self, Display, Formatter};
-use std::sync::Arc;
+use std::sync::{atomic::Ordering, Arc};
 
 // The state table has 5 columns: operator_id, zset_id, element_id, value, weight
 const OPERATOR_COLUMNS: usize = 5;
@@ -1507,7 +1507,7 @@ impl DbspCompiler {
         let db = Database::open_file(io, ":memory:", false, false)?;
         let internal_conn = db.connect()?;
         internal_conn.query_only.set(true);
-        internal_conn.auto_commit.set(false);
+        internal_conn.auto_commit.store(false, Ordering::SeqCst);
 
         // Create temporary symbol table
         let temp_syms = SymbolTable::new();
@@ -2295,7 +2295,7 @@ mod tests {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db = Database::open_file(io.clone(), ":memory:", false, false).unwrap();
         let conn = db.connect().unwrap();
-        let pager = conn.pager.borrow().clone();
+        let pager = conn.pager.read().clone();
 
         let _ = pager.io.block(|| pager.allocate_page1()).unwrap();
 

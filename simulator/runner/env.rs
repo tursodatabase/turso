@@ -142,6 +142,8 @@ pub(crate) struct SimulatorEnv {
     pub(crate) io: Arc<dyn SimIO>,
     pub(crate) db: Option<Arc<Database>>,
     pub(crate) rng: ChaCha8Rng,
+
+    seed: u64,
     pub(crate) paths: Paths,
     pub(crate) type_: SimulationType,
     pub(crate) phase: SimulationPhase,
@@ -162,6 +164,7 @@ impl SimulatorEnv {
             io: self.io.clone(),
             db: self.db.clone(),
             rng: self.rng.clone(),
+            seed: self.seed,
             paths: self.paths.clone(),
             type_: self.type_,
             phase: self.phase,
@@ -257,6 +260,12 @@ impl SimulatorEnv {
     pub fn choose_conn(&self, rng: &mut impl Rng) -> usize {
         rng.random_range(0..self.connections.len())
     }
+
+    /// Rng only used for generating interactions. By having a separate Rng we can guarantee that a particular seed
+    /// will always create the same interactions plan, regardless of the changes that happen in the Database code
+    pub fn gen_rng(&self) -> ChaCha8Rng {
+        ChaCha8Rng::seed_from_u64(self.seed)
+    }
 }
 
 impl SimulatorEnv {
@@ -269,7 +278,7 @@ impl SimulatorEnv {
     ) -> Self {
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
 
-        let opts = SimulatorOpts {
+        let mut opts = SimulatorOpts {
             seed,
             ticks: rng.random_range(cli_opts.minimum_tests..=cli_opts.maximum_tests),
             max_tables: rng.random_range(0..128),
@@ -320,6 +329,12 @@ impl SimulatorEnv {
         if let Some(min_tick) = cli_opts.min_tick {
             profile.io.latency.min_tick = min_tick;
         }
+        if cli_opts.differential {
+            // Disable faults when running against sqlite as we cannot control faults on it
+            profile.io.enable = false;
+            // Disable limits due to differences in return order from turso and rusqlite
+            opts.disable_select_limit = true;
+        }
 
         profile.validate().unwrap();
 
@@ -367,6 +382,7 @@ impl SimulatorEnv {
             connections,
             paths,
             rng,
+            seed,
             io,
             db: Some(db),
             type_: simulation_type,

@@ -70,7 +70,7 @@ use std::{
     ops::Deref,
     rc::Rc,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, LazyLock, Mutex, Weak,
     },
     time::Duration,
@@ -106,6 +106,7 @@ pub struct DatabaseOpts {
     pub enable_indexes: bool,
     pub enable_views: bool,
     pub enable_strict: bool,
+    enable_load_extension: bool,
 }
 
 impl Default for DatabaseOpts {
@@ -115,6 +116,7 @@ impl Default for DatabaseOpts {
             enable_indexes: true,
             enable_views: false,
             enable_strict: false,
+            enable_load_extension: false,
         }
     }
 }
@@ -122,6 +124,12 @@ impl Default for DatabaseOpts {
 impl DatabaseOpts {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    #[cfg(feature = "cli_only")]
+    pub fn turso_cli(mut self) -> Self {
+        self.enable_load_extension = true;
+        self
     }
 
     pub fn with_mvcc(mut self, enable: bool) -> Self {
@@ -441,7 +449,7 @@ impl Database {
             let conn = db.connect()?;
 
             let syms = conn.syms.read();
-            let pager = conn.pager.borrow().clone();
+            let pager = conn.pager.read().clone();
 
             if let Some(encryption_opts) = encryption_opts {
                 conn.pragma_update("cipher", format!("'{}'", encryption_opts.cipher))?;
@@ -484,16 +492,16 @@ impl Database {
             .get();
         let conn = Arc::new(Connection {
             db: self.clone(),
-            pager: RefCell::new(Arc::new(pager)),
-            schema: RefCell::new(
+            pager: RwLock::new(Arc::new(pager)),
+            schema: RwLock::new(
                 self.schema
                     .lock()
                     .map_err(|_| LimboError::SchemaLocked)?
                     .clone(),
             ),
-            database_schemas: RefCell::new(std::collections::HashMap::new()),
-            auto_commit: Cell::new(true),
-            transaction_state: Cell::new(TransactionState::None),
+            database_schemas: RwLock::new(std::collections::HashMap::new()),
+            auto_commit: AtomicBool::new(true),
+            transaction_state: RwLock::new(TransactionState::None),
             last_insert_rowid: Cell::new(0),
             last_change: Cell::new(0),
             total_changes: Cell::new(0),
@@ -755,6 +763,10 @@ impl Database {
         Ok((io, db))
     }
 
+    pub(crate) fn can_load_extensions(&self) -> bool {
+        self.opts.enable_load_extension
+    }
+
     #[inline]
     pub(crate) fn with_schema_mut<T>(&self, f: impl FnOnce(&mut Schema) -> Result<T>) -> Result<T> {
         let mut schema_ref = self.schema.lock().map_err(|_| LimboError::SchemaLocked)?;
@@ -967,14 +979,14 @@ impl DatabaseCatalog {
 
 pub struct Connection {
     db: Arc<Database>,
-    pager: RefCell<Arc<Pager>>,
-    schema: RefCell<Arc<Schema>>,
+    pager: RwLock<Arc<Pager>>,
+    schema: RwLock<Arc<Schema>>,
     /// Per-database schema cache (database_index -> schema)
     /// Loaded lazily to avoid copying all schemas on connection open
-    database_schemas: RefCell<std::collections::HashMap<usize, Arc<Schema>>>,
+    database_schemas: RwLock<std::collections::HashMap<usize, Arc<Schema>>>,
     /// Whether to automatically commit transaction
-    auto_commit: Cell<bool>,
-    transaction_state: Cell<TransactionState>,
+    auto_commit: AtomicBool,
+    transaction_state: RwLock<TransactionState>,
     last_insert_rowid: Cell<i64>,
     last_change: Cell<i64>,
     total_changes: Cell<i64>,
@@ -1045,11 +1057,11 @@ impl Connection {
             .unwrap()
             .trim();
         self.maybe_update_schema()?;
-        let pager = self.pager.borrow().clone();
+        let pager = self.pager.read().clone();
         let mode = QueryMode::new(&cmd);
         let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
         let program = translate::translate(
-            self.schema.borrow().deref(),
+            self.schema.read().deref(),
             stmt,
             pager.clone(),
             self.clone(),
@@ -1069,7 +1081,7 @@ impl Connection {
     /// This function must be called outside of any transaction because internally it will start transaction session by itself
     #[allow(dead_code)]
     fn maybe_reparse_schema(self: &Arc<Connection>) -> Result<()> {
-        let pager = self.pager.borrow().clone();
+        let pager = self.pager.read().clone();
 
         // first, quickly read schema_version from the root page in order to check if schema changed
         pager.begin_read_tx()?;
@@ -1103,7 +1115,7 @@ impl Connection {
         }
         // maybe_reparse_schema must be called outside of any transaction
         turso_assert!(
-            self.transaction_state.get() == TransactionState::None,
+            self.get_tx_state() == TransactionState::None,
             "unexpected start transaction"
         );
         // start read transaction manually, because we will read schema cookie once again and
@@ -1112,11 +1124,12 @@ impl Connection {
         // from now on we must be very careful with errors propagation
         // in order to not accidentally keep read transaction opened
         pager.begin_read_tx()?;
-        self.transaction_state.replace(TransactionState::Read);
+        self.set_tx_state(TransactionState::Read);
 
         let reparse_result = self.reparse_schema();
 
-        let previous = self.transaction_state.replace(TransactionState::None);
+        let previous =
+            std::mem::replace(&mut *self.transaction_state.write(), TransactionState::None);
         turso_assert!(
             matches!(previous, TransactionState::None | TransactionState::Read),
             "unexpected end transaction state"
@@ -1129,12 +1142,12 @@ impl Connection {
 
         reparse_result?;
 
-        let schema = self.schema.borrow().clone();
+        let schema = self.schema.read().clone();
         self.db.update_schema_if_newer(schema)
     }
 
     fn reparse_schema(self: &Arc<Connection>) -> Result<()> {
-        let pager = self.pager.borrow().clone();
+        let pager = self.pager.read().clone();
 
         // read cookie before consuming statement program - otherwise we can end up reading cookie with closed transaction state
         let cookie = pager
@@ -1143,12 +1156,12 @@ impl Connection {
             .get();
 
         // create fresh schema as some objects can be deleted
-        let mut fresh = Schema::new(self.schema.borrow().indexes_enabled);
+        let mut fresh = Schema::new(self.schema.read().indexes_enabled);
         fresh.schema_version = cookie;
 
         // Preserve existing views to avoid expensive repopulation.
         // TODO: We may not need to do this if we materialize our views.
-        let existing_views = self.schema.borrow().incremental_views.clone();
+        let existing_views = self.schema.read().incremental_views.clone();
 
         // TODO: this is hack to avoid a cyclical problem with schema reprepare
         // The problem here is that we prepare a statement here, but when the statement tries
@@ -1198,7 +1211,7 @@ impl Connection {
         let mut parser = Parser::new(sql.as_bytes());
         while let Some(cmd) = parser.next_cmd()? {
             let syms = self.syms.read();
-            let pager = self.pager.borrow().clone();
+            let pager = self.pager.read().clone();
             let byte_offset_end = parser.offset();
             let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
                 .unwrap()
@@ -1206,7 +1219,7 @@ impl Connection {
             let mode = QueryMode::new(&cmd);
             let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
             let program = translate::translate(
-                self.schema.borrow().deref(),
+                self.schema.read().deref(),
                 stmt,
                 pager.clone(),
                 self.clone(),
@@ -1250,11 +1263,11 @@ impl Connection {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
         let syms = self.syms.read();
-        let pager = self.pager.borrow().clone();
+        let pager = self.pager.read().clone();
         let mode = QueryMode::new(&cmd);
         let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
         let program = translate::translate(
-            self.schema.borrow().deref(),
+            self.schema.read().deref(),
             stmt,
             pager.clone(),
             self.clone(),
@@ -1282,7 +1295,7 @@ impl Connection {
         let mut parser = Parser::new(sql.as_bytes());
         while let Some(cmd) = parser.next_cmd()? {
             let syms = self.syms.read();
-            let pager = self.pager.borrow().clone();
+            let pager = self.pager.read().clone();
             let byte_offset_end = parser.offset();
             let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
                 .unwrap()
@@ -1290,7 +1303,7 @@ impl Connection {
             let mode = QueryMode::new(&cmd);
             let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
             let program = translate::translate(
-                self.schema.borrow().deref(),
+                self.schema.read().deref(),
                 stmt,
                 pager.clone(),
                 self.clone(),
@@ -1370,7 +1383,7 @@ impl Connection {
         if let Some(encryption_opts) = encryption_opts {
             let _ = conn.pragma_update("cipher", encryption_opts.cipher.to_string());
             let _ = conn.pragma_update("hexkey", encryption_opts.hexkey.to_string());
-            let pager = conn.pager.borrow();
+            let pager = conn.pager.read();
             if db.db_state.is_initialized() {
                 // Clear page cache so the header page can be reread from disk and decrypted using the encryption context.
                 pager.clear_page_cache();
@@ -1399,16 +1412,16 @@ impl Connection {
     }
 
     pub fn maybe_update_schema(&self) -> Result<()> {
-        let current_schema_version = self.schema.borrow().schema_version;
+        let current_schema_version = self.schema.read().schema_version;
         let schema = self
             .db
             .schema
             .lock()
             .map_err(|_| LimboError::SchemaLocked)?;
-        if matches!(self.transaction_state.get(), TransactionState::None)
+        if matches!(self.get_tx_state(), TransactionState::None)
             && current_schema_version != schema.schema_version
         {
-            self.schema.replace(schema.clone());
+            *self.schema.write() = schema.clone();
         }
 
         Ok(())
@@ -1417,7 +1430,7 @@ impl Connection {
     /// Read schema version at current transaction
     #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
     pub fn read_schema_version(&self) -> Result<u32> {
-        let pager = self.pager.borrow();
+        let pager = self.pager.read();
         pager
             .io
             .block(|| pager.with_header(|header| header.schema_cookie))
@@ -1430,21 +1443,21 @@ impl Connection {
     /// Write transaction must be opened in advance - otherwise method will panic
     #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
     pub fn write_schema_version(self: &Arc<Connection>, version: u32) -> Result<()> {
-        let TransactionState::Write { .. } = self.transaction_state.get() else {
+        let TransactionState::Write { .. } = self.get_tx_state() else {
             return Err(LimboError::InternalError(
                 "write_schema_version must be called from within Write transaction".to_string(),
             ));
         };
-        let pager = self.pager.borrow();
+        let pager = self.pager.read();
         pager.io.block(|| {
             pager.with_header_mut(|header| {
                 turso_assert!(
                     header.schema_cookie.get() < version,
                     "cookie can't go back in time"
                 );
-                self.transaction_state.replace(TransactionState::Write {
+                *self.transaction_state.write() = TransactionState::Write {
                     schema_did_change: true,
-                });
+                };
                 self.with_schema_mut(|schema| schema.schema_version = version);
                 header.schema_cookie = version.into();
             })
@@ -1462,7 +1475,7 @@ impl Connection {
         page: &mut [u8],
         frame_watermark: Option<u64>,
     ) -> Result<bool> {
-        let pager = self.pager.borrow();
+        let pager = self.pager.read();
         let (page_ref, c) = match pager.read_page_no_cache(page_idx as usize, frame_watermark, true)
         {
             Ok(result) => result,
@@ -1489,19 +1502,19 @@ impl Connection {
     /// (so, if concurrent connection wrote something to the WAL - this method will not see this change)
     #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
     pub fn wal_changed_pages_after(&self, frame_watermark: u64) -> Result<Vec<u32>> {
-        self.pager.borrow().wal_changed_pages_after(frame_watermark)
+        self.pager.read().wal_changed_pages_after(frame_watermark)
     }
 
     #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
     pub fn wal_state(&self) -> Result<WalState> {
-        self.pager.borrow().wal_state()
+        self.pager.read().wal_state()
     }
 
     #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
     pub fn wal_get_frame(&self, frame_no: u64, frame: &mut [u8]) -> Result<WalFrameInfo> {
         use crate::storage::sqlite3_ondisk::parse_wal_frame_header;
 
-        let c = self.pager.borrow().wal_get_frame(frame_no, frame)?;
+        let c = self.pager.read().wal_get_frame(frame_no, frame)?;
         self.db.io.wait_for_completion(c)?;
         let (header, _) = parse_wal_frame_header(frame);
         Ok(WalFrameInfo {
@@ -1515,23 +1528,23 @@ impl Connection {
     /// If attempt to write frame at the position `frame_no` will create gap in the WAL - method will return error
     #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
     pub fn wal_insert_frame(&self, frame_no: u64, frame: &[u8]) -> Result<WalFrameInfo> {
-        self.pager.borrow().wal_insert_frame(frame_no, frame)
+        self.pager.read().wal_insert_frame(frame_no, frame)
     }
 
     /// Start WAL session by initiating read+write transaction for this connection
     #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
     pub fn wal_insert_begin(&self) -> Result<()> {
-        let pager = self.pager.borrow();
+        let pager = self.pager.read();
         pager.begin_read_tx()?;
         pager.io.block(|| pager.begin_write_tx()).inspect_err(|_| {
             pager.end_read_tx().expect("read txn must be closed");
         })?;
 
         // start write transaction and disable auto-commit mode as SQL can be executed within WAL session (at caller own risk)
-        self.transaction_state.replace(TransactionState::Write {
+        *self.transaction_state.write() = TransactionState::Write {
             schema_did_change: false,
-        });
-        self.auto_commit.replace(false);
+        };
+        self.auto_commit.store(false, Ordering::SeqCst);
 
         Ok(())
     }
@@ -1541,7 +1554,7 @@ impl Connection {
     #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
     pub fn wal_insert_end(self: &Arc<Connection>, force_commit: bool) -> Result<()> {
         {
-            let pager = self.pager.borrow();
+            let pager = self.pager.read();
 
             let Some(wal) = pager.wal.as_ref() else {
                 return Err(LimboError::InternalError(
@@ -1564,8 +1577,8 @@ impl Connection {
                 None
             };
 
-            self.auto_commit.replace(true);
-            self.transaction_state.replace(TransactionState::None);
+            self.auto_commit.store(true, Ordering::SeqCst);
+            self.set_tx_state(TransactionState::None);
             {
                 let wal = wal.borrow_mut();
                 wal.end_write_tx();
@@ -1593,11 +1606,11 @@ impl Connection {
         if self.closed.get() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
-        self.pager.borrow().cacheflush()
+        self.pager.read().cacheflush()
     }
 
     pub fn clear_page_cache(&self) -> Result<()> {
-        self.pager.borrow().clear_page_cache();
+        self.pager.read().clear_page_cache();
         Ok(())
     }
 
@@ -1605,7 +1618,7 @@ impl Connection {
         if self.closed.get() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
-        self.pager.borrow().wal_checkpoint(mode)
+        self.pager.read().wal_checkpoint(mode)
     }
 
     /// Close a connection and checkpoint.
@@ -1615,19 +1628,19 @@ impl Connection {
         }
         self.closed.set(true);
 
-        match self.transaction_state.get() {
+        match self.get_tx_state() {
             TransactionState::None => {
                 // No active transaction
             }
             _ => {
-                let pager = self.pager.borrow();
+                let pager = self.pager.read();
                 pager.io.block(|| {
                     pager.end_tx(
                         true, // rollback = true for close
                         self,
                     )
                 })?;
-                self.transaction_state.set(TransactionState::None);
+                self.set_tx_state(TransactionState::None);
             }
         }
 
@@ -1638,7 +1651,7 @@ impl Connection {
             .eq(&1)
         {
             self.pager
-                .borrow()
+                .read()
                 .checkpoint_shutdown(self.wal_auto_checkpoint_disabled.get())?;
         };
         Ok(())
@@ -1735,10 +1748,10 @@ impl Connection {
             shared_wal.enabled.store(false, Ordering::SeqCst);
             shared_wal.file = None;
         }
-        self.pager.borrow_mut().clear_page_cache();
+        self.pager.write().clear_page_cache();
         let pager = self.db.init_pager(Some(size.get() as usize))?;
-        self.pager.replace(Arc::new(pager));
-        self.pager.borrow().set_initial_page_size(size);
+        *self.pager.write() = Arc::new(pager);
+        self.pager.read().set_initial_page_size(size);
 
         Ok(())
     }
@@ -1767,7 +1780,7 @@ impl Connection {
     }
 
     pub fn get_auto_commit(&self) -> bool {
-        self.auto_commit.get()
+        self.auto_commit.load(Ordering::SeqCst)
     }
 
     pub fn parse_schema_rows(self: &Arc<Connection>) -> Result<()> {
@@ -1867,7 +1880,7 @@ impl Connection {
 
     #[inline]
     pub fn with_schema_mut<T>(&self, f: impl FnOnce(&mut Schema) -> T) -> T {
-        let mut schema_ref = self.schema.borrow_mut();
+        let mut schema_ref = self.schema.write();
         let schema = Arc::make_mut(&mut *schema_ref);
         f(schema)
     }
@@ -1878,7 +1891,7 @@ impl Connection {
 
     fn get_pager_from_database_index(&self, index: &usize) -> Arc<Pager> {
         if *index < 2 {
-            self.pager.borrow().clone()
+            self.pager.read().clone()
         } else {
             self.attached_databases.borrow().get_pager_by_index(index)
         }
@@ -2017,15 +2030,15 @@ impl Connection {
     pub(crate) fn with_schema<T>(&self, database_id: usize, f: impl FnOnce(&Schema) -> T) -> T {
         if database_id == 0 {
             // Main database - use connection's schema which should be kept in sync
-            let schema = self.schema.borrow();
+            let schema = self.schema.read();
             f(&schema)
         } else if database_id == 1 {
             // Temp database - uses same schema as main for now, but this will change later.
-            let schema = self.schema.borrow();
+            let schema = self.schema.read();
             f(&schema)
         } else {
             // Attached database - check cache first, then load from database
-            let mut schemas = self.database_schemas.borrow_mut();
+            let mut schemas = self.database_schemas.write();
 
             if let Some(cached_schema) = schemas.get(&database_id) {
                 return f(cached_schema);
@@ -2092,7 +2105,7 @@ impl Connection {
     }
 
     pub fn get_pager(&self) -> Arc<Pager> {
-        self.pager.borrow().clone()
+        self.pager.read().clone()
     }
 
     pub fn get_query_only(&self) -> bool {
@@ -2150,7 +2163,7 @@ impl Connection {
             return Ok(());
         };
         tracing::trace!("setting encryption ctx for connection");
-        let pager = self.pager.borrow();
+        let pager = self.pager.read();
         if pager.is_encryption_ctx_set() {
             return Err(LimboError::InvalidArgument(
                 "cannot reset encryption attributes if already set in the session".to_string(),
@@ -2181,6 +2194,14 @@ impl Connection {
 
     pub fn get_busy_timeout(&self) -> std::time::Duration {
         self.busy_timeout.get()
+    }
+
+    fn set_tx_state(&self, state: TransactionState) {
+        *self.transaction_state.write() = state;
+    }
+
+    fn get_tx_state(&self) -> TransactionState {
+        *self.transaction_state.read()
     }
 }
 
@@ -2418,7 +2439,7 @@ impl Statement {
     fn reprepare(&mut self) -> Result<()> {
         tracing::trace!("repreparing statement");
         let conn = self.program.connection.clone();
-        *conn.schema.borrow_mut() = conn.db.clone_schema()?;
+        *conn.schema.write() = conn.db.clone_schema()?;
         self.program = {
             let mut parser = Parser::new(self.program.sql.as_bytes());
             let cmd = parser.next_cmd()?;
@@ -2429,7 +2450,7 @@ impl Statement {
             debug_assert_eq!(QueryMode::new(&cmd), mode,);
             let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
             translate::translate(
-                conn.schema.borrow().deref(),
+                conn.schema.read().deref(),
                 stmt,
                 self.pager.clone(),
                 conn.clone(),
@@ -2461,13 +2482,10 @@ impl Statement {
             if let Some(io) = &self.state.io_completions {
                 io.abort();
             }
-            let state = self.program.connection.transaction_state.get();
+            let state = self.program.connection.get_tx_state();
             if let TransactionState::Write { .. } = state {
                 let end_tx_res = self.pager.end_tx(true, &self.program.connection)?;
-                self.program
-                    .connection
-                    .transaction_state
-                    .set(TransactionState::None);
+                self.program.connection.set_tx_state(TransactionState::None);
                 assert!(
                     matches!(end_tx_res, IOResult::Done(_)),
                     "end_tx should not return IO as it should just end txn without flushing anything. Got {end_tx_res:?}"

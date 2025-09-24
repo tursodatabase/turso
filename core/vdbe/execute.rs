@@ -38,7 +38,7 @@ use std::env::temp_dir;
 use std::ops::DerefMut;
 use std::{
     borrow::BorrowMut,
-    sync::{Arc, Mutex},
+    sync::{atomic::Ordering, Arc, Mutex},
 };
 use turso_macros::match_ignore_ascii_case;
 
@@ -369,7 +369,7 @@ pub fn op_checkpoint_inner(
         },
         insn
     );
-    if !program.connection.auto_commit.get() {
+    if !program.connection.auto_commit.load(Ordering::SeqCst) {
         // TODO: sqlite returns "Runtime error: database table is locked (6)" when a table is in use
         // when a checkpoint is attempted. We don't have table locks, so return TableLocked for any
         // attempt to checkpoint in an interactive transaction. This does not end the transaction,
@@ -382,7 +382,7 @@ pub fn op_checkpoint_inner(
                 let step_result = program
                     .connection
                     .pager
-                    .borrow_mut()
+                    .write()
                     .wal_checkpoint_start(*checkpoint_mode);
                 match step_result {
                     Ok(IOResult::Done(result)) => {
@@ -403,7 +403,7 @@ pub fn op_checkpoint_inner(
                 let step_result = program
                     .connection
                     .pager
-                    .borrow_mut()
+                    .write()
                     .wal_checkpoint_finish(result.as_mut().unwrap());
                 match step_result {
                     Ok(IOResult::Done(())) => {
@@ -2130,7 +2130,7 @@ pub fn halt(
         }
     }
 
-    let auto_commit = program.connection.auto_commit.get();
+    let auto_commit = program.connection.auto_commit.load(Ordering::SeqCst);
     tracing::trace!("halt(auto_commit={})", auto_commit);
     if auto_commit {
         program
@@ -2229,7 +2229,7 @@ pub fn op_transaction_inner(
                 }
 
                 // 1. We try to upgrade current version
-                let current_state = conn.transaction_state.get();
+                let current_state = conn.get_tx_state();
                 let (new_transaction_state, updated) = if conn.is_nested_stmt.get() {
                     (current_state, false)
                 } else {
@@ -2336,9 +2336,9 @@ pub fn op_transaction_inner(
                             // start a new one.
                             if matches!(current_state, TransactionState::None) {
                                 pager.end_read_tx()?;
-                                conn.transaction_state.replace(TransactionState::None);
+                                conn.set_tx_state(TransactionState::None);
                             }
-                            assert_eq!(conn.transaction_state.get(), current_state);
+                            assert_eq!(conn.get_tx_state(), current_state);
                             return Err(LimboError::Busy);
                         }
                         if let IOResult::IO(io) = begin_w_tx_res? {
@@ -2346,8 +2346,7 @@ pub fn op_transaction_inner(
                             // end the read transaction.
                             program
                                 .connection
-                                .transaction_state
-                                .replace(TransactionState::PendingUpgrade);
+                                .set_tx_state(TransactionState::PendingUpgrade);
                             return Ok(InsnFunctionStepResult::IO(io));
                         }
                     }
@@ -2355,7 +2354,7 @@ pub fn op_transaction_inner(
 
                 // 3. Transaction state should be updated before checking for Schema cookie so that the tx is ended properly on error
                 if updated {
-                    conn.transaction_state.replace(new_transaction_state);
+                    conn.set_tx_state(new_transaction_state);
                 }
                 state.op_transaction_state = OpTransactionState::CheckSchemaCookie;
                 continue;
@@ -2414,7 +2413,7 @@ pub fn op_auto_commit(
             .map(Into::into);
     }
 
-    if *auto_commit != conn.auto_commit.get() {
+    if *auto_commit != conn.auto_commit.load(Ordering::SeqCst) {
         if *rollback {
             // TODO(pere): add rollback I/O logic once we implement rollback journal
             if let Some(mv_store) = mv_store {
@@ -2424,10 +2423,10 @@ pub fn op_auto_commit(
             } else {
                 return_if_io!(pager.end_tx(true, &conn));
             }
-            conn.transaction_state.replace(TransactionState::None);
-            conn.auto_commit.replace(true);
+            conn.set_tx_state(TransactionState::None);
+            conn.auto_commit.store(true, Ordering::SeqCst);
         } else {
-            conn.auto_commit.replace(*auto_commit);
+            conn.auto_commit.store(*auto_commit, Ordering::SeqCst);
         }
     } else {
         let mvcc_tx_active = program.connection.mv_tx.get().is_some();
@@ -4804,6 +4803,9 @@ pub fn op_function(
             #[cfg(feature = "fs")]
             #[cfg(not(target_family = "wasm"))]
             ScalarFunc::LoadExtension => {
+                if !program.connection.db.can_load_extensions() {
+                    crate::bail_parse_error!("runtime extension loading is disabled");
+                }
                 let extension = &state.registers[*start_reg];
                 let ext = resolve_ext_path(&extension.get_value().to_string())?;
                 program.connection.load_extension(ext)?;
@@ -4837,7 +4839,7 @@ pub fn op_function(
                         ));
                     };
                     let table = {
-                        let schema = program.connection.schema.borrow();
+                        let schema = program.connection.schema.read();
                         match schema.get_table(table.as_str()) {
                             Some(table) => table,
                             None => {
@@ -5374,6 +5376,49 @@ pub fn op_function(
     Ok(InsnFunctionStepResult::Step)
 }
 
+pub fn op_sequence(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+    mv_store: Option<&Arc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        Sequence {
+            cursor_id,
+            target_reg
+        },
+        insn
+    );
+    let cursor = state.get_cursor(*cursor_id).as_sorter_mut();
+    let seq_num = cursor.next_sequence();
+    state.registers[*target_reg] = Register::Value(Value::Integer(seq_num));
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_sequence_test(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+    mv_store: Option<&Arc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        SequenceTest {
+            cursor_id,
+            target_pc,
+            value_reg
+        },
+        insn
+    );
+    let cursor = state.get_cursor(*cursor_id).as_sorter_mut();
+    if cursor.seq_beginning() {
+        state.pc = target_pc.as_offset_int();
+    }
+    Ok(InsnFunctionStepResult::Step)
+}
+
 pub fn op_init_coroutine(
     program: &Program,
     state: &mut ProgramState,
@@ -5503,7 +5548,7 @@ pub fn op_insert(
     loop {
         match &state.op_insert_state.sub_state {
             OpInsertSubState::MaybeCaptureRecord => {
-                let schema = program.connection.schema.borrow();
+                let schema = program.connection.schema.read();
                 let dependent_views = schema.get_dependent_materialized_views(table_name);
                 // If there are no dependent views, we don't need to capture the old record.
                 // We also don't need to do it if the rowid of the UPDATEd row was changed, because that means
@@ -5613,7 +5658,7 @@ pub fn op_insert(
                 if root_page != 1 && table_name != "sqlite_sequence" {
                     state.op_insert_state.sub_state = OpInsertSubState::UpdateLastRowid;
                 } else {
-                    let schema = program.connection.schema.borrow();
+                    let schema = program.connection.schema.read();
                     let dependent_views = schema.get_dependent_materialized_views(table_name);
                     if !dependent_views.is_empty() {
                         state.op_insert_state.sub_state = OpInsertSubState::ApplyViewChange;
@@ -5634,7 +5679,7 @@ pub fn op_insert(
                     let prev_changes = program.n_change.get();
                     program.n_change.set(prev_changes + 1);
                 }
-                let schema = program.connection.schema.borrow();
+                let schema = program.connection.schema.read();
                 let dependent_views = schema.get_dependent_materialized_views(table_name);
                 if !dependent_views.is_empty() {
                     state.op_insert_state.sub_state = OpInsertSubState::ApplyViewChange;
@@ -5643,7 +5688,7 @@ pub fn op_insert(
                 break;
             }
             OpInsertSubState::ApplyViewChange => {
-                let schema = program.connection.schema.borrow();
+                let schema = program.connection.schema.read();
                 let dependent_views = schema.get_dependent_materialized_views(table_name);
                 assert!(!dependent_views.is_empty());
 
@@ -5678,7 +5723,7 @@ pub fn op_insert(
                         .collect::<Vec<_>>();
 
                     // Fix rowid alias columns: replace Null with actual rowid value
-                    let schema = program.connection.schema.borrow();
+                    let schema = program.connection.schema.read();
                     if let Some(table) = schema.get_table(table_name) {
                         for (i, col) in table.columns().iter().enumerate() {
                             if col.is_rowid_alias && i < new_values.len() {
@@ -5771,7 +5816,7 @@ pub fn op_delete(
     loop {
         match &state.op_delete_state.sub_state {
             OpDeleteSubState::MaybeCaptureRecord => {
-                let schema = program.connection.schema.borrow();
+                let schema = program.connection.schema.read();
                 let dependent_views = schema.get_dependent_materialized_views(table_name);
                 if dependent_views.is_empty() {
                     state.op_delete_state.sub_state = OpDeleteSubState::Delete;
@@ -5820,7 +5865,7 @@ pub fn op_delete(
                 }
                 // Increment metrics for row write (DELETE is a write operation)
                 state.metrics.rows_written = state.metrics.rows_written.saturating_add(1);
-                let schema = program.connection.schema.borrow();
+                let schema = program.connection.schema.read();
                 let dependent_views = schema.get_dependent_materialized_views(table_name);
                 if dependent_views.is_empty() {
                     break;
@@ -5829,7 +5874,7 @@ pub fn op_delete(
                 continue;
             }
             OpDeleteSubState::ApplyViewChange => {
-                let schema = program.connection.schema.borrow();
+                let schema = program.connection.schema.read();
                 let dependent_views = schema.get_dependent_materialized_views(table_name);
                 assert!(!dependent_views.is_empty());
                 let maybe_deleted_record = state.op_delete_state.deleted_record.take();
@@ -5950,8 +5995,6 @@ pub fn op_idx_delete(
                 }
                 // Increment metrics for index write (delete is a write operation)
                 state.metrics.rows_written = state.metrics.rows_written.saturating_add(1);
-                let n_change = program.n_change.get();
-                program.n_change.set(n_change + 1);
                 state.pc += 1;
                 state.op_idx_delete_state = None;
                 return Ok(InsnFunctionStepResult::Step);
@@ -6529,7 +6572,7 @@ pub fn op_open_write(
     };
     if let Some(index) = maybe_index {
         let conn = program.connection.clone();
-        let schema = conn.schema.borrow();
+        let schema = conn.schema.read();
         let table = schema
             .get_table(&index.table_name)
             .and_then(|table| table.btree());
@@ -6806,8 +6849,8 @@ pub fn op_parse_schema(
     let conn = program.connection.clone();
     // set auto commit to false in order for parse schema to not commit changes as transaction state is stored in connection,
     // and we use the same connection for nested query.
-    let previous_auto_commit = conn.auto_commit.get();
-    conn.auto_commit.set(false);
+    let previous_auto_commit = conn.auto_commit.load(Ordering::SeqCst);
+    conn.auto_commit.store(false, Ordering::SeqCst);
 
     let maybe_nested_stmt_err = if let Some(where_clause) = where_clause {
         let stmt = conn.prepare(format!("SELECT * FROM sqlite_schema WHERE {where_clause}"))?;
@@ -6843,7 +6886,8 @@ pub fn op_parse_schema(
         })
     };
     conn.is_nested_stmt.set(false);
-    conn.auto_commit.set(previous_auto_commit);
+    conn.auto_commit
+        .store(previous_auto_commit, Ordering::SeqCst);
     maybe_nested_stmt_err?;
 
     // let updated_local_schema = conn.schema.borrow().clone();
@@ -6892,7 +6936,7 @@ pub fn op_populate_materialized_views(
 
     // Now populate the views (after releasing the schema borrow)
     for (view_name, _root_page, cursor_id) in view_info {
-        let schema = conn.schema.borrow();
+        let schema = conn.schema.read();
         if let Some(view) = schema.get_materialized_view(&view_name) {
             let mut view = view.lock().unwrap();
             // Drop the schema borrow before calling populate_from_table
@@ -6990,9 +7034,9 @@ pub fn op_set_cookie(
             Cookie::IncrementalVacuum => header.incremental_vacuum_enabled = (*value as u32).into(),
             Cookie::SchemaVersion => {
                 // we update transaction state to indicate that the schema has changed
-                match program.connection.transaction_state.get() {
+                match program.connection.get_tx_state() {
                     TransactionState::Write { schema_did_change } => {
-                        program.connection.transaction_state.set(TransactionState::Write { schema_did_change: true });
+                        program.connection.set_tx_state(TransactionState::Write { schema_did_change: true });
                     },
                     TransactionState::Read => unreachable!("invalid transaction state for SetCookie: TransactionState::Read, should be write"),
                     TransactionState::None => unreachable!("invalid transaction state for SetCookie: TransactionState::None, should be write"),
@@ -7218,7 +7262,7 @@ pub fn op_open_ephemeral(
             let page_size =
                 return_if_io!(with_header(pager, mv_store, program, |header| header.page_size));
             let conn = program.connection.clone();
-            let io = conn.pager.borrow().io.clone();
+            let io = conn.pager.read().io.clone();
             let rand_num = io.generate_random_number();
             let db_file;
             let db_file_io: Arc<dyn crate::IO>;

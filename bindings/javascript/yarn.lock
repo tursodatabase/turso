@@ -37,31 +37,31 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@emnapi/core@npm:^1.4.5":
-  version: 1.4.5
-  resolution: "@emnapi/core@npm:1.4.5"
+"@emnapi/core@npm:^1.5.0":
+  version: 1.5.0
+  resolution: "@emnapi/core@npm:1.5.0"
   dependencies:
-    "@emnapi/wasi-threads": "npm:1.0.4"
+    "@emnapi/wasi-threads": "npm:1.1.0"
     tslib: "npm:^2.4.0"
-  checksum: 10c0/da4a57f65f325d720d0e0d1a9c6618b90c4c43a5027834a110476984e1d47c95ebaed4d316b5dddb9c0ed9a493ffeb97d1934f9677035f336d8a36c1f3b2818f
+  checksum: 10c0/52ba3485277706d92fa27d92b37e5b4f6ef0742c03ed68f8096f294c6bfa30f0752c82d4c2bfa14bff4dc30d63c9f71a8f9fb64a92743d00807d9e468fafd5ff
   languageName: node
   linkType: hard
 
-"@emnapi/runtime@npm:^1.4.5":
-  version: 1.4.5
-  resolution: "@emnapi/runtime@npm:1.4.5"
+"@emnapi/runtime@npm:^1.5.0":
+  version: 1.5.0
+  resolution: "@emnapi/runtime@npm:1.5.0"
   dependencies:
     tslib: "npm:^2.4.0"
-  checksum: 10c0/37a0278be5ac81e918efe36f1449875cbafba947039c53c65a1f8fc238001b866446fc66041513b286baaff5d6f9bec667f5164b3ca481373a8d9cb65bfc984b
+  checksum: 10c0/a85c9fc4e3af49cbe41e5437e5be2551392a931910cd0a5b5d3572532786927810c9cc1db11b232ec8f9657b33d4e6f7c4f985f1a052917d7cd703b5b2a20faa
   languageName: node
   linkType: hard
 
-"@emnapi/wasi-threads@npm:1.0.4":
-  version: 1.0.4
-  resolution: "@emnapi/wasi-threads@npm:1.0.4"
+"@emnapi/wasi-threads@npm:1.1.0":
+  version: 1.1.0
+  resolution: "@emnapi/wasi-threads@npm:1.1.0"
   dependencies:
     tslib: "npm:^2.4.0"
-  checksum: 10c0/2c91a53e62f875800baf035c4d42c9c0d18e5afd9a31ca2aac8b435aeaeaeaac386b5b3d0d0e70aa7a5a9852bbe05106b1f680cd82cce03145c703b423d41313
+  checksum: 10c0/e6d54bf2b1e64cdd83d2916411e44e579b6ae35d5def0dea61a3c452d9921373044dff32a8b8473ae60c80692bdc39323e98b96a3f3d87ba6886b24dd0ef7ca1
   languageName: node
   linkType: hard
 
@@ -1091,14 +1091,14 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@napi-rs/wasm-runtime@npm:^1.0.1":
-  version: 1.0.3
-  resolution: "@napi-rs/wasm-runtime@npm:1.0.3"
+"@napi-rs/wasm-runtime@npm:^1.0.1, @napi-rs/wasm-runtime@npm:^1.0.5":
+  version: 1.0.5
+  resolution: "@napi-rs/wasm-runtime@npm:1.0.5"
   dependencies:
-    "@emnapi/core": "npm:^1.4.5"
-    "@emnapi/runtime": "npm:^1.4.5"
-    "@tybys/wasm-util": "npm:^0.10.0"
-  checksum: 10c0/7918d82477e75931b6e35bb003464382eb93e526362f81a98bf8610407a67b10f4d041931015ad48072c89db547deb7e471dfb91f4ab11ac63a24d8580297f75
+    "@emnapi/core": "npm:^1.5.0"
+    "@emnapi/runtime": "npm:^1.5.0"
+    "@tybys/wasm-util": "npm:^0.10.1"
+  checksum: 10c0/8d29299933c57b6ead61f46fad5c3dfabc31e1356bbaf25c3a8ae57be0af0db0006a808f2c1bb16e28925e027f20e0856550dac94e015f56dd6ed53b38f9a385
   languageName: node
   linkType: hard
 
@@ -1575,11 +1575,11 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@tursodatabase/database-browser-common@npm:^0.2.0-pre.6, @tursodatabase/database-browser-common@workspace:packages/browser-common":
+"@tursodatabase/database-browser-common@npm:^0.2.0-pre.8, @tursodatabase/database-browser-common@workspace:packages/browser-common":
   version: 0.0.0-use.local
   resolution: "@tursodatabase/database-browser-common@workspace:packages/browser-common"
   dependencies:
-    "@tursodatabase/wasm-runtime": "npm:^0.2.0-pre.6"
+    "@napi-rs/wasm-runtime": "npm:^1.0.5"
     typescript: "npm:^5.9.2"
   languageName: unknown
   linkType: soft
@@ -1589,8 +1589,8 @@ __metadata:
   resolution: "@tursodatabase/database-browser@workspace:packages/browser"
   dependencies:
     "@napi-rs/cli": "npm:^3.1.5"
-    "@tursodatabase/database-browser-common": "npm:^0.2.0-pre.6"
-    "@tursodatabase/database-common": "npm:^0.2.0-pre.6"
+    "@tursodatabase/database-browser-common": "npm:^0.2.0-pre.8"
+    "@tursodatabase/database-common": "npm:^0.2.0-pre.8"
     "@vitest/browser": "npm:^3.2.4"
     playwright: "npm:^1.55.0"
     typescript: "npm:^5.9.2"
@@ -1599,7 +1599,7 @@ __metadata:
   languageName: unknown
   linkType: soft
 
-"@tursodatabase/database-common@npm:^0.2.0-pre.6, @tursodatabase/database-common@workspace:packages/common":
+"@tursodatabase/database-common@npm:^0.2.0-pre.8, @tursodatabase/database-common@workspace:packages/common":
   version: 0.0.0-use.local
   resolution: "@tursodatabase/database-common@workspace:packages/common"
   dependencies:
@@ -1612,7 +1612,7 @@ __metadata:
   resolution: "@tursodatabase/database@workspace:packages/native"
   dependencies:
     "@napi-rs/cli": "npm:^3.1.5"
-    "@tursodatabase/database-common": "npm:^0.2.0-pre.6"
+    "@tursodatabase/database-common": "npm:^0.2.0-pre.8"
     "@types/node": "npm:^24.3.1"
     better-sqlite3: "npm:^12.2.0"
     drizzle-kit: "npm:^0.31.4"
@@ -1627,9 +1627,9 @@ __metadata:
   resolution: "@tursodatabase/sync-browser@workspace:sync/packages/browser"
   dependencies:
     "@napi-rs/cli": "npm:^3.1.5"
-    "@tursodatabase/database-browser-common": "npm:^0.2.0-pre.6"
-    "@tursodatabase/database-common": "npm:^0.2.0-pre.6"
-    "@tursodatabase/sync-common": "npm:^0.2.0-pre.6"
+    "@tursodatabase/database-browser-common": "npm:^0.2.0-pre.8"
+    "@tursodatabase/database-common": "npm:^0.2.0-pre.8"
+    "@tursodatabase/sync-common": "npm:^0.2.0-pre.8"
     "@vitest/browser": "npm:^3.2.4"
     playwright: "npm:^1.55.0"
     typescript: "npm:^5.9.2"
@@ -1638,11 +1638,11 @@ __metadata:
   languageName: unknown
   linkType: soft
 
-"@tursodatabase/sync-common@npm:^0.2.0-pre.6, @tursodatabase/sync-common@workspace:sync/packages/common":
+"@tursodatabase/sync-common@npm:^0.2.0-pre.8, @tursodatabase/sync-common@workspace:sync/packages/common":
   version: 0.0.0-use.local
   resolution: "@tursodatabase/sync-common@workspace:sync/packages/common"
   dependencies:
-    "@tursodatabase/database-common": "npm:^0.2.0-pre.6"
+    "@tursodatabase/database-common": "npm:^0.2.0-pre.8"
     typescript: "npm:^5.9.2"
   languageName: unknown
   linkType: soft
@@ -1652,25 +1652,15 @@ __metadata:
   resolution: "@tursodatabase/sync@workspace:sync/packages/native"
   dependencies:
     "@napi-rs/cli": "npm:^3.1.5"
-    "@tursodatabase/database-common": "npm:^0.2.0-pre.6"
-    "@tursodatabase/sync-common": "npm:^0.2.0-pre.6"
+    "@tursodatabase/database-common": "npm:^0.2.0-pre.8"
+    "@tursodatabase/sync-common": "npm:^0.2.0-pre.8"
     "@types/node": "npm:^24.3.1"
     typescript: "npm:^5.9.2"
     vitest: "npm:^3.2.4"
   languageName: unknown
   linkType: soft
 
-"@tursodatabase/wasm-runtime@npm:^0.2.0-pre.6, @tursodatabase/wasm-runtime@workspace:packages/wasm-runtime":
-  version: 0.0.0-use.local
-  resolution: "@tursodatabase/wasm-runtime@workspace:packages/wasm-runtime"
-  dependencies:
-    "@emnapi/core": "npm:^1.4.5"
-    "@emnapi/runtime": "npm:^1.4.5"
-    "@tybys/wasm-util": "npm:^0.10.1"
-  languageName: unknown
-  linkType: soft
-
-"@tybys/wasm-util@npm:^0.10.0, @tybys/wasm-util@npm:^0.10.1":
+"@tybys/wasm-util@npm:^0.10.1":
   version: 0.10.1
   resolution: "@tybys/wasm-util@npm:0.10.1"
   dependencies:
@@ -3690,15 +3680,15 @@ __metadata:
   linkType: hard
 
 "tar@npm:^7.4.3":
-  version: 7.4.4
-  resolution: "tar@npm:7.4.4"
+  version: 7.5.1
+  resolution: "tar@npm:7.5.1"
   dependencies:
     "@isaacs/fs-minipass": "npm:^4.0.0"
     chownr: "npm:^3.0.0"
     minipass: "npm:^7.1.2"
     minizlib: "npm:^3.1.0"
     yallist: "npm:^5.0.0"
-  checksum: 10c0/2db46a140095488ed3244ac748f8e4f9362223b212bcae7859840dd9fd9891bc713f243d122906ce2f28eb64b49fa8cefc13cbdda24e66e8f2a5936a7c392b06
+  checksum: 10c0/0dad0596a61586180981133b20c32cfd93c5863c5b7140d646714e6ea8ec84583b879e5dc3928a4d683be6e6109ad7ea3de1cf71986d5194f81b3a016c8858c9
   languageName: node
   linkType: hard
 

@@ -1,6 +1,16 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::{BTreeMap, btree_map::Entry},
+    sync::{Arc, Mutex},
+};
 
-use crate::generation::plan::{ConnectionState, Interaction, InteractionPlanState};
+use itertools::Itertools;
+use similar_asserts::SimpleDiff;
+use sql_generation::model::table::SimValue;
+
+use crate::{
+    generation::plan::{ConnectionState, InteractionPlanIterator, InteractionPlanState},
+    runner::execution::ExecutionContinuation,
+};
 
 use super::{
     env::SimulatorEnv,
@@ -10,7 +20,7 @@ use super::{
 pub fn run_simulation(
     env: Arc<Mutex<SimulatorEnv>>,
     rusqlite_env: Arc<Mutex<SimulatorEnv>>,
-    plan: Vec<Interaction>,
+    plan: impl InteractionPlanIterator,
     last_execution: Arc<Mutex<Execution>>,
 ) -> ExecutionResult {
     tracing::info!("Executing database interaction plan...");
@@ -48,7 +58,7 @@ pub fn run_simulation(
 pub(crate) fn execute_interactions(
     env: Arc<Mutex<SimulatorEnv>>,
     rusqlite_env: Arc<Mutex<SimulatorEnv>>,
-    interactions: Vec<Interaction>,
+    mut plan: impl InteractionPlanIterator,
     state: &mut InteractionPlanState,
     conn_states: &mut [ConnectionState],
     rusqlite_states: &mut [ConnectionState],
@@ -62,15 +72,13 @@ pub(crate) fn execute_interactions(
     env.clear_tables();
     rusqlite_env.clear_tables();
 
+    let mut interaction = plan
+        .next(&mut env)
+        .expect("we should always have at least 1 interaction to start");
+
     let now = std::time::Instant::now();
 
     for _tick in 0..env.opts.ticks {
-        if state.interaction_pointer >= interactions.len() {
-            break;
-        }
-
-        let interaction = &interactions[state.interaction_pointer];
-
         let connection_index = interaction.connection_index;
         let turso_conn_state = &mut conn_states[connection_index];
         let rusqlite_conn_state = &mut rusqlite_states[connection_index];
@@ -82,37 +90,34 @@ pub(crate) fn execute_interactions(
         last_execution.connection_index = connection_index;
         last_execution.interaction_index = state.interaction_pointer;
 
-        let mut turso_state = state.clone();
-
         // first execute turso
-        let turso_res = super::execution::execute_plan(
-            &mut env,
-            interaction,
-            turso_conn_state,
-            &mut turso_state,
-        );
-
-        let mut rusqlite_state = state.clone();
+        let turso_res = super::execution::execute_plan(&mut env, &interaction, turso_conn_state);
 
         // second execute rusqlite
-        let rusqlite_res = super::execution::execute_plan(
-            &mut rusqlite_env,
-            interaction,
-            rusqlite_conn_state,
-            &mut rusqlite_state,
-        );
+        let rusqlite_res =
+            super::execution::execute_plan(&mut rusqlite_env, &interaction, rusqlite_conn_state);
 
         // Compare results
-        if let Err(err) = compare_results(
+        let next = match compare_results(
             turso_res,
             turso_conn_state,
             rusqlite_res,
             rusqlite_conn_state,
         ) {
-            return ExecutionResult::new(history, Some(err));
-        }
+            Ok(next) => next,
+            Err(err) => return ExecutionResult::new(history, Some(err)),
+        };
 
-        state.interaction_pointer += 1;
+        match next {
+            ExecutionContinuation::Stay => {}
+            ExecutionContinuation::NextInteraction => {
+                state.interaction_pointer += 1;
+                let Some(new_interaction) = plan.next(&mut env) else {
+                    break;
+                };
+                interaction = new_interaction;
+            }
+        }
 
         // Check if the maximum time for the simulation has been reached
         if now.elapsed().as_secs() >= env.opts.max_time_simulation as u64 {
@@ -129,93 +134,95 @@ pub(crate) fn execute_interactions(
 }
 
 fn compare_results(
-    turso_res: turso_core::Result<()>,
+    turso_res: turso_core::Result<ExecutionContinuation>,
     turso_conn_state: &mut ConnectionState,
-    rusqlite_res: turso_core::Result<()>,
+    rusqlite_res: turso_core::Result<ExecutionContinuation>,
     rusqlite_conn_state: &mut ConnectionState,
-) -> turso_core::Result<()> {
-    match (turso_res, rusqlite_res) {
-        (Ok(..), Ok(..)) => {
-            let limbo_values = turso_conn_state.stack.last();
+) -> turso_core::Result<ExecutionContinuation> {
+    let next = match (turso_res, rusqlite_res) {
+        (Ok(v1), Ok(v2)) => {
+            assert_eq!(v1, v2);
+            let turso_values = turso_conn_state.stack.last();
             let rusqlite_values = rusqlite_conn_state.stack.last();
-            match (limbo_values, rusqlite_values) {
-                (Some(limbo_values), Some(rusqlite_values)) => {
-                    match (limbo_values, rusqlite_values) {
-                        (Ok(limbo_values), Ok(rusqlite_values)) => {
-                            if limbo_values != rusqlite_values {
+            match (turso_values, rusqlite_values) {
+                (Some(turso_values), Some(rusqlite_values)) => {
+                    match (turso_values, rusqlite_values) {
+                        (Ok(turso_values), Ok(rusqlite_values)) => {
+                            if !compare_order_insensitive(turso_values, rusqlite_values) {
                                 tracing::error!(
                                     "returned values from limbo and rusqlite results do not match"
                                 );
-                                let diff = limbo_values
-                                    .iter()
-                                    .zip(rusqlite_values.iter())
-                                    .enumerate()
-                                    .filter(|(_, (l, r))| l != r)
-                                    .collect::<Vec<_>>();
 
-                                let diff = diff
-                                    .iter()
-                                    .flat_map(|(i, (l, r))| {
-                                        let mut diffs = vec![];
-                                        for (j, (l, r)) in l.iter().zip(r.iter()).enumerate() {
-                                            if l != r {
-                                                tracing::debug!(
-                                                    "difference at index {}, {}: {} != {}",
-                                                    i,
-                                                    j,
-                                                    l.to_string(),
-                                                    r.to_string()
-                                                );
-                                                diffs.push(((i, j), (l.clone(), r.clone())));
-                                            }
+                                fn val_to_string(sim_val: &SimValue) -> String {
+                                    match &sim_val.0 {
+                                        turso_core::Value::Blob(blob) => {
+                                            let convert_blob = || -> anyhow::Result<String> {
+                                                let val = String::from_utf8(blob.clone())?;
+                                                Ok(val)
+                                            };
+
+                                            convert_blob().unwrap_or_else(|_| sim_val.to_string())
                                         }
-                                        diffs
-                                    })
-                                    .collect::<Vec<_>>();
-                                tracing::debug!("limbo values {:?}", limbo_values);
-                                tracing::debug!("rusqlite values {:?}", rusqlite_values);
-                                tracing::debug!(
-                                    "differences: {}",
-                                    diff.iter()
-                                        .map(|((i, j), (l, r))| format!(
-                                            "\t({i}, {j}): ({l}) != ({r})"
-                                        ))
-                                        .collect::<Vec<_>>()
-                                        .join("\n")
+                                        _ => sim_val.to_string(),
+                                    }
+                                }
+
+                                let turso_string_values: Vec<Vec<_>> = turso_values
+                                    .iter()
+                                    .map(|rows| rows.iter().map(val_to_string).collect())
+                                    .sorted()
+                                    .collect();
+
+                                let rusqlite_string_values: Vec<Vec<_>> = rusqlite_values
+                                    .iter()
+                                    .map(|rows| rows.iter().map(val_to_string).collect())
+                                    .sorted()
+                                    .collect();
+
+                                let turso_string = format!("{turso_string_values:#?}");
+                                let rusqlite_string = format!("{rusqlite_string_values:#?}");
+                                let diff = SimpleDiff::from_str(
+                                    &turso_string,
+                                    &rusqlite_string,
+                                    "turso",
+                                    "rusqlite",
                                 );
+                                tracing::error!(%diff);
+
                                 return Err(turso_core::LimboError::InternalError(
                                     "returned values from limbo and rusqlite results do not match"
                                         .into(),
                                 ));
                             }
                         }
-                        (Err(limbo_err), Err(rusqlite_err)) => {
+                        (Err(turso_err), Err(rusqlite_err)) => {
                             tracing::warn!("limbo and rusqlite both fail, requires manual check");
-                            tracing::warn!("limbo error {}", limbo_err);
+                            tracing::warn!("limbo error {}", turso_err);
                             tracing::warn!("rusqlite error {}", rusqlite_err);
                         }
-                        (Ok(limbo_result), Err(rusqlite_err)) => {
+                        (Ok(turso_err), Err(rusqlite_err)) => {
                             tracing::error!(
                                 "limbo and rusqlite results do not match, limbo returned values but rusqlite failed"
                             );
-                            tracing::error!("limbo values {:?}", limbo_result);
+                            tracing::error!("limbo values {:?}", turso_err);
                             tracing::error!("rusqlite error {}", rusqlite_err);
                             return Err(turso_core::LimboError::InternalError(
                                 "limbo and rusqlite results do not match".into(),
                             ));
                         }
-                        (Err(limbo_err), Ok(_)) => {
+                        (Err(turso_err), Ok(_)) => {
                             tracing::error!(
                                 "limbo and rusqlite results do not match, limbo failed but rusqlite returned values"
                             );
-                            tracing::error!("limbo error {}", limbo_err);
+                            tracing::error!("limbo error {}", turso_err);
                             return Err(turso_core::LimboError::InternalError(
                                 "limbo and rusqlite results do not match".into(),
                             ));
                         }
                     }
+                    v1
                 }
-                (None, None) => {}
+                (None, None) => v1,
                 _ => {
                     tracing::error!("limbo and rusqlite results do not match");
                     return Err(turso_core::LimboError::InternalError(
@@ -243,7 +250,39 @@ fn compare_results(
             //       The problem is that the errors might be different, and we cannot
             //       just assume both of them being errors has the same semantics.
             // return Err(err);
+            ExecutionContinuation::NextInteraction
+        }
+    };
+    Ok(next)
+}
+
+fn count_rows(values: &[Vec<SimValue>]) -> BTreeMap<&Vec<SimValue>, i32> {
+    let mut counter = BTreeMap::new();
+    for row in values.iter() {
+        match counter.entry(row) {
+            Entry::Vacant(entry) => {
+                entry.insert(1);
+            }
+            Entry::Occupied(mut entry) => {
+                let counter = entry.get_mut();
+
+                *counter += 1;
+            }
         }
     }
-    Ok(())
+    counter
+}
+
+fn compare_order_insensitive(
+    turso_values: &[Vec<SimValue>],
+    rusqlite_values: &[Vec<SimValue>],
+) -> bool {
+    if turso_values.len() != rusqlite_values.len() {
+        return false;
+    }
+
+    let turso_counter = count_rows(turso_values);
+    let rusqlite_counter = count_rows(rusqlite_values);
+
+    turso_counter == rusqlite_counter
 }

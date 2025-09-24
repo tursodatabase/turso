@@ -1131,7 +1131,7 @@ impl Pager {
             // TODO: Unsure what the semantics of "end_tx" is for in-memory databases, ephemeral tables and ephemeral indexes.
             return Ok(IOResult::Done(PagerCommitResult::Rollback));
         };
-        let (is_write, schema_did_change) = match connection.transaction_state.get() {
+        let (is_write, schema_did_change) = match connection.get_tx_state() {
             TransactionState::Write { schema_did_change } => (true, schema_did_change),
             _ => (false, false),
         };
@@ -1153,7 +1153,7 @@ impl Pager {
         wal.borrow().end_read_tx();
 
         if schema_did_change {
-            let schema = connection.schema.borrow().clone();
+            let schema = connection.schema.read().clone();
             connection.db.update_schema_if_newer(schema)?;
         }
         Ok(IOResult::Done(commit_status))
@@ -2324,7 +2324,7 @@ impl Pager {
         }
         self.reset_internal_states();
         if schema_did_change {
-            connection.schema.replace(connection.db.clone_schema()?);
+            *connection.schema.write() = connection.db.clone_schema()?;
         }
         if is_write {
             if let Some(wal) = self.wal.as_ref() {

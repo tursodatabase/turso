@@ -2495,7 +2495,7 @@ pub mod test {
         for _i in 0..25 {
             let _ = conn.execute("insert into test (value) values (randomblob(1024)), (randomblob(1024)), (randomblob(1024))");
         }
-        let pager = conn.pager.borrow_mut();
+        let pager = conn.pager.write();
         let _ = pager.cacheflush();
         let mut wal = pager.wal.as_ref().unwrap().borrow_mut();
 
@@ -2586,7 +2586,7 @@ pub mod test {
         conn.execute("create table test(id integer primary key, value text)")
             .unwrap();
         bulk_inserts(&conn, 20, 3);
-        let completions = conn.pager.borrow_mut().cacheflush().unwrap();
+        let completions = conn.pager.write().cacheflush().unwrap();
         for c in completions {
             db.io.wait_for_completion(c).unwrap();
         }
@@ -2612,7 +2612,7 @@ pub mod test {
         // Run a RESTART checkpoint, should backfill everything and reset WAL counters,
         // but NOT truncate the file.
         {
-            let pager = conn.pager.borrow();
+            let pager = conn.pager.read();
             let mut wal = pager.wal.as_ref().unwrap().borrow_mut();
             let res = run_checkpoint_until_done(&mut *wal, &pager, CheckpointMode::Restart);
             assert_eq!(res.num_attempted, mx_before);
@@ -2658,7 +2658,7 @@ pub mod test {
         conn.execute("insert into test(value) values ('post_restart')")
             .unwrap();
         conn.pager
-            .borrow_mut()
+            .write()
             .wal
             .as_ref()
             .unwrap()
@@ -2681,14 +2681,14 @@ pub mod test {
             .execute("create table test(id integer primary key, value text)")
             .unwrap();
         bulk_inserts(&conn1.clone(), 15, 2);
-        let completions = conn1.pager.borrow_mut().cacheflush().unwrap();
+        let completions = conn1.pager.write().cacheflush().unwrap();
         for c in completions {
             db.io.wait_for_completion(c).unwrap();
         }
 
         // Force a read transaction that will freeze a lower read mark
         let readmark = {
-            let pager = conn2.pager.borrow_mut();
+            let pager = conn2.pager.write();
             let mut wal2 = pager.wal.as_ref().unwrap().borrow_mut();
             wal2.begin_read_tx().unwrap();
             wal2.get_max_frame()
@@ -2696,14 +2696,14 @@ pub mod test {
 
         // generate more frames that the reader will not see.
         bulk_inserts(&conn1.clone(), 15, 2);
-        let completions = conn1.pager.borrow_mut().cacheflush().unwrap();
+        let completions = conn1.pager.write().cacheflush().unwrap();
         for c in completions {
             db.io.wait_for_completion(c).unwrap();
         }
 
         // Run passive checkpoint, expect partial
         let (res1, max_before) = {
-            let pager = conn1.pager.borrow();
+            let pager = conn1.pager.read();
             let mut wal = pager.wal.as_ref().unwrap().borrow_mut();
             let res = run_checkpoint_until_done(
                 &mut *wal,
@@ -2728,13 +2728,13 @@ pub mod test {
         );
         // Release reader
         {
-            let pager = conn2.pager.borrow_mut();
+            let pager = conn2.pager.write();
             let wal2 = pager.wal.as_ref().unwrap().borrow_mut();
             wal2.end_read_tx();
         }
 
         // Second passive checkpoint should finish
-        let pager = conn1.pager.borrow();
+        let pager = conn1.pager.read();
         let mut wal = pager.wal.as_ref().unwrap().borrow_mut();
         let res2 = run_checkpoint_until_done(
             &mut *wal,
@@ -2758,7 +2758,7 @@ pub mod test {
         // Start a read transaction
         conn2
             .pager
-            .borrow_mut()
+            .write()
             .wal
             .as_ref()
             .unwrap()
@@ -2768,7 +2768,7 @@ pub mod test {
 
         // checkpoint should succeed here because the wal is fully checkpointed (empty)
         // so the reader is using readmark0 to read directly from the db file.
-        let p = conn1.pager.borrow();
+        let p = conn1.pager.read();
         let mut w = p.wal.as_ref().unwrap().borrow_mut();
         loop {
             match w.checkpoint(&p, CheckpointMode::Restart) {
@@ -2785,7 +2785,7 @@ pub mod test {
             }
         }
         drop(w);
-        conn2.pager.borrow_mut().end_read_tx().unwrap();
+        conn2.pager.write().end_read_tx().unwrap();
 
         conn1
             .execute("create table test(id integer primary key, value text)")
@@ -2796,8 +2796,8 @@ pub mod test {
                 .unwrap();
         }
         // now that we have some frames to checkpoint, try again
-        conn2.pager.borrow_mut().begin_read_tx().unwrap();
-        let p = conn1.pager.borrow();
+        conn2.pager.write().begin_read_tx().unwrap();
+        let p = conn1.pager.read();
         let mut w = p.wal.as_ref().unwrap().borrow_mut();
         loop {
             match w.checkpoint(&p, CheckpointMode::Restart) {
@@ -2829,7 +2829,7 @@ pub mod test {
         bulk_inserts(&conn, 10, 5);
         // Checkpoint with restart
         {
-            let pager = conn.pager.borrow();
+            let pager = conn.pager.read();
             let mut wal = pager.wal.as_ref().unwrap().borrow_mut();
             let result = run_checkpoint_until_done(&mut *wal, &pager, CheckpointMode::Restart);
             assert!(result.everything_backfilled());
@@ -2870,7 +2870,7 @@ pub mod test {
 
         // R1 starts reading
         let r1_max_frame = {
-            let pager = conn_r1.pager.borrow_mut();
+            let pager = conn_r1.pager.write();
             let mut wal = pager.wal.as_ref().unwrap().borrow_mut();
             wal.begin_read_tx().unwrap();
             wal.get_max_frame()
@@ -2879,7 +2879,7 @@ pub mod test {
 
         // R2 starts reading, sees more frames than R1
         let r2_max_frame = {
-            let pager = conn_r2.pager.borrow_mut();
+            let pager = conn_r2.pager.write();
             let mut wal = pager.wal.as_ref().unwrap().borrow_mut();
             wal.begin_read_tx().unwrap();
             wal.get_max_frame()
@@ -2887,7 +2887,7 @@ pub mod test {
 
         // try passive checkpoint, should only checkpoint up to R1's position
         let checkpoint_result = {
-            let pager = conn_writer.pager.borrow();
+            let pager = conn_writer.pager.read();
             let mut wal = pager.wal.as_ref().unwrap().borrow_mut();
             run_checkpoint_until_done(
                 &mut *wal,
@@ -2911,7 +2911,7 @@ pub mod test {
         assert_eq!(
             conn_r2
                 .pager
-                .borrow()
+                .read()
                 .wal
                 .as_ref()
                 .unwrap()
@@ -2936,7 +2936,7 @@ pub mod test {
         let max_frame_before = wal_shared.read().max_frame.load(Ordering::SeqCst);
 
         {
-            let pager = conn.pager.borrow();
+            let pager = conn.pager.read();
             let mut wal = pager.wal.as_ref().unwrap().borrow_mut();
             let _result = run_checkpoint_until_done(
                 &mut *wal,
@@ -2969,7 +2969,7 @@ pub mod test {
 
         // start a write transaction
         {
-            let pager = conn2.pager.borrow_mut();
+            let pager = conn2.pager.write();
             let mut wal = pager.wal.as_ref().unwrap().borrow_mut();
             let _ = wal.begin_read_tx().unwrap();
             wal.begin_write_tx().unwrap();
@@ -2977,7 +2977,7 @@ pub mod test {
 
         // should fail because writer lock is held
         let result = {
-            let pager = conn1.pager.borrow();
+            let pager = conn1.pager.read();
             let mut wal = pager.wal.as_ref().unwrap().borrow_mut();
             wal.checkpoint(&pager, CheckpointMode::Restart)
         };
@@ -2989,7 +2989,7 @@ pub mod test {
 
         conn2
             .pager
-            .borrow()
+            .read()
             .wal
             .as_ref()
             .unwrap()
@@ -2998,7 +2998,7 @@ pub mod test {
         // release write lock
         conn2
             .pager
-            .borrow()
+            .read()
             .wal
             .as_ref()
             .unwrap()
@@ -3007,7 +3007,7 @@ pub mod test {
 
         // now restart should succeed
         let result = {
-            let pager = conn1.pager.borrow();
+            let pager = conn1.pager.read();
             let mut wal = pager.wal.as_ref().unwrap().borrow_mut();
             run_checkpoint_until_done(&mut *wal, &pager, CheckpointMode::Restart)
         };
@@ -3025,13 +3025,13 @@ pub mod test {
             .unwrap();
 
         // Attempt to start a write transaction without a read transaction
-        let pager = conn.pager.borrow();
+        let pager = conn.pager.read();
         let mut wal = pager.wal.as_ref().unwrap().borrow_mut();
         let _ = wal.begin_write_tx();
     }
 
     fn check_read_lock_slot(conn: &Arc<Connection>, expected_slot: usize) -> bool {
-        let pager = conn.pager.borrow();
+        let pager = conn.pager.read();
         let wal = pager.wal.as_ref().unwrap().borrow();
         #[cfg(debug_assertions)]
         {
@@ -3059,7 +3059,7 @@ pub mod test {
             stmt.step().unwrap();
             let frame = conn
                 .pager
-                .borrow()
+                .read()
                 .wal
                 .as_ref()
                 .unwrap()
@@ -3087,7 +3087,7 @@ pub mod test {
 
         // passive checkpoint #1
         let result1 = {
-            let pager = conn_writer.pager.borrow();
+            let pager = conn_writer.pager.read();
             let mut wal = pager.wal.as_ref().unwrap().borrow_mut();
             run_checkpoint_until_done(
                 &mut *wal,
@@ -3104,7 +3104,7 @@ pub mod test {
 
         // passive checkpoint #2
         let result2 = {
-            let pager = conn_writer.pager.borrow();
+            let pager = conn_writer.pager.read();
             let mut wal = pager.wal.as_ref().unwrap().borrow_mut();
             run_checkpoint_until_done(
                 &mut *wal,
@@ -3153,7 +3153,7 @@ pub mod test {
 
         // Do a TRUNCATE checkpoint
         {
-            let pager = conn.pager.borrow();
+            let pager = conn.pager.read();
             let mut wal = pager.wal.as_ref().unwrap().borrow_mut();
             run_checkpoint_until_done(
                 &mut *wal,
@@ -3214,7 +3214,7 @@ pub mod test {
 
         // Do a TRUNCATE checkpoint
         {
-            let pager = conn.pager.borrow();
+            let pager = conn.pager.read();
             let mut wal = pager.wal.as_ref().unwrap().borrow_mut();
             run_checkpoint_until_done(
                 &mut *wal,
@@ -3252,7 +3252,7 @@ pub mod test {
         assert_eq!(hdr.page_size, 4096, "invalid page size");
         assert_eq!(hdr.checkpoint_seq, 1, "invalid checkpoint_seq");
         {
-            let pager = conn.pager.borrow();
+            let pager = conn.pager.read();
             let mut wal = pager.wal.as_ref().unwrap().borrow_mut();
             run_checkpoint_until_done(
                 &mut *wal,
@@ -3302,7 +3302,7 @@ pub mod test {
             .unwrap();
         // Start a read transaction on conn2
         {
-            let pager = conn2.pager.borrow_mut();
+            let pager = conn2.pager.write();
             let mut wal = pager.wal.as_ref().unwrap().borrow_mut();
             wal.begin_read_tx().unwrap();
         }
@@ -3310,7 +3310,7 @@ pub mod test {
         bulk_inserts(&conn1, 5, 5);
         // Try to start a write transaction on conn2 with a stale snapshot
         let result = {
-            let pager = conn2.pager.borrow();
+            let pager = conn2.pager.read();
             let mut wal = pager.wal.as_ref().unwrap().borrow_mut();
             wal.begin_write_tx()
         };
@@ -3319,14 +3319,14 @@ pub mod test {
 
         // End read transaction and start a fresh one
         {
-            let pager = conn2.pager.borrow();
+            let pager = conn2.pager.read();
             let mut wal = pager.wal.as_ref().unwrap().borrow_mut();
             wal.end_read_tx();
             wal.begin_read_tx().unwrap();
         }
         // Now write transaction should work
         let result = {
-            let pager = conn2.pager.borrow();
+            let pager = conn2.pager.read();
             let mut wal = pager.wal.as_ref().unwrap().borrow_mut();
             wal.begin_write_tx()
         };
@@ -3345,7 +3345,7 @@ pub mod test {
         bulk_inserts(&conn1, 5, 5);
         // Do a full checkpoint to move all data to DB file
         {
-            let pager = conn1.pager.borrow();
+            let pager = conn1.pager.read();
             let mut wal = pager.wal.as_ref().unwrap().borrow_mut();
             run_checkpoint_until_done(
                 &mut *wal,
@@ -3358,14 +3358,14 @@ pub mod test {
 
         // Start a read transaction on conn2
         {
-            let pager = conn2.pager.borrow_mut();
+            let pager = conn2.pager.write();
             let mut wal = pager.wal.as_ref().unwrap().borrow_mut();
             wal.begin_read_tx().unwrap();
         }
         // should use slot 0, as everything is backfilled
         assert!(check_read_lock_slot(&conn2, 0));
         {
-            let pager = conn1.pager.borrow();
+            let pager = conn1.pager.read();
             let wal = pager.wal.as_ref().unwrap().borrow();
             let frame = wal.find_frame(5, None);
             // since we hold readlock0, we should ignore the db file and find_frame should return none
@@ -3373,7 +3373,7 @@ pub mod test {
         }
         // Try checkpoint, should fail because reader has slot 0
         {
-            let pager = conn1.pager.borrow();
+            let pager = conn1.pager.read();
             let mut wal = pager.wal.as_ref().unwrap().borrow_mut();
             let result = wal.checkpoint(&pager, CheckpointMode::Restart);
 
@@ -3384,12 +3384,12 @@ pub mod test {
         }
         // End the read transaction
         {
-            let pager = conn2.pager.borrow();
+            let pager = conn2.pager.read();
             let wal = pager.wal.as_ref().unwrap().borrow();
             wal.end_read_tx();
         }
         {
-            let pager = conn1.pager.borrow();
+            let pager = conn1.pager.read();
             let mut wal = pager.wal.as_ref().unwrap().borrow_mut();
             let result = run_checkpoint_until_done(&mut *wal, &pager, CheckpointMode::Restart);
             assert!(
@@ -3410,7 +3410,7 @@ pub mod test {
         bulk_inserts(&conn, 8, 4);
 
         // Ensure frames are flushed to the WAL
-        let completions = conn.pager.borrow_mut().cacheflush().unwrap();
+        let completions = conn.pager.write().cacheflush().unwrap();
         for c in completions {
             db.io.wait_for_completion(c).unwrap();
         }
@@ -3422,7 +3422,7 @@ pub mod test {
 
         // Run FULL checkpoint - must backfill *all* frames up to mx_before
         let result = {
-            let pager = conn.pager.borrow();
+            let pager = conn.pager.read();
             let mut wal = pager.wal.as_ref().unwrap().borrow_mut();
             run_checkpoint_until_done(&mut *wal, &pager, CheckpointMode::Full)
         };
@@ -3443,26 +3443,26 @@ pub mod test {
 
         // First commit some data and flush (reader will snapshot here)
         bulk_inserts(&writer, 2, 3);
-        let completions = writer.pager.borrow_mut().cacheflush().unwrap();
+        let completions = writer.pager.write().cacheflush().unwrap();
         for c in completions {
             db.io.wait_for_completion(c).unwrap();
         }
 
         // Start a read transaction pinned at the current snapshot
         {
-            let pager = reader.pager.borrow_mut();
+            let pager = reader.pager.write();
             let mut wal = pager.wal.as_ref().unwrap().borrow_mut();
             wal.begin_read_tx().unwrap();
         }
         let r_snapshot = {
-            let pager = reader.pager.borrow();
+            let pager = reader.pager.read();
             let wal = pager.wal.as_ref().unwrap().borrow();
             wal.get_max_frame()
         };
 
         // Advance WAL beyond the reader's snapshot
         bulk_inserts(&writer, 3, 4);
-        let completions = writer.pager.borrow_mut().cacheflush().unwrap();
+        let completions = writer.pager.write().cacheflush().unwrap();
         for c in completions {
             db.io.wait_for_completion(c).unwrap();
         }
@@ -3471,7 +3471,7 @@ pub mod test {
 
         // FULL must return Busy while a reader is stuck behind
         {
-            let pager = writer.pager.borrow();
+            let pager = writer.pager.read();
             let mut wal = pager.wal.as_ref().unwrap().borrow_mut();
             loop {
                 match wal.checkpoint(&pager, CheckpointMode::Full) {
@@ -3489,13 +3489,13 @@ pub mod test {
 
         // Release the reader, now full mode should succeed and backfill everything
         {
-            let pager = reader.pager.borrow();
+            let pager = reader.pager.read();
             let wal = pager.wal.as_ref().unwrap().borrow();
             wal.end_read_tx();
         }
 
         let result = {
-            let pager = writer.pager.borrow();
+            let pager = writer.pager.read();
             let mut wal = pager.wal.as_ref().unwrap().borrow_mut();
             run_checkpoint_until_done(&mut *wal, &pager, CheckpointMode::Full)
         };

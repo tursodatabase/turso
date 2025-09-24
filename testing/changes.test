@@ -21,3 +21,14 @@ do_execsql_test_on_specific_db {:memory:} changes-shows-most-recent {
     insert into temp values (4), (5), (6), (7);
     select changes();
 } {4}
+
+
+# github.com/tursodatabase/turso/issues/3259
+do_execsql_test_on_specific_db {:memory:} changes-doesnt-track-indexes {
+    create table users (id integer primary key, name text, age integer);
+	create index idx_name on users(name);
+	create unique index idx_name_age on users(name, age);
+	insert into users (name, age) values ('Alice', 30),('Mike', 33),('Jim', 22),('Sarah', 44),('Rosa', 11),('Cindy', 36),('Bob', 35),('Charlie', 50);
+	UPDATE users SET name = 'young' where age < 40;
+	select changes();
+} {6}

@@ -1,6 +1,6 @@
 {
   "name": "@tursodatabase/sync-browser",
-  "version": "0.2.0-pre.6",
+  "version": "0.2.0-pre.8",
   "repository": {
     "type": "git",
     "url": "https://github.com/tursodatabase/turso"
@@ -54,8 +54,8 @@
     "#index": "./index.js"
   },
   "dependencies": {
-    "@tursodatabase/database-browser-common": "^0.2.0-pre.6",
-    "@tursodatabase/database-common": "^0.2.0-pre.6",
-    "@tursodatabase/sync-common": "^0.2.0-pre.6"
+    "@tursodatabase/database-browser-common": "^0.2.0-pre.8",
+    "@tursodatabase/database-common": "^0.2.0-pre.8",
+    "@tursodatabase/sync-common": "^0.2.0-pre.8"
   }
 }

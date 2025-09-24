@@ -6,7 +6,6 @@
     "test": "npm run test --workspaces"
   },
   "workspaces": [
-    "packages/wasm-runtime",
     "packages/common",
     "packages/native",
     "packages/browser-common",
@@ -15,5 +14,5 @@
     "sync/packages/native",
     "sync/packages/browser"
   ],
-  "version": "0.2.0-pre.6"
+  "version": "0.2.0-pre.8"
 }

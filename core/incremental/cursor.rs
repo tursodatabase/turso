@@ -316,6 +316,7 @@ mod tests {
                 enable_indexes: false,
                 enable_views: true,
                 enable_strict: false,
+                enable_load_extension: false,
             },
             None,
         )?;
@@ -341,7 +342,7 @@ mod tests {
         // Get the schema and view
         let view_mutex = conn
             .schema
-            .borrow()
+            .read()
             .get_materialized_view("test_view")
             .ok_or(crate::LimboError::InternalError(
                 "View not found".to_string(),

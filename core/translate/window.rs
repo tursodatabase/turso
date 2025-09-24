@@ -1014,15 +1014,7 @@ fn emit_return_buffered_rows(
             )?;
         }
         false => {
-            order_by_sorter_insert(
-                program,
-                &t_ctx.resolver,
-                t_ctx
-                    .meta_sort
-                    .as_ref()
-                    .expect("sort metadata must exist for ORDER BY"),
-                plan,
-            )?;
+            order_by_sorter_insert(program, t_ctx, plan)?;
         }
     }
 

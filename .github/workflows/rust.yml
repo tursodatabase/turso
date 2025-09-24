@@ -74,6 +74,8 @@ jobs:
         run: ./scripts/run-sim --maximum-tests 1000 --min-tick 10 --max-tick 50 --profile write_heavy loop -n 10 -s
       - name: Simulator Faultless
         run: ./scripts/run-sim --maximum-tests 1000 --min-tick 10 --max-tick 50 --profile faultless loop -n 10 -s
+      - name: Simulator Differential
+        run: ./scripts/run-sim --maximum-tests 1000 --differential loop -n 10 -s
 
   test-limbo:
     runs-on: blacksmith-4vcpu-ubuntu-2404

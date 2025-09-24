@@ -7902,11 +7902,11 @@ mod tests {
                     pos,
                     &record,
                     4096,
-                    conn.pager.borrow().clone(),
+                    conn.pager.read().clone(),
                     &mut fill_cell_payload_state,
                 )
             },
-            &conn.pager.borrow().clone(),
+            &conn.pager.read().clone(),
         )
         .unwrap();
         insert_into_cell(page.get_contents(), &payload, pos, 4096).unwrap();
@@ -8175,7 +8175,7 @@ mod tests {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db = Database::open_file(io.clone(), ":memory:", false, false).unwrap();
         let conn = db.connect().unwrap();
-        let pager = conn.pager.borrow().clone();
+        let pager = conn.pager.read().clone();
 
         // FIXME: handle page cache is full
         let _ = run_until_done(|| pager.allocate_page1(), &pager);
@@ -8190,7 +8190,7 @@ mod tests {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db = Database::open_file(io.clone(), ":memory:", false, false).unwrap();
         let conn = db.connect().unwrap();
-        let pager = conn.pager.borrow().clone();
+        let pager = conn.pager.read().clone();
 
         let mut cursor = BTreeCursor::new(None, pager, 1, 5);
         let result = cursor.rewind()?;
@@ -9668,11 +9668,11 @@ mod tests {
                                 cell_idx,
                                 &record,
                                 4096,
-                                conn.pager.borrow().clone(),
+                                conn.pager.read().clone(),
                                 &mut fill_cell_payload_state,
                             )
                         },
-                        &conn.pager.borrow().clone(),
+                        &conn.pager.read().clone(),
                     )
                     .unwrap();
                     if (free as usize) < payload.len() + 2 {
@@ -9750,11 +9750,11 @@ mod tests {
                                     cell_idx,
                                     &record,
                                     4096,
-                                    conn.pager.borrow().clone(),
+                                    conn.pager.read().clone(),
                                     &mut fill_cell_payload_state,
                                 )
                             },
-                            &conn.pager.borrow().clone(),
+                            &conn.pager.read().clone(),
                         )
                         .unwrap();
                         if (free as usize) < payload.len() - 2 {
@@ -10123,11 +10123,11 @@ mod tests {
                     0,
                     &record,
                     4096,
-                    conn.pager.borrow().clone(),
+                    conn.pager.read().clone(),
                     &mut fill_cell_payload_state,
                 )
             },
-            &conn.pager.borrow().clone(),
+            &conn.pager.read().clone(),
         )
         .unwrap();
 
@@ -10209,11 +10209,11 @@ mod tests {
                     0,
                     &record,
                     4096,
-                    conn.pager.borrow().clone(),
+                    conn.pager.read().clone(),
                     &mut fill_cell_payload_state,
                 )
             },
-            &conn.pager.borrow().clone(),
+            &conn.pager.read().clone(),
         )
         .unwrap();
         insert_into_cell(page.get_contents(), &payload, 0, 4096).unwrap();

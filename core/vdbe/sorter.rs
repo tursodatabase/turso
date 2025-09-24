@@ -88,6 +88,7 @@ pub struct Sorter {
     insert_state: InsertState,
     /// State machine for [Sorter::init_chunk_heap]
     init_chunk_heap_state: InitChunkHeapState,
+    seq_count: i64,
 }
 
 impl Sorter {
@@ -125,6 +126,7 @@ impl Sorter {
             sort_state: SortState::Start,
             insert_state: InsertState::Start,
             init_chunk_heap_state: InitChunkHeapState::Start,
+            seq_count: 0,
         }
     }
 
@@ -134,6 +136,21 @@ impl Sorter {
 
     pub fn has_more(&self) -> bool {
         self.current.is_some()
+    }
+
+    /// Get current sequence count and increment it
+    pub fn next_sequence(&mut self) -> i64 {
+        let current = self.seq_count;
+        self.seq_count += 1;
+        current
+    }
+
+    /// Test if at beginning of sequence (count == 0) and increment
+    /// Returns true if this was the first call (seq_count was 0)
+    pub fn seq_beginning(&mut self) -> bool {
+        let was_zero = self.seq_count == 0;
+        self.seq_count += 1;
+        was_zero
     }
 
     // We do the sorting here since this is what is called by the SorterSort instruction
@@ -578,6 +595,7 @@ struct SortableImmutableRecord {
     record: ImmutableRecord,
     cursor: RecordCursor,
     key_values: RefCell<Vec<RefValue>>,
+    key_len: usize,
     index_key_info: Rc<Vec<KeyInfo>>,
     /// The key deserialization error, if any.
     deserialization_error: RefCell<Option<LimboError>>,
@@ -601,6 +619,7 @@ impl SortableImmutableRecord {
             key_values: RefCell::new(Vec::with_capacity(key_len)),
             index_key_info,
             deserialization_error: RefCell::new(None),
+            key_len,
         })
     }
 
@@ -638,7 +657,7 @@ impl Ord for SortableImmutableRecord {
         let this_key_values_len = self.key_values.borrow().len();
         let other_key_values_len = other.key_values.borrow().len();
 
-        for i in 0..self.cursor.serial_types.len() {
+        for i in 0..self.key_len {
             // Lazily deserialize the key values if they haven't been deserialized already.
             if i >= this_key_values_len {
                 self.try_deserialize_key(i);

@@ -190,6 +190,41 @@ jobs:
         shell: bash
       - name: Test bindings
         run: docker run --rm -v $(pwd):/build -w /build node:${{ matrix.node }}-slim yarn workspace @tursodatabase/database test
+  test-db-browser-binding:
+    name: Test DB bindings on browser@${{ matrix.node }}
+    needs:
+      - build
+    strategy:
+      fail-fast: false
+      matrix:
+        node:
+          - "20"
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup node
+        uses: useblacksmith/setup-node@v5
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Install dependencies
+        run: yarn install
+      - name: Build common
+        run: yarn workspace @tursodatabase/database-common build
+      - name: Build browser-common
+        run: yarn workspace @tursodatabase/database-browser-common build
+      - name: Install playwright with deps
+        run: yarn workspace @tursodatabase/database-browser playwright install --with-deps
+      - name: Download all DB artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: bindings/javascript
+          merge-multiple: true
+          pattern: 'db*'
+      - name: List packages
+        run: ls -R .
+        shell: bash
+      - name: Test bindings
+        run: yarn workspace @tursodatabase/database-browser test
   publish:
     name: Publish
     runs-on: ubuntu-latest
@@ -198,6 +233,7 @@ jobs:
       id-token: write
     needs:
       - test-db-linux-x64-gnu-binding
+      - test-db-browser-binding
     steps:
       - uses: actions/checkout@v4
       - name: Setup node

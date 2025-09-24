@@ -354,7 +354,17 @@ fn parse_table(
         .position(|cte| cte.identifier == normalized_qualified_name)
     {
         // TODO: what if the CTE is referenced multiple times?
-        let cte_table = ctes.remove(cte_idx);
+        let mut cte_table = ctes.remove(cte_idx);
+
+        // If there's an alias provided, update the identifier to use that alias
+        if let Some(a) = maybe_alias {
+            let alias = match a {
+                ast::As::As(id) => id,
+                ast::As::Elided(id) => id,
+            };
+            cte_table.identifier = normalize_ident(alias.as_str());
+        }
+
         table_references.add_joined_table(cte_table);
         return Ok(());
     };

@@ -1136,6 +1136,20 @@ pub enum Insn {
         target_pc: BranchOffset,
     },
 
+    /// Find the next available sequence number for cursor P1. Write the sequence number into register P2.
+    /// The sequence number on the cursor is incremented after this instruction.
+    Sequence {
+        cursor_id: CursorID,
+        target_reg: usize,
+    },
+
+    /// P1 is a sorter cursor. If the sequence counter is currently zero, jump to P2. Regardless of whether or not the jump is taken, increment the the sequence value.
+    SequenceTest {
+        cursor_id: CursorID,
+        target_pc: BranchOffset,
+        value_reg: usize,
+    },
+
     // OP_Explain
     Explain {
         p1: usize,         // P1: address of instruction
@@ -1305,6 +1319,8 @@ impl InsnVariants {
             InsnVariants::Explain => execute::op_noop,
             InsnVariants::OpenDup => execute::op_open_dup,
             InsnVariants::MemMax => execute::op_mem_max,
+            InsnVariants::Sequence => execute::op_sequence,
+            InsnVariants::SequenceTest => execute::op_sequence_test,
         }
     }
 }
