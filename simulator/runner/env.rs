@@ -36,21 +36,37 @@ pub(crate) enum SimulationPhase {
     Shrink,
 }
 
+#[derive(Debug, Clone)]
+pub struct TransactionTables {
+    snapshot_tables: Vec<Table>,
+    current_tables: Vec<Table>,
+}
+
+impl TransactionTables {
+    pub fn new(tables: Vec<Table>) -> Self {
+        Self {
+            snapshot_tables: tables.clone(),
+            current_tables: tables,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct ShadowTables<'a> {
     commited_tables: &'a Vec<Table>,
-    transaction_tables: Option<&'a Vec<Table>>,
+    transaction_tables: Option<&'a TransactionTables>,
 }
 
 #[derive(Debug)]
 pub struct ShadowTablesMut<'a> {
     commited_tables: &'a mut Vec<Table>,
-    transaction_tables: &'a mut Option<Vec<Table>>,
+    transaction_tables: &'a mut Option<TransactionTables>,
 }
 
 impl<'a> ShadowTables<'a> {
     fn tables(&self) -> &'a Vec<Table> {
-        self.transaction_tables.map_or(self.commited_tables, |v| v)
+        self.transaction_tables
+            .map_or(self.commited_tables, |v| &v.current_tables)
     }
 }
 
@@ -69,24 +85,26 @@ where
     fn tables(&'a self) -> &'a Vec<Table> {
         self.transaction_tables
             .as_ref()
+            .map(|t| &t.current_tables)
             .unwrap_or(self.commited_tables)
     }
 
     fn tables_mut(&'b mut self) -> &'b mut Vec<Table> {
         self.transaction_tables
             .as_mut()
+            .map(|t| &mut t.current_tables)
             .unwrap_or(self.commited_tables)
     }
 
     pub fn create_snapshot(&mut self) {
-        *self.transaction_tables = Some(self.commited_tables.clone());
+        *self.transaction_tables = Some(TransactionTables::new(self.commited_tables.clone()));
     }
 
     pub fn apply_snapshot(&mut self) {
         // TODO: as we do not have concurrent tranasactions yet in the simulator
         // there is no conflict we are ignoring conflict problems right now
         if let Some(transation_tables) = self.transaction_tables.take() {
-            *self.commited_tables = transation_tables
+            *self.commited_tables = transation_tables.current_tables
         }
     }
 
@@ -109,36 +127,6 @@ impl<'a> DerefMut for ShadowTablesMut<'a> {
     }
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct SimulatorTables {
-    pub(crate) tables: Vec<Table>,
-    pub(crate) snapshot: Option<Vec<Table>>,
-}
-impl SimulatorTables {
-    pub(crate) fn new() -> Self {
-        Self {
-            tables: Vec::new(),
-            snapshot: None,
-        }
-    }
-
-    pub(crate) fn clear(&mut self) {
-        self.tables.clear();
-        self.snapshot = None;
-    }
-
-    pub(crate) fn push(&mut self, table: Table) {
-        self.tables.push(table);
-    }
-}
-impl Deref for SimulatorTables {
-    type Target = Vec<Table>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.tables
-    }
-}
-
 pub(crate) struct SimulatorEnv {
     pub(crate) opts: SimulatorOpts,
     pub profile: Profile,
@@ -154,7 +142,7 @@ pub(crate) struct SimulatorEnv {
     pub memory_io: bool,
 
     /// If connection state is None, means we are not in a transaction
-    pub connection_tables: Vec<Option<Vec<Table>>>,
+    pub connection_tables: Vec<Option<TransactionTables>>,
     /// Bit map indicating whether a connection has executed a query that is not transaction related
     ///
     /// E.g Select, Insert, Create
@@ -442,11 +430,7 @@ impl SimulatorEnv {
     /// Clears the commited tables and the connection tables
     pub fn clear_tables(&mut self) {
         self.committed_tables.clear();
-        self.connection_tables.iter_mut().for_each(|t| {
-            if let Some(t) = t {
-                t.clear();
-            }
-        });
+        self.connection_tables.iter_mut().for_each(|t| *t = None);
         self.connection_last_query = Bitmap::new();
     }
 
@@ -502,14 +486,14 @@ impl SimulatorEnv {
         self.update_conn_last_interaction(conn_index, Some(&Query::Rollback(Rollback)));
     }
 
-    pub fn get_conn_tables<'a>(&'a self, conn_index: usize) -> ShadowTables<'a> {
+    pub fn get_conn_tables(&self, conn_index: usize) -> ShadowTables<'_> {
         ShadowTables {
             transaction_tables: self.connection_tables.get(conn_index).unwrap().as_ref(),
             commited_tables: &self.committed_tables,
         }
     }
 
-    pub fn get_conn_tables_mut<'a>(&'a mut self, conn_index: usize) -> ShadowTablesMut<'a> {
+    pub fn get_conn_tables_mut(&mut self, conn_index: usize) -> ShadowTablesMut<'_> {
         ShadowTablesMut {
             transaction_tables: self.connection_tables.get_mut(conn_index).unwrap(),
             commited_tables: &mut self.committed_tables,
