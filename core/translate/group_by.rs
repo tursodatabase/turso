@@ -7,11 +7,15 @@ use super::{
     plan::{Distinctness, GroupBy, SelectPlan},
     result_row::emit_select_result,
 };
-use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::plan::ResultSetColumn;
 use crate::translate::{
     aggregation::{translate_aggregation_step, AggArgumentSource},
     plan::Aggregate,
+};
+use crate::translate::{
+    emitter::Resolver,
+    expr::{walk_expr, WalkControl},
+    optimizer::Optimizable,
 };
 use crate::{
     schema::PseudoCursorType,
@@ -247,14 +251,14 @@ pub fn init_group_by<'a>(
 /// on the stability of the ORDER BY sorter to preserve the traversal order
 /// of groups established by GROUP BY iteration, and no extra tiebreak
 /// `Sequence` column is appended
-pub fn is_orderby_agg_or_const(e: &ast::Expr, aggs: &[Aggregate]) -> bool {
+pub fn is_orderby_agg_or_const(resolver: &Resolver, e: &ast::Expr, aggs: &[Aggregate]) -> bool {
     if aggs
         .iter()
         .any(|agg| exprs_are_equivalent(&agg.original_expr, e))
     {
         return true;
     }
-    matches!(e, ast::Expr::Literal(_))
+    e.is_constant(resolver)
 }
 
 /// Computes the traversal order of GROUP BY keys so that the final
@@ -272,6 +276,7 @@ pub fn compute_group_by_sort_order(
     group_by_exprs: &[ast::Expr],
     order_by: &[(Box<ast::Expr>, SortOrder)],
     aggs: &[Aggregate],
+    resolver: &Resolver,
 ) -> Vec<SortOrder> {
     let groupby_len = group_by_exprs.len();
     if groupby_len == 0 || order_by.is_empty() {
@@ -279,7 +284,7 @@ pub fn compute_group_by_sort_order(
     }
     let only_agg_or_const = order_by
         .iter()
-        .all(|(e, _)| is_orderby_agg_or_const(e, aggs));
+        .all(|(e, _)| is_orderby_agg_or_const(resolver, e, aggs));
 
     if only_agg_or_const {
         let first_direction = order_by[0].1;

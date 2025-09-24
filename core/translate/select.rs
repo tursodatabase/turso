@@ -4,6 +4,7 @@ use super::plan::{
     Search, TableReferences, WhereTerm, Window,
 };
 use crate::schema::Table;
+use crate::translate::emitter::Resolver;
 use crate::translate::expr::{bind_and_rewrite_expr, ParamState};
 use crate::translate::group_by::compute_group_by_sort_order;
 use crate::translate::optimizer::optimize_plan;
@@ -20,7 +21,7 @@ use crate::{schema::Schema, vdbe::builder::ProgramBuilder, Result};
 use crate::{Connection, SymbolTable};
 use std::sync::Arc;
 use turso_parser::ast::ResultColumn;
-use turso_parser::ast::{self, CompoundSelect, Expr, SortOrder};
+use turso_parser::ast::{self, CompoundSelect, Expr};
 
 pub struct TranslateSelectResult {
     pub program: ProgramBuilder,
@@ -495,6 +496,7 @@ fn prepare_one_select_plan(
                     &group_by.exprs,
                     &plan.order_by,
                     &plan.aggregates,
+                    &Resolver::new(schema, syms),
                 ));
             }
 

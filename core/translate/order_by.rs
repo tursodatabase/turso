@@ -50,7 +50,7 @@ pub fn init_order_by(
     let sort_cursor = program.alloc_cursor_id(CursorType::Sorter);
     let only_aggs = order_by
         .iter()
-        .all(|(e, _)| is_orderby_agg_or_const(e, aggregates));
+        .all(|(e, _)| is_orderby_agg_or_const(&t_ctx.resolver, e, aggregates));
 
     // only emit sequence column if we have GROUP BY and ORDER BY is not only aggregates or constants
     let has_sequence = has_group_by && !only_aggs;
@@ -91,6 +91,7 @@ pub fn init_order_by(
         // sequence column uses BINARY collation
         collations.push(Some(CollationSeq::default()));
     }
+
     let key_len = order_by.len() + if has_sequence { 1 } else { 0 };
 
     program.emit_insn(Insn::SorterOpen {
@@ -403,9 +404,11 @@ pub fn order_by_deduplicate_result_columns(
 ) -> Vec<OrderByRemapping> {
     let mut result_column_remapping: Vec<OrderByRemapping> = Vec::new();
     let order_by_len = order_by.len();
+    // `sequence_offset` shifts the base index where non-deduped SELECT columns begin,
+    // because Sequence sits after ORDER BY keys but before result columns.
     let sequence_offset = if has_sequence { 1 } else { 0 };
 
-    let mut non_dedup_count = 0;
+    let mut i = 0;
     for rc in result_columns.iter() {
         let found = order_by
             .iter()
@@ -417,11 +420,14 @@ pub fn order_by_deduplicate_result_columns(
                 deduplicated: true,
             });
         } else {
+            // This result column is not a duplicate of any ORDER BY key, so its sorter
+            // index comes after all ORDER BY entries (hence the +order_by_len). The
+            // counter `i` tracks how many such non-duplicate result columns we've seen.
             result_column_remapping.push(OrderByRemapping {
-                orderby_sorter_idx: order_by_len + sequence_offset + non_dedup_count,
+                orderby_sorter_idx: order_by_len + sequence_offset + i,
                 deduplicated: false,
             });
-            non_dedup_count += 1;
+            i += 1;
         }
     }
 
