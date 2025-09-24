@@ -793,6 +793,7 @@ pub struct MvStore<Clock: LogicalClock> {
     txs: SkipMap<TxID, Transaction>,
     tx_ids: AtomicU64,
     next_rowid: AtomicU64,
+    next_table_id: AtomicU64,
     clock: Clock,
     storage: Storage,
     loaded_tables: RwLock<HashSet<u64>>,
@@ -823,6 +824,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             txs: SkipMap::new(),
             tx_ids: AtomicU64::new(1), // let's reserve transaction 0 for special purposes
             next_rowid: AtomicU64::new(0), // TODO: determine this from B-Tree
+            next_table_id: AtomicU64::new(2), // table id 1 / root page 1 is always sqlite_schema.
             clock,
             storage,
             loaded_tables: RwLock::new(HashSet::new()),
@@ -833,6 +835,14 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             global_header: Arc::new(RwLock::new(None)),
             blocking_checkpoint_lock: Arc::new(TursoRwLock::new()),
         }
+    }
+
+    /// MVCC does not use the pager/btree cursors to create pages until checkpoint.
+    /// This method is used to assign root page numbers when Insn::CreateBtree is used.
+    /// NOTE: during MVCC recovery (not implemented yet), [MvStore::next_table_id] must be
+    /// initialized to the current highest table id / root page number.
+    pub fn get_next_table_id(&self) -> u64 {
+        self.next_table_id.fetch_add(1, Ordering::SeqCst)
     }
 
     pub fn get_next_rowid(&self) -> i64 {
@@ -1519,7 +1529,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         // Then, scan the disk B-tree to find existing rows
         self.scan_load_table(table_id, pager)?;
 
-        self.loaded_tables.write().insert(table_id);
+        self.mark_table_as_loaded(table_id);
 
         Ok(())
     }

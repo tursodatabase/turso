@@ -6629,6 +6629,13 @@ pub fn op_create_btree(
         // TODO: implement temp databases
         todo!("temp databases not implemented yet");
     }
+
+    if let Some(mv_store) = mv_store {
+        let root_page = mv_store.get_next_table_id();
+        state.registers[*root] = Register::Value(Value::Integer(root_page as i64));
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
     // FIXME: handle page cache is full
     let root_page = return_if_io!(pager.btree_create(flags));
     state.registers[*root] = Register::Value(Value::Integer(root_page as i64));
