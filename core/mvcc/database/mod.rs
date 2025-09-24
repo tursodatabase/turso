@@ -1357,6 +1357,13 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             }
         }
 
+        if connection.schema.borrow().schema_version
+            > connection.db.schema.lock().unwrap().schema_version
+        {
+            // Connection made schema changes during tx and rolled back -> revert connection-local schema.
+            connection.schema.replace(connection.db.clone_schema()?);
+        }
+
         let tx = tx_unlocked.value();
         tx.state.store(TransactionState::Terminated);
         tracing::trace!("terminate(tx_id={})", tx_id);
