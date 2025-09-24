@@ -5354,6 +5354,49 @@ pub fn op_function(
     Ok(InsnFunctionStepResult::Step)
 }
 
+pub fn op_sequence(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+    mv_store: Option<&Arc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        Sequence {
+            cursor_id,
+            target_reg
+        },
+        insn
+    );
+    let cursor = state.get_cursor(*cursor_id).as_sorter_mut();
+    let seq_num = cursor.next_sequence();
+    state.registers[*target_reg] = Register::Value(Value::Integer(seq_num));
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_sequence_test(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+    mv_store: Option<&Arc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        SequenceTest {
+            cursor_id,
+            target_pc,
+            value_reg
+        },
+        insn
+    );
+    let cursor = state.get_cursor(*cursor_id).as_sorter_mut();
+    if cursor.seq_beginning() {
+        state.pc = target_pc.as_offset_int();
+    }
+    Ok(InsnFunctionStepResult::Step)
+}
+
 pub fn op_init_coroutine(
     program: &Program,
     state: &mut ProgramState,

@@ -4,7 +4,9 @@ use super::plan::{
     Search, TableReferences, WhereTerm, Window,
 };
 use crate::schema::Table;
+use crate::translate::emitter::Resolver;
 use crate::translate::expr::{bind_and_rewrite_expr, ParamState};
+use crate::translate::group_by::compute_group_by_sort_order;
 use crate::translate::optimizer::optimize_plan;
 use crate::translate::plan::{GroupBy, Plan, ResultSetColumn, SelectPlan};
 use crate::translate::planner::{
@@ -19,7 +21,7 @@ use crate::{schema::Schema, vdbe::builder::ProgramBuilder, Result};
 use crate::{Connection, SymbolTable};
 use std::sync::Arc;
 use turso_parser::ast::ResultColumn;
-use turso_parser::ast::{self, CompoundSelect, Expr, SortOrder};
+use turso_parser::ast::{self, CompoundSelect, Expr};
 
 pub struct TranslateSelectResult {
     pub program: ProgramBuilder,
@@ -424,7 +426,7 @@ fn prepare_one_select_plan(
                 }
 
                 plan.group_by = Some(GroupBy {
-                    sort_order: Some((0..group_by.exprs.len()).map(|_| SortOrder::Asc).collect()),
+                    sort_order: None,
                     exprs: group_by.exprs.iter().map(|expr| *expr.clone()).collect(),
                     having: if let Some(having) = group_by.having {
                         let mut predicates = vec![];
@@ -487,6 +489,16 @@ fn prepare_one_select_plan(
                 key.push((o.expr, o.order.unwrap_or(ast::SortOrder::Asc)));
             }
             plan.order_by = key;
+            if let Some(group_by) = &mut plan.group_by {
+                // now that we have resolved the ORDER BY expressions and aggregates, we can
+                // compute the necessary sort order for the GROUP BY clause
+                group_by.sort_order = Some(compute_group_by_sort_order(
+                    &group_by.exprs,
+                    &plan.order_by,
+                    &plan.aggregates,
+                    &Resolver::new(schema, syms),
+                ));
+            }
 
             // Parse the LIMIT/OFFSET clause
             (plan.limit, plan.offset) = limit.map_or(Ok((None, None)), |mut l| {
