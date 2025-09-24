@@ -510,7 +510,7 @@ impl Database {
             cache_size: AtomicI32::new(default_cache_size),
             page_size: AtomicU16::new(page_size.get_raw()),
             wal_auto_checkpoint_disabled: AtomicBool::new(false),
-            capture_data_changes: RefCell::new(CaptureDataChangesMode::Off),
+            capture_data_changes: RwLock::new(CaptureDataChangesMode::Off),
             closed: Cell::new(false),
             attached_databases: RefCell::new(DatabaseCatalog::new()),
             query_only: Cell::new(false),
@@ -999,7 +999,7 @@ pub struct Connection {
     /// Disable automatic checkpoint behaviour when DB is shutted down or WAL reach certain size
     /// Client still can manually execute PRAGMA wal_checkpoint(...) commands
     wal_auto_checkpoint_disabled: AtomicBool,
-    capture_data_changes: RefCell<CaptureDataChangesMode>,
+    capture_data_changes: RwLock<CaptureDataChangesMode>,
     closed: Cell<bool>,
     /// Attached databases
     attached_databases: RefCell<DatabaseCatalog>,
@@ -1694,11 +1694,13 @@ impl Connection {
         self.cache_size.store(size, Ordering::SeqCst);
     }
 
-    pub fn get_capture_data_changes(&self) -> std::cell::Ref<'_, CaptureDataChangesMode> {
-        self.capture_data_changes.borrow()
+    pub fn get_capture_data_changes(
+        &self,
+    ) -> parking_lot::RwLockReadGuard<'_, CaptureDataChangesMode> {
+        self.capture_data_changes.read()
     }
     pub fn set_capture_data_changes(&self, opts: CaptureDataChangesMode) {
-        self.capture_data_changes.replace(opts);
+        *self.capture_data_changes.write() = opts;
     }
     pub fn get_page_size(&self) -> PageSize {
         let value = self.page_size.load(Ordering::SeqCst);
