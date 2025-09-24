@@ -501,7 +501,7 @@ impl Database {
             ),
             database_schemas: RwLock::new(std::collections::HashMap::new()),
             auto_commit: AtomicBool::new(true),
-            transaction_state: Cell::new(TransactionState::None),
+            transaction_state: RwLock::new(TransactionState::None),
             last_insert_rowid: Cell::new(0),
             last_change: Cell::new(0),
             total_changes: Cell::new(0),
@@ -986,7 +986,7 @@ pub struct Connection {
     database_schemas: RwLock<std::collections::HashMap<usize, Arc<Schema>>>,
     /// Whether to automatically commit transaction
     auto_commit: AtomicBool,
-    transaction_state: Cell<TransactionState>,
+    transaction_state: RwLock<TransactionState>,
     last_insert_rowid: Cell<i64>,
     last_change: Cell<i64>,
     total_changes: Cell<i64>,
@@ -1115,7 +1115,7 @@ impl Connection {
         }
         // maybe_reparse_schema must be called outside of any transaction
         turso_assert!(
-            self.transaction_state.get() == TransactionState::None,
+            self.get_tx_state() == TransactionState::None,
             "unexpected start transaction"
         );
         // start read transaction manually, because we will read schema cookie once again and
@@ -1124,11 +1124,12 @@ impl Connection {
         // from now on we must be very careful with errors propagation
         // in order to not accidentally keep read transaction opened
         pager.begin_read_tx()?;
-        self.transaction_state.replace(TransactionState::Read);
+        self.set_tx_state(TransactionState::Read);
 
         let reparse_result = self.reparse_schema();
 
-        let previous = self.transaction_state.replace(TransactionState::None);
+        let previous =
+            std::mem::replace(&mut *self.transaction_state.write(), TransactionState::None);
         turso_assert!(
             matches!(previous, TransactionState::None | TransactionState::Read),
             "unexpected end transaction state"
@@ -1417,7 +1418,7 @@ impl Connection {
             .schema
             .lock()
             .map_err(|_| LimboError::SchemaLocked)?;
-        if matches!(self.transaction_state.get(), TransactionState::None)
+        if matches!(self.get_tx_state(), TransactionState::None)
             && current_schema_version != schema.schema_version
         {
             *self.schema.write() = schema.clone();
@@ -1442,7 +1443,7 @@ impl Connection {
     /// Write transaction must be opened in advance - otherwise method will panic
     #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
     pub fn write_schema_version(self: &Arc<Connection>, version: u32) -> Result<()> {
-        let TransactionState::Write { .. } = self.transaction_state.get() else {
+        let TransactionState::Write { .. } = self.get_tx_state() else {
             return Err(LimboError::InternalError(
                 "write_schema_version must be called from within Write transaction".to_string(),
             ));
@@ -1454,9 +1455,9 @@ impl Connection {
                     header.schema_cookie.get() < version,
                     "cookie can't go back in time"
                 );
-                self.transaction_state.replace(TransactionState::Write {
+                *self.transaction_state.write() = TransactionState::Write {
                     schema_did_change: true,
-                });
+                };
                 self.with_schema_mut(|schema| schema.schema_version = version);
                 header.schema_cookie = version.into();
             })
@@ -1540,9 +1541,9 @@ impl Connection {
         })?;
 
         // start write transaction and disable auto-commit mode as SQL can be executed within WAL session (at caller own risk)
-        self.transaction_state.replace(TransactionState::Write {
+        *self.transaction_state.write() = TransactionState::Write {
             schema_did_change: false,
-        });
+        };
         self.auto_commit.store(false, Ordering::SeqCst);
 
         Ok(())
@@ -1577,7 +1578,7 @@ impl Connection {
             };
 
             self.auto_commit.store(true, Ordering::SeqCst);
-            self.transaction_state.replace(TransactionState::None);
+            self.set_tx_state(TransactionState::None);
             {
                 let wal = wal.borrow_mut();
                 wal.end_write_tx();
@@ -1627,7 +1628,7 @@ impl Connection {
         }
         self.closed.set(true);
 
-        match self.transaction_state.get() {
+        match self.get_tx_state() {
             TransactionState::None => {
                 // No active transaction
             }
@@ -1639,7 +1640,7 @@ impl Connection {
                         self,
                     )
                 })?;
-                self.transaction_state.set(TransactionState::None);
+                self.set_tx_state(TransactionState::None);
             }
         }
 
@@ -2194,6 +2195,14 @@ impl Connection {
     pub fn get_busy_timeout(&self) -> std::time::Duration {
         self.busy_timeout.get()
     }
+
+    fn set_tx_state(&self, state: TransactionState) {
+        *self.transaction_state.write() = state;
+    }
+
+    fn get_tx_state(&self) -> TransactionState {
+        *self.transaction_state.read()
+    }
 }
 
 #[derive(Debug)]
@@ -2472,13 +2481,10 @@ impl Statement {
             if let Some(io) = &self.state.io_completions {
                 io.abort();
             }
-            let state = self.program.connection.transaction_state.get();
+            let state = self.program.connection.get_tx_state();
             if let TransactionState::Write { .. } = state {
                 let end_tx_res = self.pager.end_tx(true, &self.program.connection)?;
-                self.program
-                    .connection
-                    .transaction_state
-                    .set(TransactionState::None);
+                self.program.connection.set_tx_state(TransactionState::None);
                 assert!(
                     matches!(end_tx_res, IOResult::Done(_)),
                     "end_tx should not return IO as it should just end txn without flushing anything. Got {end_tx_res:?}"
