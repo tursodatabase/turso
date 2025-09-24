@@ -10,6 +10,7 @@ use crate::{
         get_io, get_writer, ApplyWriter, DbLocation, NoopProgress, OutputMode, ProgressSink,
         Settings, StderrProgress,
     },
+    manual,
     opcodes_dictionary::OPCODE_DESCRIPTIONS,
     HISTORY_FILE,
 };
@@ -255,6 +256,12 @@ impl Limbo {
         if !quiet {
             self.writeln_fmt(format_args!("Turso v{}", env!("CARGO_PKG_VERSION")))?;
             self.writeln("Enter \".help\" for usage hints.")?;
+
+            // Add random feature hint
+            if let Some(hint) = manual::get_random_feature_hint() {
+                self.writeln(&hint)?;
+            }
+
             self.writeln(
                 "This software is ALPHA, only use for development, testing, and experimentation.",
             )?;
@@ -729,6 +736,12 @@ impl Limbo {
                 }
                 Command::Clone(args) => {
                     if let Err(e) = self.clone_database(&args.output_file) {
+                        let _ = self.writeln(e.to_string());
+                    }
+                }
+                Command::Manual(args) => {
+                    let w = self.writer.as_mut().unwrap();
+                    if let Err(e) = manual::display_manual(args.page.as_deref(), w) {
                         let _ = self.writeln(e.to_string());
                     }
                 }
