@@ -6560,6 +6560,23 @@ pub fn op_open_write(
             }
         },
     };
+
+    const SQLITE_SCHEMA_ROOT_PAGE: u64 = 1;
+
+    if root_page == SQLITE_SCHEMA_ROOT_PAGE {
+        if let Some(mv_store) = mv_store {
+            let Some((tx_id, _)) = program.connection.mv_tx.get() else {
+                return Err(LimboError::InternalError(
+                    "Schema changes in MVCC mode require an exclusive MVCC transaction".to_string(),
+                ));
+            };
+            if !mv_store.is_exclusive_tx(&tx_id) {
+                // Schema changes in MVCC mode require an exclusive transaction
+                return Err(LimboError::TableLocked);
+            }
+        }
+    }
+
     let (_, cursor_type) = program.cursor_ref.get(*cursor_id).unwrap();
     let cursors = &mut state.cursors;
     let maybe_index = match cursor_type {

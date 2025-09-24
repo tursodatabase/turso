@@ -1340,7 +1340,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     }
 
     /// Returns true if the given transaction is the exclusive transaction.
-    fn is_exclusive_tx(&self, tx_id: &TxID) -> bool {
+    pub fn is_exclusive_tx(&self, tx_id: &TxID) -> bool {
         self.exclusive_tx.read().as_ref() == Some(tx_id)
     }
 
