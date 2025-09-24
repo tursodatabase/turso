@@ -3744,13 +3744,18 @@ pub fn op_agg_step(
             if acc.to_string().is_empty() {
                 *acc = col;
             } else {
-                match delimiter {
-                    Register::Value(value) => {
-                        *acc += value;
+                match col {
+                    Value::Null => {}
+                    _ => {
+                        match delimiter {
+                            Register::Value(value) => {
+                                *acc += value;
+                            }
+                            _ => unreachable!(),
+                        }
+                        *acc += col;
                     }
-                    _ => unreachable!(),
                 }
-                *acc += col;
             }
         }
         #[cfg(feature = "json")]
