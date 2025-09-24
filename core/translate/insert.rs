@@ -348,10 +348,24 @@ pub fn translate_insert(
                 (result.num_result_cols, cursor_id)
             }
         }
-        InsertBody::DefaultValues => (
-            0,
-            program.alloc_cursor_id(CursorType::BTreeTable(btree_table.clone())),
-        ),
+        InsertBody::DefaultValues => {
+            let num_values = table.columns().len();
+            values = Some(
+                table
+                    .columns()
+                    .iter()
+                    .map(|c| {
+                        c.default
+                            .clone()
+                            .unwrap_or(Box::new(ast::Expr::Literal(ast::Literal::Null)))
+                    })
+                    .collect(),
+            );
+            (
+                num_values,
+                program.alloc_cursor_id(CursorType::BTreeTable(btree_table.clone())),
+            )
+        }
     };
     let has_upsert = upsert_opt.is_some();
 
