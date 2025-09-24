@@ -581,6 +581,12 @@ def validate_fuzzy_jarowin(a):
 def validate_fuzzy_osadist(a):
     return a == "3"
 
+def validate_fuzzy_soundex(a):
+    return a == "A250"
+
+def validate_fuzzy_phonetic(a):
+    return a == "ABACAMA"
+
 def test_fuzzy():
     limbo = TestTursoShell()
     ext_path = "./target/debug/liblimbo_fuzzy"
@@ -624,6 +630,11 @@ def test_fuzzy():
         "SELECT fuzzy_osadist('awesome', 'aewsme');",
         validate_fuzzy_osadist,
         "fuzzy osadist function works",
+    )
+    limbo.run_test_fn(
+        "SELECT fuzzy_phonetic('awesome');",
+        validate_fuzzy_phonetic,
+        "fuzzy phonetic function works",
     )
 
 def test_vfs():

@@ -3,9 +3,11 @@ use std::cmp;
 use turso_ext::{register_extension, scalar, ResultCode, Value};
 mod common;
 mod editdist;
+mod phonetic;
+mod soundex;
 
 register_extension! {
-    scalars: {levenshtein, damerau_levenshtein, edit_distance, hamming, jaronwin, osadist},
+    scalars: {levenshtein, damerau_levenshtein, edit_distance, hamming, jaronwin, osadist, fuzzy_soundex, fuzzy_phonetic},
 }
 
 /// Calculates and returns the Levenshtein distance of two non NULL strings.
@@ -386,6 +388,26 @@ fn optimal_string_alignment(s1: &str, s2: &str) -> usize {
     matrix[len1][len2]
 }
 
+#[scalar(name = "fuzzy_soundex")]
+pub fn fuzzy_soundex(args: &[Value]) {
+    let arg1 = args[0].to_text();
+    if let Some(txt) = soundex::soundex(arg1) {
+        Value::from_text(txt)
+    } else {
+        Value::null()
+    }
+}
+
+#[scalar(name = "fuzzy_phonetic")]
+pub fn fuzzy_phonetic(args: &[Value]) {
+    let arg1 = args[0].to_text();
+    if let Some(txt) = phonetic::phonetic_hash_str(arg1) {
+        Value::from_text(txt)
+    } else {
+        Value::null()
+    }
+}
+
 //tests adapted from sqlean fuzzy
 #[cfg(test)]
 mod tests {
@@ -509,6 +531,42 @@ mod tests {
         for (s1, s2, expected) in cases {
             let got = optimal_string_alignment(s1, s2);
             assert_eq!(got, expected, "osadist({s1}, {s2}) failed");
+        }
+    }
+    #[test]
+    fn test_soundex() {
+        let cases = vec![
+            (None, None),
+            (Some(""), Some("".to_string())),
+            (Some("phonetics"), Some("P532".to_string())),
+            (Some("is"), Some("I200".to_string())),
+            (Some("awesome"), Some("A250".to_string())),
+        ];
+
+        for (input, expected) in cases {
+            let result = soundex::soundex(input);
+            assert_eq!(
+                result, expected,
+                "fuzzy_soundex({input:?}) failed: expected {expected:?}, got {result:?}"
+            );
+        }
+    }
+    #[test]
+    fn test_phonetic() {
+        let cases = vec![
+            (None, None),
+            (Some(""), Some("".to_string())),
+            (Some("phonetics"), Some("BAMADAC".to_string())),
+            (Some("is"), Some("AC".to_string())),
+            (Some("awesome"), Some("ABACAMA".to_string())),
+        ];
+
+        for (input, expected) in cases {
+            let result = phonetic::phonetic_hash_str(input);
+            assert_eq!(
+                result, expected,
+                "fuzzy_phonetic({input:?}) failed: expected {expected:?}, got {result:?}"
+            );
         }
     }
 }
