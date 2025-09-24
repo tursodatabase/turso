@@ -516,7 +516,7 @@ impl Database {
             query_only: AtomicBool::new(false),
             mv_tx: RwLock::new(None),
             view_transaction_states: AllViewsTxState::new(),
-            metrics: RefCell::new(ConnectionMetrics::new()),
+            metrics: RwLock::new(ConnectionMetrics::new()),
             is_nested_stmt: AtomicBool::new(false),
             encryption_key: RefCell::new(None),
             encryption_cipher_mode: Cell::new(None),
@@ -1010,7 +1010,7 @@ pub struct Connection {
     /// one entry per view that was touched in the transaction.
     view_transaction_states: AllViewsTxState,
     /// Connection-level metrics aggregation
-    pub metrics: RefCell<ConnectionMetrics>,
+    pub metrics: RwLock<ConnectionMetrics>,
     /// Whether the connection is executing a statement initiated by another statement.
     /// Generally this is only true for ParseSchema.
     is_nested_stmt: AtomicBool,
@@ -2395,7 +2395,7 @@ impl Statement {
 
         // Aggregate metrics when statement completes
         if matches!(res, Ok(StepResult::Done)) {
-            let mut conn_metrics = self.program.connection.metrics.borrow_mut();
+            let mut conn_metrics = self.program.connection.metrics.write();
             conn_metrics.record_statement(self.state.metrics.clone());
             self.busy = false;
         } else {
