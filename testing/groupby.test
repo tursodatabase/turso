@@ -346,3 +346,11 @@ Daniel|1
 Cindy|1
 Aimee|1}
 
+# In GROUP BY clauses, column aliases take precedence when resolving identifiers to columns.
+do_execsql_test_on_specific_db {:memory:} group_by_alias_precedence {
+    CREATE TABLE t(x,y);
+    INSERT INTO t VALUES (1,200),(2,100);
+    INSERT INTO t VALUES (1,200),(2,100);
+    SELECT x AS y, SUM(y) as x FROM t GROUP BY y ORDER BY x;
+} {2|200
+1|400}

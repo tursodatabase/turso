@@ -3273,6 +3273,20 @@ impl ParamState {
     }
 }
 
+/// The precedence of binding identifiers to columns.
+///
+/// TryResultColumnsFirst means that result columns (e.g. SELECT x AS y, ...) take precedence over canonical columns (e.g. SELECT x, y AS z, ...). This is the default behavior.
+///
+/// TryCanonicalColumnsFirst means that canonical columns take precedence over result columns. This is used for e.g. WHERE clauses.
+///
+/// ResultColumnsNotAllowed means that referring to result columns is not allowed. This is used e.g. for DML statements.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BindingBehavior {
+    TryResultColumnsFirst,
+    TryCanonicalColumnsFirst,
+    ResultColumnsNotAllowed,
+}
+
 /// Rewrite ast::Expr in place, binding Column references/rewriting Expr::Id -> Expr::Column
 /// using the provided TableReferences, and replacing anonymous parameters with internal named
 /// ones, as well as normalizing any DoublyQualified/Qualified quoted identifiers.
@@ -3282,6 +3296,7 @@ pub fn bind_and_rewrite_expr<'a>(
     result_columns: Option<&'a [ResultSetColumn]>,
     connection: &'a Arc<crate::Connection>,
     param_state: &mut ParamState,
+    binding_behavior: BindingBehavior,
 ) -> Result<WalkControl> {
     walk_expr_mut(
         top_level_expr,
@@ -3340,9 +3355,21 @@ pub fn bind_and_rewrite_expr<'a>(
             }
             if let Some(referenced_tables) = &mut referenced_tables {
                 match expr {
-                    // Unqualified identifier binding (including rowid aliases, outer refs, result-column fallback).
                     Expr::Id(id) => {
                         let normalized_id = normalize_ident(id.as_str());
+
+                        if binding_behavior == BindingBehavior::TryResultColumnsFirst {
+                            if let Some(result_columns) = result_columns {
+                                for result_column in result_columns.iter() {
+                                    if result_column.name(referenced_tables).is_some_and(|name| {
+                                        name.eq_ignore_ascii_case(&normalized_id)
+                                    }) {
+                                        *expr = result_column.expr.clone();
+                                        return Ok(WalkControl::Continue);
+                                    }
+                                }
+                            }
+                        }
                         if !referenced_tables.joined_tables().is_empty() {
                             if let Some(row_id_expr) = parse_row_id(
                                 &normalized_id,
@@ -3421,17 +3448,19 @@ pub fn bind_and_rewrite_expr<'a>(
                             return Ok(WalkControl::Continue);
                         }
 
-                        if let Some(result_columns) = result_columns {
-                            for result_column in result_columns.iter() {
-                                if result_column
-                                    .name(referenced_tables)
-                                    .is_some_and(|name| name.eq_ignore_ascii_case(&normalized_id))
-                                {
-                                    *expr = result_column.expr.clone();
-                                    return Ok(WalkControl::Continue);
+                        if binding_behavior == BindingBehavior::TryCanonicalColumnsFirst {
+                            if let Some(result_columns) = result_columns {
+                                for result_column in result_columns.iter() {
+                                    if result_column.name(referenced_tables).is_some_and(|name| {
+                                        name.eq_ignore_ascii_case(&normalized_id)
+                                    }) {
+                                        *expr = result_column.expr.clone();
+                                        return Ok(WalkControl::Continue);
+                                    }
                                 }
                             }
                         }
+
                         // SQLite behavior: Only double-quoted identifiers get fallback to string literals
                         // Single quotes are handled as literals earlier, unquoted identifiers must resolve to columns
                         if id.is_double_quoted() {
@@ -4054,6 +4083,7 @@ pub fn process_returning_clause(
                     None,
                     connection,
                     param_ctx,
+                    BindingBehavior::TryResultColumnsFirst,
                 )?;
 
                 result_columns.push(ResultSetColumn {

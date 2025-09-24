@@ -14,7 +14,7 @@ use crate::translate::emitter::{
 };
 use crate::translate::expr::{
     bind_and_rewrite_expr, emit_returning_results, process_returning_clause, walk_expr_mut,
-    ParamState, ReturningValueRegisters, WalkControl,
+    BindingBehavior, ParamState, ReturningValueRegisters, WalkControl,
 };
 use crate::translate::plan::TableReferences;
 use crate::translate::planner::ROWID_STRS;
@@ -148,7 +148,14 @@ pub fn translate_insert(
                         }
                         _ => {}
                     }
-                    bind_and_rewrite_expr(expr, None, None, connection, &mut param_ctx)?;
+                    bind_and_rewrite_expr(
+                        expr,
+                        None,
+                        None,
+                        connection,
+                        &mut param_ctx,
+                        BindingBehavior::ResultColumnsNotAllowed,
+                    )?;
                 }
                 values = values_expr.pop();
             }
@@ -161,10 +168,24 @@ pub fn translate_insert(
             } = &mut upsert.do_clause
             {
                 for set in sets.iter_mut() {
-                    bind_and_rewrite_expr(&mut set.expr, None, None, connection, &mut param_ctx)?;
+                    bind_and_rewrite_expr(
+                        &mut set.expr,
+                        None,
+                        None,
+                        connection,
+                        &mut param_ctx,
+                        BindingBehavior::ResultColumnsNotAllowed,
+                    )?;
                 }
                 if let Some(ref mut where_expr) = where_clause {
-                    bind_and_rewrite_expr(where_expr, None, None, connection, &mut param_ctx)?;
+                    bind_and_rewrite_expr(
+                        where_expr,
+                        None,
+                        None,
+                        connection,
+                        &mut param_ctx,
+                        BindingBehavior::ResultColumnsNotAllowed,
+                    )?;
                 }
             }
         }
