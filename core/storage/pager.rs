@@ -502,7 +502,7 @@ pub struct Pager {
     pub io: Arc<dyn crate::io::IO>,
     dirty_pages: Arc<RwLock<HashSet<usize, hash::BuildHasherDefault<hash::DefaultHasher>>>>,
 
-    commit_info: CommitInfo,
+    commit_info: RwLock<CommitInfo>,
     checkpoint_state: RwLock<CheckpointState>,
     syncing: Arc<AtomicBool>,
     auto_vacuum_mode: AtomicU8,
@@ -612,12 +612,12 @@ impl Pager {
             dirty_pages: Arc::new(RwLock::new(HashSet::with_hasher(
                 hash::BuildHasherDefault::new(),
             ))),
-            commit_info: CommitInfo {
+            commit_info: RwLock::new(CommitInfo {
                 result: RefCell::new(None),
                 completions: RefCell::new(Vec::new()),
                 state: CommitState::PrepareWal.into(),
                 time: now.into(),
-            },
+            }),
             syncing: Arc::new(AtomicBool::new(false)),
             checkpoint_state: RwLock::new(CheckpointState::Checkpoint),
             buffer_pool,
@@ -1421,7 +1421,7 @@ impl Pager {
             data_sync_retry,
         ) {
             r @ (Ok(IOResult::Done(..)) | Err(..)) => {
-                self.commit_info.state.set(CommitState::PrepareWal);
+                self.commit_info.read().state.set(CommitState::PrepareWal);
                 r
             }
             Ok(IOResult::IO(io)) => Ok(IOResult::IO(io)),
@@ -1442,44 +1442,45 @@ impl Pager {
         };
 
         loop {
-            let state = self.commit_info.state.get();
+            let state = self.commit_info.read().state.get();
             trace!(?state);
             match state {
                 CommitState::PrepareWal => {
                     let page_sz = self.get_page_size_unchecked();
                     let c = wal.lock().unwrap().prepare_wal_start(page_sz)?;
                     let Some(c) = c else {
-                        self.commit_info.state.set(CommitState::GetDbSize);
+                        self.commit_info.read().state.set(CommitState::GetDbSize);
                         continue;
                     };
-                    self.commit_info.state.set(CommitState::PrepareWalSync);
+                    self.commit_info.read().state.set(CommitState::PrepareWalSync);
                     if !c.is_completed() {
                         io_yield_one!(c);
                     }
                 }
                 CommitState::PrepareWalSync => {
                     let c = wal.lock().unwrap().prepare_wal_finish()?;
-                    self.commit_info.state.set(CommitState::GetDbSize);
+                    self.commit_info.read().state.set(CommitState::GetDbSize);
                     if !c.is_completed() {
                         io_yield_one!(c);
                     }
                 }
                 CommitState::GetDbSize => {
                     let db_size = return_if_io!(self.with_header(|header| header.database_size));
-                    self.commit_info.state.set(CommitState::PrepareFrames {
+                    self.commit_info.read().state.set(CommitState::PrepareFrames {
                         db_size: db_size.get(),
                     });
                 }
                 CommitState::PrepareFrames { db_size } => {
                     let now = self.io.now();
-                    self.commit_info.time.set(now);
+                    self.commit_info.read().time.set(now);
 
                     let dirty_ids: Vec<usize> = self.dirty_pages.read().iter().copied().collect();
                     if dirty_ids.is_empty() {
                         return Ok(IOResult::Done(PagerCommitResult::WalWritten));
                     }
 
-                    let mut completions = self.commit_info.completions.borrow_mut();
+                    let commit_info_guard = self.commit_info.read();
+                    let mut completions = commit_info_guard.completions.borrow_mut();
                     completions.clear();
                     let page_sz = self.get_page_size_unchecked();
                     let mut pages: Vec<PageRef> = Vec::with_capacity(dirty_ids.len().min(IOV_MAX));
@@ -1532,14 +1533,15 @@ impl Pager {
                             if wal_auto_checkpoint_disabled
                                 || !wal.lock().unwrap().should_checkpoint()
                             {
-                                *self.commit_info.result.borrow_mut() =
+                                let commit_info_guard = self.commit_info.read();
+                                *commit_info_guard.result.borrow_mut() =
                                     Some(PagerCommitResult::WalWritten);
-                                self.commit_info.state.set(CommitState::Done);
+                                self.commit_info.read().state.set(CommitState::Done);
                                 continue;
                             }
-                            self.commit_info.state.set(CommitState::Checkpoint);
+                            self.commit_info.read().state.set(CommitState::Checkpoint);
                         } else {
-                            self.commit_info.state.set(CommitState::SyncWal);
+                            self.commit_info.read().state.set(CommitState::SyncWal);
                         }
                     }
                 }
@@ -1552,16 +1554,21 @@ impl Pager {
                         }
                         Err(e) => return Err(e),
                     };
-                    self.commit_info.completions.borrow_mut().push(c);
+                    {
+                        let commit_info_guard = self.commit_info.read();
+                        commit_info_guard.completions.borrow_mut().push(c);
+                    }
                     if wal_auto_checkpoint_disabled || !wal.lock().unwrap().should_checkpoint() {
-                        *self.commit_info.result.borrow_mut() = Some(PagerCommitResult::WalWritten);
-                        self.commit_info.state.set(CommitState::Done);
+                        let commit_info_guard = self.commit_info.read();
+                        *commit_info_guard.result.borrow_mut() = Some(PagerCommitResult::WalWritten);
+                        self.commit_info.read().state.set(CommitState::Done);
                         continue;
                     }
-                    self.commit_info.state.set(CommitState::Checkpoint);
+                    self.commit_info.read().state.set(CommitState::Checkpoint);
                 }
                 CommitState::Checkpoint => {
-                    let mut completions = self.commit_info.completions.borrow_mut();
+                    let commit_info_guard = self.commit_info.read();
+                    let mut completions = commit_info_guard.completions.borrow_mut();
                     match self.checkpoint()? {
                         IOResult::IO(cmp) => {
                             match cmp {
@@ -1576,13 +1583,14 @@ impl Pager {
                             io_yield_many!(std::mem::take(&mut *completions));
                         }
                         IOResult::Done(res) => {
-                            *self.commit_info.result.borrow_mut() =
+                            let commit_info_guard = self.commit_info.read();
+                            *commit_info_guard.result.borrow_mut() =
                                 Some(PagerCommitResult::Checkpointed(res));
                             // Skip sync if synchronous mode is OFF
                             if sync_mode == crate::SyncMode::Off {
-                                self.commit_info.state.set(CommitState::Done);
+                                self.commit_info.read().state.set(CommitState::Done);
                             } else {
-                                self.commit_info.state.set(CommitState::SyncDbFile);
+                                self.commit_info.read().state.set(CommitState::SyncDbFile);
                             }
                         }
                     }
@@ -1590,7 +1598,8 @@ impl Pager {
                 CommitState::SyncDbFile => {
                     let sync_result =
                         sqlite3_ondisk::begin_sync(self.db_file.clone(), self.syncing.clone());
-                    self.commit_info
+                    let commit_info_guard = self.commit_info.read();
+                    commit_info_guard
                         .completions
                         .borrow_mut()
                         .push(match sync_result {
@@ -1600,7 +1609,7 @@ impl Pager {
                             }
                             Err(e) => return Err(e),
                         });
-                    self.commit_info.state.set(CommitState::Done);
+                    self.commit_info.read().state.set(CommitState::Done);
                 }
                 CommitState::Done => {
                     tracing::debug!(
@@ -1608,16 +1617,18 @@ impl Pager {
                         self.io
                             .now()
                             .to_system_time()
-                            .duration_since(self.commit_info.time.get().to_system_time())
+                            .duration_since(self.commit_info.read().time.get().to_system_time())
                             .unwrap()
                             .as_millis()
                     );
-                    let mut completions = self.commit_info.completions.borrow_mut();
+                    let commit_info_guard = self.commit_info.read();
+                    let mut completions = commit_info_guard.completions.borrow_mut();
                     if completions.iter().all(|c| c.is_completed()) {
                         completions.clear();
-                        self.commit_info.state.set(CommitState::PrepareWal);
+                        self.commit_info.read().state.set(CommitState::PrepareWal);
                         wal.lock().unwrap().finish_append_frames_commit()?;
-                        let result = self.commit_info.result.borrow_mut().take();
+                        let commit_info_guard = self.commit_info.read();
+                        let result = commit_info_guard.result.borrow_mut().take();
                         return Ok(IOResult::Done(result.expect("commit result should be set")));
                     }
                     io_yield_many!(std::mem::take(&mut completions));
@@ -2345,8 +2356,8 @@ impl Pager {
     fn reset_internal_states(&self) {
         *self.checkpoint_state.write() = CheckpointState::Checkpoint;
         self.syncing.store(false, Ordering::SeqCst);
-        self.commit_info.state.set(CommitState::PrepareWal);
-        self.commit_info.time.set(self.io.now());
+        self.commit_info.read().state.set(CommitState::PrepareWal);
+        self.commit_info.read().time.set(self.io.now());
         *self.allocate_page_state.write() = AllocatePageState::Start;
         *self.free_page_state.write() = FreePageState::Start;
         #[cfg(not(feature = "omit_autovacuum"))]
