@@ -837,7 +837,7 @@ impl Program {
                     let Some((tx_id, _)) = conn.mv_tx.get() else {
                         return Ok(IOResult::Done(()));
                     };
-                    let state_machine = mv_store.commit_tx(tx_id, pager.clone(), &conn).unwrap();
+                    let state_machine = mv_store.commit_tx(tx_id, &conn).unwrap();
                     program_state.commit_state = CommitState::CommitingMvcc { state_machine };
                 }
                 let CommitState::CommitingMvcc { state_machine } = &mut program_state.commit_state
