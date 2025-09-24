@@ -63,7 +63,7 @@ use parking_lot::RwLock;
 use schema::Schema;
 use std::{
     borrow::Cow,
-    cell::{Cell, RefCell},
+    cell::RefCell,
     collections::HashMap,
     fmt::{self, Display},
     num::NonZero,
@@ -522,7 +522,7 @@ impl Database {
             encryption_cipher_mode: RwLock::new(None),
             sync_mode: RwLock::new(SyncMode::Full),
             data_sync_retry: AtomicBool::new(false),
-            busy_timeout: Cell::new(Duration::new(0, 0)),
+            busy_timeout: RwLock::new(Duration::new(0, 0)),
         });
         self.n_connections
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -1020,7 +1020,7 @@ pub struct Connection {
     data_sync_retry: AtomicBool,
     /// User defined max accumulated Busy timeout duration
     /// Default is 0 (no timeout)
-    busy_timeout: Cell<std::time::Duration>,
+    busy_timeout: RwLock<std::time::Duration>,
 }
 
 impl Drop for Connection {
@@ -2202,11 +2202,11 @@ impl Connection {
     ///
     /// This slight api change demonstrated a better throughtput in `perf/throughput/turso` benchmark
     pub fn set_busy_timeout(&self, duration: std::time::Duration) {
-        self.busy_timeout.set(duration);
+        *self.busy_timeout.write() = duration;
     }
 
     pub fn get_busy_timeout(&self) -> std::time::Duration {
-        self.busy_timeout.get()
+        *self.busy_timeout.read()
     }
 
     fn set_tx_state(&self, state: TransactionState) {
@@ -2405,7 +2405,7 @@ impl Statement {
 
         if matches!(res, Ok(StepResult::Busy)) {
             let now = self.pager.io.now();
-            let max_duration = self.program.connection.busy_timeout.get();
+            let max_duration = *self.program.connection.busy_timeout.read();
             self.busy_timeout = match self.busy_timeout.take() {
                 None => {
                     let mut result = BusyTimeout::new(now);
