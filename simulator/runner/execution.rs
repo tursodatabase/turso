@@ -344,10 +344,6 @@ fn execute_query_rusqlite(
     query: &Query,
 ) -> rusqlite::Result<Vec<Vec<SimValue>>> {
     match query {
-        Query::Create(create) => {
-            connection.execute(create.to_string().as_str(), ())?;
-            Ok(vec![])
-        }
         Query::Select(select) => {
             let mut stmt = connection.prepare(select.to_string().as_str())?;
             let columns = stmt.column_count();
@@ -372,36 +368,8 @@ fn execute_query_rusqlite(
             }
             Ok(result)
         }
-        Query::Insert(insert) => {
-            connection.execute(insert.to_string().as_str(), ())?;
-            Ok(vec![])
-        }
-        Query::Delete(delete) => {
-            connection.execute(delete.to_string().as_str(), ())?;
-            Ok(vec![])
-        }
-        Query::Drop(drop) => {
-            connection.execute(drop.to_string().as_str(), ())?;
-            Ok(vec![])
-        }
-        Query::Update(update) => {
-            connection.execute(update.to_string().as_str(), ())?;
-            Ok(vec![])
-        }
-        Query::CreateIndex(create_index) => {
-            connection.execute(create_index.to_string().as_str(), ())?;
-            Ok(vec![])
-        }
-        Query::Begin(begin) => {
-            connection.execute(begin.to_string().as_str(), ())?;
-            Ok(vec![])
-        }
-        Query::Commit(commit) => {
-            connection.execute(commit.to_string().as_str(), ())?;
-            Ok(vec![])
-        }
-        Query::Rollback(rollback) => {
-            connection.execute(rollback.to_string().as_str(), ())?;
+        _ => {
+            connection.execute(query.to_string().as_str(), ())?;
             Ok(vec![])
         }
     }
