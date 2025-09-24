@@ -703,3 +703,50 @@ fn test_bind_parameters_delete_rowid_alias_seek_out_of_order() -> anyhow::Result
     assert_eq!(ins.parameters().count(), 4);
     Ok(())
 }
+
+#[test]
+fn test_cte_alias() -> anyhow::Result<()> {
+    let tmp_db = TempDatabase::new_with_rusqlite(
+        "CREATE TABLE test (id INTEGER PRIMARY KEY, name TEXT);",
+        false,
+    );
+    let conn = tmp_db.connect_limbo();
+    conn.execute("INSERT INTO test (id, name) VALUES (1, 'Limbo');")?;
+    conn.execute("INSERT INTO test (id, name) VALUES (2, 'Turso');")?;
+
+    let mut stmt1 = conn.prepare(
+        "WITH a1 AS (SELECT id FROM test WHERE name = 'Limbo') SELECT a2.id FROM a1 AS a2",
+    )?;
+    loop {
+        match stmt1.step()? {
+            StepResult::Row => {
+                let row = stmt1.row().unwrap();
+                assert_eq!(row.get::<&Value>(0).unwrap(), &Value::Integer(1));
+                break;
+            }
+            StepResult::Done => {
+                panic!("Expected a row but got Done");
+            }
+            StepResult::IO => stmt1.run_once()?,
+            _ => panic!("Unexpected step result"),
+        }
+    }
+
+    let mut stmt2 = conn
+        .prepare("WITH a1 AS (SELECT id FROM test WHERE name = 'Turso') SELECT a2.id FROM a1 a2")?;
+    loop {
+        match stmt2.step()? {
+            StepResult::Row => {
+                let row = stmt2.row().unwrap();
+                assert_eq!(row.get::<&Value>(0).unwrap(), &Value::Integer(2));
+                break;
+            }
+            StepResult::Done => {
+                panic!("Expected a row but got Done");
+            }
+            StepResult::IO => stmt2.run_once()?,
+            _ => panic!("Unexpected step result"),
+        }
+    }
+    Ok(())
+}
