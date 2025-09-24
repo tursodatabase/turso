@@ -133,6 +133,17 @@ do_execsql_test_in_memory_any_error fail-alter-table-drop-unique-column-constrai
     ALTER TABLE t DROP b;
 }
 
+
+# refer https://github.com/tursodatabase/turso/issues/3231
+do_execsql_test_in_memory_any_error fail-alter-table-add-duplicate-column {
+    CREATE TABLE t1 (a);
+    ALTER TABLE t1 ADD COLUMN a;
+}
+do_execsql_test_in_memory_any_error fail-alter-table-add-duplicate-column-case-insensitive {
+    CREATE TABLE t1 (a);
+    ALTER TABLE t1 ADD COLUMN A;
+}
+
 do_execsql_test_in_memory_any_error fail-alter-table-drop-primary-key-column {
     CREATE TABLE t (a PRIMARY KEY, b);
     ALTER TABLE t DROP a;
