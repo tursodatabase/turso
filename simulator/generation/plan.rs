@@ -239,7 +239,16 @@ impl InteractionPlan {
             self.plan.push(interactions);
             Some(out_interactions)
         } else {
-            None
+            // after we generated all interactions if some connection is still in a transaction, commit
+            (0..env.connections.len())
+                .find(|idx| env.conn_in_transaction(*idx))
+                .map(|conn_index| {
+                    let query = Query::Commit(Commit);
+                    let interaction = Interactions::new(conn_index, InteractionsType::Query(query));
+                    let out_interactions = interaction.interactions();
+                    self.plan.push(interaction);
+                    out_interactions
+                })
         }
     }
 
@@ -292,6 +301,7 @@ pub trait InteractionPlanIterator {
 }
 
 impl<T: InteractionPlanIterator> InteractionPlanIterator for &mut T {
+    #[inline]
     fn next(&mut self, env: &mut SimulatorEnv) -> Option<Interaction> {
         T::next(self, env)
     }
@@ -332,6 +342,7 @@ impl<I> InteractionPlanIterator for PlanIterator<I>
 where
     I: Iterator<Item = Interaction>,
 {
+    #[inline]
     fn next(&mut self, _env: &mut SimulatorEnv) -> Option<Interaction> {
         self.iter.next()
     }
