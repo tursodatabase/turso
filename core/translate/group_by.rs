@@ -1,4 +1,4 @@
-use turso_parser::ast;
+use turso_parser::ast::{self, SortOrder};
 
 use super::{
     emitter::TranslateCtx,
@@ -7,9 +7,12 @@ use super::{
     plan::{Distinctness, GroupBy, SelectPlan},
     result_row::emit_select_result,
 };
-use crate::translate::aggregation::{translate_aggregation_step, AggArgumentSource};
 use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::plan::ResultSetColumn;
+use crate::translate::{
+    aggregation::{translate_aggregation_step, AggArgumentSource},
+    plan::Aggregate,
+};
 use crate::{
     schema::PseudoCursorType,
     translate::collate::CollationSeq,
@@ -229,6 +232,70 @@ pub fn init_group_by<'a>(
         },
     });
     Ok(())
+}
+
+/// Returns whether an ORDER BY expression should be treated as an
+/// aggregate-position term for the purposes of tie-ordering.
+///
+/// We classify an ORDER BY term as "aggregate or constant" when:
+/// it is syntactically equivalent to one of the finalized aggregate
+/// expressions for this SELECT (`COUNT(*)`, `SUM(col)`, `MAX(price)`), or
+/// it is a constant literal
+///
+/// Why this matters:
+/// When ORDER BY consists only of aggregates and/or constants, SQLite relies
+/// on the stability of the ORDER BY sorter to preserve the traversal order
+/// of groups established by GROUP BY iteration, and no extra tiebreak
+/// `Sequence` column is appended
+pub fn is_orderby_agg_or_const(e: &ast::Expr, aggs: &[Aggregate]) -> bool {
+    if aggs
+        .iter()
+        .any(|agg| exprs_are_equivalent(&agg.original_expr, e))
+    {
+        return true;
+    }
+    matches!(e, ast::Expr::Literal(_))
+}
+
+/// Computes the traversal order of GROUP BY keys so that the final
+/// ORDER BY matches SQLite's tie-breaking semantics.
+///
+/// If there are no GROUP BY keys or no ORDER BY terms, all keys default to ascending.
+///
+/// If *every* ORDER BY term is an aggregate or a constant then we mirror the
+/// direction of the first ORDER BY term across all GROUP BY keys.
+///
+/// Otherwise (mixed ORDER BY: at least one non-aggregate, non-constant term),
+/// we try to mirror explicit directions for any GROUP BY expression that
+/// appears in ORDER BY, and the remaining keys default to `ASC`.
+pub fn compute_group_by_sort_order(
+    group_by_exprs: &[ast::Expr],
+    order_by: &[(Box<ast::Expr>, SortOrder)],
+    aggs: &[Aggregate],
+) -> Vec<SortOrder> {
+    let groupby_len = group_by_exprs.len();
+    if groupby_len == 0 || order_by.is_empty() {
+        return vec![SortOrder::Asc; groupby_len];
+    }
+    let only_agg_or_const = order_by
+        .iter()
+        .all(|(e, _)| is_orderby_agg_or_const(e, aggs));
+
+    if only_agg_or_const {
+        let first_direction = order_by[0].1;
+        return vec![first_direction; groupby_len];
+    }
+
+    let mut result = vec![SortOrder::Asc; groupby_len];
+    for (idx, groupby_expr) in group_by_exprs.iter().enumerate() {
+        if let Some((_, direction)) = order_by
+            .iter()
+            .find(|(expr, _)| exprs_are_equivalent(expr, groupby_expr))
+        {
+            result[idx] = *direction;
+        }
+    }
+    result
 }
 
 fn collect_non_aggregate_expressions<'a>(
@@ -736,15 +803,7 @@ pub fn group_by_emit_row_phase<'a>(
             )?;
         }
         false => {
-            order_by_sorter_insert(
-                program,
-                &t_ctx.resolver,
-                t_ctx
-                    .meta_sort
-                    .as_ref()
-                    .expect("sort metadata must exist for ORDER BY"),
-                plan,
-            )?;
+            order_by_sorter_insert(program, t_ctx, plan)?;
         }
     }
 

@@ -858,15 +858,7 @@ fn emit_loop_source(
             Ok(())
         }
         LoopEmitTarget::OrderBySorter => {
-            order_by_sorter_insert(
-                program,
-                &t_ctx.resolver,
-                t_ctx
-                    .meta_sort
-                    .as_ref()
-                    .expect("sort metadata must exist for ORDER BY"),
-                plan,
-            )?;
+            order_by_sorter_insert(program, t_ctx, plan)?;
 
             if let Distinctness::Distinct { ctx } = &plan.distinctness {
                 let distinct_ctx = ctx.as_ref().expect("distinct context must exist");

@@ -299,6 +299,8 @@ pub fn emit_query<'a>(
             &plan.result_columns,
             &plan.order_by,
             &plan.table_references,
+            plan.group_by.is_some(),
+            &plan.aggregates,
         )?;
     }
 
