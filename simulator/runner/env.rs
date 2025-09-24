@@ -142,6 +142,8 @@ pub(crate) struct SimulatorEnv {
     pub(crate) io: Arc<dyn SimIO>,
     pub(crate) db: Option<Arc<Database>>,
     pub(crate) rng: ChaCha8Rng,
+
+    seed: u64,
     pub(crate) paths: Paths,
     pub(crate) type_: SimulationType,
     pub(crate) phase: SimulationPhase,
@@ -162,6 +164,7 @@ impl SimulatorEnv {
             io: self.io.clone(),
             db: self.db.clone(),
             rng: self.rng.clone(),
+            seed: self.seed,
             paths: self.paths.clone(),
             type_: self.type_,
             phase: self.phase,
@@ -256,6 +259,12 @@ impl SimulatorEnv {
 
     pub fn choose_conn(&self, rng: &mut impl Rng) -> usize {
         rng.random_range(0..self.connections.len())
+    }
+
+    /// Rng only used for generating interactions. By having a separate Rng we can guarantee that a particular seed
+    /// will always create the same interactions plan, regardless of the changes that happen in the Database code
+    pub fn gen_rng(&self) -> ChaCha8Rng {
+        ChaCha8Rng::seed_from_u64(self.seed)
     }
 }
 
@@ -373,6 +382,7 @@ impl SimulatorEnv {
             connections,
             paths,
             rng,
+            seed,
             io,
             db: Some(db),
             type_: simulation_type,

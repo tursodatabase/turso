@@ -5,7 +5,7 @@ import {
     WASI as __WASI,
     instantiateNapiModuleSync,
     MessageHandler
-} from '@tursodatabase/wasm-runtime'
+} from '@napi-rs/wasm-runtime'
 
 function getUint8ArrayFromMemory(memory: WebAssembly.Memory, ptr: number, len: number): Uint8Array {
     ptr = ptr >>> 0;

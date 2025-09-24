@@ -7,7 +7,10 @@ use turso_core::{Connection, LimboError, Result, StepResult, Value};
 use crate::{
     generation::{
         Shadow as _,
-        plan::{ConnectionState, Interaction, InteractionPlanState, InteractionType, ResultSet},
+        plan::{
+            ConnectionState, Interaction, InteractionPlanIterator, InteractionPlanState,
+            InteractionType, ResultSet,
+        },
     },
     model::Query,
 };
@@ -55,7 +58,7 @@ impl ExecutionResult {
 
 pub(crate) fn execute_interactions(
     env: Arc<Mutex<SimulatorEnv>>,
-    interactions: Vec<Interaction>,
+    mut plan: impl InteractionPlanIterator,
     state: &mut InteractionPlanState,
     conn_states: &mut [ConnectionState],
     last_execution: Arc<Mutex<Execution>>,
@@ -67,14 +70,12 @@ pub(crate) fn execute_interactions(
 
     env.clear_tables();
 
+    let mut interaction = plan
+        .next(&mut env)
+        .expect("we should always have at least 1 interaction to start");
+
     for _tick in 0..env.opts.ticks {
         tracing::trace!("Executing tick {}", _tick);
-
-        if state.interaction_pointer >= interactions.len() {
-            break;
-        }
-
-        let interaction = &interactions[state.interaction_pointer];
 
         let connection_index = interaction.connection_index;
         let conn_state = &mut conn_states[connection_index];
@@ -86,11 +87,18 @@ pub(crate) fn execute_interactions(
         last_execution.connection_index = connection_index;
         last_execution.interaction_index = state.interaction_pointer;
         // Execute the interaction for the selected connection
-        match execute_plan(&mut env, interaction, conn_state, state) {
-            Ok(_) => {}
+        match execute_plan(&mut env, &interaction, conn_state) {
+            Ok(ExecutionContinuation::NextInteraction) => {
+                state.interaction_pointer += 1;
+                let Some(new_interaction) = plan.next(&mut env) else {
+                    break;
+                };
+                interaction = new_interaction;
+            }
             Err(err) => {
                 return ExecutionResult::new(history, Some(err));
             }
+            _ => {}
         }
         // Check if the maximum time for the simulation has been reached
         if now.elapsed().as_secs() >= env.opts.max_time_simulation as u64 {
@@ -110,33 +118,17 @@ pub fn execute_plan(
     env: &mut SimulatorEnv,
     interaction: &Interaction,
     conn_state: &mut ConnectionState,
-    state: &mut InteractionPlanState,
-) -> Result<()> {
+) -> Result<ExecutionContinuation> {
     let connection_index = interaction.connection_index;
     let connection = &mut env.connections[connection_index];
     if let SimConnection::Disconnected = connection {
         tracing::debug!("connecting {}", connection_index);
         env.connect(connection_index);
+        Ok(ExecutionContinuation::Stay)
     } else {
         tracing::debug!("connection {} already connected", connection_index);
-        match execute_interaction(env, interaction, &mut conn_state.stack) {
-            Ok(next_execution) => {
-                tracing::debug!("connection {} processed", connection_index);
-                // Move to the next interaction or property
-                match next_execution {
-                    ExecutionContinuation::NextInteraction => {
-                        state.interaction_pointer += 1;
-                    }
-                }
-            }
-            Err(err) => {
-                tracing::error!("error {}", err);
-                return Err(err);
-            }
-        }
+        execute_interaction(env, interaction, &mut conn_state.stack)
     }
-
-    Ok(())
 }
 
 /// The next point of control flow after executing an interaction.
@@ -145,6 +137,8 @@ pub fn execute_plan(
 /// indicates the next step in the plan.
 #[derive(PartialEq, Debug)]
 pub(crate) enum ExecutionContinuation {
+    /// Stay in the current interaction
+    Stay,
     /// Default continuation, execute the next interaction.
     NextInteraction,
     //  /// Typically used in the case of preconditions failures, skip to the next property.

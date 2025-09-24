@@ -864,12 +864,12 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
             }
             CommitState::EndCommitLogicalLog { end_ts } => {
                 let connection = self.connection.clone();
-                let schema_did_change = match connection.transaction_state.get() {
+                let schema_did_change = match connection.get_tx_state() {
                     crate::TransactionState::Write { schema_did_change } => schema_did_change,
                     _ => false,
                 };
                 if schema_did_change {
-                    let schema = connection.schema.borrow().clone();
+                    let schema = connection.schema.read().clone();
                     connection.db.update_schema_if_newer(schema)?;
                 }
                 let tx = mvcc_store.txs.get(&self.tx_id).unwrap();

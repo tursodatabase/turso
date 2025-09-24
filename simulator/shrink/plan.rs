@@ -339,9 +339,9 @@ impl InteractionPlan {
         let last_execution = Arc::new(Mutex::new(*failing_execution));
         let result = SandboxedResult::from(
             std::panic::catch_unwind(|| {
-                let interactions = test_plan.interactions_list();
+                let plan = test_plan.static_iterator();
 
-                run_simulation(env.clone(), interactions, last_execution.clone())
+                run_simulation(env.clone(), plan, last_execution.clone())
             }),
             last_execution,
         );

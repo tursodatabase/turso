@@ -207,6 +207,13 @@ pub fn translate_alter_table(
                 }
             }
 
+            let new_column_name = column.name.as_ref().unwrap();
+            if btree.get_column(new_column_name).is_some() {
+                return Err(LimboError::ParseError(
+                    "duplicate column name: ".to_string() + new_column_name,
+                ));
+            }
+
             // TODO: All quoted ids will be quoted with `[]`, we should store some info from the parsed AST
             btree.columns.push(column.clone());
 

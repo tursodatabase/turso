@@ -3,7 +3,10 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use crate::generation::plan::{ConnectionState, Interaction, InteractionPlanState};
+use crate::{
+    generation::plan::{ConnectionState, InteractionPlanIterator, InteractionPlanState},
+    runner::execution::ExecutionContinuation,
+};
 
 use super::{
     env::SimulatorEnv,
@@ -13,7 +16,7 @@ use super::{
 pub fn run_simulation(
     env: Arc<Mutex<SimulatorEnv>>,
     doublecheck_env: Arc<Mutex<SimulatorEnv>>,
-    plan: Vec<Interaction>,
+    plan: impl InteractionPlanIterator,
     last_execution: Arc<Mutex<Execution>>,
 ) -> ExecutionResult {
     tracing::info!("Executing database interaction plan...");
@@ -78,7 +81,7 @@ pub fn run_simulation(
 pub(crate) fn execute_plans(
     env: Arc<Mutex<SimulatorEnv>>,
     doublecheck_env: Arc<Mutex<SimulatorEnv>>,
-    interactions: Vec<Interaction>,
+    mut plan: impl InteractionPlanIterator,
     state: &mut InteractionPlanState,
     conn_states: &mut [ConnectionState],
     doublecheck_states: &mut [ConnectionState],
@@ -92,15 +95,13 @@ pub(crate) fn execute_plans(
     env.clear_tables();
     doublecheck_env.clear_tables();
 
+    let mut interaction = plan
+        .next(&mut env)
+        .expect("we should always have at least 1 interaction to start");
+
     let now = std::time::Instant::now();
 
     for _tick in 0..env.opts.ticks {
-        if state.interaction_pointer >= interactions.len() {
-            break;
-        }
-
-        let interaction = &interactions[state.interaction_pointer];
-
         let connection_index = interaction.connection_index;
         let turso_conn_state = &mut conn_states[connection_index];
         let doublecheck_conn_state = &mut doublecheck_states[connection_index];
@@ -112,39 +113,37 @@ pub(crate) fn execute_plans(
         last_execution.connection_index = connection_index;
         last_execution.interaction_index = state.interaction_pointer;
 
-        let mut turso_state = state.clone();
-
         // first execute turso
-        let turso_res = super::execution::execute_plan(
-            &mut env,
-            interaction,
-            turso_conn_state,
-            &mut turso_state,
-        );
-
-        let mut doublecheck_state = state.clone();
+        let turso_res = super::execution::execute_plan(&mut env, &interaction, turso_conn_state);
 
         // second execute doublecheck
         let doublecheck_res = super::execution::execute_plan(
             &mut doublecheck_env,
-            interaction,
+            &interaction,
             doublecheck_conn_state,
-            &mut doublecheck_state,
         );
 
         // Compare results
-        if let Err(err) = compare_results(
+        let next = match compare_results(
             turso_res,
             turso_conn_state,
             doublecheck_res,
             doublecheck_conn_state,
         ) {
-            return ExecutionResult::new(history, Some(err));
+            Ok(next) => next,
+            Err(err) => return ExecutionResult::new(history, Some(err)),
+        };
+
+        match next {
+            ExecutionContinuation::Stay => {}
+            ExecutionContinuation::NextInteraction => {
+                state.interaction_pointer += 1;
+                let Some(new_interaction) = plan.next(&mut env) else {
+                    break;
+                };
+                interaction = new_interaction;
+            }
         }
-
-        assert_eq!(turso_state, doublecheck_state);
-
-        *state = turso_state;
 
         // Check if the maximum time for the simulation has been reached
         if now.elapsed().as_secs() >= env.opts.max_time_simulation as u64 {
@@ -161,13 +160,14 @@ pub(crate) fn execute_plans(
 }
 
 fn compare_results(
-    turso_res: turso_core::Result<()>,
+    turso_res: turso_core::Result<ExecutionContinuation>,
     turso_state: &mut ConnectionState,
-    doublecheck_res: turso_core::Result<()>,
+    doublecheck_res: turso_core::Result<ExecutionContinuation>,
     doublecheck_state: &mut ConnectionState,
-) -> turso_core::Result<()> {
-    match (turso_res, doublecheck_res) {
-        (Ok(..), Ok(..)) => {
+) -> turso_core::Result<ExecutionContinuation> {
+    let next = match (turso_res, doublecheck_res) {
+        (Ok(v1), Ok(v2)) => {
+            assert_eq!(v1, v2);
             let turso_values = turso_state.stack.last();
             let doublecheck_values = doublecheck_state.stack.last();
             match (turso_values, doublecheck_values) {
@@ -184,6 +184,7 @@ fn compare_results(
                                             "returned values from limbo and doublecheck results do not match".into(),
                                         ));
                             }
+                            v1
                         }
                         (Err(limbo_err), Err(doublecheck_err)) => {
                             if limbo_err.to_string() != doublecheck_err.to_string() {
@@ -194,6 +195,7 @@ fn compare_results(
                                     "limbo and doublecheck errors do not match".into(),
                                 ));
                             }
+                            v1
                         }
                         (Ok(limbo_result), Err(doublecheck_err)) => {
                             tracing::error!(
@@ -216,7 +218,7 @@ fn compare_results(
                         }
                     }
                 }
-                (None, None) => {}
+                (None, None) => v1,
                 _ => {
                     tracing::error!("limbo and doublecheck results do not match");
                     return Err(turso_core::LimboError::InternalError(
@@ -245,7 +247,8 @@ fn compare_results(
                     "limbo and doublecheck errors do not match".into(),
                 ));
             }
+            ExecutionContinuation::NextInteraction
         }
-    }
-    Ok(())
+    };
+    Ok(next)
 }

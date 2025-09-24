@@ -70,7 +70,7 @@ use std::{
     ops::Deref,
     rc::Rc,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, LazyLock, Mutex, Weak,
     },
     time::Duration,
@@ -493,15 +493,15 @@ impl Database {
         let conn = Arc::new(Connection {
             db: self.clone(),
             pager: RwLock::new(Arc::new(pager)),
-            schema: RefCell::new(
+            schema: RwLock::new(
                 self.schema
                     .lock()
                     .map_err(|_| LimboError::SchemaLocked)?
                     .clone(),
             ),
-            database_schemas: RefCell::new(std::collections::HashMap::new()),
-            auto_commit: Cell::new(true),
-            transaction_state: Cell::new(TransactionState::None),
+            database_schemas: RwLock::new(std::collections::HashMap::new()),
+            auto_commit: AtomicBool::new(true),
+            transaction_state: RwLock::new(TransactionState::None),
             last_insert_rowid: Cell::new(0),
             last_change: Cell::new(0),
             total_changes: Cell::new(0),
@@ -980,13 +980,13 @@ impl DatabaseCatalog {
 pub struct Connection {
     db: Arc<Database>,
     pager: RwLock<Arc<Pager>>,
-    schema: RefCell<Arc<Schema>>,
+    schema: RwLock<Arc<Schema>>,
     /// Per-database schema cache (database_index -> schema)
     /// Loaded lazily to avoid copying all schemas on connection open
-    database_schemas: RefCell<std::collections::HashMap<usize, Arc<Schema>>>,
+    database_schemas: RwLock<std::collections::HashMap<usize, Arc<Schema>>>,
     /// Whether to automatically commit transaction
-    auto_commit: Cell<bool>,
-    transaction_state: Cell<TransactionState>,
+    auto_commit: AtomicBool,
+    transaction_state: RwLock<TransactionState>,
     last_insert_rowid: Cell<i64>,
     last_change: Cell<i64>,
     total_changes: Cell<i64>,
@@ -1061,7 +1061,7 @@ impl Connection {
         let mode = QueryMode::new(&cmd);
         let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
         let program = translate::translate(
-            self.schema.borrow().deref(),
+            self.schema.read().deref(),
             stmt,
             pager.clone(),
             self.clone(),
@@ -1115,7 +1115,7 @@ impl Connection {
         }
         // maybe_reparse_schema must be called outside of any transaction
         turso_assert!(
-            self.transaction_state.get() == TransactionState::None,
+            self.get_tx_state() == TransactionState::None,
             "unexpected start transaction"
         );
         // start read transaction manually, because we will read schema cookie once again and
@@ -1124,11 +1124,12 @@ impl Connection {
         // from now on we must be very careful with errors propagation
         // in order to not accidentally keep read transaction opened
         pager.begin_read_tx()?;
-        self.transaction_state.replace(TransactionState::Read);
+        self.set_tx_state(TransactionState::Read);
 
         let reparse_result = self.reparse_schema();
 
-        let previous = self.transaction_state.replace(TransactionState::None);
+        let previous =
+            std::mem::replace(&mut *self.transaction_state.write(), TransactionState::None);
         turso_assert!(
             matches!(previous, TransactionState::None | TransactionState::Read),
             "unexpected end transaction state"
@@ -1141,7 +1142,7 @@ impl Connection {
 
         reparse_result?;
 
-        let schema = self.schema.borrow().clone();
+        let schema = self.schema.read().clone();
         self.db.update_schema_if_newer(schema)
     }
 
@@ -1155,12 +1156,12 @@ impl Connection {
             .get();
 
         // create fresh schema as some objects can be deleted
-        let mut fresh = Schema::new(self.schema.borrow().indexes_enabled);
+        let mut fresh = Schema::new(self.schema.read().indexes_enabled);
         fresh.schema_version = cookie;
 
         // Preserve existing views to avoid expensive repopulation.
         // TODO: We may not need to do this if we materialize our views.
-        let existing_views = self.schema.borrow().incremental_views.clone();
+        let existing_views = self.schema.read().incremental_views.clone();
 
         // TODO: this is hack to avoid a cyclical problem with schema reprepare
         // The problem here is that we prepare a statement here, but when the statement tries
@@ -1218,7 +1219,7 @@ impl Connection {
             let mode = QueryMode::new(&cmd);
             let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
             let program = translate::translate(
-                self.schema.borrow().deref(),
+                self.schema.read().deref(),
                 stmt,
                 pager.clone(),
                 self.clone(),
@@ -1266,7 +1267,7 @@ impl Connection {
         let mode = QueryMode::new(&cmd);
         let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
         let program = translate::translate(
-            self.schema.borrow().deref(),
+            self.schema.read().deref(),
             stmt,
             pager.clone(),
             self.clone(),
@@ -1302,7 +1303,7 @@ impl Connection {
             let mode = QueryMode::new(&cmd);
             let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
             let program = translate::translate(
-                self.schema.borrow().deref(),
+                self.schema.read().deref(),
                 stmt,
                 pager.clone(),
                 self.clone(),
@@ -1411,16 +1412,16 @@ impl Connection {
     }
 
     pub fn maybe_update_schema(&self) -> Result<()> {
-        let current_schema_version = self.schema.borrow().schema_version;
+        let current_schema_version = self.schema.read().schema_version;
         let schema = self
             .db
             .schema
             .lock()
             .map_err(|_| LimboError::SchemaLocked)?;
-        if matches!(self.transaction_state.get(), TransactionState::None)
+        if matches!(self.get_tx_state(), TransactionState::None)
             && current_schema_version != schema.schema_version
         {
-            self.schema.replace(schema.clone());
+            *self.schema.write() = schema.clone();
         }
 
         Ok(())
@@ -1442,7 +1443,7 @@ impl Connection {
     /// Write transaction must be opened in advance - otherwise method will panic
     #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
     pub fn write_schema_version(self: &Arc<Connection>, version: u32) -> Result<()> {
-        let TransactionState::Write { .. } = self.transaction_state.get() else {
+        let TransactionState::Write { .. } = self.get_tx_state() else {
             return Err(LimboError::InternalError(
                 "write_schema_version must be called from within Write transaction".to_string(),
             ));
@@ -1454,9 +1455,9 @@ impl Connection {
                     header.schema_cookie.get() < version,
                     "cookie can't go back in time"
                 );
-                self.transaction_state.replace(TransactionState::Write {
+                *self.transaction_state.write() = TransactionState::Write {
                     schema_did_change: true,
-                });
+                };
                 self.with_schema_mut(|schema| schema.schema_version = version);
                 header.schema_cookie = version.into();
             })
@@ -1540,10 +1541,10 @@ impl Connection {
         })?;
 
         // start write transaction and disable auto-commit mode as SQL can be executed within WAL session (at caller own risk)
-        self.transaction_state.replace(TransactionState::Write {
+        *self.transaction_state.write() = TransactionState::Write {
             schema_did_change: false,
-        });
-        self.auto_commit.replace(false);
+        };
+        self.auto_commit.store(false, Ordering::SeqCst);
 
         Ok(())
     }
@@ -1576,8 +1577,8 @@ impl Connection {
                 None
             };
 
-            self.auto_commit.replace(true);
-            self.transaction_state.replace(TransactionState::None);
+            self.auto_commit.store(true, Ordering::SeqCst);
+            self.set_tx_state(TransactionState::None);
             {
                 let wal = wal.borrow_mut();
                 wal.end_write_tx();
@@ -1627,7 +1628,7 @@ impl Connection {
         }
         self.closed.set(true);
 
-        match self.transaction_state.get() {
+        match self.get_tx_state() {
             TransactionState::None => {
                 // No active transaction
             }
@@ -1639,7 +1640,7 @@ impl Connection {
                         self,
                     )
                 })?;
-                self.transaction_state.set(TransactionState::None);
+                self.set_tx_state(TransactionState::None);
             }
         }
 
@@ -1779,7 +1780,7 @@ impl Connection {
     }
 
     pub fn get_auto_commit(&self) -> bool {
-        self.auto_commit.get()
+        self.auto_commit.load(Ordering::SeqCst)
     }
 
     pub fn parse_schema_rows(self: &Arc<Connection>) -> Result<()> {
@@ -1879,7 +1880,7 @@ impl Connection {
 
     #[inline]
     pub fn with_schema_mut<T>(&self, f: impl FnOnce(&mut Schema) -> T) -> T {
-        let mut schema_ref = self.schema.borrow_mut();
+        let mut schema_ref = self.schema.write();
         let schema = Arc::make_mut(&mut *schema_ref);
         f(schema)
     }
@@ -2029,15 +2030,15 @@ impl Connection {
     pub(crate) fn with_schema<T>(&self, database_id: usize, f: impl FnOnce(&Schema) -> T) -> T {
         if database_id == 0 {
             // Main database - use connection's schema which should be kept in sync
-            let schema = self.schema.borrow();
+            let schema = self.schema.read();
             f(&schema)
         } else if database_id == 1 {
             // Temp database - uses same schema as main for now, but this will change later.
-            let schema = self.schema.borrow();
+            let schema = self.schema.read();
             f(&schema)
         } else {
             // Attached database - check cache first, then load from database
-            let mut schemas = self.database_schemas.borrow_mut();
+            let mut schemas = self.database_schemas.write();
 
             if let Some(cached_schema) = schemas.get(&database_id) {
                 return f(cached_schema);
@@ -2193,6 +2194,14 @@ impl Connection {
 
     pub fn get_busy_timeout(&self) -> std::time::Duration {
         self.busy_timeout.get()
+    }
+
+    fn set_tx_state(&self, state: TransactionState) {
+        *self.transaction_state.write() = state;
+    }
+
+    fn get_tx_state(&self) -> TransactionState {
+        *self.transaction_state.read()
     }
 }
 
@@ -2430,7 +2439,7 @@ impl Statement {
     fn reprepare(&mut self) -> Result<()> {
         tracing::trace!("repreparing statement");
         let conn = self.program.connection.clone();
-        *conn.schema.borrow_mut() = conn.db.clone_schema()?;
+        *conn.schema.write() = conn.db.clone_schema()?;
         self.program = {
             let mut parser = Parser::new(self.program.sql.as_bytes());
             let cmd = parser.next_cmd()?;
@@ -2441,7 +2450,7 @@ impl Statement {
             debug_assert_eq!(QueryMode::new(&cmd), mode,);
             let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
             translate::translate(
-                conn.schema.borrow().deref(),
+                conn.schema.read().deref(),
                 stmt,
                 self.pager.clone(),
                 conn.clone(),
@@ -2472,13 +2481,10 @@ impl Statement {
             if let Some(io) = &self.state.io_completions {
                 io.abort();
             }
-            let state = self.program.connection.transaction_state.get();
+            let state = self.program.connection.get_tx_state();
             if let TransactionState::Write { .. } = state {
                 let end_tx_res = self.pager.end_tx(true, &self.program.connection)?;
-                self.program
-                    .connection
-                    .transaction_state
-                    .set(TransactionState::None);
+                self.program.connection.set_tx_state(TransactionState::None);
                 assert!(
                     matches!(end_tx_res, IOResult::Done(_)),
                     "end_tx should not return IO as it should just end txn without flushing anything. Got {end_tx_res:?}"
