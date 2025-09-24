@@ -8,7 +8,10 @@ use crate::{
     run_simulation,
     runner::execution::Execution,
 };
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
 impl InteractionPlan {
     /// Create a smaller interaction plan by deleting a property
@@ -133,21 +136,29 @@ impl InteractionPlan {
                 retain
             });
 
-            // Comprise of idxs of Begin interactions
-            let mut begin_idx = Vec::new();
-            // Comprise of idxs of the intereactions Commit and Rollback
-            let mut end_tx_idx = Vec::new();
+            // Comprises of idxs of Begin interactions
+            let mut begin_idx: HashMap<usize, Vec<usize>> = HashMap::new();
+            // Comprises of idxs of Commit and Rollback intereactions
+            let mut end_tx_idx: HashMap<usize, Vec<usize>> = HashMap::new();
 
             for (idx, interactions) in plan.plan.iter().enumerate() {
                 match &interactions.interactions {
                     InteractionsType::Query(Query::Begin(..)) => {
-                        begin_idx.push(idx);
+                        begin_idx
+                            .entry(interactions.connection_index)
+                            .or_insert_with(|| vec![idx]);
                     }
                     InteractionsType::Query(Query::Commit(..))
                     | InteractionsType::Query(Query::Rollback(..)) => {
-                        let last_begin = begin_idx.last().unwrap() + 1;
+                        let last_begin = begin_idx
+                            .get(&interactions.connection_index)
+                            .and_then(|list| list.last())
+                            .unwrap()
+                            + 1;
                         if last_begin == idx {
-                            end_tx_idx.push(idx);
+                            end_tx_idx
+                                .entry(interactions.connection_index)
+                                .or_insert_with(|| vec![idx]);
                         }
                     }
                     _ => {}
@@ -155,19 +166,29 @@ impl InteractionPlan {
             }
 
             // remove interactions if its just a Begin Commit/Rollback with no queries in the middle
-            let mut range_transactions = end_tx_idx.into_iter().peekable();
+            let mut range_transactions = end_tx_idx
+                .into_iter()
+                .map(|(conn_index, list)| (conn_index, list.into_iter().peekable()))
+                .collect::<HashMap<_, _>>();
             let mut idx = 0;
-            plan.plan.retain_mut(|_| {
+            plan.plan.retain_mut(|interactions| {
                 let mut retain = true;
 
-                if let Some(txn_interaction_idx) = range_transactions.peek().copied() {
-                    if txn_interaction_idx == idx {
-                        range_transactions.next();
-                    }
-                    if txn_interaction_idx == idx || txn_interaction_idx.saturating_sub(1) == idx {
-                        retain = false;
+                let iter = range_transactions.get_mut(&interactions.connection_index);
+
+                if let Some(iter) = iter {
+                    if let Some(txn_interaction_idx) = iter.peek().copied() {
+                        if txn_interaction_idx == idx {
+                            iter.next();
+                        }
+                        if txn_interaction_idx == idx
+                            || txn_interaction_idx.saturating_sub(1) == idx
+                        {
+                            retain = false;
+                        }
                     }
                 }
+
                 idx += 1;
                 retain
             });
