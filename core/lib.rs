@@ -520,7 +520,7 @@ impl Database {
             is_nested_stmt: AtomicBool::new(false),
             encryption_key: RwLock::new(None),
             encryption_cipher_mode: RwLock::new(None),
-            sync_mode: Cell::new(SyncMode::Full),
+            sync_mode: RwLock::new(SyncMode::Full),
             data_sync_retry: AtomicBool::new(false),
             busy_timeout: Cell::new(Duration::new(0, 0)),
         });
@@ -1016,7 +1016,7 @@ pub struct Connection {
     is_nested_stmt: AtomicBool,
     encryption_key: RwLock<Option<EncryptionKey>>,
     encryption_cipher_mode: RwLock<Option<CipherMode>>,
-    sync_mode: Cell<SyncMode>,
+    sync_mode: RwLock<SyncMode>,
     data_sync_retry: AtomicBool,
     /// User defined max accumulated Busy timeout duration
     /// Default is 0 (no timeout)
@@ -2127,11 +2127,11 @@ impl Connection {
     }
 
     pub fn get_sync_mode(&self) -> SyncMode {
-        self.sync_mode.get()
+        *self.sync_mode.read()
     }
 
     pub fn set_sync_mode(&self, mode: SyncMode) {
-        self.sync_mode.set(mode);
+        *self.sync_mode.write() = mode;
     }
 
     pub fn get_data_sync_retry(&self) -> bool {
