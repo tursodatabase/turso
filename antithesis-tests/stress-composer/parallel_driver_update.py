@@ -4,7 +4,7 @@ import json
 
 import turso
 from antithesis.random import get_random
-from utils import generate_random_value
+from helper_utils import generate_random_value
 
 # Get initial state
 try:
