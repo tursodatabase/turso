@@ -521,7 +521,7 @@ impl Database {
             encryption_key: RefCell::new(None),
             encryption_cipher_mode: Cell::new(None),
             sync_mode: Cell::new(SyncMode::Full),
-            data_sync_retry: Cell::new(false),
+            data_sync_retry: AtomicBool::new(false),
             busy_timeout: Cell::new(Duration::new(0, 0)),
         });
         self.n_connections
@@ -1017,7 +1017,7 @@ pub struct Connection {
     encryption_key: RefCell<Option<EncryptionKey>>,
     encryption_cipher_mode: Cell<Option<CipherMode>>,
     sync_mode: Cell<SyncMode>,
-    data_sync_retry: Cell<bool>,
+    data_sync_retry: AtomicBool,
     /// User defined max accumulated Busy timeout duration
     /// Default is 0 (no timeout)
     busy_timeout: Cell<std::time::Duration>,
@@ -2140,11 +2140,13 @@ impl Connection {
     }
 
     pub fn get_data_sync_retry(&self) -> bool {
-        self.data_sync_retry.get()
+        self.data_sync_retry
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     pub fn set_data_sync_retry(&self, value: bool) {
-        self.data_sync_retry.set(value);
+        self.data_sync_retry
+            .store(value, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Creates a HashSet of modules that have been loaded
