@@ -42,6 +42,8 @@ pub fn translate_create_index(
             "CREATE INDEX is disabled by default. Run with `--experimental-indexes` to enable this feature."
         );
     }
+    let original_idx_name = idx_name;
+    let original_tbl_name = tbl_name;
     let idx_name = normalize_ident(idx_name);
     let tbl_name = normalize_ident(tbl_name);
     let opts = crate::vdbe::builder::ProgramBuilderOpts {
@@ -66,6 +68,7 @@ pub fn translate_create_index(
     let Some(tbl) = table.btree() else {
         crate::bail_parse_error!("Error: table '{tbl_name}' is not a b-tree table.");
     };
+    let original_columns = columns;
     let columns = resolve_sorted_columns(&tbl, columns)?;
 
     let idx = Arc::new(Index {
@@ -152,10 +155,10 @@ pub fn translate_create_index(
         db: 0,
     });
     let sql = create_idx_stmt_to_sql(
-        &tbl_name,
-        &idx_name,
+        original_tbl_name,
+        original_idx_name,
         unique_if_not_exists,
-        &columns,
+        original_columns,
         &idx.where_clause.clone(),
     );
     let resolver = Resolver::new(schema, syms);
@@ -353,7 +356,7 @@ fn create_idx_stmt_to_sql(
     tbl_name: &str,
     idx_name: &str,
     unique_if_not_exists: (bool, bool),
-    cols: &[((usize, &Column), SortOrder)],
+    cols: &[SortedColumn],
     where_clause: &Option<Box<Expr>>,
 ) -> String {
     let mut sql = String::with_capacity(128);
@@ -369,12 +372,19 @@ fn create_idx_stmt_to_sql(
     sql.push_str(" ON ");
     sql.push_str(tbl_name);
     sql.push_str(" (");
-    for (i, (col, order)) in cols.iter().enumerate() {
+    for (i, col) in cols.iter().enumerate() {
         if i > 0 {
             sql.push_str(", ");
         }
-        sql.push_str(col.1.name.as_ref().unwrap());
-        if *order == SortOrder::Desc {
+        let col_ident = match col.expr.as_ref() {
+            Expr::Id(ast::Name::Ident(col_name))
+            | Expr::Id(ast::Name::Quoted(col_name))
+            | Expr::Name(ast::Name::Ident(col_name))
+            | Expr::Name(ast::Name::Quoted(col_name)) => col_name,
+            _ => unreachable!("expressions in CREATE INDEX should have been rejected earlier"),
+        };
+        sql.push_str(col_ident);
+        if col.order.unwrap_or(SortOrder::Asc) == SortOrder::Desc {
             sql.push_str(" DESC");
         }
     }
