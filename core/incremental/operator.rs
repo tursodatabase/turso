@@ -332,20 +332,25 @@ mod tests {
                 // Get the blob data from column 3 (value column)
                 if let Some(Value::Blob(blob)) = values.get(3) {
                     // Deserialize the state
-                    if let Some((state, group_key)) =
-                        AggregateState::from_blob(blob, &agg.aggregates)
-                    {
-                        // Should not have made it this far.
-                        assert!(state.count != 0);
-                        // Build output row: group_by columns + aggregate values
-                        let mut output_values = group_key.clone();
-                        output_values.extend(state.to_values(&agg.aggregates));
+                    match AggregateState::from_blob(blob) {
+                        Ok((state, group_key)) => {
+                            // Should not have made it this far.
+                            assert!(state.count != 0);
+                            // Build output row: group_by columns + aggregate values
+                            let mut output_values = group_key.clone();
+                            output_values.extend(state.to_values(&agg.aggregates));
 
-                        let group_key_str = AggregateOperator::group_key_to_string(&group_key);
-                        let rowid = agg.generate_group_rowid(&group_key_str);
+                            let group_key_str = AggregateOperator::group_key_to_string(&group_key);
+                            let rowid = agg.generate_group_rowid(&group_key_str);
 
-                        let output_row = HashableRow::new(rowid, output_values);
-                        result.changes.push((output_row, 1));
+                            let output_row = HashableRow::new(rowid, output_values);
+                            result.changes.push((output_row, 1));
+                        }
+                        Err(e) => {
+                            // Log or handle the deserialization error
+                            // For now, we'll skip this entry
+                            eprintln!("Failed to deserialize aggregate state: {e}");
+                        }
                     }
                 }
             }
@@ -4010,5 +4015,116 @@ mod tests {
         } else {
             panic!("Expected Done result");
         }
+    }
+
+    #[test]
+    fn test_aggregate_serialization_with_different_column_indices() {
+        // Test that aggregate state serialization correctly preserves column indices
+        // when multiple aggregates operate on different columns
+        let (pager, table_root_page_id, index_root_page_id) = create_test_pager();
+        let table_cursor = BTreeCursor::new_table(None, pager.clone(), table_root_page_id, 5);
+        let index_def = create_dbsp_state_index(index_root_page_id);
+        let index_cursor =
+            BTreeCursor::new_index(None, pager.clone(), index_root_page_id, &index_def, 4);
+        let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
+
+        // Create first operator with SUM(col1), MIN(col3) GROUP BY col0
+        let mut agg1 = AggregateOperator::new(
+            1,
+            vec![0],
+            vec![AggregateFunction::Sum(1), AggregateFunction::Min(3)],
+            vec![
+                "group".to_string(),
+                "val1".to_string(),
+                "val2".to_string(),
+                "val3".to_string(),
+            ],
+        );
+
+        // Add initial data
+        let mut delta = Delta::new();
+        delta.insert(
+            1,
+            vec![
+                Value::Text("A".into()),
+                Value::Integer(10),
+                Value::Integer(100),
+                Value::Integer(5),
+            ],
+        );
+        delta.insert(
+            2,
+            vec![
+                Value::Text("A".into()),
+                Value::Integer(15),
+                Value::Integer(200),
+                Value::Integer(3),
+            ],
+        );
+
+        let result1 = pager
+            .io
+            .block(|| agg1.commit((&delta).into(), &mut cursors))
+            .unwrap();
+
+        assert_eq!(result1.changes.len(), 1);
+        let (row1, _) = &result1.changes[0];
+        assert_eq!(row1.values[0], Value::Text("A".into()));
+        assert_eq!(row1.values[1], Value::Integer(25)); // SUM(val1) = 10 + 15
+        assert_eq!(row1.values[2], Value::Integer(3)); // MIN(val3) = min(5, 3)
+
+        // Create operator with same ID but different column mappings: SUM(col3), MIN(col1)
+        let mut agg2 = AggregateOperator::new(
+            1, // Same operator_id
+            vec![0],
+            vec![AggregateFunction::Sum(3), AggregateFunction::Min(1)],
+            vec![
+                "group".to_string(),
+                "val1".to_string(),
+                "val2".to_string(),
+                "val3".to_string(),
+            ],
+        );
+
+        // Process new data
+        let mut delta2 = Delta::new();
+        delta2.insert(
+            3,
+            vec![
+                Value::Text("A".into()),
+                Value::Integer(20),
+                Value::Integer(300),
+                Value::Integer(4),
+            ],
+        );
+
+        let result2 = pager
+            .io
+            .block(|| agg2.commit((&delta2).into(), &mut cursors))
+            .unwrap();
+
+        // Find the positive weight row for group A (the updated aggregate)
+        let row2 = result2
+            .changes
+            .iter()
+            .find(|(row, weight)| row.values[0] == Value::Text("A".into()) && *weight > 0)
+            .expect("Should have a positive weight row for group A");
+        let (row2, _) = row2;
+
+        // Verify that column indices are preserved correctly in serialization
+        // When agg2 processes the data with different column mappings:
+        // - It reads the existing state which has SUM(col1)=25 and MIN(col3)=3
+        // - For SUM(col3), there's no existing state, so it starts fresh: 4
+        // - For MIN(col1), there's no existing state, so it starts fresh: 20
+        assert_eq!(
+            row2.values[1],
+            Value::Integer(4),
+            "SUM(col3) should be 4 (new data only)"
+        );
+        assert_eq!(
+            row2.values[2],
+            Value::Integer(20),
+            "MIN(col1) should be 20 (new data only)"
+        );
     }
 }

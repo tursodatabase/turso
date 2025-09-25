@@ -518,124 +518,44 @@ impl JoinOperator {
     }
 }
 
-// Helper to deserialize a HashableRow from a blob
 fn deserialize_hashable_row(blob: &[u8]) -> Result<HashableRow> {
-    // Simple deserialization - this needs to match how we serialize in commit
-    // Format: [rowid:8 bytes][num_values:4 bytes][values...]
-    if blob.len() < 12 {
+    use crate::types::ImmutableRecord;
+
+    let record = ImmutableRecord::from_bin_record(blob.to_vec());
+    let ref_values = record.get_values();
+    let all_values: Vec<Value> = ref_values.into_iter().map(|rv| rv.to_owned()).collect();
+
+    if all_values.is_empty() {
         return Err(crate::LimboError::InternalError(
-            "Invalid blob size".to_string(),
+            "HashableRow blob must contain at least rowid".to_string(),
         ));
     }
 
-    let rowid = i64::from_le_bytes(blob[0..8].try_into().unwrap());
-    let num_values = u32::from_le_bytes(blob[8..12].try_into().unwrap()) as usize;
-
-    let mut values = Vec::new();
-    let mut offset = 12;
-
-    for _ in 0..num_values {
-        if offset >= blob.len() {
-            break;
+    // First value is the rowid
+    let rowid = match &all_values[0] {
+        Value::Integer(i) => *i,
+        _ => {
+            return Err(crate::LimboError::InternalError(
+                "First value must be rowid (integer)".to_string(),
+            ))
         }
+    };
 
-        let type_tag = blob[offset];
-        offset += 1;
-
-        match type_tag {
-            0 => values.push(Value::Null),
-            1 => {
-                if offset + 8 <= blob.len() {
-                    let i = i64::from_le_bytes(blob[offset..offset + 8].try_into().unwrap());
-                    values.push(Value::Integer(i));
-                    offset += 8;
-                }
-            }
-            2 => {
-                if offset + 8 <= blob.len() {
-                    let f = f64::from_le_bytes(blob[offset..offset + 8].try_into().unwrap());
-                    values.push(Value::Float(f));
-                    offset += 8;
-                }
-            }
-            3 => {
-                if offset + 4 <= blob.len() {
-                    let len =
-                        u32::from_le_bytes(blob[offset..offset + 4].try_into().unwrap()) as usize;
-                    offset += 4;
-                    if offset + len < blob.len() {
-                        let text_bytes = blob[offset..offset + len].to_vec();
-                        offset += len;
-                        let subtype = match blob[offset] {
-                            0 => crate::types::TextSubtype::Text,
-                            1 => crate::types::TextSubtype::Json,
-                            _ => crate::types::TextSubtype::Text,
-                        };
-                        offset += 1;
-                        values.push(Value::Text(crate::types::Text {
-                            value: text_bytes,
-                            subtype,
-                        }));
-                    }
-                }
-            }
-            4 => {
-                if offset + 4 <= blob.len() {
-                    let len =
-                        u32::from_le_bytes(blob[offset..offset + 4].try_into().unwrap()) as usize;
-                    offset += 4;
-                    if offset + len <= blob.len() {
-                        let blob_data = blob[offset..offset + len].to_vec();
-                        values.push(Value::Blob(blob_data));
-                        offset += len;
-                    }
-                }
-            }
-            _ => break, // Unknown type tag
-        }
-    }
+    // Rest are the row values
+    let values = all_values[1..].to_vec();
 
     Ok(HashableRow::new(rowid, values))
 }
 
-// Helper to serialize a HashableRow to a blob
 fn serialize_hashable_row(row: &HashableRow) -> Vec<u8> {
-    let mut blob = Vec::new();
+    use crate::types::ImmutableRecord;
 
-    // Write rowid
-    blob.extend_from_slice(&row.rowid.to_le_bytes());
+    let mut all_values = Vec::with_capacity(row.values.len() + 1);
+    all_values.push(Value::Integer(row.rowid));
+    all_values.extend_from_slice(&row.values);
 
-    // Write number of values
-    blob.extend_from_slice(&(row.values.len() as u32).to_le_bytes());
-
-    // Write each value directly with type tags (like AggregateState does)
-    for value in &row.values {
-        match value {
-            Value::Null => blob.push(0u8),
-            Value::Integer(i) => {
-                blob.push(1u8);
-                blob.extend_from_slice(&i.to_le_bytes());
-            }
-            Value::Float(f) => {
-                blob.push(2u8);
-                blob.extend_from_slice(&f.to_le_bytes());
-            }
-            Value::Text(s) => {
-                blob.push(3u8);
-                let bytes = &s.value;
-                blob.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-                blob.extend_from_slice(bytes);
-                blob.push(s.subtype as u8);
-            }
-            Value::Blob(b) => {
-                blob.push(4u8);
-                blob.extend_from_slice(&(b.len() as u32).to_le_bytes());
-                blob.extend_from_slice(b);
-            }
-        }
-    }
-
-    blob
+    let record = ImmutableRecord::from_values(&all_values, all_values.len());
+    record.as_blob().clone()
 }
 
 impl IncrementalOperator for JoinOperator {
