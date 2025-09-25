@@ -7,10 +7,10 @@ use crate::translate::logical::LogicalPlanBuilder;
 use crate::types::{IOResult, Value};
 use crate::util::{extract_view_columns, ViewColumnSchema};
 use crate::{return_if_io, LimboError, Pager, Result, Statement};
+use parking_lot::RwLock;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use turso_parser::ast;
 use turso_parser::{
@@ -127,20 +127,20 @@ impl ViewTransactionState {
 /// Provides interior mutability for the map of view states
 #[derive(Debug, Clone, Default)]
 pub struct AllViewsTxState {
-    states: Rc<RefCell<HashMap<String, Arc<ViewTransactionState>>>>,
+    states: Arc<RwLock<HashMap<String, Arc<ViewTransactionState>>>>,
 }
 
 impl AllViewsTxState {
     /// Create a new container for view transaction states
     pub fn new() -> Self {
         Self {
-            states: Rc::new(RefCell::new(HashMap::new())),
+            states: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
     /// Get or create a transaction state for a view
     pub fn get_or_create(&self, view_name: &str) -> Arc<ViewTransactionState> {
-        let mut states = self.states.borrow_mut();
+        let mut states = self.states.write();
         states
             .entry(view_name.to_string())
             .or_insert_with(|| Arc::new(ViewTransactionState::new()))
@@ -149,22 +149,22 @@ impl AllViewsTxState {
 
     /// Get a transaction state for a view if it exists
     pub fn get(&self, view_name: &str) -> Option<Arc<ViewTransactionState>> {
-        self.states.borrow().get(view_name).cloned()
+        self.states.read().get(view_name).cloned()
     }
 
     /// Clear all transaction states
     pub fn clear(&self) {
-        self.states.borrow_mut().clear();
+        self.states.write().clear();
     }
 
     /// Check if there are no transaction states
     pub fn is_empty(&self) -> bool {
-        self.states.borrow().is_empty()
+        self.states.read().is_empty()
     }
 
     /// Get all view names that have transaction states
     pub fn get_view_names(&self) -> Vec<String> {
-        self.states.borrow().keys().cloned().collect()
+        self.states.read().keys().cloned().collect()
     }
 }
 
