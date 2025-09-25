@@ -435,7 +435,8 @@ pub fn load_logical_log(
     mv_store.begin_load_tx(pager.clone())?;
     loop {
         match reader.next_record(io).unwrap() {
-            StreamingResult::InsertRow { row, rowid: _ } => {
+            StreamingResult::InsertRow { row, rowid } => {
+                tracing::trace!("read {rowid:?}");
                 mv_store.insert(tx_id, row)?;
             }
             StreamingResult::DeleteRow { rowid } => {
@@ -514,5 +515,58 @@ mod tests {
             unreachable!()
         };
         assert_eq!(foo.as_str(), "foo");
+    }
+
+    #[test]
+    fn test_logical_log_read_multiple_transactions() {
+        let values = (0..100)
+            .map(|i| (RowID::new(1, i), format!("foo_{i}")))
+            .collect::<Vec<(RowID, String)>>();
+        // let's not drop db as we don't want files to be removed
+        let db = MvccTestDbNoConn::new_with_random_db();
+        let (db_path, io, pager) = {
+            let conn = db.connect();
+            let pager = conn.pager.read().clone();
+            let mvcc_store = db.get_mvcc_store();
+
+            // generate insert per transaction
+            for (rowid, value) in &values {
+                let tx_id = mvcc_store.begin_tx(pager.clone()).unwrap();
+                let row = generate_simple_string_row(rowid.table_id, rowid.row_id, value);
+                mvcc_store.insert(tx_id, row).unwrap();
+                commit_tx(mvcc_store.clone(), &conn, tx_id).unwrap();
+            }
+
+            conn.close().unwrap();
+            let db = db.get_db();
+            (db.path.clone(), db.io.clone(), pager)
+        };
+
+        // Now try to read it back
+        let db_path = PathBuf::from(db_path);
+        let mut log_file = db_path.clone();
+        let filename = log_file
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|s| format!("{s}-lg"))
+            .unwrap();
+        log_file.set_file_name(filename);
+
+        let file = io
+            .open_file(log_file.to_str().unwrap(), OpenFlags::ReadOnly, false)
+            .unwrap();
+        let mvcc_store = Arc::new(MvStore::new(LocalClock::new(), Storage::new(file.clone())));
+        load_logical_log(&mvcc_store, file, &io, &pager).unwrap();
+        for (rowid, value) in &values {
+            let tx = mvcc_store.begin_tx(pager.clone()).unwrap();
+            let row = mvcc_store.read(tx, *rowid).unwrap().unwrap();
+            let record = ImmutableRecord::from_bin_record(row.data.clone());
+            let values = record.get_values();
+            let foo = values.first().unwrap();
+            let RefValue::Text(foo) = foo else {
+            unreachable!()
+        };
+            assert_eq!(foo.as_str(), value.as_str());
+        }
     }
 }
