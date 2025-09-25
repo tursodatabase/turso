@@ -348,13 +348,13 @@ fn py_to_db_value(obj: &Bound<PyAny>) -> Result<turso_core::Value> {
     if obj.is_none() {
         Ok(Value::Null)
     } else if let Ok(integer) = obj.extract::<i64>() {
-        return Ok(Value::Integer(integer));
+        Ok(Value::Integer(integer))
     } else if let Ok(float) = obj.extract::<f64>() {
-        return Ok(Value::Float(float));
+        Ok(Value::Float(float))
     } else if let Ok(string) = obj.extract::<String>() {
-        return Ok(Value::Text(string.into()));
+        Ok(Value::Text(string.into()))
     } else if let Ok(bytes) = obj.downcast::<PyBytes>() {
-        return Ok(Value::Blob(bytes.as_bytes().to_vec()));
+        Ok(Value::Blob(bytes.as_bytes().to_vec()))
     } else {
         return Err(PyErr::new::<ProgrammingError, _>(format!(
             "Unsupported Python type: {}",

@@ -410,15 +410,14 @@ fn perform_work(
                             drop(stmt_borrow);
                             context.fibers[fiber_idx].statement.replace(None);
                             // Rollback the transaction if we're in one
-                            if matches!(context.fibers[fiber_idx].state, FiberState::InTx) {
-                                if let Ok(rollback_stmt) =
+                            if matches!(context.fibers[fiber_idx].state, FiberState::InTx)
+                                && let Ok(rollback_stmt) =
                                     context.fibers[fiber_idx].connection.prepare("ROLLBACK")
-                                {
-                                    context.fibers[fiber_idx]
-                                        .statement
-                                        .replace(Some(rollback_stmt));
-                                    context.fibers[fiber_idx].state = FiberState::Idle;
-                                }
+                            {
+                                context.fibers[fiber_idx]
+                                    .statement
+                                    .replace(Some(rollback_stmt));
+                                context.fibers[fiber_idx].state = FiberState::Idle;
                             }
                             return Ok(());
                         }
@@ -427,15 +426,14 @@ fn perform_work(
                             drop(stmt_borrow);
                             context.fibers[fiber_idx].statement.replace(None);
                             // Rollback the transaction if we're in one
-                            if matches!(context.fibers[fiber_idx].state, FiberState::InTx) {
-                                if let Ok(rollback_stmt) =
+                            if matches!(context.fibers[fiber_idx].state, FiberState::InTx)
+                                && let Ok(rollback_stmt) =
                                     context.fibers[fiber_idx].connection.prepare("ROLLBACK")
-                                {
-                                    context.fibers[fiber_idx]
-                                        .statement
-                                        .replace(Some(rollback_stmt));
-                                    context.fibers[fiber_idx].state = FiberState::Idle;
-                                }
+                            {
+                                context.fibers[fiber_idx]
+                                    .statement
+                                    .replace(Some(rollback_stmt));
+                                context.fibers[fiber_idx].state = FiberState::Idle;
                             }
                             return Ok(());
                         }

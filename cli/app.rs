@@ -1107,8 +1107,7 @@ impl Limbo {
         match table_name {
             "sqlite_master" | "sqlite_schema" | "sqlite_temp_master" | "sqlite_temp_schema" => {
                 let schema = format!(
-                                    "CREATE TABLE {} (\n type text,\n name text,\n tbl_name text,\n rootpage integer,\n sql text\n);",
-                                    table_name
+                                    "CREATE TABLE {table_name} (\n type text,\n name text,\n tbl_name text,\n rootpage integer,\n sql text\n);",
                                 );
                 let _ = self.writeln(&schema);
                 return Ok(true);
