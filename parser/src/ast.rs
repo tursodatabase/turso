@@ -910,7 +910,8 @@ impl Name {
 
     pub fn as_str(&self) -> &str {
         match self {
-            Name::Ident(s) | Name::Quoted(s) => s.as_str(),
+            Name::Ident(s) => s.as_str(),
+            Name::Quoted(s) => &s[1..s.len() - 1],
         }
     }
 
