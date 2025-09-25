@@ -470,7 +470,7 @@ pub fn load_logical_log(
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashSet, path::PathBuf, sync::Arc};
+    use std::{collections::HashSet, sync::Arc};
 
     use rand::{thread_rng, Rng};
     use rand_chacha::{
@@ -498,7 +498,7 @@ mod tests {
         // Load a transaction
         // let's not drop db as we don't want files to be removed
         let db = MvccTestDbNoConn::new_with_random_db();
-        let (db_path, io, pager) = {
+        let (io, pager) = {
             let conn = db.connect();
             let pager = conn.pager.read().clone();
             let mvcc_store = db.get_mvcc_store();
@@ -509,22 +509,13 @@ mod tests {
             commit_tx(mvcc_store.clone(), &conn, tx_id).unwrap();
             conn.close().unwrap();
             let db = db.get_db();
-            (db.path.clone(), db.io.clone(), pager)
+            (db.io.clone(), pager)
         };
 
         // Now try to read it back
-        let db_path = PathBuf::from(db_path);
-        let mut log_file = db_path.clone();
-        let filename = log_file
-            .file_name()
-            .and_then(|name| name.to_str())
-            .map(|s| format!("{s}-lg"))
-            .unwrap();
-        log_file.set_file_name(filename);
+        let log_file = db.get_log_path();
 
-        let file = io
-            .open_file(log_file.to_str().unwrap(), OpenFlags::ReadOnly, false)
-            .unwrap();
+        let file = io.open_file(log_file, OpenFlags::ReadOnly, false).unwrap();
         let mvcc_store = Arc::new(MvStore::new(LocalClock::new(), Storage::new(file.clone())));
         load_logical_log(&mvcc_store, file, &io, &pager).unwrap();
         let tx = mvcc_store.begin_tx(pager.clone()).unwrap();
@@ -545,7 +536,7 @@ mod tests {
             .collect::<Vec<(RowID, String)>>();
         // let's not drop db as we don't want files to be removed
         let db = MvccTestDbNoConn::new_with_random_db();
-        let (db_path, io, pager) = {
+        let (io, pager) = {
             let conn = db.connect();
             let pager = conn.pager.read().clone();
             let mvcc_store = db.get_mvcc_store();
@@ -560,22 +551,13 @@ mod tests {
 
             conn.close().unwrap();
             let db = db.get_db();
-            (db.path.clone(), db.io.clone(), pager)
+            (db.io.clone(), pager)
         };
 
         // Now try to read it back
-        let db_path = PathBuf::from(db_path);
-        let mut log_file = db_path.clone();
-        let filename = log_file
-            .file_name()
-            .and_then(|name| name.to_str())
-            .map(|s| format!("{s}-lg"))
-            .unwrap();
-        log_file.set_file_name(filename);
+        let log_file = db.get_log_path();
 
-        let file = io
-            .open_file(log_file.to_str().unwrap(), OpenFlags::ReadOnly, false)
-            .unwrap();
+        let file = io.open_file(log_file, OpenFlags::ReadOnly, false).unwrap();
         let mvcc_store = Arc::new(MvStore::new(LocalClock::new(), Storage::new(file.clone())));
         load_logical_log(&mvcc_store, file, &io, &pager).unwrap();
         for (rowid, value) in &values {
@@ -636,7 +618,7 @@ mod tests {
         }
         // let's not drop db as we don't want files to be removed
         let db = MvccTestDbNoConn::new_with_random_db();
-        let (db_path, io, pager) = {
+        let (io, pager) = {
             let conn = db.connect();
             let pager = conn.pager.read().clone();
             let mvcc_store = db.get_mvcc_store();
@@ -660,22 +642,13 @@ mod tests {
 
             conn.close().unwrap();
             let db = db.get_db();
-            (db.path.clone(), db.io.clone(), pager)
+            (db.io.clone(), pager)
         };
 
         // Now try to read it back
-        let db_path = PathBuf::from(db_path);
-        let mut log_file = db_path.clone();
-        let filename = log_file
-            .file_name()
-            .and_then(|name| name.to_str())
-            .map(|s| format!("{s}-lg"))
-            .unwrap();
-        log_file.set_file_name(filename);
+        let log_file = db.get_log_path();
 
-        let file = io
-            .open_file(log_file.to_str().unwrap(), OpenFlags::ReadOnly, false)
-            .unwrap();
+        let file = io.open_file(log_file, OpenFlags::ReadOnly, false).unwrap();
         let mvcc_store = Arc::new(MvStore::new(LocalClock::new(), Storage::new(file.clone())));
         load_logical_log(&mvcc_store, file, &io, &pager).unwrap();
 
