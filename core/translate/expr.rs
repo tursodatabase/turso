@@ -1823,13 +1823,8 @@ pub fn translate_expr(
         ast::Expr::FunctionCallStar { .. } => {
             crate::bail_parse_error!("FunctionCallStar in WHERE clause is not supported")
         }
-        ast::Expr::Id(id) => {
-            // Treat double-quoted identifiers as string literals (SQLite compatibility)
-            program.emit_insn(Insn::String8 {
-                value: sanitize_double_quoted_string(id.as_str()),
-                dest: target_register,
-            });
-            Ok(target_register)
+        ast::Expr::Id(..) => {
+            crate::bail_parse_error!("ast::Expr::Id in WHERE clause is not supported")
         }
         ast::Expr::Column {
             database: _,
