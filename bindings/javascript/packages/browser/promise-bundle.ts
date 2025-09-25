@@ -15,6 +15,9 @@ class Database extends DatabasePromise {
     constructor(path: string, opts: DatabaseOpts = {}) {
         super(new NativeDatabase(path, opts) as unknown as any)
     }
+    /**
+     * connect database and pre-open necessary files in the OPFS
+     */
     override async connect() {
         if (!this.memory) {
             const worker = await init();
@@ -26,6 +29,9 @@ class Database extends DatabasePromise {
         }
         await super.connect();
     }
+    /**
+     * close the database and relevant files
+     */
     async close() {
         if (this.name != null && this.#worker != null) {
             await Promise.all([

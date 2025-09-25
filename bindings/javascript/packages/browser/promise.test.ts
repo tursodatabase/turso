@@ -14,7 +14,7 @@ test('explicit connect', async () => {
     const db = new Database(':memory:');
     expect(() => db.prepare("SELECT 1")).toThrowError(/database must be connected/g);
     await db.connect();
-    db.prepare("SELECT 1");
+    expect(await db.prepare("SELECT 1 as x").all()).toEqual([{ x: 1 }]);
 })
 
 test('on-disk db large inserts', async () => {

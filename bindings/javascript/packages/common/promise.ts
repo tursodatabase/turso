@@ -52,6 +52,9 @@ class Database {
     });
   }
 
+  /**
+   * connect database
+   */
   async connect() {
     await this.db.connectAsync();
   }
