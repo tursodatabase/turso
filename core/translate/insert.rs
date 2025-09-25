@@ -1740,7 +1740,7 @@ pub fn rewrite_partial_index_where(
         &mut |e: &mut ast::Expr| -> crate::Result<WalkControl> {
             match e {
                 // NOTE: should not have ANY Expr::Columns bound to the expr
-                Expr::Id(ast::Name::Ident(name)) | Expr::Id(ast::Name::Quoted(name)) => {
+                Expr::Id(name) => {
                     let normalized = normalize_ident(name.as_str());
                     if let Some(reg) = col_reg(&normalized) {
                         *e = Expr::Register(reg);

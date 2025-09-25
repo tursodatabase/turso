@@ -73,7 +73,7 @@ use super::{
 };
 use parking_lot::RwLock;
 use rand::{thread_rng, Rng};
-use turso_parser::ast;
+use turso_parser::ast::{self, Name};
 use turso_parser::parser::Parser;
 
 use super::{
@@ -5320,11 +5320,12 @@ pub fn op_function(
 
                                 for column in &mut columns {
                                     match column.expr.as_mut() {
-                                        ast::Expr::Id(ast::Name::Ident(id))
-                                        | ast::Expr::Id(ast::Name::Quoted(id))
-                                            if normalize_ident(id) == rename_from =>
+                                        ast::Expr::Id(id)
+                                            if normalize_ident(id.as_str()) == rename_from =>
                                         {
-                                            *id = column_def.col_name.as_str().to_owned();
+                                            *id = Name::Ident(
+                                                column_def.col_name.as_str().to_owned(),
+                                            );
                                         }
                                         _ => {}
                                     }
