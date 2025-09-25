@@ -330,14 +330,14 @@ impl Limbo {
 
         // Display all metrics
         let output = {
-            let metrics = self.conn.metrics.borrow();
+            let metrics = self.conn.metrics.read();
             format!("{metrics}")
         };
 
         self.writeln(output)?;
 
         if args.reset {
-            self.conn.metrics.borrow_mut().reset();
+            self.conn.metrics.write().reset();
             self.writeln("Statistics reset.")?;
         }
 
@@ -482,7 +482,7 @@ impl Limbo {
         // Display stats if enabled
         if self.opts.stats {
             let stats_output = {
-                let metrics = self.conn.metrics.borrow();
+                let metrics = self.conn.metrics.read();
                 metrics
                     .last_statement
                     .as_ref()

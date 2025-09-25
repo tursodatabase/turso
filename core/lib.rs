@@ -63,7 +63,7 @@ use parking_lot::RwLock;
 use schema::Schema;
 use std::{
     borrow::Cow,
-    cell::{Cell, RefCell},
+    cell::RefCell,
     collections::HashMap,
     fmt::{self, Display},
     num::NonZero,
@@ -516,13 +516,13 @@ impl Database {
             query_only: AtomicBool::new(false),
             mv_tx: RwLock::new(None),
             view_transaction_states: AllViewsTxState::new(),
-            metrics: RefCell::new(ConnectionMetrics::new()),
+            metrics: RwLock::new(ConnectionMetrics::new()),
             is_nested_stmt: AtomicBool::new(false),
-            encryption_key: RefCell::new(None),
-            encryption_cipher_mode: Cell::new(None),
-            sync_mode: Cell::new(SyncMode::Full),
+            encryption_key: RwLock::new(None),
+            encryption_cipher_mode: RwLock::new(None),
+            sync_mode: RwLock::new(SyncMode::Full),
             data_sync_retry: AtomicBool::new(false),
-            busy_timeout: Cell::new(Duration::new(0, 0)),
+            busy_timeout: RwLock::new(Duration::new(0, 0)),
         });
         self.n_connections
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -1010,17 +1010,17 @@ pub struct Connection {
     /// one entry per view that was touched in the transaction.
     view_transaction_states: AllViewsTxState,
     /// Connection-level metrics aggregation
-    pub metrics: RefCell<ConnectionMetrics>,
+    pub metrics: RwLock<ConnectionMetrics>,
     /// Whether the connection is executing a statement initiated by another statement.
     /// Generally this is only true for ParseSchema.
     is_nested_stmt: AtomicBool,
-    encryption_key: RefCell<Option<EncryptionKey>>,
-    encryption_cipher_mode: Cell<Option<CipherMode>>,
-    sync_mode: Cell<SyncMode>,
+    encryption_key: RwLock<Option<EncryptionKey>>,
+    encryption_cipher_mode: RwLock<Option<CipherMode>>,
+    sync_mode: RwLock<SyncMode>,
     data_sync_retry: AtomicBool,
     /// User defined max accumulated Busy timeout duration
     /// Default is 0 (no timeout)
-    busy_timeout: Cell<std::time::Duration>,
+    busy_timeout: RwLock<std::time::Duration>,
 }
 
 impl Drop for Connection {
@@ -2154,11 +2154,11 @@ impl Connection {
     }
 
     pub fn get_sync_mode(&self) -> SyncMode {
-        self.sync_mode.get()
+        *self.sync_mode.read()
     }
 
     pub fn set_sync_mode(&self, mode: SyncMode) {
-        self.sync_mode.set(mode);
+        *self.sync_mode.write() = mode;
     }
 
     pub fn get_data_sync_retry(&self) -> bool {
@@ -2178,27 +2178,28 @@ impl Connection {
 
     pub fn set_encryption_key(&self, key: EncryptionKey) -> Result<()> {
         tracing::trace!("setting encryption key for connection");
-        *self.encryption_key.borrow_mut() = Some(key.clone());
+        *self.encryption_key.write() = Some(key.clone());
         self.set_encryption_context()
     }
 
     pub fn set_encryption_cipher(&self, cipher_mode: CipherMode) -> Result<()> {
         tracing::trace!("setting encryption cipher for connection");
-        self.encryption_cipher_mode.replace(Some(cipher_mode));
+        *self.encryption_cipher_mode.write() = Some(cipher_mode);
         self.set_encryption_context()
     }
 
     pub fn get_encryption_cipher_mode(&self) -> Option<CipherMode> {
-        self.encryption_cipher_mode.get()
+        *self.encryption_cipher_mode.read()
     }
 
     // if both key and cipher are set, set encryption context on pager
     fn set_encryption_context(&self) -> Result<()> {
-        let key_ref = self.encryption_key.borrow();
-        let Some(key) = key_ref.as_ref() else {
+        let key_guard = self.encryption_key.read();
+        let Some(key) = key_guard.as_ref() else {
             return Ok(());
         };
-        let Some(cipher_mode) = self.encryption_cipher_mode.get() else {
+        let cipher_guard = self.encryption_cipher_mode.read();
+        let Some(cipher_mode) = *cipher_guard else {
             return Ok(());
         };
         tracing::trace!("setting encryption ctx for connection");
@@ -2228,11 +2229,11 @@ impl Connection {
     ///
     /// This slight api change demonstrated a better throughtput in `perf/throughput/turso` benchmark
     pub fn set_busy_timeout(&self, duration: std::time::Duration) {
-        self.busy_timeout.set(duration);
+        *self.busy_timeout.write() = duration;
     }
 
     pub fn get_busy_timeout(&self) -> std::time::Duration {
-        self.busy_timeout.get()
+        *self.busy_timeout.read()
     }
 
     fn set_tx_state(&self, state: TransactionState) {
@@ -2422,7 +2423,7 @@ impl Statement {
 
         // Aggregate metrics when statement completes
         if matches!(res, Ok(StepResult::Done)) {
-            let mut conn_metrics = self.program.connection.metrics.borrow_mut();
+            let mut conn_metrics = self.program.connection.metrics.write();
             conn_metrics.record_statement(self.state.metrics.clone());
             self.busy = false;
         } else {
@@ -2431,7 +2432,7 @@ impl Statement {
 
         if matches!(res, Ok(StepResult::Busy)) {
             let now = self.pager.io.now();
-            let max_duration = self.program.connection.busy_timeout.get();
+            let max_duration = *self.program.connection.busy_timeout.read();
             self.busy_timeout = match self.busy_timeout.take() {
                 None => {
                     let mut result = BusyTimeout::new(now);
