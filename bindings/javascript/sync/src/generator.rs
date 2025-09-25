@@ -7,9 +7,6 @@ use std::{
 
 use turso_sync_engine::types::{DbChangesStatus, ProtocolCommand};
 
-pub const GENERATOR_RESUME_IO: u32 = 0;
-pub const GENERATOR_RESUME_DONE: u32 = 1;
-
 pub trait Generator {
     fn resume(&mut self, result: Option<String>) -> napi::Result<GeneratorResponse>;
 }
@@ -55,6 +52,17 @@ pub enum GeneratorResponse {
     SyncEngineChanges {
         changes: SyncEngineChanges,
     },
+}
+
+#[napi]
+impl SyncEngineChanges {
+    #[napi]
+    pub fn empty(&self) -> bool {
+        let Some(changes) = self.status.as_ref() else {
+            return true;
+        };
+        changes.file_slot.is_none()
+    }
 }
 
 #[napi]

@@ -1,6 +1,6 @@
 import { unlinkSync } from "node:fs";
 import { expect, test } from 'vitest'
-import { connect } from './promise.js'
+import { Database, connect } from './promise.js'
 import { sql } from 'drizzle-orm';
 import { drizzle } from 'drizzle-orm/better-sqlite3';
 
@@ -29,6 +29,47 @@ test('in-memory-db-async', async () => {
     const stmt = db.prepare("SELECT * FROM t WHERE x % 2 = ?");
     const rows = await stmt.all([1]);
     expect(rows).toEqual([{ x: 1 }, { x: 3 }]);
+})
+
+test('exec multiple statements', async () => {
+    const db = await connect(":memory:");
+    await db.exec("CREATE TABLE t(x); INSERT INTO t VALUES (1); INSERT INTO t VALUES (2)");
+    const stmt = db.prepare("SELECT * FROM t");
+    const rows = await stmt.all();
+    expect(rows).toEqual([{ x: 1 }, { x: 2 }]);
+})
+
+test('readonly-db', async () => {
+    const path = `test-${(Math.random() * 10000) | 0}.db`;
+    try {
+        {
+            const rw = await connect(path);
+            await rw.exec("CREATE TABLE t(x)");
+            await rw.exec("INSERT INTO t VALUES (1)");
+            rw.close();
+        }
+        {
+            const ro = await connect(path, { readonly: true });
+            await expect(async () => await ro.exec("INSERT INTO t VALUES (2)")).rejects.toThrowError(/Resource is read-only/g);
+            expect(await ro.prepare("SELECT * FROM t").all()).toEqual([{ x: 1 }])
+            ro.close();
+        }
+    } finally {
+        unlinkSync(path);
+        unlinkSync(`${path}-wal`);
+    }
+})
+
+test('file-must-exist', async () => {
+    const path = `test-${(Math.random() * 10000) | 0}.db`;
+    await expect(async () => await connect(path, { fileMustExist: true })).rejects.toThrowError(/failed to open file/);
+})
+
+test('explicit connect', async () => {
+    const db = new Database(':memory:');
+    expect(() => db.prepare("SELECT 1")).toThrowError(/database must be connected/g);
+    await db.connect();
+    expect(await db.prepare("SELECT 1 as x").all()).toEqual([{ x: 1 }]);
 })
 
 test('on-disk db', async () => {

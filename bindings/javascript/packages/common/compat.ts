@@ -29,9 +29,13 @@ function createErrorByName(name, message) {
  * Database represents a connection that can prepare and execute SQL statements.
  */
 class Database {
-  db: NativeDatabase;
-  memory: boolean;
+  name: string;
+  readonly: boolean;
   open: boolean;
+  memory: boolean;
+  inTransaction: boolean;
+
+  private db: NativeDatabase;
   private _inTransaction: boolean = false;
 
   /**
@@ -44,34 +48,16 @@ class Database {
    * @param {boolean} [opts.fileMustExist=false] - If true, throws if database file does not exist.
    * @param {number} [opts.timeout=0] - Timeout duration in milliseconds for database operations. Defaults to 0 (no timeout).
    */
-  constructor(db: NativeDatabase, opts: any = {}) {
-    opts.readonly = opts.readonly === undefined ? false : opts.readonly;
-    opts.fileMustExist =
-      opts.fileMustExist === undefined ? false : opts.fileMustExist;
-    opts.timeout = opts.timeout === undefined ? 0 : opts.timeout;
-
+  constructor(db: NativeDatabase) {
     this.db = db;
-    this.memory = this.db.memory;
+    this.db.connectSync();
 
     Object.defineProperties(this, {
-      inTransaction: {
-        get: () => this._inTransaction,
-      },
-      name: {
-        get() {
-          return db.path;
-        },
-      },
-      readonly: {
-        get() {
-          return opts.readonly;
-        },
-      },
-      open: {
-        get() {
-          return this.db.open;
-        },
-      },
+      name: { get: () => this.db.path },
+      readonly: { get: () => this.db.readonly },
+      open: { get: () => this.db.open },
+      memory: { get: () => this.db.memory },
+      inTransaction: { get: () => this._inTransaction },
     });
   }
 
@@ -81,16 +67,12 @@ class Database {
    * @param {string} sql - The SQL statement string to prepare.
    */
   prepare(sql) {
-    if (!this.open) {
-      throw new TypeError("The database connection is not open");
-    }
-
     if (!sql) {
       throw new RangeError("The supplied SQL string contains no statements");
     }
 
     try {
-      return new Statement(this.db.prepare(sql), this);
+      return new Statement(this.db.prepare(sql), this.db);
     } catch (err) {
       throw convertError(err);
     }
@@ -148,9 +130,12 @@ class Database {
     const pragma = `PRAGMA ${source}`;
 
     const stmt = this.prepare(pragma);
-    const results = stmt.all();
-
-    return results;
+    try {
+      const results = stmt.all();
+      return results;
+    } finally {
+      stmt.close();
+    }
   }
 
   backup(filename, options) {
@@ -182,24 +167,30 @@ class Database {
   }
 
   /**
-   * Executes a SQL statement.
+   * Executes the given SQL string
+   * Unlike prepared statements, this can execute strings that contain multiple SQL statements
    *
-   * @param {string} sql - The SQL statement string to execute.
+   * @param {string} sql - The string containing SQL statements to execute
    */
   exec(sql) {
-    if (!this.open) {
-      throw new TypeError("The database connection is not open");
-    }
-
+    const exec = this.db.executor(sql);
     try {
-      let stmt = this.prepare(sql);
-      try {
-        stmt.run();
-      } finally {
-        stmt.close();
+      while (true) {
+        const stepResult = exec.stepSync();
+        if (stepResult === STEP_IO) {
+          this.db.ioLoopSync();
+          continue;
+        }
+        if (stepResult === STEP_DONE) {
+          break;
+        }
+        if (stepResult === STEP_ROW) {
+          // For exec(), we don't need the row data, just continue
+          continue;
+        }
       }
-    } catch (err) {
-      throw convertError(err);
+    } finally {
+      exec.reset();
     }
   }
 
@@ -232,11 +223,11 @@ class Database {
  */
 class Statement {
   stmt: NativeStatement;
-  db: Database;
+  db: NativeDatabase;
 
-  constructor(stmt: NativeStatement, database: Database) {
+  constructor(stmt: NativeStatement, db: NativeDatabase) {
     this.stmt = stmt;
-    this.db = database;
+    this.db = db;
   }
 
   /**
@@ -294,14 +285,14 @@ class Statement {
    * Executes the SQL statement and returns an info object.
    */
   run(...bindParameters) {
-    const totalChangesBefore = this.db.db.totalChanges();
+    const totalChangesBefore = this.db.totalChanges();
 
     this.stmt.reset();
     bindParams(this.stmt, bindParameters);
     for (; ;) {
       const stepResult = this.stmt.stepSync();
       if (stepResult === STEP_IO) {
-        this.db.db.ioLoopSync();
+        this.db.ioLoopSync();
         continue;
       }
       if (stepResult === STEP_DONE) {
@@ -313,8 +304,8 @@ class Statement {
       }
     }
 
-    const lastInsertRowid = this.db.db.lastInsertRowid();
-    const changes = this.db.db.totalChanges() === totalChangesBefore ? 0 : this.db.db.changes();
+    const lastInsertRowid = this.db.lastInsertRowid();
+    const changes = this.db.totalChanges() === totalChangesBefore ? 0 : this.db.changes();
 
     return { changes, lastInsertRowid };
   }
@@ -330,7 +321,7 @@ class Statement {
     for (; ;) {
       const stepResult = this.stmt.stepSync();
       if (stepResult === STEP_IO) {
-        this.db.db.ioLoopSync();
+        this.db.ioLoopSync();
         continue;
       }
       if (stepResult === STEP_DONE) {
@@ -354,7 +345,7 @@ class Statement {
     while (true) {
       const stepResult = this.stmt.stepSync();
       if (stepResult === STEP_IO) {
-        this.db.db.ioLoopSync();
+        this.db.ioLoopSync();
         continue;
       }
       if (stepResult === STEP_DONE) {
@@ -378,7 +369,7 @@ class Statement {
     for (; ;) {
       const stepResult = this.stmt.stepSync();
       if (stepResult === STEP_IO) {
-        this.db.db.ioLoopSync();
+        this.db.ioLoopSync();
         continue;
       }
       if (stepResult === STEP_DONE) {

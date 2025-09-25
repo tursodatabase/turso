@@ -3,9 +3,6 @@
 import { GeneratorResponse, ProtocolIo, RunOpts } from "./types.js";
 import { AsyncLock } from "@tursodatabase/database-common";
 
-const GENERATOR_RESUME_IO = 0;
-const GENERATOR_RESUME_DONE = 1;
-
 interface TrackPromise<T> {
     promise: Promise<T>,
     finished: boolean
@@ -26,7 +23,7 @@ async function process(opts: RunOpts, io: ProtocolIo, request: any) {
     const completion = request.completion();
     if (requestType.type == 'Http') {
         try {
-            let headers = opts.headers;
+            let headers = typeof opts.headers === "function" ? opts.headers() : opts.headers;
             if (requestType.headers != null && requestType.headers.length > 0) {
                 headers = { ...opts.headers };
                 for (let header of requestType.headers) {
@@ -128,10 +125,7 @@ export async function run(opts: RunOpts, io: ProtocolIo, engine: any, generator:
 
         tasks = tasks.filter(t => !t.finished);
     }
-    return generator.take();
 }
-
-
 
 export class SyncEngineGuards {
     waitLock: AsyncLock;

@@ -1,6 +1,6 @@
 import { unlinkSync } from "node:fs";
 import { expect, test } from 'vitest'
-import { connect, DatabaseRowMutation, DatabaseRowTransformResult } from './promise.js'
+import { connect, Database, DatabaseRowMutation, DatabaseRowTransformResult } from './promise.js'
 
 const localeCompare = (a, b) => a.x.localeCompare(b.x);
 
@@ -11,6 +11,13 @@ function cleanup(path) {
     unlinkSync(`${path}-changes`);
     try { unlinkSync(`${path}-wal-revert`) } catch (e) { }
 }
+
+test('explicit connect', async () => {
+    const db = new Database({ path: ':memory:', url: process.env.VITE_TURSO_DB_URL });
+    expect(() => db.prepare("SELECT 1")).toThrowError(/database must be connected/g);
+    await db.connect();
+    expect(await db.prepare("SELECT 1 as x").all()).toEqual([{ x: 1 }]);
+})
 
 test('select-after-push', async () => {
     {

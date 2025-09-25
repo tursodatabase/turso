@@ -1317,6 +1317,33 @@ impl Connection {
         Ok(())
     }
 
+    #[instrument(skip_all, level = Level::INFO)]
+    pub fn consume_stmt(self: &Arc<Connection>, sql: &str) -> Result<Option<(Statement, usize)>> {
+        let mut parser = Parser::new(sql.as_bytes());
+        let Some(cmd) = parser.next_cmd()? else {
+            return Ok(None);
+        };
+        let syms = self.syms.read();
+        let pager = self.pager.read().clone();
+        let byte_offset_end = parser.offset();
+        let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
+            .unwrap()
+            .trim();
+        let mode = QueryMode::new(&cmd);
+        let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
+        let program = translate::translate(
+            self.schema.read().deref(),
+            stmt,
+            pager.clone(),
+            self.clone(),
+            &syms,
+            mode,
+            input,
+        )?;
+        let stmt = Statement::new(program, self.db.mv_store.clone(), pager.clone(), mode);
+        Ok(Some((stmt, parser.offset())))
+    }
+
     #[cfg(feature = "fs")]
     pub fn from_uri(
         uri: &str,

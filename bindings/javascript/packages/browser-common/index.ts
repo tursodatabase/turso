@@ -42,9 +42,7 @@ function panicWorker(name): never {
     throw new Error(`method ${name} must be invoked only from the main thread`);
 }
 
-let completeOpfs: any = null;
-
-function mainImports(worker: Worker): BrowserImports {
+function mainImports(worker: Worker, completeOpfs: (c: any, r: any) => void): BrowserImports {
     return {
         is_web_worker(): boolean {
             return false;
@@ -270,7 +268,7 @@ let workerRequestId = 0;
 function waitForWorkerResponse(worker: Worker, id: number): Promise<any> {
     let waitResolve, waitReject;
     const callback = msg => {
-        if (msg.data.id == id) {
+        if (msg.data.__turso__ && msg.data.id == id) {
             if (msg.data.error != null) {
                 waitReject(msg.data.error)
             } else {
@@ -378,31 +376,31 @@ function setupWebWorker() {
         if (e.data.__turso__ == 'register') {
             try {
                 await opfs.registerFile(e.data.path);
-                self.postMessage({ id: e.data.id });
+                self.postMessage({ __turso__: true, id: e.data.id });
             } catch (error) {
-                self.postMessage({ id: e.data.id, error: error });
+                self.postMessage({ __turso__: true, id: e.data.id, error: error });
             }
             return;
         } else if (e.data.__turso__ == 'unregister') {
             try {
                 await opfs.unregisterFile(e.data.path);
-                self.postMessage({ id: e.data.id });
+                self.postMessage({ __turso__: true, id: e.data.id });
             } catch (error) {
-                self.postMessage({ id: e.data.id, error: error });
+                self.postMessage({ __turso__: true, id: e.data.id, error: error });
             }
             return;
         } else if (e.data.__turso__ == 'read_async') {
             let result = opfs.read(e.data.handle, getUint8ArrayFromMemory(memory, e.data.ptr, e.data.len), e.data.offset);
-            self.postMessage({ id: e.data.id, result: result });
+            self.postMessage({ __turso__: true, id: e.data.id, result: result });
         } else if (e.data.__turso__ == 'write_async') {
             let result = opfs.write(e.data.handle, getUint8ArrayFromMemory(memory, e.data.ptr, e.data.len), e.data.offset);
-            self.postMessage({ id: e.data.id, result: result });
+            self.postMessage({ __turso__: true, id: e.data.id, result: result });
         } else if (e.data.__turso__ == 'sync_async') {
             let result = opfs.sync(e.data.handle);
-            self.postMessage({ id: e.data.id, result: result });
+            self.postMessage({ __turso__: true, id: e.data.id, result: result });
         } else if (e.data.__turso__ == 'truncate_async') {
             let result = opfs.truncate(e.data.handle, e.data.len);
-            self.postMessage({ id: e.data.id, result: result });
+            self.postMessage({ __turso__: true, id: e.data.id, result: result });
         }
         handler.handle(e)
     }
@@ -410,6 +408,7 @@ function setupWebWorker() {
 
 async function setupMainThread(wasmFile: ArrayBuffer, factory: () => Worker): Promise<any> {
     const worker = factory();
+    let completeOpfs = null;
     const __emnapiContext = __emnapiGetDefaultContext()
     const __wasi = new __WASI({
         version: 'preview1',
@@ -433,7 +432,7 @@ async function setupMainThread(wasmFile: ArrayBuffer, factory: () => Worker): Pr
                 ...importObject.env,
                 ...importObject.napi,
                 ...importObject.emnapi,
-                ...mainImports(worker),
+                ...mainImports(worker, (c, res) => completeOpfs(c, res)),
                 memory: __sharedMemory,
             }
             return importObject

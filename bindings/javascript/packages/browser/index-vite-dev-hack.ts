@@ -7,7 +7,6 @@ let napiModule = {
     Opfs: {} as any,
     OpfsFile: {} as any,
     Statement: {} as any,
-    connectDbAsync: {} as any,
     initThreadPool: {} as any,
   }
 };
@@ -37,5 +36,4 @@ export const Database = napiModule.exports.Database
 export const Opfs = napiModule.exports.Opfs
 export const OpfsFile = napiModule.exports.OpfsFile
 export const Statement = napiModule.exports.Statement
-export const connectDbAsync = napiModule.exports.connectDbAsync
 export const initThreadPool = napiModule.exports.initThreadPool

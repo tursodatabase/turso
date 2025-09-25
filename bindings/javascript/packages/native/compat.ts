@@ -3,7 +3,7 @@ import { Database as NativeDB } from "#index";
 
 class Database extends DatabaseCompat {
     constructor(path: string, opts: DatabaseOpts = {}) {
-        super(new NativeDB(path, { tracing: opts.tracing }) as unknown as NativeDatabase, opts)
+        super(new NativeDB(path, opts) as unknown as NativeDatabase)
     }
 }
 

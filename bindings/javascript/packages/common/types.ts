@@ -2,21 +2,24 @@ export interface DatabaseOpts {
     readonly?: boolean,
     fileMustExist?: boolean,
     timeout?: number
-    name?: string
     tracing?: 'info' | 'debug' | 'trace'
 }
 
 export interface NativeDatabase {
     memory: boolean,
     path: string,
+    readonly: boolean;
+    open: boolean;
     new(path: string): NativeDatabase;
-    batchSync(sql: string);
-    batchAsync(sql: string): Promise<void>;
+
+    connectSync();
+    connectAsync(): Promise<void>;
 
     ioLoopSync();
     ioLoopAsync(): Promise<void>;
 
     prepare(sql: string): NativeStatement;
+    executor(sql: string): NativeExecutor;
 
     defaultSafeIntegers(toggle: boolean);
     totalChanges(): number;
@@ -36,6 +39,10 @@ export interface TableColumn {
     type: string
 }
 
+export interface NativeExecutor {
+    stepSync(): number;
+    reset();
+}
 export interface NativeStatement {
     stepAsync(): Promise<number>;
     stepSync(): number;
