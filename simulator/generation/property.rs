@@ -1635,11 +1635,21 @@ fn print_row(row: &[SimValue]) -> String {
             types::Value::Integer(i) => i.to_string(),
             types::Value::Float(f) => f.to_string(),
             types::Value::Text(t) => t.to_string(),
-            types::Value::Blob(b) => format!(
-                "X'{}'",
-                b.iter()
-                    .fold(String::new(), |acc, b| acc + &format!("{b:02X}"))
-            ),
+            types::Value::Blob(b) => {
+                let bytes = if b.unalloc_bytes > 0 {
+                    let mut blob = b.clone();
+                    blob.expand();
+                    blob.value
+                } else {
+                    b.value.clone()
+                };
+                format!(
+                    "X'{}'",
+                    bytes
+                        .iter()
+                        .fold(String::new(), |acc, byte| acc + &format!("{byte:02X}"))
+                )
+            }
         })
         .collect::<Vec<String>>()
         .join(", ")

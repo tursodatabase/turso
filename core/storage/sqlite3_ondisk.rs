@@ -61,7 +61,7 @@ use crate::storage::buffer_pool::BufferPool;
 use crate::storage::database::{DatabaseStorage, EncryptionOrChecksum};
 use crate::storage::pager::Pager;
 use crate::storage::wal::READMARK_NOT_USED;
-use crate::types::{RawSlice, RefValue, SerialType, SerialTypeKind, TextRef, TextSubtype};
+use crate::types::{BlobRef, RawSlice, RefValue, SerialType, SerialTypeKind, TextRef, TextSubtype};
 use crate::{
     bail_corrupt_error, turso_assert, CompletionError, File, IOContext, Result, WalFileShared,
 };
@@ -1412,11 +1412,23 @@ pub fn read_value(buf: &[u8], serial_type: SerialType) -> Result<(RefValue, usiz
                 crate::bail_corrupt_error!("Invalid Blob value");
             }
             if content_size == 0 {
-                Ok((RefValue::Blob(RawSlice::new(std::ptr::null(), 0)), 0))
+                Ok((
+                    RefValue::Blob(BlobRef {
+                        value: RawSlice::new(std::ptr::null(), 0),
+                        unalloc_bytes: 0,
+                    }),
+                    0,
+                ))
             } else {
                 let ptr = &buf[0] as *const u8;
                 let slice = RawSlice::new(ptr, content_size);
-                Ok((RefValue::Blob(slice), content_size))
+                Ok((
+                    RefValue::Blob(BlobRef {
+                        value: slice,
+                        unalloc_bytes: 0,
+                    }),
+                    content_size,
+                ))
             }
         }
         SerialTypeKind::Text => {
@@ -2221,8 +2233,8 @@ mod tests {
     #[case(&[0x40, 0x09, 0x21, 0xFB, 0x54, 0x44, 0x2D, 0x18], SerialType::f64(), Value::Float(std::f64::consts::PI))]
     #[case(&[1, 2], SerialType::const_int0(), Value::Integer(0))]
     #[case(&[65, 66], SerialType::const_int1(), Value::Integer(1))]
-    #[case(&[1, 2, 3], SerialType::blob(3), Value::Blob(vec![1, 2, 3]))]
-    #[case(&[], SerialType::blob(0), Value::Blob(vec![]))] // empty blob
+    #[case(&[1, 2, 3], SerialType::blob(3), Value::build_blob(vec![1, 2, 3]))]
+    #[case(&[], SerialType::blob(0), Value::build_blob(vec![]))] // empty blob
     #[case(&[65, 66, 67], SerialType::text(3), Value::build_text("ABC"))]
     #[case(&[0x80], SerialType::i8(), Value::Integer(-128))]
     #[case(&[0x80, 0], SerialType::i16(), Value::Integer(-32768))]

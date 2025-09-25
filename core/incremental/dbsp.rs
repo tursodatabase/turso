@@ -68,7 +68,8 @@ impl HashableRow {
                 }
                 Value::Blob(b) => {
                     4u8.hash(&mut hasher);
-                    b.hash(&mut hasher);
+                    b.value.hash(&mut hasher);
+                    b.unalloc_bytes.hash(&mut hasher);
                 }
             }
         }

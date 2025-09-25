@@ -57,7 +57,7 @@ fn test_statement_bind() -> anyhow::Result<()> {
     let i = stmt.parameters().index(":named").unwrap();
     stmt.bind_at(i, Value::Integer(42));
 
-    stmt.bind_at(3.try_into()?, Value::from_blob(vec![0x1, 0x2, 0x3]));
+    stmt.bind_at(3.try_into()?, Value::build_blob(vec![0x1, 0x2, 0x3]));
 
     stmt.bind_at(4.try_into()?, Value::Float(0.5));
 
@@ -80,7 +80,7 @@ fn test_statement_bind() -> anyhow::Result<()> {
                 }
 
                 if let turso_core::Value::Blob(v) = row.get::<&Value>(3).unwrap() {
-                    assert_eq!(v.as_slice(), &vec![0x1_u8, 0x2, 0x3])
+                    assert_eq!(v.value.as_slice(), &vec![0x1_u8, 0x2, 0x3])
                 }
 
                 if let turso_core::Value::Float(f) = row.get::<&Value>(4).unwrap() {

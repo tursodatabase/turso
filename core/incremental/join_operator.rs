@@ -96,7 +96,7 @@ fn read_next_join_row(
                 // Deserialize the row from the blob
                 let value_at_3 = table_values[3].to_owned();
                 let blob = match value_at_3 {
-                    Value::Blob(ref b) => b,
+                    Value::Blob(ref b) => &b.value,
                     _ => return Ok(IOResult::Done(None)),
                 };
 
@@ -586,7 +586,7 @@ fn deserialize_hashable_row(blob: &[u8]) -> Result<HashableRow> {
                     offset += 4;
                     if offset + len <= blob.len() {
                         let blob_data = blob[offset..offset + len].to_vec();
-                        values.push(Value::Blob(blob_data));
+                        values.push(Value::build_blob(blob_data));
                         offset += len;
                     }
                 }
@@ -629,8 +629,14 @@ fn serialize_hashable_row(row: &HashableRow) -> Vec<u8> {
             }
             Value::Blob(b) => {
                 blob.push(4u8);
-                blob.extend_from_slice(&(b.len() as u32).to_le_bytes());
-                blob.extend_from_slice(b);
+                blob.extend_from_slice(&(b.bytes_len() as u32).to_le_bytes());
+                if b.unalloc_bytes > 0 {
+                    let mut b = b.clone();
+                    b.expand();
+                    blob.extend_from_slice(&b.value);
+                } else {
+                    blob.extend_from_slice(&b.value);
+                }
             }
         }
     }
@@ -711,7 +717,7 @@ impl IncrementalOperator for JoinOperator {
                         Value::Integer(self.left_storage_id()),
                         Value::Integer(join_key.cached_hash() as i64),
                         Value::Integer(row.cached_hash() as i64),
-                        Value::Blob(row_blob),
+                        Value::build_blob(row_blob),
                     ];
 
                     // Use return_and_restore_if_io to handle I/O properly
@@ -757,7 +763,7 @@ impl IncrementalOperator for JoinOperator {
                         Value::Integer(self.right_storage_id()),
                         Value::Integer(join_key.cached_hash() as i64),
                         Value::Integer(row.cached_hash() as i64),
-                        Value::Blob(row_blob),
+                        Value::build_blob(row_blob),
                     ];
 
                     // Use return_and_restore_if_io to handle I/O properly

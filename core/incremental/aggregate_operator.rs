@@ -403,8 +403,8 @@ impl AggregateState {
                 }
                 Value::Blob(b) => {
                     blob.push(4u8);
-                    blob.extend_from_slice(&(b.len() as u32).to_le_bytes());
-                    blob.extend_from_slice(b);
+                    blob.extend_from_slice(&(b.value.len() as u32).to_le_bytes());
+                    blob.extend_from_slice(&b.value);
                 }
             }
         }
@@ -500,7 +500,7 @@ impl AggregateState {
                     cursor += 4;
                     let bytes = blob.get(cursor..cursor + len)?;
                     cursor += len;
-                    Value::Blob(bytes.to_vec())
+                    Value::Blob(bytes.into())
                 }
                 _ => return None,
             };
@@ -1028,7 +1028,7 @@ impl IncrementalOperator for AggregateOperator {
 
                         // Serialize the aggregate state with group key (even for deletion, we need a row)
                         let state_blob = agg_state.to_blob(&self.aggregates, group_key);
-                        let blob_value = Value::Blob(state_blob);
+                        let blob_value = Value::Blob(state_blob.as_slice().into());
 
                         // Build the aggregate storage format: [operator_id, zset_id, element_id, value, weight]
                         let operator_id_val = Value::Integer(operator_storage_id);
