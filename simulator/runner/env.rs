@@ -264,7 +264,9 @@ impl SimulatorEnv {
     /// Rng only used for generating interactions. By having a separate Rng we can guarantee that a particular seed
     /// will always create the same interactions plan, regardless of the changes that happen in the Database code
     pub fn gen_rng(&self) -> ChaCha8Rng {
-        ChaCha8Rng::seed_from_u64(self.seed)
+        // Seed + 1 so that there is no relation with the original seed, and so we have no way to accidently generate
+        // the first Create statement twice in a row
+        ChaCha8Rng::seed_from_u64(self.seed + 1)
     }
 }
 
