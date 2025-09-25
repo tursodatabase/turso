@@ -2281,7 +2281,17 @@ pub fn op_transaction_inner(
                     // In MVCC we don't have write exclusivity, therefore we just need to start a transaction if needed.
                     // Programs can run Transaction twice, first with read flag and then with write flag. So a single txid is enough
                     // for both.
-                    if program.connection.mv_tx.get().is_none() {
+                    let has_existing_mv_tx = program.connection.mv_tx.get().is_some();
+
+                    let conn_has_executed_begin_deferred = !has_existing_mv_tx
+                        && !program.connection.auto_commit.load(Ordering::SeqCst);
+                    if conn_has_executed_begin_deferred && *tx_mode == TransactionMode::Concurrent {
+                        return Err(LimboError::TxError(
+                            "Cannot start CONCURRENT transaction after BEGIN DEFERRED".to_string(),
+                        ));
+                    }
+
+                    if !has_existing_mv_tx {
                         let tx_id = match tx_mode {
                             TransactionMode::None
                             | TransactionMode::Read
