@@ -339,3 +339,15 @@ do_execsql_test_on_specific_db {:memory:} left-join-column-crash {
     select * from a left join b on a.x < 2 where a.x < 3 and b.x < 12;
 } {1|1|3|3
 1|1|4|4}
+
+# Test that column names in USING clause are not ambiguous since they are deduplicated.
+# The column 'a' appears in both tables but can be referenced unqualified in the SELECT
+# since it's in the USING clause.
+do_execsql_test_on_specific_db {:memory:} using-deduplicates-columns {
+    create table t(a);
+    create table tt(a); 
+    insert into t values (1),(2),(3),(4),(5);
+    insert into tt values (4),(5),(6),(7),(8);
+    select a from t join tt using(a);
+} {4
+5}
