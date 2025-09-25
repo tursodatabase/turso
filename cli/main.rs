@@ -4,6 +4,7 @@ mod commands;
 mod config;
 mod helper;
 mod input;
+mod manual;
 mod mcp_server;
 mod opcodes_dictionary;
 

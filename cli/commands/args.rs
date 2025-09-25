@@ -166,6 +166,12 @@ pub struct CloneArgs {
     pub output_file: String,
 }
 
+#[derive(Debug, Clone, Args)]
+pub struct ManualArgs {
+    /// The manual page to display (e.g., "mcp")
+    pub page: Option<String>,
+}
+
 #[derive(ValueEnum, Copy, Clone, Debug, PartialEq, Eq)]
 pub enum HeadersMode {
     On,

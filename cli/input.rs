@@ -361,6 +361,10 @@ pub const AFTER_HELP_MSG: &str = r#"Usage Examples:
 18. To clone the open database to another file:
    .clone output_file.db
 
+19. To view manual pages for features:
+   .manual mcp    # View MCP server documentation
+   .man           # List all available manuals
+
 Note:
 - All SQL commands must end with a semicolon (;).
 - Special commands start with a dot (.) and are not required to end with a semicolon."#;
