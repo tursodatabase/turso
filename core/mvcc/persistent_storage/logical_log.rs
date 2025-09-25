@@ -8,7 +8,7 @@ use crate::{
     },
     storage::sqlite3_ondisk::{read_varint, write_varint_to_vec},
     turso_assert,
-    types::IOCompletions,
+    types::{IOCompletions, ImmutableRecord},
     Buffer, Completion, CompletionError, LimboError, Pager, Result,
 };
 use std::{cell::RefCell, sync::Arc};
@@ -327,8 +327,8 @@ impl StreamingLogicalLogReader {
                             let (rowid, nrowid) = self.consume_varint(io)?;
                             let (payload_size, npayload) = self.consume_varint(io)?;
                             let buffer = self.consume_buffer(io, payload_size as usize)?;
-                            // TODO: add column count to format
-                            let column_count = 1;
+                            let record = ImmutableRecord::from_bin_record(buffer.clone());
+                            let column_count = record.column_count();
 
                             bytes_read_on_row += npayload + nrowid + payload_size as usize;
                             self.state = StreamingState::NeedRow {
@@ -477,9 +477,9 @@ mod tests {
         let db = MvccTestDbNoConn::new_with_random_db();
         let (db_path, io, pager) = {
             let conn = db.connect();
-            let pager = conn.pager.clone().borrow().clone();
+            let pager = conn.pager.read().clone();
             let mvcc_store = db.get_mvcc_store();
-            let tx_id = mvcc_store.begin_tx(conn.pager.borrow().clone()).unwrap();
+            let tx_id = mvcc_store.begin_tx(pager.clone()).unwrap();
 
             let row = generate_simple_string_row(1, 1, "foo");
             mvcc_store.insert(tx_id, row).unwrap();
