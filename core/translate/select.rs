@@ -519,6 +519,12 @@ fn prepare_one_select_plan(
             Ok(plan)
         }
         ast::OneSelect::Values(values) => {
+            if !order_by.is_empty() {
+                crate::bail_parse_error!("ORDER BY clause is not allowed with VALUES clause");
+            }
+            if limit.is_some() {
+                crate::bail_parse_error!("LIMIT clause is not allowed with VALUES clause");
+            }
             let len = values[0].len();
             let mut result_columns = Vec::with_capacity(len);
             for i in 0..len {
