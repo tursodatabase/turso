@@ -7585,8 +7585,8 @@ mod tests {
                     },
                     order_by: vec![],
                     limit: Some(Limit {
-                        expr: Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
-                        offset: Some(Box::new(Expr::Literal(Literal::Numeric("2".to_owned())))),
+                        expr: Box::new(Expr::Literal(Literal::Numeric("2".to_owned()))),
+                        offset: Some(Box::new(Expr::Literal(Literal::Numeric("1".to_owned())))),
                     }),
                 }))],
             ),
