@@ -1039,11 +1039,11 @@ pub fn parse_pragma_bool(expr: &Expr) -> Result<bool> {
             return Ok(x != 0);
         }
     } else if let Expr::Name(name) = expr {
-        let ident = normalize_ident(name.as_str());
-        if TRUE_VALUES.contains(&ident.as_str()) {
+        let ident = name.as_str();
+        if TRUE_VALUES.contains(&ident) {
             return Ok(true);
         }
-        if FALSE_VALUES.contains(&ident.as_str()) {
+        if FALSE_VALUES.contains(&ident) {
             return Ok(false);
         }
     }
@@ -1058,7 +1058,7 @@ pub fn extract_column_name_from_expr(expr: impl AsRef<ast::Expr>) -> Option<Stri
     match expr.as_ref() {
         ast::Expr::Id(name) => Some(name.as_str().to_string()),
         ast::Expr::DoublyQualified(_, _, name) | ast::Expr::Qualified(_, name) => {
-            Some(normalize_ident(name.as_str()))
+            Some(name.as_str().to_string())
         }
         _ => None,
     }
@@ -1133,13 +1133,13 @@ pub fn extract_view_columns(
                         // Include database qualifier if present
                         qualified_name.to_string()
                     } else {
-                        normalize_ident(qualified_name.name.as_str())
+                        qualified_name.name.as_str().to_string()
                     };
                     tables.push(ViewTable {
                         name: table_name.clone(),
                         alias: alias.as_ref().map(|a| match a {
-                            ast::As::As(name) => normalize_ident(name.as_str()),
-                            ast::As::Elided(name) => normalize_ident(name.as_str()),
+                            ast::As::As(name) => name.as_str().to_string(),
+                            ast::As::Elided(name) => name.as_str().to_string(),
                         }),
                     });
                 }
@@ -1156,13 +1156,13 @@ pub fn extract_view_columns(
                             // Include database qualifier if present
                             qualified_name.to_string()
                         } else {
-                            normalize_ident(qualified_name.name.as_str())
+                            qualified_name.name.as_str().to_string()
                         };
                         tables.push(ViewTable {
                             name: table_name.clone(),
                             alias: alias.as_ref().map(|a| match a {
-                                ast::As::As(name) => normalize_ident(name.as_str()),
-                                ast::As::Elided(name) => normalize_ident(name.as_str()),
+                                ast::As::As(name) => name.as_str().to_string(),
+                                ast::As::Elided(name) => name.as_str().to_string(),
                             }),
                         });
                     }
@@ -1288,7 +1288,7 @@ pub fn extract_view_columns(
                 }
                 ast::ResultColumn::TableStar(table_ref) => {
                     // For table.*, expand to all columns from the specified table
-                    let table_name_str = normalize_ident(table_ref.as_str());
+                    let table_name_str = table_ref.as_str();
                     if let Some(table_idx) = find_table_index(&table_name_str) {
                         if let Some(table) = schema.get_table(&tables[table_idx].name) {
                             for table_column in table.columns() {

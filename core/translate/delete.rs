@@ -4,7 +4,6 @@ use crate::translate::expr::ParamState;
 use crate::translate::optimizer::optimize_plan;
 use crate::translate::plan::{DeletePlan, Operation, Plan};
 use crate::translate::planner::{parse_limit, parse_where};
-use crate::util::normalize_ident;
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts, TableRefIdCounter};
 use crate::{schema::Schema, Result, SymbolTable};
 use std::sync::Arc;
@@ -23,7 +22,7 @@ pub fn translate_delete(
     mut program: ProgramBuilder,
     connection: &Arc<crate::Connection>,
 ) -> Result<ProgramBuilder> {
-    let tbl_name = normalize_ident(tbl_name.name.as_str());
+    let tbl_name = tbl_name.name.as_str();
 
     // Check if this is a system table that should be protected from direct writes
     if crate::schema::is_system_table(&tbl_name) {
@@ -49,7 +48,7 @@ pub fn translate_delete(
 
     let mut delete_plan = prepare_delete_plan(
         schema,
-        tbl_name,
+        tbl_name.to_string(),
         where_clause,
         limit,
         result_columns,

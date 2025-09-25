@@ -37,7 +37,7 @@ use std::sync::Mutex;
 use tracing::trace;
 use turso_parser::ast::{self, ColumnDefinition, Expr, Literal, SortOrder, TableOptions};
 use turso_parser::{
-    ast::{Cmd, CreateTableBody, Name, ResultColumn, Stmt},
+    ast::{Cmd, CreateTableBody, ResultColumn, Stmt},
     parser::Parser,
 };
 
@@ -118,44 +118,40 @@ impl Schema {
             .any(|idx| idx.1.iter().any(|i| i.name == name))
     }
     pub fn add_materialized_view(&mut self, view: IncrementalView, table: Arc<Table>, sql: String) {
-        let name = normalize_ident(view.name());
+        let name = view.name();
 
         // Add to tables (so it appears as a regular table)
-        self.tables.insert(name.clone(), table);
+        self.tables.insert(name.to_string(), table);
 
         // Track that this is a materialized view
-        self.materialized_view_names.insert(name.clone());
-        self.materialized_view_sql.insert(name.clone(), sql);
+        self.materialized_view_names.insert(name.to_string());
+        self.materialized_view_sql.insert(name.to_string(), sql);
 
         // Store the incremental view (DBSP circuit)
         self.incremental_views
-            .insert(name, Arc::new(Mutex::new(view)));
+            .insert(name.to_string(), Arc::new(Mutex::new(view)));
     }
 
     pub fn get_materialized_view(&self, name: &str) -> Option<Arc<Mutex<IncrementalView>>> {
-        let name = normalize_ident(name);
-        self.incremental_views.get(&name).cloned()
+        self.incremental_views.get(name).cloned()
     }
 
     pub fn is_materialized_view(&self, name: &str) -> bool {
-        let name = normalize_ident(name);
-        self.materialized_view_names.contains(&name)
+        self.materialized_view_names.contains(name)
     }
 
     pub fn remove_view(&mut self, name: &str) -> Result<()> {
-        let name = normalize_ident(name);
-
-        if self.views.contains_key(&name) {
-            self.views.remove(&name);
+        if self.views.contains_key(name) {
+            self.views.remove(name);
             Ok(())
-        } else if self.materialized_view_names.contains(&name) {
+        } else if self.materialized_view_names.contains(name) {
             // Remove from tables
-            self.tables.remove(&name);
+            self.tables.remove(name);
 
             // Remove from materialized view tracking
-            self.materialized_view_names.remove(&name);
-            self.materialized_view_sql.remove(&name);
-            self.incremental_views.remove(&name);
+            self.materialized_view_names.remove(name);
+            self.materialized_view_sql.remove(name);
+            self.incremental_views.remove(name);
 
             // Remove from table_to_materialized_views dependencies
             for views in self.table_to_materialized_views.values_mut() {
@@ -172,13 +168,10 @@ impl Schema {
 
     /// Register that a materialized view depends on a table
     pub fn add_materialized_view_dependency(&mut self, table_name: &str, view_name: &str) {
-        let table_name = normalize_ident(table_name);
-        let view_name = normalize_ident(view_name);
-
         self.table_to_materialized_views
-            .entry(table_name)
+            .entry(table_name.to_string())
             .or_default()
-            .push(view_name);
+            .push(view_name.to_string());
     }
 
     /// Get all materialized views that depend on a given table
@@ -186,37 +179,34 @@ impl Schema {
         if self.table_to_materialized_views.is_empty() {
             return Vec::new();
         }
-        let table_name = normalize_ident(table_name);
         self.table_to_materialized_views
-            .get(&table_name)
+            .get(table_name)
             .cloned()
             .unwrap_or_default()
     }
 
     /// Add a regular (non-materialized) view
     pub fn add_view(&mut self, view: View) {
-        let name = normalize_ident(&view.name);
+        let name = view.name.clone();
         self.views.insert(name, view);
     }
 
     /// Get a regular view by name
     pub fn get_view(&self, name: &str) -> Option<&View> {
-        let name = normalize_ident(name);
-        self.views.get(&name)
+        self.views.get(name)
     }
 
     pub fn add_btree_table(&mut self, table: Arc<BTreeTable>) {
-        let name = normalize_ident(&table.name);
-        self.tables.insert(name, Table::BTree(table).into());
+        self.tables
+            .insert(table.name.clone(), Table::BTree(table).into());
     }
 
     pub fn add_virtual_table(&mut self, table: Arc<VirtualTable>) {
-        let name = normalize_ident(&table.name);
-        self.tables.insert(name, Table::Virtual(table).into());
+        self.tables
+            .insert(table.name.clone(), Table::Virtual(table).into());
     }
 
     pub fn get_table(&self, name: &str) -> Option<Arc<Table>> {
-        let name = normalize_ident(name);
         let name = if name.eq_ignore_ascii_case(SCHEMA_TABLE_NAME_ALT) {
             SCHEMA_TABLE_NAME
         } else {
@@ -225,20 +215,18 @@ impl Schema {
         self.tables.get(name).cloned()
     }
 
-    pub fn remove_table(&mut self, table_name: &str) {
-        let name = normalize_ident(table_name);
-        self.tables.remove(&name);
+    pub fn remove_table(&mut self, name: &str) {
+        self.tables.remove(name);
 
         // If this was a materialized view, also clean up the metadata
-        if self.materialized_view_names.remove(&name) {
-            self.incremental_views.remove(&name);
-            self.materialized_view_sql.remove(&name);
+        if self.materialized_view_names.remove(name) {
+            self.incremental_views.remove(name);
+            self.materialized_view_sql.remove(name);
         }
     }
 
     pub fn get_btree_table(&self, name: &str) -> Option<Arc<BTreeTable>> {
-        let name = normalize_ident(name);
-        if let Some(table) = self.tables.get(&name) {
+        if let Some(table) = self.tables.get(name) {
             table.btree()
         } else {
             None
@@ -246,50 +234,46 @@ impl Schema {
     }
 
     pub fn add_index(&mut self, index: Arc<Index>) {
-        let table_name = normalize_ident(&index.table_name);
+        let table_name = &index.table_name;
         // We must add the new index to the front of the deque, because SQLite stores index definitions as a linked list
         // where the newest parsed index entry is at the head of list. If we would add it to the back of a regular Vec for example,
         // then we would evaluate ON CONFLICT DO UPDATE clauses in the wrong index iteration order and UPDATE the wrong row. One might
         // argue that this is an implementation detail and we should not care about this, but it makes e.g. the fuzz test 'partial_index_mutation_and_upsert_fuzz'
         // fail, so let's just be compatible.
         self.indexes
-            .entry(table_name)
+            .entry(table_name.clone())
             .or_default()
             .push_front(index.clone())
     }
 
     pub fn get_indices(&self, table_name: &str) -> impl Iterator<Item = &Arc<Index>> {
-        let name = normalize_ident(table_name);
         self.indexes
-            .get(&name)
+            .get(table_name)
             .map(|v| v.iter())
             .unwrap_or_default()
     }
 
     pub fn get_index(&self, table_name: &str, index_name: &str) -> Option<&Arc<Index>> {
-        let name = normalize_ident(table_name);
         self.indexes
-            .get(&name)?
+            .get(table_name)?
             .iter()
             .find(|index| index.name == index_name)
     }
 
     pub fn remove_indices_for_table(&mut self, table_name: &str) {
-        let name = normalize_ident(table_name);
-        self.indexes.remove(&name);
+        self.indexes.remove(table_name);
     }
 
     pub fn remove_index(&mut self, idx: &Index) {
-        let name = normalize_ident(&idx.table_name);
+        let name = &idx.table_name;
         self.indexes
-            .get_mut(&name)
+            .get_mut(name)
             .expect("Must have the index")
             .retain_mut(|other_idx| other_idx.name != idx.name);
     }
 
     pub fn table_has_indexes(&self, table_name: &str) -> bool {
-        let name = normalize_ident(table_name);
-        self.has_indexes.contains(&name)
+        self.has_indexes.contains(table_name)
     }
 
     pub fn table_set_has_index(&mut self, table_name: &str) {
@@ -818,19 +802,18 @@ impl Table {
 
     /// Returns the column position and column for a given column name.
     pub fn get_column_by_name(&self, name: &str) -> Option<(usize, &Column)> {
-        let name = normalize_ident(name);
         match self {
-            Self::BTree(table) => table.get_column(name.as_str()),
+            Self::BTree(table) => table.get_column(name),
             Self::Virtual(table) => table
                 .columns
                 .iter()
                 .enumerate()
-                .find(|(_, col)| col.name.as_ref() == Some(&name)),
+                .find(|(_, col)| col.name.as_deref() == Some(name)),
             Self::FromClauseSubquery(from_clause_subquery) => from_clause_subquery
                 .columns
                 .iter()
                 .enumerate()
-                .find(|(_, col)| col.name.as_ref() == Some(&name)),
+                .find(|(_, col)| col.name.as_deref() == Some(name)),
         }
     }
 
@@ -905,12 +888,10 @@ impl BTreeTable {
     /// E.g. if table is CREATE TABLE t (a, b, c)
     /// then get_column("b") returns (1, &Column { .. })
     pub fn get_column(&self, name: &str) -> Option<(usize, &Column)> {
-        let name = normalize_ident(name);
-
         self.columns
             .iter()
             .enumerate()
-            .find(|(_, column)| column.name.as_ref() == Some(&name))
+            .find(|(_, column)| column.name.as_deref() == Some(name))
     }
 
     pub fn from_sql(sql: &str, root_page: usize) -> Result<BTreeTable> {
@@ -1009,11 +990,10 @@ pub struct FromClauseSubquery {
 }
 
 pub fn create_table(
-    tbl_name: &str,
+    table_name: &str,
     body: &CreateTableBody,
     root_page: usize,
 ) -> Result<BTreeTable> {
-    let table_name = normalize_ident(tbl_name);
     trace!("Creating table {}", table_name);
     let mut has_rowid = true;
     let mut primary_key_columns = vec![];
@@ -1031,7 +1011,7 @@ pub fn create_table(
                 if let ast::TableConstraint::PrimaryKey { columns, .. } = &c.constraint {
                     for column in columns {
                         let col_name = match column.expr.as_ref() {
-                            Expr::Id(id) => normalize_ident(id.as_str()),
+                            Expr::Id(id) => id.as_str().to_string(),
                             Expr::Literal(Literal::String(value)) => {
                                 value.trim_matches('\'').to_owned()
                             }
@@ -1150,7 +1130,7 @@ pub fn create_table(
                 }
 
                 cols.push(Column {
-                    name: Some(normalize_ident(&name)),
+                    name: Some(name),
                     ty,
                     ty_str,
                     primary_key,
@@ -1194,7 +1174,7 @@ pub fn create_table(
 
     Ok(BTreeTable {
         root_page,
-        name: table_name,
+        name: table_name.to_string(),
         has_rowid,
         primary_key_columns,
         columns: cols,
@@ -1313,7 +1293,7 @@ impl From<&ColumnDefinition> for Column {
         let hidden = ty_str.contains("HIDDEN");
 
         Column {
-            name: Some(normalize_ident(name)),
+            name: Some(name.to_string()),
             ty,
             default,
             notnull,
@@ -1637,7 +1617,7 @@ impl Index {
                 where_clause,
                 ..
             })) => {
-                let index_name = normalize_ident(idx_name.name.as_str());
+                let index_name = idx_name.name.as_str();
                 let mut index_columns = Vec::with_capacity(columns.len());
                 for col in columns.into_iter() {
                     let name = normalize_ident(&col.expr.to_string());
@@ -1657,8 +1637,8 @@ impl Index {
                     });
                 }
                 Ok(Index {
-                    name: index_name,
-                    table_name: normalize_ident(tbl_name.as_str()),
+                    name: index_name.to_string(),
+                    table_name: tbl_name.as_str().to_string(),
                     root_page,
                     columns: index_columns,
                     unique,
@@ -1691,7 +1671,7 @@ impl Index {
             };
             let (_, column) = table.get_column(col_name).unwrap();
             primary_keys.push(IndexColumn {
-                name: normalize_ident(col_name),
+                name: col_name.to_string(),
                 order: *order,
                 pos_in_table,
                 collation: column.collation,
@@ -1702,7 +1682,7 @@ impl Index {
         assert!(primary_keys.len() == column_count);
 
         Ok(Index {
-            name: normalize_ident(index_name.as_str()),
+            name: index_name.as_str().to_string(),
             table_name: table.name.clone(),
             root_page,
             columns: primary_keys,
@@ -1729,7 +1709,7 @@ impl Index {
                     .iter()
                     .find(|(pos, _)| *pos == pos_in_table)?;
                 Some(IndexColumn {
-                    name: normalize_ident(col.name.as_ref().unwrap()),
+                    name: col.name.as_ref().unwrap().clone(),
                     order: *sort_order,
                     pos_in_table: *pos_in_table,
                     collation: col.collation,
@@ -1739,7 +1719,7 @@ impl Index {
             .collect::<Vec<_>>();
 
         Ok(Index {
-            name: normalize_ident(index_name.as_str()),
+            name: index_name.as_str().to_string(),
             table_name: table.name.clone(),
             root_page,
             columns: unique_cols,
@@ -1769,18 +1749,16 @@ impl Index {
             return true;
         };
 
-        let tbl_norm = normalize_ident(self.table_name.as_str());
+        let tbl_norm = self.table_name.as_str();
         let has_col = |name: &str| {
-            let n = normalize_ident(name);
             table
                 .columns()
                 .iter()
-                .any(|c| c.name.as_ref().is_some_and(|cn| normalize_ident(cn) == n))
+                .any(|c| c.name.as_ref().is_some_and(|cn| cn == name))
         };
-        let is_tbl = |ns: &str| normalize_ident(ns).eq_ignore_ascii_case(&tbl_norm);
+        let is_tbl = |ns: &str| ns.eq_ignore_ascii_case(&tbl_norm);
         let is_deterministic_fn = |name: &str, argc: usize| {
-            let n = normalize_ident(name);
-            Func::resolve_function(&n, argc).is_ok_and(|f| f.is_deterministic())
+            Func::resolve_function(&name, argc).is_ok_and(|f| f.is_deterministic())
         };
 
         let mut ok = true;

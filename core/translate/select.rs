@@ -14,7 +14,6 @@ use crate::translate::planner::{
     resolve_window_and_aggregate_functions,
 };
 use crate::translate::window::plan_windows;
-use crate::util::normalize_ident;
 use crate::vdbe::builder::{ProgramBuilderOpts, TableRefIdCounter};
 use crate::vdbe::insn::Insn;
 use crate::{schema::Schema, vdbe::builder::ProgramBuilder, Result};
@@ -292,8 +291,8 @@ fn prepare_one_select_plan(
 
             let mut windows = Vec::with_capacity(window_clause.len());
             for window_def in window_clause.iter() {
-                let name = normalize_ident(window_def.name.as_str());
-                let mut window = Window::new(Some(name), &window_def.window)?;
+                let name = window_def.name.as_str();
+                let mut window = Window::new(Some(name.to_string()), &window_def.window)?;
 
                 for expr in window.partition_by.iter_mut() {
                     bind_and_rewrite_expr(
@@ -338,7 +337,7 @@ fn prepare_one_select_plan(
                         }
                     }
                     ResultColumn::TableStar(name) => {
-                        let name_normalized = normalize_ident(name.as_str());
+                        let name_normalized = name.as_str();
                         let referenced_table = plan
                             .table_references
                             .joined_tables_mut()

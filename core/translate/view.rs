@@ -2,7 +2,7 @@ use crate::schema::{Schema, DBSP_TABLE_PREFIX};
 use crate::storage::pager::CreateBTreeFlags;
 use crate::translate::emitter::Resolver;
 use crate::translate::schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
-use crate::util::{normalize_ident, PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX};
+use crate::util::PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX;
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{CmpInsFlags, Cookie, Insn, RegisterOrLiteral};
 use crate::{Connection, Result, SymbolTable};
@@ -25,7 +25,7 @@ pub fn translate_create_materialized_view(
         ));
     }
 
-    let normalized_view_name = normalize_ident(view_name);
+    let normalized_view_name = view_name;
 
     // Check if view already exists
     if schema
@@ -71,7 +71,7 @@ pub fn translate_create_materialized_view(
     // Create a proper BTreeTable for the cursor with the actual view columns
     let view_table = Arc::new(BTreeTable {
         root_page: 0, // Will be set to actual root page after creation
-        name: normalized_view_name.clone(),
+        name: normalized_view_name.to_string(),
         columns: view_columns.clone(),
         primary_key_columns: vec![], // Materialized views use implicit rowid
         has_rowid: true,
@@ -108,7 +108,7 @@ pub fn translate_create_materialized_view(
     program.preassign_label_to_next_insn(clear_loop_label);
     program.emit_insn(Insn::Delete {
         cursor_id: view_cursor_id,
-        table_name: normalized_view_name.clone(),
+        table_name: normalized_view_name.to_string(),
     });
     program.emit_insn(Insn::Next {
         cursor_id: view_cursor_id,
@@ -211,7 +211,7 @@ pub fn translate_create_materialized_view(
     });
 
     // Populate the materialized view
-    let cursor_info = vec![(normalized_view_name.clone(), view_cursor_id)];
+    let cursor_info = vec![(normalized_view_name.to_string(), view_cursor_id)];
     program.emit_insn(Insn::PopulateMaterializedViews {
         cursors: cursor_info,
     });
@@ -233,7 +233,7 @@ pub fn translate_create_view(
     syms: &SymbolTable,
     mut program: ProgramBuilder,
 ) -> Result<ProgramBuilder> {
-    let normalized_view_name = normalize_ident(view_name);
+    let normalized_view_name = view_name;
 
     // Check if view already exists
     if schema.get_view(&normalized_view_name).is_some()
@@ -298,7 +298,7 @@ pub fn translate_drop_view(
     if_exists: bool,
     mut program: ProgramBuilder,
 ) -> Result<ProgramBuilder> {
-    let normalized_view_name = normalize_ident(view_name);
+    let normalized_view_name = view_name;
 
     // Check if view exists (either regular or materialized)
     let is_regular_view = schema.get_view(&normalized_view_name).is_some();
@@ -348,7 +348,7 @@ pub fn translate_drop_view(
     // Set the view name and type we're looking for
     program.emit_insn(Insn::String8 {
         dest: view_name_reg,
-        value: normalized_view_name.clone(),
+        value: normalized_view_name.to_string(),
     });
     program.emit_insn(Insn::String8 {
         dest: type_reg,
@@ -416,7 +416,7 @@ pub fn translate_drop_view(
     // Remove the view from the in-memory schema
     program.emit_insn(Insn::DropView {
         db: 0,
-        view_name: normalized_view_name.clone(),
+        view_name: normalized_view_name.to_string(),
     });
 
     // Update schema version (increment schema cookie)

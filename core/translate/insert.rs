@@ -21,7 +21,6 @@ use crate::translate::planner::ROWID_STRS;
 use crate::translate::upsert::{
     collect_set_clauses_for_upsert, emit_upsert, resolve_upsert_target, ResolvedUpsertTarget,
 };
-use crate::util::normalize_ident;
 use crate::vdbe::builder::ProgramBuilderOpts;
 use crate::vdbe::insn::{IdxInsertFlags, InsertFlags, RegisterOrLiteral};
 use crate::vdbe::BranchOffset;
@@ -134,13 +133,8 @@ pub fn translate_insert(
                 for expr in values_expr.iter_mut().flat_map(|v| v.iter_mut()) {
                     match expr.as_mut() {
                         Expr::Id(name) => {
-                            if name.is_double_quoted() {
-                                *expr =
-                                    Expr::Literal(ast::Literal::String(name.to_string())).into();
-                            } else {
-                                // an INSERT INTO ... VALUES (...) cannot reference columns
-                                crate::bail_parse_error!("no such column: {name}");
-                            }
+                            // an INSERT INTO ... VALUES (...) cannot reference columns
+                            crate::bail_parse_error!("no such column: {name}");
                         }
                         Expr::Qualified(first_name, second_name) => {
                             // an INSERT INTO ... VALUES (...) cannot reference columns
@@ -301,7 +295,7 @@ pub fn translate_insert(
                         columns
                             .iter()
                             .map(|col_name| {
-                                let column_name = normalize_ident(col_name.as_str());
+                                let column_name = col_name.as_str();
                                 table
                                     .get_column_by_name(&column_name)
                                     .unwrap()
@@ -1151,7 +1145,7 @@ fn build_insertion<'a>(
         // Case 2: Columns specified - map named columns to their values
         // Map each named column to its value index
         for (value_index, column_name) in columns.iter().enumerate() {
-            let column_name = normalize_ident(column_name.as_str());
+            let column_name = column_name.as_str();
             if let Some((idx_in_table, col_in_table)) = table.get_column_by_name(&column_name) {
                 // Named column
                 if col_in_table.is_rowid_alias {
@@ -1462,13 +1456,13 @@ pub fn rewrite_partial_index_where(
             match e {
                 // NOTE: should not have ANY Expr::Columns bound to the expr
                 Expr::Id(ast::Name::Ident(name)) | Expr::Id(ast::Name::Quoted(name)) => {
-                    let normalized = normalize_ident(name.as_str());
+                    let normalized = name.as_str();
                     if let Some(reg) = col_reg(&normalized) {
                         *e = Expr::Register(reg);
                     }
                 }
                 Expr::Qualified(_, col) | Expr::DoublyQualified(_, _, col) => {
-                    let normalized = normalize_ident(col.as_str());
+                    let normalized = col.as_str();
                     if let Some(reg) = col_reg(&normalized) {
                         *e = Expr::Register(reg);
                     }

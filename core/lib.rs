@@ -2008,11 +2008,9 @@ impl Connection {
 
     /// Resolve database ID from a qualified name
     pub(crate) fn resolve_database_id(&self, qualified_name: &ast::QualifiedName) -> Result<usize> {
-        use crate::util::normalize_ident;
-
         // Check if this is a qualified name (database.table) or unqualified
         if let Some(db_name) = &qualified_name.db_name {
-            let db_name_normalized = normalize_ident(db_name.as_str());
+            let db_name_normalized = db_name.as_str();
             let name_bytes = db_name_normalized.as_bytes();
             match_ignore_ascii_case!(match name_bytes {
                 b"main" => Ok(0),

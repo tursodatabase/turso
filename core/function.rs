@@ -643,8 +643,8 @@ impl Func {
         }
     }
     pub fn resolve_function(name: &str, arg_count: usize) -> Result<Self, LimboError> {
-        let normalized_name = crate::util::normalize_ident(name);
-        match normalized_name.as_str() {
+        let normalized_name = name;
+        match normalized_name {
             "avg" => {
                 if arg_count != 1 {
                     crate::bail_parse_error!("wrong number of arguments to function {}()", name)

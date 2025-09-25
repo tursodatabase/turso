@@ -12,7 +12,6 @@ use crate::vdbe::builder::CursorType;
 use crate::{
     bail_parse_error,
     schema::{Schema, Table},
-    util::normalize_ident,
     vdbe::builder::{ProgramBuilder, ProgramBuilderOpts},
     SymbolTable,
 };
@@ -211,8 +210,8 @@ pub fn prepare_update_plan(
 
         // Map each column to its corresponding expression
         for (col_name, expr) in set.col_names.iter().zip(values.iter()) {
-            let ident = normalize_ident(col_name.as_str());
-            let col_index = match column_lookup.get(&ident) {
+            let ident = col_name.as_str();
+            let col_index = match column_lookup.get(ident) {
                 Some(idx) => idx,
                 None => bail_parse_error!("no such column: {}", ident),
             };

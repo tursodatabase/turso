@@ -10,7 +10,6 @@ use crate::{
         emitter::Resolver,
         schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID},
     },
-    util::normalize_ident,
     vdbe::{
         builder::{CursorType, ProgramBuilder},
         insn::{Insn, RegisterOrLiteral},
@@ -27,7 +26,7 @@ pub fn translate_analyze(
     let Some(target) = target_opt else {
         bail_parse_error!("ANALYZE with no target is not supported");
     };
-    let normalized = normalize_ident(target.name.as_str());
+    let normalized = target.name.as_str();
     let Some(target_schema) = schema.get_table(&normalized) else {
         bail_parse_error!("ANALYZE <schema_name> is not supported");
     };

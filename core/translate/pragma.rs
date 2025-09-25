@@ -17,7 +17,7 @@ use crate::storage::sqlite3_ondisk::CacheSize;
 use crate::storage::wal::CheckpointMode;
 use crate::translate::emitter::TransactionMode;
 use crate::translate::schema::translate_create_table;
-use crate::util::{normalize_ident, parse_signed_number, parse_string, IOExt as _};
+use crate::util::{parse_signed_number, parse_string, IOExt as _};
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
 use crate::vdbe::insn::{Cookie, Insn};
 use crate::{bail_parse_error, CaptureDataChangesMode, LimboError, SymbolTable, Value};
@@ -464,7 +464,7 @@ fn query_pragma(
             // Allocate two more here as one was allocated at the top.
             let mode = match value {
                 Some(ast::Expr::Name(name)) => {
-                    let mode_name = normalize_ident(name.as_str());
+                    let mode_name = name.as_str();
                     CheckpointMode::from_str(&mode_name).map_err(|e| {
                         LimboError::ParseError(format!("Unknown Checkpoint Mode: {e}"))
                     })?
@@ -514,7 +514,7 @@ fn query_pragma(
         }
         PragmaName::TableInfo => {
             let name = match value {
-                Some(ast::Expr::Name(name)) => Some(normalize_ident(name.as_str())),
+                Some(ast::Expr::Name(name)) => Some(name.as_str().to_string()),
                 _ => None,
             };
 

@@ -16,7 +16,6 @@ use crate::translate::emitter::OperationMode;
 use crate::translate::emitter::Resolver;
 use crate::translate::ProgramBuilder;
 use crate::translate::ProgramBuilderOpts;
-use crate::util::normalize_ident;
 use crate::util::PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX;
 use crate::vdbe::builder::CursorType;
 use crate::vdbe::insn::Cookie;
@@ -56,7 +55,7 @@ pub fn translate_create_table(
         approx_num_labels: 1,
     };
     program.extend(&opts);
-    let normalized_tbl_name = normalize_ident(tbl_name.name.as_str());
+    let normalized_tbl_name = tbl_name.name.as_str();
     if schema.get_table(&normalized_tbl_name).is_some() {
         if if_not_exists {
             return Ok(program);

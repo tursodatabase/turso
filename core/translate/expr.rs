@@ -15,7 +15,7 @@ use crate::schema::{affinity, Affinity, Table, Type};
 use crate::translate::optimizer::TakeOwnership;
 use crate::translate::plan::ResultSetColumn;
 use crate::translate::planner::parse_row_id;
-use crate::util::{exprs_are_equivalent, normalize_ident, parse_numeric_literal};
+use crate::util::{exprs_are_equivalent, parse_numeric_literal};
 use crate::vdbe::builder::CursorKey;
 use crate::vdbe::{
     builder::ProgramBuilder,
@@ -3319,13 +3319,6 @@ pub fn bind_and_rewrite_expr<'a>(
                     ));
                     param_state.next_param_idx += 1;
                 }
-                ast::Expr::Qualified(ast::Name::Quoted(ns), ast::Name::Quoted(c))
-                | ast::Expr::DoublyQualified(_, ast::Name::Quoted(ns), ast::Name::Quoted(c)) => {
-                    *expr = ast::Expr::Qualified(
-                        ast::Name::Ident(normalize_ident(ns.as_str())),
-                        ast::Name::Ident(normalize_ident(c.as_str())),
-                    );
-                }
                 ast::Expr::Between {
                     lhs,
                     not,
@@ -3356,7 +3349,7 @@ pub fn bind_and_rewrite_expr<'a>(
             if let Some(referenced_tables) = &mut referenced_tables {
                 match expr {
                     Expr::Id(id) => {
-                        let normalized_id = normalize_ident(id.as_str());
+                        let normalized_id = id.as_str();
 
                         if binding_behavior == BindingBehavior::TryResultColumnsFirst {
                             if let Some(result_columns) = result_columns {
@@ -3461,26 +3454,18 @@ pub fn bind_and_rewrite_expr<'a>(
                             }
                         }
 
-                        // SQLite behavior: Only double-quoted identifiers get fallback to string literals
-                        // Single quotes are handled as literals earlier, unquoted identifiers must resolve to columns
-                        if id.is_double_quoted() {
-                            // Convert failed double-quoted identifier to string literal
-                            *expr = Expr::Literal(ast::Literal::String(id.as_str().to_string()));
-                            return Ok(WalkControl::Continue);
-                        } else {
-                            // Unquoted identifiers must resolve to columns - no fallback
-                            crate::bail_parse_error!("no such column: {}", id.as_str())
-                        }
+                        // Unquoted identifiers must resolve to columns - no fallback
+                        crate::bail_parse_error!("no such column: {}", id.as_str())
                     }
                     Expr::Qualified(tbl, id) => {
-                        let normalized_table_name = normalize_ident(tbl.as_str());
+                        let normalized_table_name = tbl.as_str();
                         let matching_tbl = referenced_tables
                             .find_table_and_internal_id_by_identifier(&normalized_table_name);
                         if matching_tbl.is_none() {
                             crate::bail_parse_error!("no such table: {}", normalized_table_name);
                         }
                         let (tbl_id, tbl) = matching_tbl.unwrap();
-                        let normalized_id = normalize_ident(id.as_str());
+                        let normalized_id = id.as_str();
 
                         if let Some(row_id_expr) = parse_row_id(&normalized_id, tbl_id, || false)? {
                             *expr = row_id_expr;
@@ -3506,7 +3491,7 @@ pub fn bind_and_rewrite_expr<'a>(
                         return Ok(WalkControl::Continue);
                     }
                     Expr::DoublyQualified(db_name, tbl_name, col_name) => {
-                        let normalized_col_name = normalize_ident(col_name.as_str());
+                        let normalized_col_name = col_name.as_str();
 
                         // Create a QualifiedName and use existing resolve_database_id method
                         let qualified_name = ast::QualifiedName {
@@ -3553,7 +3538,7 @@ pub fn bind_and_rewrite_expr<'a>(
                         // Convert to Column expression - since this is a cross-database reference,
                         // we need to create a synthetic table reference for it
                         // For now, we'll error if the table isn't already in the referenced tables
-                        let normalized_tbl_name = normalize_ident(tbl_name.as_str());
+                        let normalized_tbl_name = tbl_name.as_str();
                         let matching_tbl = referenced_tables
                             .find_table_and_internal_id_by_identifier(&normalized_tbl_name);
 

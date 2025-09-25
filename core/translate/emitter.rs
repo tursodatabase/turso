@@ -34,7 +34,7 @@ use crate::translate::planner::ROWID_STRS;
 use crate::translate::result_row::try_fold_expr_to_i64;
 use crate::translate::values::emit_values;
 use crate::translate::window::{emit_window_results, init_window, WindowMetadata};
-use crate::util::{exprs_are_equivalent, normalize_ident};
+use crate::util::exprs_are_equivalent;
 use crate::vdbe::builder::{CursorKey, CursorType, ProgramBuilder};
 use crate::vdbe::insn::{CmpInsFlags, IdxInsertFlags, InsertFlags, RegisterOrLiteral};
 use crate::vdbe::CursorID;
@@ -1803,7 +1803,7 @@ fn rewrite_where_for_update_registers(
     walk_expr_mut(expr, &mut |e: &mut Expr| -> Result<WalkControl> {
         match e {
             Expr::Qualified(_, col) | Expr::DoublyQualified(_, _, col) => {
-                let normalized = normalize_ident(col.as_str());
+                let normalized = col.as_str();
                 if let Some((idx, c)) = columns.iter().enumerate().find(|(_, c)| {
                     c.name
                         .as_ref()
@@ -1817,7 +1817,7 @@ fn rewrite_where_for_update_registers(
                 }
             }
             Expr::Id(ast::Name::Ident(name)) | Expr::Id(ast::Name::Quoted(name)) => {
-                let normalized = normalize_ident(name.as_str());
+                let normalized = name.as_str();
                 if ROWID_STRS
                     .iter()
                     .any(|s| s.eq_ignore_ascii_case(&normalized))

@@ -17,7 +17,7 @@ use crate::{
     ast::Limit,
     function::Func,
     schema::{Schema, Table},
-    util::{exprs_are_equivalent, normalize_ident},
+    util::exprs_are_equivalent,
     vdbe::builder::TableRefIdCounter,
     Result,
 };
@@ -231,11 +231,11 @@ fn resolve_window<'a>(windows: &'a mut Vec<Window>, over_clause: &Over) -> Resul
             Ok(windows.last_mut().expect("just pushed, so must exist"))
         }
         Over::Name(name) => {
-            let window_name = normalize_ident(name.as_str());
+            let window_name = name.as_str();
             // When multiple windows share the same name, SQLite uses the most recent
             // definition. Iterate in reverse so we find the last definition first.
             for window in windows.iter_mut().rev() {
-                if window.name.as_ref() == Some(&window_name) {
+                if window.name.as_deref() == Some(window_name) {
                     return Ok(window);
                 }
             }
@@ -306,7 +306,7 @@ fn parse_from_clause_table(
                     ast::As::As(id) => id,
                     ast::As::Elided(id) => id,
                 })
-                .map(|id| normalize_ident(id.as_str()))
+                .map(|id| id.as_str().to_string())
                 .unwrap_or(format!("subquery_{cur_table_index}"));
             table_references.add_joined_table(JoinedTable::new_subquery(
                 identifier,
@@ -345,7 +345,7 @@ fn parse_table(
     args: &[Box<Expr>],
     connection: &Arc<crate::Connection>,
 ) -> Result<()> {
-    let normalized_qualified_name = normalize_ident(qualified_name.name.as_str());
+    let normalized_qualified_name = qualified_name.name.as_str();
     let database_id = connection.resolve_database_id(qualified_name)?;
     let table_name = &qualified_name.name;
 
@@ -363,7 +363,7 @@ fn parse_table(
                 ast::As::As(id) => id,
                 ast::As::Elided(id) => id,
             };
-            cte_table.identifier = normalize_ident(alias.as_str());
+            cte_table.identifier = alias.as_str().to_string();
         }
 
         table_references.add_joined_table(cte_table);
@@ -379,7 +379,7 @@ fn parse_table(
                 ast::As::As(id) => id,
                 ast::As::Elided(id) => id,
             })
-            .map(|a| normalize_ident(a.as_str()));
+            .map(|a| a.as_str().to_string());
         let internal_id = table_ref_counter.next();
         let tbl_ref = if let Table::Virtual(tbl) = table.as_ref() {
             transform_args_into_where_terms(args, internal_id, vtab_predicates, table.as_ref())?;
@@ -394,7 +394,7 @@ fn parse_table(
         table_references.add_joined_table(JoinedTable {
             op: Operation::default_scan_for(&tbl_ref),
             table: tbl_ref,
-            identifier: alias.unwrap_or(normalized_qualified_name),
+            identifier: alias.unwrap_or(normalized_qualified_name.to_string()),
             internal_id,
             join_info: None,
             col_used_mask: ColumnUsedMask::default(),
@@ -462,7 +462,7 @@ fn parse_table(
                 ast::As::As(id) => id,
                 ast::As::Elided(id) => id,
             })
-            .map(|a| normalize_ident(a.as_str()));
+            .map(|a| a.as_str().to_string());
 
         table_references.add_joined_table(JoinedTable {
             op: Operation::Scan(Scan::BTreeTable {
@@ -470,7 +470,7 @@ fn parse_table(
                 index: None,
             }),
             table: Table::BTree(btree_table),
-            identifier: alias.unwrap_or(normalized_qualified_name),
+            identifier: alias.unwrap_or(normalized_qualified_name.to_string()),
             internal_id: table_ref_counter.next(),
             join_info: None,
             col_used_mask: ColumnUsedMask::default(),
@@ -585,7 +585,7 @@ pub fn parse_from(
             // Check if normalized name conflicts with catalog tables or other CTEs
             // TODO: sqlite actually allows overriding a catalog table with a CTE.
             // We should carry over the 'Scope' struct to all of our identifier resolution.
-            let cte_name_normalized = normalize_ident(cte.tbl_name.as_str());
+            let cte_name_normalized = cte.tbl_name.as_str();
             if schema.get_table(&cte_name_normalized).is_some() {
                 crate::bail_parse_error!(
                     "CTE name {} conflicts with catalog table name",
@@ -628,7 +628,7 @@ pub fn parse_from(
                 crate::bail_parse_error!("Only SELECT queries are currently supported in CTEs");
             };
             ctes_as_subqueries.push(JoinedTable::new_subquery(
-                cte_name_normalized,
+                cte_name_normalized.to_string(),
                 cte_plan,
                 None,
                 table_ref_counter.next(),
@@ -981,7 +981,7 @@ fn parse_join(
             ast::JoinConstraint::Using(distinct_names) => {
                 // USING join is replaced with a list of equality predicates
                 for distinct_name in distinct_names.iter() {
-                    let name_normalized = normalize_ident(distinct_name.as_str());
+                    let name_normalized = distinct_name.as_str();
                     let cur_table_idx = table_references.joined_tables().len() - 1;
                     let left_tables = &table_references.joined_tables()[..cur_table_idx];
                     assert!(!left_tables.is_empty());

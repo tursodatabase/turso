@@ -17,7 +17,6 @@ use crate::types::{
     compare_immutable, compare_records_generic, Extendable, IOCompletions, ImmutableRecord,
     SeekResult, Text,
 };
-use crate::util::normalize_ident;
 use crate::vdbe::insn::InsertFlags;
 use crate::vdbe::registers_to_ref_values;
 use crate::vector::{vector_concat, vector_slice};
@@ -5140,14 +5139,14 @@ pub fn op_function(
                 AlterTableFunc::RenameTable => {
                     let rename_from = {
                         match &state.registers[*start_reg + 5].get_value() {
-                            Value::Text(rename_from) => normalize_ident(rename_from.as_str()),
+                            Value::Text(rename_from) => rename_from.as_str().to_string(),
                             _ => panic!("rename_from parameter should be TEXT"),
                         }
                     };
 
                     let rename_to = {
                         match &state.registers[*start_reg + 6].get_value() {
-                            Value::Text(rename_to) => normalize_ident(rename_to.as_str()),
+                            Value::Text(rename_to) => rename_to.as_str().to_string(),
                             _ => panic!("rename_to parameter should be TEXT"),
                         }
                     };
@@ -5187,7 +5186,7 @@ pub fn op_function(
                                 columns,
                                 where_clause,
                             } => {
-                                let table_name = normalize_ident(tbl_name.as_str());
+                                let table_name = tbl_name.as_str();
 
                                 if rename_from != table_name {
                                     break 'sql None;
@@ -5211,7 +5210,7 @@ pub fn op_function(
                                 if_not_exists,
                                 body,
                             } => {
-                                let table_name = normalize_ident(tbl_name.name.as_str());
+                                let table_name = tbl_name.name.as_str();
 
                                 if rename_from != table_name {
                                     break 'sql None;
@@ -5240,14 +5239,14 @@ pub fn op_function(
                 AlterTableFunc::AlterColumn | AlterTableFunc::RenameColumn => {
                     let table = {
                         match &state.registers[*start_reg + 5].get_value() {
-                            Value::Text(rename_to) => normalize_ident(rename_to.as_str()),
+                            Value::Text(rename_to) => rename_to.as_str().to_string(),
                             _ => panic!("table parameter should be TEXT"),
                         }
                     };
 
                     let rename_from = {
                         match &state.registers[*start_reg + 6].get_value() {
-                            Value::Text(rename_from) => normalize_ident(rename_from.as_str()),
+                            Value::Text(rename_from) => rename_from.as_str().to_string(),
                             _ => panic!("rename_from parameter should be TEXT"),
                         }
                     };
@@ -5286,16 +5285,16 @@ pub fn op_function(
                                 idx_name,
                                 where_clause,
                             } => {
-                                if table != normalize_ident(tbl_name.as_str()) {
+                                if table != tbl_name.as_str() {
                                     break 'sql None;
                                 }
 
                                 for column in &mut columns {
                                     match column.expr.as_mut() {
-                                        ast::Expr::Id(ast::Name::Ident(id))
-                                            if normalize_ident(id) == rename_from =>
-                                        {
-                                            *id = column_def.col_name.as_str().to_owned();
+                                        ast::Expr::Id(name) if name.as_str() == rename_from => {
+                                            *name = ast::Name::Ident(
+                                                column_def.col_name.as_str().to_owned(),
+                                            );
                                         }
                                         _ => {}
                                     }
@@ -5319,7 +5318,7 @@ pub fn op_function(
                                 temporary,
                                 if_not_exists,
                             } => {
-                                if table != normalize_ident(tbl_name.name.as_str()) {
+                                if table != tbl_name.name.as_str() {
                                     break 'sql None;
                                 }
 

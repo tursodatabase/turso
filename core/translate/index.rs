@@ -15,13 +15,12 @@ use crate::SymbolTable;
 use crate::{
     schema::{BTreeTable, Column, Index, IndexColumn, PseudoCursorType, Schema},
     storage::pager::CreateBTreeFlags,
-    util::normalize_ident,
     vdbe::{
         builder::{CursorType, ProgramBuilder},
         insn::{IdxInsertFlags, Insn, RegisterOrLiteral},
     },
 };
-use turso_parser::ast::{self, Expr, SortOrder, SortedColumn};
+use turso_parser::ast::{Expr, SortOrder, SortedColumn};
 
 use super::schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
 
@@ -42,8 +41,6 @@ pub fn translate_create_index(
             "CREATE INDEX is disabled by default. Run with `--experimental-indexes` to enable this feature."
         );
     }
-    let idx_name = normalize_ident(idx_name);
-    let tbl_name = normalize_ident(tbl_name);
     let opts = crate::vdbe::builder::ProgramBuilderOpts {
         num_cursors: 5,
         approx_num_insns: 40,
@@ -60,7 +57,7 @@ pub fn translate_create_index(
         }
         crate::bail_parse_error!("Error: index with name '{idx_name}' already exists.");
     }
-    let Some(table) = schema.tables.get(&tbl_name) else {
+    let Some(table) = schema.tables.get(tbl_name) else {
         crate::bail_parse_error!("Error: table '{tbl_name}' does not exist.");
     };
     let Some(tbl) = table.btree() else {
@@ -69,8 +66,8 @@ pub fn translate_create_index(
     let columns = resolve_sorted_columns(&tbl, columns)?;
 
     let idx = Arc::new(Index {
-        name: idx_name.clone(),
-        table_name: tbl.name.clone(),
+        name: idx_name.to_string(),
+        table_name: tbl.name.to_string(),
         root_page: 0, //  we dont have access till its created, after we parse the schema table
         columns: columns
             .iter()
@@ -127,7 +124,7 @@ pub fn translate_create_index(
                 index: None,
             }),
             table: Table::BTree(tbl.clone()),
-            identifier: tbl_name.clone(),
+            identifier: tbl_name.to_string(),
             internal_id: table_ref,
             join_info: None,
             col_used_mask: ColumnUsedMask::default(),
@@ -239,7 +236,7 @@ pub fn translate_create_index(
         start_reg,
         count: columns.len() + 1,
         dest_reg: record_reg,
-        index_name: Some(idx_name.clone()),
+        index_name: Some(idx_name.to_string()),
         affinity_str: None,
     });
     program.emit_insn(Insn::SorterInsert {
@@ -332,10 +329,7 @@ fn resolve_sorted_columns<'a>(
         let ident = match sc.expr.as_ref() {
             // SQLite supports indexes on arbitrary expressions, but we don't (yet).
             // See "How to use indexes on expressions" in https://www.sqlite.org/expridx.html
-            Expr::Id(col_name)
-            | Expr::Id(col_name)
-            | Expr::Name(col_name)
-            | Expr::Name(col_name) => col_name.as_str(),
+            Expr::Id(col_name) | Expr::Name(col_name) => col_name.as_str(),
             _ => crate::bail_parse_error!("Error: cannot use expressions in CREATE INDEX"),
         };
         let Some(col) = table.get_column(ident) else {
@@ -398,7 +392,6 @@ pub fn translate_drop_index(
             "DROP INDEX is disabled by default. Run with `--experimental-indexes` to enable this feature."
         );
     }
-    let idx_name = normalize_ident(idx_name);
     let opts = crate::vdbe::builder::ProgramBuilderOpts {
         num_cursors: 5,
         approx_num_insns: 40,

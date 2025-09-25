@@ -4,7 +4,6 @@ use turso_parser::{ast, parser::Parser};
 use crate::{
     function::{AlterTableFunc, Func},
     schema::{Column, Schema},
-    util::normalize_ident,
     vdbe::{
         builder::{CursorType, ProgramBuilder},
         insn::{Cookie, Insn, RegisterOrLiteral},
@@ -83,11 +82,10 @@ pub fn translate_alter_table(
             }
 
             if column.unique
-                || btree.unique_sets.iter().any(|set| {
-                    set.columns
-                        .iter()
-                        .any(|(name, _)| name == &normalize_ident(column_name))
-                })
+                || btree
+                    .unique_sets
+                    .iter()
+                    .any(|set| set.columns.iter().any(|(name, _)| name == column_name))
             {
                 return Err(LimboError::ParseError(format!(
                     "cannot drop column \"{column_name}\": UNIQUE"
@@ -270,7 +268,7 @@ pub fn translate_alter_table(
                     .indexes
                     .values()
                     .flatten()
-                    .any(|index| index.name == normalize_ident(new_name))
+                    .any(|index| index.name == new_name)
             {
                 return Err(LimboError::ParseError(format!(
                     "there is already another table or index with this name: {new_name}"

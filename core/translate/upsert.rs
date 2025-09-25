@@ -24,7 +24,6 @@ use crate::{
         insert::{Insertion, ROWID_COLUMN},
         plan::ResultSetColumn,
     },
-    util::normalize_ident,
     vdbe::{
         builder::ProgramBuilder,
         insn::{IdxInsertFlags, InsertFlags, Insn},
@@ -87,14 +86,14 @@ fn extract_target_key(e: &ast::Expr) -> Option<ConflictTarget> {
         ast::Expr::Parenthesized(v) if v.len() == 1 => extract_target_key(&v[0]),
 
         ast::Expr::Id(name) => Some(ConflictTarget {
-            col_name: normalize_ident(name.as_str()),
+            col_name: name.as_str().to_string(),
             collate: None,
         }),
         // t.a or db.t.a: accept ident or quoted in the column position
         ast::Expr::Qualified(_, col) | ast::Expr::DoublyQualified(_, _, col) => {
             let cname = col.as_str();
             Some(ConflictTarget {
-                col_name: normalize_ident(cname),
+                col_name: cname.to_string(),
                 collate: None,
             })
         }
@@ -187,7 +186,7 @@ fn index_keys(idx: &Index) -> Vec<usize> {
 
 /// Columns referenced by the partial WHERE (empty if none).
 fn partial_index_cols(idx: &Index, table: &Table) -> HashSet<usize> {
-    use ast::{Expr, Name};
+    use ast::Expr;
     let Some(expr) = &idx.where_clause else {
         return HashSet::new();
     };
@@ -195,16 +194,16 @@ fn partial_index_cols(idx: &Index, table: &Table) -> HashSet<usize> {
     let _ = walk_expr(expr, &mut |e: &ast::Expr| -> crate::Result<WalkControl> {
         match e {
             Expr::Id(n) => {
-                if let Some((i, _)) = table.get_column_by_name(&normalize_ident(n.as_str())) {
+                if let Some((i, _)) = table.get_column_by_name(n.as_str()) {
                     out.insert(i);
                 }
             }
             Expr::Qualified(ns, c) | Expr::DoublyQualified(_, ns, c) => {
                 // Only count columns that belong to this table
-                let nsn = normalize_ident(ns.as_str());
-                let tname = normalize_ident(table.get_name());
+                let nsn = ns.as_str();
+                let tname = table.get_name();
                 if nsn.eq_ignore_ascii_case(&tname) {
-                    if let Some((i, _)) = table.get_column_by_name(&normalize_ident(c.as_str())) {
+                    if let Some((i, _)) = table.get_column_by_name(c.as_str()) {
                         out.insert(i);
                     }
                 }
@@ -238,7 +237,7 @@ pub fn upsert_matches_index(upsert: &Upsert, index: &Index, table: &Table) -> bo
         .iter()
         .map(|ic| {
             (
-                normalize_ident(&ic.name),
+                ic.name.clone(),
                 effective_collation_for_index_col(ic, table),
             )
         })
@@ -823,7 +822,7 @@ pub fn collect_set_clauses_for_upsert(
             );
         }
         for (cn, e) in set.col_names.iter().zip(values.into_iter()) {
-            let Some(idx) = lookup.get(&normalize_ident(cn.as_str())) else {
+            let Some(idx) = lookup.get(cn.as_str()) else {
                 bail_parse_error!("no such column: {}", cn);
             };
             if let Some(existing) = out.iter_mut().find(|(i, _)| *i == *idx) {
@@ -885,8 +884,8 @@ fn rewrite_expr_to_registers(
     insertion: Option<&Insertion>,
     allow_excluded: bool,
 ) -> crate::Result<WalkControl> {
-    use ast::{Expr, Name};
-    let table_name_norm = table_name.map(normalize_ident);
+    use ast::Expr;
+    let table_name_norm = table_name;
 
     // Map a column name to a register within the row image at `base_start`.
     let col_reg_from_row_image = |name: &str| -> Option<usize> {
@@ -906,8 +905,8 @@ fn rewrite_expr_to_registers(
         &mut |expr: &mut ast::Expr| -> crate::Result<WalkControl> {
             match expr {
                 Expr::Qualified(ns, c) | Expr::DoublyQualified(_, ns, c) => {
-                    let ns = normalize_ident(ns.as_str());
-                    let c = normalize_ident(c.as_str());
+                    let ns = ns.as_str();
+                    let c = c.as_str();
                     // Handle EXCLUDED.* if enabled
                     if allow_excluded && ns.eq_ignore_ascii_case("excluded") {
                         if let Some(ins) = insertion {
@@ -934,7 +933,7 @@ fn rewrite_expr_to_registers(
                 }
                 // Unqualified id -> row image (CURRENT/NEW depending on caller)
                 Expr::Id(name) => {
-                    if let Some(r) = col_reg_from_row_image(&normalize_ident(name.as_str())) {
+                    if let Some(r) = col_reg_from_row_image(name.as_str()) {
                         *expr = Expr::Register(r);
                     }
                 }
