@@ -1,13 +1,14 @@
 // Adapted from sqlean fuzzy
 use std::cmp;
 use turso_ext::{register_extension, scalar, ResultCode, Value};
+mod caver;
 mod common;
 mod editdist;
 mod phonetic;
 mod soundex;
 
 register_extension! {
-    scalars: {levenshtein, damerau_levenshtein, edit_distance, hamming, jaronwin, osadist, fuzzy_soundex, fuzzy_phonetic},
+    scalars: {levenshtein, damerau_levenshtein, edit_distance, hamming, jaronwin, osadist, fuzzy_soundex, fuzzy_phonetic, fuzzy_caver},
 }
 
 /// Calculates and returns the Levenshtein distance of two non NULL strings.
@@ -408,6 +409,16 @@ pub fn fuzzy_phonetic(args: &[Value]) {
     }
 }
 
+#[scalar(name = "fuzzy_caver")]
+pub fn fuzzy_caver(args: &[Value]) {
+    let arg1 = args[0].to_text();
+    if let Some(txt) = caver::caver_str(arg1) {
+        Value::from_text(txt)
+    } else {
+        Value::null()
+    }
+}
+
 //tests adapted from sqlean fuzzy
 #[cfg(test)]
 mod tests {
@@ -566,6 +577,25 @@ mod tests {
             assert_eq!(
                 result, expected,
                 "fuzzy_phonetic({input:?}) failed: expected {expected:?}, got {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_caver() {
+        let cases = vec![
+            (None, None),
+            (Some(""), Some("".to_string())),
+            (Some("phonetics"), Some("FNTKS11111".to_string())),
+            (Some("is"), Some("AS11111111".to_string())),
+            (Some("awesome"), Some("AWSM111111".to_string())),
+        ];
+
+        for (input, expected) in cases {
+            let result = caver::caver_str(input);
+            assert_eq!(
+                result, expected,
+                "fuzzy_caver({input:?}) failed: expected {expected:?}, got {result:?}"
             );
         }
     }

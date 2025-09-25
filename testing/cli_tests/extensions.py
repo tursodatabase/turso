@@ -587,6 +587,9 @@ def validate_fuzzy_soundex(a):
 def validate_fuzzy_phonetic(a):
     return a == "ABACAMA"
 
+def validate_fuzzy_caver(a):
+    return a == "AWSM111111"
+
 def test_fuzzy():
     limbo = TestTursoShell()
     ext_path = "./target/debug/liblimbo_fuzzy"
@@ -635,6 +638,11 @@ def test_fuzzy():
         "SELECT fuzzy_phonetic('awesome');",
         validate_fuzzy_phonetic,
         "fuzzy phonetic function works",
+    )
+    limbo.run_test_fn(
+        "SELECT fuzzy_caver('awesome');",
+        validate_fuzzy_caver,
+        "fuzzy caver function works",
     )
 
 def test_vfs():
