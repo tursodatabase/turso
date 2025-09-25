@@ -1413,6 +1413,7 @@ mod tests {
             has_rowid: true,
             is_strict: false,
             unique_sets: vec![],
+            has_autoincrement: false,
         };
 
         // Create orders table
@@ -1460,6 +1461,7 @@ mod tests {
             ],
             has_rowid: true,
             is_strict: false,
+            has_autoincrement: false,
             unique_sets: vec![],
         };
 
@@ -1508,6 +1510,7 @@ mod tests {
             ],
             has_rowid: true,
             is_strict: false,
+            has_autoincrement: false,
             unique_sets: vec![],
         };
 
@@ -1556,6 +1559,7 @@ mod tests {
             ],
             has_rowid: true, // Has implicit rowid but no alias
             is_strict: false,
+            has_autoincrement: false,
             unique_sets: vec![],
         };
 

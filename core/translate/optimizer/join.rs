@@ -1658,6 +1658,7 @@ mod tests {
         Arc::new(BTreeTable {
             root_page: 1, // Page number doesn't matter for tests
             name: name.to_string(),
+            has_autoincrement: false,
             primary_key_columns: vec![],
             columns,
             has_rowid: true,

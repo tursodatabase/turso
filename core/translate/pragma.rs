@@ -287,25 +287,26 @@ fn update_pragma(
             // but for now, let's keep it as is...
             let opts = CaptureDataChangesMode::parse(&value)?;
             if let Some(table) = &opts.table() {
-                // make sure that we have table created
-                program = translate_create_table(
-                    QualifiedName {
-                        db_name: None,
-                        name: ast::Name::new(table),
-                        alias: None,
-                    },
-                    false,
-                    ast::CreateTableBody::ColumnsAndConstraints {
-                        columns: turso_cdc_table_columns(),
-                        constraints: vec![],
-                        options: ast::TableOptions::NONE,
-                    },
-                    true,
-                    schema,
-                    syms,
-                    &connection,
-                    program,
-                )?;
+                if schema.get_table(table).is_none() {
+                    program = translate_create_table(
+                        QualifiedName {
+                            db_name: None,
+                            name: ast::Name::new(table),
+                            alias: None,
+                        },
+                        false,
+                        true, // if_not_exists
+                        ast::CreateTableBody::ColumnsAndConstraints {
+                            columns: turso_cdc_table_columns(),
+                            constraints: vec![],
+                            options: ast::TableOptions::NONE,
+                        },
+                        schema,
+                        syms,
+                        program,
+                        &connection,
+                    )?;
+                }
             }
             connection.set_capture_data_changes(opts);
             Ok((program, TransactionMode::Write))

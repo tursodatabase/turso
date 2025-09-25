@@ -21,6 +21,7 @@ use crate::util::PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX;
 use crate::vdbe::builder::CursorType;
 use crate::vdbe::insn::Cookie;
 use crate::vdbe::insn::{CmpInsFlags, InsertFlags, Insn};
+use crate::Connection;
 use crate::SymbolTable;
 use crate::{bail_parse_error, Result};
 
@@ -30,13 +31,14 @@ use turso_ext::VTabKind;
 pub fn translate_create_table(
     tbl_name: ast::QualifiedName,
     temporary: bool,
-    body: ast::CreateTableBody,
     if_not_exists: bool,
+    body: ast::CreateTableBody,
     schema: &Schema,
     syms: &SymbolTable,
-    connection: &Arc<crate::Connection>,
     mut program: ProgramBuilder,
+    connection: &Connection,
 ) -> Result<ProgramBuilder> {
+    let normalized_tbl_name = normalize_ident(tbl_name.name.as_str());
     if temporary {
         bail_parse_error!("TEMPORARY table not supported yet");
     }
@@ -56,13 +58,85 @@ pub fn translate_create_table(
         approx_num_labels: 1,
     };
     program.extend(&opts);
-    let normalized_tbl_name = normalize_ident(tbl_name.name.as_str());
     if schema.get_table(&normalized_tbl_name).is_some() {
         if if_not_exists {
             return Ok(program);
         }
         bail_parse_error!("Table {} already exists", normalized_tbl_name);
     }
+
+    let mut has_autoincrement = false;
+    if let ast::CreateTableBody::ColumnsAndConstraints {
+        columns,
+        constraints,
+        ..
+    } = &body
+    {
+        for col in columns {
+            for constraint in &col.constraints {
+                if let ast::ColumnConstraint::PrimaryKey { auto_increment, .. } =
+                    constraint.constraint
+                {
+                    if auto_increment {
+                        has_autoincrement = true;
+                        break;
+                    }
+                }
+            }
+            if has_autoincrement {
+                break;
+            }
+        }
+        if !has_autoincrement {
+            for constraint in constraints {
+                if let ast::TableConstraint::PrimaryKey { auto_increment, .. } =
+                    constraint.constraint
+                {
+                    if auto_increment {
+                        has_autoincrement = true;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    let schema_master_table = schema.get_btree_table(SQLITE_TABLEID).unwrap();
+    let sqlite_schema_cursor_id =
+        program.alloc_cursor_id(CursorType::BTreeTable(schema_master_table.clone()));
+    program.emit_insn(Insn::OpenWrite {
+        cursor_id: sqlite_schema_cursor_id,
+        root_page: 1usize.into(),
+        db: 0,
+    });
+    let resolver = Resolver::new(schema, syms);
+    let cdc_table = prepare_cdc_if_necessary(&mut program, schema, SQLITE_TABLEID)?;
+
+    let created_sequence_table =
+        if has_autoincrement && schema.get_table("sqlite_sequence").is_none() {
+            let seq_table_root_reg = program.alloc_register();
+            program.emit_insn(Insn::CreateBtree {
+                db: 0,
+                root: seq_table_root_reg,
+                flags: CreateBTreeFlags::new_table(),
+            });
+
+            let seq_sql = "CREATE TABLE sqlite_sequence(name,seq)";
+            emit_schema_entry(
+                &mut program,
+                &resolver,
+                sqlite_schema_cursor_id,
+                cdc_table.as_ref().map(|x| x.0),
+                SchemaEntryType::Table,
+                "sqlite_sequence",
+                "sqlite_sequence",
+                seq_table_root_reg,
+                Some(seq_sql.to_string()),
+            )?;
+            true
+        } else {
+            false
+        };
 
     let sql = create_table_body_to_str(&tbl_name, &body);
 
@@ -72,7 +146,6 @@ pub fn translate_create_table(
     // TODO: SetCookie
     // TODO: SetCookie
 
-    // Create the table B-tree
     let table_root_reg = program.alloc_register();
     program.emit_insn(Insn::CreateBtree {
         db: 0,
@@ -128,12 +201,12 @@ pub fn translate_create_table(
 
     let cdc_table = prepare_cdc_if_necessary(&mut program, schema, SQLITE_TABLEID)?;
     let resolver = Resolver::new(schema, syms);
-    // Add the table entry to sqlite_schema
+
     emit_schema_entry(
         &mut program,
         &resolver,
         sqlite_schema_cursor_id,
-        cdc_table.map(|x| x.0),
+        cdc_table.as_ref().map(|x| x.0),
         SchemaEntryType::Table,
         &normalized_tbl_name,
         &normalized_tbl_name,
@@ -141,7 +214,6 @@ pub fn translate_create_table(
         Some(sql),
     )?;
 
-    // If we need an automatic index, add its entry to sqlite_schema
     if let Some(index_regs) = index_regs {
         for (idx, index_reg) in index_regs.into_iter().enumerate() {
             let index_name = format!(
@@ -171,9 +243,14 @@ pub fn translate_create_table(
         value: schema.schema_version as i32 + 1,
         p5: 0,
     });
+
     // TODO: remove format, it sucks for performance but is convenient
-    let parse_schema_where_clause =
+    let mut parse_schema_where_clause =
         format!("tbl_name = '{normalized_tbl_name}' AND type != 'trigger'");
+    if created_sequence_table {
+        parse_schema_where_clause.push_str(" OR tbl_name = 'sqlite_sequence'");
+    }
+
     program.emit_insn(Insn::ParseSchema {
         db: sqlite_schema_cursor_id,
         where_clause: Some(parse_schema_where_clause),
@@ -225,16 +302,16 @@ pub fn emit_schema_entry(
     program.emit_string8_new_reg(name.to_string());
     program.emit_string8_new_reg(tbl_name.to_string());
 
-    let rootpage_reg = program.alloc_register();
+    let table_root_reg = program.alloc_register();
     if root_page_reg == 0 {
         program.emit_insn(Insn::Integer {
-            dest: rootpage_reg,
+            dest: table_root_reg,
             value: 0, // virtual tables in sqlite always have rootpage=0
         });
     } else {
         program.emit_insn(Insn::Copy {
             src_reg: root_page_reg,
-            dst_reg: rootpage_reg,
+            dst_reg: table_root_reg,
             extra_amount: 0,
         });
     }
@@ -496,13 +573,22 @@ pub fn translate_drop_table(
     syms: &SymbolTable,
     mut program: ProgramBuilder,
 ) -> Result<ProgramBuilder> {
+    if tbl_name
+        .name
+        .as_str()
+        .eq_ignore_ascii_case("sqlite_sequence")
+    {
+        bail_parse_error!("table sqlite_sequence may not be dropped");
+    }
+
     if !schema.indexes_enabled() && schema.table_has_indexes(&tbl_name.name.to_string()) {
         bail_parse_error!(
             "DROP TABLE with indexes on the table is disabled by default. Omit the `--experimental-indexes=false` flag to enable this feature."
         );
     }
+
     let opts = ProgramBuilderOpts {
-        num_cursors: 3,
+        num_cursors: 4,
         approx_num_insns: 40,
         approx_num_labels: 4,
     };
@@ -556,7 +642,7 @@ pub fn translate_drop_table(
     });
     program.preassign_label_to_next_insn(metadata_loop);
 
-    //  start loop on schema table
+    // start loop on schema table
     program.emit_column_or_rowid(
         sqlite_schema_cursor_id_0,
         2,
@@ -587,7 +673,7 @@ pub fn translate_drop_table(
         dest: row_id_reg,
     });
     if let Some((cdc_cursor_id, _)) = cdc_table {
-        let table_type = program.emit_string8_new_reg("table".to_string()); //  r4
+        let table_type = program.emit_string8_new_reg("table".to_string()); // r4
         program.mark_last_insn_constant();
 
         let skip_cdc_label = program.allocate_label();
@@ -636,7 +722,7 @@ pub fn translate_drop_table(
         pc_if_next: metadata_loop,
     });
     program.preassign_label_to_next_insn(end_metadata_label);
-    //  end of loop on schema table
+    // end of loop on schema table
 
     //  2. Destroy the indices within a loop
     let indices = schema.get_indices(tbl_name.name.as_str());
@@ -685,17 +771,18 @@ pub fn translate_drop_table(
     let schema_row_id_register = program.alloc_register();
     program.emit_null(schema_data_register, Some(schema_row_id_register));
 
-    //  All of the following processing needs to be done only if the table is not a virtual table
+    // All of the following processing needs to be done only if the table is not a virtual table
     if table.btree().is_some() {
-        //  4. Open an ephemeral table, and read over the entry from the schema table whose root page was moved in the destroy operation
+        // 4. Open an ephemeral table, and read over the entry from the schema table whose root page was moved in the destroy operation
 
-        //  cursor id 1
+        // cursor id 1
         let sqlite_schema_cursor_id_1 =
             program.alloc_cursor_id(CursorType::BTreeTable(schema_table.clone()));
         let simple_table_rc = Arc::new(BTreeTable {
             root_page: 0, // Not relevant for ephemeral table definition
             name: "ephemeral_scratch".to_string(),
             has_rowid: true,
+            has_autoincrement: false,
             primary_key_columns: vec![],
             columns: vec![Column {
                 name: Some("rowid".to_string()),
@@ -712,7 +799,7 @@ pub fn translate_drop_table(
             is_strict: false,
             unique_sets: vec![],
         });
-        //  cursor id 2
+        // cursor id 2
         let ephemeral_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(simple_table_rc));
         program.emit_insn(Insn::OpenEphemeral {
             cursor_id: ephemeral_cursor_id,
@@ -747,9 +834,9 @@ pub fn translate_drop_table(
             pc_if_empty: copy_schema_to_temp_table_loop_end_label,
         });
         program.preassign_label_to_next_insn(copy_schema_to_temp_table_loop);
-        //  start loop on schema table
+        // start loop on schema table
         program.emit_column_or_rowid(sqlite_schema_cursor_id_1, 3, prev_root_page_register);
-        //  The label and Insn::Ne are used to skip over any rows in the schema table that don't have the root page that was moved
+        // The label and Insn::Ne are used to skip over any rows in the schema table that don't have the root page that was moved
         let next_label = program.allocate_label();
         program.emit_insn(Insn::Ne {
             lhs: prev_root_page_register,
@@ -776,18 +863,18 @@ pub fn translate_drop_table(
             pc_if_next: copy_schema_to_temp_table_loop,
         });
         program.preassign_label_to_next_insn(copy_schema_to_temp_table_loop_end_label);
-        //  End loop to copy over row id's from the schema table for rows that have the same root page as the one that was moved
+        // End loop to copy over row id's from the schema table for rows that have the same root page as the one that was moved
 
         program.resolve_label(if_not_label, program.offset());
 
-        //  5. Open a write cursor to the schema table and re-insert the records placed in the ephemeral table but insert the correct root page now
+        // 5. Open a write cursor to the schema table and re-insert the records placed in the ephemeral table but insert the correct root page now
         program.emit_insn(Insn::OpenWrite {
             cursor_id: sqlite_schema_cursor_id_1,
             root_page: 1usize.into(),
             db: 0,
         });
 
-        //  Loop to copy over row id's from the ephemeral table and then re-insert into the schema table with the correct root page
+        // Loop to copy over row id's from the ephemeral table and then re-insert into the schema table with the correct root page
         let copy_temp_table_to_schema_loop_end_label = program.allocate_label();
         let copy_temp_table_to_schema_loop = program.allocate_label();
         program.emit_insn(Insn::Rewind {
@@ -844,10 +931,59 @@ pub fn translate_drop_table(
             pc_if_next: copy_temp_table_to_schema_loop,
         });
         program.preassign_label_to_next_insn(copy_temp_table_to_schema_loop_end_label);
-        //  End loop to copy over row id's from the ephemeral table and then re-insert into the schema table with the correct root page
+        // End loop to copy over row id's from the ephemeral table and then re-insert into the schema table with the correct root page
     }
 
-    //  Drop the in-memory structures for the table
+    // if drops table, sequence table should reset.
+    if let Some(seq_table) = schema.get_table("sqlite_sequence").and_then(|t| t.btree()) {
+        let seq_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(seq_table.clone()));
+        let seq_table_name_reg = program.alloc_register();
+        let dropped_table_name_reg =
+            program.emit_string8_new_reg(tbl_name.name.as_str().to_string());
+        program.mark_last_insn_constant();
+
+        program.emit_insn(Insn::OpenWrite {
+            cursor_id: seq_cursor_id,
+            root_page: seq_table.root_page.into(),
+            db: 0,
+        });
+
+        let end_loop_label = program.allocate_label();
+        let loop_start_label = program.allocate_label();
+
+        program.emit_insn(Insn::Rewind {
+            cursor_id: seq_cursor_id,
+            pc_if_empty: end_loop_label,
+        });
+
+        program.preassign_label_to_next_insn(loop_start_label);
+
+        program.emit_column_or_rowid(seq_cursor_id, 0, seq_table_name_reg);
+
+        let continue_loop_label = program.allocate_label();
+        program.emit_insn(Insn::Ne {
+            lhs: seq_table_name_reg,
+            rhs: dropped_table_name_reg,
+            target_pc: continue_loop_label,
+            flags: CmpInsFlags::default(),
+            collation: None,
+        });
+
+        program.emit_insn(Insn::Delete {
+            cursor_id: seq_cursor_id,
+            table_name: "sqlite_sequence".to_string(),
+        });
+
+        program.resolve_label(continue_loop_label, program.offset());
+        program.emit_insn(Insn::Next {
+            cursor_id: seq_cursor_id,
+            pc_if_next: loop_start_label,
+        });
+
+        program.preassign_label_to_next_insn(end_loop_label);
+    }
+
+    // Drop the in-memory structures for the table
     program.emit_insn(Insn::DropTable {
         db: 0,
         _p2: 0,

@@ -182,12 +182,12 @@ pub fn translate_inner(
         } => translate_create_table(
             tbl_name,
             temporary,
-            body,
             if_not_exists,
+            body,
             schema,
             syms,
-            connection,
             program,
+            connection,
         )?,
         ast::Stmt::CreateTrigger { .. } => bail_parse_error!("CREATE TRIGGER not supported yet"),
         ast::Stmt::CreateView {

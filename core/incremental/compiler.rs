@@ -1977,6 +1977,7 @@ mod tests {
                 ],
                 has_rowid: true,
                 is_strict: false,
+                has_autoincrement: false,
                 unique_sets: vec![],
             };
             schema.add_btree_table(Arc::new(users_table));
@@ -2029,6 +2030,7 @@ mod tests {
                 ],
                 has_rowid: true,
                 is_strict: false,
+                has_autoincrement: false,
                 unique_sets: vec![],
             };
             schema.add_btree_table(Arc::new(products_table));
@@ -2092,6 +2094,7 @@ mod tests {
                     },
                 ],
                 has_rowid: true,
+                has_autoincrement: false,
                 is_strict: false,
                 unique_sets: vec![],
             };
@@ -2130,6 +2133,7 @@ mod tests {
                 ],
                 has_rowid: true,
                 is_strict: false,
+                has_autoincrement: false,
                 unique_sets: vec![],
             };
             schema.add_btree_table(Arc::new(customers_table));
@@ -2191,6 +2195,7 @@ mod tests {
                 ],
                 has_rowid: true,
                 is_strict: false,
+                has_autoincrement: false,
                 unique_sets: vec![],
             };
             schema.add_btree_table(Arc::new(purchases_table));
@@ -2240,6 +2245,7 @@ mod tests {
                 ],
                 has_rowid: true,
                 is_strict: false,
+                has_autoincrement: false,
                 unique_sets: vec![],
             };
             schema.add_btree_table(Arc::new(vendors_table));
@@ -2276,6 +2282,7 @@ mod tests {
                 ],
                 has_rowid: true,
                 is_strict: false,
+                has_autoincrement: false,
                 unique_sets: vec![],
             };
             schema.add_btree_table(Arc::new(sales_table));

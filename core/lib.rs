@@ -2498,6 +2498,7 @@ impl Statement {
                 &self.program.sql,
             )?
         };
+
         // Save parameters before they are reset
         let parameters = std::mem::take(&mut self.state.parameters);
         let (max_registers, cursor_count) = match self.query_mode {

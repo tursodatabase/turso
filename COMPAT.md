@@ -486,7 +486,7 @@ Modifiers:
 | Lt             | Yes    |         |
 | MakeRecord     | Yes    |         |
 | MaxPgcnt       | Yes    |         |
-| MemMax         | No     |         |
+| MemMax         | Yes     |         |
 | Move           | Yes    |         |
 | Multiply       | Yes    |         |
 | MustBeInt      | Yes    |         |
