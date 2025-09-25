@@ -349,7 +349,8 @@ impl StreamingLogicalLogReader {
     }
 
     pub fn is_eof(&self) -> bool {
-        self.offset >= self.file_size
+        // if we are positioned at the end of file and we have consumed all bytes
+        self.offset >= self.file_size && self.bytes_can_read() == 0
     }
 
     fn consume_u8(&mut self, io: &Arc<dyn crate::IO>) -> Result<u8> {
