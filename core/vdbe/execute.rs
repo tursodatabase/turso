@@ -2282,14 +2282,6 @@ pub fn op_transaction_inner(
                     // Programs can run Transaction twice, first with read flag and then with write flag. So a single txid is enough
                     // for both.
                     if program.connection.mv_tx.get().is_none() {
-                        // We allocate the first page lazily in the first transaction.
-                        // TODO: when we fix MVCC enable schema cookie detection for reprepare statements
-                        // let header_schema_cookie = pager
-                        //     .io
-                        //     .block(|| pager.with_header(|header| header.schema_cookie.get()))?;
-                        // if header_schema_cookie != *schema_cookie {
-                        //     return Err(LimboError::SchemaUpdated);
-                        // }
                         let tx_id = match tx_mode {
                             TransactionMode::None
                             | TransactionMode::Read

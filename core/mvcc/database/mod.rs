@@ -1357,11 +1357,11 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             }
         }
 
-        if connection.schema.borrow().schema_version
+        if connection.schema.read().schema_version
             > connection.db.schema.lock().unwrap().schema_version
         {
             // Connection made schema changes during tx and rolled back -> revert connection-local schema.
-            connection.schema.replace(connection.db.clone_schema()?);
+            *connection.schema.write() = connection.db.clone_schema()?;
         }
 
         let tx = tx_unlocked.value();
