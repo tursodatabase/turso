@@ -1,4 +1,3 @@
-use crate::json::vtab::JsonEachVirtualTable;
 use crate::pragma::{PragmaVirtualTable, PragmaVirtualTableCursor};
 use crate::schema::Column;
 use crate::util::columns_from_create_table_body;
@@ -58,7 +57,9 @@ impl VirtualTable {
 
     #[cfg(feature = "json")]
     fn json_virtual_tables() -> Vec<Arc<VirtualTable>> {
-        let json_each = JsonEachVirtualTable {};
+        use crate::json::vtab::JsonVirtualTable;
+
+        let json_each = JsonVirtualTable::json_each();
 
         let json_each_virtual_table = VirtualTable {
             name: json_each.name(),
@@ -68,7 +69,20 @@ impl VirtualTable {
             vtab_type: VirtualTableType::Internal(Arc::new(RwLock::new(json_each))),
         };
 
-        vec![Arc::new(json_each_virtual_table)]
+        let json_tree = JsonVirtualTable::json_tree();
+
+        let json_tree_virtual_table = VirtualTable {
+            name: json_tree.name(),
+            columns: Self::resolve_columns(json_tree.sql())
+                .expect("internal table-valued function schema resolution should not fail"),
+            kind: VTabKind::TableValuedFunction,
+            vtab_type: VirtualTableType::Internal(Arc::new(RwLock::new(json_tree))),
+        };
+
+        vec![
+            Arc::new(json_each_virtual_table),
+            Arc::new(json_tree_virtual_table),
+        ]
     }
 
     pub(crate) fn function(name: &str, syms: &SymbolTable) -> crate::Result<Arc<VirtualTable>> {
