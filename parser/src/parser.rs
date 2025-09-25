@@ -2603,16 +2603,24 @@ impl<'a> Parser<'a> {
             return Ok(None);
         }
 
-        let limit = self.parse_expr(0)?;
-        let offset = match self.peek()? {
+        let expr = self.parse_expr(0)?;
+        let (limit, offset) = match self.peek()? {
             Some(tok) => match tok.token_type.unwrap() {
-                TK_OFFSET | TK_COMMA => {
-                    eat_assert!(self, TK_OFFSET, TK_COMMA);
-                    Some(self.parse_expr(0)?)
+                TK_COMMA => {
+                    eat_assert!(self, TK_COMMA);
+                    let offset = expr;
+                    let limit = self.parse_expr(0)?;
+                    (limit, Some(offset))
                 }
-                _ => None,
+                TK_OFFSET => {
+                    eat_assert!(self, TK_OFFSET);
+                    let limit = expr;
+                    let offset = self.parse_expr(0)?;
+                    (limit, Some(offset))
+                }
+                _ => (expr, None),
             },
-            _ => None,
+            _ => (expr, None),
         };
 
         Ok(Some(Limit {
@@ -7577,8 +7585,8 @@ mod tests {
                     },
                     order_by: vec![],
                     limit: Some(Limit {
-                        expr: Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
-                        offset: Some(Box::new(Expr::Literal(Literal::Numeric("2".to_owned())))),
+                        expr: Box::new(Expr::Literal(Literal::Numeric("2".to_owned()))),
+                        offset: Some(Box::new(Expr::Literal(Literal::Numeric("1".to_owned())))),
                     }),
                 }))],
             ),
