@@ -1443,9 +1443,9 @@ pub mod tests {
     #[test]
     fn test_expressions_equivalent_case_insensitive_functioncalls() {
         let func1 = Expr::FunctionCall {
-            name: Name::Ident("SUM".to_string()),
+            name: Name::exact("SUM".to_string()),
             distinctness: None,
-            args: vec![Expr::Id(Name::Ident("x".to_string())).into()],
+            args: vec![Expr::Id(Name::exact("x".to_string())).into()],
             order_by: vec![],
             filter_over: FunctionTail {
                 filter_clause: None,
@@ -1453,9 +1453,9 @@ pub mod tests {
             },
         };
         let func2 = Expr::FunctionCall {
-            name: Name::Ident("sum".to_string()),
+            name: Name::exact("sum".to_string()),
             distinctness: None,
-            args: vec![Expr::Id(Name::Ident("x".to_string())).into()],
+            args: vec![Expr::Id(Name::exact("x".to_string())).into()],
             order_by: vec![],
             filter_over: FunctionTail {
                 filter_clause: None,
@@ -1465,9 +1465,9 @@ pub mod tests {
         assert!(exprs_are_equivalent(&func1, &func2));
 
         let func3 = Expr::FunctionCall {
-            name: Name::Ident("SUM".to_string()),
+            name: Name::exact("SUM".to_string()),
             distinctness: Some(ast::Distinctness::Distinct),
-            args: vec![Expr::Id(Name::Ident("x".to_string())).into()],
+            args: vec![Expr::Id(Name::exact("x".to_string())).into()],
             order_by: vec![],
             filter_over: FunctionTail {
                 filter_clause: None,
@@ -1480,9 +1480,9 @@ pub mod tests {
     #[test]
     fn test_expressions_equivalent_identical_fn_with_distinct() {
         let sum = Expr::FunctionCall {
-            name: Name::Ident("SUM".to_string()),
+            name: Name::exact("SUM".to_string()),
             distinctness: None,
-            args: vec![Expr::Id(Name::Ident("x".to_string())).into()],
+            args: vec![Expr::Id(Name::exact("x".to_string())).into()],
             order_by: vec![],
             filter_over: FunctionTail {
                 filter_clause: None,
@@ -1490,9 +1490,9 @@ pub mod tests {
             },
         };
         let sum_distinct = Expr::FunctionCall {
-            name: Name::Ident("SUM".to_string()),
+            name: Name::exact("SUM".to_string()),
             distinctness: Some(ast::Distinctness::Distinct),
-            args: vec![Expr::Id(Name::Ident("x".to_string())).into()],
+            args: vec![Expr::Id(Name::exact("x".to_string())).into()],
             order_by: vec![],
             filter_over: FunctionTail {
                 filter_clause: None,
@@ -1551,14 +1551,14 @@ pub mod tests {
     #[test]
     fn test_like_expressions_equivalent() {
         let expr1 = Expr::Like {
-            lhs: Box::new(Expr::Id(Name::Ident("name".to_string()))),
+            lhs: Box::new(Expr::Id(Name::exact("name".to_string()))),
             not: false,
             op: ast::LikeOperator::Like,
             rhs: Box::new(Expr::Literal(Literal::String("%john%".to_string()))),
             escape: Some(Box::new(Expr::Literal(Literal::String("\\".to_string())))),
         };
         let expr2 = Expr::Like {
-            lhs: Box::new(Expr::Id(Name::Ident("name".to_string()))),
+            lhs: Box::new(Expr::Id(Name::exact("name".to_string()))),
             not: false,
             op: ast::LikeOperator::Like,
             rhs: Box::new(Expr::Literal(Literal::String("%john%".to_string()))),
@@ -1570,14 +1570,14 @@ pub mod tests {
     #[test]
     fn test_expressions_equivalent_like_escaped() {
         let expr1 = Expr::Like {
-            lhs: Box::new(Expr::Id(Name::Ident("name".to_string()))),
+            lhs: Box::new(Expr::Id(Name::exact("name".to_string()))),
             not: false,
             op: ast::LikeOperator::Like,
             rhs: Box::new(Expr::Literal(Literal::String("%john%".to_string()))),
             escape: Some(Box::new(Expr::Literal(Literal::String("\\".to_string())))),
         };
         let expr2 = Expr::Like {
-            lhs: Box::new(Expr::Id(Name::Ident("name".to_string()))),
+            lhs: Box::new(Expr::Id(Name::exact("name".to_string()))),
             not: false,
             op: ast::LikeOperator::Like,
             rhs: Box::new(Expr::Literal(Literal::String("%john%".to_string()))),
@@ -1588,13 +1588,13 @@ pub mod tests {
     #[test]
     fn test_expressions_equivalent_between() {
         let expr1 = Expr::Between {
-            lhs: Box::new(Expr::Id(Name::Ident("age".to_string()))),
+            lhs: Box::new(Expr::Id(Name::exact("age".to_string()))),
             not: false,
             start: Box::new(Expr::Literal(Literal::Numeric("18".to_string()))),
             end: Box::new(Expr::Literal(Literal::Numeric("65".to_string()))),
         };
         let expr2 = Expr::Between {
-            lhs: Box::new(Expr::Id(Name::Ident("age".to_string()))),
+            lhs: Box::new(Expr::Id(Name::exact("age".to_string()))),
             not: false,
             start: Box::new(Expr::Literal(Literal::Numeric("18".to_string()))),
             end: Box::new(Expr::Literal(Literal::Numeric("65".to_string()))),
@@ -1603,7 +1603,7 @@ pub mod tests {
 
         // differing BETWEEN bounds
         let expr3 = Expr::Between {
-            lhs: Box::new(Expr::Id(Name::Ident("age".to_string()))),
+            lhs: Box::new(Expr::Id(Name::exact("age".to_string()))),
             not: false,
             start: Box::new(Expr::Literal(Literal::Numeric("20".to_string()))),
             end: Box::new(Expr::Literal(Literal::Numeric("65".to_string()))),
@@ -2328,18 +2328,18 @@ pub mod tests {
     #[test]
     fn test_parse_pragma_bool() {
         assert!(parse_pragma_bool(&Expr::Literal(Literal::Numeric("1".into()))).unwrap(),);
-        assert!(parse_pragma_bool(&Expr::Name(Name::Ident("true".into()))).unwrap(),);
-        assert!(parse_pragma_bool(&Expr::Name(Name::Ident("on".into()))).unwrap(),);
-        assert!(parse_pragma_bool(&Expr::Name(Name::Ident("yes".into()))).unwrap(),);
+        assert!(parse_pragma_bool(&Expr::Name(Name::exact("true".into()))).unwrap(),);
+        assert!(parse_pragma_bool(&Expr::Name(Name::exact("on".into()))).unwrap(),);
+        assert!(parse_pragma_bool(&Expr::Name(Name::exact("yes".into()))).unwrap(),);
 
         assert!(!parse_pragma_bool(&Expr::Literal(Literal::Numeric("0".into()))).unwrap(),);
-        assert!(!parse_pragma_bool(&Expr::Name(Name::Ident("false".into()))).unwrap(),);
-        assert!(!parse_pragma_bool(&Expr::Name(Name::Ident("off".into()))).unwrap(),);
-        assert!(!parse_pragma_bool(&Expr::Name(Name::Ident("no".into()))).unwrap(),);
+        assert!(!parse_pragma_bool(&Expr::Name(Name::exact("false".into()))).unwrap(),);
+        assert!(!parse_pragma_bool(&Expr::Name(Name::exact("off".into()))).unwrap(),);
+        assert!(!parse_pragma_bool(&Expr::Name(Name::exact("no".into()))).unwrap(),);
 
-        assert!(parse_pragma_bool(&Expr::Name(Name::Ident("nono".into()))).is_err());
-        assert!(parse_pragma_bool(&Expr::Name(Name::Ident("10".into()))).is_err());
-        assert!(parse_pragma_bool(&Expr::Name(Name::Ident("-1".into()))).is_err());
+        assert!(parse_pragma_bool(&Expr::Name(Name::exact("nono".into()))).is_err());
+        assert!(parse_pragma_bool(&Expr::Name(Name::exact("10".into()))).is_err());
+        assert!(parse_pragma_bool(&Expr::Name(Name::exact("-1".into()))).is_err());
     }
 
     #[test]

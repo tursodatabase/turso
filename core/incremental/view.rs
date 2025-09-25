@@ -2444,7 +2444,7 @@ mod tests {
         let view = IncrementalView::from_stmt(
             ast::QualifiedName {
                 db_name: None,
-                name: ast::Name::Ident("test_view".to_string()),
+                name: ast::Name::exact("test_view".to_string()),
                 alias: None,
             },
             select,
@@ -2481,7 +2481,7 @@ mod tests {
         let view = IncrementalView::from_stmt(
             ast::QualifiedName {
                 db_name: None,
-                name: ast::Name::Ident("test_view".to_string()),
+                name: ast::Name::exact("test_view".to_string()),
                 alias: None,
             },
             select,

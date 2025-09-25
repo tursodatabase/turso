@@ -3322,8 +3322,8 @@ pub fn bind_and_rewrite_expr<'a>(
                 ast::Expr::Qualified(ast::Name::Quoted(ns), ast::Name::Quoted(c))
                 | ast::Expr::DoublyQualified(_, ast::Name::Quoted(ns), ast::Name::Quoted(c)) => {
                     *expr = ast::Expr::Qualified(
-                        ast::Name::Ident(normalize_ident(ns.as_str())),
-                        ast::Name::Ident(normalize_ident(c.as_str())),
+                        ast::Name::exact(normalize_ident(ns.as_str())),
+                        ast::Name::exact(normalize_ident(c.as_str())),
                     );
                 }
                 ast::Expr::Between {

@@ -834,7 +834,7 @@ impl<'a> LogicalPlanBuilder<'a> {
                 .iter()
                 .any(|col| col.name == left_col.name)
             {
-                common_columns.push(ast::Name::Ident(left_col.name.clone()));
+                common_columns.push(ast::Name::exact(left_col.name.clone()));
             }
         }
 

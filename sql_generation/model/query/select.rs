@@ -295,7 +295,7 @@ impl Select {
                             }
                             ResultColumn::Star => ast::ResultColumn::Star,
                             ResultColumn::Column(name) => ast::ResultColumn::Expr(
-                                ast::Expr::Id(ast::Name::Ident(name.clone())).into_boxed(),
+                                ast::Expr::Id(ast::Name::exact(name.clone())).into_boxed(),
                                 None,
                             ),
                         })
@@ -326,7 +326,7 @@ impl Select {
                                     }
                                     ResultColumn::Star => ast::ResultColumn::Star,
                                     ResultColumn::Column(name) => ast::ResultColumn::Expr(
-                                        ast::Expr::Id(ast::Name::Ident(name.clone())).into_boxed(),
+                                        ast::Expr::Id(ast::Name::exact(name.clone())).into_boxed(),
                                         None,
                                     ),
                                 })
@@ -348,7 +348,7 @@ impl Select {
                     o.columns
                         .iter()
                         .map(|(name, order)| ast::SortedColumn {
-                            expr: ast::Expr::Id(ast::Name::Ident(name.clone())).into_boxed(),
+                            expr: ast::Expr::Id(ast::Name::exact(name.clone())).into_boxed(),
                             order: match order {
                                 SortOrder::Asc => Some(ast::SortOrder::Asc),
                                 SortOrder::Desc => Some(ast::SortOrder::Desc),

@@ -888,17 +888,20 @@ pub enum Name {
 }
 
 impl Name {
+    pub fn exact(s: String) -> Self {
+        Self::Ident(s)
+    }
     pub fn new(s: impl AsRef<str>) -> Self {
         let s = s.as_ref();
         let bytes = s.as_bytes();
 
         if s.is_empty() {
-            return Name::Ident(s.to_string());
+            return Name::exact(s.to_string());
         }
 
         match bytes[0] {
             b'"' | b'\'' | b'`' | b'[' => Name::Quoted(s.to_string()),
-            _ => Name::Ident(s.to_string()),
+            _ => Name::exact(s.to_string()),
         }
     }
 

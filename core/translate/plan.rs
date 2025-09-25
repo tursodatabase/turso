@@ -367,7 +367,7 @@ impl SelectPlan {
         }
 
         let count = ast::Expr::FunctionCall {
-            name: ast::Name::Ident("count".to_string()),
+            name: ast::Name::exact("count".to_string()),
             distinctness: None,
             args: vec![],
             order_by: vec![],
@@ -377,7 +377,7 @@ impl SelectPlan {
             },
         };
         let count_star = ast::Expr::FunctionCallStar {
-            name: ast::Name::Ident("count".to_string()),
+            name: ast::Name::exact("count".to_string()),
             filter_over: ast::FunctionTail {
                 filter_clause: None,
                 over_clause: None,

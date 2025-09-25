@@ -16,7 +16,7 @@ use crate::vdbe::{BranchOffset, CursorID};
 use crate::SymbolTable;
 use std::mem;
 use std::sync::Arc;
-use turso_parser::ast::Name::Ident;
+use turso_parser::ast::Name;
 use turso_parser::ast::{Expr, FunctionTail, Literal, Over, SortOrder, TableInternalId};
 
 const SUBQUERY_DATABASE_ID: usize = 0;
@@ -339,7 +339,7 @@ fn rewrite_expr_referencing_current_window(
         // The window name may be user-provided or planner-generated.
         *filter_over = FunctionTail {
             filter_clause: None,
-            over_clause: Some(Over::Name(Ident(window_name.to_string()))),
+            over_clause: Some(Over::Name(Name::exact(window_name.to_string()))),
         };
     }
 

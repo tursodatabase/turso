@@ -5323,7 +5323,7 @@ pub fn op_function(
                                         ast::Expr::Id(id)
                                             if normalize_ident(id.as_str()) == rename_from =>
                                         {
-                                            *id = Name::Ident(
+                                            *id = Name::exact(
                                                 column_def.col_name.as_str().to_owned(),
                                             );
                                         }

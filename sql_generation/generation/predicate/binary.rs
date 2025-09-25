@@ -27,7 +27,7 @@ impl Predicate {
             vec![
                 Box::new(|_| {
                     Expr::Binary(
-                        Box::new(Expr::Id(ast::Name::Ident(column_name.to_string()))),
+                        Box::new(Expr::Id(ast::Name::exact(column_name.to_string()))),
                         ast::Operator::Equals,
                         Box::new(Expr::Literal(value.into())),
                     )
@@ -35,7 +35,7 @@ impl Predicate {
                 Box::new(|rng| {
                     let gt_value = GTValue::arbitrary_from(rng, context, value).0;
                     Expr::Binary(
-                        Box::new(Expr::Id(ast::Name::Ident(column_name.to_string()))),
+                        Box::new(Expr::Id(ast::Name::exact(column_name.to_string()))),
                         ast::Operator::Greater,
                         Box::new(Expr::Literal(gt_value.into())),
                     )
@@ -43,7 +43,7 @@ impl Predicate {
                 Box::new(|rng| {
                     let lt_value = LTValue::arbitrary_from(rng, context, value).0;
                     Expr::Binary(
-                        Box::new(Expr::Id(ast::Name::Ident(column_name.to_string()))),
+                        Box::new(Expr::Id(ast::Name::exact(column_name.to_string()))),
                         ast::Operator::Less,
                         Box::new(Expr::Literal(lt_value.into())),
                     )
