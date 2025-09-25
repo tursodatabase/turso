@@ -26,6 +26,7 @@ pub fn emit_ungrouped_aggregation<'a>(
     plan: &'a SelectPlan,
 ) -> Result<()> {
     let agg_start_reg = t_ctx.reg_agg_start.unwrap();
+
     for (i, agg) in plan.aggregates.iter().enumerate() {
         let agg_result_reg = agg_start_reg + i;
         program.emit_insn(Insn::AggFinal {
@@ -33,6 +34,9 @@ pub fn emit_ungrouped_aggregation<'a>(
             func: agg.func.clone(),
         });
     }
+    // we now have the agg results in (agg_start_reg..agg_start_reg + aggregates.len() - 1)
+    // we need to call translate_expr on each result column, but replace the expr with a register copy in case any part of the
+    // result column expression matches a) a group by column or b) an aggregation result.
     for (i, agg) in plan.aggregates.iter().enumerate() {
         t_ctx
             .resolver
