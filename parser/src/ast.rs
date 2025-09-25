@@ -891,6 +891,9 @@ impl Name {
     pub fn exact(s: String) -> Self {
         Self::Ident(s)
     }
+    pub fn from_bytes(s: &[u8]) -> Self {
+        Self::new(unsafe { std::str::from_utf8_unchecked(s) }.to_owned())
+    }
     pub fn new(s: impl AsRef<str>) -> Self {
         let s = s.as_ref();
         let bytes = s.as_bytes();
@@ -911,12 +914,26 @@ impl Name {
         }
     }
 
-    /// Checks if a name represents a double-quoted string that should get fallback behavior
-    pub fn is_double_quoted(&self) -> bool {
+    pub fn as_literal(&self) -> &str {
+        match self {
+            Name::Ident(s) | Name::Quoted(s) => s.as_str(),
+        }
+    }
+
+    /// Checks if a name represents a quoted string that should get fallback behavior
+    /// Need to detect legacy conversion of double quoted keywords to string literals
+    /// (see https://sqlite.org/lang_keywords.html)
+    ///
+    /// Also, used to detect string literals in PRAGMA cases
+    pub fn quoted_with(&self, quote: char) -> bool {
         if let Self::Quoted(ident) = self {
-            return ident.starts_with("\"");
+            return ident.starts_with(quote);
         }
         false
+    }
+
+    pub fn quoted(&self) -> bool {
+        matches!(self, Self::Quoted(..))
     }
 }
 

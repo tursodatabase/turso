@@ -3471,7 +3471,7 @@ pub fn bind_and_rewrite_expr<'a>(
 
                         // SQLite behavior: Only double-quoted identifiers get fallback to string literals
                         // Single quotes are handled as literals earlier, unquoted identifiers must resolve to columns
-                        if id.is_double_quoted() {
+                        if id.quoted_with('"') {
                             // Convert failed double-quoted identifier to string literal
                             *expr = Expr::Literal(ast::Literal::String(id.as_str().to_string()));
                             return Ok(WalkControl::Continue);
