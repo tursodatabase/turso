@@ -2040,22 +2040,12 @@ mod tests {
     }
 
     #[test]
-    pub fn test_primary_key_inline_multiple() -> Result<()> {
+    pub fn test_primary_key_inline_multiple_forbidden() -> Result<()> {
         let sql = r#"CREATE TABLE t1 (a INTEGER PRIMARY KEY, b TEXT PRIMARY KEY, c REAL);"#;
-        let table = BTreeTable::from_sql(sql, 0)?;
-        let column = table.get_column("a").unwrap().1;
-        assert!(column.primary_key, "column 'a' should be a primary key");
-        let column = table.get_column("b").unwrap().1;
-        assert!(column.primary_key, "column 'b' shouldn be a primary key");
-        let column = table.get_column("c").unwrap().1;
-        assert!(!column.primary_key, "column 'c' shouldn't be a primary key");
-        assert_eq!(
-            vec![
-                ("a".to_string(), SortOrder::Asc),
-                ("b".to_string(), SortOrder::Asc)
-            ],
-            table.primary_key_columns,
-            "primary key column names should be ['a', 'b']"
+        let table = BTreeTable::from_sql(sql, 0);
+        let error = table.unwrap_err();
+        assert!(
+            matches!(error, LimboError::ParseError(e) if e.contains("table \"t1\" has more than one primary key"))
         );
         Ok(())
     }
