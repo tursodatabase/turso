@@ -149,8 +149,8 @@ pub fn translate_create_materialized_view(
     let dbsp_sql = format!(
         "CREATE TABLE {dbsp_table_name} (\
          operator_id INTEGER NOT NULL, \
-         zset_id INTEGER NOT NULL, \
-         element_id NOT NULL, \
+         zset_id BLOB NOT NULL, \
+         element_id BLOB NOT NULL, \
          value BLOB, \
          weight INTEGER NOT NULL, \
          PRIMARY KEY (operator_id, zset_id, element_id)\

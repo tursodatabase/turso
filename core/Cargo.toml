@@ -72,7 +72,7 @@ strum_macros = { workspace = true }
 bitflags = { workspace = true }
 serde = { workspace = true, optional = true, features = ["derive"] }
 paste = "1.0.15"
-uuid = { version = "1.11.0", features = ["v4", "v7"], optional = true }
+uuid = { version = "1.11.0", features = ["v4", "v5", "v7"], optional = true }
 tempfile = { workspace = true }
 pack1 = { version = "1.0.0", features = ["bytemuck"] }
 bytemuck = "1.23.1"

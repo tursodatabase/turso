@@ -1,6 +1,7 @@
 // Aggregate operator for DBSP-style incremental computation
 
 use crate::function::{AggFunc, Func};
+use crate::incremental::dbsp::Hash128;
 use crate::incremental::dbsp::{Delta, DeltaPair, HashableRow};
 use crate::incremental::operator::{
     generate_storage_id, ComputationTracker, DbspStateCursors, EvalState, IncrementalOperator,
@@ -312,17 +313,17 @@ impl AggregateEvalState {
                         // Get the current group to read
                         let (group_key_str, _group_key) = &groups_to_read[*current_idx];
 
-                        // Build the key for the index: (operator_id, zset_id, element_id)
+                        // Build the key for the index: (operator_id, zset_hash, element_id)
                         // For regular aggregates, use column_index=0 and AGG_TYPE_REGULAR
                         let operator_storage_id =
                             generate_storage_id(operator.operator_id, 0, AGG_TYPE_REGULAR);
-                        let zset_id = operator.generate_group_rowid(group_key_str);
+                        let zset_hash = operator.generate_group_hash(group_key_str);
                         let element_id = 0i64; // Always 0 for aggregators
 
                         // Create index key values
                         let index_key_values = vec![
                             Value::Integer(operator_storage_id),
-                            Value::Integer(zset_id),
+                            zset_hash.to_value(),
                             Value::Integer(element_id),
                         ];
 
@@ -955,7 +956,7 @@ impl AggregateOperator {
         for (group_key_str, state) in existing_groups {
             let group_key = temp_keys.get(group_key_str).cloned().unwrap_or_default();
 
-            // Generate a unique rowid for this group
+            // Generate synthetic rowid for this group
             let result_key = self.generate_group_rowid(group_key_str);
 
             if let Some(old_row_values) = old_values.get(group_key_str) {
@@ -1022,17 +1023,24 @@ impl AggregateOperator {
         self.tracker = Some(tracker);
     }
 
-    /// Generate a rowid for a group
-    /// For no GROUP BY: always returns 0
-    /// For GROUP BY: returns a hash of the group key string
-    pub fn generate_group_rowid(&self, group_key_str: &str) -> i64 {
+    /// Generate a hash for a group
+    /// For no GROUP BY: returns a zero hash
+    /// For GROUP BY: returns a 128-bit hash of the group key string
+    pub fn generate_group_hash(&self, group_key_str: &str) -> Hash128 {
         if self.group_by.is_empty() {
-            0
+            Hash128::new(0, 0)
         } else {
-            group_key_str
-                .bytes()
-                .fold(0i64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as i64))
+            Hash128::hash_str(group_key_str)
         }
+    }
+
+    /// Generate a rowid for a group (for output rows)
+    /// This is NOT the hash used for storage (that's generate_group_hash which returns full 128-bit).
+    /// This is a synthetic rowid used in place of SQLite's rowid for aggregate output rows.
+    /// We truncate the 128-bit hash to 64 bits for SQLite rowid compatibility.
+    pub fn generate_group_rowid(&self, group_key_str: &str) -> i64 {
+        let hash = self.generate_group_hash(group_key_str);
+        hash.as_i64()
     }
 
     /// Extract group key values from a row
@@ -1140,7 +1148,7 @@ impl IncrementalOperator for AggregateOperator {
                         // For regular aggregates, use column_index=0 and AGG_TYPE_REGULAR
                         let operator_storage_id =
                             generate_storage_id(self.operator_id, 0, AGG_TYPE_REGULAR);
-                        let zset_id = self.generate_group_rowid(group_key_str);
+                        let zset_hash = self.generate_group_hash(group_key_str);
                         let element_id = 0i64;
 
                         // Determine weight: -1 to delete (cancels existing weight=1), 1 to insert/update
@@ -1150,22 +1158,22 @@ impl IncrementalOperator for AggregateOperator {
                         let state_blob = agg_state.to_blob(&self.aggregates, group_key);
                         let blob_value = Value::Blob(state_blob);
 
-                        // Build the aggregate storage format: [operator_id, zset_id, element_id, value, weight]
+                        // Build the aggregate storage format: [operator_id, zset_hash, element_id, value, weight]
                         let operator_id_val = Value::Integer(operator_storage_id);
-                        let zset_id_val = Value::Integer(zset_id);
+                        let zset_hash_val = zset_hash.to_value();
                         let element_id_val = Value::Integer(element_id);
                         let blob_val = blob_value.clone();
 
                         // Create index key - the first 3 columns of our primary key
                         let index_key = vec![
                             operator_id_val.clone(),
-                            zset_id_val.clone(),
+                            zset_hash_val.clone(),
                             element_id_val.clone(),
                         ];
 
                         // Record values (without weight)
                         let record_values =
-                            vec![operator_id_val, zset_id_val, element_id_val, blob_val];
+                            vec![operator_id_val, zset_hash_val, element_id_val, blob_val];
 
                         return_and_restore_if_io!(
                             &mut self.commit_state,
@@ -1201,7 +1209,7 @@ impl IncrementalOperator for AggregateOperator {
                                 self.operator_id,
                                 &self.column_min_max,
                                 cursors,
-                                |group_key_str| self.generate_group_rowid(group_key_str)
+                                |group_key_str| self.generate_group_hash(group_key_str)
                             )
                         );
 
@@ -1359,7 +1367,7 @@ impl RecomputeMinMax {
                     // Create storage keys for index lookup
                     let storage_id =
                         generate_storage_id(operator.operator_id, storage_index, AGG_TYPE_MINMAX);
-                    let zset_id = operator.generate_group_rowid(&group_key);
+                    let zset_hash = operator.generate_group_hash(&group_key);
 
                     // Get the values for this group from min_max_deltas
                     let group_values = min_max_deltas.get(&group_key).cloned().unwrap_or_default();
@@ -1373,7 +1381,7 @@ impl RecomputeMinMax {
                             group_key.clone(),
                             column_name,
                             storage_id,
-                            zset_id,
+                            zset_hash,
                             group_values,
                         ))
                     } else {
@@ -1382,7 +1390,7 @@ impl RecomputeMinMax {
                             group_key.clone(),
                             column_name,
                             storage_id,
-                            zset_id,
+                            zset_hash,
                             group_values,
                         ))
                     };
@@ -1454,7 +1462,7 @@ pub enum ScanState {
         /// Storage ID for the index seek
         storage_id: i64,
         /// ZSet ID for the group
-        zset_id: i64,
+        zset_hash: Hash128,
         /// Group values from MinMaxDeltas: (column_name, HashableRow) -> weight
         group_values: HashMap<(usize, HashableRow), isize>,
         /// Whether we're looking for MIN (true) or MAX (false)
@@ -1470,7 +1478,7 @@ pub enum ScanState {
         /// Storage ID for the index seek
         storage_id: i64,
         /// ZSet ID for the group
-        zset_id: i64,
+        zset_hash: Hash128,
         /// Group values from MinMaxDeltas: (column_name, HashableRow) -> weight
         group_values: HashMap<(usize, HashableRow), isize>,
         /// Whether we're looking for MIN (true) or MAX (false)
@@ -1488,7 +1496,7 @@ impl ScanState {
         group_key: String,
         column_name: usize,
         storage_id: i64,
-        zset_id: i64,
+        zset_hash: Hash128,
         group_values: HashMap<(usize, HashableRow), isize>,
     ) -> Self {
         Self::CheckCandidate {
@@ -1496,7 +1504,7 @@ impl ScanState {
             group_key,
             column_name,
             storage_id,
-            zset_id,
+            zset_hash,
             group_values,
             is_min: true,
         }
@@ -1510,7 +1518,7 @@ impl ScanState {
         index_record: &ImmutableRecord,
         seek_op: SeekOp,
         storage_id: i64,
-        zset_id: i64,
+        zset_hash: Hash128,
     ) -> Result<IOResult<Option<Value>>> {
         let seek_result = return_if_io!(cursors
             .index_cursor
@@ -1533,15 +1541,26 @@ impl ScanState {
         let Some(rec_storage_id) = values.first() else {
             return Ok(IOResult::Done(None));
         };
-        let Some(rec_zset_id) = values.get(1) else {
+        let Some(rec_zset_hash) = values.get(1) else {
             return Ok(IOResult::Done(None));
         };
 
         // Check if we're still in the same group
-        if let (RefValue::Integer(rec_sid), RefValue::Integer(rec_zid)) =
-            (rec_storage_id, rec_zset_id)
-        {
-            if *rec_sid != storage_id || *rec_zid != zset_id {
+        if let RefValue::Integer(rec_sid) = rec_storage_id {
+            if *rec_sid != storage_id {
+                return Ok(IOResult::Done(None));
+            }
+        } else {
+            return Ok(IOResult::Done(None));
+        }
+
+        // Compare zset_hash as blob
+        if let RefValue::Blob(rec_zset_blob) = rec_zset_hash {
+            if let Some(rec_hash) = Hash128::from_blob(rec_zset_blob.to_slice()) {
+                if rec_hash != zset_hash {
+                    return Ok(IOResult::Done(None));
+                }
+            } else {
                 return Ok(IOResult::Done(None));
             }
         } else {
@@ -1557,7 +1576,7 @@ impl ScanState {
         group_key: String,
         column_name: usize,
         storage_id: i64,
-        zset_id: i64,
+        zset_hash: Hash128,
         group_values: HashMap<(usize, HashableRow), isize>,
     ) -> Self {
         Self::CheckCandidate {
@@ -1565,7 +1584,7 @@ impl ScanState {
             group_key,
             column_name,
             storage_id,
-            zset_id,
+            zset_hash,
             group_values,
             is_min: false,
         }
@@ -1582,7 +1601,7 @@ impl ScanState {
                     group_key,
                     column_name,
                     storage_id,
-                    zset_id,
+                    zset_hash,
                     group_values,
                     is_min,
                 } => {
@@ -1602,7 +1621,7 @@ impl ScanState {
                                 group_key: std::mem::take(group_key),
                                 column_name: std::mem::take(column_name),
                                 storage_id: *storage_id,
-                                zset_id: *zset_id,
+                                zset_hash: *zset_hash,
                                 group_values: std::mem::take(group_values),
                                 is_min: *is_min,
                             };
@@ -1664,14 +1683,14 @@ impl ScanState {
                     group_key,
                     column_name,
                     storage_id,
-                    zset_id,
+                    zset_hash,
                     group_values,
                     is_min,
                 } => {
                     // Seek to the next value in the index
                     let index_key = vec![
                         Value::Integer(*storage_id),
-                        Value::Integer(*zset_id),
+                        zset_hash.to_value(),
                         current_candidate.clone(),
                     ];
                     let index_record = ImmutableRecord::from_values(&index_key, index_key.len());
@@ -1687,7 +1706,7 @@ impl ScanState {
                         &index_record,
                         seek_op,
                         *storage_id,
-                        *zset_id
+                        *zset_hash
                     ));
 
                     *self = ScanState::CheckCandidate {
@@ -1695,7 +1714,7 @@ impl ScanState {
                         group_key: std::mem::take(group_key),
                         column_name: std::mem::take(column_name),
                         storage_id: *storage_id,
-                        zset_id: *zset_id,
+                        zset_hash: *zset_hash,
                         group_values: std::mem::take(group_values),
                         is_min: *is_min,
                     };
@@ -1749,7 +1768,7 @@ impl MinMaxPersistState {
         operator_id: usize,
         column_min_max: &HashMap<usize, AggColumnInfo>,
         cursors: &mut DbspStateCursors,
-        generate_group_rowid: impl Fn(&str) -> i64,
+        generate_group_hash: impl Fn(&str) -> Hash128,
     ) -> Result<IOResult<()>> {
         loop {
             match self {
@@ -1835,7 +1854,7 @@ impl MinMaxPersistState {
                     // Build the key components for MinMax storage using new encoding
                     let storage_id =
                         generate_storage_id(operator_id, column_index, AGG_TYPE_MINMAX);
-                    let zset_id = generate_group_rowid(group_key_str);
+                    let zset_hash = generate_group_hash(group_key_str);
 
                     // element_id is the actual value for Min/Max
                     let element_id_val = value.clone();
@@ -1843,15 +1862,15 @@ impl MinMaxPersistState {
                     // Create index key
                     let index_key = vec![
                         Value::Integer(storage_id),
-                        Value::Integer(zset_id),
+                        zset_hash.to_value(),
                         element_id_val.clone(),
                     ];
 
-                    // Record values (operator_id, zset_id, element_id, unused_placeholder)
+                    // Record values (operator_id, zset_hash, element_id, unused_placeholder)
                     // For MIN/MAX, the element_id IS the value, so we use NULL for the 4th column
                     let record_values = vec![
                         Value::Integer(storage_id),
-                        Value::Integer(zset_id),
+                        zset_hash.to_value(),
                         element_id_val.clone(),
                         Value::Null, // Placeholder - not used for MIN/MAX
                     ];

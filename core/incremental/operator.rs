@@ -342,7 +342,6 @@ mod tests {
 
                             let group_key_str = AggregateOperator::group_key_to_string(&group_key);
                             let rowid = agg.generate_group_rowid(&group_key_str);
-
                             let output_row = HashableRow::new(rowid, output_values);
                             result.changes.push((output_row, 1));
                         }
@@ -2929,7 +2928,6 @@ mod tests {
         let index_cursor =
             BTreeCursor::new_index(None, pager.clone(), index_page_id, &index_def, 10);
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
-
         let mut join = JoinOperator::new(
             1, // operator_id
             JoinType::Inner,
@@ -2945,7 +2943,6 @@ mod tests {
         left_delta.insert(1, vec![Value::Integer(1), Value::Float(100.0)]);
         left_delta.insert(2, vec![Value::Integer(2), Value::Float(200.0)]);
         left_delta.insert(3, vec![Value::Integer(3), Value::Float(300.0)]); // No match initially
-
         let mut right_delta = Delta::new();
         right_delta.insert(1, vec![Value::Integer(1), Value::Text("Alice".into())]);
         right_delta.insert(2, vec![Value::Integer(2), Value::Text("Bob".into())]);
