@@ -277,11 +277,9 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                     return Err(crate::LimboError::Busy);
                 }
                 result?;
-                self.connection
-                    .transaction_state
-                    .replace(TransactionState::Write {
-                        schema_did_change: false,
-                    }); // TODO: schema_did_change??
+                *self.connection.transaction_state.write() = TransactionState::Write {
+                    schema_did_change: false,
+                }; // TODO: schema_did_change??
                 self.lock_states.pager_write_tx = true;
                 self.state = CheckpointState::WriteRow {
                     write_set_index: 0,
@@ -422,9 +420,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                         self.state = CheckpointState::TruncateLogicalLog;
                         self.lock_states.pager_read_tx = false;
                         self.lock_states.pager_write_tx = false;
-                        self.connection
-                            .transaction_state
-                            .replace(TransactionState::None);
+                        *self.connection.transaction_state.write() = TransactionState::None;
                         let header = self
                             .pager
                             .io
@@ -520,14 +516,10 @@ impl<Clock: LogicalClock> StateTransition for CheckpointStateMachine<Clock> {
                         .io
                         .block(|| self.pager.end_tx(rollback, self.connection.as_ref()))
                         .expect("failed to end pager write tx");
-                    self.connection
-                        .transaction_state
-                        .replace(TransactionState::None);
+                    *self.connection.transaction_state.write() = TransactionState::None;
                 } else if self.lock_states.pager_read_tx {
                     self.pager.end_read_tx().unwrap();
-                    self.connection
-                        .transaction_state
-                        .replace(TransactionState::None);
+                    *self.connection.transaction_state.write() = TransactionState::None;
                 }
                 if self.lock_states.blocking_checkpoint_lock_held {
                     self.checkpoint_lock.unlock();

@@ -590,7 +590,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 mvcc_store
                     .global_header
                     .write()
-                    .replace(*tx_unlocked.header.borrow());
+                    .replace(*tx_unlocked.header.read());
                 // We have now updated all the versions with a reference to the
                 // transaction ID to a timestamp and can, therefore, remove the
                 // transaction. Please note that when we move to lockless, the
