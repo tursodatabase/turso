@@ -288,6 +288,7 @@ struct CommitCoordinator {
 pub struct CommitStateMachine<Clock: LogicalClock> {
     state: CommitState,
     is_finalized: bool,
+    did_commit_schema_change: bool,
     tx_id: TxID,
     connection: Arc<Connection>,
     /// Write set sorted by table id and row id
@@ -340,6 +341,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
         Self {
             state,
             is_finalized: false,
+            did_commit_schema_change: false,
             tx_id,
             connection,
             write_set: Vec::new(),
@@ -388,6 +390,16 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                         assert_eq!(tx.state, TransactionState::Active);
                     }
                 }
+
+                if mvcc_store
+                    .last_committed_schema_change_ts
+                    .load(Ordering::Acquire)
+                    > tx.begin_ts
+                {
+                    // Schema changes made after the transaction began always cause a [SchemaUpdated] error and the tx must abort.
+                    return Err(LimboError::SchemaUpdated);
+                }
+
                 tx.state.store(TransactionState::Preparing);
                 tracing::trace!("prepare_tx(tx_id={})", self.tx_id);
 
@@ -501,6 +513,10 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                                         &mut log_record.row_versions,
                                         row_version.clone(),
                                     ); // FIXME: optimize cloning out
+
+                                    if row_version.row.id.table_id == 1 {
+                                        self.did_commit_schema_change = true;
+                                    }
                                 }
                             }
                             if let Some(TxTimestampOrID::TxID(id)) = row_version.end {
@@ -512,6 +528,10 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                                         &mut log_record.row_versions,
                                         row_version.clone(),
                                     ); // FIXME: optimize cloning out
+
+                                    if row_version.row.id.table_id == 1 {
+                                        self.did_commit_schema_change = true;
+                                    }
                                 }
                             }
                         }
@@ -565,10 +585,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
             }
             CommitState::EndCommitLogicalLog { end_ts } => {
                 let connection = self.connection.clone();
-                let schema_did_change = match connection.get_tx_state() {
-                    crate::TransactionState::Write { schema_did_change } => schema_did_change,
-                    _ => false,
-                };
+                let schema_did_change = self.did_commit_schema_change;
                 if schema_did_change {
                     let schema = connection.schema.read().clone();
                     connection.db.update_schema_if_newer(schema)?;
@@ -591,6 +608,16 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     .global_header
                     .write()
                     .replace(*tx_unlocked.header.read());
+
+                mvcc_store
+                    .last_committed_tx_ts
+                    .store(*end_ts, Ordering::Release);
+                if self.did_commit_schema_change {
+                    mvcc_store
+                        .last_committed_schema_change_ts
+                        .store(*end_ts, Ordering::Release);
+                }
+
                 // We have now updated all the versions with a reference to the
                 // transaction ID to a timestamp and can, therefore, remove the
                 // transaction. Please note that when we move to lockless, the
@@ -820,6 +847,13 @@ pub struct MvStore<Clock: LogicalClock> {
     /// The highest transaction ID that has been checkpointed.
     /// Used to skip checkpointing transactions that have already been checkpointed.
     checkpointed_txid_max: AtomicU64,
+    /// The timestamp of the last committed schema change.
+    /// Schema changes always cause a [SchemaUpdated] error.
+    last_committed_schema_change_ts: AtomicU64,
+    /// The timestamp of the last committed transaction.
+    /// If there are two concurrent BEGIN (non-CONCURRENT) transactions, and one tries to promote
+    /// to exclusive, it will abort if another transaction committed after its begin timestamp.
+    last_committed_tx_ts: AtomicU64,
 }
 
 impl<Clock: LogicalClock> MvStore<Clock> {
@@ -841,6 +875,8 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             global_header: Arc::new(RwLock::new(None)),
             blocking_checkpoint_lock: Arc::new(TursoRwLock::new()),
             checkpointed_txid_max: AtomicU64::new(0),
+            last_committed_schema_change_ts: AtomicU64::new(0),
+            last_committed_tx_ts: AtomicU64::new(0),
         }
     }
 
@@ -1329,6 +1365,13 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             }
         }
 
+        if connection.schema.read().schema_version
+            > connection.db.schema.lock().unwrap().schema_version
+        {
+            // Connection made schema changes during tx and rolled back -> revert connection-local schema.
+            *connection.schema.write() = connection.db.clone_schema()?;
+        }
+
         let tx = tx_unlocked.value();
         tx.state.store(TransactionState::Terminated);
         tracing::trace!("terminate(tx_id={})", tx_id);
@@ -1340,7 +1383,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     }
 
     /// Returns true if the given transaction is the exclusive transaction.
-    fn is_exclusive_tx(&self, tx_id: &TxID) -> bool {
+    pub fn is_exclusive_tx(&self, tx_id: &TxID) -> bool {
         self.exclusive_tx.read().as_ref() == Some(tx_id)
     }
 
@@ -1351,6 +1394,14 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
     /// Acquires the exclusive transaction lock to the given transaction ID.
     fn acquire_exclusive_tx(&self, tx_id: &TxID) -> Result<()> {
+        if let Some(tx) = self.txs.get(tx_id) {
+            let tx = tx.value();
+            if tx.begin_ts < self.last_committed_tx_ts.load(Ordering::Acquire) {
+                // Another transaction committed after this transaction's begin timestamp, do not allow exclusive lock.
+                // This mimics regular (non-CONCURRENT) sqlite transaction behavior.
+                return Err(LimboError::Busy);
+            }
+        }
         let mut exclusive_tx = self.exclusive_tx.write();
         if exclusive_tx.is_some() {
             // Another transaction already holds the exclusive lock

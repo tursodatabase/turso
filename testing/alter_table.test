@@ -165,3 +165,42 @@ do_execsql_test_in_memory_any_error fail-alter-table-rename-to-existing-table {
     CREATE TABLE y (a);
     ALTER TABLE x RENAME TO y;
 }
+
+do_execsql_test_on_specific_db {:memory:} alter-table-rename-to-quoted-identifier {
+    CREATE TABLE t (a);
+    CREATE INDEX idx ON t (a);
+    INSERT INTO t VALUES (1);
+
+    ALTER TABLE t RENAME TO "t t";
+    SELECT sql FROM sqlite_schema;
+
+    INSERT INTO "t t" VALUES (2);
+    SELECT a FROM "t t";
+
+    DELETE FROM "t t" WHERE a = 1;
+    SELECT a FROM "t t";
+
+    ALTER TABLE "t t" RENAME COLUMN a TO "a a";
+    SELECT sql FROM sqlite_schema;
+    SELECT "a a" FROM "t t";
+
+    ALTER TABLE "t t" RENAME COLUMN "a a" TO "b b";
+    SELECT sql FROM sqlite_schema;
+    SELECT "b b" FROM "t t";
+} {
+    "CREATE TABLE \"t t\" (a)"
+    "CREATE INDEX idx ON \"t t\" (a)"
+
+    "1"
+    "2"
+
+    "2"
+
+    "CREATE TABLE \"t t\" (\"a a\")"
+    "CREATE INDEX idx ON \"t t\" (\"a a\")"
+    "2"
+
+    "CREATE TABLE \"t t\" (\"b b\")"
+    "CREATE INDEX idx ON \"t t\" (\"b b\")"
+    "2"
+}

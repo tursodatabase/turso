@@ -2280,15 +2280,17 @@ pub fn op_transaction_inner(
                     // In MVCC we don't have write exclusivity, therefore we just need to start a transaction if needed.
                     // Programs can run Transaction twice, first with read flag and then with write flag. So a single txid is enough
                     // for both.
-                    if program.connection.mv_tx.get().is_none() {
-                        // We allocate the first page lazily in the first transaction.
-                        // TODO: when we fix MVCC enable schema cookie detection for reprepare statements
-                        // let header_schema_cookie = pager
-                        //     .io
-                        //     .block(|| pager.with_header(|header| header.schema_cookie.get()))?;
-                        // if header_schema_cookie != *schema_cookie {
-                        //     return Err(LimboError::SchemaUpdated);
-                        // }
+                    let has_existing_mv_tx = program.connection.mv_tx.get().is_some();
+
+                    let conn_has_executed_begin_deferred = !has_existing_mv_tx
+                        && !program.connection.auto_commit.load(Ordering::SeqCst);
+                    if conn_has_executed_begin_deferred && *tx_mode == TransactionMode::Concurrent {
+                        return Err(LimboError::TxError(
+                            "Cannot start CONCURRENT transaction after BEGIN DEFERRED".to_string(),
+                        ));
+                    }
+
+                    if !has_existing_mv_tx {
                         let tx_id = match tx_mode {
                             TransactionMode::None
                             | TransactionMode::Read
@@ -2448,6 +2450,11 @@ pub fn op_auto_commit(
                     "cannot commit - no transaction is active".to_string(),
                 ));
             }
+        } else {
+            let is_begin = !*auto_commit && !*rollback;
+            return Err(LimboError::TxError(
+                "cannot use BEGIN after BEGIN CONCURRENT".to_string(),
+            ));
         }
     }
 
@@ -5144,25 +5151,26 @@ pub fn op_function(
                         }
                     };
 
-                    let rename_to = {
+                    let original_rename_to = {
                         match &state.registers[*start_reg + 6].get_value() {
                             Value::Text(rename_to) => rename_to.as_str().to_string(),
                             _ => panic!("rename_to parameter should be TEXT"),
                         }
                     };
+                    let rename_to = original_rename_to.as_str();
 
                     let new_name = if let Some(column) =
                         &name.strip_prefix(&format!("sqlite_autoindex_{rename_from}_"))
                     {
                         format!("sqlite_autoindex_{rename_to}_{column}")
                     } else if name == rename_from {
-                        rename_to.clone()
+                        rename_to.to_string()
                     } else {
                         name
                     };
 
                     let new_tbl_name = if tbl_name == rename_from {
-                        rename_to.clone()
+                        rename_to.to_string()
                     } else {
                         tbl_name
                     };
@@ -5194,7 +5202,7 @@ pub fn op_function(
 
                                 Some(
                                     ast::Stmt::CreateIndex {
-                                        tbl_name: ast::Name::new(&rename_to),
+                                        tbl_name: ast::Name::new(original_rename_to),
                                         unique,
                                         if_not_exists,
                                         idx_name,
@@ -5220,7 +5228,7 @@ pub fn op_function(
                                     ast::Stmt::CreateTable {
                                         tbl_name: ast::QualifiedName {
                                             db_name: None,
-                                            name: ast::Name::new(&rename_to),
+                                            name: ast::Name::new(original_rename_to),
                                             alias: None,
                                         },
                                         temporary,
@@ -5244,12 +5252,13 @@ pub fn op_function(
                         }
                     };
 
-                    let rename_from = {
+                    let original_rename_from = {
                         match &state.registers[*start_reg + 6].get_value() {
                             Value::Text(rename_from) => rename_from.as_str().to_string(),
                             _ => panic!("rename_from parameter should be TEXT"),
                         }
                     };
+                    let rename_from = original_rename_from.as_str();
 
                     let column_def = {
                         match &state.registers[*start_reg + 7].get_value() {
@@ -5333,7 +5342,9 @@ pub fn op_function(
 
                                 let column = columns
                                     .iter_mut()
-                                    .find(|column| column.col_name == ast::Name::new(&rename_from))
+                                    .find(|column| {
+                                        column.col_name.as_str() == &original_rename_from
+                                    })
                                     .expect("column being renamed should be present");
 
                                 match alter_func {
@@ -6564,6 +6575,23 @@ pub fn op_open_write(
             }
         },
     };
+
+    const SQLITE_SCHEMA_ROOT_PAGE: u64 = 1;
+
+    if root_page == SQLITE_SCHEMA_ROOT_PAGE {
+        if let Some(mv_store) = mv_store {
+            let Some((tx_id, _)) = program.connection.mv_tx.get() else {
+                return Err(LimboError::InternalError(
+                    "Schema changes in MVCC mode require an exclusive MVCC transaction".to_string(),
+                ));
+            };
+            if !mv_store.is_exclusive_tx(&tx_id) {
+                // Schema changes in MVCC mode require an exclusive transaction
+                return Err(LimboError::TableLocked);
+            }
+        }
+    }
+
     let (_, cursor_type) = program.cursor_ref.get(*cursor_id).unwrap();
     let cursors = &mut state.cursors;
     let maybe_index = match cursor_type {
@@ -7773,21 +7801,24 @@ pub fn op_rename_table(
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(RenameTable { from, to }, insn);
 
+    let normalized_from = from.as_str();
+    let normalized_to = to.as_str();
+
     let conn = program.connection.clone();
 
     conn.with_schema_mut(|schema| {
-        if let Some(mut indexes) = schema.indexes.remove(from) {
+        if let Some(mut indexes) = schema.indexes.remove(normalized_from) {
             indexes.iter_mut().for_each(|index| {
                 let index = Arc::make_mut(index);
-                index.table_name = to.to_owned();
+                index.table_name = normalized_to.to_owned();
             });
 
-            schema.indexes.insert(to.to_owned(), indexes);
+            schema.indexes.insert(normalized_to.to_owned(), indexes);
         };
 
         let mut table = schema
             .tables
-            .remove(from)
+            .remove(normalized_from)
             .expect("table being renamed should be in schema");
 
         {
@@ -7798,10 +7829,10 @@ pub fn op_rename_table(
             };
 
             let btree = Arc::make_mut(btree);
-            btree.name = to.to_owned();
+            btree.name = normalized_to.to_owned();
         }
 
-        schema.tables.insert(to.to_owned(), table);
+        schema.tables.insert(normalized_to.to_owned(), table);
     });
 
     state.pc += 1;
@@ -7895,12 +7926,13 @@ pub fn op_alter_column(
 
     let conn = program.connection.clone();
 
+    let normalized_table_name = table_name.as_str();
     let new_column = crate::schema::Column::from(definition);
 
     conn.with_schema_mut(|schema| {
         let table = schema
             .tables
-            .get_mut(table_name)
+            .get_mut(normalized_table_name)
             .expect("table being renamed should be in schema");
 
         let table = Arc::make_mut(table);
@@ -7916,7 +7948,7 @@ pub fn op_alter_column(
             .get_mut(*column_index)
             .expect("renamed column should be in schema");
 
-        if let Some(indexes) = schema.indexes.get_mut(table_name) {
+        if let Some(indexes) = schema.indexes.get_mut(normalized_table_name) {
             for index in indexes {
                 let index = Arc::make_mut(index);
                 for index_column in &mut index.columns {

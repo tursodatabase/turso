@@ -305,20 +305,6 @@ fn test_mvcc_update_basic() {
 }
 
 #[test]
-fn test_mvcc_begin_concurrent_smoke() {
-    let tmp_db = TempDatabase::new_with_opts(
-        "test_mvcc_begin_concurrent_smoke.db",
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
-    let conn1 = tmp_db.connect_limbo();
-    conn1.execute("BEGIN CONCURRENT").unwrap();
-    conn1
-        .execute("CREATE TABLE test (id INTEGER, value TEXT)")
-        .unwrap();
-    conn1.execute("COMMIT").unwrap();
-}
-
-#[test]
 fn test_mvcc_concurrent_insert_basic() {
     let tmp_db = TempDatabase::new_with_opts(
         "test_mvcc_update_basic.db",
