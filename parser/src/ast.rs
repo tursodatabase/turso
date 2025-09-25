@@ -889,11 +889,12 @@ pub enum Name {
 }
 
 impl Name {
-    pub fn new(s: String) -> Self {
+    pub fn new(s: impl AsRef<str>) -> Self {
+        let s = s.as_ref();
         let bytes = s.as_bytes();
 
         if s.is_empty() {
-            return Name::Ident(s);
+            return Name::Ident(s.to_string());
         }
 
         match bytes[0] {
@@ -915,9 +916,9 @@ impl Name {
             b'\'' => {
                 assert_eq!(bytes[bytes.len() - 1], b'\'');
                 assert!(s.len() >= 2);
-                Name::Quoted(s)
+                Name::Quoted(s.to_string())
             }
-            _ => Name::Ident(s),
+            _ => Name::Ident(s.to_lowercase()),
         }
     }
 
