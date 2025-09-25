@@ -1,11 +1,17 @@
+// FIXME: remove this once we add recovery
+#![allow(dead_code)]
 use crate::{
-    mvcc::database::{LogRecord, RowVersion},
-    storage::sqlite3_ondisk::write_varint_to_vec,
+    io::ReadComplete,
+    mvcc::{
+        database::{LogRecord, Row, RowID, RowVersion},
+        LocalClock, MvStore,
+    },
+    storage::sqlite3_ondisk::{read_varint, write_varint_to_vec},
     turso_assert,
     types::IOCompletions,
-    Buffer, Completion, CompletionError, Result,
+    Buffer, Completion, CompletionError, LimboError, Pager, Result,
 };
-use std::sync::Arc;
+use std::{cell::RefCell, sync::Arc};
 
 use crate::{types::IOResult, File};
 
@@ -17,6 +23,7 @@ pub struct LogicalLog {
 /// Log's Header, this will be the 64 bytes in any logical log file.
 /// Log header is 64 bytes at maximum, fields added must not exceed that size. If it doesn't exceed
 /// it, any bytes missing will be padded with zeroes.
+#[derive(Debug)]
 struct LogHeader {
     version: u8,
     salt: u64,
@@ -25,6 +32,10 @@ struct LogHeader {
 
 const LOG_HEADER_MAX_SIZE: usize = 64;
 const LOG_HEADER_PADDING: [u8; LOG_HEADER_MAX_SIZE] = [0; LOG_HEADER_MAX_SIZE];
+/// u64 tx id
+/// u64 checksum
+/// u64 payload length
+const TRANSACTION_HEAD_SIZE: usize = 8 + 8 + 8;
 
 impl LogHeader {
     pub fn serialize(&self, buffer: &mut Vec<u8>) {
@@ -37,6 +48,17 @@ impl LogHeader {
         let padding = 64 - header_size_before_padding;
         debug_assert!(header_size_before_padding <= LOG_HEADER_MAX_SIZE);
         buffer.extend_from_slice(&LOG_HEADER_PADDING[0..padding]);
+        assert_eq!(buffer.len() - buffer_size_start, LOG_HEADER_MAX_SIZE);
+    }
+}
+
+impl Default for LogHeader {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            salt: 0,
+            encrypted: 0,
+        }
     }
 }
 
@@ -125,11 +147,7 @@ impl LogicalLog {
         // 1. Serialize log header if it's first write
         let is_first_write = self.offset == 0;
         if is_first_write {
-            let header = LogHeader {
-                version: 1,
-                salt: 0, // TODO: add checksums!
-                encrypted: 0,
-            };
+            let header = LogHeader::default();
             header.serialize(&mut buffer);
         }
 
@@ -183,5 +201,317 @@ impl LogicalLog {
         });
         let c = self.file.sync(completion)?;
         Ok(IOResult::IO(IOCompletions::Single(c)))
+    }
+}
+
+enum StreamingResult {
+    InsertRow { row: Row, rowid: RowID },
+    DeleteRow { rowid: RowID },
+    Eof,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum StreamingState {
+    NeedTransactionStart,
+    NeedRow {
+        transaction_size: u64,
+        transaction_read_bytes: usize,
+    },
+}
+
+struct StreamingLogicalLogReader {
+    file: Arc<dyn File>,
+    /// Offset to read from file
+    offset: usize,
+    /// Log Header
+    header: Option<Arc<LogHeader>>,
+    /// Cached buffer after io read
+    buffer: Arc<RefCell<Vec<u8>>>,
+    /// Position to read from loaded buffer
+    buffer_offset: usize,
+    file_size: usize,
+    state: StreamingState,
+}
+
+impl StreamingLogicalLogReader {
+    pub fn new(file: Arc<dyn File>) -> Self {
+        let file_size = file.size().unwrap() as usize;
+        Self {
+            file,
+            offset: 0,
+            header: None,
+            buffer: Arc::new(RefCell::new(Vec::with_capacity(4096))),
+            buffer_offset: 0,
+            file_size,
+            state: StreamingState::NeedTransactionStart,
+        }
+    }
+
+    pub fn read_header(&mut self) -> Result<Completion> {
+        let header_buf = Arc::new(Buffer::new_temporary(LOG_HEADER_MAX_SIZE));
+        let header = Arc::new(RefCell::new(LogHeader::default()));
+        let completion: Box<ReadComplete> = Box::new(move |res| {
+            let header = header.clone();
+            let mut header = header.borrow_mut();
+            let Ok((buf, bytes_read)) = res else {
+                tracing::error!("couldn't ready log err={:?}", res,);
+                return;
+            };
+            if bytes_read != LOG_HEADER_MAX_SIZE as i32 {
+                tracing::error!(
+                    "couldn't ready log header read={}, expected={}",
+                    bytes_read,
+                    LOG_HEADER_MAX_SIZE
+                );
+                return;
+            }
+            let buf = buf.as_slice();
+            header.version = buf[0];
+            header.salt = u64::from_be_bytes(buf[1..9].try_into().unwrap());
+            header.encrypted = buf[10];
+            tracing::trace!("LogicalLog header={:?}", header);
+        });
+        let c = Completion::new_read(header_buf, completion);
+        self.offset += LOG_HEADER_MAX_SIZE;
+        self.file.pread(0, c)
+    }
+
+    /// Reads next record in log.
+    /// 1. Read start of transaction
+    /// 2. Read next row
+    /// 3. Check transaction marker
+    pub fn next_record(&mut self, io: &Arc<dyn crate::IO>) -> Result<StreamingResult> {
+        loop {
+            match self.state {
+                StreamingState::NeedTransactionStart => {
+                    if self.is_eof() {
+                        return Ok(StreamingResult::Eof);
+                    }
+                    let tx_id = self.consume_u64(io)?;
+                    let checksum = self.consume_u64(io)?;
+                    let transaction_size = self.consume_u64(io)?;
+                    self.state = StreamingState::NeedRow {
+                        transaction_size,
+                        transaction_read_bytes: 0,
+                    };
+                }
+                StreamingState::NeedRow {
+                    transaction_size,
+                    transaction_read_bytes,
+                } => {
+                    if transaction_read_bytes > transaction_size as usize {
+                        return Err(LimboError::Corrupt(format!("streaming log read more bytes than expected from a transaction expected={transaction_size} read={transaction_size}")));
+                    } else if transaction_size as usize == transaction_read_bytes {
+                        // TODO: offset verification
+                        let _offset_after = self.consume_u64(io)?;
+                        self.state = StreamingState::NeedTransactionStart;
+                        continue;
+                    }
+                    let table_id = self.consume_u64(io)?;
+                    let record_type = self.consume_u8(io)?;
+                    let payload_size = self.consume_u64(io)?;
+                    let mut bytes_read_on_row = 17; // table_id, record_type and payload_size
+                    match LogRecordType::from_u8(record_type).unwrap() {
+                        LogRecordType::DeleteRow => {
+                            let (rowid, n) = self.consume_varint(io)?;
+                            bytes_read_on_row += n;
+                            self.state = StreamingState::NeedRow {
+                                transaction_size,
+                                transaction_read_bytes: transaction_read_bytes + bytes_read_on_row,
+                            };
+                            return Ok(StreamingResult::DeleteRow {
+                                rowid: RowID::new(table_id, rowid as i64),
+                            });
+                        }
+                        LogRecordType::InsertRow => {
+                            let (rowid, nrowid) = self.consume_varint(io)?;
+                            let (payload_size, npayload) = self.consume_varint(io)?;
+                            let buffer = self.consume_buffer(io, payload_size as usize)?;
+                            // TODO: add column count to format
+                            let column_count = 1;
+
+                            bytes_read_on_row += npayload + nrowid + payload_size as usize;
+                            self.state = StreamingState::NeedRow {
+                                transaction_size,
+                                transaction_read_bytes: transaction_read_bytes + bytes_read_on_row,
+                            };
+                            let row =
+                                Row::new(RowID::new(table_id, rowid as i64), buffer, column_count);
+                            return Ok(StreamingResult::InsertRow {
+                                rowid: RowID::new(table_id, rowid as i64),
+                                row,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn is_eof(&self) -> bool {
+        self.offset >= self.file_size
+    }
+
+    fn consume_u8(&mut self, io: &Arc<dyn crate::IO>) -> Result<u8> {
+        self.read_more_data(io, 1)?;
+        let r = self.buffer.borrow()[self.buffer_offset];
+        self.buffer_offset += 1;
+        Ok(r)
+    }
+
+    fn consume_u64(&mut self, io: &Arc<dyn crate::IO>) -> Result<u64> {
+        self.read_more_data(io, 8)?;
+        let r = u64::from_be_bytes(
+            self.buffer.borrow()[self.buffer_offset..self.buffer_offset + 8]
+                .try_into()
+                .unwrap(),
+        );
+        self.buffer_offset += 8;
+        Ok(r)
+    }
+
+    fn consume_varint(&mut self, io: &Arc<dyn crate::IO>) -> Result<(u64, usize)> {
+        self.read_more_data(io, 9)?;
+        let buffer = &self.buffer.borrow()[self.buffer_offset..];
+        let (v, n) = read_varint(buffer)?;
+        self.buffer_offset += n;
+        Ok((v, n))
+    }
+
+    fn consume_buffer(&mut self, io: &Arc<dyn crate::IO>, amount: usize) -> Result<Vec<u8>> {
+        self.read_more_data(io, amount)?;
+        let buffer = self.buffer.borrow()[self.buffer_offset..self.buffer_offset + amount].to_vec();
+        self.buffer_offset += amount;
+        Ok(buffer)
+    }
+
+    fn get_buffer(&self) -> std::cell::Ref<'_, Vec<u8>> {
+        self.buffer.borrow()
+    }
+
+    pub fn read_more_data(&mut self, io: &Arc<dyn crate::IO>, need: usize) -> Result<()> {
+        let bytes_can_read = self.bytes_can_read();
+        if bytes_can_read >= need {
+            return Ok(());
+        }
+        let to_read = 4096;
+        let to_read = to_read.min(self.file_size - self.offset);
+        let header_buf = Arc::new(Buffer::new_temporary(to_read));
+        let buffer = self.buffer.clone();
+        let completion: Box<ReadComplete> = Box::new(move |res| {
+            let buffer = buffer.clone();
+            let mut buffer = buffer.borrow_mut();
+            let Ok((buf, _bytes_read)) = res else {
+                tracing::trace!("couldn't ready log err={:?}", res,);
+                return;
+            };
+            let buf = buf.as_slice();
+            buffer.extend_from_slice(buf);
+        });
+        let c = Completion::new_read(header_buf, completion);
+        let c = self.file.pread(self.offset as u64, c)?;
+        io.wait_for_completion(c)?;
+        self.offset += to_read;
+        Ok(())
+    }
+
+    fn bytes_can_read(&self) -> usize {
+        self.buffer.borrow().len() - self.buffer_offset
+    }
+}
+
+pub fn load_logical_log(
+    mv_store: &Arc<MvStore<LocalClock>>,
+    file: Arc<dyn File>,
+    io: &Arc<dyn crate::IO>,
+    pager: &Arc<Pager>,
+) -> Result<LogicalLog> {
+    let mut reader = StreamingLogicalLogReader::new(file.clone());
+
+    let c = reader.read_header()?;
+    io.wait_for_completion(c)?;
+    let tx_id = 0;
+    mv_store.begin_load_tx(pager.clone())?;
+    loop {
+        match reader.next_record(io).unwrap() {
+            StreamingResult::InsertRow { row, rowid: _ } => {
+                mv_store.insert(tx_id, row)?;
+            }
+            StreamingResult::DeleteRow { rowid } => {
+                mv_store.delete(tx_id, rowid)?;
+            }
+            StreamingResult::Eof => {
+                break;
+            }
+        }
+    }
+    mv_store.commit_load_tx(tx_id);
+
+    let logical_log = LogicalLog::new(file);
+    Ok(logical_log)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{path::PathBuf, sync::Arc};
+
+    use crate::{
+        mvcc::{
+            database::{
+                tests::{commit_tx, generate_simple_string_row, MvccTestDbNoConn},
+                RowID,
+            },
+            persistent_storage::Storage,
+            LocalClock, MvStore,
+        },
+        types::ImmutableRecord,
+        OpenFlags, RefValue,
+    };
+
+    use super::load_logical_log;
+
+    #[test]
+    fn test_logical_log_read() {
+        // Load a transaction
+        // let's not drop db as we don't want files to be removed
+        let db = MvccTestDbNoConn::new_with_random_db();
+        let (db_path, io, pager) = {
+            let conn = db.connect();
+            let pager = conn.pager.clone().borrow().clone();
+            let mvcc_store = db.get_mvcc_store();
+            let tx_id = mvcc_store.begin_tx(conn.pager.borrow().clone()).unwrap();
+
+            let row = generate_simple_string_row(1, 1, "foo");
+            mvcc_store.insert(tx_id, row).unwrap();
+            commit_tx(mvcc_store.clone(), &conn, tx_id).unwrap();
+            conn.close().unwrap();
+            let db = db.get_db();
+            (db.path.clone(), db.io.clone(), pager)
+        };
+
+        // Now try to read it back
+        let db_path = PathBuf::from(db_path);
+        let mut log_file = db_path.clone();
+        let filename = log_file
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|s| format!("{s}-lg"))
+            .unwrap();
+        log_file.set_file_name(filename);
+
+        let file = io
+            .open_file(log_file.to_str().unwrap(), OpenFlags::ReadOnly, false)
+            .unwrap();
+        let mvcc_store = Arc::new(MvStore::new(LocalClock::new(), Storage::new(file.clone())));
+        load_logical_log(&mvcc_store, file, &io, &pager).unwrap();
+        let tx = mvcc_store.begin_tx(pager.clone()).unwrap();
+        let row = mvcc_store.read(tx, RowID::new(1, 1)).unwrap().unwrap();
+        let record = ImmutableRecord::from_bin_record(row.data.clone());
+        let values = record.get_values();
+        let foo = values.first().unwrap();
+        let RefValue::Text(foo) = foo else {
+            unreachable!()
+        };
+        assert_eq!(foo.as_str(), "foo");
     }
 }
