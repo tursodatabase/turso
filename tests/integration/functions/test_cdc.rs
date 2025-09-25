@@ -1,5 +1,6 @@
 use rusqlite::types::Value;
 use turso_core::types::ImmutableRecord;
+use serde_json::Value as JsonValue;
 
 use crate::common::{limbo_exec_rows, TempDatabase};
 
@@ -1162,5 +1163,94 @@ fn test_cdc_schema_changes_alter_table() {
                 ])),
             ],
         ]
+    );
+}
+
+
+#[test]
+fn test_debezium_json_object() {
+    let db = TempDatabase::new_empty(false);
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA unstable_capture_data_changes_conn('full')")
+        .unwrap();
+    conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)")
+        .unwrap();
+
+    conn.execute("INSERT INTO users (id, name, age) VALUES (101, 'alice', 30)")
+        .unwrap();
+    conn.execute("UPDATE users SET name = 'bob', age = 31 WHERE id = 101")
+        .unwrap();
+    conn.execute("DELETE FROM users WHERE id = 101").unwrap();
+
+    let rows = limbo_exec_rows(
+        &db,
+        &conn,
+        "SELECT debezium_json_object(change_type, table_name, before, after, table_columns_json_array(table_name)) FROM turso_cdc WHERE table_name = 'users'",
+    );
+
+    assert_eq!(rows.len(), 3);
+
+    let insert_event_json = match &rows[0][0] {
+        Value::Text(s) => s,
+        _ => panic!("Expected a text value for the JSON event"),
+    };
+    let insert_event: JsonValue = serde_json::from_str(insert_event_json).unwrap();
+
+    assert_eq!(insert_event["op"], "c");
+    assert!(insert_event["before"].is_null());
+    assert_eq!(insert_event["source"]["table"], "users");
+    assert!(insert_event["ts_ms"].is_number());
+    assert_eq!(
+        insert_event["after"],
+        serde_json::json!({
+            "id": 101,
+            "name": "alice",
+            "age": 30
+        })
+    );
+
+    let update_event_json = match &rows[1][0] {
+        Value::Text(s) => s,
+        _ => panic!("Expected a text value for the JSON event"),
+    };
+    let update_event: JsonValue = serde_json::from_str(update_event_json).unwrap();
+
+    assert_eq!(update_event["op"], "u");
+    assert_eq!(update_event["source"]["table"], "users");
+    assert!(update_event["ts_ms"].is_number());
+    assert_eq!(
+        update_event["before"],
+        serde_json::json!({
+            "id": 101,
+            "name": "alice",
+            "age": 30
+        })
+    );
+    assert_eq!(
+        update_event["after"],
+        serde_json::json!({
+            "id": 101,
+            "name": "bob",
+            "age": 31
+        })
+    );
+
+    let delete_event_json = match &rows[2][0] {
+        Value::Text(s) => s,
+        _ => panic!("Expected a text value for the JSON event"),
+    };
+    let delete_event: JsonValue = serde_json::from_str(delete_event_json).unwrap();
+
+    assert_eq!(delete_event["op"], "d");
+    assert!(delete_event["after"].is_null());
+    assert_eq!(delete_event["source"]["table"], "users");
+    assert!(delete_event["ts_ms"].is_number());
+    assert_eq!(
+        delete_event["before"],
+        serde_json::json!({
+            "id": 101,
+            "name": "bob",
+            "age": 31
+        })
     );
 }

@@ -1716,6 +1716,32 @@ pub fn translate_expr(
                             });
                             Ok(target_register)
                         }
+
+                             ScalarFunc::DebeziumJsonObject => {
+                            if args.len() != 5 {
+                                crate::bail_parse_error!(
+                                    "debezium_json_object() function must have exactly 5 arguments(for now atleast)",
+                                );
+                            }
+                            let start_reg = program.alloc_registers(5);
+                            for (i, arg) in args.iter().enumerate() {
+                                translate_expr(
+                                    program,
+                                    referenced_tables,
+                                    arg,
+                                    start_reg + i,
+                                    resolver,
+                                )?;
+                            }
+                            program.emit_insn(Insn::Function {
+                                constant_mask: 0,
+                                start_reg,
+                                dest: target_register,
+                                func: func_ctx,
+                            });
+                            Ok(target_register)
+                        }
+                        
                         ScalarFunc::Attach => {
                             // ATTACH is handled by the attach.rs module, not here
                             crate::bail_parse_error!(

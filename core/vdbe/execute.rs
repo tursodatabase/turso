@@ -4920,6 +4920,94 @@ pub fn op_function(
                     )?);
                 }
             }
+           
+            ScalarFunc::DebeziumJsonObject => {
+                assert_eq!(arg_count, 5);
+                #[cfg(not(feature = "json"))]
+                {
+                    return Err(LimboError::InvalidArgument(
+                        "debezium_json_object: needs json"
+                            .to_string(),
+                    ));
+                }
+                #[cfg(feature = "json")]
+                {
+                    use crate::json::jsonb::{Jsonb, ElementType};
+                    use crate::types::{RefValue, TextRef, TextSubtype, RawSlice};
+
+                    let change_type = state.registers[*start_reg].get_value();
+                    let table_name = state.registers[*start_reg + 1].get_value();
+                    let before_record = state.registers[*start_reg + 2].get_value();
+                    let after_record = state.registers[*start_reg + 3].get_value();
+                    let columns_json = state.registers[*start_reg + 4].get_value();
+
+                    let op_str = match change_type {
+                        Value::Integer(1) => "c",
+                        Value::Integer(0) => "u",
+                        Value::Integer(-1) => "d",
+                        _ => return Err(LimboError::InvalidArgument("debezium_json_object: invalid change_type".to_string())),
+                    };
+
+                    let mut event = Jsonb::make_empty_obj(5);
+
+                    // "op"
+                    let op_key = json::convert_ref_dbtype_to_jsonb(&RefValue::Text(TextRef::create_from("op".as_bytes(), TextSubtype::Text)), json::Conv::ToString)?;
+                    let op_val = json::convert_ref_dbtype_to_jsonb(&RefValue::Text(TextRef::create_from(op_str.as_bytes(), TextSubtype::Text)), json::Conv::ToString)?;
+                    event.append_jsonb_to_end(op_key.data());
+                    event.append_jsonb_to_end(op_val.data());
+
+                    // "before"
+                    let before_key = json::convert_ref_dbtype_to_jsonb(&RefValue::Text(TextRef::create_from("before".as_bytes(), TextSubtype::Text)), json::Conv::ToString)?;
+                    event.append_jsonb_to_end(before_key.data());
+                    let before_val = bin_record_to_jsonb(columns_json, before_record)?;
+                    event.append_jsonb_to_end(before_val.data());
+
+                    // "after"
+                    let after_key = json::convert_ref_dbtype_to_jsonb(&RefValue::Text(TextRef::create_from("after".as_bytes(), TextSubtype::Text)), json::Conv::ToString)?;
+                    event.append_jsonb_to_end(after_key.data());
+                    let after_val = bin_record_to_jsonb(columns_json, after_record)?;
+                    event.append_jsonb_to_end(after_val.data());
+
+                    // "source"
+                    let source_key = json::convert_ref_dbtype_to_jsonb(&RefValue::Text(TextRef::create_from("source".as_bytes(), TextSubtype::Text)), json::Conv::ToString)?;
+                    event.append_jsonb_to_end(source_key.data());
+                    let mut source_obj = Jsonb::make_empty_obj(1);
+                    let table_key = json::convert_ref_dbtype_to_jsonb(&RefValue::Text(TextRef::create_from("table".as_bytes(), TextSubtype::Text)), json::Conv::ToString)?;
+                    
+                    let table_name_ref = match table_name {
+                        Value::Text(t) => RefValue::Text(TextRef::create_from(&t.value, t.subtype)),
+                        Value::Integer(i) => RefValue::Integer(*i),
+                        Value::Float(f) => RefValue::Float(*f),
+                        Value::Blob(b) => RefValue::Blob(RawSlice::create_from(b)),
+                        Value::Null => RefValue::Null,
+                    };
+                    let table_val = json::convert_ref_dbtype_to_jsonb(&table_name_ref, json::Conv::ToString)?;
+
+                    source_obj.append_jsonb_to_end(table_key.data());
+                    source_obj.append_jsonb_to_end(table_val.data());
+                    source_obj.finalize_unsafe(ElementType::OBJECT)?;
+                    event.append_jsonb_to_end(source_obj.data());
+
+                    // "ts_ms"
+                    let ts_key = json::convert_ref_dbtype_to_jsonb(&RefValue::Text(TextRef::create_from("ts_ms".as_bytes(), TextSubtype::Text)), json::Conv::ToString)?;
+                    event.append_jsonb_to_end(ts_key.data());
+                    let ts_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis() as i64;
+                    let ts_val = json::convert_ref_dbtype_to_jsonb(&RefValue::Integer(ts_ms), json::Conv::NotStrict)?;
+                    event.append_jsonb_to_end(ts_val.data());
+
+                    event.finalize_unsafe(ElementType::OBJECT)?;
+
+                    state.registers[*dest] = Register::Value(json::json_string_to_db_type(
+                        event,
+                        ElementType::OBJECT,
+                        json::OutputVariant::String,
+                    )?);
+                }
+            }
+
             ScalarFunc::Attach => {
                 assert_eq!(arg_count, 3);
                 let filename = state.registers[*start_reg].get_value();
@@ -9409,6 +9497,64 @@ where
         pager.with_header_mut(&f)
     }
 }
+
+#[cfg(feature = "json")]
+fn bin_record_to_jsonb(columns_json: &Value, bin_record: &Value) -> Result<json::jsonb::Jsonb> {
+    use crate::types::{RecordCursor, RefValue};
+    use std::str::FromStr;
+    use crate::json;
+
+    if let Value::Null = bin_record {
+        return json::convert_ref_dbtype_to_jsonb(&RefValue::Null, json::Conv::NotStrict);
+    }
+
+    let Value::Text(columns_str) = columns_json else {
+        return Err(LimboError::InvalidArgument(
+            "function arguments must be of type TEXT and BLOB correspondingly".to_string()
+        ));
+    };
+
+    let Value::Blob(bin_record) = bin_record else {
+        return Err(LimboError::InvalidArgument(
+            "function arguments must be of type TEXT and BLOB correspondingly".to_string()
+        ));
+    };
+    let mut columns_json_array =
+        json::jsonb::Jsonb::from_str(columns_str.as_str())?;
+    let columns_len = columns_json_array.array_len()?;
+
+    let mut record = ImmutableRecord::new(bin_record.len());
+    record.start_serialization(bin_record);
+    let mut record_cursor = RecordCursor::new();
+
+    let mut json_obj = json::jsonb::Jsonb::make_empty_obj(columns_len);
+    for i in 0..columns_len {
+        let mut op = json::jsonb::SearchOperation::new(0);
+        let path = json::path::JsonPath {
+            elements: vec![
+                json::path::PathElement::Root(),
+                json::path::PathElement::ArrayLocator(Some(i as i32)),
+            ],
+        };
+
+        columns_json_array.operate_on_path(&path, &mut op)?;
+        let column_name = op.result();
+        json_obj.append_jsonb_to_end(column_name.data());
+
+        let val = record_cursor.get_value(&record, i)?;
+        if let RefValue::Blob(..) = val {
+            return Err(LimboError::InvalidArgument(
+                "formatting of BLOB values stored in binary record is not supported".to_string()
+            ));
+        }
+        let val_json =
+            json::convert_ref_dbtype_to_jsonb(&val, json::Conv::NotStrict)?;
+        json_obj.append_jsonb_to_end(val_json.data());
+    }
+    json_obj.finalize_unsafe(json::jsonb::ElementType::OBJECT)?;
+    Ok(json_obj)
+}
+
 
 #[cfg(test)]
 mod tests {
