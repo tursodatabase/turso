@@ -310,17 +310,17 @@ fn update_pragma(
                 let view_sql = format!(
                     "CREATE VIEW IF NOT EXISTS turso_debezium_events AS SELECT \
                         change_id, table_name, id AS row_id, \
-                        debezium_json_object(change_type, table_name, before, after, table_columns_json_array(table_name)) AS event \
+                        cdc_json_object(change_type, table_name, before, after, table_columns_json_array(table_name)) AS event \
                      FROM \"{cdc_table_name_str}\""
                 );
-                
+
                 let mut parser = turso_parser::parser::Parser::new(view_sql.as_bytes());
                 let cmd = parser.next().unwrap().unwrap();
-                
+
                 if let turso_parser::ast::Cmd::Stmt(turso_parser::ast::Stmt::CreateView {
                     view_name,
-                    temporary: _, 
-                    if_not_exists: _, 
+                    temporary: _,
+                    if_not_exists: _,
                     select,
                     columns,
                 }) = cmd
@@ -335,10 +335,10 @@ fn update_pragma(
                         program,
                     )?;
                 } else {
-                    return Err(LimboError::InternalError("Failed to parse CREATE VIEW for CDC wrapper".to_string()));
+                    return Err(LimboError::InternalError(
+                        "Failed to parse CREATE VIEW for CDC wrapper".to_string(),
+                    ));
                 }
-
-
             }
             connection.set_capture_data_changes(opts);
             Ok((program, TransactionMode::Write))

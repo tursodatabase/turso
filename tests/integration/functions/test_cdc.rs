@@ -1184,7 +1184,7 @@ fn test_debezium_json_object() {
     let rows = limbo_exec_rows(
         &db,
         &conn,
-        "SELECT debezium_json_object(change_type, table_name, before, after, table_columns_json_array(table_name)) FROM turso_cdc WHERE table_name = 'users'",
+        "SELECT cdc_json_object(change_type, table_name, before, after, table_columns_json_array(table_name)) FROM turso_cdc WHERE table_name = 'users'",
     );
 
     assert_eq!(rows.len(), 3);

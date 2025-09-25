@@ -1717,10 +1717,10 @@ pub fn translate_expr(
                             Ok(target_register)
                         }
 
-                        ScalarFunc::DebeziumJsonObject => {
+                        ScalarFunc::CDCJsonObject => {
                             if args.len() != 5 {
                                 crate::bail_parse_error!(
-                                    "debezium_json_object() function must have exactly 5 arguments(for now atleast)",
+                                    "cdc_json_object() function must have exactly 5 arguments(for now atleast)",
                                 );
                             }
                             let start_reg = program.alloc_registers(5);

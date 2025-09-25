@@ -4921,12 +4921,12 @@ pub fn op_function(
                 }
             }
 
-            ScalarFunc::DebeziumJsonObject => {
+            ScalarFunc::CDCJsonObject => {
                 assert_eq!(arg_count, 5);
                 #[cfg(not(feature = "json"))]
                 {
                     return Err(LimboError::InvalidArgument(
-                        "debezium_json_object: needs json".to_string(),
+                        "cdc_json_object: needs json".to_string(),
                     ));
                 }
                 #[cfg(feature = "json")]
@@ -4946,7 +4946,7 @@ pub fn op_function(
                         Value::Integer(-1) => "d",
                         _ => {
                             return Err(LimboError::InvalidArgument(
-                                "debezium_json_object: invalid change_type".to_string(),
+                                "cdc_json_object: invalid change_type".to_string(),
                             ))
                         }
                     };

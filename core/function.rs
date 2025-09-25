@@ -328,7 +328,7 @@ pub enum ScalarFunc {
     Likelihood,
     TableColumnsJsonArray,
     BinRecordJsonObject,
-    DebeziumJsonObject,
+    CDCJsonObject,
     Attach,
     Detach,
     Unlikely,
@@ -392,7 +392,7 @@ impl ScalarFunc {
             ScalarFunc::Likelihood => true,
             ScalarFunc::TableColumnsJsonArray => true, // while columns of the table can change with DDL statements, within single query plan it's static
             ScalarFunc::BinRecordJsonObject => true,
-            ScalarFunc::DebeziumJsonObject => true,
+            ScalarFunc::CDCJsonObject => true,
             ScalarFunc::Attach => false, // changes database state
             ScalarFunc::Detach => false, // changes database state
             ScalarFunc::Unlikely => true,
@@ -458,7 +458,7 @@ impl Display for ScalarFunc {
             Self::Likelihood => "likelihood".to_string(),
             Self::TableColumnsJsonArray => "table_columns_json_array".to_string(),
             Self::BinRecordJsonObject => "bin_record_json_object".to_string(),
-            Self::DebeziumJsonObject => "debezium_json_object".to_string(),
+            Self::CDCJsonObject => "cdc_json_object".to_string(),
             Self::Attach => "attach".to_string(),
             Self::Detach => "detach".to_string(),
             Self::Unlikely => "unlikely".to_string(),
@@ -810,7 +810,7 @@ impl Func {
             "soundex" => Ok(Self::Scalar(ScalarFunc::Soundex)),
             "table_columns_json_array" => Ok(Self::Scalar(ScalarFunc::TableColumnsJsonArray)),
             "bin_record_json_object" => Ok(Self::Scalar(ScalarFunc::BinRecordJsonObject)),
-            "debezium_json_object" => Ok(Self::Scalar(ScalarFunc::DebeziumJsonObject)),
+            "cdc_json_object" => Ok(Self::Scalar(ScalarFunc::CDCJsonObject)),
             "acos" => Ok(Self::Math(MathFunc::Acos)),
             "acosh" => Ok(Self::Math(MathFunc::Acosh)),
             "asin" => Ok(Self::Math(MathFunc::Asin)),
