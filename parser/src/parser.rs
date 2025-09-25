@@ -1460,7 +1460,10 @@ impl<'a> Parser<'a> {
             }
             _ => {
                 let can_be_lit_str = tok.token_type == Some(TK_STRING);
-                let name = self.parse_nm()?;
+
+                // can be either Literal::String or Name - so we parse raw value early and decide later
+                let tok = eat_expect!(self, TK_ID, TK_STRING, TK_INDEXED, TK_JOIN_KW);
+                let name = from_bytes(tok.value);
 
                 let second_name = if let Some(tok) = self.peek()? {
                     if tok.token_type == Some(TK_DOT) {
@@ -1482,7 +1485,7 @@ impl<'a> Parser<'a> {
                                 eat_assert!(self, TK_STAR);
                                 eat_expect!(self, TK_RP);
                                 return Ok(Box::new(Expr::FunctionCallStar {
-                                    name,
+                                    name: Name::new(name),
                                     filter_over: self.parse_filter_over()?,
                                 }));
                             }
@@ -1493,7 +1496,7 @@ impl<'a> Parser<'a> {
                                 eat_expect!(self, TK_RP);
                                 let filter_over = self.parse_filter_over()?;
                                 return Ok(Box::new(Expr::FunctionCall {
-                                    name,
+                                    name: Name::new(name),
                                     distinctness: distinct,
                                     args: exprs,
                                     order_by,
@@ -1523,33 +1526,26 @@ impl<'a> Parser<'a> {
                 if let Some(second_name) = second_name {
                     if let Some(third_name) = third_name {
                         Ok(Box::new(Expr::DoublyQualified(
-                            name,
+                            Name::new(name),
                             second_name,
                             third_name,
                         )))
                     } else {
-                        Ok(Box::new(Expr::Qualified(name, second_name)))
+                        Ok(Box::new(Expr::Qualified(Name::new(name), second_name)))
                     }
                 } else if can_be_lit_str {
-                    Ok(Box::new(Expr::Literal(match name {
-                        Name::Quoted(s) | Name::Ident(s) => Literal::String(s),
-                    })))
+                    Ok(Box::new(Expr::Literal(Literal::String(name))))
                 } else {
-                    match name {
-                        Name::Ident(s) => {
-                            let s_bytes = s.as_bytes();
-                            match_ignore_ascii_case!(match s_bytes {
-                                b"true" => {
-                                    Ok(Box::new(Expr::Literal(Literal::Numeric("1".into()))))
-                                }
-                                b"false" => {
-                                    Ok(Box::new(Expr::Literal(Literal::Numeric("0".into()))))
-                                }
-                                _ => return Ok(Box::new(Expr::Id(Name::Ident(s)))),
-                            })
+                    let name_bytes = name.as_bytes();
+                    match_ignore_ascii_case!(match name_bytes {
+                        b"true" => {
+                            Ok(Box::new(Expr::Literal(Literal::Numeric("1".into()))))
                         }
-                        _ => Ok(Box::new(Expr::Id(name))),
-                    }
+                        b"false" => {
+                            Ok(Box::new(Expr::Literal(Literal::Numeric("0".into()))))
+                        }
+                        _ => return Ok(Box::new(Expr::Id(Name::new(name)))),
+                    })
                 }
             }
         }
@@ -4120,7 +4116,7 @@ mod tests {
                 b"BEGIN EXCLUSIVE TRANSACTION 'my_transaction'".as_slice(),
                 vec![Cmd::Stmt(Stmt::Begin {
                     typ: Some(TransactionType::Exclusive),
-                    name: Some(Name::Quoted("'my_transaction'".to_string())),
+                    name: Some(Name::Ident("my_transaction".to_string())),
                 })],
             ),
             (
@@ -4141,7 +4137,7 @@ mod tests {
                 b"BEGIN CONCURRENT TRANSACTION 'my_transaction'".as_slice(),
                 vec![Cmd::Stmt(Stmt::Begin {
                     typ: Some(TransactionType::Concurrent),
-                    name: Some(Name::Quoted("'my_transaction'".to_string())),
+                    name: Some(Name::Ident("my_transaction".to_string())),
                 })],
             ),
             (
@@ -4236,7 +4232,7 @@ mod tests {
             (
                 b"SAVEPOINT 'my_savepoint'".as_slice(),
                 vec![Cmd::Stmt(Stmt::Savepoint {
-                    name: Name::Quoted("'my_savepoint'".to_string()),
+                    name: Name::Ident("my_savepoint".to_string()),
                 })],
             ),
             // release
@@ -4255,7 +4251,7 @@ mod tests {
             (
                 b"RELEASE SAVEPOINT 'my_savepoint'".as_slice(),
                 vec![Cmd::Stmt(Stmt::Release {
-                    name: Name::Quoted("'my_savepoint'".to_string()),
+                    name: Name::Ident("my_savepoint".to_string()),
                 })],
             ),
             (
@@ -11467,13 +11463,13 @@ mod tests {
                     if_not_exists: false,
                     tbl_name: QualifiedName {
                         db_name: None,
-                        name: Name::Quoted("\"settings\"".to_owned()),
+                        name: Name::Ident("settings".to_owned()),
                         alias: None,
                     },
                     body: CreateTableBody::ColumnsAndConstraints{
                         columns: vec![
                             ColumnDefinition {
-                                col_name: Name::Quoted("\"enabled\"".to_owned()),
+                                col_name: Name::Ident("enabled".to_owned()),
                                 col_type: Some(Type {
                                     name: "INTEGER".to_owned(),
                                     size: None,

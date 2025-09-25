@@ -25,8 +25,8 @@ use crate::util::{
     module_args_from_sql, module_name_from_sql, type_from_name, IOExt, UnparsedFromSqlIndex,
 };
 use crate::{
-    contains_ignore_ascii_case, eq_ignore_ascii_case, match_ignore_ascii_case, Connection,
-    LimboError, MvCursor, MvStore, Pager, RefValue, SymbolTable, VirtualTable,
+    bail_parse_error, contains_ignore_ascii_case, eq_ignore_ascii_case, match_ignore_ascii_case,
+    Connection, LimboError, MvCursor, MvStore, Pager, RefValue, SymbolTable, VirtualTable,
 };
 use crate::{util::normalize_ident, Result};
 use core::fmt;
@@ -1012,12 +1012,7 @@ pub fn create_table(
                     for column in columns {
                         let col_name = match column.expr.as_ref() {
                             Expr::Id(id) => id.as_str().to_string(),
-                            Expr::Literal(Literal::String(value)) => {
-                                value.trim_matches('\'').to_owned()
-                            }
-                            _ => {
-                                todo!("Unsupported primary key expression");
-                            }
+                            _ => bail_parse_error!("Unsupported primary key expression"),
                         };
                         primary_key_columns
                             .push((col_name, column.order.unwrap_or(SortOrder::Asc)));
@@ -1034,19 +1029,18 @@ pub fn create_table(
                     if conflict_clause.is_some() {
                         unimplemented!("ON CONFLICT not implemented");
                     }
-                    let unique_set = UniqueSet {
-                        columns: columns
-                            .iter()
-                            .map(|column| {
-                                (
-                                    column.expr.as_ref().to_string(),
-                                    column.order.unwrap_or(SortOrder::Asc),
-                                )
-                            })
-                            .collect(),
+                    let mut unique_set_columns = vec![];
+                    for column in columns {
+                        let col_name = match column.expr.as_ref() {
+                            Expr::Id(id) => id.as_str().to_string(),
+                            _ => bail_parse_error!("Unsupported unique expression"),
+                        };
+                        unique_set_columns.push((col_name, column.order.unwrap_or(SortOrder::Asc)));
+                    }
+                    unique_sets.push(UniqueSet {
+                        columns: unique_set_columns,
                         is_primary_key: false,
-                    };
-                    unique_sets.push(unique_set);
+                    });
                 }
             }
             for ast::ColumnDefinition {

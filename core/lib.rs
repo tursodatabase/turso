@@ -1401,6 +1401,7 @@ impl Connection {
         let mut opts = OpenOptions::parse(uri)?;
         // FIXME: for now, only support read only attach
         opts.mode = OpenMode::ReadOnly;
+        tracing::debug!("from_uri_attached: uri={}, opts={:?}", uri, opts);
         let flags = opts.get_flags()?;
         let io = opts.vfs.map(Database::io_for_vfs).unwrap_or(Ok(io))?;
         let db = Database::open_file_with_flags(io.clone(), &opts.path, flags, db_opts, None)?;
@@ -1928,6 +1929,7 @@ impl Connection {
     /// Attach a database file with the given alias name
     #[cfg(feature = "fs")]
     pub(crate) fn attach_database(&self, path: &str, alias: &str) -> Result<()> {
+        tracing::debug!("attach database: path={}, alias={}", path, alias);
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }

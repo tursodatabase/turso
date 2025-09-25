@@ -1370,7 +1370,7 @@ impl ToTokens for Name {
         s: &mut S,
         _: &C,
     ) -> Result<(), S::Error> {
-        double_quote(self.as_str(), s)
+        s.append(TK_ID, Some(&self.as_sql()))
     }
 }
 

@@ -883,9 +883,44 @@ pub struct GroupBy {
 pub enum Name {
     /// Identifier
     Ident(String),
-    /// Quoted identifier normalized if keyword quotes used before (e.g. `...`, "..." or [...])
-    /// Note, that quotes are **included** in the String, but they will be omitted in the as_str() method
-    Quoted(String),
+}
+
+pub fn need_quote(id: &str) -> bool {
+    id.is_empty() || id.as_bytes().iter().any(|x| !x.is_ascii_alphanumeric())
+}
+
+pub fn unquote_id(id: &str, quote: char, lowercase: bool) -> String {
+    let mut unquoted = String::with_capacity(id.len());
+    let mut duplicated = false;
+    for c in id.chars() {
+        if c == quote && !duplicated {
+            duplicated = true;
+            continue;
+        }
+        duplicated = false;
+        if lowercase {
+            unquoted.extend(c.to_lowercase());
+        } else {
+            unquoted.push(c);
+        }
+    }
+    unquoted
+}
+
+pub fn quote(id: &str, quote: char) -> String {
+    let quotes_cnt = id.chars().filter(|&c| c == quote).count();
+    let mut quoted = String::with_capacity(2 + id.len() + quotes_cnt);
+    quoted.push(quote);
+    for c in id.chars() {
+        if c == quote {
+            quoted.push(c);
+            quoted.push(c);
+        } else {
+            quoted.push(c);
+        }
+    }
+    quoted.push(quote);
+    quoted
 }
 
 impl Name {
@@ -897,35 +932,43 @@ impl Name {
             return Name::Ident(s.to_string());
         }
 
-        match bytes[0] {
+        let result = match bytes[0] {
             b'"' => {
                 assert_eq!(bytes[bytes.len() - 1], b'"');
                 assert!(s.len() >= 2);
-                Name::Quoted(s.to_lowercase())
+                Name::Ident(unquote_id(&s[1..s.len() - 1], '"', true))
             }
             b'`' => {
                 assert_eq!(bytes[bytes.len() - 1], b'`');
                 assert!(s.len() >= 2);
-                Name::Quoted(s.to_lowercase())
+                Name::Ident(unquote_id(&s[1..s.len() - 1], '`', true))
             }
             b'[' => {
                 assert_eq!(bytes[bytes.len() - 1], b']');
                 assert!(s.len() >= 2);
-                Name::Quoted(s.to_lowercase())
+                Name::Ident(s[1..s.len() - 1].to_lowercase())
             }
             b'\'' => {
                 assert_eq!(bytes[bytes.len() - 1], b'\'');
                 assert!(s.len() >= 2);
-                Name::Quoted(s.to_string())
+                Name::Ident(unquote_id(&s[1..s.len() - 1], '\'', false))
             }
             _ => Name::Ident(s.to_lowercase()),
-        }
+        };
+        result
     }
 
     pub fn as_str(&self) -> &str {
         match self {
-            Name::Quoted(s) => &s[1..s.len() - 1],
             Name::Ident(s) => s,
+        }
+    }
+
+    pub fn as_sql(&self) -> String {
+        if need_quote(self.as_str()) {
+            quote(self.as_str(), '"')
+        } else {
+            self.as_str().to_string()
         }
     }
 }
