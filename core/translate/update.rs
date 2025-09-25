@@ -122,6 +122,11 @@ pub fn prepare_update_plan(
     {
         bail_parse_error!("INDEXED BY clause is not supported in UPDATE");
     }
+
+    if !body.order_by.is_empty() {
+        bail_parse_error!("ORDER BY is not supported in UPDATE");
+    }
+
     let table_name = &body.tbl_name.name;
 
     // Check if this is a system table that should be protected from direct writes
