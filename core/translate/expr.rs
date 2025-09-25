@@ -3289,7 +3289,7 @@ pub enum BindingBehavior {
 
 /// Rewrite ast::Expr in place, binding Column references/rewriting Expr::Id -> Expr::Column
 /// using the provided TableReferences, and replacing anonymous parameters with internal named
-/// ones, as well as normalizing any DoublyQualified/Qualified quoted identifiers.
+/// ones
 pub fn bind_and_rewrite_expr<'a>(
     top_level_expr: &mut ast::Expr,
     mut referenced_tables: Option<&'a mut TableReferences>,
@@ -3318,13 +3318,6 @@ pub fn bind_and_rewrite_expr<'a>(
                         PARAM_PREFIX, param_state.next_param_idx
                     ));
                     param_state.next_param_idx += 1;
-                }
-                ast::Expr::Qualified(ast::Name::Quoted(ns), ast::Name::Quoted(c))
-                | ast::Expr::DoublyQualified(_, ast::Name::Quoted(ns), ast::Name::Quoted(c)) => {
-                    *expr = ast::Expr::Qualified(
-                        ast::Name::exact(normalize_ident(ns.as_str())),
-                        ast::Name::exact(normalize_ident(c.as_str())),
-                    );
                 }
                 ast::Expr::Between {
                     lhs,
