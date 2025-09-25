@@ -415,9 +415,7 @@ impl<'a> LogicalPlanBuilder<'a> {
 
     // Convert Name to String
     fn name_to_string(name: &ast::Name) -> String {
-        match name {
-            ast::Name::Ident(s) | ast::Name::Quoted(s) => s.clone(),
-        }
+        name.as_str().to_string()
     }
 
     // Build a SELECT statement

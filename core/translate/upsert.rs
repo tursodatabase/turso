@@ -77,27 +77,22 @@ pub struct ConflictTarget {
 // Extract `(column, optional_collate)` from an ON CONFLICT target Expr.
 // Accepts: Id, Qualified, DoublyQualified, Parenthesized, Collate
 fn extract_target_key(e: &ast::Expr) -> Option<ConflictTarget> {
-    use ast::Name::{Ident, Quoted};
     match e {
         ast::Expr::Collate(inner, c) => {
             let mut tk = extract_target_key(inner.as_ref())?;
-            let cstr = match c {
-                Ident(s) | Quoted(s) => s.as_str(),
-            };
+            let cstr = c.as_str();
             tk.collate = Some(cstr.to_ascii_lowercase());
             Some(tk)
         }
         ast::Expr::Parenthesized(v) if v.len() == 1 => extract_target_key(&v[0]),
 
-        ast::Expr::Id(Ident(name)) | ast::Expr::Id(Quoted(name)) => Some(ConflictTarget {
-            col_name: normalize_ident(name),
+        ast::Expr::Id(name) => Some(ConflictTarget {
+            col_name: normalize_ident(name.as_str()),
             collate: None,
         }),
         // t.a or db.t.a: accept ident or quoted in the column position
         ast::Expr::Qualified(_, col) | ast::Expr::DoublyQualified(_, _, col) => {
-            let cname = match col {
-                Ident(s) | Quoted(s) => s.as_str(),
-            };
+            let cname = col.as_str();
             Some(ConflictTarget {
                 col_name: normalize_ident(cname),
                 collate: None,
@@ -199,13 +194,12 @@ fn partial_index_cols(idx: &Index, table: &Table) -> HashSet<usize> {
     let mut out = HashSet::new();
     let _ = walk_expr(expr, &mut |e: &ast::Expr| -> crate::Result<WalkControl> {
         match e {
-            Expr::Id(Name::Ident(n) | Name::Quoted(n)) => {
+            Expr::Id(n) => {
                 if let Some((i, _)) = table.get_column_by_name(&normalize_ident(n.as_str())) {
                     out.insert(i);
                 }
             }
-            Expr::Qualified(ns, Name::Ident(c) | Name::Quoted(c))
-            | Expr::DoublyQualified(_, ns, Name::Ident(c) | Name::Quoted(c)) => {
+            Expr::Qualified(ns, c) | Expr::DoublyQualified(_, ns, c) => {
                 // Only count columns that belong to this table
                 let nsn = normalize_ident(ns.as_str());
                 let tname = normalize_ident(table.get_name());
@@ -911,8 +905,7 @@ fn rewrite_expr_to_registers(
         e,
         &mut |expr: &mut ast::Expr| -> crate::Result<WalkControl> {
             match expr {
-                Expr::Qualified(ns, Name::Ident(c) | Name::Quoted(c))
-                | Expr::DoublyQualified(_, ns, Name::Ident(c) | Name::Quoted(c)) => {
+                Expr::Qualified(ns, c) | Expr::DoublyQualified(_, ns, c) => {
                     let ns = normalize_ident(ns.as_str());
                     let c = normalize_ident(c.as_str());
                     // Handle EXCLUDED.* if enabled
@@ -940,7 +933,7 @@ fn rewrite_expr_to_registers(
                     }
                 }
                 // Unqualified id -> row image (CURRENT/NEW depending on caller)
-                Expr::Id(Name::Ident(name)) | Expr::Id(Name::Quoted(name)) => {
+                Expr::Id(name) => {
                     if let Some(r) = col_reg_from_row_image(&normalize_ident(name.as_str())) {
                         *expr = Expr::Register(r);
                     }

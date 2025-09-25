@@ -448,9 +448,7 @@ impl IncrementalView {
                 // Store the alias mapping if there is an alias
                 if let Some(alias_enum) = alias {
                     let alias_name = match alias_enum {
-                        ast::As::As(name) | ast::As::Elided(name) => match name {
-                            ast::Name::Ident(s) | ast::Name::Quoted(s) => s,
-                        },
+                        ast::As::As(name) | ast::As::Elided(name) => name.as_str(),
                     };
                     aliases.insert(alias_name.to_string(), table_name.to_string());
                 }
