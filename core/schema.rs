@@ -1,6 +1,8 @@
 use crate::function::Func;
 use crate::incremental::view::IncrementalView;
-use crate::translate::expr::{bind_and_rewrite_expr, walk_expr, ParamState, WalkControl};
+use crate::translate::expr::{
+    bind_and_rewrite_expr, walk_expr, BindingBehavior, ParamState, WalkControl,
+};
 use crate::translate::planner::ROWID_STRS;
 use parking_lot::RwLock;
 
@@ -1852,7 +1854,15 @@ impl Index {
         };
         let mut params = ParamState::disallow();
         let mut expr = where_clause.clone();
-        bind_and_rewrite_expr(&mut expr, table_refs, None, connection, &mut params).ok()?;
+        bind_and_rewrite_expr(
+            &mut expr,
+            table_refs,
+            None,
+            connection,
+            &mut params,
+            BindingBehavior::ResultColumnsNotAllowed,
+        )
+        .ok()?;
         Some(*expr)
     }
 }

@@ -11,7 +11,7 @@ use super::{
     select::prepare_select_plan,
     SymbolTable,
 };
-use crate::translate::expr::WalkControl;
+use crate::translate::expr::{BindingBehavior, WalkControl};
 use crate::translate::plan::{Window, WindowFunction};
 use crate::{
     ast::Limit,
@@ -686,6 +686,7 @@ pub fn parse_where(
                 result_columns,
                 connection,
                 param_ctx,
+                BindingBehavior::TryCanonicalColumnsFirst,
             )?;
         }
         Ok(())
@@ -973,6 +974,7 @@ fn parse_join(
                         None,
                         connection,
                         param_ctx,
+                        BindingBehavior::TryResultColumnsFirst,
                     )?;
                 }
             }
@@ -1117,9 +1119,23 @@ pub fn parse_limit(
     connection: &std::sync::Arc<crate::Connection>,
     param_ctx: &mut ParamState,
 ) -> Result<(Option<Box<Expr>>, Option<Box<Expr>>)> {
-    bind_and_rewrite_expr(&mut limit.expr, None, None, connection, param_ctx)?;
+    bind_and_rewrite_expr(
+        &mut limit.expr,
+        None,
+        None,
+        connection,
+        param_ctx,
+        BindingBehavior::TryResultColumnsFirst,
+    )?;
     if let Some(ref mut off_expr) = limit.offset {
-        bind_and_rewrite_expr(off_expr, None, None, connection, param_ctx)?;
+        bind_and_rewrite_expr(
+            off_expr,
+            None,
+            None,
+            connection,
+            param_ctx,
+            BindingBehavior::TryResultColumnsFirst,
+        )?;
     }
     Ok((Some(limit.expr.clone()), limit.offset.clone()))
 }

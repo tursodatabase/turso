@@ -2,7 +2,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::schema::{BTreeTable, Column, Type};
-use crate::translate::expr::{bind_and_rewrite_expr, walk_expr, ParamState, WalkControl};
+use crate::translate::expr::{
+    bind_and_rewrite_expr, walk_expr, BindingBehavior, ParamState, WalkControl,
+};
 use crate::translate::optimizer::optimize_select_plan;
 use crate::translate::plan::{Operation, QueryDestination, Scan, Search, SelectPlan};
 use crate::translate::planner::parse_limit;
@@ -191,6 +193,7 @@ pub fn prepare_update_plan(
             None,
             connection,
             &mut param_idx,
+            BindingBehavior::ResultColumnsNotAllowed,
         )?;
 
         let values = match set.expr.as_ref() {
@@ -241,6 +244,7 @@ pub fn prepare_update_plan(
                 Some(&result_columns),
                 connection,
                 &mut param_idx,
+                BindingBehavior::ResultColumnsNotAllowed,
             );
             (o.expr.clone(), o.order.unwrap_or(SortOrder::Asc))
         })
@@ -400,6 +404,7 @@ pub fn prepare_update_plan(
                             None,
                             connection,
                             &mut param,
+                            BindingBehavior::ResultColumnsNotAllowed,
                         )
                         .ok()?;
                         let cols_used = collect_cols_used_in_expr(&where_copy);

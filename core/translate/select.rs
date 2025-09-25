@@ -5,7 +5,7 @@ use super::plan::{
 };
 use crate::schema::Table;
 use crate::translate::emitter::Resolver;
-use crate::translate::expr::{bind_and_rewrite_expr, ParamState};
+use crate::translate::expr::{bind_and_rewrite_expr, BindingBehavior, ParamState};
 use crate::translate::group_by::compute_group_by_sort_order;
 use crate::translate::optimizer::optimize_plan;
 use crate::translate::plan::{GroupBy, Plan, ResultSetColumn, SelectPlan};
@@ -302,6 +302,7 @@ fn prepare_one_select_plan(
                         None,
                         connection,
                         param_ctx,
+                        BindingBehavior::ResultColumnsNotAllowed,
                     )?;
                 }
                 for (expr, _) in window.order_by.iter_mut() {
@@ -311,6 +312,7 @@ fn prepare_one_select_plan(
                         None,
                         connection,
                         param_ctx,
+                        BindingBehavior::ResultColumnsNotAllowed,
                     )?;
                 }
 
@@ -373,6 +375,7 @@ fn prepare_one_select_plan(
                             None,
                             connection,
                             param_ctx,
+                            BindingBehavior::ResultColumnsNotAllowed,
                         )?;
                         let contains_aggregates = resolve_window_and_aggregate_functions(
                             schema,
@@ -422,6 +425,7 @@ fn prepare_one_select_plan(
                         Some(&plan.result_columns),
                         connection,
                         param_ctx,
+                        BindingBehavior::TryResultColumnsFirst,
                     )?;
                 }
 
@@ -438,6 +442,7 @@ fn prepare_one_select_plan(
                                 Some(&plan.result_columns),
                                 connection,
                                 param_ctx,
+                                BindingBehavior::TryResultColumnsFirst,
                             )?;
                             let contains_aggregates = resolve_window_and_aggregate_functions(
                                 schema,
@@ -477,6 +482,7 @@ fn prepare_one_select_plan(
                     Some(&plan.result_columns),
                     connection,
                     param_ctx,
+                    BindingBehavior::TryResultColumnsFirst,
                 )?;
                 resolve_window_and_aggregate_functions(
                     schema,
@@ -561,6 +567,7 @@ fn add_vtab_predicates_to_where_clause(
             Some(&plan.result_columns),
             connection,
             param_ctx,
+            BindingBehavior::TryCanonicalColumnsFirst,
         )?;
     }
     for expr in vtab_predicates.drain(..) {
