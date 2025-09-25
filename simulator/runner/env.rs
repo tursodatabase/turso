@@ -38,15 +38,15 @@ pub(crate) enum SimulationPhase {
 
 #[derive(Debug, Clone)]
 pub struct TransactionTables {
-    snapshot_tables: Vec<Table>,
     current_tables: Vec<Table>,
+    pending_changes: Vec<Query>,
 }
 
 impl TransactionTables {
     pub fn new(tables: Vec<Table>) -> Self {
         Self {
-            snapshot_tables: tables.clone(),
             current_tables: tables,
+            pending_changes: Vec::new(),
         }
     }
 }
@@ -104,12 +104,28 @@ where
         // TODO: as we do not have concurrent tranasactions yet in the simulator
         // there is no conflict we are ignoring conflict problems right now
         if let Some(transation_tables) = self.transaction_tables.take() {
-            *self.commited_tables = transation_tables.current_tables
+            let mut shadow_table = ShadowTablesMut {
+                commited_tables: self.commited_tables,
+                transaction_tables: &mut None,
+            };
+
+            for query in transation_tables.pending_changes {
+                // TODO: maybe panic on shadow error here
+                let _ = query.shadow(&mut shadow_table);
+            }
         }
     }
 
     pub fn delete_snapshot(&mut self) {
         *self.transaction_tables = None;
+    }
+
+    /// Append non transaction queries to the shadow tables
+    pub fn add_query(&mut self, query: &Query) {
+        assert!(!query.is_transaction());
+        if let Some(transaction_tables) = self.transaction_tables {
+            transaction_tables.pending_changes.push(query.clone());
+        }
     }
 }
 

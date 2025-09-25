@@ -61,6 +61,14 @@ impl Query {
             Query::Begin(..) | Query::Commit(..) | Query::Rollback(..) => vec![],
         }
     }
+
+    #[inline]
+    pub fn is_transaction(&self) -> bool {
+        matches!(
+            self,
+            Self::Begin(..) | Self::Commit(..) | Self::Rollback(..)
+        )
+    }
 }
 
 impl Display for Query {
