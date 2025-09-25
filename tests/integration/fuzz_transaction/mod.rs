@@ -502,8 +502,8 @@ async fn test_multiple_connections_fuzz_mvcc() {
             weight_rollback: 8,
             weight_checkpoint: 2,
             checkpoint_modes: vec![CheckpointMode::Truncate],
-            weight_ddl: 0,
-            weight_dml: 76,
+            weight_ddl: 10,
+            weight_dml: 66,
             dml_gen_options: DmlGenOptions {
                 weight_insert: 25,
                 weight_delete: 25,
@@ -635,6 +635,7 @@ async fn multiple_connections_fuzz(opts: FuzzOptions) {
             let conn = db.connect().unwrap();
 
             // Create table if it doesn't exist
+            tracing::info!("Creating table test_table for connection {conn_id}");
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS test_table (id INTEGER PRIMARY KEY, text TEXT)",
                 (),
@@ -650,10 +651,11 @@ async fn multiple_connections_fuzz(opts: FuzzOptions) {
             e_string.contains("is locked")
                 || e_string.contains("busy")
                 || e_string.contains("Write-write conflict")
+                || e_string.contains("schema changed")
         };
         let requires_rollback = |e: &turso::Error| -> bool {
             let e_string = e.to_string();
-            e_string.contains("Write-write conflict")
+            e_string.contains("Write-write conflict") || e_string.contains("schema changed")
         };
 
         let handle_error = |e: &turso::Error,
@@ -968,13 +970,13 @@ async fn multiple_connections_fuzz(opts: FuzzOptions) {
                                     next_tx_id += 1;
                                 }
                             }
-                            Err(e) => {
-                                println!("Connection {conn_id}(op={op_num}) FAILED: {e}");
-                                // Check if it's an acceptable error
-                                if !e.to_string().contains("database is locked") {
-                                    panic!("Unexpected error during alter table: {e}");
-                                }
-                            }
+                            Err(e) => handle_error(
+                                &e,
+                                current_tx_id,
+                                *conn_id,
+                                op_num,
+                                &mut shared_shadow_db,
+                            ),
                         }
                     }
                     Operation::Checkpoint { mode } => {

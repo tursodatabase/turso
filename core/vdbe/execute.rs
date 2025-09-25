@@ -2281,15 +2281,17 @@ pub fn op_transaction_inner(
                     // In MVCC we don't have write exclusivity, therefore we just need to start a transaction if needed.
                     // Programs can run Transaction twice, first with read flag and then with write flag. So a single txid is enough
                     // for both.
-                    if program.connection.mv_tx.get().is_none() {
-                        // We allocate the first page lazily in the first transaction.
-                        // TODO: when we fix MVCC enable schema cookie detection for reprepare statements
-                        // let header_schema_cookie = pager
-                        //     .io
-                        //     .block(|| pager.with_header(|header| header.schema_cookie.get()))?;
-                        // if header_schema_cookie != *schema_cookie {
-                        //     return Err(LimboError::SchemaUpdated);
-                        // }
+                    let has_existing_mv_tx = program.connection.mv_tx.get().is_some();
+
+                    let conn_has_executed_begin_deferred = !has_existing_mv_tx
+                        && !program.connection.auto_commit.load(Ordering::SeqCst);
+                    if conn_has_executed_begin_deferred && *tx_mode == TransactionMode::Concurrent {
+                        return Err(LimboError::TxError(
+                            "Cannot start CONCURRENT transaction after BEGIN DEFERRED".to_string(),
+                        ));
+                    }
+
+                    if !has_existing_mv_tx {
                         let tx_id = match tx_mode {
                             TransactionMode::None
                             | TransactionMode::Read
@@ -2449,6 +2451,11 @@ pub fn op_auto_commit(
                     "cannot commit - no transaction is active".to_string(),
                 ));
             }
+        } else {
+            let is_begin = !*auto_commit && !*rollback;
+            return Err(LimboError::TxError(
+                "cannot use BEGIN after BEGIN CONCURRENT".to_string(),
+            ));
         }
     }
 
@@ -6570,6 +6577,23 @@ pub fn op_open_write(
             }
         },
     };
+
+    const SQLITE_SCHEMA_ROOT_PAGE: u64 = 1;
+
+    if root_page == SQLITE_SCHEMA_ROOT_PAGE {
+        if let Some(mv_store) = mv_store {
+            let Some((tx_id, _)) = program.connection.mv_tx.get() else {
+                return Err(LimboError::InternalError(
+                    "Schema changes in MVCC mode require an exclusive MVCC transaction".to_string(),
+                ));
+            };
+            if !mv_store.is_exclusive_tx(&tx_id) {
+                // Schema changes in MVCC mode require an exclusive transaction
+                return Err(LimboError::TableLocked);
+            }
+        }
+    }
+
     let (_, cursor_type) = program.cursor_ref.get(*cursor_id).unwrap();
     let cursors = &mut state.cursors;
     let maybe_index = match cursor_type {
