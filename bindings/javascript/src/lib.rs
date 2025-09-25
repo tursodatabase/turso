@@ -244,6 +244,7 @@ impl Database {
             init_tracing(&opts.tracing);
         }
         Ok(Self {
+            #[allow(clippy::arc_with_non_send_sync)]
             inner: Some(Arc::new(DatabaseInner {
                 path,
                 opts,
@@ -362,12 +363,12 @@ impl Database {
 
     #[napi]
     pub fn executor(&self, sql: String) -> napi::Result<BatchExecutor> {
-        return Ok(BatchExecutor {
+        Ok(BatchExecutor {
             conn: Some(self.conn()?.clone()),
             sql,
             position: 0,
             stmt: None,
-        });
+        })
     }
 
     /// Returns the rowid of the last row inserted.
@@ -457,6 +458,7 @@ impl BatchExecutor {
             if self.stmt.is_none() {
                 let conn = self.conn.as_ref().unwrap();
                 match conn.consume_stmt(&self.sql[self.position..]) {
+                    #[allow(clippy::arc_with_non_send_sync)]
                     Ok(Some((stmt, offset))) => {
                         self.position += offset;
                         self.stmt = Some(Arc::new(RefCell::new(stmt)));
