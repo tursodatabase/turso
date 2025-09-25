@@ -1,13 +1,13 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use crate::schema::{BTreeTable, Column, Type};
+use crate::schema::{BTreeTable, Column, Type, ROWID_SENTINEL};
 use crate::translate::expr::{
     bind_and_rewrite_expr, walk_expr, BindingBehavior, ParamState, WalkControl,
 };
 use crate::translate::optimizer::optimize_select_plan;
 use crate::translate::plan::{Operation, QueryDestination, Scan, Search, SelectPlan};
-use crate::translate::planner::parse_limit;
+use crate::translate::planner::{parse_limit, ROWID_STRS};
 use crate::vdbe::builder::CursorType;
 use crate::{
     bail_parse_error,
@@ -214,18 +214,39 @@ pub fn prepare_update_plan(
             );
         }
 
-        // Map each column to its corresponding expression
         for (col_name, expr) in set.col_names.iter().zip(values.iter()) {
             let ident = normalize_ident(col_name.as_str());
-            let col_index = match column_lookup.get(&ident) {
-                Some(idx) => idx,
-                None => bail_parse_error!("no such column: {}", ident),
-            };
 
-            // Update existing entry or add new one
-            match set_clauses.iter_mut().find(|(idx, _)| idx == col_index) {
-                Some((_, existing_expr)) => *existing_expr = expr.clone(),
-                None => set_clauses.push((*col_index, expr.clone())),
+            // Check if this is the 'rowid' keyword
+            if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(&ident)) {
+                // Find the rowid alias column if it exists
+                if let Some((idx, _col)) = table
+                    .columns()
+                    .iter()
+                    .enumerate()
+                    .find(|(_, c)| c.is_rowid_alias)
+                {
+                    // Use the rowid alias column index
+                    match set_clauses.iter_mut().find(|(i, _)| i == &idx) {
+                        Some((_, existing_expr)) => *existing_expr = expr.clone(),
+                        None => set_clauses.push((idx, expr.clone())),
+                    }
+                } else {
+                    // No rowid alias, use sentinel value for actual rowid
+                    match set_clauses.iter_mut().find(|(i, _)| *i == ROWID_SENTINEL) {
+                        Some((_, existing_expr)) => *existing_expr = expr.clone(),
+                        None => set_clauses.push((ROWID_SENTINEL, expr.clone())),
+                    }
+                }
+            } else {
+                let col_index = match column_lookup.get(&ident) {
+                    Some(idx) => idx,
+                    None => bail_parse_error!("no such column: {}", ident),
+                };
+                match set_clauses.iter_mut().find(|(idx, _)| idx == col_index) {
+                    Some((_, existing_expr)) => *existing_expr = expr.clone(),
+                    None => set_clauses.push((*col_index, expr.clone())),
+                }
             }
         }
     }
@@ -262,10 +283,11 @@ pub fn prepare_update_plan(
     let columns = table.columns();
 
     let rowid_alias_used = set_clauses.iter().fold(false, |accum, (idx, _)| {
-        accum || columns[*idx].is_rowid_alias
+        accum || (*idx != ROWID_SENTINEL && columns[*idx].is_rowid_alias)
     });
+    let direct_rowid_update = set_clauses.iter().any(|(idx, _)| *idx == ROWID_SENTINEL);
 
-    let (ephemeral_plan, mut where_clause) = if rowid_alias_used {
+    let (ephemeral_plan, mut where_clause) = if rowid_alias_used || direct_rowid_update {
         let mut where_clause = vec![];
         let internal_id = program.table_reference_counter.next();
 
@@ -384,7 +406,7 @@ pub fn prepare_update_plan(
     let updated_cols: HashSet<usize> = set_clauses.iter().map(|(i, _)| *i).collect();
     let rowid_alias_used = set_clauses
         .iter()
-        .any(|(idx, _)| columns[*idx].is_rowid_alias);
+        .any(|(idx, _)| *idx == ROWID_SENTINEL || columns[*idx].is_rowid_alias);
     let indexes_to_update = if rowid_alias_used {
         // If the rowid alias is used in the SET clause, we need to update all indexes
         indexes.cloned().collect()
