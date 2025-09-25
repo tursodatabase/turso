@@ -147,6 +147,7 @@ impl SyncEngine {
                 turso_node::browser::opfs()
             }
         };
+        #[allow(clippy::arc_with_non_send_sync)]
         let db = Arc::new(Mutex::new(turso_node::Database::new_with_io(
             opts.path.clone(),
             io.clone(),
