@@ -1039,16 +1039,15 @@ pub fn op_open_read(
     let pager = program.get_pager_from_database_index(db);
 
     let (_, cursor_type) = program.cursor_ref.get(*cursor_id).unwrap();
-    let mv_cursor = match program.connection.mv_tx.get() {
-        Some((tx_id, _)) => {
-            let table_id = *root_page as u64;
-            let mv_store = mv_store.unwrap().clone();
-            let mv_cursor = Arc::new(RwLock::new(
-                MvCursor::new(mv_store, tx_id, table_id, pager.clone()).unwrap(),
-            ));
-            Some(mv_cursor)
-        }
-        None => None,
+    let mv_cursor = if let Some(tx_id) = program.connection.get_mv_tx_id() {
+        let table_id = *root_page as u64;
+        let mv_store = mv_store.unwrap().clone();
+        let mv_cursor = Arc::new(RwLock::new(
+            MvCursor::new(mv_store, tx_id, table_id, pager.clone()).unwrap(),
+        ));
+        Some(mv_cursor)
+    } else {
+        None
     };
     let cursors = &mut state.cursors;
     let num_columns = match cursor_type {
@@ -2304,7 +2303,8 @@ pub fn op_transaction_inner(
                     // In MVCC we don't have write exclusivity, therefore we just need to start a transaction if needed.
                     // Programs can run Transaction twice, first with read flag and then with write flag. So a single txid is enough
                     // for both.
-                    let has_existing_mv_tx = program.connection.mv_tx.get().is_some();
+                    let current_mv_tx = program.connection.get_mv_tx();
+                    let has_existing_mv_tx = current_mv_tx.is_some();
 
                     let conn_has_executed_begin_deferred = !has_existing_mv_tx
                         && !program.connection.auto_commit.load(Ordering::SeqCst);
@@ -2323,10 +2323,10 @@ pub fn op_transaction_inner(
                                 return_if_io!(mv_store.begin_exclusive_tx(pager.clone(), None))
                             }
                         };
-                        program.connection.mv_tx.set(Some((tx_id, *tx_mode)));
+                        *program.connection.mv_tx.write() = Some((tx_id, *tx_mode));
                     } else if updated {
                         // TODO: fix tx_mode in Insn::Transaction, now each statement overrides it even if there's already a CONCURRENT Tx in progress, for example
-                        let mv_tx_mode = program.connection.mv_tx.get().unwrap().1;
+                        let (tx_id, mv_tx_mode) = current_mv_tx.unwrap();
                         let actual_tx_mode = if mv_tx_mode == TransactionMode::Concurrent {
                             TransactionMode::Concurrent
                         } else {
@@ -2335,7 +2335,6 @@ pub fn op_transaction_inner(
                         if matches!(new_transaction_state, TransactionState::Write { .. })
                             && matches!(actual_tx_mode, TransactionMode::Write)
                         {
-                            let (tx_id, _) = program.connection.mv_tx.get().unwrap();
                             return_if_io!(mv_store.begin_exclusive_tx(pager.clone(), Some(tx_id)));
                         }
                     }
@@ -2447,7 +2446,7 @@ pub fn op_auto_commit(
         if *rollback {
             // TODO(pere): add rollback I/O logic once we implement rollback journal
             if let Some(mv_store) = mv_store {
-                if let Some((tx_id, _)) = conn.mv_tx.get() {
+                if let Some(tx_id) = conn.get_mv_tx_id() {
                     mv_store.rollback_tx(tx_id, pager.clone(), &conn)?;
                 }
             } else {
@@ -2459,7 +2458,7 @@ pub fn op_auto_commit(
             conn.auto_commit.store(*auto_commit, Ordering::SeqCst);
         }
     } else {
-        let mvcc_tx_active = program.connection.mv_tx.get().is_some();
+        let mvcc_tx_active = program.connection.get_mv_tx().is_some();
         if !mvcc_tx_active {
             if !*auto_commit {
                 return Err(LimboError::TxError(
@@ -6605,7 +6604,7 @@ pub fn op_open_write(
 
     if root_page == SQLITE_SCHEMA_ROOT_PAGE {
         if let Some(mv_store) = mv_store {
-            let Some((tx_id, _)) = program.connection.mv_tx.get() else {
+            let Some(tx_id) = program.connection.get_mv_tx_id() else {
                 return Err(LimboError::InternalError(
                     "Schema changes in MVCC mode require an exclusive MVCC transaction".to_string(),
                 ));
@@ -6623,16 +6622,15 @@ pub fn op_open_write(
         CursorType::BTreeIndex(index) => Some(index),
         _ => None,
     };
-    let mv_cursor = match program.connection.mv_tx.get() {
-        Some((tx_id, _)) => {
-            let table_id = root_page;
-            let mv_store = mv_store.unwrap().clone();
-            let mv_cursor = Arc::new(RwLock::new(
-                MvCursor::new(mv_store.clone(), tx_id, table_id, pager.clone()).unwrap(),
-            ));
-            Some(mv_cursor)
-        }
-        None => None,
+    let mv_cursor = if let Some(tx_id) = program.connection.get_mv_tx_id() {
+        let table_id = root_page;
+        let mv_store = mv_store.unwrap().clone();
+        let mv_cursor = Arc::new(RwLock::new(
+            MvCursor::new(mv_store.clone(), tx_id, table_id, pager.clone()).unwrap(),
+        ));
+        Some(mv_cursor)
+    } else {
+        None
     };
     if let Some(index) = maybe_index {
         let conn = program.connection.clone();
@@ -6934,7 +6932,7 @@ pub fn op_parse_schema(
                 stmt,
                 schema,
                 &conn.syms.read(),
-                program.connection.mv_tx.get(),
+                program.connection.get_mv_tx(),
                 existing_views,
                 mv_store,
             )
@@ -6950,7 +6948,7 @@ pub fn op_parse_schema(
                 stmt,
                 schema,
                 &conn.syms.read(),
-                program.connection.mv_tx.get(),
+                program.connection.get_mv_tx(),
                 existing_views,
                 mv_store,
             )
@@ -7399,16 +7397,15 @@ pub fn op_open_ephemeral(
             let root_page = return_if_io!(pager.btree_create(flag));
 
             let (_, cursor_type) = program.cursor_ref.get(cursor_id).unwrap();
-            let mv_cursor = match program.connection.mv_tx.get() {
-                Some((tx_id, _)) => {
-                    let table_id = root_page as u64;
-                    let mv_store = mv_store.unwrap().clone();
-                    let mv_cursor = Arc::new(RwLock::new(
-                        MvCursor::new(mv_store.clone(), tx_id, table_id, pager.clone()).unwrap(),
-                    ));
-                    Some(mv_cursor)
-                }
-                None => None,
+            let mv_cursor = if let Some(tx_id) = program.connection.get_mv_tx_id() {
+                let table_id = root_page as u64;
+                let mv_store = mv_store.unwrap().clone();
+                let mv_cursor = Arc::new(RwLock::new(
+                    MvCursor::new(mv_store.clone(), tx_id, table_id, pager.clone()).unwrap(),
+                ));
+                Some(mv_cursor)
+            } else {
+                None
             };
 
             let num_columns = match cursor_type {
@@ -7505,19 +7502,18 @@ pub fn op_open_dup(
     // a separate database file).
     let pager = &original_cursor.pager;
 
-    let mv_cursor = match program.connection.mv_tx.get() {
-        Some((tx_id, _)) => {
-            let table_id = root_page as u64;
-            let mv_store = mv_store.unwrap().clone();
-            let mv_cursor = Arc::new(RwLock::new(MvCursor::new(
-                mv_store,
-                tx_id,
-                table_id,
-                pager.clone(),
-            )?));
-            Some(mv_cursor)
-        }
-        None => None,
+    let mv_cursor = if let Some(tx_id) = program.connection.get_mv_tx_id() {
+        let table_id = root_page as u64;
+        let mv_store = mv_store.unwrap().clone();
+        let mv_cursor = Arc::new(RwLock::new(MvCursor::new(
+            mv_store,
+            tx_id,
+            table_id,
+            pager.clone(),
+        )?));
+        Some(mv_cursor)
+    } else {
+        None
     };
 
     let (_, cursor_type) = program.cursor_ref.get(*original_cursor_id).unwrap();
@@ -9483,7 +9479,7 @@ where
     F: Fn(&DatabaseHeader) -> T,
 {
     if let Some(mv_store) = mv_store {
-        let tx_id = program.connection.mv_tx.get().map(|(tx_id, _)| tx_id);
+        let tx_id = program.connection.get_mv_tx_id();
         mv_store.with_header(f, tx_id.as_ref()).map(IOResult::Done)
     } else {
         pager.with_header(&f)
@@ -9500,7 +9496,7 @@ where
     F: Fn(&mut DatabaseHeader) -> T,
 {
     if let Some(mv_store) = mv_store {
-        let tx_id = program.connection.mv_tx.get().map(|(tx_id, _)| tx_id);
+        let tx_id = program.connection.get_mv_tx_id();
         mv_store
             .with_header_mut(f, tx_id.as_ref())
             .map(IOResult::Done)

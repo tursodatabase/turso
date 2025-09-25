@@ -514,7 +514,7 @@ impl Database {
             closed: AtomicBool::new(false),
             attached_databases: RwLock::new(DatabaseCatalog::new()),
             query_only: AtomicBool::new(false),
-            mv_tx: Cell::new(None),
+            mv_tx: RwLock::new(None),
             view_transaction_states: AllViewsTxState::new(),
             metrics: RefCell::new(ConnectionMetrics::new()),
             is_nested_stmt: AtomicBool::new(false),
@@ -1004,7 +1004,7 @@ pub struct Connection {
     /// Attached databases
     attached_databases: RwLock<DatabaseCatalog>,
     query_only: AtomicBool,
-    pub(crate) mv_tx: Cell<Option<(crate::mvcc::database::TxID, TransactionMode)>>,
+    pub(crate) mv_tx: RwLock<Option<(crate::mvcc::database::TxID, TransactionMode)>>,
 
     /// Per-connection view transaction states for uncommitted changes. This represents
     /// one entry per view that was touched in the transaction.
@@ -2242,6 +2242,14 @@ impl Connection {
     fn get_tx_state(&self) -> TransactionState {
         *self.transaction_state.read()
     }
+
+    pub(crate) fn get_mv_tx_id(&self) -> Option<u64> {
+        self.mv_tx.read().map(|(tx_id, _)| tx_id)
+    }
+
+    pub(crate) fn get_mv_tx(&self) -> Option<(u64, TransactionMode)> {
+        *self.mv_tx.read()
+    }
 }
 
 #[derive(Debug)]
@@ -2365,7 +2373,7 @@ impl Statement {
     }
 
     pub fn set_mv_tx(&mut self, mv_tx: Option<(u64, TransactionMode)>) {
-        self.program.connection.mv_tx.set(mv_tx);
+        *self.program.connection.mv_tx.write() = mv_tx;
     }
 
     pub fn interrupt(&mut self) {

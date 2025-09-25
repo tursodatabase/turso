@@ -1392,7 +1392,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     ) -> Result<()> {
         let tx_unlocked = self.txs.get(&tx_id).unwrap();
         let tx = tx_unlocked.value();
-        connection.mv_tx.set(None);
+        *connection.mv_tx.write() = None;
         assert!(tx.state == TransactionState::Active || tx.state == TransactionState::Preparing);
         tx.state.store(TransactionState::Aborted);
         tracing::trace!("abort(tx_id={})", tx_id);

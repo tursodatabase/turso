@@ -834,7 +834,7 @@ impl Program {
             if auto_commit {
                 // FIXME: we don't want to commit stuff from other programs.
                 if matches!(program_state.commit_state, CommitState::Ready) {
-                    let Some((tx_id, _)) = conn.mv_tx.get() else {
+                    let Some(tx_id) = conn.get_mv_tx_id() else {
                         return Ok(IOResult::Done(()));
                     };
                     let state_machine = mv_store.commit_tx(tx_id, &conn).unwrap();
@@ -847,7 +847,7 @@ impl Program {
                 match self.step_end_mvcc_txn(state_machine, mv_store)? {
                     IOResult::Done(_) => {
                         assert!(state_machine.is_finalized());
-                        conn.mv_tx.set(None);
+                        *conn.mv_tx.write() = None;
                         conn.set_tx_state(TransactionState::None);
                         program_state.commit_state = CommitState::Ready;
                         return Ok(IOResult::Done(()));
@@ -1082,7 +1082,7 @@ pub fn handle_program_error(
         LimboError::Busy => {}
         _ => {
             if let Some(mv_store) = mv_store {
-                if let Some((tx_id, _)) = connection.mv_tx.get() {
+                if let Some(tx_id) = connection.get_mv_tx_id() {
                     connection.set_tx_state(TransactionState::None);
                     connection.auto_commit.store(true, Ordering::SeqCst);
                     mv_store.rollback_tx(tx_id, pager.clone(), connection)?;
