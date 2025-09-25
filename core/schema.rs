@@ -1038,6 +1038,12 @@ pub fn create_table(
                     ..
                 } = &c.constraint
                 {
+                    if !primary_key_columns.is_empty() {
+                        crate::bail_parse_error!(
+                            "table \"{}\" has more than one primary key",
+                            tbl_name
+                        );
+                    }
                     if *auto_increment {
                         has_autoincrement = true;
                     }
@@ -1126,6 +1132,12 @@ pub fn create_table(
                             auto_increment,
                             ..
                         } => {
+                            if !primary_key_columns.is_empty() {
+                                crate::bail_parse_error!(
+                                    "table \"{}\" has more than one primary key",
+                                    tbl_name
+                                );
+                            }
                             primary_key = true;
                             if auto_increment {
                                 has_autoincrement = true;
