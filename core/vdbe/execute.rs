@@ -2451,6 +2451,11 @@ pub fn op_auto_commit(
                     "cannot commit - no transaction is active".to_string(),
                 ));
             }
+        } else {
+            let is_begin = !*auto_commit && !*rollback;
+            return Err(LimboError::TxError(
+                "cannot use BEGIN after BEGIN CONCURRENT".to_string(),
+            ));
         }
     }
 
