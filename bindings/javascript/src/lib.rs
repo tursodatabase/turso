@@ -10,13 +10,13 @@
 //! - Iterating through query results
 //! - Managing the I/O event loop
 
-// #[cfg(feature = "browser")]
+#[cfg(feature = "browser")]
 pub mod browser;
 
 use napi::bindgen_prelude::*;
 use napi::{Env, Task};
 use napi_derive::napi;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::{
     cell::{Cell, RefCell},
     num::NonZeroUsize,
@@ -44,7 +44,6 @@ enum PresentationMode {
 #[derive(Clone)]
 pub struct Database {
     inner: Option<Arc<DatabaseInner>>,
-    default_safe_integers: Cell<bool>,
 }
 
 /// database inner is Send to the worker for initial connection
@@ -56,6 +55,7 @@ pub struct DatabaseInner {
     db: OnceLock<Option<Arc<turso_core::Database>>>,
     conn: OnceLock<Option<Arc<turso_core::Connection>>>,
     is_connected: OnceLock<bool>,
+    default_safe_integers: Mutex<bool>,
 }
 
 pub(crate) fn is_memory(path: &str) -> bool {
@@ -163,7 +163,6 @@ fn connect_sync(db: &DatabaseInner) -> napi::Result<()> {
     let mut flags = turso_core::OpenFlags::Create;
     let mut busy_timeout = None;
     if let Some(opts) = &db.opts {
-        init_tracing(&opts.tracing);
         if opts.readonly == Some(true) {
             flags.set(turso_core::OpenFlags::ReadOnly, true);
             flags.set(turso_core::OpenFlags::Create, false);
@@ -221,10 +220,6 @@ impl Database {
     /// # Arguments
     /// * `path` - The path to the database file.
     #[napi(constructor)]
-    pub fn new_napi(path: String, opts: Option<DatabaseOpts>) -> napi::Result<Self> {
-        Self::new(path, opts)
-    }
-
     pub fn new(path: String, opts: Option<DatabaseOpts>) -> napi::Result<Self> {
         let io: Arc<dyn turso_core::IO> = if is_memory(&path) {
             Arc::new(turso_core::MemoryIO::new())
@@ -249,6 +244,9 @@ impl Database {
         io: Arc<dyn turso_core::IO>,
         opts: Option<DatabaseOpts>,
     ) -> napi::Result<Self> {
+        if let Some(opts) = &opts {
+            init_tracing(&opts.tracing);
+        }
         Ok(Self {
             inner: Some(Arc::new(DatabaseInner {
                 path,
@@ -257,35 +255,29 @@ impl Database {
                 db: OnceLock::new(),
                 conn: OnceLock::new(),
                 is_connected: OnceLock::new(),
+                default_safe_integers: Mutex::new(false),
             })),
-            default_safe_integers: Cell::new(false),
         })
     }
 
-    pub fn new_connected(
-        path: String,
-        io: Arc<dyn turso_core::IO>,
-        conn: Arc<turso_core::Connection>,
-    ) -> Self {
-        let db_once = OnceLock::new();
-        db_once.set(None).unwrap();
+    pub fn set_connected(&self, conn: Arc<turso_core::Connection>) -> napi::Result<()> {
+        let inner = self.inner()?;
+        inner
+            .db
+            .set(None)
+            .map_err(|_| create_generic_error("database was already connected"))?;
 
-        let conn_once = OnceLock::new();
-        conn_once.set(Some(conn)).ok().unwrap();
+        inner
+            .conn
+            .set(Some(conn))
+            .map_err(|_| create_generic_error("database was already connected"))?;
 
-        let is_connected_once = OnceLock::new();
-        is_connected_once.set(true).unwrap();
-        Database {
-            inner: Some(Arc::new(DatabaseInner {
-                path,
-                io,
-                opts: None,
-                db: db_once,
-                conn: conn_once,
-                is_connected: is_connected_once,
-            })),
-            default_safe_integers: Cell::new(false),
-        }
+        inner
+            .is_connected
+            .set(true)
+            .map_err(|_| create_generic_error("database was already connected"))?;
+
+        Ok(())
     }
 
     fn inner(&self) -> napi::Result<&Arc<DatabaseInner>> {
@@ -368,7 +360,7 @@ impl Database {
             stmt: Arc::new(RefCell::new(Some(stmt))),
             column_names,
             mode: RefCell::new(PresentationMode::Expanded),
-            safe_integers: Cell::new(self.default_safe_integers.get()),
+            safe_integers: Cell::new(*self.inner()?.default_safe_integers.lock().unwrap()),
         })
     }
 
@@ -419,8 +411,9 @@ impl Database {
     ///
     /// * `toggle` - Whether to use safe integers by default.
     #[napi(js_name = "defaultSafeIntegers")]
-    pub fn default_safe_integers(&self, toggle: Option<bool>) {
-        self.default_safe_integers.set(toggle.unwrap_or(true));
+    pub fn default_safe_integers(&self, toggle: Option<bool>) -> napi::Result<()> {
+        *self.inner()?.default_safe_integers.lock().unwrap() = toggle.unwrap_or(true);
+        Ok(())
     }
 
     /// Runs the I/O loop synchronously.
