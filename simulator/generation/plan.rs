@@ -394,30 +394,6 @@ pub enum InteractionsType {
     Fault(Fault),
 }
 
-impl Shadow for Interactions {
-    type Result = ();
-
-    fn shadow(&self, tables: &mut ShadowTablesMut) {
-        match &self.interactions {
-            InteractionsType::Property(property) => {
-                let initial_tables = tables.clone();
-                for interaction in property.interactions(self.connection_index) {
-                    let res = interaction.shadow(tables);
-                    if res.is_err() {
-                        // If any interaction fails, we reset the tables to the initial state
-                        **tables = initial_tables.clone();
-                        break;
-                    }
-                }
-            }
-            InteractionsType::Query(query) => {
-                let _ = query.shadow(tables);
-            }
-            InteractionsType::Fault(_) => {}
-        }
-    }
-}
-
 impl Interactions {
     pub(crate) fn name(&self) -> Option<&str> {
         match &self.interactions {
@@ -674,15 +650,17 @@ impl Shadow for InteractionType {
     type Result = anyhow::Result<Vec<Vec<SimValue>>>;
     fn shadow(&self, env: &mut ShadowTablesMut) -> Self::Result {
         match self {
-            Self::Query(query) => query.shadow(env),
-            Self::FsyncQuery(query) => {
-                let mut first = query.shadow(env)?;
-                first.extend(query.shadow(env)?);
-                Ok(first)
+            Self::Query(query) => {
+                if !query.is_transaction() {
+                    env.add_query(query);
+                }
+                query.shadow(env)
             }
-            Self::Assumption(_) | Self::Assertion(_) | Self::Fault(_) | Self::FaultyQuery(_) => {
-                Ok(vec![])
-            }
+            Self::Assumption(_)
+            | Self::Assertion(_)
+            | Self::Fault(_)
+            | Self::FaultyQuery(_)
+            | Self::FsyncQuery(_) => Ok(vec![]),
         }
     }
 }
