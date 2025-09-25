@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::schema::Table;
+use crate::schema::{Table, RESERVED_TABLE_PREFIXES};
 use crate::translate::emitter::{
     emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary, OperationMode, Resolver,
 };
@@ -11,7 +11,7 @@ use crate::translate::plan::{
 use crate::vdbe::builder::CursorKey;
 use crate::vdbe::insn::{CmpInsFlags, Cookie};
 use crate::vdbe::BranchOffset;
-use crate::SymbolTable;
+use crate::{bail_parse_error, SymbolTable};
 use crate::{
     schema::{BTreeTable, Column, Index, IndexColumn, PseudoCursorType, Schema},
     storage::pager::CreateBTreeFlags,
@@ -49,6 +49,21 @@ pub fn translate_create_index(
     let original_tbl_name = tbl_name;
     let idx_name = normalize_ident(idx_name);
     let tbl_name = normalize_ident(tbl_name);
+    if RESERVED_TABLE_PREFIXES
+        .iter()
+        .any(|prefix| idx_name.starts_with(prefix))
+    {
+        bail_parse_error!(
+            "Object name reserved for internal use: {}",
+            original_idx_name
+        );
+    }
+    if RESERVED_TABLE_PREFIXES
+        .iter()
+        .any(|prefix| tbl_name.starts_with(prefix))
+    {
+        bail_parse_error!("Object name reserved for internal use: {}", tbl_name);
+    }
     let opts = crate::vdbe::builder::ProgramBuilderOpts {
         num_cursors: 5,
         approx_num_insns: 40,
