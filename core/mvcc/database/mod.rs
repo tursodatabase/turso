@@ -8,6 +8,7 @@ use crate::storage::btree::BTreeKey;
 use crate::storage::btree::CursorValidState;
 use crate::storage::sqlite3_ondisk::DatabaseHeader;
 use crate::storage::wal::TursoRwLock;
+use crate::turso_assert;
 use crate::types::IOCompletions;
 use crate::types::IOResult;
 use crate::types::ImmutableRecord;
@@ -1229,6 +1230,22 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         self.blocking_checkpoint_lock.unlock();
     }
 
+    /// Begins a loading transaction
+    ///
+    /// A loading transaction is one that happens while trying recover from a logical log file.
+    /// This transaction will be stored on tx_id = 0.
+    pub fn begin_load_tx(&self, pager: Arc<Pager>) -> Result<()> {
+        let tx_id = 0;
+        let begin_ts = self.get_timestamp();
+
+        let header = self.get_new_transaction_database_header(&pager);
+        let tx = Transaction::new(tx_id, begin_ts, header);
+        tracing::trace!("begin_load_tx(tx_id={tx_id})");
+        self.txs.insert(tx_id, tx);
+
+        Ok(())
+    }
+
     fn get_new_transaction_database_header(&self, pager: &Arc<Pager>) -> DatabaseHeader {
         if self.global_header.read().is_none() {
             pager.io.block(|| pager.maybe_allocate_page1()).unwrap();
@@ -1319,6 +1336,44 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 self.global_header.clone(),
             ));
         Ok(state_machine)
+    }
+
+    /// Commits a load transaction that is running while recovering from a logical log file.
+    /// This will simply mark timestamps of row version correctly so they are now visible to new
+    /// transactions.
+    pub fn commit_load_tx(&self, tx_id: TxID) {
+        let end_ts = self.get_timestamp();
+        let tx = self.txs.get(&tx_id).unwrap();
+        let tx = tx.value();
+        for rowid in &tx.write_set {
+            let rowid = rowid.value();
+            if let Some(row_versions) = self.rows.get(rowid) {
+                let mut row_versions = row_versions.value().write();
+                // Find rows that were written by this transaction.
+                // Hekaton uses oldest-to-newest order for row versions, so we reverse iterate to find the newest one
+                // this transaction changed.
+                for row_version in row_versions.iter_mut().rev() {
+                    if let TxTimestampOrID::TxID(id) = row_version.begin {
+                        turso_assert!(
+                            id == tx_id,
+                            "only one tx(0) should exist on loading logical log"
+                        );
+                        // New version is valid STARTING FROM committing transaction's end timestamp
+                        // See diagram on page 299: https://www.cs.cmu.edu/~15721-f24/papers/Hekaton.pdf
+                        row_version.begin = TxTimestampOrID::Timestamp(end_ts);
+                    }
+                    if let Some(TxTimestampOrID::TxID(id)) = row_version.end {
+                        turso_assert!(
+                            id == tx_id,
+                            "only one tx(0) should exist on loading logical log"
+                        );
+                        // Old version is valid UNTIL committing transaction's end timestamp
+                        // See diagram on page 299: https://www.cs.cmu.edu/~15721-f24/papers/Hekaton.pdf
+                        row_version.end = Some(TxTimestampOrID::Timestamp(end_ts));
+                    }
+                }
+            }
+        }
     }
 
     /// Rolls back a transaction with the specified ID.
