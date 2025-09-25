@@ -297,7 +297,7 @@ pub fn translate_insert(
                             .map(|col_name| {
                                 let column_name = col_name.as_str();
                                 table
-                                    .get_column_by_name(&column_name)
+                                    .get_column_by_name(column_name)
                                     .unwrap()
                                     .1
                                     .affinity()
@@ -1146,7 +1146,7 @@ fn build_insertion<'a>(
         // Map each named column to its value index
         for (value_index, column_name) in columns.iter().enumerate() {
             let column_name = column_name.as_str();
-            if let Some((idx_in_table, col_in_table)) = table.get_column_by_name(&column_name) {
+            if let Some((idx_in_table, col_in_table)) = table.get_column_by_name(column_name) {
                 // Named column
                 if col_in_table.is_rowid_alias {
                     insertion_key = InsertionKey::RowidAlias(ColMapping {
@@ -1159,7 +1159,7 @@ fn build_insertion<'a>(
                 }
             } else if ROWID_STRS
                 .iter()
-                .any(|s| s.eq_ignore_ascii_case(&column_name))
+                .any(|s| s.eq_ignore_ascii_case(column_name))
             {
                 // Explicit use of the 'rowid' keyword
                 if let Some(col_in_table) = table.columns().iter().find(|c| c.is_rowid_alias) {
@@ -1457,13 +1457,13 @@ pub fn rewrite_partial_index_where(
                 // NOTE: should not have ANY Expr::Columns bound to the expr
                 Expr::Id(ast::Name::Ident(name)) | Expr::Id(ast::Name::Quoted(name)) => {
                     let normalized = name.as_str();
-                    if let Some(reg) = col_reg(&normalized) {
+                    if let Some(reg) = col_reg(normalized) {
                         *e = Expr::Register(reg);
                     }
                 }
                 Expr::Qualified(_, col) | Expr::DoublyQualified(_, _, col) => {
                     let normalized = col.as_str();
-                    if let Some(reg) = col_reg(&normalized) {
+                    if let Some(reg) = col_reg(normalized) {
                         *e = Expr::Register(reg);
                     }
                 }

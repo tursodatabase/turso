@@ -465,7 +465,7 @@ fn query_pragma(
             let mode = match value {
                 Some(ast::Expr::Name(name)) => {
                     let mode_name = name.as_str();
-                    CheckpointMode::from_str(&mode_name).map_err(|e| {
+                    CheckpointMode::from_str(mode_name).map_err(|e| {
                         LimboError::ParseError(format!("Unknown Checkpoint Mode: {e}"))
                     })?
                 }

@@ -3355,7 +3355,7 @@ pub fn bind_and_rewrite_expr<'a>(
                             if let Some(result_columns) = result_columns {
                                 for result_column in result_columns.iter() {
                                     if result_column.name(referenced_tables).is_some_and(|name| {
-                                        name.eq_ignore_ascii_case(&normalized_id)
+                                        name.eq_ignore_ascii_case(normalized_id)
                                     }) {
                                         *expr = result_column.expr.clone();
                                         return Ok(WalkControl::Continue);
@@ -3365,7 +3365,7 @@ pub fn bind_and_rewrite_expr<'a>(
                         }
                         if !referenced_tables.joined_tables().is_empty() {
                             if let Some(row_id_expr) = parse_row_id(
-                                &normalized_id,
+                                normalized_id,
                                 referenced_tables.joined_tables()[0].internal_id,
                                 || referenced_tables.joined_tables().len() != 1,
                             )? {
@@ -3381,7 +3381,7 @@ pub fn bind_and_rewrite_expr<'a>(
                             let col_idx = joined_table.table.columns().iter().position(|c| {
                                 c.name
                                     .as_ref()
-                                    .is_some_and(|name| name.eq_ignore_ascii_case(&normalized_id))
+                                    .is_some_and(|name| name.eq_ignore_ascii_case(normalized_id))
                             });
                             if col_idx.is_some() {
                                 if match_result.is_some() {
@@ -3409,7 +3409,7 @@ pub fn bind_and_rewrite_expr<'a>(
                             for outer_ref in referenced_tables.outer_query_refs().iter() {
                                 let col_idx = outer_ref.table.columns().iter().position(|c| {
                                     c.name.as_ref().is_some_and(|name| {
-                                        name.eq_ignore_ascii_case(&normalized_id)
+                                        name.eq_ignore_ascii_case(normalized_id)
                                     })
                                 });
                                 if col_idx.is_some() {
@@ -3445,7 +3445,7 @@ pub fn bind_and_rewrite_expr<'a>(
                             if let Some(result_columns) = result_columns {
                                 for result_column in result_columns.iter() {
                                     if result_column.name(referenced_tables).is_some_and(|name| {
-                                        name.eq_ignore_ascii_case(&normalized_id)
+                                        name.eq_ignore_ascii_case(normalized_id)
                                     }) {
                                         *expr = result_column.expr.clone();
                                         return Ok(WalkControl::Continue);
@@ -3460,14 +3460,14 @@ pub fn bind_and_rewrite_expr<'a>(
                     Expr::Qualified(tbl, id) => {
                         let normalized_table_name = tbl.as_str();
                         let matching_tbl = referenced_tables
-                            .find_table_and_internal_id_by_identifier(&normalized_table_name);
+                            .find_table_and_internal_id_by_identifier(normalized_table_name);
                         if matching_tbl.is_none() {
                             crate::bail_parse_error!("no such table: {}", normalized_table_name);
                         }
                         let (tbl_id, tbl) = matching_tbl.unwrap();
                         let normalized_id = id.as_str();
 
-                        if let Some(row_id_expr) = parse_row_id(&normalized_id, tbl_id, || false)? {
+                        if let Some(row_id_expr) = parse_row_id(normalized_id, tbl_id, || false)? {
                             *expr = row_id_expr;
 
                             return Ok(WalkControl::Continue);
@@ -3475,7 +3475,7 @@ pub fn bind_and_rewrite_expr<'a>(
                         let col_idx = tbl.columns().iter().position(|c| {
                             c.name
                                 .as_ref()
-                                .is_some_and(|name| name.eq_ignore_ascii_case(&normalized_id))
+                                .is_some_and(|name| name.eq_ignore_ascii_case(normalized_id))
                         });
                         let Some(col_idx) = col_idx else {
                             crate::bail_parse_error!("no such column: {}", normalized_id);
@@ -3518,7 +3518,7 @@ pub fn bind_and_rewrite_expr<'a>(
                             .iter()
                             .position(|c| {
                                 c.name.as_ref().is_some_and(|name| {
-                                    name.eq_ignore_ascii_case(&normalized_col_name)
+                                    name.eq_ignore_ascii_case(normalized_col_name)
                                 })
                             })
                             .ok_or_else(|| {
@@ -3540,7 +3540,7 @@ pub fn bind_and_rewrite_expr<'a>(
                         // For now, we'll error if the table isn't already in the referenced tables
                         let normalized_tbl_name = tbl_name.as_str();
                         let matching_tbl = referenced_tables
-                            .find_table_and_internal_id_by_identifier(&normalized_tbl_name);
+                            .find_table_and_internal_id_by_identifier(normalized_tbl_name);
 
                         if let Some((tbl_id, _)) = matching_tbl {
                             // Table is already in referenced tables, use existing internal ID

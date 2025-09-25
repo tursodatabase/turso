@@ -27,7 +27,7 @@ pub fn translate_analyze(
         bail_parse_error!("ANALYZE with no target is not supported");
     };
     let normalized = target.name.as_str();
-    let Some(target_schema) = schema.get_table(&normalized) else {
+    let Some(target_schema) = schema.get_table(normalized) else {
         bail_parse_error!("ANALYZE <schema_name> is not supported");
     };
     let Some(target_btree) = target_schema.btree() else {

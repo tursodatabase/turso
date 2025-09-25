@@ -155,7 +155,7 @@ impl Schema {
 
             // Remove from table_to_materialized_views dependencies
             for views in self.table_to_materialized_views.values_mut() {
-                views.retain(|v| v != &name);
+                views.retain(|v| v != name);
             }
 
             Ok(())
@@ -210,7 +210,7 @@ impl Schema {
         let name = if name.eq_ignore_ascii_case(SCHEMA_TABLE_NAME_ALT) {
             SCHEMA_TABLE_NAME
         } else {
-            &name
+            name
         };
         self.tables.get(name).cloned()
     }
@@ -1756,9 +1756,9 @@ impl Index {
                 .iter()
                 .any(|c| c.name.as_ref().is_some_and(|cn| cn == name))
         };
-        let is_tbl = |ns: &str| ns.eq_ignore_ascii_case(&tbl_norm);
+        let is_tbl = |ns: &str| ns.eq_ignore_ascii_case(tbl_norm);
         let is_deterministic_fn = |name: &str, argc: usize| {
-            Func::resolve_function(&name, argc).is_ok_and(|f| f.is_deterministic())
+            Func::resolve_function(name, argc).is_ok_and(|f| f.is_deterministic())
         };
 
         let mut ok = true;

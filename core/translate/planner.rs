@@ -487,7 +487,7 @@ fn parse_table(
     // because the query can simply _reference_ them in e.g. the SELECT columns or the WHERE clause,
     // but it's not part of the join order.
     if let Some(outer_ref) =
-        table_references.find_outer_query_ref_by_identifier(&normalized_qualified_name)
+        table_references.find_outer_query_ref_by_identifier(normalized_qualified_name)
     {
         if matches!(outer_ref.table, Table::FromClauseSubquery(_)) {
             table_references.add_joined_table(JoinedTable {
@@ -586,7 +586,7 @@ pub fn parse_from(
             // TODO: sqlite actually allows overriding a catalog table with a CTE.
             // We should carry over the 'Scope' struct to all of our identifier resolution.
             let cte_name_normalized = cte.tbl_name.as_str();
-            if schema.get_table(&cte_name_normalized).is_some() {
+            if schema.get_table(cte_name_normalized).is_some() {
                 crate::bail_parse_error!(
                     "CTE name {} conflicts with catalog table name",
                     cte.tbl_name.as_str()

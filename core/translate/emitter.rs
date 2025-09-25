@@ -1807,7 +1807,7 @@ fn rewrite_where_for_update_registers(
                 if let Some((idx, c)) = columns.iter().enumerate().find(|(_, c)| {
                     c.name
                         .as_ref()
-                        .is_some_and(|n| n.eq_ignore_ascii_case(&normalized))
+                        .is_some_and(|n| n.eq_ignore_ascii_case(normalized))
                 }) {
                     if c.is_rowid_alias {
                         *e = Expr::Register(rowid_reg);
@@ -1820,13 +1820,13 @@ fn rewrite_where_for_update_registers(
                 let normalized = name.as_str();
                 if ROWID_STRS
                     .iter()
-                    .any(|s| s.eq_ignore_ascii_case(&normalized))
+                    .any(|s| s.eq_ignore_ascii_case(normalized))
                 {
                     *e = Expr::Register(rowid_reg);
                 } else if let Some((idx, c)) = columns.iter().enumerate().find(|(_, c)| {
                     c.name
                         .as_ref()
-                        .is_some_and(|n| n.eq_ignore_ascii_case(&normalized))
+                        .is_some_and(|n| n.eq_ignore_ascii_case(normalized))
                 }) {
                     if c.is_rowid_alias {
                         *e = Expr::Register(rowid_reg);

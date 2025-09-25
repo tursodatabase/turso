@@ -2018,7 +2018,7 @@ impl Connection {
                 _ => {
                     // Look up attached database
                     if let Some((idx, _attached_db)) =
-                        self.get_attached_database(&db_name_normalized)
+                        self.get_attached_database(db_name_normalized)
                     {
                         Ok(idx)
                     } else {

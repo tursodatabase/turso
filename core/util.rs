@@ -1289,7 +1289,7 @@ pub fn extract_view_columns(
                 ast::ResultColumn::TableStar(table_ref) => {
                     // For table.*, expand to all columns from the specified table
                     let table_name_str = table_ref.as_str();
-                    if let Some(table_idx) = find_table_index(&table_name_str) {
+                    if let Some(table_idx) = find_table_index(table_name_str) {
                         if let Some(table) = schema.get_table(&tables[table_idx].name) {
                             for table_column in table.columns() {
                                 let col_name =

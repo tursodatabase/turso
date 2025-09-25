@@ -29,7 +29,7 @@ pub fn translate_create_materialized_view(
 
     // Check if view already exists
     if schema
-        .get_materialized_view(&normalized_view_name)
+        .get_materialized_view(normalized_view_name)
         .is_some()
     {
         return Err(crate::LimboError::ParseError(format!(
@@ -134,8 +134,8 @@ pub fn translate_create_materialized_view(
         sqlite_schema_cursor_id,
         None, // cdc_table_cursor_id, no cdc for views
         SchemaEntryType::View,
-        &normalized_view_name,
-        &normalized_view_name,
+        normalized_view_name,
+        normalized_view_name,
         view_root_reg, // btree root for materialized view data
         Some(sql),
     )?;
@@ -236,9 +236,9 @@ pub fn translate_create_view(
     let normalized_view_name = view_name;
 
     // Check if view already exists
-    if schema.get_view(&normalized_view_name).is_some()
+    if schema.get_view(normalized_view_name).is_some()
         || schema
-            .get_materialized_view(&normalized_view_name)
+            .get_materialized_view(normalized_view_name)
             .is_some()
     {
         return Err(crate::LimboError::ParseError(format!(
@@ -266,8 +266,8 @@ pub fn translate_create_view(
         sqlite_schema_cursor_id,
         None, // cdc_table_cursor_id, no cdc for views
         SchemaEntryType::View,
-        &normalized_view_name,
-        &normalized_view_name,
+        normalized_view_name,
+        normalized_view_name,
         0, // Regular views don't have a btree
         Some(sql),
     )?;
@@ -301,8 +301,8 @@ pub fn translate_drop_view(
     let normalized_view_name = view_name;
 
     // Check if view exists (either regular or materialized)
-    let is_regular_view = schema.get_view(&normalized_view_name).is_some();
-    let is_materialized_view = schema.is_materialized_view(&normalized_view_name);
+    let is_regular_view = schema.get_view(normalized_view_name).is_some();
+    let is_materialized_view = schema.is_materialized_view(normalized_view_name);
     let view_exists = is_regular_view || is_materialized_view;
 
     if !view_exists && !if_exists {
@@ -318,7 +318,7 @@ pub fn translate_drop_view(
 
     // If this is a materialized view, we need to destroy its btree as well
     if is_materialized_view {
-        if let Some(table) = schema.get_table(&normalized_view_name) {
+        if let Some(table) = schema.get_table(normalized_view_name) {
             if let Some(btree_table) = table.btree() {
                 // Destroy the btree for the materialized view
                 program.emit_insn(Insn::Destroy {

@@ -50,7 +50,7 @@ pub fn translate_create_index(
 
     // Check if the index is being created on a valid btree table and
     // the name is globally unique in the schema.
-    if !schema.is_unique_idx_name(&idx_name) {
+    if !schema.is_unique_idx_name(idx_name) {
         // If IF NOT EXISTS is specified, silently return without error
         if unique_if_not_exists.1 {
             return Ok(program);
@@ -149,8 +149,8 @@ pub fn translate_create_index(
         db: 0,
     });
     let sql = create_idx_stmt_to_sql(
-        &tbl_name,
-        &idx_name,
+        tbl_name,
+        idx_name,
         unique_if_not_exists,
         &columns,
         &idx.where_clause.clone(),
@@ -163,8 +163,8 @@ pub fn translate_create_index(
         sqlite_schema_cursor_id,
         cdc_table.map(|x| x.0),
         SchemaEntryType::Index,
-        &idx_name,
-        &tbl_name,
+        idx_name,
+        tbl_name,
         root_page_reg,
         Some(sql),
     )?;

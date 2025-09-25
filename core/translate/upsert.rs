@@ -202,7 +202,7 @@ fn partial_index_cols(idx: &Index, table: &Table) -> HashSet<usize> {
                 // Only count columns that belong to this table
                 let nsn = ns.as_str();
                 let tname = table.get_name();
-                if nsn.eq_ignore_ascii_case(&tname) {
+                if nsn.eq_ignore_ascii_case(tname) {
                     if let Some((i, _)) = table.get_column_by_name(c.as_str()) {
                         out.insert(i);
                     }
@@ -910,9 +910,9 @@ fn rewrite_expr_to_registers(
                     // Handle EXCLUDED.* if enabled
                     if allow_excluded && ns.eq_ignore_ascii_case("excluded") {
                         if let Some(ins) = insertion {
-                            if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(&c)) {
+                            if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(c)) {
                                 *expr = Expr::Register(ins.key_register());
-                            } else if let Some(cm) = ins.get_col_mapping_by_name(&c) {
+                            } else if let Some(cm) = ins.get_col_mapping_by_name(c) {
                                 *expr = Expr::Register(cm.register);
                             } else {
                                 bail_parse_error!("no such column in EXCLUDED: {}", c);
@@ -923,9 +923,9 @@ fn rewrite_expr_to_registers(
                     }
 
                     // Match the target table namespace if provided
-                    if let Some(ref tn) = table_name_norm {
+                    if let Some(tn) = table_name_norm {
                         if ns.eq_ignore_ascii_case(tn) {
-                            if let Some(r) = col_reg_from_row_image(&c) {
+                            if let Some(r) = col_reg_from_row_image(c) {
                                 *expr = Expr::Register(r);
                             }
                         }

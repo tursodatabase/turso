@@ -56,7 +56,7 @@ pub fn translate_create_table(
     };
     program.extend(&opts);
     let normalized_tbl_name = tbl_name.name.as_str();
-    if schema.get_table(&normalized_tbl_name).is_some() {
+    if schema.get_table(normalized_tbl_name).is_some() {
         if if_not_exists {
             return Ok(program);
         }
@@ -103,7 +103,7 @@ pub fn translate_create_table(
     // https://github.com/sqlite/sqlite/blob/95f6df5b8d55e67d1e34d2bff217305a2f21b1fb/src/build.c#L2856-L2871
     // https://github.com/sqlite/sqlite/blob/95f6df5b8d55e67d1e34d2bff217305a2f21b1fb/src/build.c#L1334C5-L1336C65
 
-    let index_regs = collect_autoindexes(&body, &mut program, &normalized_tbl_name)?;
+    let index_regs = collect_autoindexes(&body, &mut program, normalized_tbl_name)?;
     if let Some(index_regs) = index_regs.as_ref() {
         if !schema.indexes_enabled() {
             bail_parse_error!("Constraints UNIQUE and PRIMARY KEY (unless INTEGER PRIMARY KEY) on table are not supported without indexes");
@@ -134,8 +134,8 @@ pub fn translate_create_table(
         sqlite_schema_cursor_id,
         cdc_table.map(|x| x.0),
         SchemaEntryType::Table,
-        &normalized_tbl_name,
-        &normalized_tbl_name,
+        normalized_tbl_name,
+        normalized_tbl_name,
         table_root_reg,
         Some(sql),
     )?;
@@ -155,7 +155,7 @@ pub fn translate_create_table(
                 None,
                 SchemaEntryType::Index,
                 &index_name,
-                &normalized_tbl_name,
+                normalized_tbl_name,
                 index_reg,
                 None,
             )?;
