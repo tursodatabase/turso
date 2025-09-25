@@ -33,9 +33,6 @@ pub fn emit_ungrouped_aggregation<'a>(
             func: agg.func.clone(),
         });
     }
-    // we now have the agg results in (agg_start_reg..agg_start_reg + aggregates.len() - 1)
-    // we need to call translate_expr on each result column, but replace the expr with a register copy in case any part of the
-    // result column expression matches a) a group by column or b) an aggregation result.
     for (i, agg) in plan.aggregates.iter().enumerate() {
         t_ctx
             .resolver
@@ -44,19 +41,46 @@ pub fn emit_ungrouped_aggregation<'a>(
     }
     t_ctx.resolver.enable_expr_to_reg_cache();
 
-    // This always emits a ResultRow because currently it can only be used for a single row result
-    // Limit is None because we early exit on limit 0 and the max rows here is 1
-    emit_select_result(
-        program,
-        &t_ctx.resolver,
-        plan,
-        None,
-        None,
-        t_ctx.reg_nonagg_emit_once_flag,
-        t_ctx.reg_offset,
-        t_ctx.reg_result_cols_start.unwrap(),
-        t_ctx.limit_ctx,
-    )?;
+    // Handle OFFSET for ungrouped aggregates
+    // Since we only have one result row, either skip it (offset > 0) or emit it
+    if let Some(offset_reg) = t_ctx.reg_offset {
+        let done_label = program.allocate_label();
+
+        // If offset > 0, jump to end (skip the single row)
+        program.emit_insn(Insn::IfPos {
+            reg: offset_reg,
+            target_pc: done_label,
+            decrement_by: 0,
+        });
+
+        // Offset is 0, fall through to emit the row
+        emit_select_result(
+            program,
+            &t_ctx.resolver,
+            plan,
+            None,
+            None,
+            t_ctx.reg_nonagg_emit_once_flag,
+            None, // we've already handled offset
+            t_ctx.reg_result_cols_start.unwrap(),
+            t_ctx.limit_ctx,
+        )?;
+
+        program.resolve_label(done_label, program.offset());
+    } else {
+        // No offset specified, just emit the row
+        emit_select_result(
+            program,
+            &t_ctx.resolver,
+            plan,
+            None,
+            None,
+            t_ctx.reg_nonagg_emit_once_flag,
+            t_ctx.reg_offset,
+            t_ctx.reg_result_cols_start.unwrap(),
+            t_ctx.limit_ctx,
+        )?;
+    }
 
     Ok(())
 }
