@@ -28,10 +28,7 @@ pub fn translate_create_materialized_view(
     let normalized_view_name = view_name;
 
     // Check if view already exists
-    if schema
-        .get_materialized_view(normalized_view_name)
-        .is_some()
-    {
+    if schema.get_materialized_view(normalized_view_name).is_some() {
         return Err(crate::LimboError::ParseError(format!(
             "View {normalized_view_name} already exists"
         )));
@@ -237,9 +234,7 @@ pub fn translate_create_view(
 
     // Check if view already exists
     if schema.get_view(normalized_view_name).is_some()
-        || schema
-            .get_materialized_view(normalized_view_name)
-            .is_some()
+        || schema.get_materialized_view(normalized_view_name).is_some()
     {
         return Err(crate::LimboError::ParseError(format!(
             "View {normalized_view_name} already exists"
