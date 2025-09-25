@@ -1,6 +1,6 @@
 use rusqlite::types::Value;
-use turso_core::types::ImmutableRecord;
 use serde_json::Value as JsonValue;
+use turso_core::types::ImmutableRecord;
 
 use crate::common::{limbo_exec_rows, TempDatabase};
 
@@ -1165,7 +1165,6 @@ fn test_cdc_schema_changes_alter_table() {
         ]
     );
 }
-
 
 #[test]
 fn test_debezium_json_object() {

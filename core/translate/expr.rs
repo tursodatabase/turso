@@ -1717,7 +1717,7 @@ pub fn translate_expr(
                             Ok(target_register)
                         }
 
-                             ScalarFunc::DebeziumJsonObject => {
+                        ScalarFunc::DebeziumJsonObject => {
                             if args.len() != 5 {
                                 crate::bail_parse_error!(
                                     "debezium_json_object() function must have exactly 5 arguments(for now atleast)",
@@ -1741,7 +1741,7 @@ pub fn translate_expr(
                             });
                             Ok(target_register)
                         }
-                        
+
                         ScalarFunc::Attach => {
                             // ATTACH is handled by the attach.rs module, not here
                             crate::bail_parse_error!(
