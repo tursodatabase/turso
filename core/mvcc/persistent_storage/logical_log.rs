@@ -574,8 +574,8 @@ mod tests {
             let values = record.get_values();
             let foo = values.first().unwrap();
             let RefValue::Text(foo) = foo else {
-            unreachable!()
-        };
+                unreachable!()
+            };
             assert_eq!(foo.as_str(), value.as_str());
         }
     }
