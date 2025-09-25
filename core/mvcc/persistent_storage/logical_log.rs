@@ -413,6 +413,10 @@ impl StreamingLogicalLogReader {
         let c = self.file.pread(self.offset as u64, c)?;
         io.wait_for_completion(c)?;
         self.offset += to_read;
+        // cleanup consumed bytes
+        // this could be better for sure
+        let _ = self.buffer.borrow_mut().drain(0..self.buffer_offset);
+        self.buffer_offset = 0;
         Ok(())
     }
 
