@@ -1117,6 +1117,17 @@ impl Limbo {
         db_display_name: &str,
         table_name: &str,
     ) -> anyhow::Result<bool> {
+        // Yeah, sqlite also has this hardcoded: https://github.com/sqlite/sqlite/blob/31efe5a0f2f80a263457a1fc6524783c0c45769b/src/shell.c.in#L10765
+        match table_name {
+            "sqlite_master" | "sqlite_schema" | "sqlite_temp_master" | "sqlite_temp_schema" => {
+                let schema = format!(
+                                    "CREATE TABLE {table_name} (\n type text,\n name text,\n tbl_name text,\n rootpage integer,\n sql text\n);",
+                                );
+                let _ = self.writeln(&schema);
+                return Ok(true);
+            }
+            _ => {}
+        }
         let sql = format!(
             "SELECT sql, type, name FROM {db_prefix}.sqlite_schema WHERE type IN ('table', 'index', 'view') AND (tbl_name = '{table_name}' OR name = '{table_name}') AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '__turso_internal_%' ORDER BY CASE type WHEN 'table' THEN 1 WHEN 'view' THEN 2 WHEN 'index' THEN 3 END, rowid"
         );

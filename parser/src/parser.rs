@@ -1551,7 +1551,7 @@ impl<'a> Parser<'a> {
                                 b"false" => {
                                     Ok(Box::new(Expr::Literal(Literal::Numeric("0".into()))))
                                 }
-                                _ => return Ok(Box::new(Expr::Id(Name::Ident(s)))),
+                                _ => Ok(Box::new(Expr::Id(Name::Ident(s)))),
                             })
                         }
                         _ => Ok(Box::new(Expr::Id(name))),
