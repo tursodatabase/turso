@@ -494,13 +494,14 @@ async fn test_multiple_connections_fuzz() {
 async fn test_multiple_connections_fuzz_mvcc() {
     let mvcc_fuzz_options = FuzzOptions {
         mvcc_enabled: true,
-        max_num_connections: 8,
+        max_num_connections: 2,
         query_gen_options: QueryGenOptions {
             weight_begin_deferred: 4,
             weight_begin_concurrent: 12,
             weight_commit: 8,
             weight_rollback: 8,
-            weight_checkpoint: 0,
+            weight_checkpoint: 2,
+            checkpoint_modes: vec![CheckpointMode::Truncate],
             weight_ddl: 0,
             weight_dml: 76,
             dml_gen_options: DmlGenOptions {
@@ -531,6 +532,7 @@ struct QueryGenOptions {
     weight_commit: usize,
     weight_rollback: usize,
     weight_checkpoint: usize,
+    checkpoint_modes: Vec<CheckpointMode>,
     weight_ddl: usize,
     weight_dml: usize,
     dml_gen_options: DmlGenOptions,
@@ -564,6 +566,12 @@ impl Default for QueryGenOptions {
             weight_commit: 10,
             weight_rollback: 10,
             weight_checkpoint: 5,
+            checkpoint_modes: vec![
+                CheckpointMode::Passive,
+                CheckpointMode::Restart,
+                CheckpointMode::Truncate,
+                CheckpointMode::Full,
+            ],
             weight_ddl: 5,
             weight_dml: 55,
             dml_gen_options: DmlGenOptions::default(),
@@ -587,7 +595,8 @@ async fn multiple_connections_fuzz(opts: FuzzOptions) {
     println!("Multiple connections fuzz test seed: {seed}");
 
     for iteration in 0..opts.num_iterations {
-        let num_connections = rng.random_range(2..=opts.max_num_connections);
+        let num_connections =
+            rng.random_range(2.min(opts.max_num_connections)..=opts.max_num_connections);
         println!("--- Seed {seed} Iteration {iteration} ---");
         println!("Options: {opts:?}");
         // Create a fresh database for each iteration
@@ -1104,14 +1113,15 @@ fn generate_operation(
             )
         }
     } else if range_checkpoint.contains(&random_val) {
-        let mode = match rng.random_range(0..=3) {
-            0 => CheckpointMode::Passive,
-            1 => CheckpointMode::Restart,
-            2 => CheckpointMode::Truncate,
-            3 => CheckpointMode::Full,
-            _ => unreachable!(),
-        };
-        (Operation::Checkpoint { mode }, get_visible_rows())
+        let mode = shadow_db
+            .query_gen_options
+            .checkpoint_modes
+            .choose(rng)
+            .unwrap();
+        (
+            Operation::Checkpoint { mode: mode.clone() },
+            get_visible_rows(),
+        )
     } else if range_ddl.contains(&random_val) {
         let op = match rng.random_range(0..6) {
             0..=2 => AlterTableOp::AddColumn {

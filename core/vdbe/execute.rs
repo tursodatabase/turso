@@ -1,8 +1,10 @@
 #![allow(unused_variables)]
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::AlterTableFunc;
+use crate::mvcc::database::CheckpointStateMachine;
 use crate::numeric::{NullableInteger, Numeric};
 use crate::schema::Table;
+use crate::state_machine::StateMachine;
 use crate::storage::btree::{
     integrity_check, IntegrityCheckError, IntegrityCheckState, PageCategory,
 };
@@ -33,7 +35,7 @@ use crate::{
     },
     translate::emitter::TransactionMode,
 };
-use crate::{get_cursor, MvCursor};
+use crate::{get_cursor, CheckpointMode, MvCursor};
 use std::env::temp_dir;
 use std::ops::DerefMut;
 use std::{
@@ -375,6 +377,31 @@ pub fn op_checkpoint_inner(
         // attempt to checkpoint in an interactive transaction. This does not end the transaction,
         // however.
         return Err(LimboError::TableLocked);
+    }
+    if let Some(mv_store) = mv_store {
+        if !matches!(checkpoint_mode, CheckpointMode::Truncate { .. }) {
+            return Err(LimboError::InvalidArgument(
+                "Only TRUNCATE checkpoint mode is supported for MVCC".to_string(),
+            ));
+        }
+        let mut ckpt_sm = StateMachine::new(CheckpointStateMachine::new(
+            pager.clone(),
+            mv_store.clone(),
+            program.connection.clone(),
+        ));
+        loop {
+            let result = ckpt_sm.step(&())?;
+            match result {
+                IOResult::IO(io) => {
+                    pager.io.step()?;
+                }
+                IOResult::Done(result) => {
+                    state.op_checkpoint_state =
+                        OpCheckpointState::CompleteResult { result: Ok(result) };
+                    break;
+                }
+            }
+        }
     }
     loop {
         match &mut state.op_checkpoint_state {
@@ -6628,6 +6655,13 @@ pub fn op_create_btree(
     if *db > 0 {
         // TODO: implement temp databases
         todo!("temp databases not implemented yet");
+    }
+
+    if let Some(mv_store) = mv_store {
+        let root_page = mv_store.get_next_table_id();
+        state.registers[*root] = Register::Value(Value::Integer(root_page as i64));
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
     }
     // FIXME: handle page cache is full
     let root_page = return_if_io!(pager.btree_create(flags));

@@ -760,9 +760,7 @@ pub(crate) fn commit_tx(
     conn: &Arc<Connection>,
     tx_id: u64,
 ) -> Result<()> {
-    let mut sm = mv_store
-        .commit_tx(tx_id, conn.pager.read().clone(), conn)
-        .unwrap();
+    let mut sm = mv_store.commit_tx(tx_id, conn).unwrap();
     // TODO: sync IO hack
     loop {
         let res = sm.step(&mv_store)?;
@@ -783,9 +781,7 @@ pub(crate) fn commit_tx_no_conn(
     conn: &Arc<Connection>,
 ) -> Result<(), LimboError> {
     let mv_store = db.get_mvcc_store();
-    let mut sm = mv_store
-        .commit_tx(tx_id, conn.pager.read().clone(), conn)
-        .unwrap();
+    let mut sm = mv_store.commit_tx(tx_id, conn).unwrap();
     // TODO: sync IO hack
     loop {
         let res = sm.step(&mv_store)?;

@@ -31,6 +31,10 @@ impl Storage {
     pub fn sync(&self) -> Result<IOResult<()>> {
         self.logical_log.write().unwrap().sync()
     }
+
+    pub fn truncate(&self) -> Result<IOResult<()>> {
+        self.logical_log.write().unwrap().truncate()
+    }
 }
 
 impl Debug for Storage {
