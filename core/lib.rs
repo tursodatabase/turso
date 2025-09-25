@@ -212,6 +212,7 @@ pub struct Database {
     n_connections: AtomicUsize,
 }
 
+unsafe impl Send for Database {}
 unsafe impl Sync for Database {}
 
 impl fmt::Debug for Database {
