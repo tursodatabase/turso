@@ -5,10 +5,11 @@ mod caver;
 mod common;
 mod editdist;
 mod phonetic;
+mod rsoundex;
 mod soundex;
 
 register_extension! {
-    scalars: {levenshtein, damerau_levenshtein, edit_distance, hamming, jaronwin, osadist, fuzzy_soundex, fuzzy_phonetic, fuzzy_caver},
+    scalars: {levenshtein, damerau_levenshtein, edit_distance, hamming, jaronwin, osadist, fuzzy_soundex, fuzzy_phonetic, fuzzy_caver, fuzzy_rsoundex},
 }
 
 /// Calculates and returns the Levenshtein distance of two non NULL strings.
@@ -419,6 +420,16 @@ pub fn fuzzy_caver(args: &[Value]) {
     }
 }
 
+#[scalar(name = "fuzzy_rsoundex")]
+pub fn fuzzy_rsoundex(args: &[Value]) {
+    let arg1 = args[0].to_text();
+    if let Some(txt) = rsoundex::rsoundex(arg1) {
+        Value::from_text(txt)
+    } else {
+        Value::null()
+    }
+}
+
 //tests adapted from sqlean fuzzy
 #[cfg(test)]
 mod tests {
@@ -596,6 +607,24 @@ mod tests {
             assert_eq!(
                 result, expected,
                 "fuzzy_caver({input:?}) failed: expected {expected:?}, got {result:?}"
+            );
+        }
+    }
+    #[test]
+    fn test_rsoundex() {
+        let cases = vec![
+            (None, None),
+            (Some(""), Some("".to_string())),
+            (Some("phonetics"), Some("P1080603".to_string())),
+            (Some("is"), Some("I03".to_string())),
+            (Some("awesome"), Some("A03080".to_string())),
+        ];
+
+        for (input, expected) in cases {
+            let result = rsoundex::rsoundex(input);
+            assert_eq!(
+                result, expected,
+                "fuzzy_rsoundex({input:?}) failed: expected {expected:?}, got {result:?}"
             );
         }
     }
