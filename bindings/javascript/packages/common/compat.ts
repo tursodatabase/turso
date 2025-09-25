@@ -167,16 +167,30 @@ class Database {
   }
 
   /**
-   * Executes a SQL statement.
+   * Executes the given SQL string
+   * Unlike prepared statements, this can execute strings that contain multiple SQL statements
    *
-   * @param {string} sql - The SQL statement string to execute.
+   * @param {string} sql - The string containing SQL statements to execute
    */
   exec(sql) {
-    let stmt = this.prepare(sql);
+    const exec = this.db.executor(sql);
     try {
-      stmt.run();
+      while (true) {
+        const stepResult = exec.stepSync();
+        if (stepResult === STEP_IO) {
+          this.db.ioLoopSync();
+          continue;
+        }
+        if (stepResult === STEP_DONE) {
+          break;
+        }
+        if (stepResult === STEP_ROW) {
+          // For exec(), we don't need the row data, just continue
+          continue;
+        }
+      }
     } finally {
-      stmt.close();
+      exec.reset();
     }
   }
 

@@ -508,6 +508,7 @@ if (!nativeBinding) {
   throw new Error(`Failed to load native binding`)
 }
 
-const { Database, Statement } = nativeBinding
+const { BatchExecutor, Database, Statement } = nativeBinding
+export { BatchExecutor }
 export { Database }
 export { Statement }

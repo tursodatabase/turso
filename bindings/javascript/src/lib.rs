@@ -121,12 +121,8 @@ pub struct DatabaseOpts {
     pub tracing: Option<String>,
 }
 
-fn step_sync(stmt: &Arc<RefCell<Option<turso_core::Statement>>>) -> napi::Result<u32> {
-    let mut stmt_ref = stmt.borrow_mut();
-    let stmt = stmt_ref
-        .as_mut()
-        .ok_or_else(|| create_generic_error("statement has been finalized"))?;
-
+fn step_sync(stmt: &Arc<RefCell<turso_core::Statement>>) -> napi::Result<u32> {
+    let mut stmt = stmt.borrow_mut();
     match stmt.step() {
         Ok(turso_core::StepResult::Row) => Ok(STEP_ROW),
         Ok(turso_core::StepResult::IO) => Ok(STEP_IO),
@@ -357,11 +353,21 @@ impl Database {
             .collect();
         Ok(Statement {
             #[allow(clippy::arc_with_non_send_sync)]
-            stmt: Arc::new(RefCell::new(Some(stmt))),
+            stmt: Some(Arc::new(RefCell::new(stmt))),
             column_names,
             mode: RefCell::new(PresentationMode::Expanded),
             safe_integers: Cell::new(*self.inner()?.default_safe_integers.lock().unwrap()),
         })
+    }
+
+    #[napi]
+    pub fn executor(&self, sql: String) -> napi::Result<BatchExecutor> {
+        return Ok(BatchExecutor {
+            conn: Some(self.conn()?.clone()),
+            sql,
+            position: 0,
+            stmt: None,
+        });
     }
 
     /// Returns the rowid of the last row inserted.
@@ -432,10 +438,55 @@ impl Database {
     }
 }
 
+#[napi]
+pub struct BatchExecutor {
+    conn: Option<Arc<turso_core::Connection>>,
+    sql: String,
+    position: usize,
+    stmt: Option<Arc<RefCell<turso_core::Statement>>>,
+}
+
+#[napi]
+impl BatchExecutor {
+    #[napi]
+    pub fn step_sync(&mut self) -> Result<u32> {
+        loop {
+            if self.stmt.is_none() && self.position >= self.sql.len() {
+                return Ok(STEP_DONE);
+            }
+            if self.stmt.is_none() {
+                let conn = self.conn.as_ref().unwrap();
+                match conn.consume_stmt(&self.sql[self.position..]) {
+                    Ok(Some((stmt, offset))) => {
+                        self.position += offset;
+                        self.stmt = Some(Arc::new(RefCell::new(stmt)));
+                    }
+                    Ok(None) => return Ok(STEP_DONE),
+                    Err(err) => return Err(to_generic_error("failed to consume stmt", err)),
+                }
+            }
+            let stmt = self.stmt.as_ref().unwrap();
+            match step_sync(stmt) {
+                Ok(STEP_DONE) => {
+                    let _ = self.stmt.take();
+                    continue;
+                }
+                result => return result,
+            }
+        }
+    }
+
+    #[napi]
+    pub fn reset(&mut self) {
+        let _ = self.conn.take();
+        let _ = self.stmt.take();
+    }
+}
+
 /// A prepared statement.
 #[napi]
 pub struct Statement {
-    stmt: Arc<RefCell<Option<turso_core::Statement>>>,
+    stmt: Option<Arc<RefCell<turso_core::Statement>>>,
     column_names: Vec<std::ffi::CString>,
     mode: RefCell<PresentationMode>,
     safe_integers: Cell<bool>,
@@ -443,24 +494,21 @@ pub struct Statement {
 
 #[napi]
 impl Statement {
+    pub fn stmt(&self) -> napi::Result<&Arc<RefCell<turso_core::Statement>>> {
+        self.stmt
+            .as_ref()
+            .ok_or_else(|| create_generic_error("statement has been finalized"))
+    }
     #[napi]
     pub fn reset(&self) -> Result<()> {
-        let mut stmt = self.stmt.borrow_mut();
-        let stmt = stmt
-            .as_mut()
-            .ok_or_else(|| create_generic_error("statement has been finalized"))?;
-        stmt.reset();
+        self.stmt()?.borrow_mut().reset();
         Ok(())
     }
 
     /// Returns the number of parameters in the statement.
     #[napi]
     pub fn parameter_count(&self) -> Result<u32> {
-        let stmt = self.stmt.borrow();
-        let stmt = stmt
-            .as_ref()
-            .ok_or_else(|| create_generic_error("statement has been finalized"))?;
-        Ok(stmt.parameters_count() as u32)
+        Ok(self.stmt()?.borrow().parameters_count() as u32)
     }
 
     /// Returns the name of a parameter at a specific 1-based index.
@@ -470,15 +518,11 @@ impl Statement {
     /// * `index` - The 1-based parameter index.
     #[napi]
     pub fn parameter_name(&self, index: u32) -> Result<Option<String>> {
-        let stmt = self.stmt.borrow();
-        let stmt = stmt
-            .as_ref()
-            .ok_or_else(|| create_generic_error("statement has been finalized"))?;
-
         let non_zero_idx = NonZeroUsize::new(index as usize).ok_or_else(|| {
             create_error(Status::InvalidArg, "parameter index must be greater than 0")
         })?;
 
+        let stmt = self.stmt()?.borrow();
         Ok(stmt.parameters().name(non_zero_idx).map(|s| s.to_string()))
     }
 
@@ -491,11 +535,6 @@ impl Statement {
     /// * `value` - The value to bind.
     #[napi]
     pub fn bind_at(&self, index: u32, value: Unknown) -> Result<()> {
-        let mut stmt = self.stmt.borrow_mut();
-        let stmt = stmt
-            .as_mut()
-            .ok_or_else(|| create_generic_error("statement has been finalized"))?;
-
         let non_zero_idx = NonZeroUsize::new(index as usize).ok_or_else(|| {
             create_error(Status::InvalidArg, "parameter index must be greater than 0")
         })?;
@@ -547,7 +586,7 @@ impl Statement {
             }
         };
 
-        stmt.bind_at(non_zero_idx, turso_value);
+        self.stmt()?.borrow_mut().bind_at(non_zero_idx, turso_value);
         Ok(())
     }
 
@@ -555,17 +594,13 @@ impl Statement {
     /// 1 = Row available, 2 = Done, 3 = I/O needed
     #[napi]
     pub fn step_sync(&self) -> Result<u32> {
-        step_sync(&self.stmt)
+        step_sync(self.stmt()?)
     }
 
     /// Get the current row data according to the presentation mode
     #[napi]
     pub fn row<'env>(&self, env: &'env Env) -> Result<Unknown<'env>> {
-        let stmt_ref = self.stmt.borrow();
-        let stmt = stmt_ref
-            .as_ref()
-            .ok_or_else(|| create_generic_error("statement has been finalized"))?;
-
+        let stmt = self.stmt()?.borrow();
         let row_data = stmt
             .row()
             .ok_or_else(|| create_generic_error("no row data available"))?;
@@ -647,10 +682,7 @@ impl Statement {
     /// Get column information for the statement
     #[napi(ts_return_type = "Promise<any>")]
     pub fn columns<'env>(&self, env: &'env Env) -> Result<Array<'env>> {
-        let stmt_ref = self.stmt.borrow();
-        let stmt = stmt_ref
-            .as_ref()
-            .ok_or_else(|| create_generic_error("statement has been finalized"))?;
+        let stmt = self.stmt()?.borrow();
 
         let column_count = stmt.num_columns();
         let mut js_array = env.create_array(column_count as u32)?;
@@ -682,13 +714,8 @@ impl Statement {
 
     /// Finalizes the statement.
     #[napi]
-    pub fn finalize(&self) -> Result<()> {
-        match self.stmt.try_borrow_mut() {
-            Ok(mut stmt) => {
-                stmt.take();
-            }
-            Err(err) => tracing::error!("borrow error: {:?}", err),
-        }
+    pub fn finalize(&mut self) -> Result<()> {
+        let _ = self.stmt.take();
         Ok(())
     }
 }

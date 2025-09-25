@@ -11,6 +11,14 @@ test('in-memory db', () => {
     expect(rows).toEqual([{ x: 1 }, { x: 3 }]);
 })
 
+test('exec multiple statements', async () => {
+    const db = new Database(":memory:");
+    db.exec("CREATE TABLE t(x); INSERT INTO t VALUES (1); INSERT INTO t VALUES (2)");
+    const stmt = db.prepare("SELECT * FROM t");
+    const rows = stmt.all();
+    expect(rows).toEqual([{ x: 1 }, { x: 2 }]);
+})
+
 test('readonly-db', () => {
     const path = `test-${(Math.random() * 10000) | 0}.db`;
     try {

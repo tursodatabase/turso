@@ -19,6 +19,7 @@ export interface NativeDatabase {
     ioLoopAsync(): Promise<void>;
 
     prepare(sql: string): NativeStatement;
+    executor(sql: string): NativeExecutor;
 
     defaultSafeIntegers(toggle: boolean);
     totalChanges(): number;
@@ -38,6 +39,10 @@ export interface TableColumn {
     type: string
 }
 
+export interface NativeExecutor {
+    stepSync(): number;
+    reset();
+}
 export interface NativeStatement {
     stepAsync(): Promise<number>;
     stepSync(): number;
