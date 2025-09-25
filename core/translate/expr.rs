@@ -3392,7 +3392,22 @@ pub fn bind_and_rewrite_expr<'a>(
                             });
                             if col_idx.is_some() {
                                 if match_result.is_some() {
-                                    crate::bail_parse_error!("Column {} is ambiguous", id.as_str());
+                                    let mut ok = false;
+                                    // Column name ambiguity is ok if it is in the USING clause because then it is deduplicated
+                                    // and the left table is used.
+                                    if let Some(join_info) = &joined_table.join_info {
+                                        if join_info.using.iter().any(|using_col| {
+                                            using_col.as_str().eq_ignore_ascii_case(&normalized_id)
+                                        }) {
+                                            ok = true;
+                                        }
+                                    }
+                                    if !ok {
+                                        crate::bail_parse_error!(
+                                            "Column {} is ambiguous",
+                                            id.as_str()
+                                        );
+                                    }
                                 }
                                 let col =
                                     joined_table.table.columns().get(col_idx.unwrap()).unwrap();
