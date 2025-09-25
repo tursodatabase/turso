@@ -190,6 +190,10 @@ pub(crate) enum Property {
         query: Query,
         tables: Vec<String>,
     },
+    /// Property used to subsititute a property with its queries only
+    Queries {
+        queries: Vec<Query>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -213,8 +217,27 @@ impl Property {
             Property::FsyncNoWait { .. } => "FsyncNoWait",
             Property::FaultyQuery { .. } => "FaultyQuery",
             Property::UNIONAllPreservesCardinality { .. } => "UNION-All-Preserves-Cardinality",
+            Property::Queries { .. } => "Queries",
         }
     }
+
+    pub fn get_extensional_queries(&mut self) -> Option<&mut Vec<Query>> {
+        match self {
+            Property::InsertValuesSelect { queries, .. }
+            | Property::DoubleCreateFailure { queries, .. }
+            | Property::DeleteSelect { queries, .. }
+            | Property::DropSelect { queries, .. }
+            | Property::Queries { queries } => Some(queries),
+            Property::FsyncNoWait { .. } | Property::FaultyQuery { .. } => None,
+            Property::SelectLimit { .. }
+            | Property::SelectSelectOptimizer { .. }
+            | Property::WhereTrueFalseNull { .. }
+            | Property::UNIONAllPreservesCardinality { .. }
+            | Property::ReadYourUpdatesBack { .. }
+            | Property::TableHasExpectedContent { .. } => None,
+        }
+    }
+
     /// interactions construct a list of interactions, which is an executable representation of the property.
     /// the requirement of property -> vec<interaction> conversion emerges from the need to serialize the property,
     /// and `interaction` cannot be serialized directly.
@@ -1028,6 +1051,11 @@ impl Property {
                     )),
                 ].into_iter().map(|i| Interaction::new(connection_index, i)).collect()
             }
+            Property::Queries { queries } => queries
+                .clone()
+                .into_iter()
+                .map(|query| Interaction::new(connection_index, InteractionType::Query(query)))
+                .collect(),
         }
     }
 }

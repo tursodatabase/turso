@@ -371,6 +371,13 @@ impl Interactions {
             interactions,
         }
     }
+
+    pub fn get_extensional_queries(&mut self) -> Option<&mut Vec<Query>> {
+        match &mut self.interactions {
+            InteractionsType::Property(property) => property.get_extensional_queries(),
+            InteractionsType::Query(..) | InteractionsType::Fault(..) => None,
+        }
+    }
 }
 
 impl Deref for Interactions {
