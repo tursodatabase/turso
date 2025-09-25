@@ -609,6 +609,9 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     .write()
                     .replace(*tx_unlocked.header.read());
 
+                mvcc_store
+                    .last_committed_tx_ts
+                    .store(*end_ts, Ordering::Release);
                 if self.did_commit_schema_change {
                     mvcc_store
                         .last_committed_schema_change_ts
@@ -847,6 +850,10 @@ pub struct MvStore<Clock: LogicalClock> {
     /// The timestamp of the last committed schema change.
     /// Schema changes always cause a [SchemaUpdated] error.
     last_committed_schema_change_ts: AtomicU64,
+    /// The timestamp of the last committed transaction.
+    /// If there are two concurrent BEGIN (non-CONCURRENT) transactions, and one tries to promote
+    /// to exclusive, it will abort if another transaction committed after its begin timestamp.
+    last_committed_tx_ts: AtomicU64,
 }
 
 impl<Clock: LogicalClock> MvStore<Clock> {
@@ -869,6 +876,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             blocking_checkpoint_lock: Arc::new(TursoRwLock::new()),
             checkpointed_txid_max: AtomicU64::new(0),
             last_committed_schema_change_ts: AtomicU64::new(0),
+            last_committed_tx_ts: AtomicU64::new(0),
         }
     }
 
@@ -1386,6 +1394,14 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
     /// Acquires the exclusive transaction lock to the given transaction ID.
     fn acquire_exclusive_tx(&self, tx_id: &TxID) -> Result<()> {
+        if let Some(tx) = self.txs.get(tx_id) {
+            let tx = tx.value();
+            if tx.begin_ts < self.last_committed_tx_ts.load(Ordering::Acquire) {
+                // Another transaction committed after this transaction's begin timestamp, do not allow exclusive lock.
+                // This mimics regular (non-CONCURRENT) sqlite transaction behavior.
+                return Err(LimboError::Busy);
+            }
+        }
         let mut exclusive_tx = self.exclusive_tx.write();
         if exclusive_tx.is_some() {
             // Another transaction already holds the exclusive lock
