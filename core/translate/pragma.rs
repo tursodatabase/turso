@@ -4,7 +4,7 @@
 use chrono::Datelike;
 use std::sync::Arc;
 use turso_macros::match_ignore_ascii_case;
-use turso_parser::ast::{self, ColumnDefinition, Expr, Literal, Name};
+use turso_parser::ast::{self, ColumnDefinition, Expr, Literal};
 use turso_parser::ast::{PragmaName, QualifiedName};
 
 use super::integrity_check::translate_integrity_check;
@@ -611,9 +611,10 @@ fn query_pragma(
                 let is_query_only = match value_expr {
                     ast::Expr::Literal(Literal::Numeric(i)) => i.parse::<i64>().unwrap() != 0,
                     ast::Expr::Literal(Literal::String(..)) | ast::Expr::Name(..) => {
-                        let s = match value_expr {
-                            Literal::String(s) => s.as_bytes(),
+                        let s = match &value_expr {
+                            ast::Expr::Literal(Literal::String(s)) => s.as_bytes(),
                             ast::Expr::Name(n) => n.as_str().as_bytes(),
+                            _ => unreachable!(),
                         };
                         match_ignore_ascii_case!(match s {
                             b"1" | b"on" | b"true" => true,

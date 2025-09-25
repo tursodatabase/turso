@@ -1,4 +1,4 @@
-use turso_parser::ast::{Expr, Literal, Name, Operator, UnaryOperator};
+use turso_parser::ast::{Expr, Literal, Operator, UnaryOperator};
 
 use crate::{
     vdbe::{
