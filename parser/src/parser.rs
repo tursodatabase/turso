@@ -605,12 +605,7 @@ impl<'a> Parser<'a> {
 
     fn parse_nm(&mut self) -> Result<Name> {
         let tok = eat_expect!(self, TK_ID, TK_STRING, TK_INDEXED, TK_JOIN_KW);
-
-        let first_char = tok.value[0]; // no need to check empty
-        match first_char {
-            b'[' | b'\'' | b'`' | b'"' => Ok(Name::Quoted(from_bytes(tok.value))),
-            _ => Ok(Name::Ident(from_bytes(tok.value))),
-        }
+        Ok(Name::new(from_bytes(tok.value)))
     }
 
     fn parse_transopt(&mut self) -> Result<Option<Name>> {
@@ -1537,8 +1532,7 @@ impl<'a> Parser<'a> {
                     }
                 } else if can_be_lit_str {
                     Ok(Box::new(Expr::Literal(match name {
-                        Name::Quoted(s) => Literal::String(s),
-                        Name::Ident(s) => Literal::String(s),
+                        Name::Quoted(s) | Name::Ident(s) => Literal::String(s),
                     })))
                 } else {
                     match name {
@@ -1919,11 +1913,7 @@ impl<'a> Parser<'a> {
         }
 
         let tok = eat_expect!(self, TK_ID, TK_STRING);
-        let first_char = tok.value[0]; // no need to check empty
-        match first_char {
-            b'[' | b'\'' | b'`' | b'"' => Ok(Some(Name::Quoted(from_bytes(tok.value)))),
-            _ => Ok(Some(Name::Ident(from_bytes(tok.value)))),
-        }
+        Ok(Some(Name::new(from_bytes(tok.value))))
     }
 
     fn parse_sort_order(&mut self) -> Result<Option<SortOrder>> {

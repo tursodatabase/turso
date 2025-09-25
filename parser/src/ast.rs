@@ -883,37 +883,49 @@ pub struct GroupBy {
 pub enum Name {
     /// Identifier
     Ident(String),
-    /// Quoted values
+    /// Quoted identifier normalized if keyword quotes used before (e.g. `...`, "..." or [...])
+    /// Note, that quotes are **included** in the String, but they will be omitted in the as_str() method
     Quoted(String),
 }
 
 impl Name {
-    pub fn new(s: impl AsRef<str>) -> Self {
-        let s = s.as_ref();
+    pub fn new(s: String) -> Self {
         let bytes = s.as_bytes();
 
         if s.is_empty() {
-            return Name::Ident(s.to_string());
+            return Name::Ident(s);
         }
 
         match bytes[0] {
-            b'"' | b'\'' | b'`' | b'[' => Name::Quoted(s.to_string()),
-            _ => Name::Ident(s.to_string()),
+            b'"' => {
+                assert_eq!(bytes[bytes.len() - 1], b'"');
+                assert!(s.len() >= 2);
+                Name::Quoted(s.to_lowercase())
+            }
+            b'`' => {
+                assert_eq!(bytes[bytes.len() - 1], b'`');
+                assert!(s.len() >= 2);
+                Name::Quoted(s.to_lowercase())
+            }
+            b'[' => {
+                assert_eq!(bytes[bytes.len() - 1], b']');
+                assert!(s.len() >= 2);
+                Name::Quoted(s.to_lowercase())
+            }
+            b'\'' => {
+                assert_eq!(bytes[bytes.len() - 1], b'\'');
+                assert!(s.len() >= 2);
+                Name::Quoted(s)
+            }
+            _ => Name::Ident(s),
         }
     }
 
     pub fn as_str(&self) -> &str {
         match self {
-            Name::Ident(s) | Name::Quoted(s) => s.as_str(),
+            Name::Quoted(s) => &s[1..s.len() - 1],
+            Name::Ident(s) => s,
         }
-    }
-
-    /// Checks if a name represents a double-quoted string that should get fallback behavior
-    pub fn is_double_quoted(&self) -> bool {
-        if let Self::Quoted(ident) = self {
-            return ident.starts_with("\"");
-        }
-        false
     }
 }
 
