@@ -76,7 +76,7 @@ impl Default for FaultProfile {
             read: true,
             write: true,
             sync: true,
-            short_write: false,
+            short_write: true,
         }
     }
 }
