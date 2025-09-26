@@ -190,7 +190,7 @@ pub fn translate_create_materialized_view(
     );
     emit_schema_entry(
         &mut program,
-        &resolver,
+        resolver,
         sqlite_schema_cursor_id,
         None, // cdc_table_cursor_id
         SchemaEntryType::Index,

@@ -142,7 +142,7 @@ pub fn translate_analyze(
         // Add the table entry to sqlite_schema
         emit_schema_entry(
             &mut program,
-            &resolver,
+            resolver,
             sqlite_schema_cursor_id,
             None,
             SchemaEntryType::Table,

@@ -438,7 +438,7 @@ pub fn translate_insert(
             &mut program,
             &insertion,
             yield_reg_opt.unwrap() + 1,
-            &resolver,
+            resolver,
             &temp_table_ctx,
         )?;
     } else {
@@ -449,7 +449,7 @@ pub fn translate_insert(
             db: 0,
         });
 
-        translate_rows_single(&mut program, &values.unwrap(), &insertion, &resolver)?;
+        translate_rows_single(&mut program, &values.unwrap(), &insertion, resolver)?;
     }
 
     // Open all the index btrees for writing
@@ -714,7 +714,7 @@ pub fn translate_insert(
                 Some(&TableReferences::new_empty()),
                 &where_for_eval,
                 reg,
-                &resolver,
+                resolver,
                 NoConstantOptReason::RegisterReuse,
             )?;
             let lbl = program.allocate_label();
@@ -953,7 +953,7 @@ pub fn translate_insert(
                     Some(&TableReferences::new_empty()),
                     &where_for_eval,
                     reg,
-                    &resolver,
+                    resolver,
                     NoConstantOptReason::RegisterReuse,
                 )?;
                 let lbl = program.allocate_label();
@@ -1060,7 +1060,7 @@ pub fn translate_insert(
         };
         emit_cdc_insns(
             &mut program,
-            &resolver,
+            resolver,
             OperationMode::INSERT,
             *cdc_cursor_id,
             insertion.key_register(),
@@ -1100,14 +1100,13 @@ pub fn translate_insert(
 
             emit_upsert(
                 &mut program,
-                resolver.schema,
                 &table,
                 &insertion,
                 cursor_id,
                 conflict_rowid_reg,
                 &mut rewritten_sets,
                 where_clause,
-                &resolver,
+                resolver,
                 &idx_cursors,
                 &mut result_columns,
                 cdc_table.as_ref().map(|c| c.0),

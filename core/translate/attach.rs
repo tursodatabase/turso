@@ -54,7 +54,7 @@ pub fn translate_attach(
             });
         }
         _ => {
-            translate_expr(&mut program, None, expr, arg_reg, &resolver)?;
+            translate_expr(&mut program, None, expr, arg_reg, resolver)?;
         }
     }
 
@@ -85,13 +85,13 @@ pub fn translate_attach(
             });
         }
         _ => {
-            translate_expr(&mut program, None, db_name, arg_reg + 1, &resolver)?;
+            translate_expr(&mut program, None, db_name, arg_reg + 1, resolver)?;
         }
     }
 
     // Load key argument (NULL if not provided)
     if let Some(key_expr) = key {
-        translate_expr(&mut program, None, key_expr, arg_reg + 2, &resolver)?;
+        translate_expr(&mut program, None, key_expr, arg_reg + 2, resolver)?;
     } else {
         program.emit_insn(Insn::Null {
             dest: arg_reg + 2,
@@ -157,7 +157,7 @@ pub fn translate_detach(
             });
         }
         _ => {
-            translate_expr(&mut program, None, expr, arg_reg, &resolver)?;
+            translate_expr(&mut program, None, expr, arg_reg, resolver)?;
         }
     }
 

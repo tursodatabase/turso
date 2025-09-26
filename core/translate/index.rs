@@ -181,7 +181,7 @@ pub fn translate_create_index(
     let cdc_table = prepare_cdc_if_necessary(&mut program, resolver.schema, SQLITE_TABLEID)?;
     emit_schema_entry(
         &mut program,
-        &resolver,
+        resolver,
         sqlite_schema_cursor_id,
         cdc_table.map(|x| x.0),
         SchemaEntryType::Index,
@@ -239,7 +239,7 @@ pub fn translate_create_index(
                 jump_target_when_false: label,
                 jump_target_when_true: BranchOffset::Placeholder,
             },
-            &resolver,
+            resolver,
         )?;
         skip_row_label = Some(label);
     }
@@ -553,7 +553,7 @@ pub fn translate_drop_index(
         };
         emit_cdc_insns(
             &mut program,
-            &resolver,
+            resolver,
             OperationMode::DELETE,
             cdc_cursor_id,
             row_id_reg,

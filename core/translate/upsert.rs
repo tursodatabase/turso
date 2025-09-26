@@ -341,7 +341,6 @@ pub fn resolve_upsert_target(
 /// (unchanged) row. To refer to would-be inserted values, use `excluded.x`.
 pub fn emit_upsert(
     program: &mut ProgramBuilder,
-    schema: &Schema,
     table: &Table,
     insertion: &Insertion,
     tbl_cursor_id: usize,
@@ -476,7 +475,8 @@ pub fn emit_upsert(
         let (changed_cols, rowid_changed) = collect_changed_cols(table, set_pairs);
 
         for (idx_name, _root, idx_cid) in idx_cursors {
-            let idx_meta = schema
+            let idx_meta = resolver
+                .schema
                 .get_index(table.get_name(), idx_name)
                 .expect("index exists");
 
