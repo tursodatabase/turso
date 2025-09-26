@@ -2055,7 +2055,7 @@ mod tests {
         let table = BTreeTable::from_sql(sql, 0)?;
         let column = table.get_column("a").unwrap().1;
         assert!(
-            !column,
+            !column.is_rowid_alias,
             "column 'a´ shouldn't be a rowid alias because table has no rowid"
         );
         Ok(())
