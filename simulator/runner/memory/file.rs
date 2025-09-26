@@ -158,7 +158,7 @@ impl MemorySimFile {
     }
 
     pub fn write_buf(&self, buf: &[u8], offset: usize, short_write: bool) -> usize {
-        let buf_to_write = if short_write && buf.len() > 1 {
+        let buf = if short_write && buf.len() > 1 {
             let mut rng = self.rng.borrow_mut();
             let short_len = rng.random_range(1..buf.len());
             &buf[..short_len]
@@ -168,7 +168,7 @@ impl MemorySimFile {
         };
 
         let mut file_buf = self.buffer.borrow_mut();
-        let len_to_write = buf_to_write.len();
+        let len_to_write = buf.len();
 
         let more_space = if file_buf.len() < offset {
             (offset + len_to_write) - file_buf.len()
@@ -182,7 +182,7 @@ impl MemorySimFile {
             }
         }
 
-        file_buf[offset..][0..len_to_write].copy_from_slice(buf_to_write);
+        file_buf[offset..][0..len_to_write].copy_from_slice(buf);
         len_to_write
     }
 }
