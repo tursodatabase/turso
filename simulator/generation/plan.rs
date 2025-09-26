@@ -233,9 +233,38 @@ impl InteractionPlan {
 
             tracing::debug!("Generating interaction {}/{}", self.len(), num_interactions);
 
-            let out_interactions = interactions.interactions();
+            let mut out_interactions = interactions.interactions();
 
             assert!(!out_interactions.is_empty());
+
+            let out_interactions = if self.mvcc
+                && out_interactions
+                    .iter()
+                    .any(|interaction| interaction.is_ddl())
+            {
+                // DDL statements must be serial, so commit all connections and then execute the DDL
+                let mut commit_interactions = (0..env.connections.len())
+                    .filter(|&idx| env.conn_in_transaction(idx))
+                    .map(|idx| {
+                        let query = Query::Commit(Commit);
+                        let interaction = Interactions::new(idx, InteractionsType::Query(query));
+                        let out_interactions = interaction.interactions();
+                        self.plan.push(interaction);
+                        out_interactions
+                    })
+                    .fold(
+                        Vec::with_capacity(env.connections.len()),
+                        |mut accum, mut curr| {
+                            accum.append(&mut curr);
+                            accum
+                        },
+                    );
+                commit_interactions.append(&mut out_interactions);
+                commit_interactions
+            } else {
+                out_interactions
+            };
+
             self.plan.push(interactions);
             Some(out_interactions)
         } else {
@@ -399,6 +428,15 @@ pub enum InteractionsType {
     Property(Property),
     Query(Query),
     Fault(Fault),
+}
+
+impl InteractionsType {
+    pub fn is_transaction(&self) -> bool {
+        match self {
+            InteractionsType::Query(query) => query.is_transaction(),
+            _ => false,
+        }
+    }
 }
 
 impl Interactions {
@@ -671,7 +709,17 @@ impl Shadow for InteractionType {
         }
     }
 }
+
 impl InteractionType {
+    pub fn is_ddl(&self) -> bool {
+        match self {
+            InteractionType::Query(query)
+            | InteractionType::FsyncQuery(query)
+            | InteractionType::FaultyQuery(query) => query.is_ddl(),
+            _ => false,
+        }
+    }
+
     pub(crate) fn execute_query(&self, conn: &mut Arc<Connection>) -> ResultSet {
         if let Self::Query(query) = self {
             let query_str = query.to_string();
