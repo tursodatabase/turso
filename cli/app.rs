@@ -1209,26 +1209,14 @@ impl Limbo {
                     };
 
                 // Query only the specific table in the specific database
-                let found = if target_db == "main" {
-                    self.query_one_table_schema("main", "main", table_name)?
+                if target_db == "main" {
+                    self.query_one_table_schema("main", "main", table_name)?;
                 } else {
                     // Check if the database is attached
                     let attached_databases = self.conn.list_attached_databases();
                     if attached_databases.contains(&target_db.to_string()) {
-                        self.query_one_table_schema(target_db, target_db, table_name)?
-                    } else {
-                        false
+                        self.query_one_table_schema(target_db, target_db, table_name)?;
                     }
-                };
-
-                if !found {
-                    let table_display = if target_db == "main" {
-                        table_name.to_string()
-                    } else {
-                        format!("{target_db}.{table_name}")
-                    };
-                    let _ = self
-                        .writeln_fmt(format_args!("-- Error: Table '{table_display}' not found."));
                 }
             }
             None => {

@@ -100,7 +100,7 @@ def test_switch_back_to_in_memory():
     shell.run_test("open-testing-db-file", ".open testing/testing.db", "")
     # Then switch back to :memory:
     shell.run_test("switch-back", ".open :memory:", "")
-    shell.run_test("schema-in-memory", ".schema users", "-- Error: Table 'users' not found.")
+    shell.run_test("schema-in-memory", ".schema users", "")
     shell.quit()
 
 
