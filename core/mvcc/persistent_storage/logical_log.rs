@@ -15,7 +15,7 @@ use crate::{types::IOResult, File};
 pub struct LogicalLog {
     pub file: Arc<dyn File>,
     offset: u64,
-    recover: bool,
+    needs_recovery: bool,
 }
 
 /// Log's Header, this will be the 64 bytes in any logical log file.
@@ -140,7 +140,7 @@ impl LogicalLog {
         Self {
             file,
             offset: 0,
-            recover,
+            needs_recovery: recover,
         }
     }
 
@@ -218,11 +218,11 @@ impl LogicalLog {
     }
 
     pub fn needs_recover(&self) -> bool {
-        self.recover
+        self.needs_recovery
     }
 
     pub fn mark_recovered(&mut self) {
-        self.recover = false;
+        self.needs_recovery = false;
     }
 }
 
