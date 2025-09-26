@@ -220,4 +220,11 @@ endif
 	sqlite3 "testing-turso-$(SEED).db" '.clone testing-sqlite-$(SEED).db'
 	sleep 1
 	@echo "Running fuzzing tests..."
-	SEED=$(SEED) cargo test -- --ignored  large_database_fuzz
+	if ! SEED=$(SEED) cargo test -- --ignored large_database_fuzz; then \
+		echo "Test failed, dumping databases..."; \
+		sqlite3 "testing-turso-$(SEED).db" .dump > "turso-$(SEED).sql"; \
+		sqlite3 "testing-sqlite-$(SEED).db" .dump > "sqlite-$(SEED).sql"; \
+		diff -u "sqlite-$(SEED).sql" "turso-$(SEED).sql" > "diff-$(SEED).txt" || true; \
+		echo "db files have been .dump'd and the diff has been saved to diff-$(SEED).txt"; \
+		exit 1; \
+	fi
