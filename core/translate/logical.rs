@@ -415,9 +415,7 @@ impl<'a> LogicalPlanBuilder<'a> {
 
     // Convert Name to String
     fn name_to_string(name: &ast::Name) -> String {
-        match name {
-            ast::Name::Ident(s) | ast::Name::Quoted(s) => s.clone(),
-        }
+        name.as_str().to_string()
     }
 
     // Build a SELECT statement
@@ -836,7 +834,7 @@ impl<'a> LogicalPlanBuilder<'a> {
                 .iter()
                 .any(|col| col.name == left_col.name)
             {
-                common_columns.push(ast::Name::Ident(left_col.name.clone()));
+                common_columns.push(ast::Name::exact(left_col.name.clone()));
             }
         }
 

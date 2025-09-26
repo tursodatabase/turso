@@ -613,7 +613,7 @@ impl ToTokens for UpdatePlan {
                     .unwrap();
 
                 ast::Set {
-                    col_names: vec![ast::Name::new(col_name)],
+                    col_names: vec![ast::Name::exact(col_name.clone())],
                     expr: set_expr.clone(),
                 }
             }),

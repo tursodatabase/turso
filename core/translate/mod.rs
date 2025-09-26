@@ -165,8 +165,8 @@ pub fn translate_inner(
             where_clause,
         } => translate_create_index(
             (unique, if_not_exists),
-            idx_name.name.as_str(),
-            tbl_name.as_str(),
+            &idx_name.name,
+            &tbl_name,
             &columns,
             schema,
             syms,
@@ -197,7 +197,7 @@ pub fn translate_inner(
             ..
         } => view::translate_create_view(
             schema,
-            view_name.name.as_str(),
+            &view_name.name,
             &select,
             &columns,
             connection.clone(),
@@ -208,7 +208,7 @@ pub fn translate_inner(
             view_name, select, ..
         } => view::translate_create_materialized_view(
             schema,
-            view_name.name.as_str(),
+            &view_name.name,
             &select,
             connection.clone(),
             syms,

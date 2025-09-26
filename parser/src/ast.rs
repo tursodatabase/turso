@@ -879,41 +879,129 @@ pub struct GroupBy {
 
 /// identifier or string or `CROSS` or `FULL` or `INNER` or `LEFT` or `NATURAL` or `OUTER` or `RIGHT`.
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub enum Name {
-    /// Identifier
-    Ident(String),
-    /// Quoted values
-    Quoted(String),
+pub struct Name {
+    quote: Option<char>,
+    value: String,
+}
+
+#[cfg(feature = "serde")]
+impl serde::Serialize for Name {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.value)
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for Name {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct NameVisitor;
+        impl<'de> serde::de::Visitor<'de> for NameVisitor {
+            type Value = Name;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a string")
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(Name::from_bytes(v.as_bytes()))
+            }
+        }
+        deserializer.deserialize_str(NameVisitor)
+    }
 }
 
 impl Name {
-    pub fn new(s: impl AsRef<str>) -> Self {
+    /// Create name which will have exactly the value of given string
+    /// (e.g. if s = "\"str\"" - the name value will contain quotes and translation to SQL will give us """str""")
+    pub fn exact(s: String) -> Self {
+        Self {
+            value: s,
+            quote: None,
+        }
+    }
+    /// Parse name from the bytes (e.g. handle quoting and handle escaped quotes)
+    pub fn from_bytes(s: &[u8]) -> Self {
+        Self::from_string(unsafe { std::str::from_utf8_unchecked(s) })
+    }
+    /// Parse name from the string (e.g. handle quoting and handle escaped quotes)
+    pub fn from_string(s: impl AsRef<str>) -> Self {
         let s = s.as_ref();
         let bytes = s.as_bytes();
 
         if s.is_empty() {
-            return Name::Ident(s.to_string());
+            return Name::exact(s.to_string());
         }
 
-        match bytes[0] {
-            b'"' | b'\'' | b'`' | b'[' => Name::Quoted(s.to_string()),
-            _ => Name::Ident(s.to_string()),
+        if matches!(bytes[0], b'"' | b'\'' | b'`') {
+            assert!(s.len() >= 2);
+            assert!(bytes[bytes.len() - 1] == bytes[0]);
+            let s = match bytes[0] {
+                b'"' => s[1..s.len() - 1].replace("\"\"", "\""),
+                b'\'' => s[1..s.len() - 1].replace("''", "'"),
+                b'`' => s[1..s.len() - 1].replace("``", "`"),
+                _ => unreachable!(),
+            };
+            Name {
+                value: s,
+                quote: Some(bytes[0] as char),
+            }
+        } else if bytes[0] == b'[' {
+            assert!(s.len() >= 2);
+            assert!(bytes[bytes.len() - 1] == b']');
+            Name::exact(s[1..s.len() - 1].to_string())
+        } else {
+            Name::exact(s.to_string())
         }
     }
 
+    /// Return string value of the name
     pub fn as_str(&self) -> &str {
-        match self {
-            Name::Ident(s) | Name::Quoted(s) => s.as_str(),
+        &self.value
+    }
+
+    /// Convert value to the string literal (e.g. single-quoted string with escaped single quotes)
+    pub fn as_literal(&self) -> String {
+        format!("'{}'", self.value.replace("'", "''"))
+    }
+
+    /// Convert value to the name string (e.g. double-quoted string with escaped double quotes)
+    pub fn as_ident(&self) -> String {
+        // let's keep original quotes if they were set
+        // (parser.rs tests validates that behaviour)
+        if let Some(quote) = self.quote {
+            let single = quote.to_string();
+            let double = single.clone() + &single;
+            return format!("{}{}{}", quote, self.value.replace(&single, &double), quote);
+        }
+        let value = self.value.as_bytes();
+        let safe_char = |&c: &u8| c.is_ascii_alphanumeric() || c == b'_';
+        if !value.is_empty() && value.iter().all(safe_char) {
+            self.value.clone()
+        } else {
+            format!("\"{}\"", self.value.replace("\"", "\"\""))
         }
     }
 
-    /// Checks if a name represents a double-quoted string that should get fallback behavior
-    pub fn is_double_quoted(&self) -> bool {
-        if let Self::Quoted(ident) = self {
-            return ident.starts_with("\"");
-        }
-        false
+    /// Checks if a name represents a quoted string that should get fallback behavior
+    /// Need to detect legacy conversion of double quoted keywords to string literals
+    /// (see https://sqlite.org/lang_keywords.html)
+    ///
+    /// Also, used to detect string literals in PRAGMA cases
+    pub fn quoted_with(&self, quote: char) -> bool {
+        self.quote == Some(quote)
+    }
+
+    pub fn quoted(&self) -> bool {
+        self.quote.is_some()
     }
 }
 

@@ -11,7 +11,7 @@ use turso_parser::ast;
 
 pub fn translate_create_materialized_view(
     schema: &Schema,
-    view_name: &str,
+    view_name: &ast::Name,
     select_stmt: &ast::Select,
     connection: Arc<Connection>,
     syms: &SymbolTable,
@@ -25,7 +25,7 @@ pub fn translate_create_materialized_view(
         ));
     }
 
-    let normalized_view_name = normalize_ident(view_name);
+    let normalized_view_name = normalize_ident(view_name.as_str());
 
     // Check if view already exists
     if schema
@@ -46,7 +46,7 @@ pub fn translate_create_materialized_view(
     let view_columns = view_column_schema.flat_columns();
 
     // Reconstruct the SQL string for storage
-    let sql = create_materialized_view_to_str(view_name, select_stmt);
+    let sql = create_materialized_view_to_str(&view_name.as_ident(), select_stmt);
 
     // Create a btree for storing the materialized view state
     // This btree will hold the materialized rows (row_id -> values)
@@ -145,14 +145,16 @@ pub fn translate_create_materialized_view(
     // Add the DBSP state table to sqlite_master (required for materialized views)
     // Include the version number in the table name
     use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
-    let dbsp_table_name =
-        format!("{DBSP_TABLE_PREFIX}{DBSP_CIRCUIT_VERSION}_{normalized_view_name}");
+    let dbsp_table_name = ast::Name::exact(format!(
+        "{DBSP_TABLE_PREFIX}{DBSP_CIRCUIT_VERSION}_{normalized_view_name}"
+    ));
+    let dbsp_table_ident = dbsp_table_name.as_ident();
     // The element_id column uses SQLite's dynamic typing system to store different value types:
     // - For hash-based operators (joins, filters): stores INTEGER hash values or rowids
     // - For future MIN/MAX operators: stores the actual values being compared (INTEGER, REAL, TEXT, BLOB)
     // SQLite's type affinity and sorting rules ensure correct ordering within each operator's data
     let dbsp_sql = format!(
-        "CREATE TABLE {dbsp_table_name} (\
+        "CREATE TABLE {dbsp_table_ident} (\
          operator_id INTEGER NOT NULL, \
          zset_id BLOB NOT NULL, \
          element_id BLOB NOT NULL, \
@@ -168,8 +170,8 @@ pub fn translate_create_materialized_view(
         sqlite_schema_cursor_id,
         None, // cdc_table_cursor_id
         SchemaEntryType::Table,
-        &dbsp_table_name,
-        &dbsp_table_name,
+        dbsp_table_name.as_str(),
+        dbsp_table_name.as_str(),
         dbsp_state_root_reg, // Root for DBSP state table
         Some(dbsp_sql),
     )?;
@@ -186,7 +188,8 @@ pub fn translate_create_materialized_view(
     // Register the index in sqlite_schema
     let dbsp_index_name = format!(
         "{}{}_1",
-        PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX, &dbsp_table_name
+        PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX,
+        &dbsp_table_name.as_str()
     );
     emit_schema_entry(
         &mut program,
@@ -195,7 +198,7 @@ pub fn translate_create_materialized_view(
         None, // cdc_table_cursor_id
         SchemaEntryType::Index,
         &dbsp_index_name,
-        &dbsp_table_name,
+        dbsp_table_name.as_str(),
         dbsp_index_root_reg,
         None, // Automatic indexes don't store SQL
     )?;
@@ -231,14 +234,14 @@ fn create_materialized_view_to_str(view_name: &str, select_stmt: &ast::Select) -
 
 pub fn translate_create_view(
     schema: &Schema,
-    view_name: &str,
+    view_name: &ast::Name,
     select_stmt: &ast::Select,
     _columns: &[ast::IndexedColumn],
     _connection: Arc<Connection>,
     syms: &SymbolTable,
     mut program: ProgramBuilder,
 ) -> Result<ProgramBuilder> {
-    let normalized_view_name = normalize_ident(view_name);
+    let normalized_view_name = normalize_ident(view_name.as_str());
 
     // Check if view already exists
     if schema.get_view(&normalized_view_name).is_some()
@@ -252,7 +255,7 @@ pub fn translate_create_view(
     }
 
     // Reconstruct the SQL string
-    let sql = create_view_to_str(view_name, select_stmt);
+    let sql = create_view_to_str(&view_name.as_ident(), select_stmt);
 
     // Open cursor to sqlite_schema table
     let table = schema.get_btree_table(SQLITE_TABLEID).unwrap();

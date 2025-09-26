@@ -37,7 +37,7 @@ use std::sync::Mutex;
 use tracing::trace;
 use turso_parser::ast::{self, ColumnDefinition, Expr, Literal, SortOrder, TableOptions};
 use turso_parser::{
-    ast::{Cmd, CreateTableBody, Name, ResultColumn, Stmt},
+    ast::{Cmd, CreateTableBody, ResultColumn, Stmt},
     parser::Parser,
 };
 
@@ -1927,7 +1927,7 @@ impl Index {
             match e {
                 Expr::Literal(_) | Expr::RowId { .. } => {}
                 // Unqualified identifier: must be a column of the target table or ROWID
-                Expr::Id(Name::Ident(n)) | Expr::Id(Name::Quoted(n)) => {
+                Expr::Id(n) => {
                     let n = n.as_str();
                     if !ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(n)) && !has_col(n) {
                         ok = false;
