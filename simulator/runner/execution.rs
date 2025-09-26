@@ -224,7 +224,9 @@ pub fn execute_interaction_turso(
             stack.push(results);
             // Reset fault injection
             env.io.inject_fault(false);
-            env.io.inject_short_write(false);
+            if env.memory_io {
+                env.io.inject_short_write(false);
+            }
             // TODO: skip integrity check with mvcc
             if !env.profile.experimental_mvcc {
                 limbo_integrity_check(&conn)?;
