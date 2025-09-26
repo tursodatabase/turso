@@ -260,10 +260,10 @@ impl StreamingLogicalLogReader {
 
     pub fn read_header(&mut self) -> Result<Completion> {
         let header_buf = Arc::new(Buffer::new_temporary(LOG_HEADER_MAX_SIZE));
-        let header = Arc::new(RefCell::new(LogHeader::default()));
+        let header = Arc::new(RwLock::new(LogHeader::default()));
         let completion: Box<ReadComplete> = Box::new(move |res| {
             let header = header.clone();
-            let mut header = header.borrow_mut();
+            let mut header = header.write().unwrap();
             let Ok((buf, bytes_read)) = res else {
                 tracing::error!("couldn't ready log err={:?}", res,);
                 return;
