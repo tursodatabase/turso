@@ -3446,10 +3446,6 @@ impl<'a> Parser<'a> {
 
     pub fn parse_column_definition(&mut self, in_alter: bool) -> Result<ColumnDefinition> {
         let col_name = self.parse_nm()?;
-        if !in_alter && col_name.as_str().eq_ignore_ascii_case("rowid") {
-            return Err(Error::Custom("cannot use reserved word: ROWID".to_owned()));
-        }
-
         let col_type = self.parse_type()?;
         let constraints = self.parse_named_column_constraints(in_alter)?;
         Ok(ColumnDefinition {
@@ -4039,7 +4035,6 @@ mod tests {
             "ALTER TABLE my_table ADD COLUMN my_column PRIMARY KEY",
             "ALTER TABLE my_table ADD COLUMN my_column UNIQUE",
             "CREATE TEMP TABLE baz.foo(bar)",
-            "CREATE TABLE foo(rowid)",
             "CREATE TABLE foo(d INT AS (a*abs(b)))",
             "CREATE TABLE foo(d INT AS (a*abs(b)))",
             "CREATE TABLE foo(bar UNKNOWN_INT) STRICT",
