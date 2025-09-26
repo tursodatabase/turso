@@ -596,7 +596,7 @@ mod tests {
             txns.push(ops);
         }
         // let's not drop db as we don't want files to be removed
-        let db = MvccTestDbNoConn::new_with_random_db();
+        let mut db = MvccTestDbNoConn::new_with_random_db();
         let (io, pager) = {
             let conn = db.connect();
             let pager = conn.pager.read().clone();
@@ -624,12 +624,10 @@ mod tests {
             (db.io.clone(), pager)
         };
 
-        // Now try to read it back
-        let log_file = db.get_log_path();
-
-        let file = io.open_file(log_file, OpenFlags::ReadOnly, false).unwrap();
-        let mvcc_store = Arc::new(MvStore::new(LocalClock::new(), Storage::new(file.clone())));
-        mvcc_store.recover_logical_log(&io, &pager).unwrap();
+        db.restart();
+        // connect after restart should recover log.
+        let conn = db.connect();
+        let mvcc_store = db.get_mvcc_store();
 
         // Check rowids that weren't deleted
         let tx = mvcc_store.begin_tx(pager.clone()).unwrap();
