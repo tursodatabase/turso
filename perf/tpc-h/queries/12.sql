@@ -20,8 +20,8 @@ where
 	and l_shipmode in ('FOB', 'SHIP')
 	and l_commitdate < l_receiptdate
 	and l_shipdate < l_commitdate
-	and l_receiptdate >= cast('1994-01-01' as datetime)
-	and l_receiptdate < cast('1995-01-01' as datetime) -- modified not to include cast({'year': 1} as interval)
+	and l_receiptdate >= '1994-01-01'
+	and l_receiptdate < '1995-01-01' -- modified not to include cast({'year': 1} as interval)
 group by
 	l_shipmode
 order by
