@@ -1250,6 +1250,10 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         let header = self.get_new_transaction_database_header(&pager);
         let tx = Transaction::new(tx_id, begin_ts, header);
         tracing::trace!("begin_load_tx(tx_id={tx_id})");
+        assert!(
+            !self.txs.contains_key(&tx_id),
+            "somehow we tried to call begin_load_tx twice"
+        );
         self.txs.insert(tx_id, tx);
 
         Ok(())
