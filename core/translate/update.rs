@@ -228,36 +228,40 @@ pub fn prepare_update_plan(
         for (col_name, expr) in set.col_names.iter().zip(values.iter()) {
             let ident = normalize_ident(col_name.as_str());
 
-            // Check if this is the 'rowid' keyword
-            if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(&ident)) {
-                // Find the rowid alias column if it exists
-                if let Some((idx, _col)) = table
-                    .columns()
-                    .iter()
-                    .enumerate()
-                    .find(|(_, c)| c.is_rowid_alias)
-                {
-                    // Use the rowid alias column index
-                    match set_clauses.iter_mut().find(|(i, _)| i == &idx) {
-                        Some((_, existing_expr)) => *existing_expr = expr.clone(),
-                        None => set_clauses.push((idx, expr.clone())),
-                    }
-                } else {
-                    // No rowid alias, use sentinel value for actual rowid
-                    match set_clauses.iter_mut().find(|(i, _)| *i == ROWID_SENTINEL) {
-                        Some((_, existing_expr)) => *existing_expr = expr.clone(),
-                        None => set_clauses.push((ROWID_SENTINEL, expr.clone())),
+            let col_index = match column_lookup.get(&ident) {
+                Some(idx) => *idx,
+                None => {
+                    // Check if this is the 'rowid' keyword
+                    if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(&ident)) {
+                        // Find the rowid alias column if it exists
+                        if let Some((idx, _col)) = table
+                            .columns()
+                            .iter()
+                            .enumerate()
+                            .find(|(_i, c)| c.is_rowid_alias)
+                        {
+                            // Use the rowid alias column index
+                            match set_clauses.iter_mut().find(|(i, _)| i == &idx) {
+                                Some((_, existing_expr)) => *existing_expr = expr.clone(),
+                                None => set_clauses.push((idx, expr.clone())),
+                            }
+                            idx
+                        } else {
+                            // No rowid alias, use sentinel value for actual rowid
+                            match set_clauses.iter_mut().find(|(i, _)| *i == ROWID_SENTINEL) {
+                                Some((_, existing_expr)) => *existing_expr = expr.clone(),
+                                None => set_clauses.push((ROWID_SENTINEL, expr.clone())),
+                            }
+                            ROWID_SENTINEL
+                        }
+                    } else {
+                        crate::bail_parse_error!("no such column: {}.{}", table_name, col_name);
                     }
                 }
-            } else {
-                let col_index = match column_lookup.get(&ident) {
-                    Some(idx) => idx,
-                    None => bail_parse_error!("no such column: {}", ident),
-                };
-                match set_clauses.iter_mut().find(|(idx, _)| idx == col_index) {
-                    Some((_, existing_expr)) => *existing_expr = expr.clone(),
-                    None => set_clauses.push((*col_index, expr.clone())),
-                }
+            };
+            match set_clauses.iter_mut().find(|(idx, _)| *idx == col_index) {
+                Some((_, existing_expr)) => *existing_expr = expr.clone(),
+                None => set_clauses.push((col_index, expr.clone())),
             }
         }
     }
