@@ -27,7 +27,7 @@ use super::plan::{Assertion, Interaction, InteractionStats, ResultSet};
 /// Properties are representations of executable specifications
 /// about the database behavior.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) enum Property {
+pub enum Property {
     /// Insert-Select is a property in which the inserted row
     /// must be in the resulting rows of a select query that has a
     /// where clause that matches the inserted row.

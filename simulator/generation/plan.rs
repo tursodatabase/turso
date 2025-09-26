@@ -36,8 +36,10 @@ pub(crate) type ResultSet = Result<Vec<Vec<SimValue>>>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct InteractionPlan {
-    pub plan: Vec<Interactions>,
+    plan: Vec<Interactions>,
     pub mvcc: bool,
+    // Len should not count transactions statements, just so we can generate more meaningful interactions per run
+    len: usize,
 }
 
 impl InteractionPlan {
@@ -45,16 +47,34 @@ impl InteractionPlan {
         Self {
             plan: Vec::new(),
             mvcc,
+            len: 0,
         }
     }
 
     pub fn new_with(plan: Vec<Interactions>, mvcc: bool) -> Self {
-        Self { plan, mvcc }
+        let len = plan
+            .iter()
+            .filter(|interaction| !interaction.is_transaction())
+            .count();
+        Self { plan, mvcc, len }
     }
 
     #[inline]
     pub fn plan(&self) -> &[Interactions] {
         &self.plan
+    }
+
+    /// Length of interactions that are not transaction statements
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn push(&mut self, interactions: Interactions) {
+        if !interactions.is_transaction() {
+            self.len += 1;
+        }
+        self.plan.push(interactions);
     }
 
     /// Compute via diff computes a a plan from a given `.plan` file without the need to parse
@@ -199,7 +219,7 @@ impl InteractionPlan {
         let create_query = Create::arbitrary(&mut env.rng.clone(), &env.connection_context(0));
 
         // initial query starts at 0th connection
-        plan.plan.push(Interactions::new(
+        plan.push(Interactions::new(
             0,
             InteractionsType::Query(Query::Create(create_query)),
         ));
@@ -249,7 +269,7 @@ impl InteractionPlan {
                         let query = Query::Commit(Commit);
                         let interaction = Interactions::new(idx, InteractionsType::Query(query));
                         let out_interactions = interaction.interactions();
-                        self.plan.push(interaction);
+                        self.push(interaction);
                         out_interactions
                     })
                     .fold(
@@ -265,7 +285,7 @@ impl InteractionPlan {
                 out_interactions
             };
 
-            self.plan.push(interactions);
+            self.push(interactions);
             Some(out_interactions)
         } else {
             // after we generated all interactions if some connection is still in a transaction, commit
@@ -275,7 +295,7 @@ impl InteractionPlan {
                     let query = Query::Commit(Commit);
                     let interaction = Interactions::new(conn_index, InteractionsType::Query(query));
                     let out_interactions = interaction.interactions();
-                    self.plan.push(interaction);
+                    self.push(interaction);
                     out_interactions
                 })
         }
@@ -302,7 +322,7 @@ impl InteractionPlan {
 }
 
 impl Deref for InteractionPlan {
-    type Target = [Interactions];
+    type Target = Vec<Interactions>;
 
     fn deref(&self) -> &Self::Target {
         &self.plan
@@ -322,6 +342,26 @@ impl IntoIterator for InteractionPlan {
 
     fn into_iter(self) -> Self::IntoIter {
         self.plan.into_iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a InteractionPlan {
+    type Item = &'a Interactions;
+
+    type IntoIter = <&'a Vec<Interactions> as IntoIterator>::IntoIter;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.plan.iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a mut InteractionPlan {
+    type Item = &'a mut Interactions;
+
+    type IntoIter = <&'a mut Vec<Interactions> as IntoIterator>::IntoIter;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.plan.iter_mut()
     }
 }
 
@@ -600,7 +640,7 @@ impl Assertion {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub(crate) enum Fault {
+pub enum Fault {
     Disconnect,
     ReopenDatabase,
 }
