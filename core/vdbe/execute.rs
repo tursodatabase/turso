@@ -3637,17 +3637,21 @@ pub fn op_agg_step(
     match func {
         AggFunc::Avg => {
             let col = state.registers[*col].clone();
-            let Register::Aggregate(agg) = state.registers[*acc_reg].borrow_mut() else {
-                panic!(
-                    "Unexpected value {:?} in AggStep at register {}",
-                    state.registers[*acc_reg], *acc_reg
-                );
-            };
-            let AggContext::Avg(acc, count) = agg.borrow_mut() else {
-                unreachable!();
-            };
-            *acc = acc.exec_add(col.get_value());
-            *count += 1;
+            // > The avg() function returns the average value of all non-NULL X within a group
+            // https://sqlite.org/lang_aggfunc.html#avg
+            if !col.is_null() {
+                let Register::Aggregate(agg) = state.registers[*acc_reg].borrow_mut() else {
+                    panic!(
+                        "Unexpected value {:?} in AggStep at register {}",
+                        state.registers[*acc_reg], *acc_reg
+                    );
+                };
+                let AggContext::Avg(acc, count) = agg.borrow_mut() else {
+                    unreachable!();
+                };
+                *acc = acc.exec_add(col.get_value());
+                *count += 1;
+            }
         }
         AggFunc::Sum | AggFunc::Total => {
             let col = state.registers[*col].clone();
@@ -3915,7 +3919,11 @@ pub fn op_agg_final(
                 let AggContext::Avg(acc, count) = agg else {
                     unreachable!();
                 };
-                let acc = acc.clone() / count.clone();
+                let acc = if count.as_int() == Some(0) {
+                    Value::Null
+                } else {
+                    acc.clone() / count.clone()
+                };
                 state.registers[dest_reg] = Register::Value(acc);
             }
             AggFunc::Sum => {
