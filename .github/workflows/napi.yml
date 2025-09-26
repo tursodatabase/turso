@@ -161,6 +161,7 @@ jobs:
           if-no-files-found: error
   test-db-linux-x64-gnu-binding:
     name: Test DB bindings on Linux-x64-gnu - node@${{ matrix.node }}
+    timeout-minutes: 30
     needs:
       - build
     strategy:
@@ -192,6 +193,7 @@ jobs:
         run: docker run --rm -v $(pwd):/build -w /build node:${{ matrix.node }}-slim yarn workspace @tursodatabase/database test
   test-db-browser-binding:
     name: Test DB bindings on browser@${{ matrix.node }}
+    timeout-minutes: 30
     needs:
       - build
     strategy:
@@ -228,6 +230,7 @@ jobs:
   publish:
     name: Publish
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: read
       id-token: write
