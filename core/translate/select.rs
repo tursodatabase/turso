@@ -369,15 +369,6 @@ fn prepare_one_select_plan(
                         }
                     }
                     ResultColumn::Expr(ref mut expr, maybe_alias) => {
-                        let alias = if let Some(alias) = maybe_alias {
-                            match alias {
-                                ast::As::Elided(alias) => alias.as_str().to_string(),
-                                ast::As::As(alias) => alias.as_str().to_string(),
-                            }
-                        } else {
-                            // we always emit alias - otherwise user will see very confusing column name (e.g. avg(t0.c1))
-                            expr.as_ref().to_string()
-                        };
                         bind_and_rewrite_expr(
                             expr,
                             Some(&mut plan.table_references),
@@ -394,7 +385,10 @@ fn prepare_one_select_plan(
                             Some(&mut windows),
                         )?;
                         plan.result_columns.push(ResultSetColumn {
-                            alias: Some(alias),
+                            alias: maybe_alias.as_ref().map(|alias| match alias {
+                                ast::As::Elided(alias) => alias.as_str().to_string(),
+                                ast::As::As(alias) => alias.as_str().to_string(),
+                            }),
                             expr: expr.as_ref().clone(),
                             contains_aggregates,
                         });
