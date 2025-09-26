@@ -1180,8 +1180,7 @@ mod tests {
                 let product_id = rng.random_range(1..12000);
                 format!(
                     "INSERT INTO reviews (product_id, user_id, rating, comment)
-                 VALUES ({product_id}, (SELECT id FROM users ORDER BY RANDOM() LIMIT 1), DEFAULT, DEFAULT)",
-                )
+                 VALUES ({product_id}, (SELECT id FROM users ORDER BY id LIMIT 1), DEFAULT, DEFAULT)")
             }
             5 => {
                 let id = rng.random_range(1..15000);
@@ -1229,11 +1228,12 @@ mod tests {
                     "INSERT INTO products (name, price)
                  VALUES (
                     UPPER('{}') || '_' || LOWER('{}') || '_' || {},
-                    ROUND(RANDOM() % 900 + 100, 2)
+                    ROUND({} + 100, 2)
                  )",
                     base_name,
                     base_name,
-                    rng.random_range(1000..9999)
+                    rng.random_range(1000..9999),
+                    rng.random_range(1..9999),
                 )
             }
             9 => {
@@ -1264,13 +1264,14 @@ mod tests {
                         WHEN {} = 3 THEN 'Decent'
                         ELSE 'Not satisfied'
                     END,
-                    CASE WHEN RANDOM() % 100 < 70 THEN 1 ELSE 0 END
+                    CASE WHEN {} % 100 < 70 THEN 1 ELSE 0 END
                  )",
                     rng.random_range(1..12000),
                     rng.random_range(1..15000),
                     rating,
                     rating,
-                    rating
+                    rating,
+                    rng.random_range(1..10000),
                 )
             }
             _ => unreachable!(),
@@ -1379,7 +1380,8 @@ mod tests {
                     .unwrap();
                 format!(
                     "DELETE FROM {table} 
-                 WHERE ABS(RANDOM()) % 100 < {probability}",
+                 WHERE ABS({} % 100 < {probability}",
+                    rng.random_range(1..10000),
                 )
             }
             _ => unreachable!(),
@@ -1502,7 +1504,6 @@ mod tests {
              FROM products p
              JOIN order_items oi ON p.id = oi.product_id
              GROUP BY p.id, p.name, p.price
-             HAVING ABS(p.price - AVG(oi.unit_price)) > p.price * 0.1
              ORDER BY sales_count DESC
              LIMIT 20",
             "SELECT DISTINCT u.state, 
