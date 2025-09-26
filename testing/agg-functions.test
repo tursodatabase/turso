@@ -220,3 +220,10 @@ do_execsql_test_error_content select-nested-agg-func {
 do_execsql_test_error_content select-nested-agg-func-in-expression {
   SELECT CASE WHEN max(abs(sum(age))) > 0 THEN 1 ELSE 0 END, sum(age) FROM users;
 } {"misuse of aggregate function"}
+
+# https://github.com/tursodatabase/turso/issues/3371
+do_execsql_test_on_specific_db {:memory:} agg-null-regression-test {
+	create table avg_nulls(val);
+	insert into avg_nulls(val) values (1), (NULL), (3);
+	select avg(val), sum(val), count(val) from avg_nulls;
+} {2.0|4|2}
