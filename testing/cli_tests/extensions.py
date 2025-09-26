@@ -593,6 +593,15 @@ def validate_fuzzy_caver(a):
 def validate_fuzzy_rsoundex(a):
     return a == "A03080"
 
+def validate_fuzzy_translit1(a):
+    return a == "oh my ?"
+
+def validate_fuzzy_translit2(a):
+    return a == "privet"
+
+def validate_fuzzy_script(a):
+    return a == "160"
+
 def test_fuzzy():
     limbo = TestTursoShell()
     ext_path = "./target/debug/liblimbo_fuzzy"
@@ -651,6 +660,21 @@ def test_fuzzy():
         "SELECT fuzzy_rsoundex('awesome');",
         validate_fuzzy_rsoundex,
         "fuzzy rsoundex function works",
+    )
+    limbo.run_test_fn(
+        "SELECT fuzzy_translit('oh my 😅');",
+        validate_fuzzy_translit1,
+        "fuzzy translit1 function works",
+    )
+    limbo.run_test_fn(
+        "SELECT fuzzy_translit('привет');",
+        validate_fuzzy_translit2,
+        "fuzzy translit2 function works",
+    )
+    limbo.run_test_fn(
+        "SELECT fuzzy_script('داناوانب');",
+        validate_fuzzy_script,
+        "fuzzy script function works",
     )
 
 def test_vfs():

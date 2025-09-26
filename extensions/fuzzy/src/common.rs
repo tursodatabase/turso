@@ -46,3 +46,9 @@ pub const CLASS_NAME: [u8; 13] = [
     b' ', // CCLASS_SPACE (11) -> space
     b'?', // CCLASS_OTHER (12) -> ?
 ];
+
+pub const SCRIPT_LATIN: u32 = 0x0001;
+pub const SCRIPT_CYRILLIC: u32 = 0x0002;
+pub const SCRIPT_GREEK: u32 = 0x0004;
+pub const SCRIPT_HEBREW: u32 = 0x0008;
+pub const SCRIPT_ARABIC: u32 = 0x0010;

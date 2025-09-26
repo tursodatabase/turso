@@ -7,9 +7,10 @@ mod editdist;
 mod phonetic;
 mod rsoundex;
 mod soundex;
+mod translit;
 
 register_extension! {
-    scalars: {levenshtein, damerau_levenshtein, edit_distance, hamming, jaronwin, osadist, fuzzy_soundex, fuzzy_phonetic, fuzzy_caver, fuzzy_rsoundex},
+    scalars: {levenshtein, damerau_levenshtein, edit_distance, hamming, jaronwin, osadist, fuzzy_soundex, fuzzy_phonetic, fuzzy_caver, fuzzy_rsoundex, fuzzy_translit, fuzzy_script}
 }
 
 /// Calculates and returns the Levenshtein distance of two non NULL strings.
@@ -167,7 +168,7 @@ fn damlev(s1: &str, s2: &str) -> i64 {
 // cost.
 //
 #[scalar(name = "fuzzy_editdist")]
-pub fn edit_distance(args: &[Value]) {
+fn edit_distance(args: &[Value]) {
     let Some(arg1) = args[0].to_text() else {
         return Value::error(ResultCode::InvalidArgs);
     };
@@ -311,7 +312,7 @@ fn jaro(s1: &str, s2: &str) -> f64 {
 
 /// Computes and returns the Optimal String Alignment distance for two non NULL
 #[scalar(name = "fuzzy_osadist")]
-pub fn osadist(args: &[Value]) {
+fn osadist(args: &[Value]) {
     let Some(arg1) = args[0].to_text() else {
         return Value::error(ResultCode::InvalidArgs);
     };
@@ -391,7 +392,7 @@ fn optimal_string_alignment(s1: &str, s2: &str) -> usize {
 }
 
 #[scalar(name = "fuzzy_soundex")]
-pub fn fuzzy_soundex(args: &[Value]) {
+fn fuzzy_soundex(args: &[Value]) {
     let arg1 = args[0].to_text();
     if let Some(txt) = soundex::soundex(arg1) {
         Value::from_text(txt)
@@ -401,7 +402,7 @@ pub fn fuzzy_soundex(args: &[Value]) {
 }
 
 #[scalar(name = "fuzzy_phonetic")]
-pub fn fuzzy_phonetic(args: &[Value]) {
+fn fuzzy_phonetic(args: &[Value]) {
     let arg1 = args[0].to_text();
     if let Some(txt) = phonetic::phonetic_hash_str(arg1) {
         Value::from_text(txt)
@@ -411,7 +412,7 @@ pub fn fuzzy_phonetic(args: &[Value]) {
 }
 
 #[scalar(name = "fuzzy_caver")]
-pub fn fuzzy_caver(args: &[Value]) {
+fn fuzzy_caver(args: &[Value]) {
     let arg1 = args[0].to_text();
     if let Some(txt) = caver::caver_str(arg1) {
         Value::from_text(txt)
@@ -428,6 +429,40 @@ pub fn fuzzy_rsoundex(args: &[Value]) {
     } else {
         Value::null()
     }
+}
+
+//Convert a string that contains non-ASCII Roman characters into
+//pure ASCII.
+#[scalar(name = "fuzzy_translit")]
+fn fuzzy_translit(args: &[Value]) {
+    let Some(arg) = args[0].to_text() else {
+        return Value::error(ResultCode::InvalidArgs);
+    };
+    let dist = translit::transliterate_str(arg);
+    return Value::from_text(dist);
+}
+
+// Try to determine the dominant script used by the word X and return
+// its ISO 15924 numeric code.
+//
+// The current implementation only understands the following scripts:
+//
+//    125  (Hebrew)
+//    160  (Arabic)
+//    200  (Greek)
+//    215  (Latin)
+//    220  (Cyrillic)
+//
+// This routine will return 998 if the input X contains characters from
+// two or more of the above scripts or 999 if X contains no characters
+// from any of the above scripts.
+#[scalar(name = "fuzzy_script")]
+pub fn fuzzy_script(args: &[Value]) {
+    let Some(arg) = args[0].to_text() else {
+        return Value::error(ResultCode::InvalidArgs);
+    };
+    let dist = translit::script_code(arg.as_bytes());
+    return Value::from_integer(dist as i64);
 }
 
 //tests adapted from sqlean fuzzy
