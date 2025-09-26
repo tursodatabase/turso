@@ -463,15 +463,15 @@ fn create_vtable_body_to_str(vtab: &ast::CreateVirtualTable, module: Arc<VTabImp
     };
     format!(
         "CREATE VIRTUAL TABLE {} {} USING {}{}\n /*{}{}*/",
-        vtab.tbl_name.name.as_str(),
+        vtab.tbl_name.name.as_ident(),
         if_not_exists,
-        vtab.module_name.as_str(),
+        vtab.module_name.as_ident(),
         if args.is_empty() {
             String::new()
         } else {
             format!("({args})")
         },
-        vtab.tbl_name.name.as_str(),
+        vtab.tbl_name.name.as_ident(),
         vtab_args
     )
 }

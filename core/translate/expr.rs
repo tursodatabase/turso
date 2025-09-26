@@ -3475,6 +3475,7 @@ pub fn bind_and_rewrite_expr<'a>(
                         }
                     }
                     Expr::Qualified(tbl, id) => {
+                        tracing::debug!("bind_and_rewrite_expr({:?}, {:?})", tbl, id);
                         let normalized_table_name = normalize_ident(tbl.as_str());
                         let matching_tbl = referenced_tables
                             .find_table_and_internal_id_by_identifier(&normalized_table_name);
@@ -3504,6 +3505,7 @@ pub fn bind_and_rewrite_expr<'a>(
                             column: col_idx,
                             is_rowid_alias: col.is_rowid_alias,
                         };
+                        tracing::debug!("rewritten to column");
                         referenced_tables.mark_column_used(tbl_id, col_idx);
                         return Ok(WalkControl::Continue);
                     }
@@ -4147,7 +4149,7 @@ fn determine_column_alias(
 ) -> Option<String> {
     // First check for explicit alias
     if let Some(As::As(name)) = explicit_alias {
-        return Some(name.to_string());
+        return Some(name.as_str().to_string());
     }
 
     // For ROWID expressions, use "rowid" as the alias

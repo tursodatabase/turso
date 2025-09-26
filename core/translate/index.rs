@@ -21,15 +21,15 @@ use crate::{
         insn::{IdxInsertFlags, Insn, RegisterOrLiteral},
     },
 };
-use turso_parser::ast::{Expr, SortOrder, SortedColumn};
+use turso_parser::ast::{Expr, Name, SortOrder, SortedColumn};
 
 use super::schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
 
 #[allow(clippy::too_many_arguments)]
 pub fn translate_create_index(
     unique_if_not_exists: (bool, bool),
-    idx_name: &str,
-    tbl_name: &str,
+    idx_name: &Name,
+    tbl_name: &Name,
     columns: &[SortedColumn],
     schema: &Schema,
     syms: &SymbolTable,
@@ -37,6 +37,11 @@ pub fn translate_create_index(
     connection: &Arc<crate::Connection>,
     where_clause: Option<Box<Expr>>,
 ) -> crate::Result<ProgramBuilder> {
+    let original_idx_name = idx_name;
+    let original_tbl_name = tbl_name;
+    let idx_name = normalize_ident(idx_name.as_str());
+    let tbl_name = normalize_ident(tbl_name.as_str());
+
     if tbl_name.eq_ignore_ascii_case("sqlite_sequence") {
         crate::bail_parse_error!("table sqlite_sequence may not be indexed");
     }
@@ -45,10 +50,6 @@ pub fn translate_create_index(
             "CREATE INDEX is disabled by default. Run with `--experimental-indexes` to enable this feature."
         );
     }
-    let original_idx_name = idx_name;
-    let original_tbl_name = tbl_name;
-    let idx_name = normalize_ident(idx_name);
-    let tbl_name = normalize_ident(tbl_name);
     if RESERVED_TABLE_PREFIXES
         .iter()
         .any(|prefix| idx_name.starts_with(prefix))
@@ -173,8 +174,8 @@ pub fn translate_create_index(
         db: 0,
     });
     let sql = create_idx_stmt_to_sql(
-        original_tbl_name,
-        original_idx_name,
+        &original_tbl_name.as_ident(),
+        &original_idx_name.as_ident(),
         unique_if_not_exists,
         original_columns,
         &idx.where_clause.clone(),
@@ -392,10 +393,10 @@ fn create_idx_stmt_to_sql(
             sql.push_str(", ");
         }
         let col_ident = match col.expr.as_ref() {
-            Expr::Id(name) | Expr::Name(name) => name.as_str(),
+            Expr::Id(name) | Expr::Name(name) => name.as_ident(),
             _ => unreachable!("expressions in CREATE INDEX should have been rejected earlier"),
         };
-        sql.push_str(col_ident);
+        sql.push_str(&col_ident);
         if col.order.unwrap_or(SortOrder::Asc) == SortOrder::Desc {
             sql.push_str(" DESC");
         }
