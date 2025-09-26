@@ -4093,8 +4093,6 @@ pub fn process_returning_clause(
     for rc in returning.iter_mut() {
         match rc {
             ast::ResultColumn::Expr(expr, alias) => {
-                let column_alias = determine_column_alias(expr, alias, table);
-
                 bind_and_rewrite_expr(
                     expr,
                     Some(&mut table_references),
@@ -4103,6 +4101,8 @@ pub fn process_returning_clause(
                     param_ctx,
                     BindingBehavior::TryResultColumnsFirst,
                 )?;
+
+                let column_alias = determine_column_alias(expr, alias, table);
 
                 result_columns.push(ResultSetColumn {
                     expr: *expr.clone(),
