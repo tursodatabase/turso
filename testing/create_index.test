@@ -1,0 +1,15 @@
+#!/usr/bin/env tclsh
+
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+
+do_execsql_test_on_specific_db {:memory:} create-index-quoted-identifiers {
+    CREATE TABLE "t t" ("a a");
+    CREATE INDEX "idx idx" ON "t t" ("a a");
+    CREATE UNIQUE INDEX "unique idx idx" ON "t t" ("a a");
+
+    SELECT sql FROM sqlite_schema WHERE type='index';
+} {
+    "CREATE INDEX \"idx idx\" ON \"t t\" (\"a a\")"
+    "CREATE UNIQUE INDEX \"unique idx idx\" ON \"t t\" (\"a a\")"
+}

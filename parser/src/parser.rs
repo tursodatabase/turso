@@ -911,7 +911,7 @@ impl<'a> Parser<'a> {
     fn parse_fullname(&mut self, allow_alias: bool) -> Result<QualifiedName> {
         let first_name = self.parse_nm()?;
 
-        let secone_name = if let Some(tok) = self.peek()? {
+        let second_name = if let Some(tok) = self.peek()? {
             if tok.token_type == Some(TK_DOT) {
                 eat_assert!(self, TK_DOT);
                 Some(self.parse_nm()?)
@@ -937,10 +937,10 @@ impl<'a> Parser<'a> {
             None
         };
 
-        if let Some(secone_name) = secone_name {
+        if let Some(second_name) = second_name {
             Ok(QualifiedName {
                 db_name: Some(first_name),
-                name: secone_name,
+                name: second_name,
                 alias: alias_name,
             })
         } else {
