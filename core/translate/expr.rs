@@ -668,7 +668,7 @@ pub fn translate_expr(
         ast::Expr::Cast { expr, type_name } => {
             let type_name = type_name.as_ref().unwrap(); // TODO: why is this optional?
             translate_expr(program, referenced_tables, expr, target_register, resolver)?;
-            let type_affinity = affinity(&type_name.name.to_uppercase());
+            let type_affinity = affinity(&type_name.name);
             program.emit_insn(Insn::Cast {
                 reg: target_register,
                 affinity: type_affinity,
@@ -3794,6 +3794,9 @@ pub fn get_expr_affinity(
             } else {
                 Affinity::Blob
             }
+        }
+        ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => {
+            get_expr_affinity(exprs.first().unwrap(), referenced_tables)
         }
         ast::Expr::Collate(expr, _) => get_expr_affinity(expr, referenced_tables),
         // Literals have NO affinity in SQLite!

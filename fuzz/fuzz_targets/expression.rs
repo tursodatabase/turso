@@ -165,11 +165,21 @@ str_enum! {
     }
 }
 
+str_enum! {
+    enum CastType {
+        Text => "text",
+        Real => "real",
+        Integer => "integer",
+        Numeric => "numeric",
+    }
+}
+
 #[derive(Debug, Arbitrary)]
 enum Expr {
     Value(Value),
     Binary(Binary, Box<Expr>, Box<Expr>),
     Unary(Unary, Box<Expr>),
+    Cast(Box<Expr>, CastType),
     UnaryFunc(UnaryFunc, Box<Expr>),
     BinaryFunc(BinaryFunc, Box<Expr>, Box<Expr>),
 }
@@ -225,6 +235,14 @@ impl Expr {
                 let expr = expr.lower();
                 Output {
                     query: format!("{func}({})", expr.query),
+                    parameters: expr.parameters,
+                    depth: expr.depth + 1,
+                }
+            }
+            Expr::Cast(expr, cast_type) => {
+                let expr = expr.lower();
+                Output {
+                    query: format!("cast({} as {cast_type})", expr.query),
                     parameters: expr.parameters,
                     depth: expr.depth + 1,
                 }
