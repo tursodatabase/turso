@@ -149,10 +149,8 @@ pub fn translate_insert(
                     match expr.as_mut() {
                         Expr::Id(name) => {
                             if name.quoted_with('"') {
-                                *expr = Expr::Literal(ast::Literal::String(
-                                    name.as_literal().to_string(),
-                                ))
-                                .into();
+                                *expr =
+                                    Expr::Literal(ast::Literal::String(name.as_literal())).into();
                             } else {
                                 // an INSERT INTO ... VALUES (...) cannot reference columns
                                 crate::bail_parse_error!("no such column: {name}");

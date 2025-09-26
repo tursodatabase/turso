@@ -924,6 +924,8 @@ impl<'de> serde::Deserialize<'de> for Name {
 }
 
 impl Name {
+    /// Create name which will have exactly the value of given string
+    /// (e.g. if s = "\"str\"" - the name value will contain quotes and translation to SQL will give us """str""")
     pub fn exact(s: String) -> Self {
         let value_is_lowercase = s.chars().all(|x| x.is_lowercase());
         Self {
@@ -933,9 +935,11 @@ impl Name {
             value_is_lowercase,
         }
     }
+    /// Parse name from the bytes (e.g. handle quoting and handle escaped quotes)
     pub fn from_bytes(s: &[u8]) -> Self {
         Self::from_str(unsafe { std::str::from_utf8_unchecked(s) })
     }
+    /// Parse name from the string (e.g. handle quoting and handle escaped quotes)
     pub fn from_str(s: impl AsRef<str>) -> Self {
         let s = s.as_ref();
         let bytes = s.as_bytes();
@@ -969,6 +973,8 @@ impl Name {
         }
     }
 
+    /// Return string value of the name alredy converted to the lowercase
+    /// This value can be safely compared with other values without any normalization logic
     pub fn as_str(&self) -> &str {
         if self.value_is_lowercase {
             return &self.value;
@@ -979,10 +985,12 @@ impl Name {
         self.lowercase.get().unwrap()
     }
 
-    pub fn as_literal(&self) -> &str {
-        &self.value
+    /// Convert value to the string literal (e.g. single-quoted string with escaped single quotes)
+    pub fn as_literal(&self) -> String {
+        format!("'{}'", self.value.replace("'", "''"))
     }
 
+    /// Convert value to the name string (e.g. double-quoted string with escaped double quotes)
     pub fn as_quoted(&self) -> String {
         let value = self.value.as_bytes();
         if !value.is_empty() && value.iter().all(|x| x.is_ascii_alphanumeric()) {

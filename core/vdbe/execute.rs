@@ -5365,7 +5365,7 @@ pub fn op_function(
                                 let column = columns
                                     .iter_mut()
                                     .find(|column| {
-                                        column.col_name == ast::Name::exact(original_rename_from.to_string())
+                                        column.col_name.as_str() == original_rename_from.as_str()
                                     })
                                     .expect("column being renamed should be present");
 

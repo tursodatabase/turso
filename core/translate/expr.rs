@@ -1826,7 +1826,7 @@ pub fn translate_expr(
         ast::Expr::Id(id) => {
             // Treat double-quoted identifiers as string literals (SQLite compatibility)
             program.emit_insn(Insn::String8 {
-                value: sanitize_double_quoted_string(id.as_str()),
+                value: id.as_str().to_string(),
                 dest: target_register,
             });
             Ok(target_register)
@@ -3008,12 +3008,6 @@ pub fn sanitize_string(input: &str) -> String {
     inner.replace("''", "'")
 }
 
-/// Sanitizes a double-quoted string literal by removing double quotes at front and back
-/// and unescaping double quotes
-pub fn sanitize_double_quoted_string(input: &str) -> String {
-    input[1..input.len() - 1].replace("\"\"", "\"").to_string()
-}
-
 /// Returns the components of a binary expression
 /// e.g. t.x = 5 -> Some((t.x, =, 5))
 pub fn as_binary_components(
@@ -3473,7 +3467,7 @@ pub fn bind_and_rewrite_expr<'a>(
                         // Single quotes are handled as literals earlier, unquoted identifiers must resolve to columns
                         if id.quoted_with('"') {
                             // Convert failed double-quoted identifier to string literal
-                            *expr = Expr::Literal(ast::Literal::String(id.as_str().to_string()));
+                            *expr = Expr::Literal(ast::Literal::String(id.as_literal()));
                             return Ok(WalkControl::Continue);
                         } else {
                             // Unquoted identifiers must resolve to columns - no fallback
