@@ -1,8 +1,6 @@
 pub mod check;
 pub mod fmt;
 
-use std::sync::OnceLock;
-
 use strum_macros::{EnumIter, EnumString};
 
 /// `?` or `$` Prepared statement arg placeholder(s)
@@ -884,8 +882,6 @@ pub struct GroupBy {
 pub struct Name {
     quote: Option<char>,
     value: String,
-    lowercase: OnceLock<String>,
-    value_is_lowercase: bool,
 }
 
 #[cfg(feature = "serde")]
@@ -927,12 +923,9 @@ impl Name {
     /// Create name which will have exactly the value of given string
     /// (e.g. if s = "\"str\"" - the name value will contain quotes and translation to SQL will give us """str""")
     pub fn exact(s: String) -> Self {
-        let value_is_lowercase = s.chars().all(|x| x.is_lowercase());
         Self {
             value: s,
             quote: None,
-            lowercase: OnceLock::new(),
-            value_is_lowercase,
         }
     }
     /// Parse name from the bytes (e.g. handle quoting and handle escaped quotes)
@@ -957,12 +950,9 @@ impl Name {
                 b'`' => s[1..s.len() - 1].replace("``", "`"),
                 _ => unreachable!(),
             };
-            let value_is_lowercase = s.chars().all(|x| x.is_lowercase());
             Name {
                 value: s,
                 quote: Some(bytes[0] as char),
-                lowercase: OnceLock::new(),
-                value_is_lowercase,
             }
         } else if bytes[0] == b'[' {
             assert!(s.len() >= 2);
@@ -973,16 +963,9 @@ impl Name {
         }
     }
 
-    /// Return string value of the name alredy converted to the lowercase
-    /// This value can be safely compared with other values without any normalization logic
+    /// Return string value of the name
     pub fn as_str(&self) -> &str {
-        if self.value_is_lowercase {
-            return &self.value;
-        }
-        if self.lowercase.get().is_none() {
-            let _ = self.lowercase.set(self.value.to_lowercase());
-        }
-        self.lowercase.get().unwrap()
+        &self.value
     }
 
     /// Convert value to the string literal (e.g. single-quoted string with escaped single quotes)
@@ -991,9 +974,17 @@ impl Name {
     }
 
     /// Convert value to the name string (e.g. double-quoted string with escaped double quotes)
-    pub fn as_quoted(&self) -> String {
+    pub fn as_ident(&self) -> String {
+        // let's keep original quotes if they were set
+        // (parser.rs tests validates that behaviour)
+        if let Some(quote) = self.quote {
+            let single = quote.to_string();
+            let double = single.clone() + &single;
+            return format!("{}{}{}", quote, self.value.replace(&single, &double), quote);
+        }
         let value = self.value.as_bytes();
-        if !value.is_empty() && value.iter().all(|x| x.is_ascii_alphanumeric()) {
+        let safe_char = |&c: &u8| c.is_ascii_alphanumeric() || c == b'_';
+        if !value.is_empty() && value.iter().all(safe_char) {
             self.value.clone()
         } else {
             format!("\"{}\"", self.value.replace("\"", "\"\""))

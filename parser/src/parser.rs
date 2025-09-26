@@ -4105,28 +4105,28 @@ mod tests {
                 b"BEGIN DEFERRED TRANSACTION my_transaction".as_slice(),
                 vec![Cmd::Stmt(Stmt::Begin {
                     typ: Some(TransactionType::Deferred),
-                    name: Some(Name::exact("my_transaction".to_string())),
+                    name: Some(Name::from_string("my_transaction")),
                 })],
             ),
             (
                 b"BEGIN IMMEDIATE TRANSACTION my_transaction".as_slice(),
                 vec![Cmd::Stmt(Stmt::Begin {
                     typ: Some(TransactionType::Immediate),
-                    name: Some(Name::exact("my_transaction".to_string())),
+                    name: Some(Name::from_string("my_transaction")),
                 })],
             ),
             (
                 b"BEGIN EXCLUSIVE TRANSACTION my_transaction".as_slice(),
                 vec![Cmd::Stmt(Stmt::Begin {
                     typ: Some(TransactionType::Exclusive),
-                    name: Some(Name::exact("my_transaction".to_string())),
+                    name: Some(Name::from_string("my_transaction")),
                 })],
             ),
             (
                 b"BEGIN EXCLUSIVE TRANSACTION 'my_transaction'".as_slice(),
                 vec![Cmd::Stmt(Stmt::Begin {
                     typ: Some(TransactionType::Exclusive),
-                    name: Some(Name::from_string("'my_transaction'".to_string())),
+                    name: Some(Name::from_string("'my_transaction'")),
                 })],
             ),
             (
@@ -4140,14 +4140,14 @@ mod tests {
                 b"BEGIN CONCURRENT TRANSACTION my_transaction".as_slice(),
                 vec![Cmd::Stmt(Stmt::Begin {
                     typ: Some(TransactionType::Concurrent),
-                    name: Some(Name::exact("my_transaction".to_string())),
+                    name: Some(Name::from_string("my_transaction")),
                 })],
             ),
             (
                 b"BEGIN CONCURRENT TRANSACTION 'my_transaction'".as_slice(),
                 vec![Cmd::Stmt(Stmt::Begin {
                     typ: Some(TransactionType::Concurrent),
-                    name: Some(Name::from_string("'my_transaction'".to_string())),
+                    name: Some(Name::from_string("'my_transaction'")),
                 })],
             ),
             (
@@ -4187,13 +4187,13 @@ mod tests {
             (
                 b"COMMIT TRANSACTION my_transaction".as_slice(),
                 vec![Cmd::Stmt(Stmt::Commit {
-                    name: Some(Name::exact("my_transaction".to_string())),
+                    name: Some(Name::from_string("my_transaction")),
                 })],
             ),
             (
                 b"END TRANSACTION my_transaction".as_slice(),
                 vec![Cmd::Stmt(Stmt::Commit {
-                    name: Some(Name::exact("my_transaction".to_string())),
+                    name: Some(Name::from_string("my_transaction")),
                 })],
             ),
             // Rollback
@@ -4208,66 +4208,66 @@ mod tests {
                 b"ROLLBACK TO SAVEPOINT my_savepoint".as_slice(),
                 vec![Cmd::Stmt(Stmt::Rollback {
                     tx_name: None,
-                    savepoint_name: Some(Name::exact("my_savepoint".to_string())),
+                    savepoint_name: Some(Name::from_string("my_savepoint")),
                 })],
             ),
             (
                 b"ROLLBACK TO my_savepoint".as_slice(),
                 vec![Cmd::Stmt(Stmt::Rollback {
                     tx_name: None,
-                    savepoint_name: Some(Name::exact("my_savepoint".to_string())),
+                    savepoint_name: Some(Name::from_string("my_savepoint")),
                 })],
             ),
             (
                 b"ROLLBACK TRANSACTION my_transaction".as_slice(),
                 vec![Cmd::Stmt(Stmt::Rollback {
-                    tx_name: Some(Name::exact("my_transaction".to_string())),
+                    tx_name: Some(Name::from_string("my_transaction")),
                     savepoint_name: None,
                 })],
             ),
             (
                 b"ROLLBACK TRANSACTION my_transaction TO my_savepoint".as_slice(),
                 vec![Cmd::Stmt(Stmt::Rollback {
-                    tx_name: Some(Name::exact("my_transaction".to_string())),
-                    savepoint_name: Some(Name::exact("my_savepoint".to_string())),
+                    tx_name: Some(Name::from_string("my_transaction")),
+                    savepoint_name: Some(Name::from_string("my_savepoint")),
                 })],
             ),
             // savepoint
             (
                 b"SAVEPOINT my_savepoint".as_slice(),
                 vec![Cmd::Stmt(Stmt::Savepoint {
-                    name: Name::exact("my_savepoint".to_string()),
+                    name: Name::from_string("my_savepoint"),
                 })],
             ),
             (
                 b"SAVEPOINT 'my_savepoint'".as_slice(),
                 vec![Cmd::Stmt(Stmt::Savepoint {
-                    name: Name::from_string("'my_savepoint'".to_string()),
+                    name: Name::from_string("'my_savepoint'"),
                 })],
             ),
             // release
             (
                 b"RELEASE my_savepoint".as_slice(),
                 vec![Cmd::Stmt(Stmt::Release {
-                    name: Name::exact("my_savepoint".to_string()),
+                    name: Name::from_string("my_savepoint"),
                 })],
             ),
             (
                 b"RELEASE SAVEPOINT my_savepoint".as_slice(),
                 vec![Cmd::Stmt(Stmt::Release {
-                    name: Name::exact("my_savepoint".to_string()),
+                    name: Name::from_string("my_savepoint"),
                 })],
             ),
             (
                 b"RELEASE SAVEPOINT 'my_savepoint'".as_slice(),
                 vec![Cmd::Stmt(Stmt::Release {
-                    name: Name::from_string("'my_savepoint'".to_string()),
+                    name: Name::from_string("'my_savepoint'"),
                 })],
             ),
             (
                 b"RELEASE SAVEPOINT ABORT".as_slice(),
                 vec![Cmd::Stmt(Stmt::Release {
-                    name: Name::exact("ABORT".to_string()),
+                    name: Name::from_string("ABORT"),
                 })],
             ),
             // test expr operand

@@ -422,7 +422,7 @@ fn collect_autoindexes(
 
 fn create_table_body_to_str(tbl_name: &ast::QualifiedName, body: &ast::CreateTableBody) -> String {
     let mut sql = String::new();
-    sql.push_str(format!("CREATE TABLE {} {}", tbl_name.name.as_quoted(), body).as_str());
+    sql.push_str(format!("CREATE TABLE {} {}", tbl_name.name.as_ident(), body).as_str());
     match body {
         ast::CreateTableBody::ColumnsAndConstraints {
             columns: _,

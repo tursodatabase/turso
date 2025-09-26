@@ -745,7 +745,7 @@ impl ToTokens for Expr {
             Self::Collate(expr, collation) => {
                 expr.to_tokens(s, context)?;
                 s.append(TK_COLLATE, None)?;
-                s.append(TK_ID, Some(&collation.as_quoted()))
+                s.append(TK_ID, Some(&collation.as_ident()))
             }
             Self::DoublyQualified(db_name, tbl_name, col_name) => {
                 db_name.to_tokens(s, context)?;
@@ -1370,7 +1370,7 @@ impl ToTokens for Name {
         s: &mut S,
         _: &C,
     ) -> Result<(), S::Error> {
-        s.append(TK_ID, Some(&self.as_quoted()))
+        s.append(TK_ID, Some(&self.as_ident()))
     }
 }
 
