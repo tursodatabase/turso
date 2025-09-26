@@ -541,7 +541,6 @@ impl Database {
     pub fn maybe_recover_logical_log(self: &Arc<Database>, pager: Arc<Pager>) -> Result<()> {
         let Some(mv_store) = self.mv_store.clone() else {
             panic!("tryign to recover logical log without mvcc");
-
         };
         if !mv_store.needs_recover() {
             return Ok(());
