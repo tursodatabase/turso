@@ -1,14 +1,14 @@
 use std::fmt::Debug;
 use std::sync::{Arc, RwLock};
 
-mod logical_log;
+pub mod logical_log;
 use crate::mvcc::database::LogRecord;
 use crate::mvcc::persistent_storage::logical_log::LogicalLog;
 use crate::types::IOResult;
 use crate::{File, Result};
 
 pub struct Storage {
-    logical_log: RwLock<LogicalLog>,
+    pub logical_log: RwLock<LogicalLog>,
 }
 
 impl Storage {
@@ -34,6 +34,18 @@ impl Storage {
 
     pub fn truncate(&self) -> Result<IOResult<()>> {
         self.logical_log.write().unwrap().truncate()
+    }
+
+    pub fn needs_recover(&self) -> bool {
+        self.logical_log.read().unwrap().needs_recover()
+    }
+
+    pub fn mark_recovered(&self) {
+        self.logical_log.write().unwrap().mark_recovered();
+    }
+
+    pub fn get_logical_log_file(&self) -> Arc<dyn File> {
+        self.logical_log.write().unwrap().file.clone()
     }
 }
 
