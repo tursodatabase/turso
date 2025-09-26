@@ -21,7 +21,7 @@ use crate::{
             emit_returning_results, translate_expr, translate_expr_no_constant_opt, walk_expr_mut,
             NoConstantOptReason, ReturningValueRegisters,
         },
-        insert::{Insertion, ROWID_COLUMN},
+        insert::Insertion,
         plan::ResultSetColumn,
     },
     util::normalize_ident,
