@@ -937,10 +937,10 @@ impl Name {
     }
     /// Parse name from the bytes (e.g. handle quoting and handle escaped quotes)
     pub fn from_bytes(s: &[u8]) -> Self {
-        Self::from_str(unsafe { std::str::from_utf8_unchecked(s) })
+        Self::from_string(unsafe { std::str::from_utf8_unchecked(s) })
     }
     /// Parse name from the string (e.g. handle quoting and handle escaped quotes)
-    pub fn from_str(s: impl AsRef<str>) -> Self {
+    pub fn from_string(s: impl AsRef<str>) -> Self {
         let s = s.as_ref();
         let bytes = s.as_bytes();
 

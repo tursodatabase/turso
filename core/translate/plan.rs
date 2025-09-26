@@ -760,6 +760,7 @@ impl ColumnUsedMask {
 }
 
 #[derive(Clone, Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum Operation {
     // Scan operation
     // This operation is used to scan a table.
@@ -1065,7 +1066,7 @@ pub enum Scan {
 
 /// An enum that represents a search operation that can be used to search for a row in a table using an index
 /// (i.e. a primary key or a secondary index)
-#[allow(clippy::enum_variant_names)]
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug)]
 pub enum Search {
     /// A rowid equality point lookup. This is a special case that uses the SeekRowid bytecode instruction and does not loop.
