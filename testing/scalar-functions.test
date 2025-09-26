@@ -939,6 +939,11 @@ do_execsql_test parse-large-integral-numeric-string-as-number {
   SELECT (-104614899632619 || 45597) > CAST(0 AS NUMERIC);
 } {0}
 
+# https://github.com/tursodatabase/turso/issues/3317
+do_execsql_test length-999123 {
+  select length('a' || char(0) || 'b');
+} {1}
+
 # TODO: sqlite seems not enable soundex() by default unless build it with SQLITE_SOUNDEX enabled.
 # do_execsql_test soundex-text {
 #  select soundex('Pfister'), soundex('husobee'), soundex('Tymczak'), soundex('Ashcraft'), soundex('Robert'), soundex('Rupert'), soundex('Rubin'), soundex('Kant'), soundex('Knuth'), soundex('x'), soundex('');

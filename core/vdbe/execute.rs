@@ -8012,8 +8012,12 @@ impl Value {
     pub fn exec_length(&self) -> Self {
         match self {
             Value::Text(t) => {
-                // Count Unicode scalar values (characters)
-                Value::Integer(t.as_str().chars().count() as i64)
+                let s = t.as_str();
+                let len_before_null = s.find('\0').map_or_else(
+                    || s.chars().count(),
+                    |null_pos| s[..null_pos].chars().count(),
+                );
+                Value::Integer(len_before_null as i64)
             }
             Value::Integer(_) | Value::Float(_) => {
                 // For numbers, SQLite returns the length of the string representation
