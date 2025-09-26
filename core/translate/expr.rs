@@ -3302,12 +3302,6 @@ pub fn bind_and_rewrite_expr<'a>(
         top_level_expr,
         &mut |expr: &mut ast::Expr| -> Result<WalkControl> {
             match expr {
-                ast::Expr::Id(ast::Name::Ident(n)) if n.eq_ignore_ascii_case("true") => {
-                    *expr = ast::Expr::Literal(ast::Literal::Numeric("1".to_string()));
-                }
-                ast::Expr::Id(ast::Name::Ident(n)) if n.eq_ignore_ascii_case("false") => {
-                    *expr = ast::Expr::Literal(ast::Literal::Numeric("0".to_string()));
-                }
                 // Rewrite anonymous variables in encounter order.
                 ast::Expr::Variable(var) if var.is_empty() => {
                     if !param_state.is_valid() {
@@ -3370,17 +3364,6 @@ pub fn bind_and_rewrite_expr<'a>(
                                 }
                             }
                         }
-                        if !referenced_tables.joined_tables().is_empty() {
-                            if let Some(row_id_expr) = parse_row_id(
-                                &normalized_id,
-                                referenced_tables.joined_tables()[0].internal_id,
-                                || referenced_tables.joined_tables().len() != 1,
-                            )? {
-                                *expr = row_id_expr;
-
-                                return Ok(WalkControl::Continue);
-                            }
-                        }
                         let mut match_result = None;
 
                         // First check joined tables
@@ -3416,6 +3399,15 @@ pub fn bind_and_rewrite_expr<'a>(
                                     col_idx.unwrap(),
                                     col.is_rowid_alias,
                                 ));
+                            // only if we haven't found a match, check for explicit rowid reference
+                            } else if let Some(row_id_expr) = parse_row_id(
+                                &normalized_id,
+                                referenced_tables.joined_tables()[0].internal_id,
+                                || referenced_tables.joined_tables().len() != 1,
+                            )? {
+                                *expr = row_id_expr;
+
+                                return Ok(WalkControl::Continue);
                             }
                         }
 
@@ -3496,17 +3488,16 @@ pub fn bind_and_rewrite_expr<'a>(
                         }
                         let (tbl_id, tbl) = matching_tbl.unwrap();
                         let normalized_id = normalize_ident(id.as_str());
-
-                        if let Some(row_id_expr) = parse_row_id(&normalized_id, tbl_id, || false)? {
-                            *expr = row_id_expr;
-
-                            return Ok(WalkControl::Continue);
-                        }
                         let col_idx = tbl.columns().iter().position(|c| {
                             c.name
                                 .as_ref()
                                 .is_some_and(|name| name.eq_ignore_ascii_case(&normalized_id))
                         });
+                        if let Some(row_id_expr) = parse_row_id(&normalized_id, tbl_id, || false)? {
+                            *expr = row_id_expr;
+
+                            return Ok(WalkControl::Continue);
+                        }
                         let Some(col_idx) = col_idx else {
                             crate::bail_parse_error!("no such column: {}", normalized_id);
                         };
