@@ -89,6 +89,20 @@ pub fn prepare_delete_plan(
         crate::bail_parse_error!("cannot modify materialized view {}", tbl_name);
     }
 
+    // Check if this table has any incompatible dependent views
+    let incompatible_views = schema.has_incompatible_dependent_views(&tbl_name);
+    if !incompatible_views.is_empty() {
+        use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
+        crate::bail_parse_error!(
+            "Cannot DELETE from table '{}' because it has incompatible dependent materialized view(s): {}. \n\
+             These views were created with a different DBSP version than the current version ({}). \n\
+             Please DROP and recreate the view(s) before modifying this table.",
+            tbl_name,
+            incompatible_views.join(", "),
+            DBSP_CIRCUIT_VERSION
+        );
+    }
+
     let table = if let Some(table) = table.virtual_table() {
         Table::Virtual(table.clone())
     } else if let Some(table) = table.btree() {

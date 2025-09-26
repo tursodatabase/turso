@@ -368,6 +368,10 @@ impl DbspNode {
     }
 }
 
+/// Version number for the DBSP circuit format
+/// This should be incremented when the circuit structure changes
+pub const DBSP_CIRCUIT_VERSION: u32 = 1;
+
 /// Represents a complete DBSP circuit (DAG of operators)
 #[derive(Debug)]
 pub struct DbspCircuit {
@@ -403,7 +407,7 @@ impl DbspCircuit {
         let empty_schema = Arc::new(LogicalSchema::new(vec![]));
         Self {
             nodes: HashMap::new(),
-            next_id: 0,
+            next_id: 1, // Start from 1 to reserve 0 for metadata
             root: None,
             output_schema: empty_schema,
             commit_state: CommitState::Init,

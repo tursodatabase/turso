@@ -143,7 +143,10 @@ pub fn translate_create_materialized_view(
     )?;
 
     // Add the DBSP state table to sqlite_master (required for materialized views)
-    let dbsp_table_name = format!("{DBSP_TABLE_PREFIX}{normalized_view_name}");
+    // Include the version number in the table name
+    use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
+    let dbsp_table_name =
+        format!("{DBSP_TABLE_PREFIX}{DBSP_CIRCUIT_VERSION}_{normalized_view_name}");
     // The element_id column uses SQLite's dynamic typing system to store different value types:
     // - For hash-based operators (joins, filters): stores INTEGER hash values or rowids
     // - For future MIN/MAX operators: stores the actual values being compared (INTEGER, REAL, TEXT, BLOB)
@@ -151,8 +154,8 @@ pub fn translate_create_materialized_view(
     let dbsp_sql = format!(
         "CREATE TABLE {dbsp_table_name} (\
          operator_id INTEGER NOT NULL, \
-         zset_id INTEGER NOT NULL, \
-         element_id NOT NULL, \
+         zset_id BLOB NOT NULL, \
+         element_id BLOB NOT NULL, \
          value BLOB, \
          weight INTEGER NOT NULL, \
          PRIMARY KEY (operator_id, zset_id, element_id)\

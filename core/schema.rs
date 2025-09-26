@@ -43,7 +43,7 @@ use turso_parser::{
 
 const SCHEMA_TABLE_NAME: &str = "sqlite_schema";
 const SCHEMA_TABLE_NAME_ALT: &str = "sqlite_master";
-pub const DBSP_TABLE_PREFIX: &str = "__turso_internal_dbsp_state_";
+pub const DBSP_TABLE_PREFIX: &str = "__turso_internal_dbsp_state_v";
 
 /// Used to refer to the implicit rowid column in tables without an alias during UPDATE
 pub const ROWID_SENTINEL: usize = usize::MAX;
@@ -77,6 +77,9 @@ pub struct Schema {
 
     /// Mapping from table names to the materialized views that depend on them
     pub table_to_materialized_views: HashMap<String, Vec<String>>,
+
+    /// Track views that exist but have incompatible versions
+    pub incompatible_views: HashSet<String>,
 }
 
 impl Schema {
@@ -100,6 +103,7 @@ impl Schema {
         let incremental_views = HashMap::new();
         let views: ViewsMap = HashMap::new();
         let table_to_materialized_views: HashMap<String, Vec<String>> = HashMap::new();
+        let incompatible_views = HashSet::new();
         Self {
             tables,
             materialized_view_names,
@@ -111,6 +115,7 @@ impl Schema {
             indexes_enabled,
             schema_version: 0,
             table_to_materialized_views,
+            incompatible_views,
         }
     }
 
@@ -140,9 +145,37 @@ impl Schema {
         self.incremental_views.get(&name).cloned()
     }
 
+    /// Check if DBSP state table exists with the current version
+    pub fn has_compatible_dbsp_state_table(&self, view_name: &str) -> bool {
+        use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
+        let view_name = normalize_ident(view_name);
+        let expected_table_name = format!("{DBSP_TABLE_PREFIX}{DBSP_CIRCUIT_VERSION}_{view_name}");
+
+        // Check if a table with the expected versioned name exists
+        self.tables.contains_key(&expected_table_name)
+    }
+
     pub fn is_materialized_view(&self, name: &str) -> bool {
         let name = normalize_ident(name);
         self.materialized_view_names.contains(&name)
+    }
+
+    /// Check if a table has any incompatible dependent materialized views
+    pub fn has_incompatible_dependent_views(&self, table_name: &str) -> Vec<String> {
+        let table_name = normalize_ident(table_name);
+
+        // Get all materialized views that depend on this table
+        let dependent_views = self
+            .table_to_materialized_views
+            .get(&table_name)
+            .cloned()
+            .unwrap_or_default();
+
+        // Filter to only incompatible views
+        dependent_views
+            .into_iter()
+            .filter(|view_name| self.incompatible_views.contains(view_name))
+            .collect()
     }
 
     pub fn remove_view(&mut self, name: &str) -> Result<()> {
@@ -519,12 +552,21 @@ impl Schema {
         dbsp_state_index_roots: std::collections::HashMap<String, usize>,
     ) -> Result<()> {
         for (view_name, (sql, main_root)) in materialized_view_info {
-            // Look up the DBSP state root for this view - must exist for materialized views
-            let dbsp_state_root = dbsp_state_roots.get(&view_name).ok_or_else(|| {
-                LimboError::InternalError(format!(
-                    "Materialized view {view_name} is missing its DBSP state table"
-                ))
-            })?;
+            // Look up the DBSP state root for this view
+            // If missing, it means version mismatch - skip this view
+            // Check if we have a compatible DBSP state root
+            let dbsp_state_root = if let Some(&root) = dbsp_state_roots.get(&view_name) {
+                root
+            } else {
+                tracing::warn!(
+                    "Materialized view '{}' has incompatible version or missing DBSP state table",
+                    view_name
+                );
+                // Track this as an incompatible view
+                self.incompatible_views.insert(view_name.clone());
+                // Use a dummy root page - the view won't be usable anyway
+                0
+            };
 
             // Look up the DBSP state index root (may not exist for older schemas)
             let dbsp_state_index_root =
@@ -534,7 +576,7 @@ impl Schema {
                 &sql,
                 self,
                 main_root,
-                *dbsp_state_root,
+                dbsp_state_root,
                 dbsp_state_index_root,
             )?;
             let referenced_tables = incremental_view.get_referenced_table_names();
@@ -552,9 +594,12 @@ impl Schema {
                 unique_sets: vec![],
             })));
 
-            self.add_materialized_view(incremental_view, table, sql);
+            // Only add to schema if compatible
+            if !self.incompatible_views.contains(&view_name) {
+                self.add_materialized_view(incremental_view, table, sql);
+            }
 
-            // Register dependencies
+            // Register dependencies regardless of compatibility
             for table_name in referenced_tables {
                 self.add_materialized_view_dependency(&table_name, &view_name);
             }
@@ -606,13 +651,33 @@ impl Schema {
 
                     // Check if this is a DBSP state table
                     if table.name.starts_with(DBSP_TABLE_PREFIX) {
-                        // Extract the view name from __turso_internal_dbsp_state_<viewname>
-                        let view_name = table
-                            .name
-                            .strip_prefix(DBSP_TABLE_PREFIX)
-                            .unwrap()
-                            .to_string();
-                        dbsp_state_roots.insert(view_name, root_page as usize);
+                        // Extract version and view name from __turso_internal_dbsp_state_v<version>_<viewname>
+                        let suffix = table.name.strip_prefix(DBSP_TABLE_PREFIX).unwrap();
+
+                        // Parse version and view name (format: "<version>_<viewname>")
+                        if let Some(underscore_pos) = suffix.find('_') {
+                            let version_str = &suffix[..underscore_pos];
+                            let view_name = &suffix[underscore_pos + 1..];
+
+                            // Check version compatibility
+                            if let Ok(stored_version) = version_str.parse::<u32>() {
+                                use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
+                                if stored_version == DBSP_CIRCUIT_VERSION {
+                                    // Version matches, store the root page
+                                    dbsp_state_roots
+                                        .insert(view_name.to_string(), root_page as usize);
+                                } else {
+                                    // Version mismatch - DO NOT insert into dbsp_state_roots
+                                    // This will cause populate_materialized_views to skip this view
+                                    tracing::warn!(
+                                        "Skipping materialized view '{}' - has version {} but current version is {}. DROP and recreate the view to use it.",
+                                        view_name, stored_version, DBSP_CIRCUIT_VERSION
+                                    );
+                                    // We can't track incompatible views here since we're in handle_schema_row
+                                    // which doesn't have mutable access to self
+                                }
+                            }
+                        }
                     }
 
                     if let Some(mv_store) = mv_store {
@@ -640,12 +705,23 @@ impl Schema {
 
                         // Check if this is an index for a DBSP state table
                         if table_name.starts_with(DBSP_TABLE_PREFIX) {
-                            // Extract the view name from __turso_internal_dbsp_state_<viewname>
-                            let view_name = table_name
-                                .strip_prefix(DBSP_TABLE_PREFIX)
-                                .unwrap()
-                                .to_string();
-                            dbsp_state_index_roots.insert(view_name, root_page as usize);
+                            // Extract version and view name from __turso_internal_dbsp_state_v<version>_<viewname>
+                            let suffix = table_name.strip_prefix(DBSP_TABLE_PREFIX).unwrap();
+
+                            // Parse version and view name (format: "<version>_<viewname>")
+                            if let Some(underscore_pos) = suffix.find('_') {
+                                let version_str = &suffix[..underscore_pos];
+                                let view_name = &suffix[underscore_pos + 1..];
+
+                                // Only store index root if version matches
+                                if let Ok(stored_version) = version_str.parse::<u32>() {
+                                    use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
+                                    if stored_version == DBSP_CIRCUIT_VERSION {
+                                        dbsp_state_index_roots
+                                            .insert(view_name.to_string(), root_page as usize);
+                                    }
+                                }
+                            }
                         } else {
                             match automatic_indices.entry(table_name) {
                                 std::collections::hash_map::Entry::Vacant(e) => {
@@ -772,6 +848,7 @@ impl Clone for Schema {
             .map(|(name, view)| (name.clone(), view.clone()))
             .collect();
         let views = self.views.clone();
+        let incompatible_views = self.incompatible_views.clone();
         Self {
             tables,
             materialized_view_names,
@@ -783,6 +860,7 @@ impl Clone for Schema {
             indexes_enabled: self.indexes_enabled,
             schema_version: self.schema_version,
             table_to_materialized_views: self.table_to_materialized_views.clone(),
+            incompatible_views,
         }
     }
 }

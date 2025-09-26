@@ -1,6 +1,7 @@
 // Aggregate operator for DBSP-style incremental computation
 
 use crate::function::{AggFunc, Func};
+use crate::incremental::dbsp::Hash128;
 use crate::incremental::dbsp::{Delta, DeltaPair, HashableRow};
 use crate::incremental::operator::{
     generate_storage_id, ComputationTracker, DbspStateCursors, EvalState, IncrementalOperator,
@@ -15,6 +16,13 @@ use std::sync::{Arc, Mutex};
 /// Constants for aggregate type encoding in storage IDs (2 bits)
 pub const AGG_TYPE_REGULAR: u8 = 0b00; // COUNT/SUM/AVG
 pub const AGG_TYPE_MINMAX: u8 = 0b01; // MIN/MAX (BTree ordering gives both)
+
+// Serialization type codes for aggregate functions
+const AGG_FUNC_COUNT: i64 = 0;
+const AGG_FUNC_SUM: i64 = 1;
+const AGG_FUNC_AVG: i64 = 2;
+const AGG_FUNC_MIN: i64 = 3;
+const AGG_FUNC_MAX: i64 = 4;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum AggregateFunction {
@@ -42,6 +50,104 @@ impl AggregateFunction {
     #[inline]
     pub fn default_output_name(&self) -> String {
         self.to_string()
+    }
+
+    /// Serialize this aggregate function to a Value
+    /// Returns a vector of values: [type_code, optional_column_index]
+    pub fn to_values(&self) -> Vec<Value> {
+        match self {
+            AggregateFunction::Count => vec![Value::Integer(AGG_FUNC_COUNT)],
+            AggregateFunction::Sum(idx) => {
+                vec![Value::Integer(AGG_FUNC_SUM), Value::Integer(*idx as i64)]
+            }
+            AggregateFunction::Avg(idx) => {
+                vec![Value::Integer(AGG_FUNC_AVG), Value::Integer(*idx as i64)]
+            }
+            AggregateFunction::Min(idx) => {
+                vec![Value::Integer(AGG_FUNC_MIN), Value::Integer(*idx as i64)]
+            }
+            AggregateFunction::Max(idx) => {
+                vec![Value::Integer(AGG_FUNC_MAX), Value::Integer(*idx as i64)]
+            }
+        }
+    }
+
+    /// Deserialize an aggregate function from values
+    /// Consumes values from the cursor and returns the aggregate function
+    pub fn from_values(values: &[Value], cursor: &mut usize) -> Result<Self> {
+        let type_code = values
+            .get(*cursor)
+            .ok_or_else(|| LimboError::InternalError("Missing aggregate type code".into()))?;
+
+        let agg_fn = match type_code {
+            Value::Integer(AGG_FUNC_COUNT) => {
+                *cursor += 1;
+                AggregateFunction::Count
+            }
+            Value::Integer(AGG_FUNC_SUM) => {
+                *cursor += 1;
+                let idx = values
+                    .get(*cursor)
+                    .ok_or_else(|| LimboError::InternalError("Missing SUM column index".into()))?;
+                if let Value::Integer(idx) = idx {
+                    *cursor += 1;
+                    AggregateFunction::Sum(*idx as usize)
+                } else {
+                    return Err(LimboError::InternalError(format!(
+                        "Expected Integer for SUM column index, got {idx:?}"
+                    )));
+                }
+            }
+            Value::Integer(AGG_FUNC_AVG) => {
+                *cursor += 1;
+                let idx = values
+                    .get(*cursor)
+                    .ok_or_else(|| LimboError::InternalError("Missing AVG column index".into()))?;
+                if let Value::Integer(idx) = idx {
+                    *cursor += 1;
+                    AggregateFunction::Avg(*idx as usize)
+                } else {
+                    return Err(LimboError::InternalError(format!(
+                        "Expected Integer for AVG column index, got {idx:?}"
+                    )));
+                }
+            }
+            Value::Integer(AGG_FUNC_MIN) => {
+                *cursor += 1;
+                let idx = values
+                    .get(*cursor)
+                    .ok_or_else(|| LimboError::InternalError("Missing MIN column index".into()))?;
+                if let Value::Integer(idx) = idx {
+                    *cursor += 1;
+                    AggregateFunction::Min(*idx as usize)
+                } else {
+                    return Err(LimboError::InternalError(format!(
+                        "Expected Integer for MIN column index, got {idx:?}"
+                    )));
+                }
+            }
+            Value::Integer(AGG_FUNC_MAX) => {
+                *cursor += 1;
+                let idx = values
+                    .get(*cursor)
+                    .ok_or_else(|| LimboError::InternalError("Missing MAX column index".into()))?;
+                if let Value::Integer(idx) = idx {
+                    *cursor += 1;
+                    AggregateFunction::Max(*idx as usize)
+                } else {
+                    return Err(LimboError::InternalError(format!(
+                        "Expected Integer for MAX column index, got {idx:?}"
+                    )));
+                }
+            }
+            _ => {
+                return Err(LimboError::InternalError(format!(
+                    "Unknown aggregate type code: {type_code:?}"
+                )))
+            }
+        };
+
+        Ok(agg_fn)
     }
 
     /// Create an AggregateFunction from a SQL function and its arguments
@@ -75,42 +181,6 @@ pub struct AggColumnInfo {
     pub has_min: bool,
     /// Whether this column has a MAX aggregate
     pub has_max: bool,
-}
-
-/// Serialize a Value using SQLite's serial type format
-/// This is used for MIN/MAX values that need to be stored in a compact, sortable format
-pub fn serialize_value(value: &Value, blob: &mut Vec<u8>) {
-    let serial_type = crate::types::SerialType::from(value);
-    let serial_type_u64: u64 = serial_type.into();
-    crate::storage::sqlite3_ondisk::write_varint_to_vec(serial_type_u64, blob);
-    value.serialize_serial(blob);
-}
-
-/// Deserialize a Value using SQLite's serial type format
-/// Returns the deserialized value and the number of bytes consumed
-pub fn deserialize_value(blob: &[u8]) -> Option<(Value, usize)> {
-    let mut cursor = 0;
-
-    // Read the serial type
-    let (serial_type, varint_size) = crate::storage::sqlite3_ondisk::read_varint(blob).ok()?;
-    cursor += varint_size;
-
-    let serial_type_obj = crate::types::SerialType::try_from(serial_type).ok()?;
-    let expected_size = serial_type_obj.size();
-
-    // Read the value
-    let (value, actual_size) =
-        crate::storage::sqlite3_ondisk::read_value(&blob[cursor..], serial_type_obj).ok()?;
-
-    // Verify that the actual size matches what we expected from the serial type
-    if actual_size != expected_size {
-        return None; // Data corruption - size mismatch
-    }
-
-    cursor += actual_size;
-
-    // Convert RefValue to Value
-    Some((value.to_owned(), cursor))
 }
 
 // group_key_str -> (group_key, state)
@@ -198,9 +268,9 @@ pub struct AggregateState {
     // For COUNT: just the count
     pub count: i64,
     // For SUM: column_index -> sum value
-    sums: HashMap<usize, f64>,
+    pub sums: HashMap<usize, f64>,
     // For AVG: column_index -> (sum, count) for computing average
-    avgs: HashMap<usize, (f64, i64)>,
+    pub avgs: HashMap<usize, (f64, i64)>,
     // For MIN: column_index -> minimum value
     pub mins: HashMap<usize, Value>,
     // For MAX: column_index -> maximum value
@@ -243,17 +313,17 @@ impl AggregateEvalState {
                         // Get the current group to read
                         let (group_key_str, _group_key) = &groups_to_read[*current_idx];
 
-                        // Build the key for the index: (operator_id, zset_id, element_id)
+                        // Build the key for the index: (operator_id, zset_hash, element_id)
                         // For regular aggregates, use column_index=0 and AGG_TYPE_REGULAR
                         let operator_storage_id =
                             generate_storage_id(operator.operator_id, 0, AGG_TYPE_REGULAR);
-                        let zset_id = operator.generate_group_rowid(group_key_str);
+                        let zset_hash = operator.generate_group_hash(group_key_str);
                         let element_id = 0i64; // Always 0 for aggregators
 
                         // Create index key values
                         let index_key_values = vec![
                             Value::Integer(operator_storage_id),
-                            Value::Integer(zset_id),
+                            zset_hash.to_value(),
                             Value::Integer(element_id),
                         ];
 
@@ -306,11 +376,9 @@ impl AggregateEvalState {
                     // Only try to read if we have a rowid
                     if let Some(rowid) = rowid {
                         let key = SeekKey::TableRowId(*rowid);
-                        let state = return_if_io!(read_record_state.read_record(
-                            key,
-                            &operator.aggregates,
-                            &mut cursors.table_cursor
-                        ));
+                        let state = return_if_io!(
+                            read_record_state.read_record(key, &mut cursors.table_cursor)
+                        );
                         // Process the fetched state
                         if let Some(state) = state {
                             let mut old_row = group_key.clone();
@@ -368,196 +436,249 @@ impl AggregateState {
         Self::default()
     }
 
-    // Serialize the aggregate state to a binary blob including group key values
-    // The reason we serialize it like this, instead of just writing the actual values, is that
-    // The same table may have different aggregators in the circuit. They will all have different
-    // columns.
-    fn to_blob(&self, aggregates: &[AggregateFunction], group_key: &[Value]) -> Vec<u8> {
-        let mut blob = Vec::new();
+    /// Convert the aggregate state to a vector of Values for unified serialization
+    /// Format: [count, num_aggregates, (agg_metadata, agg_state)...]
+    /// Each aggregate includes its type and column index for proper deserialization
+    pub fn to_value_vector(&self, aggregates: &[AggregateFunction]) -> Vec<Value> {
+        let mut values = Vec::new();
 
-        // Write version byte for future compatibility
-        blob.push(1u8);
+        // Include count first
+        values.push(Value::Integer(self.count));
 
-        // Write number of group key values
-        blob.extend_from_slice(&(group_key.len() as u32).to_le_bytes());
+        // Store number of aggregates
+        values.push(Value::Integer(aggregates.len() as i64));
 
-        // Write each group key value
-        for value in group_key {
-            // Write value type tag
-            match value {
-                Value::Null => blob.push(0u8),
-                Value::Integer(i) => {
-                    blob.push(1u8);
-                    blob.extend_from_slice(&i.to_le_bytes());
-                }
-                Value::Float(f) => {
-                    blob.push(2u8);
-                    blob.extend_from_slice(&f.to_le_bytes());
-                }
-                Value::Text(s) => {
-                    blob.push(3u8);
-                    let text_str = s.as_str();
-                    let bytes = text_str.as_bytes();
-                    blob.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-                    blob.extend_from_slice(bytes);
-                }
-                Value::Blob(b) => {
-                    blob.push(4u8);
-                    blob.extend_from_slice(&(b.len() as u32).to_le_bytes());
-                    blob.extend_from_slice(b);
-                }
-            }
-        }
-
-        // Write count as 8 bytes (little-endian)
-        blob.extend_from_slice(&self.count.to_le_bytes());
-
-        // Write each aggregate's state
+        // Add each aggregate's metadata and state
         for agg in aggregates {
+            // First, add the aggregate function metadata (type and column index)
+            values.extend(agg.to_values());
+
+            // Then add the state for this aggregate
             match agg {
-                AggregateFunction::Sum(col_name) => {
-                    let sum = self.sums.get(col_name).copied().unwrap_or(0.0);
-                    blob.extend_from_slice(&sum.to_le_bytes());
-                }
-                AggregateFunction::Avg(col_name) => {
-                    let (sum, count) = self.avgs.get(col_name).copied().unwrap_or((0.0, 0));
-                    blob.extend_from_slice(&sum.to_le_bytes());
-                    blob.extend_from_slice(&count.to_le_bytes());
-                }
                 AggregateFunction::Count => {
-                    // Count is already written above
+                    // Count state is already stored at the beginning
                 }
-                AggregateFunction::Min(col_name) => {
-                    // Write whether we have a MIN value (1 byte)
-                    if let Some(min_val) = self.mins.get(col_name) {
-                        blob.push(1u8); // Has value
-                        serialize_value(min_val, &mut blob);
+                AggregateFunction::Sum(col_idx) => {
+                    let sum = self.sums.get(col_idx).copied().unwrap_or(0.0);
+                    values.push(Value::Float(sum));
+                }
+                AggregateFunction::Avg(col_idx) => {
+                    let (sum, count) = self.avgs.get(col_idx).copied().unwrap_or((0.0, 0));
+                    values.push(Value::Float(sum));
+                    values.push(Value::Integer(count));
+                }
+                AggregateFunction::Min(col_idx) => {
+                    if let Some(min_val) = self.mins.get(col_idx) {
+                        values.push(Value::Integer(1)); // Has value
+                        values.push(min_val.clone());
                     } else {
-                        blob.push(0u8); // No value
+                        values.push(Value::Integer(0)); // No value
                     }
                 }
-                AggregateFunction::Max(col_name) => {
-                    // Write whether we have a MAX value (1 byte)
-                    if let Some(max_val) = self.maxs.get(col_name) {
-                        blob.push(1u8); // Has value
-                        serialize_value(max_val, &mut blob);
+                AggregateFunction::Max(col_idx) => {
+                    if let Some(max_val) = self.maxs.get(col_idx) {
+                        values.push(Value::Integer(1)); // Has value
+                        values.push(max_val.clone());
                     } else {
-                        blob.push(0u8); // No value
+                        values.push(Value::Integer(0)); // No value
                     }
                 }
             }
         }
 
-        blob
+        values
     }
 
-    /// Deserialize aggregate state from a binary blob
-    /// Returns the aggregate state and the group key values
-    pub fn from_blob(blob: &[u8], aggregates: &[AggregateFunction]) -> Option<(Self, Vec<Value>)> {
+    /// Reconstruct aggregate state from a vector of Values
+    pub fn from_value_vector(values: &[Value]) -> Result<Self> {
         let mut cursor = 0;
-
-        // Check version byte
-        if blob.get(cursor) != Some(&1u8) {
-            return None;
-        }
-        cursor += 1;
-
-        // Read number of group key values
-        let num_group_keys =
-            u32::from_le_bytes(blob.get(cursor..cursor + 4)?.try_into().ok()?) as usize;
-        cursor += 4;
-
-        // Read group key values
-        let mut group_key = Vec::new();
-        for _ in 0..num_group_keys {
-            let value_type = *blob.get(cursor)?;
-            cursor += 1;
-
-            let value = match value_type {
-                0 => Value::Null,
-                1 => {
-                    let i = i64::from_le_bytes(blob.get(cursor..cursor + 8)?.try_into().ok()?);
-                    cursor += 8;
-                    Value::Integer(i)
-                }
-                2 => {
-                    let f = f64::from_le_bytes(blob.get(cursor..cursor + 8)?.try_into().ok()?);
-                    cursor += 8;
-                    Value::Float(f)
-                }
-                3 => {
-                    let len =
-                        u32::from_le_bytes(blob.get(cursor..cursor + 4)?.try_into().ok()?) as usize;
-                    cursor += 4;
-                    let bytes = blob.get(cursor..cursor + len)?;
-                    cursor += len;
-                    let text_str = std::str::from_utf8(bytes).ok()?;
-                    Value::Text(text_str.to_string().into())
-                }
-                4 => {
-                    let len =
-                        u32::from_le_bytes(blob.get(cursor..cursor + 4)?.try_into().ok()?) as usize;
-                    cursor += 4;
-                    let bytes = blob.get(cursor..cursor + len)?;
-                    cursor += len;
-                    Value::Blob(bytes.to_vec())
-                }
-                _ => return None,
-            };
-            group_key.push(value);
-        }
+        let mut state = Self::new();
 
         // Read count
-        let count = i64::from_le_bytes(blob.get(cursor..cursor + 8)?.try_into().ok()?);
-        cursor += 8;
+        let count = values
+            .get(cursor)
+            .ok_or_else(|| LimboError::InternalError("Aggregate state missing count".into()))?;
+        if let Value::Integer(count) = count {
+            state.count = *count;
+            cursor += 1;
+        } else {
+            return Err(LimboError::InternalError(format!(
+                "Expected Integer for count, got {count:?}"
+            )));
+        }
 
-        let mut state = Self::new();
-        state.count = count;
+        // Read number of aggregates
+        let num_aggregates = values
+            .get(cursor)
+            .ok_or_else(|| LimboError::InternalError("Missing number of aggregates".into()))?;
+        let num_aggregates = match num_aggregates {
+            Value::Integer(n) => *n as usize,
+            _ => {
+                return Err(LimboError::InternalError(format!(
+                    "Expected Integer for aggregate count, got {num_aggregates:?}"
+                )))
+            }
+        };
+        cursor += 1;
 
-        // Read each aggregate's state
-        for agg in aggregates {
-            match agg {
-                AggregateFunction::Sum(col_name) => {
-                    let sum = f64::from_le_bytes(blob.get(cursor..cursor + 8)?.try_into().ok()?);
-                    cursor += 8;
-                    state.sums.insert(*col_name, sum);
-                }
-                AggregateFunction::Avg(col_name) => {
-                    let sum = f64::from_le_bytes(blob.get(cursor..cursor + 8)?.try_into().ok()?);
-                    cursor += 8;
-                    let count = i64::from_le_bytes(blob.get(cursor..cursor + 8)?.try_into().ok()?);
-                    cursor += 8;
-                    state.avgs.insert(*col_name, (sum, count));
-                }
+        // Read each aggregate's state with type and column index
+        for _ in 0..num_aggregates {
+            // Deserialize the aggregate function metadata
+            let agg_fn = AggregateFunction::from_values(values, &mut cursor)?;
+
+            // Read the state for this aggregate
+            match agg_fn {
                 AggregateFunction::Count => {
-                    // Count was already read above
+                    // Count state is already stored at the beginning
                 }
-                AggregateFunction::Min(col_name) => {
-                    // Read whether we have a MIN value
-                    let has_value = *blob.get(cursor)?;
-                    cursor += 1;
-
-                    if has_value == 1 {
-                        let (min_value, bytes_consumed) = deserialize_value(&blob[cursor..])?;
-                        cursor += bytes_consumed;
-                        state.mins.insert(*col_name, min_value);
+                AggregateFunction::Sum(col_idx) => {
+                    let sum = values
+                        .get(cursor)
+                        .ok_or_else(|| LimboError::InternalError("Missing SUM value".into()))?;
+                    if let Value::Float(sum) = sum {
+                        state.sums.insert(col_idx, *sum);
+                        cursor += 1;
+                    } else {
+                        return Err(LimboError::InternalError(format!(
+                            "Expected Float for SUM value, got {sum:?}"
+                        )));
                     }
                 }
-                AggregateFunction::Max(col_name) => {
-                    // Read whether we have a MAX value
-                    let has_value = *blob.get(cursor)?;
+                AggregateFunction::Avg(col_idx) => {
+                    let sum = values
+                        .get(cursor)
+                        .ok_or_else(|| LimboError::InternalError("Missing AVG sum value".into()))?;
+                    let sum = match sum {
+                        Value::Float(f) => *f,
+                        _ => {
+                            return Err(LimboError::InternalError(format!(
+                                "Expected Float for AVG sum, got {sum:?}"
+                            )))
+                        }
+                    };
                     cursor += 1;
 
-                    if has_value == 1 {
-                        let (max_value, bytes_consumed) = deserialize_value(&blob[cursor..])?;
-                        cursor += bytes_consumed;
-                        state.maxs.insert(*col_name, max_value);
+                    let count = values.get(cursor).ok_or_else(|| {
+                        LimboError::InternalError("Missing AVG count value".into())
+                    })?;
+                    let count = match count {
+                        Value::Integer(i) => *i,
+                        _ => {
+                            return Err(LimboError::InternalError(format!(
+                                "Expected Integer for AVG count, got {count:?}"
+                            )))
+                        }
+                    };
+                    cursor += 1;
+
+                    state.avgs.insert(col_idx, (sum, count));
+                }
+                AggregateFunction::Min(col_idx) => {
+                    let has_value = values.get(cursor).ok_or_else(|| {
+                        LimboError::InternalError("Missing MIN has_value flag".into())
+                    })?;
+                    if let Value::Integer(has_value) = has_value {
+                        cursor += 1;
+                        if *has_value == 1 {
+                            let min_val = values
+                                .get(cursor)
+                                .ok_or_else(|| {
+                                    LimboError::InternalError("Missing MIN value".into())
+                                })?
+                                .clone();
+                            cursor += 1;
+                            state.mins.insert(col_idx, min_val);
+                        }
+                    } else {
+                        return Err(LimboError::InternalError(format!(
+                            "Expected Integer for MIN has_value flag, got {has_value:?}"
+                        )));
+                    }
+                }
+                AggregateFunction::Max(col_idx) => {
+                    let has_value = values.get(cursor).ok_or_else(|| {
+                        LimboError::InternalError("Missing MAX has_value flag".into())
+                    })?;
+                    if let Value::Integer(has_value) = has_value {
+                        cursor += 1;
+                        if *has_value == 1 {
+                            let max_val = values
+                                .get(cursor)
+                                .ok_or_else(|| {
+                                    LimboError::InternalError("Missing MAX value".into())
+                                })?
+                                .clone();
+                            cursor += 1;
+                            state.maxs.insert(col_idx, max_val);
+                        }
+                    } else {
+                        return Err(LimboError::InternalError(format!(
+                            "Expected Integer for MAX has_value flag, got {has_value:?}"
+                        )));
                     }
                 }
             }
         }
 
-        Some((state, group_key))
+        Ok(state)
+    }
+
+    fn to_blob(&self, aggregates: &[AggregateFunction], group_key: &[Value]) -> Vec<u8> {
+        let mut all_values = Vec::new();
+        // Store the group key size first
+        all_values.push(Value::Integer(group_key.len() as i64));
+        all_values.extend_from_slice(group_key);
+        all_values.extend(self.to_value_vector(aggregates));
+
+        let record = ImmutableRecord::from_values(&all_values, all_values.len());
+        record.as_blob().clone()
+    }
+
+    pub fn from_blob(blob: &[u8]) -> Result<(Self, Vec<Value>)> {
+        let record = ImmutableRecord::from_bin_record(blob.to_vec());
+        let ref_values = record.get_values();
+        let mut all_values: Vec<Value> = ref_values.into_iter().map(|rv| rv.to_owned()).collect();
+
+        if all_values.is_empty() {
+            return Err(LimboError::InternalError(
+                "Aggregate state blob is empty".into(),
+            ));
+        }
+
+        // Read the group key size
+        let group_key_count = match &all_values[0] {
+            Value::Integer(n) if *n >= 0 => *n as usize,
+            Value::Integer(n) => {
+                return Err(LimboError::InternalError(format!(
+                    "Negative group key count: {n}"
+                )))
+            }
+            other => {
+                return Err(LimboError::InternalError(format!(
+                    "Expected Integer for group key count, got {other:?}"
+                )))
+            }
+        };
+
+        // Remove the group key count from the values
+        all_values.remove(0);
+
+        if all_values.len() < group_key_count {
+            return Err(LimboError::InternalError(format!(
+                "Blob too short: expected at least {} values for group key, got {}",
+                group_key_count,
+                all_values.len()
+            )));
+        }
+
+        // Split into group key and state values
+        let group_key = all_values[..group_key_count].to_vec();
+        let state_values = &all_values[group_key_count..];
+
+        // Reconstruct the aggregate state
+        let state = Self::from_value_vector(state_values)?;
+
+        Ok((state, group_key))
     }
 
     /// Apply a delta to this aggregate state
@@ -835,7 +956,7 @@ impl AggregateOperator {
         for (group_key_str, state) in existing_groups {
             let group_key = temp_keys.get(group_key_str).cloned().unwrap_or_default();
 
-            // Generate a unique rowid for this group
+            // Generate synthetic rowid for this group
             let result_key = self.generate_group_rowid(group_key_str);
 
             if let Some(old_row_values) = old_values.get(group_key_str) {
@@ -902,17 +1023,24 @@ impl AggregateOperator {
         self.tracker = Some(tracker);
     }
 
-    /// Generate a rowid for a group
-    /// For no GROUP BY: always returns 0
-    /// For GROUP BY: returns a hash of the group key string
-    pub fn generate_group_rowid(&self, group_key_str: &str) -> i64 {
+    /// Generate a hash for a group
+    /// For no GROUP BY: returns a zero hash
+    /// For GROUP BY: returns a 128-bit hash of the group key string
+    pub fn generate_group_hash(&self, group_key_str: &str) -> Hash128 {
         if self.group_by.is_empty() {
-            0
+            Hash128::new(0, 0)
         } else {
-            group_key_str
-                .bytes()
-                .fold(0i64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as i64))
+            Hash128::hash_str(group_key_str)
         }
+    }
+
+    /// Generate a rowid for a group (for output rows)
+    /// This is NOT the hash used for storage (that's generate_group_hash which returns full 128-bit).
+    /// This is a synthetic rowid used in place of SQLite's rowid for aggregate output rows.
+    /// We truncate the 128-bit hash to 64 bits for SQLite rowid compatibility.
+    pub fn generate_group_rowid(&self, group_key_str: &str) -> i64 {
+        let hash = self.generate_group_hash(group_key_str);
+        hash.as_i64()
     }
 
     /// Extract group key values from a row
@@ -1020,7 +1148,7 @@ impl IncrementalOperator for AggregateOperator {
                         // For regular aggregates, use column_index=0 and AGG_TYPE_REGULAR
                         let operator_storage_id =
                             generate_storage_id(self.operator_id, 0, AGG_TYPE_REGULAR);
-                        let zset_id = self.generate_group_rowid(group_key_str);
+                        let zset_hash = self.generate_group_hash(group_key_str);
                         let element_id = 0i64;
 
                         // Determine weight: -1 to delete (cancels existing weight=1), 1 to insert/update
@@ -1030,22 +1158,22 @@ impl IncrementalOperator for AggregateOperator {
                         let state_blob = agg_state.to_blob(&self.aggregates, group_key);
                         let blob_value = Value::Blob(state_blob);
 
-                        // Build the aggregate storage format: [operator_id, zset_id, element_id, value, weight]
+                        // Build the aggregate storage format: [operator_id, zset_hash, element_id, value, weight]
                         let operator_id_val = Value::Integer(operator_storage_id);
-                        let zset_id_val = Value::Integer(zset_id);
+                        let zset_hash_val = zset_hash.to_value();
                         let element_id_val = Value::Integer(element_id);
                         let blob_val = blob_value.clone();
 
                         // Create index key - the first 3 columns of our primary key
                         let index_key = vec![
                             operator_id_val.clone(),
-                            zset_id_val.clone(),
+                            zset_hash_val.clone(),
                             element_id_val.clone(),
                         ];
 
                         // Record values (without weight)
                         let record_values =
-                            vec![operator_id_val, zset_id_val, element_id_val, blob_val];
+                            vec![operator_id_val, zset_hash_val, element_id_val, blob_val];
 
                         return_and_restore_if_io!(
                             &mut self.commit_state,
@@ -1081,7 +1209,7 @@ impl IncrementalOperator for AggregateOperator {
                                 self.operator_id,
                                 &self.column_min_max,
                                 cursors,
-                                |group_key_str| self.generate_group_rowid(group_key_str)
+                                |group_key_str| self.generate_group_hash(group_key_str)
                             )
                         );
 
@@ -1239,7 +1367,7 @@ impl RecomputeMinMax {
                     // Create storage keys for index lookup
                     let storage_id =
                         generate_storage_id(operator.operator_id, storage_index, AGG_TYPE_MINMAX);
-                    let zset_id = operator.generate_group_rowid(&group_key);
+                    let zset_hash = operator.generate_group_hash(&group_key);
 
                     // Get the values for this group from min_max_deltas
                     let group_values = min_max_deltas.get(&group_key).cloned().unwrap_or_default();
@@ -1253,7 +1381,7 @@ impl RecomputeMinMax {
                             group_key.clone(),
                             column_name,
                             storage_id,
-                            zset_id,
+                            zset_hash,
                             group_values,
                         ))
                     } else {
@@ -1262,7 +1390,7 @@ impl RecomputeMinMax {
                             group_key.clone(),
                             column_name,
                             storage_id,
-                            zset_id,
+                            zset_hash,
                             group_values,
                         ))
                     };
@@ -1334,7 +1462,7 @@ pub enum ScanState {
         /// Storage ID for the index seek
         storage_id: i64,
         /// ZSet ID for the group
-        zset_id: i64,
+        zset_hash: Hash128,
         /// Group values from MinMaxDeltas: (column_name, HashableRow) -> weight
         group_values: HashMap<(usize, HashableRow), isize>,
         /// Whether we're looking for MIN (true) or MAX (false)
@@ -1350,7 +1478,7 @@ pub enum ScanState {
         /// Storage ID for the index seek
         storage_id: i64,
         /// ZSet ID for the group
-        zset_id: i64,
+        zset_hash: Hash128,
         /// Group values from MinMaxDeltas: (column_name, HashableRow) -> weight
         group_values: HashMap<(usize, HashableRow), isize>,
         /// Whether we're looking for MIN (true) or MAX (false)
@@ -1368,7 +1496,7 @@ impl ScanState {
         group_key: String,
         column_name: usize,
         storage_id: i64,
-        zset_id: i64,
+        zset_hash: Hash128,
         group_values: HashMap<(usize, HashableRow), isize>,
     ) -> Self {
         Self::CheckCandidate {
@@ -1376,7 +1504,7 @@ impl ScanState {
             group_key,
             column_name,
             storage_id,
-            zset_id,
+            zset_hash,
             group_values,
             is_min: true,
         }
@@ -1390,7 +1518,7 @@ impl ScanState {
         index_record: &ImmutableRecord,
         seek_op: SeekOp,
         storage_id: i64,
-        zset_id: i64,
+        zset_hash: Hash128,
     ) -> Result<IOResult<Option<Value>>> {
         let seek_result = return_if_io!(cursors
             .index_cursor
@@ -1413,15 +1541,26 @@ impl ScanState {
         let Some(rec_storage_id) = values.first() else {
             return Ok(IOResult::Done(None));
         };
-        let Some(rec_zset_id) = values.get(1) else {
+        let Some(rec_zset_hash) = values.get(1) else {
             return Ok(IOResult::Done(None));
         };
 
         // Check if we're still in the same group
-        if let (RefValue::Integer(rec_sid), RefValue::Integer(rec_zid)) =
-            (rec_storage_id, rec_zset_id)
-        {
-            if *rec_sid != storage_id || *rec_zid != zset_id {
+        if let RefValue::Integer(rec_sid) = rec_storage_id {
+            if *rec_sid != storage_id {
+                return Ok(IOResult::Done(None));
+            }
+        } else {
+            return Ok(IOResult::Done(None));
+        }
+
+        // Compare zset_hash as blob
+        if let RefValue::Blob(rec_zset_blob) = rec_zset_hash {
+            if let Some(rec_hash) = Hash128::from_blob(rec_zset_blob.to_slice()) {
+                if rec_hash != zset_hash {
+                    return Ok(IOResult::Done(None));
+                }
+            } else {
                 return Ok(IOResult::Done(None));
             }
         } else {
@@ -1437,7 +1576,7 @@ impl ScanState {
         group_key: String,
         column_name: usize,
         storage_id: i64,
-        zset_id: i64,
+        zset_hash: Hash128,
         group_values: HashMap<(usize, HashableRow), isize>,
     ) -> Self {
         Self::CheckCandidate {
@@ -1445,7 +1584,7 @@ impl ScanState {
             group_key,
             column_name,
             storage_id,
-            zset_id,
+            zset_hash,
             group_values,
             is_min: false,
         }
@@ -1462,7 +1601,7 @@ impl ScanState {
                     group_key,
                     column_name,
                     storage_id,
-                    zset_id,
+                    zset_hash,
                     group_values,
                     is_min,
                 } => {
@@ -1482,7 +1621,7 @@ impl ScanState {
                                 group_key: std::mem::take(group_key),
                                 column_name: std::mem::take(column_name),
                                 storage_id: *storage_id,
-                                zset_id: *zset_id,
+                                zset_hash: *zset_hash,
                                 group_values: std::mem::take(group_values),
                                 is_min: *is_min,
                             };
@@ -1544,14 +1683,14 @@ impl ScanState {
                     group_key,
                     column_name,
                     storage_id,
-                    zset_id,
+                    zset_hash,
                     group_values,
                     is_min,
                 } => {
                     // Seek to the next value in the index
                     let index_key = vec![
                         Value::Integer(*storage_id),
-                        Value::Integer(*zset_id),
+                        zset_hash.to_value(),
                         current_candidate.clone(),
                     ];
                     let index_record = ImmutableRecord::from_values(&index_key, index_key.len());
@@ -1567,7 +1706,7 @@ impl ScanState {
                         &index_record,
                         seek_op,
                         *storage_id,
-                        *zset_id
+                        *zset_hash
                     ));
 
                     *self = ScanState::CheckCandidate {
@@ -1575,7 +1714,7 @@ impl ScanState {
                         group_key: std::mem::take(group_key),
                         column_name: std::mem::take(column_name),
                         storage_id: *storage_id,
-                        zset_id: *zset_id,
+                        zset_hash: *zset_hash,
                         group_values: std::mem::take(group_values),
                         is_min: *is_min,
                     };
@@ -1629,7 +1768,7 @@ impl MinMaxPersistState {
         operator_id: usize,
         column_min_max: &HashMap<usize, AggColumnInfo>,
         cursors: &mut DbspStateCursors,
-        generate_group_rowid: impl Fn(&str) -> i64,
+        generate_group_hash: impl Fn(&str) -> Hash128,
     ) -> Result<IOResult<()>> {
         loop {
             match self {
@@ -1715,7 +1854,7 @@ impl MinMaxPersistState {
                     // Build the key components for MinMax storage using new encoding
                     let storage_id =
                         generate_storage_id(operator_id, column_index, AGG_TYPE_MINMAX);
-                    let zset_id = generate_group_rowid(group_key_str);
+                    let zset_hash = generate_group_hash(group_key_str);
 
                     // element_id is the actual value for Min/Max
                     let element_id_val = value.clone();
@@ -1723,15 +1862,15 @@ impl MinMaxPersistState {
                     // Create index key
                     let index_key = vec![
                         Value::Integer(storage_id),
-                        Value::Integer(zset_id),
+                        zset_hash.to_value(),
                         element_id_val.clone(),
                     ];
 
-                    // Record values (operator_id, zset_id, element_id, unused_placeholder)
+                    // Record values (operator_id, zset_hash, element_id, unused_placeholder)
                     // For MIN/MAX, the element_id IS the value, so we use NULL for the 4th column
                     let record_values = vec![
                         Value::Integer(storage_id),
-                        Value::Integer(zset_id),
+                        zset_hash.to_value(),
                         element_id_val.clone(),
                         Value::Null, // Placeholder - not used for MIN/MAX
                     ];

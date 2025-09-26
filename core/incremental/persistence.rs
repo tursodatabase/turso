@@ -1,4 +1,4 @@
-use crate::incremental::operator::{AggregateFunction, AggregateState, DbspStateCursors};
+use crate::incremental::operator::{AggregateState, DbspStateCursors};
 use crate::storage::btree::{BTreeCursor, BTreeKey};
 use crate::types::{IOResult, ImmutableRecord, SeekKey, SeekOp, SeekResult};
 use crate::{return_if_io, LimboError, Result, Value};
@@ -20,7 +20,6 @@ impl ReadRecord {
     pub fn read_record(
         &mut self,
         key: SeekKey,
-        aggregates: &[AggregateFunction],
         cursor: &mut BTreeCursor,
     ) -> Result<IOResult<Option<AggregateState>>> {
         loop {
@@ -41,12 +40,7 @@ impl ReadRecord {
                         let blob = values[3].to_owned();
 
                         let (state, _group_key) = match blob {
-                            Value::Blob(blob) => AggregateState::from_blob(&blob, aggregates)
-                                .ok_or_else(|| {
-                                    LimboError::InternalError(format!(
-                                        "Cannot deserialize aggregate state {blob:?}",
-                                    ))
-                                }),
+                            Value::Blob(blob) => AggregateState::from_blob(&blob),
                             _ => Err(LimboError::ParseError(
                                 "Value in aggregator not blob".to_string(),
                             )),

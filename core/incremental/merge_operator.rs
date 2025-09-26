@@ -57,7 +57,7 @@ impl MergeOperator {
                 for (row, weight) in delta.changes {
                     // Hash only the values (not rowid) for deduplication
                     let temp_row = HashableRow::new(0, row.values.clone());
-                    let value_hash = temp_row.cached_hash();
+                    let value_hash = temp_row.cached_hash().as_i64() as u64;
 
                     // Check if we've seen this value before
                     let assigned_rowid =
