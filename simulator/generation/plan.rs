@@ -476,7 +476,7 @@ impl Display for InteractionPlan {
                     writeln!(f, "-- FAULT '{fault}'")?;
                 }
                 InteractionsType::Query(query) => {
-                    writeln!(f, "{query};")?;
+                    writeln!(f, "{query}; -- {}", interactions.connection_index)?;
                 }
             }
         }
@@ -630,7 +630,7 @@ pub enum InteractionType {
 // FIXME: add the connection index here later
 impl Display for Interaction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.interaction)
+        write!(f, "{}; -- {}", self.interaction, self.connection_index)
     }
 }
 
@@ -638,13 +638,13 @@ impl Display for InteractionType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Query(query) => write!(f, "{query}"),
-            Self::Assumption(assumption) => write!(f, "-- ASSUME {};", assumption.name),
+            Self::Assumption(assumption) => write!(f, "-- ASSUME {}", assumption.name),
             Self::Assertion(assertion) => {
                 write!(f, "-- ASSERT {};", assertion.name)
             }
-            Self::Fault(fault) => write!(f, "-- FAULT '{fault}';"),
+            Self::Fault(fault) => write!(f, "-- FAULT '{fault}'"),
             Self::FsyncQuery(query) => {
-                writeln!(f, "-- FSYNC QUERY;")?;
+                writeln!(f, "-- FSYNC QUERY")?;
                 writeln!(f, "{query};")?;
                 write!(f, "{query};")
             }
