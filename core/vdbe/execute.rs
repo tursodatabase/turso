@@ -5222,7 +5222,7 @@ pub fn op_function(
 
                                 Some(
                                     ast::Stmt::CreateIndex {
-                                        tbl_name: ast::Name::new(original_rename_to),
+                                        tbl_name: ast::Name::exact(original_rename_to.to_string()),
                                         unique,
                                         if_not_exists,
                                         idx_name,
@@ -5248,7 +5248,7 @@ pub fn op_function(
                                     ast::Stmt::CreateTable {
                                         tbl_name: ast::QualifiedName {
                                             db_name: None,
-                                            name: ast::Name::new(original_rename_to),
+                                            name: ast::Name::exact(original_rename_to.to_string()),
                                             alias: None,
                                         },
                                         temporary,
@@ -5365,7 +5365,7 @@ pub fn op_function(
                                 let column = columns
                                     .iter_mut()
                                     .find(|column| {
-                                        column.col_name == ast::Name::new(original_rename_from)
+                                        column.col_name == ast::Name::exact(original_rename_from.to_string())
                                     })
                                     .expect("column being renamed should be present");
 

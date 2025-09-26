@@ -745,7 +745,7 @@ impl ToTokens for Expr {
             Self::Collate(expr, collation) => {
                 expr.to_tokens(s, context)?;
                 s.append(TK_COLLATE, None)?;
-                double_quote(collation.as_str(), s)
+                s.append(TK_ID, Some(&collation.as_quoted()))
             }
             Self::DoublyQualified(db_name, tbl_name, col_name) => {
                 db_name.to_tokens(s, context)?;
@@ -1370,7 +1370,7 @@ impl ToTokens for Name {
         s: &mut S,
         _: &C,
     ) -> Result<(), S::Error> {
-        double_quote(self.as_literal(), s)
+        s.append(TK_ID, Some(&self.as_quoted()))
     }
 }
 
@@ -2459,12 +2459,4 @@ where
     I::Item: ToTokens,
 {
     s.comma(items, context)
-}
-
-// TK_ID: [...] / `...` / "..." / some keywords / non keywords
-fn double_quote<S: TokenStream + ?Sized>(name: &str, s: &mut S) -> Result<(), S::Error> {
-    if name.is_empty() {
-        return s.append(TK_ID, Some("\"\""));
-    }
-    s.append(TK_ID, Some(name))
 }

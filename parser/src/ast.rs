@@ -1,6 +1,8 @@
 pub mod check;
 pub mod fmt;
 
+use std::sync::OnceLock;
+
 use strum_macros::{EnumIter, EnumString};
 
 /// `?` or `$` Prepared statement arg placeholder(s)
@@ -879,22 +881,62 @@ pub struct GroupBy {
 
 /// identifier or string or `CROSS` or `FULL` or `INNER` or `LEFT` or `NATURAL` or `OUTER` or `RIGHT`.
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub enum Name {
-    /// Identifier
-    Ident(String),
-    /// Quoted values
-    Quoted(String),
+pub struct Name {
+    quote: Option<char>,
+    value: String,
+    lowercase: OnceLock<String>,
+    value_is_lowercase: bool,
+}
+
+#[cfg(feature = "serde")]
+impl serde::Serialize for Name {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.value)
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for Name {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct NameVisitor;
+        impl<'de> serde::de::Visitor<'de> for NameVisitor {
+            type Value = Name;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a string")
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(Name::from_bytes(v.as_bytes()))
+            }
+        }
+        deserializer.deserialize_str(NameVisitor)
+    }
 }
 
 impl Name {
     pub fn exact(s: String) -> Self {
-        Self::Ident(s)
+        let value_is_lowercase = s.chars().all(|x| x.is_lowercase());
+        Self {
+            value: s,
+            quote: None,
+            lowercase: OnceLock::new(),
+            value_is_lowercase,
+        }
     }
     pub fn from_bytes(s: &[u8]) -> Self {
-        Self::new(unsafe { std::str::from_utf8_unchecked(s) }.to_owned())
+        Self::from_str(unsafe { std::str::from_utf8_unchecked(s) })
     }
-    pub fn new(s: impl AsRef<str>) -> Self {
+    pub fn from_str(s: impl AsRef<str>) -> Self {
         let s = s.as_ref();
         let bytes = s.as_bytes();
 
@@ -902,22 +944,51 @@ impl Name {
             return Name::exact(s.to_string());
         }
 
-        match bytes[0] {
-            b'"' | b'\'' | b'`' | b'[' => Name::Quoted(s.to_string()),
-            _ => Name::exact(s.to_string()),
+        if matches!(bytes[0], b'"' | b'\'' | b'`') {
+            assert!(s.len() >= 2);
+            assert!(bytes[bytes.len() - 1] == bytes[0]);
+            let s = match bytes[0] {
+                b'"' => s[1..s.len() - 1].replace("\"\"", "\""),
+                b'\'' => s[1..s.len() - 1].replace("''", "'"),
+                b'`' => s[1..s.len() - 1].replace("``", "`"),
+                _ => unreachable!(),
+            };
+            let value_is_lowercase = s.chars().all(|x| x.is_lowercase());
+            Name {
+                value: s,
+                quote: Some(bytes[0] as char),
+                lowercase: OnceLock::new(),
+                value_is_lowercase,
+            }
+        } else if bytes[0] == b'[' {
+            assert!(s.len() >= 2);
+            assert!(bytes[bytes.len() - 1] == b']');
+            Name::exact(s[1..s.len() - 1].to_string())
+        } else {
+            Name::exact(s.to_string())
         }
     }
 
     pub fn as_str(&self) -> &str {
-        match self {
-            Name::Ident(s) => s.as_str(),
-            Name::Quoted(s) => &s[1..s.len() - 1],
+        if self.value_is_lowercase {
+            return &self.value;
         }
+        if self.lowercase.get().is_none() {
+            let _ = self.lowercase.set(self.value.to_lowercase());
+        }
+        self.lowercase.get().unwrap()
     }
 
     pub fn as_literal(&self) -> &str {
-        match self {
-            Name::Ident(s) | Name::Quoted(s) => s.as_str(),
+        &self.value
+    }
+
+    pub fn as_quoted(&self) -> String {
+        let value = self.value.as_bytes();
+        if !value.is_empty() && value.iter().all(|x| x.is_ascii_alphanumeric()) {
+            self.value.clone()
+        } else {
+            format!("\"{}\"", self.value.replace("\"", "\"\""))
         }
     }
 
@@ -927,14 +998,11 @@ impl Name {
     ///
     /// Also, used to detect string literals in PRAGMA cases
     pub fn quoted_with(&self, quote: char) -> bool {
-        if let Self::Quoted(ident) = self {
-            return ident.starts_with(quote);
-        }
-        false
+        self.quote == Some(quote)
     }
 
     pub fn quoted(&self) -> bool {
-        matches!(self, Self::Quoted(..))
+        self.quote.is_some()
     }
 }
 

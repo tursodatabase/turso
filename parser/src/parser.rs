@@ -4127,7 +4127,7 @@ mod tests {
                 b"BEGIN EXCLUSIVE TRANSACTION 'my_transaction'".as_slice(),
                 vec![Cmd::Stmt(Stmt::Begin {
                     typ: Some(TransactionType::Exclusive),
-                    name: Some(Name::new("'my_transaction'".to_string())),
+                    name: Some(Name::from_str("'my_transaction'".to_string())),
                 })],
             ),
             (
@@ -4148,7 +4148,7 @@ mod tests {
                 b"BEGIN CONCURRENT TRANSACTION 'my_transaction'".as_slice(),
                 vec![Cmd::Stmt(Stmt::Begin {
                     typ: Some(TransactionType::Concurrent),
-                    name: Some(Name::new("'my_transaction'".to_string())),
+                    name: Some(Name::from_str("'my_transaction'".to_string())),
                 })],
             ),
             (
@@ -4243,7 +4243,7 @@ mod tests {
             (
                 b"SAVEPOINT 'my_savepoint'".as_slice(),
                 vec![Cmd::Stmt(Stmt::Savepoint {
-                    name: Name::new("'my_savepoint'".to_string()),
+                    name: Name::from_str("'my_savepoint'".to_string()),
                 })],
             ),
             // release
@@ -4262,7 +4262,7 @@ mod tests {
             (
                 b"RELEASE SAVEPOINT 'my_savepoint'".as_slice(),
                 vec![Cmd::Stmt(Stmt::Release {
-                    name: Name::new("'my_savepoint'".to_string()),
+                    name: Name::from_str("'my_savepoint'".to_string()),
                 })],
             ),
             (
@@ -11474,13 +11474,13 @@ mod tests {
                     if_not_exists: false,
                     tbl_name: QualifiedName {
                         db_name: None,
-                        name: Name::new("\"settings\"".to_owned()),
+                        name: Name::from_str("\"settings\"".to_owned()),
                         alias: None,
                     },
                     body: CreateTableBody::ColumnsAndConstraints{
                         columns: vec![
                             ColumnDefinition {
-                                col_name: Name::new("\"enabled\"".to_owned()),
+                                col_name: Name::from_str("\"enabled\"".to_owned()),
                                 col_type: Some(Type {
                                     name: "INTEGER".to_owned(),
                                     size: None,

@@ -392,10 +392,7 @@ fn create_idx_stmt_to_sql(
             sql.push_str(", ");
         }
         let col_ident = match col.expr.as_ref() {
-            Expr::Id(ast::Name::Ident(col_name))
-            | Expr::Id(ast::Name::Quoted(col_name))
-            | Expr::Name(ast::Name::Ident(col_name))
-            | Expr::Name(ast::Name::Quoted(col_name)) => col_name,
+            Expr::Id(name) | Expr::Name(name) => name.as_str(),
             _ => unreachable!("expressions in CREATE INDEX should have been rejected earlier"),
         };
         sql.push_str(col_ident);

@@ -187,7 +187,7 @@ impl FromClause {
     fn to_sql_ast(&self) -> ast::FromClause {
         ast::FromClause {
             select: Box::new(ast::SelectTable::Table(
-                ast::QualifiedName::single(ast::Name::new(&self.table)),
+                ast::QualifiedName::single(ast::Name::from_str(&self.table)),
                 None,
                 None,
             )),
@@ -203,7 +203,7 @@ impl FromClause {
                         JoinType::Cross => ast::JoinOperator::TypedJoin(Some(ast::JoinType::CROSS)),
                     },
                     table: Box::new(ast::SelectTable::Table(
-                        ast::QualifiedName::single(ast::Name::new(&join.table)),
+                        ast::QualifiedName::single(ast::Name::from_str(&join.table)),
                         None,
                         None,
                     )),
