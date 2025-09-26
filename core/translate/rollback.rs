@@ -1,14 +1,11 @@
 use turso_parser::ast::Name;
 
 use crate::{
-    schema::Schema,
     vdbe::{builder::ProgramBuilder, insn::Insn},
-    Result, SymbolTable,
+    Result,
 };
 
 pub fn translate_rollback(
-    _schema: &Schema,
-    _syms: &SymbolTable,
     mut program: ProgramBuilder,
     txn_name: Option<Name>,
     savepoint_name: Option<Name>,

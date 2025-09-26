@@ -5,7 +5,6 @@ use crate::ext::VTabImpl;
 use crate::schema::create_table;
 use crate::schema::BTreeTable;
 use crate::schema::Column;
-use crate::schema::Schema;
 use crate::schema::Table;
 use crate::schema::Type;
 use crate::schema::RESERVED_TABLE_PREFIXES;
@@ -23,19 +22,16 @@ use crate::vdbe::builder::CursorType;
 use crate::vdbe::insn::Cookie;
 use crate::vdbe::insn::{CmpInsFlags, InsertFlags, Insn};
 use crate::Connection;
-use crate::SymbolTable;
 use crate::{bail_parse_error, Result};
 
 use turso_ext::VTabKind;
 
-#[allow(clippy::too_many_arguments)]
 pub fn translate_create_table(
     tbl_name: ast::QualifiedName,
+    resolver: &Resolver,
     temporary: bool,
     if_not_exists: bool,
     body: ast::CreateTableBody,
-    schema: &Schema,
-    syms: &SymbolTable,
     mut program: ProgramBuilder,
     connection: &Connection,
 ) -> Result<ProgramBuilder> {
@@ -70,7 +66,7 @@ pub fn translate_create_table(
         );
     }
 
-    if schema.get_table(&normalized_tbl_name).is_some() {
+    if resolver.schema.get_table(&normalized_tbl_name).is_some() {
         if if_not_exists {
             return Ok(program);
         }
@@ -113,7 +109,7 @@ pub fn translate_create_table(
         }
     }
 
-    let schema_master_table = schema.get_btree_table(SQLITE_TABLEID).unwrap();
+    let schema_master_table = resolver.schema.get_btree_table(SQLITE_TABLEID).unwrap();
     let sqlite_schema_cursor_id =
         program.alloc_cursor_id(CursorType::BTreeTable(schema_master_table.clone()));
     program.emit_insn(Insn::OpenWrite {
@@ -121,11 +117,10 @@ pub fn translate_create_table(
         root_page: 1usize.into(),
         db: 0,
     });
-    let resolver = Resolver::new(schema, syms);
-    let cdc_table = prepare_cdc_if_necessary(&mut program, schema, SQLITE_TABLEID)?;
+    let cdc_table = prepare_cdc_if_necessary(&mut program, resolver.schema, SQLITE_TABLEID)?;
 
     let created_sequence_table =
-        if has_autoincrement && schema.get_table("sqlite_sequence").is_none() {
+        if has_autoincrement && resolver.schema.get_table("sqlite_sequence").is_none() {
             let seq_table_root_reg = program.alloc_register();
             program.emit_insn(Insn::CreateBtree {
                 db: 0,
@@ -136,7 +131,7 @@ pub fn translate_create_table(
             let seq_sql = "CREATE TABLE sqlite_sequence(name,seq)";
             emit_schema_entry(
                 &mut program,
-                &resolver,
+                resolver,
                 sqlite_schema_cursor_id,
                 cdc_table.as_ref().map(|x| x.0),
                 SchemaEntryType::Table,
@@ -191,7 +186,7 @@ pub fn translate_create_table(
 
     let index_regs = collect_autoindexes(&body, &mut program, &normalized_tbl_name)?;
     if let Some(index_regs) = index_regs.as_ref() {
-        if !schema.indexes_enabled() {
+        if !resolver.schema.indexes_enabled() {
             bail_parse_error!("Constraints UNIQUE and PRIMARY KEY (unless INTEGER PRIMARY KEY) on table are not supported without indexes");
         }
         for index_reg in index_regs.iter() {
@@ -203,7 +198,7 @@ pub fn translate_create_table(
         }
     }
 
-    let table = schema.get_btree_table(SQLITE_TABLEID).unwrap();
+    let table = resolver.schema.get_btree_table(SQLITE_TABLEID).unwrap();
     let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
     program.emit_insn(Insn::OpenWrite {
         cursor_id: sqlite_schema_cursor_id,
@@ -211,12 +206,11 @@ pub fn translate_create_table(
         db: 0,
     });
 
-    let cdc_table = prepare_cdc_if_necessary(&mut program, schema, SQLITE_TABLEID)?;
-    let resolver = Resolver::new(schema, syms);
+    let cdc_table = prepare_cdc_if_necessary(&mut program, resolver.schema, SQLITE_TABLEID)?;
 
     emit_schema_entry(
         &mut program,
-        &resolver,
+        resolver,
         sqlite_schema_cursor_id,
         cdc_table.as_ref().map(|x| x.0),
         SchemaEntryType::Table,
@@ -235,7 +229,7 @@ pub fn translate_create_table(
             );
             emit_schema_entry(
                 &mut program,
-                &resolver,
+                resolver,
                 sqlite_schema_cursor_id,
                 None,
                 SchemaEntryType::Index,
@@ -252,7 +246,7 @@ pub fn translate_create_table(
     program.emit_insn(Insn::SetCookie {
         db: 0,
         cookie: Cookie::SchemaVersion,
-        value: schema.schema_version as i32 + 1,
+        value: resolver.schema.schema_version as i32 + 1,
         p5: 0,
     });
 
@@ -478,8 +472,7 @@ fn create_vtable_body_to_str(vtab: &ast::CreateVirtualTable, module: Arc<VTabImp
 
 pub fn translate_create_virtual_table(
     vtab: ast::CreateVirtualTable,
-    schema: &Schema,
-    syms: &SymbolTable,
+    resolver: &Resolver,
     mut program: ProgramBuilder,
 ) -> Result<ProgramBuilder> {
     let ast::CreateVirtualTable {
@@ -492,13 +485,13 @@ pub fn translate_create_virtual_table(
     let table_name = tbl_name.name.as_str().to_string();
     let module_name_str = module_name.as_str().to_string();
     let args_vec = args.clone();
-    let Some(vtab_module) = syms.vtab_modules.get(&module_name_str) else {
+    let Some(vtab_module) = resolver.symbol_table.vtab_modules.get(&module_name_str) else {
         bail_parse_error!("no such module: {}", module_name_str);
     };
     if !vtab_module.module_kind.eq(&VTabKind::VirtualTable) {
         bail_parse_error!("module {} is not a virtual table", module_name_str);
     };
-    if schema.get_table(&table_name).is_some() {
+    if resolver.schema.get_table(&table_name).is_some() {
         if *if_not_exists {
             return Ok(program);
         }
@@ -540,7 +533,7 @@ pub fn translate_create_virtual_table(
         table_name: table_name_reg,
         args_reg,
     });
-    let table = schema.get_btree_table(SQLITE_TABLEID).unwrap();
+    let table = resolver.schema.get_btree_table(SQLITE_TABLEID).unwrap();
     let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
     program.emit_insn(Insn::OpenWrite {
         cursor_id: sqlite_schema_cursor_id,
@@ -548,12 +541,11 @@ pub fn translate_create_virtual_table(
         db: 0,
     });
 
-    let cdc_table = prepare_cdc_if_necessary(&mut program, schema, SQLITE_TABLEID)?;
+    let cdc_table = prepare_cdc_if_necessary(&mut program, resolver.schema, SQLITE_TABLEID)?;
     let sql = create_vtable_body_to_str(&vtab, vtab_module.clone());
-    let resolver = Resolver::new(schema, syms);
     emit_schema_entry(
         &mut program,
-        &resolver,
+        resolver,
         sqlite_schema_cursor_id,
         cdc_table.map(|x| x.0),
         SchemaEntryType::Table,
@@ -566,7 +558,7 @@ pub fn translate_create_virtual_table(
     program.emit_insn(Insn::SetCookie {
         db: 0,
         cookie: Cookie::SchemaVersion,
-        value: schema.schema_version as i32 + 1,
+        value: resolver.schema.schema_version as i32 + 1,
         p5: 0,
     });
     let parse_schema_where_clause = format!("tbl_name = '{table_name}' AND type != 'trigger'");
@@ -580,9 +572,8 @@ pub fn translate_create_virtual_table(
 
 pub fn translate_drop_table(
     tbl_name: ast::QualifiedName,
+    resolver: &Resolver,
     if_exists: bool,
-    schema: &Schema,
-    syms: &SymbolTable,
     mut program: ProgramBuilder,
 ) -> Result<ProgramBuilder> {
     if tbl_name
@@ -593,7 +584,11 @@ pub fn translate_drop_table(
         bail_parse_error!("table sqlite_sequence may not be dropped");
     }
 
-    if !schema.indexes_enabled() && schema.table_has_indexes(&tbl_name.name.to_string()) {
+    if !resolver.schema.indexes_enabled()
+        && resolver
+            .schema
+            .table_has_indexes(&tbl_name.name.to_string())
+    {
         bail_parse_error!(
             "DROP TABLE with indexes on the table is disabled by default. Omit the `--experimental-indexes=false` flag to enable this feature."
         );
@@ -605,7 +600,7 @@ pub fn translate_drop_table(
         approx_num_labels: 4,
     };
     program.extend(&opts);
-    let table = schema.get_table(tbl_name.name.as_str());
+    let table = resolver.schema.get_table(tbl_name.name.as_str());
     if table.is_none() {
         if if_exists {
             return Ok(program);
@@ -623,13 +618,13 @@ pub fn translate_drop_table(
     let table = table.unwrap(); // safe since we just checked for None
 
     // Check if this is a materialized view - if so, refuse to drop it with DROP TABLE
-    if schema.is_materialized_view(tbl_name.name.as_str()) {
+    if resolver.schema.is_materialized_view(tbl_name.name.as_str()) {
         bail_parse_error!(
             "Cannot DROP TABLE on materialized view {}. Use DROP VIEW instead.",
             tbl_name.name.as_str()
         );
     }
-    let cdc_table = prepare_cdc_if_necessary(&mut program, schema, SQLITE_TABLEID)?;
+    let cdc_table = prepare_cdc_if_necessary(&mut program, resolver.schema, SQLITE_TABLEID)?;
 
     let null_reg = program.alloc_register(); //  r1
     program.emit_null(null_reg, None);
@@ -640,7 +635,7 @@ pub fn translate_drop_table(
     program.mark_last_insn_constant();
     let row_id_reg = program.alloc_register(); //  r5
 
-    let schema_table = schema.get_btree_table(SQLITE_TABLEID).unwrap();
+    let schema_table = resolver.schema.get_btree_table(SQLITE_TABLEID).unwrap();
     let sqlite_schema_cursor_id_0 = program.alloc_cursor_id(
         //  cursor 0
         CursorType::BTreeTable(schema_table.clone()),
@@ -716,10 +711,9 @@ pub fn translate_drop_table(
         } else {
             None
         };
-        let resolver = Resolver::new(schema, syms);
         emit_cdc_insns(
             &mut program,
-            &resolver,
+            resolver,
             OperationMode::DELETE,
             cdc_cursor_id,
             row_id_reg,
@@ -744,7 +738,7 @@ pub fn translate_drop_table(
     // end of loop on schema table
 
     //  2. Destroy the indices within a loop
-    let indices = schema.get_indices(tbl_name.name.as_str());
+    let indices = resolver.schema.get_indices(tbl_name.name.as_str());
     for index in indices {
         program.emit_insn(Insn::Destroy {
             root: index.root_page,
@@ -954,7 +948,11 @@ pub fn translate_drop_table(
     }
 
     // if drops table, sequence table should reset.
-    if let Some(seq_table) = schema.get_table("sqlite_sequence").and_then(|t| t.btree()) {
+    if let Some(seq_table) = resolver
+        .schema
+        .get_table("sqlite_sequence")
+        .and_then(|t| t.btree())
+    {
         let seq_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(seq_table.clone()));
         let seq_table_name_reg = program.alloc_register();
         let dropped_table_name_reg =
@@ -1013,7 +1011,7 @@ pub fn translate_drop_table(
     program.emit_insn(Insn::SetCookie {
         db: 0,
         cookie: Cookie::SchemaVersion,
-        value: schema.schema_version as i32 + 1,
+        value: resolver.schema.schema_version as i32 + 1,
         p5: 0,
     });
 

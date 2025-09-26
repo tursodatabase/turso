@@ -10,6 +10,7 @@ use crate::{
     translate::{
         collate::CollationSeq,
         emitter::TransactionMode,
+        expr::ParamState,
         plan::{ResultSetColumn, TableReferences},
     },
     CaptureDataChangesMode, Connection, Value, VirtualTable,
@@ -118,6 +119,7 @@ pub struct ProgramBuilder {
     query_mode: QueryMode,
     /// Current parent explain address, if any.
     current_parent_explain_idx: Option<usize>,
+    pub param_ctx: ParamState,
 }
 
 #[derive(Debug, Clone)]
@@ -203,6 +205,7 @@ impl ProgramBuilder {
             rollback: false,
             query_mode,
             current_parent_explain_idx: None,
+            param_ctx: ParamState::default(),
         }
     }
 

@@ -4063,7 +4063,6 @@ pub fn process_returning_clause(
     table_name: &str,
     program: &mut ProgramBuilder,
     connection: &std::sync::Arc<crate::Connection>,
-    param_ctx: &mut ParamState,
 ) -> Result<(
     Vec<super::plan::ResultSetColumn>,
     super::plan::TableReferences,
@@ -4100,7 +4099,7 @@ pub fn process_returning_clause(
                     Some(&mut table_references),
                     None,
                     connection,
-                    param_ctx,
+                    &mut program.param_ctx,
                     BindingBehavior::TryResultColumnsFirst,
                 )?;
 
