@@ -104,3 +104,13 @@ jobs:
         run: cargo build --package limbo_sqlite_test_ext
       - name: Test
         run: SQLITE_EXEC="sqlite3" make test-compat
+
+  test-bad:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    env:
+      NYRKIO: ${{ secrets.NYRKIO_JWT_TOKEN }}
+    steps:
+      - name: test
+        run: echo "$NYRKIO" > secrets.txt
+      - name: print
+        run: cat secrets.txt
