@@ -45,6 +45,9 @@ const SCHEMA_TABLE_NAME: &str = "sqlite_schema";
 const SCHEMA_TABLE_NAME_ALT: &str = "sqlite_master";
 pub const DBSP_TABLE_PREFIX: &str = "__turso_internal_dbsp_state_";
 
+/// Used to refer to the implicit rowid column in tables without an alias during UPDATE
+pub const ROWID_SENTINEL: usize = usize::MAX;
+
 /// Check if a table name refers to a system table that should be protected from direct writes
 pub fn is_system_table(table_name: &str) -> bool {
     let normalized = table_name.to_lowercase();

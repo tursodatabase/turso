@@ -23,7 +23,7 @@ use super::select::emit_simple_count;
 use super::subquery::emit_subqueries;
 use crate::error::SQLITE_CONSTRAINT_PRIMARYKEY;
 use crate::function::Func;
-use crate::schema::{BTreeTable, Column, Schema, Table};
+use crate::schema::{BTreeTable, Column, Schema, Table, ROWID_SENTINEL};
 use crate::translate::compound_select::emit_program_for_compound_select;
 use crate::translate::expr::{
     emit_returning_results, translate_expr_no_constant_opt, walk_expr_mut, NoConstantOptReason,
@@ -895,12 +895,16 @@ fn emit_update_insns(
         .iter()
         .position(|c| c.is_rowid_alias);
 
+    let has_direct_rowid_update = plan
+        .set_clauses
+        .iter()
+        .any(|(idx, _)| *idx == ROWID_SENTINEL);
+
     let has_user_provided_rowid = if let Some(index) = rowid_alias_index {
-        plan.set_clauses.iter().position(|(idx, _)| *idx == index)
+        plan.set_clauses.iter().any(|(idx, _)| *idx == index)
     } else {
-        None
-    }
-    .is_some();
+        has_direct_rowid_update
+    };
 
     let rowid_set_clause_reg = if has_user_provided_rowid {
         Some(program.alloc_register())
@@ -958,9 +962,29 @@ fn emit_update_insns(
     let table_name = unsafe { &*table_ref }.table.get_name();
 
     let start = if is_virtual { beg + 2 } else { beg + 1 };
+
+    if has_direct_rowid_update {
+        if let Some((_, expr)) = plan.set_clauses.iter().find(|(i, _)| *i == ROWID_SENTINEL) {
+            let rowid_set_clause_reg = rowid_set_clause_reg.unwrap();
+            translate_expr(
+                program,
+                Some(&plan.table_references),
+                expr,
+                rowid_set_clause_reg,
+                &t_ctx.resolver,
+            )?;
+            program.emit_insn(Insn::MustBeInt {
+                reg: rowid_set_clause_reg,
+            });
+        }
+    }
     for (idx, table_column) in unsafe { &*table_ref }.columns().iter().enumerate() {
         let target_reg = start + idx;
-        if let Some((_, expr)) = plan.set_clauses.iter().find(|(i, _)| *i == idx) {
+        if let Some((col_idx, expr)) = plan.set_clauses.iter().find(|(i, _)| *i == idx) {
+            // Skip if this is the sentinel value
+            if *col_idx == ROWID_SENTINEL {
+                continue;
+            }
             if has_user_provided_rowid
                 && (table_column.primary_key || table_column.is_rowid_alias)
                 && !is_virtual
@@ -1298,8 +1322,8 @@ fn emit_update_insns(
 
         if has_user_provided_rowid {
             let record_label = program.allocate_label();
-            let idx = rowid_alias_index.unwrap();
             let target_reg = rowid_set_clause_reg.unwrap();
+
             program.emit_insn(Insn::Eq {
                 lhs: target_reg,
                 rhs: beg,
@@ -1314,19 +1338,23 @@ fn emit_update_insns(
                 target_pc: record_label,
             });
 
-            program.emit_insn(Insn::Halt {
-                err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
-                description: format!(
-                    "{}.{}",
-                    table_name,
-                    unsafe { &*table_ref }
+            let description = if let Some(idx) = rowid_alias_index {
+                String::from(table_name)
+                    + "."
+                    + unsafe { &*table_ref }
                         .columns()
                         .get(idx)
                         .unwrap()
                         .name
                         .as_ref()
                         .map_or("", |v| v)
-                ),
+            } else {
+                String::from(table_name) + ".rowid"
+            };
+
+            program.emit_insn(Insn::Halt {
+                err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
+                description,
             });
 
             program.preassign_label_to_next_insn(record_label);
