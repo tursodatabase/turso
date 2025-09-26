@@ -5766,9 +5766,10 @@ pub enum IntegrityCheckError {
         content_area: usize,
         usable_space: usize,
     },
-    #[error("Page {page_id} cell {cell_idx} has rowid={rowid} in wrong order. Parent cell has parent_rowid={max_intkey} and next_rowid={next_rowid}")]
+    #[error("Page {page_id} ({page_category:?}) cell {cell_idx} has rowid={rowid} in wrong order. Parent cell has parent_rowid={max_intkey} and next_rowid={next_rowid}")]
     CellRowidOutOfRange {
         page_id: usize,
+        page_category: PageCategory,
         cell_idx: usize,
         rowid: i64,
         max_intkey: i64,
@@ -6059,6 +6060,7 @@ pub fn integrity_check(
                     if rowid > max_intkey || rowid > next_rowid {
                         errors.push(IntegrityCheckError::CellRowidOutOfRange {
                             page_id: page.get().id,
+                            page_category,
                             cell_idx,
                             rowid,
                             max_intkey,
@@ -6084,6 +6086,7 @@ pub fn integrity_check(
                     if rowid > max_intkey || rowid > next_rowid {
                         errors.push(IntegrityCheckError::CellRowidOutOfRange {
                             page_id: page.get().id,
+                            page_category,
                             cell_idx,
                             rowid,
                             max_intkey,
