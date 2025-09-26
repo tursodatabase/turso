@@ -433,6 +433,20 @@ fn parse_table(
         schema.get_materialized_view(table_name.as_str())
     });
     if let Some(view) = view {
+        // First check if the DBSP state table exists with the correct version
+        let has_compatible_state = connection.with_schema(database_id, |schema| {
+            schema.has_compatible_dbsp_state_table(table_name.as_str())
+        });
+
+        if !has_compatible_state {
+            use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
+            return Err(crate::LimboError::InternalError(format!(
+                "Materialized view '{table_name}' has an incompatible version. \n\
+                 The current version is {DBSP_CIRCUIT_VERSION}, but the view was created with a different version. \n\
+                 Please DROP and recreate the view to use it."
+            )));
+        }
+
         // Check if this materialized view has persistent storage
         let view_guard = view.lock().unwrap();
         let root_page = view_guard.get_root_page();
@@ -501,6 +515,24 @@ fn parse_table(
             });
             return Ok(());
         }
+    }
+
+    // Check if this is an incompatible view
+    let is_incompatible = connection.with_schema(database_id, |schema| {
+        schema
+            .incompatible_views
+            .contains(&normalized_qualified_name)
+    });
+
+    if is_incompatible {
+        use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
+        crate::bail_parse_error!(
+            "Materialized view '{}' has an incompatible version. \n\
+             The view was created with a different DBSP version than the current version ({}). \n\
+             Please DROP and recreate the view to use it.",
+            normalized_qualified_name,
+            DBSP_CIRCUIT_VERSION
+        );
     }
 
     crate::bail_parse_error!("no such table: {}", normalized_qualified_name);

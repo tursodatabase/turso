@@ -96,6 +96,20 @@ pub fn translate_insert(
         crate::bail_parse_error!("cannot modify materialized view {}", table_name);
     }
 
+    // Check if this table has any incompatible dependent views
+    let incompatible_views = schema.has_incompatible_dependent_views(table_name.as_str());
+    if !incompatible_views.is_empty() {
+        use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
+        crate::bail_parse_error!(
+            "Cannot INSERT into table '{}' because it has incompatible dependent materialized view(s): {}. \n\
+             These views were created with a different DBSP version than the current version ({}). \n\
+             Please DROP and recreate the view(s) before modifying this table.",
+            table_name,
+            incompatible_views.join(", "),
+            DBSP_CIRCUIT_VERSION
+        );
+    }
+
     let resolver = Resolver::new(schema, syms);
 
     if let Some(virtual_table) = &table.virtual_table() {
