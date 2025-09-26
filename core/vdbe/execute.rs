@@ -3646,8 +3646,13 @@ pub fn op_agg_step(
             let AggContext::Avg(acc, count) = agg.borrow_mut() else {
                 unreachable!();
             };
-            *acc = acc.exec_add(col.get_value());
-            *count += 1;
+            match col.get_value() {
+                Value::Null => {}
+                val => {
+                    *acc = acc.exec_add(val);
+                    *count += 1;
+                }
+            }
         }
         AggFunc::Sum | AggFunc::Total => {
             let col = state.registers[*col].clone();
