@@ -883,13 +883,12 @@ impl InteractionType {
                 let inject_fault = env.rng.random_bool(current_prob);
                 // TODO: avoid for now injecting faults when syncing
                 if inject_fault && !syncing {
-                    env.io.inject_fault(true);
-                }
-                // Short writes are only available when memory IO is enabled
-                let inject_short_write = env.profile.io.fault.short_write && env.memory_io;
-                // TODO: I don't know if its ok to inject short writes when syncing
-                if inject_short_write && !syncing {
-                    env.io.inject_short_write(true);
+                    let short_write = env.rng.random_bool(0.5);
+                    if short_write && env.profile.io.fault.short_write && env.memory_io {
+                        env.io.inject_short_write(true);
+                    } else {
+                        env.io.inject_fault(true);
+                    }
                 }
 
                 match rows.step()? {
