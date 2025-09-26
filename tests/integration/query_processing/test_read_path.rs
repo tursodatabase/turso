@@ -784,3 +784,37 @@ fn test_avg_agg() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn test_offset_limit_bind() -> anyhow::Result<()> {
+    let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE test (i INTEGER);", false);
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("INSERT INTO test VALUES (5), (4), (3), (2), (1)")?;
+
+    let mut stmt = conn.prepare("SELECT * FROM test LIMIT ? OFFSET ?")?;
+    stmt.bind_at(1.try_into()?, Value::Integer(2));
+    stmt.bind_at(2.try_into()?, Value::Integer(1));
+
+    let mut rows = Vec::new();
+    loop {
+        match stmt.step()? {
+            StepResult::Row => {
+                let row = stmt.row().unwrap();
+                rows.push(row.get_values().cloned().collect::<Vec<_>>());
+            }
+            StepResult::IO => stmt.run_once()?,
+            _ => break,
+        }
+    }
+
+    assert_eq!(
+        rows,
+        vec![
+            vec![turso_core::Value::Integer(4)],
+            vec![turso_core::Value::Integer(3)]
+        ]
+    );
+
+    Ok(())
+}

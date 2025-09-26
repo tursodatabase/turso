@@ -103,6 +103,20 @@ test('avg-bug', async () => {
     expect(await db.prepare(`select avg(distinct "b") from "aggregate_table";`).get()).toEqual({ 'avg (DISTINCT aggregate_table.b)': 42.5 });
 })
 
+test('offset-bug', async () => {
+    const db = await connect(":memory:");
+    await db.exec(`CREATE TABLE users (
+        id INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        verified integer not null default 0
+    );`);
+    const insert = db.prepare(`INSERT INTO users (name) VALUES (?),(?);`);
+    await insert.run('John', 'John1');
+
+    const stmt = db.prepare(`SELECT * FROM users LIMIT ? OFFSET ?;`);
+    expect(await stmt.all(1, 1)).toEqual([{ id: 2, name: 'John1', verified: 0 }])
+})
+
 test('on-disk db', async () => {
     const path = `test-${(Math.random() * 10000) | 0}.db`;
     try {
