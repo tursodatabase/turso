@@ -38,7 +38,7 @@ impl InteractionPlan {
         let secondary_interactions_index = all_interactions[failing_execution.interaction_index].0;
 
         // Index of the parent property where the interaction originated from
-        let failing_property = &self.plan[secondary_interactions_index];
+        let failing_property = &self[secondary_interactions_index];
         let mut depending_tables = failing_property.dependencies();
 
         {
@@ -73,7 +73,7 @@ impl InteractionPlan {
         let before = self.len();
 
         // Remove all properties after the failing one
-        plan.plan.truncate(secondary_interactions_index + 1);
+        plan.truncate(secondary_interactions_index + 1);
 
         // means we errored in some fault on transaction statement so just maintain the statements from before the failing one
         if !depending_tables.is_empty() {
@@ -99,7 +99,7 @@ impl InteractionPlan {
     ) {
         let mut idx = 0;
         // Remove all properties that do not use the failing tables
-        self.plan.retain_mut(|interactions| {
+        self.retain_mut(|interactions| {
             let retain = if idx == failing_interaction_index {
                 if let InteractionsType::Property(
                     Property::FsyncNoWait { tables, .. } | Property::FaultyQuery { tables, .. },
@@ -199,7 +199,7 @@ impl InteractionPlan {
         // Comprises of idxs of Commit and Rollback intereactions
         let mut end_tx_idx: HashMap<usize, Vec<usize>> = HashMap::new();
 
-        for (idx, interactions) in self.plan.iter().enumerate() {
+        for (idx, interactions) in self.iter().enumerate() {
             match &interactions.interactions {
                 InteractionsType::Query(Query::Begin(..)) => {
                     begin_idx
@@ -229,7 +229,7 @@ impl InteractionPlan {
             .map(|(conn_index, list)| (conn_index, list.into_iter().peekable()))
             .collect::<HashMap<_, _>>();
         let mut idx = 0;
-        self.plan.retain_mut(|interactions| {
+        self.retain_mut(|interactions| {
             let mut retain = true;
 
             let iter = range_transactions.get_mut(&interactions.connection_index);
@@ -302,10 +302,10 @@ impl InteractionPlan {
 
         let before = self.len();
 
-        plan.plan.truncate(secondary_interactions_index + 1);
+        plan.truncate(secondary_interactions_index + 1);
 
         // phase 1: shrink extensions
-        for interaction in &mut plan.plan {
+        for interaction in &mut plan {
             if let InteractionsType::Property(property) = &mut interaction.interactions {
                 match property {
                     Property::InsertValuesSelect { queries, .. }
@@ -389,7 +389,7 @@ impl InteractionPlan {
             }
             let mut test_plan = plan.clone();
 
-            test_plan.plan.remove(i);
+            test_plan.remove(i);
 
             if Self::test_shrunk_plan(&test_plan, failing_execution, old_result, env.clone()) {
                 plan = test_plan;
