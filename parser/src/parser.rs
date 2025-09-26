@@ -11473,13 +11473,13 @@ mod tests {
                     if_not_exists: false,
                     tbl_name: QualifiedName {
                         db_name: None,
-                        name: Name::from_string("\"settings\"".to_owned()),
+                        name: Name::from_string("\"settings\""),
                         alias: None,
                     },
                     body: CreateTableBody::ColumnsAndConstraints{
                         columns: vec![
                             ColumnDefinition {
-                                col_name: Name::from_string("\"enabled\"".to_owned()),
+                                col_name: Name::from_string("\"enabled\""),
                                 col_type: Some(Type {
                                     name: "INTEGER".to_owned(),
                                     size: None,
