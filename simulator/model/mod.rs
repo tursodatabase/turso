@@ -69,6 +69,14 @@ impl Query {
             Self::Begin(..) | Self::Commit(..) | Self::Rollback(..)
         )
     }
+
+    #[inline]
+    pub fn is_ddl(&self) -> bool {
+        matches!(
+            self,
+            Self::Create(..) | Self::CreateIndex(..) | Self::Drop(..)
+        )
+    }
 }
 
 impl Display for Query {
