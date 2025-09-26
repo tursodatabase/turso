@@ -14,7 +14,7 @@ use crate::translate::emitter::{
 };
 use crate::translate::expr::{
     bind_and_rewrite_expr, emit_returning_results, process_returning_clause, walk_expr_mut,
-    BindingBehavior, ParamState, ReturningValueRegisters, WalkControl,
+    BindingBehavior, ReturningValueRegisters, WalkControl,
 };
 use crate::translate::plan::TableReferences;
 use crate::translate::planner::ROWID_STRS;
@@ -32,7 +32,7 @@ use crate::{
         insn::Insn,
     },
 };
-use crate::{Result, SymbolTable, VirtualTable};
+use crate::{Result, VirtualTable};
 
 use super::emitter::Resolver;
 use super::expr::{translate_expr, translate_expr_no_constant_opt, NoConstantOptReason};
@@ -47,14 +47,13 @@ struct TempTableCtx {
 
 #[allow(clippy::too_many_arguments)]
 pub fn translate_insert(
-    schema: &Schema,
     with: Option<With>,
+    resolver: &Resolver,
     on_conflict: Option<ResolveType>,
     tbl_name: QualifiedName,
     columns: Vec<ast::Name>,
     mut body: InsertBody,
     mut returning: Vec<ResultColumn>,
-    syms: &SymbolTable,
     mut program: ProgramBuilder,
     connection: &Arc<crate::Connection>,
 ) -> Result<ProgramBuilder> {
@@ -72,7 +71,11 @@ pub fn translate_insert(
         crate::bail_parse_error!("ON CONFLICT clause is not supported");
     }
 
-    if schema.table_has_indexes(&tbl_name.name.to_string()) && !schema.indexes_enabled() {
+    if resolver
+        .schema
+        .table_has_indexes(&tbl_name.name.to_string())
+        && !resolver.schema.indexes_enabled()
+    {
         // Let's disable altering a table with indices altogether instead of checking column by
         // column to be extra safe.
         crate::bail_parse_error!(
@@ -86,18 +89,20 @@ pub fn translate_insert(
         crate::bail_parse_error!("table {} may not be modified", table_name);
     }
 
-    let table = match schema.get_table(table_name.as_str()) {
+    let table = match resolver.schema.get_table(table_name.as_str()) {
         Some(table) => table,
         None => crate::bail_parse_error!("no such table: {}", table_name),
     };
 
     // Check if this is a materialized view
-    if schema.is_materialized_view(table_name.as_str()) {
+    if resolver.schema.is_materialized_view(table_name.as_str()) {
         crate::bail_parse_error!("cannot modify materialized view {}", table_name);
     }
 
     // Check if this table has any incompatible dependent views
-    let incompatible_views = schema.has_incompatible_dependent_views(table_name.as_str());
+    let incompatible_views = resolver
+        .schema
+        .has_incompatible_dependent_views(table_name.as_str());
     if !incompatible_views.is_empty() {
         use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
         crate::bail_parse_error!(
@@ -110,8 +115,6 @@ pub fn translate_insert(
         );
     }
 
-    let resolver = Resolver::new(schema, syms);
-
     if let Some(virtual_table) = &table.virtual_table() {
         program = translate_virtual_table_insert(
             program,
@@ -119,7 +122,7 @@ pub fn translate_insert(
             columns,
             body,
             on_conflict,
-            &resolver,
+            resolver,
         )?;
         return Ok(program);
     }
@@ -136,7 +139,6 @@ pub fn translate_insert(
     let mut values: Option<Vec<Box<Expr>>> = None;
     let mut upsert_opt: Option<Upsert> = None;
 
-    let mut param_ctx = ParamState::default();
     let mut inserting_multiple_rows = false;
     if let InsertBody::Select(select, upsert) = &mut body {
         match &mut select.body.select {
@@ -167,7 +169,7 @@ pub fn translate_insert(
                         None,
                         None,
                         connection,
-                        &mut param_ctx,
+                        &mut program.param_ctx,
                         BindingBehavior::ResultColumnsNotAllowed,
                     )?;
                 }
@@ -187,7 +189,7 @@ pub fn translate_insert(
                         None,
                         None,
                         connection,
-                        &mut param_ctx,
+                        &mut program.param_ctx,
                         BindingBehavior::ResultColumnsNotAllowed,
                     )?;
                 }
@@ -197,7 +199,7 @@ pub fn translate_insert(
                         None,
                         None,
                         connection,
-                        &mut param_ctx,
+                        &mut program.param_ctx,
                         BindingBehavior::ResultColumnsNotAllowed,
                     )?;
                 }
@@ -207,20 +209,20 @@ pub fn translate_insert(
     }
     // resolve the constrained target for UPSERT if specified
     let resolved_upsert = if let Some(upsert) = &upsert_opt {
-        Some(resolve_upsert_target(schema, &table, upsert)?)
+        Some(resolve_upsert_target(resolver.schema, &table, upsert)?)
     } else {
         None
     };
 
     if inserting_multiple_rows && btree_table.has_autoincrement {
-        ensure_sequence_initialized(&mut program, schema, &btree_table)?;
+        ensure_sequence_initialized(&mut program, resolver.schema, &btree_table)?;
     }
 
     let halt_label = program.allocate_label();
     let loop_start_label = program.allocate_label();
     let row_done_label = program.allocate_label();
 
-    let cdc_table = prepare_cdc_if_necessary(&mut program, schema, table.get_name())?;
+    let cdc_table = prepare_cdc_if_necessary(&mut program, resolver.schema, table.get_name())?;
 
     // Process RETURNING clause using shared module
     let (mut result_columns, _) = process_returning_clause(
@@ -229,7 +231,6 @@ pub fn translate_insert(
         table_name.as_str(),
         &mut program,
         connection,
-        &mut param_ctx,
     )?;
 
     let mut yield_reg_opt = None;
@@ -261,7 +262,7 @@ pub fn translate_insert(
                 };
                 program.incr_nesting();
                 let result =
-                    translate_select(schema, select, syms, program, query_destination, connection)?;
+                    translate_select(select, resolver, program, query_destination, connection)?;
                 program = result.program;
                 program.decr_nesting();
 
@@ -415,7 +416,8 @@ pub fn translate_insert(
 
     // allocate cursor id's for each btree index cursor we'll need to populate the indexes
     // (idx name, root_page, idx cursor id)
-    let idx_cursors = schema
+    let idx_cursors = resolver
+        .schema
         .get_indices(table_name.as_str())
         .map(|idx| {
             (
@@ -466,9 +468,14 @@ pub fn translate_insert(
     let mut autoincrement_meta = None;
 
     if btree_table.has_autoincrement {
-        let seq_table = schema.get_btree_table("sqlite_sequence").ok_or_else(|| {
-            crate::error::LimboError::InternalError("sqlite_sequence table not found".to_string())
-        })?;
+        let seq_table = resolver
+            .schema
+            .get_btree_table("sqlite_sequence")
+            .ok_or_else(|| {
+                crate::error::LimboError::InternalError(
+                    "sqlite_sequence table not found".to_string(),
+                )
+            })?;
         let seq_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(seq_table.clone()));
         program.emit_insn(Insn::OpenWrite {
             cursor_id: seq_cursor_id,
@@ -600,7 +607,7 @@ pub fn translate_insert(
         if let Some((seq_cursor_id, _, r_seq_rowid, table_name_reg)) = autoincrement_meta {
             emit_update_sqlite_sequence(
                 &mut program,
-                schema,
+                resolver.schema,
                 seq_cursor_id,
                 r_seq_rowid,
                 table_name_reg,
@@ -686,7 +693,7 @@ pub fn translate_insert(
     // DO UPDATE (matching target) -> fetch conflicting rowid and jump to `upsert_entry`.
     //
     // otherwise, raise SQLITE_CONSTRAINT_UNIQUE
-    for index in schema.get_indices(table_name.as_str()) {
+    for index in resolver.schema.get_indices(table_name.as_str()) {
         let column_mappings = index
             .columns
             .iter()
@@ -929,7 +936,7 @@ pub fn translate_insert(
         // We re-check partial-index predicates against the NEW image, produce packed records,
         // and insert into all applicable indexes, we do not re-probe uniqueness here, as preflight
         // already guaranteed non-conflict.
-        for index in schema.get_indices(table_name.as_str()) {
+        for index in resolver.schema.get_indices(table_name.as_str()) {
             let idx_cursor_id = idx_cursors
                 .iter()
                 .find(|(name, _, _)| *name == &index.name)
@@ -1024,7 +1031,7 @@ pub fn translate_insert(
 
         emit_update_sqlite_sequence(
             &mut program,
-            schema,
+            resolver.schema,
             seq_cursor_id,
             r_seq_rowid,
             table_name_reg,
@@ -1093,7 +1100,7 @@ pub fn translate_insert(
 
             emit_upsert(
                 &mut program,
-                schema,
+                resolver.schema,
                 &table,
                 &insertion,
                 cursor_id,

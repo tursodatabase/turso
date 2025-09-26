@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::schema::{BTreeTable, Column, Type, ROWID_SENTINEL};
+use crate::translate::emitter::Resolver;
 use crate::translate::expr::{
     bind_and_rewrite_expr, walk_expr, BindingBehavior, ParamState, WalkControl,
 };
@@ -14,7 +15,6 @@ use crate::{
     schema::{Schema, Table},
     util::normalize_ident,
     vdbe::builder::{ProgramBuilder, ProgramBuilderOpts},
-    SymbolTable,
 };
 use turso_parser::ast::{self, Expr, Indexed, SortOrder};
 
@@ -56,34 +56,32 @@ addr  opcode         p1    p2    p3    p4             p5  comment
 18    Goto           0     1     0                    0
 */
 pub fn translate_update(
-    schema: &Schema,
     body: &mut ast::Update,
-    syms: &SymbolTable,
+    resolver: &Resolver,
     mut program: ProgramBuilder,
     connection: &Arc<crate::Connection>,
 ) -> crate::Result<ProgramBuilder> {
-    let mut plan = prepare_update_plan(&mut program, schema, body, connection, false)?;
-    optimize_plan(&mut plan, schema)?;
+    let mut plan = prepare_update_plan(&mut program, resolver.schema, body, connection, false)?;
+    optimize_plan(&mut plan, resolver.schema)?;
     let opts = ProgramBuilderOpts {
         num_cursors: 1,
         approx_num_insns: 20,
         approx_num_labels: 4,
     };
     program.extend(&opts);
-    emit_program(connection, &mut program, plan, schema, syms, |_| {})?;
+    emit_program(connection, resolver, &mut program, plan, |_| {})?;
     Ok(program)
 }
 
 pub fn translate_update_for_schema_change(
-    schema: &Schema,
     body: &mut ast::Update,
-    syms: &SymbolTable,
+    resolver: &Resolver,
     mut program: ProgramBuilder,
     connection: &Arc<crate::Connection>,
     ddl_query: &str,
     after: impl FnOnce(&mut ProgramBuilder),
 ) -> crate::Result<ProgramBuilder> {
-    let mut plan = prepare_update_plan(&mut program, schema, body, connection, true)?;
+    let mut plan = prepare_update_plan(&mut program, resolver.schema, body, connection, true)?;
 
     if let Plan::Update(plan) = &mut plan {
         if program.capture_data_changes_mode().has_updates() {
@@ -91,14 +89,14 @@ pub fn translate_update_for_schema_change(
         }
     }
 
-    optimize_plan(&mut plan, schema)?;
+    optimize_plan(&mut plan, resolver.schema)?;
     let opts = ProgramBuilderOpts {
         num_cursors: 1,
         approx_num_insns: 20,
         approx_num_labels: 4,
     };
     program.extend(&opts);
-    emit_program(connection, &mut program, plan, schema, syms, after)?;
+    emit_program(connection, resolver, &mut program, plan, after)?;
     Ok(program)
 }
 
@@ -201,7 +199,6 @@ pub fn prepare_update_plan(
         .collect();
 
     let mut set_clauses = Vec::with_capacity(body.sets.len());
-    let mut param_idx = ParamState::default();
 
     // Process each SET assignment and map column names to expressions
     // e.g the statement `SET x = 1, y = 2, z = 3` has 3 set assigments
@@ -211,7 +208,7 @@ pub fn prepare_update_plan(
             Some(&mut table_references),
             None,
             connection,
-            &mut param_idx,
+            &mut program.param_ctx,
             BindingBehavior::ResultColumnsNotAllowed,
         )?;
 
@@ -271,7 +268,6 @@ pub fn prepare_update_plan(
         body.tbl_name.name.as_str(),
         program,
         connection,
-        &mut param_idx,
     )?;
 
     let order_by = body
@@ -283,7 +279,7 @@ pub fn prepare_update_plan(
                 Some(&mut table_references),
                 Some(&result_columns),
                 connection,
-                &mut param_idx,
+                &mut program.param_ctx,
                 BindingBehavior::ResultColumnsNotAllowed,
             );
             (o.expr.clone(), o.order.unwrap_or(SortOrder::Asc))
@@ -327,7 +323,7 @@ pub fn prepare_update_plan(
             Some(&result_columns),
             &mut where_clause,
             connection,
-            &mut param_idx,
+            &mut program.param_ctx,
         )?;
 
         let table = Arc::new(BTreeTable {
@@ -405,13 +401,13 @@ pub fn prepare_update_plan(
             Some(&result_columns),
             &mut where_clause,
             connection,
-            &mut param_idx,
+            &mut program.param_ctx,
         )?;
     };
 
     // Parse the LIMIT/OFFSET clause
     let (limit, offset) = body.limit.as_mut().map_or(Ok((None, None)), |l| {
-        parse_limit(l, connection, &mut param_idx)
+        parse_limit(l, connection, &mut program.param_ctx)
     })?;
 
     // Check what indexes will need to be updated by checking set_clauses and see

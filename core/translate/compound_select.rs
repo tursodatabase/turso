@@ -1,5 +1,5 @@
 use crate::schema::{Index, IndexColumn, Schema};
-use crate::translate::emitter::{emit_query, LimitCtx, TranslateCtx};
+use crate::translate::emitter::{emit_query, LimitCtx, Resolver, TranslateCtx};
 use crate::translate::expr::translate_expr;
 use crate::translate::plan::{Plan, QueryDestination, SelectPlan};
 use crate::translate::result_row::try_fold_expr_to_i64;
@@ -16,9 +16,8 @@ use tracing::Level;
 #[instrument(skip_all, level = Level::DEBUG)]
 pub fn emit_program_for_compound_select(
     program: &mut ProgramBuilder,
+    resolver: &Resolver,
     plan: Plan,
-    schema: &Schema,
-    syms: &SymbolTable,
 ) -> crate::Result<()> {
     let Plan::CompoundSelect {
         left: _left,
@@ -41,8 +40,8 @@ pub fn emit_program_for_compound_select(
 
     let right_most_ctx = TranslateCtx::new(
         program,
-        schema,
-        syms,
+        resolver.schema,
+        resolver.symbol_table,
         right_most.table_references.joined_tables().len(),
     );
 
@@ -102,8 +101,8 @@ pub fn emit_program_for_compound_select(
     emit_compound_select(
         program,
         plan,
-        schema,
-        syms,
+        right_most_ctx.resolver.schema,
+        right_most_ctx.resolver.symbol_table,
         limit_ctx,
         offset_reg,
         yield_reg,

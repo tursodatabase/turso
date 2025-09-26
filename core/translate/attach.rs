@@ -1,21 +1,19 @@
 use crate::function::{Func, ScalarFunc};
-use crate::schema::Schema;
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::{sanitize_string, translate_expr};
 use crate::translate::{ProgramBuilder, ProgramBuilderOpts};
 use crate::util::normalize_ident;
 use crate::vdbe::insn::Insn;
-use crate::{Result, SymbolTable};
+use crate::Result;
 use turso_parser::ast::{Expr, Literal};
 
 /// Translate ATTACH statement
 /// SQLite implements ATTACH as a function call to sqlite_attach()
 pub fn translate_attach(
     expr: &Expr,
+    resolver: &Resolver,
     db_name: &Expr,
     key: &Option<Box<Expr>>,
-    schema: &Schema,
-    syms: &SymbolTable,
     mut program: ProgramBuilder,
 ) -> Result<ProgramBuilder> {
     // SQLite treats ATTACH as a function call to sqlite_attach(filename, dbname, key)
@@ -28,7 +26,6 @@ pub fn translate_attach(
     });
 
     let arg_reg = program.alloc_registers(4); // 3 for args + 1 for result
-    let resolver = Resolver::new(schema, syms);
 
     // Load filename argument
     // Handle different expression types as string literals for filenames
@@ -120,8 +117,7 @@ pub fn translate_attach(
 /// SQLite implements DETACH as a function call to sqlite_detach()
 pub fn translate_detach(
     expr: &Expr,
-    schema: &Schema,
-    syms: &SymbolTable,
+    resolver: &Resolver,
     mut program: ProgramBuilder,
 ) -> Result<ProgramBuilder> {
     // SQLite treats DETACH as a function call to sqlite_detach(dbname)
@@ -133,7 +129,6 @@ pub fn translate_detach(
     });
 
     let arg_reg = program.alloc_registers(2); // 1 for arg + 1 for result
-    let resolver = Resolver::new(schema, syms);
 
     // Load database name argument
     // Handle different expression types as string literals for database names
