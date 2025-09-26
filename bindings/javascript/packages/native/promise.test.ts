@@ -72,6 +72,37 @@ test('explicit connect', async () => {
     expect(await db.prepare("SELECT 1 as x").all()).toEqual([{ x: 1 }]);
 })
 
+test('avg-bug', async () => {
+    const db = await connect(':memory:');
+    const create = db.prepare(`create table "aggregate_table" (
+        "id" integer primary key autoincrement not null,
+        "name" text not null,
+        "a" integer,
+        "b" integer,
+        "c" integer,
+        "null_only" integer
+    );`);
+
+    await create.run();
+    const insert = db.prepare(
+        `insert into "aggregate_table" ("id", "name", "a", "b", "c", "null_only") values (null, ?, ?, ?, ?, null), (null, ?, ?, ?, ?, null), (null, ?, ?, ?, ?, null), (null, ?, ?, ?, ?, null), (null, ?, ?, ?, ?, null), (null, ?, ?, ?, ?, null), (null, ?, ?, ?, ?, null);`,
+    );
+
+    await insert.run(
+        'value 1', 5, 10, 20,
+        'value 1', 5, 20, 30,
+        'value 2', 10, 50, 60,
+        'value 3', 20, 20, null,
+        'value 4', null, 90, 120,
+        'value 5', 80, 10, null,
+        'value 6', null, null, 150,
+    );
+
+    expect(await db.prepare(`select avg("a") from "aggregate_table";`).get()).toEqual({ 'avg ("a")': 24 });
+    expect(await db.prepare(`select avg("null_only") from "aggregate_table";`).get()).toEqual({ 'avg ("null_only")': null });
+    expect(await db.prepare(`select avg(distinct "b") from "aggregate_table";`).get()).toEqual({ 'avg (DISTINCT "b")': 42.5 });
+})
+
 test('on-disk db', async () => {
     const path = `test-${(Math.random() * 10000) | 0}.db`;
     try {

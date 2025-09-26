@@ -750,3 +750,37 @@ fn test_cte_alias() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn test_avg_agg() -> anyhow::Result<()> {
+    let tmp_db = TempDatabase::new_with_rusqlite("create table t (x, y);", false);
+    let conn = tmp_db.connect_limbo();
+    conn.execute("insert into t values (1, null), (2, null), (3, null), (null, null), (4, null)")?;
+    let mut rows = Vec::new();
+    let mut stmt = conn.prepare("select avg(x), avg(y) from t")?;
+    loop {
+        match stmt.step()? {
+            StepResult::Row => {
+                let row = stmt.row().unwrap();
+                rows.push(row.get_values().cloned().collect::<Vec<_>>());
+            }
+            StepResult::Done => break,
+            StepResult::IO => stmt.run_once()?,
+            _ => panic!("Unexpected step result"),
+        }
+    }
+
+    assert_eq!(stmt.num_columns(), 2);
+    assert_eq!(stmt.get_column_name(0), "avg (x)");
+    assert_eq!(stmt.get_column_name(1), "avg (y)");
+
+    assert_eq!(
+        rows,
+        vec![vec![
+            turso_core::Value::Float((1.0 + 2.0 + 3.0 + 4.0) / (4.0)),
+            turso_core::Value::Null
+        ]]
+    );
+
+    Ok(())
+}
