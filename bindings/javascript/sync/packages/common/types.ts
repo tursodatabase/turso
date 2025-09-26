@@ -56,6 +56,13 @@ export interface DatabaseRowMutation {
 }
 
 export type Transform = (arg: DatabaseRowMutation) => DatabaseRowTransformResult;
+
+export interface EncryptionOpts {
+    // base64 encoded encryption key (must be either 16 or 32 bytes depending on the cipher)
+    key: string,
+    // encryption cipher algorithm
+    cipher: 'aes256gcm' | 'aes128gcm' | 'chacha20poly1305'
+}
 export interface DatabaseOpts {
     /**
      * local path where to store all synced database files (e.g. local.db)
@@ -79,9 +86,9 @@ export interface DatabaseOpts {
      */
     clientName?: string;
     /**
-     * optional key if cloud database were encrypted by default
+     * optional encryption parameters if cloud database were encrypted by default
      */
-    encryptionKey?: string;
+    encryption?: EncryptionOpts;
     /**
      * optional callback which will be called for every mutation before sending it to the remote
      * this callback can transform the update in order to support complex conflict resolution strategy
