@@ -166,8 +166,6 @@ pub fn emit_offset(program: &mut ProgramBuilder, jump_to: BranchOffset, reg_offs
     let Some(reg_offset) = &reg_offset else {
         return;
     };
-
-    program.add_comment(program.offset(), "OFFSET const");
     program.emit_insn(Insn::IfPos {
         reg: *reg_offset,
         target_pc: jump_to,
