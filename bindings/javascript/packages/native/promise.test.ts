@@ -98,9 +98,9 @@ test('avg-bug', async () => {
         'value 6', null, null, 150,
     );
 
-    expect(await db.prepare(`select avg("a") from "aggregate_table";`).get()).toEqual({ 'avg ("a")': 24 });
-    expect(await db.prepare(`select avg("null_only") from "aggregate_table";`).get()).toEqual({ 'avg ("null_only")': null });
-    expect(await db.prepare(`select avg(distinct "b") from "aggregate_table";`).get()).toEqual({ 'avg (DISTINCT "b")': 42.5 });
+    expect(await db.prepare(`select avg("a") from "aggregate_table";`).get()).toEqual({ 'avg (aggregate_table.a)': 24 });
+    expect(await db.prepare(`select avg("null_only") from "aggregate_table";`).get()).toEqual({ 'avg (aggregate_table.null_only)': null });
+    expect(await db.prepare(`select avg(distinct "b") from "aggregate_table";`).get()).toEqual({ 'avg (DISTINCT aggregate_table.b)': 42.5 });
 })
 
 test('on-disk db', async () => {
