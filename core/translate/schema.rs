@@ -8,6 +8,7 @@ use crate::schema::Column;
 use crate::schema::Schema;
 use crate::schema::Table;
 use crate::schema::Type;
+use crate::schema::RESERVED_TABLE_PREFIXES;
 use crate::storage::pager::CreateBTreeFlags;
 use crate::translate::emitter::emit_cdc_full_record;
 use crate::translate::emitter::emit_cdc_insns;
@@ -58,6 +59,17 @@ pub fn translate_create_table(
         approx_num_labels: 1,
     };
     program.extend(&opts);
+
+    if RESERVED_TABLE_PREFIXES
+        .iter()
+        .any(|prefix| normalized_tbl_name.starts_with(prefix))
+    {
+        bail_parse_error!(
+            "Object name reserved for internal use: {}",
+            tbl_name.name.as_str()
+        );
+    }
+
     if schema.get_table(&normalized_tbl_name).is_some() {
         if if_not_exists {
             return Ok(program);
@@ -599,6 +611,13 @@ pub fn translate_drop_table(
             return Ok(program);
         }
         bail_parse_error!("No such table: {}", tbl_name.name.as_str());
+    }
+
+    if RESERVED_TABLE_PREFIXES
+        .iter()
+        .any(|prefix| tbl_name.name.as_str().starts_with(prefix))
+    {
+        bail_parse_error!("table {} may not be dropped", tbl_name.name.as_str());
     }
 
     let table = table.unwrap(); // safe since we just checked for None

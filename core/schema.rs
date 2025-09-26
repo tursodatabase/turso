@@ -48,6 +48,9 @@ pub const DBSP_TABLE_PREFIX: &str = "__turso_internal_dbsp_state_v";
 /// Used to refer to the implicit rowid column in tables without an alias during UPDATE
 pub const ROWID_SENTINEL: usize = usize::MAX;
 
+/// Internal table prefixes that should be protected from CREATE/DROP
+pub const RESERVED_TABLE_PREFIXES: [&str; 2] = ["sqlite_", "__turso_internal_"];
+
 /// Check if a table name refers to a system table that should be protected from direct writes
 pub fn is_system_table(table_name: &str) -> bool {
     let normalized = table_name.to_lowercase();
