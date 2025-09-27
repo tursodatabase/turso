@@ -7883,10 +7883,27 @@ pub fn op_drop_column(
 
     let conn = program.connection.clone();
 
+    let normalized_table_name = normalize_ident(table.as_str());
+
+    let column_name = {
+        let schema = conn.schema.read();
+        let table = schema
+            .tables
+            .get(&normalized_table_name)
+            .expect("table being ALTERed should be in schema");
+        table
+            .get_column_at(*column_index)
+            .expect("column being ALTERed should be in schema")
+            .name
+            .as_ref()
+            .expect("column being ALTERed should be named")
+            .clone()
+    };
+
     conn.with_schema_mut(|schema| {
         let table = schema
             .tables
-            .get_mut(table)
+            .get_mut(&normalized_table_name)
             .expect("table being renamed should be in schema");
 
         let table = Arc::make_mut(table);
@@ -7898,6 +7915,31 @@ pub fn op_drop_column(
         let btree = Arc::make_mut(btree);
         btree.columns.remove(*column_index)
     });
+
+    let schema = conn.schema.read();
+    if let Some(indexes) = schema.indexes.get(&normalized_table_name) {
+        for index in indexes {
+            if index
+                .columns
+                .iter()
+                .any(|column| column.pos_in_table == *column_index)
+            {
+                return Err(LimboError::ParseError(format!(
+                    "cannot drop column \"{column_name}\": indexed"
+                )));
+            }
+        }
+    }
+
+    for (view_name, view) in schema.views.iter() {
+        let view_select_sql = format!("SELECT * FROM {view_name}");
+        conn.prepare(view_select_sql.as_str()).map_err(|e| {
+            LimboError::ParseError(format!(
+                "cannot drop column \"{}\": referenced in VIEW {view_name}: {}",
+                column_name, view.sql,
+            ))
+        })?;
+    }
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -7954,6 +7996,20 @@ pub fn op_alter_column(
     let conn = program.connection.clone();
 
     let normalized_table_name = normalize_ident(table_name.as_str());
+    let old_column_name = {
+        let schema = conn.schema.read();
+        let table = schema
+            .tables
+            .get(&normalized_table_name)
+            .expect("table being ALTERed should be in schema");
+        table
+            .get_column_at(*column_index)
+            .expect("column being ALTERed should be in schema")
+            .name
+            .as_ref()
+            .expect("column being ALTERed should be named")
+            .clone()
+    };
     let new_column = crate::schema::Column::from(definition);
 
     conn.with_schema_mut(|schema| {
@@ -7994,6 +8050,27 @@ pub fn op_alter_column(
             *column = new_column;
         }
     });
+
+    let schema = conn.schema.read();
+    if *rename {
+        let table = schema
+            .tables
+            .get(&normalized_table_name)
+            .expect("table being ALTERed should be in schema");
+        let column = table
+            .get_column_at(*column_index)
+            .expect("column being ALTERed should be in schema");
+        for (view_name, view) in schema.views.iter() {
+            let view_select_sql = format!("SELECT * FROM {view_name}");
+            // FIXME: this should rewrite the view to reference the new column name
+            conn.prepare(view_select_sql.as_str()).map_err(|e| {
+                LimboError::ParseError(format!(
+                    "cannot rename column \"{}\": referenced in VIEW {view_name}: {}",
+                    old_column_name, view.sql,
+                ))
+            })?;
+        }
+    }
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
