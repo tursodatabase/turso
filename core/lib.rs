@@ -40,6 +40,7 @@ pub mod numeric;
 mod numeric;
 
 use crate::storage::checksum::CHECKSUM_REQUIRED_RESERVED_BYTES;
+use crate::translate::display::PlanContext;
 use crate::translate::pragma::TURSO_CDC_DEFAULT_TABLE_NAME;
 #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
 use crate::types::{WalFrameInfo, WalState};
@@ -63,7 +64,7 @@ use parking_lot::RwLock;
 use schema::Schema;
 use std::{
     borrow::Cow,
-    cell::{Cell, RefCell},
+    cell::RefCell,
     collections::HashMap,
     fmt::{self, Display},
     num::NonZero,
@@ -91,6 +92,7 @@ pub use storage::{
 };
 use tracing::{instrument, Level};
 use turso_macros::match_ignore_ascii_case;
+use turso_parser::ast::fmt::ToTokens;
 use turso_parser::{ast, ast::Cmd, parser::Parser};
 use types::IOResult;
 pub use types::RefValue;
@@ -510,19 +512,19 @@ impl Database {
             cache_size: AtomicI32::new(default_cache_size),
             page_size: AtomicU16::new(page_size.get_raw()),
             wal_auto_checkpoint_disabled: AtomicBool::new(false),
-            capture_data_changes: RefCell::new(CaptureDataChangesMode::Off),
-            closed: Cell::new(false),
-            attached_databases: RefCell::new(DatabaseCatalog::new()),
-            query_only: Cell::new(false),
-            mv_tx: Cell::new(None),
+            capture_data_changes: RwLock::new(CaptureDataChangesMode::Off),
+            closed: AtomicBool::new(false),
+            attached_databases: RwLock::new(DatabaseCatalog::new()),
+            query_only: AtomicBool::new(false),
+            mv_tx: RwLock::new(None),
             view_transaction_states: AllViewsTxState::new(),
-            metrics: RefCell::new(ConnectionMetrics::new()),
-            is_nested_stmt: Cell::new(false),
-            encryption_key: RefCell::new(None),
-            encryption_cipher_mode: Cell::new(None),
-            sync_mode: Cell::new(SyncMode::Full),
-            data_sync_retry: Cell::new(false),
-            busy_timeout: Cell::new(Duration::new(0, 0)),
+            metrics: RwLock::new(ConnectionMetrics::new()),
+            is_nested_stmt: AtomicBool::new(false),
+            encryption_key: RwLock::new(None),
+            encryption_cipher_mode: RwLock::new(None),
+            sync_mode: RwLock::new(SyncMode::Full),
+            data_sync_retry: AtomicBool::new(false),
+            busy_timeout: RwLock::new(Duration::new(0, 0)),
         });
         self.n_connections
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -999,33 +1001,33 @@ pub struct Connection {
     /// Disable automatic checkpoint behaviour when DB is shutted down or WAL reach certain size
     /// Client still can manually execute PRAGMA wal_checkpoint(...) commands
     wal_auto_checkpoint_disabled: AtomicBool,
-    capture_data_changes: RefCell<CaptureDataChangesMode>,
-    closed: Cell<bool>,
+    capture_data_changes: RwLock<CaptureDataChangesMode>,
+    closed: AtomicBool,
     /// Attached databases
-    attached_databases: RefCell<DatabaseCatalog>,
-    query_only: Cell<bool>,
-    pub(crate) mv_tx: Cell<Option<(crate::mvcc::database::TxID, TransactionMode)>>,
+    attached_databases: RwLock<DatabaseCatalog>,
+    query_only: AtomicBool,
+    pub(crate) mv_tx: RwLock<Option<(crate::mvcc::database::TxID, TransactionMode)>>,
 
     /// Per-connection view transaction states for uncommitted changes. This represents
     /// one entry per view that was touched in the transaction.
     view_transaction_states: AllViewsTxState,
     /// Connection-level metrics aggregation
-    pub metrics: RefCell<ConnectionMetrics>,
+    pub metrics: RwLock<ConnectionMetrics>,
     /// Whether the connection is executing a statement initiated by another statement.
     /// Generally this is only true for ParseSchema.
-    is_nested_stmt: Cell<bool>,
-    encryption_key: RefCell<Option<EncryptionKey>>,
-    encryption_cipher_mode: Cell<Option<CipherMode>>,
-    sync_mode: Cell<SyncMode>,
-    data_sync_retry: Cell<bool>,
+    is_nested_stmt: AtomicBool,
+    encryption_key: RwLock<Option<EncryptionKey>>,
+    encryption_cipher_mode: RwLock<Option<CipherMode>>,
+    sync_mode: RwLock<SyncMode>,
+    data_sync_retry: AtomicBool,
     /// User defined max accumulated Busy timeout duration
     /// Default is 0 (no timeout)
-    busy_timeout: Cell<std::time::Duration>,
+    busy_timeout: RwLock<std::time::Duration>,
 }
 
 impl Drop for Connection {
     fn drop(&mut self) {
-        if !self.closed.get() {
+        if !self.is_closed() {
             // if connection wasn't properly closed, decrement the connection counter
             self.db
                 .n_connections
@@ -1037,7 +1039,7 @@ impl Drop for Connection {
 impl Connection {
     #[instrument(skip_all, level = Level::INFO)]
     pub fn prepare(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<Statement> {
-        if self.closed.get() {
+        if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
         if sql.as_ref().is_empty() {
@@ -1197,7 +1199,7 @@ impl Connection {
 
     #[instrument(skip_all, level = Level::INFO)]
     pub fn prepare_execute_batch(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<()> {
-        if self.closed.get() {
+        if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
         if sql.as_ref().is_empty() {
@@ -1235,7 +1237,7 @@ impl Connection {
 
     #[instrument(skip_all, level = Level::INFO)]
     pub fn query(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<Option<Statement>> {
-        if self.closed.get() {
+        if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
         let sql = sql.as_ref();
@@ -1259,7 +1261,7 @@ impl Connection {
         cmd: Cmd,
         input: &str,
     ) -> Result<Option<Statement>> {
-        if self.closed.get() {
+        if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
         let syms = self.syms.read();
@@ -1287,7 +1289,7 @@ impl Connection {
     /// TODO: make this api async
     #[instrument(skip_all, level = Level::INFO)]
     pub fn execute(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<()> {
-        if self.closed.get() {
+        if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
         let sql = sql.as_ref();
@@ -1315,6 +1317,33 @@ impl Connection {
                 .run_ignore_rows()?;
         }
         Ok(())
+    }
+
+    #[instrument(skip_all, level = Level::INFO)]
+    pub fn consume_stmt(self: &Arc<Connection>, sql: &str) -> Result<Option<(Statement, usize)>> {
+        let mut parser = Parser::new(sql.as_bytes());
+        let Some(cmd) = parser.next_cmd()? else {
+            return Ok(None);
+        };
+        let syms = self.syms.read();
+        let pager = self.pager.read().clone();
+        let byte_offset_end = parser.offset();
+        let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
+            .unwrap()
+            .trim();
+        let mode = QueryMode::new(&cmd);
+        let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
+        let program = translate::translate(
+            self.schema.read().deref(),
+            stmt,
+            pager.clone(),
+            self.clone(),
+            &syms,
+            mode,
+            input,
+        )?;
+        let stmt = Statement::new(program, self.db.mv_store.clone(), pager.clone(), mode);
+        Ok(Some((stmt, parser.offset())))
     }
 
     #[cfg(feature = "fs")]
@@ -1603,7 +1632,7 @@ impl Connection {
 
     /// Flush dirty pages to disk.
     pub fn cacheflush(&self) -> Result<Vec<Completion>> {
-        if self.closed.get() {
+        if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
         self.pager.read().cacheflush()
@@ -1615,7 +1644,7 @@ impl Connection {
     }
 
     pub fn checkpoint(&self, mode: CheckpointMode) -> Result<CheckpointResult> {
-        if self.closed.get() {
+        if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
         self.pager.read().wal_checkpoint(mode)
@@ -1623,10 +1652,10 @@ impl Connection {
 
     /// Close a connection and checkpoint.
     pub fn close(&self) -> Result<()> {
-        if self.closed.get() {
+        if self.is_closed() {
             return Ok(());
         }
-        self.closed.set(true);
+        self.closed.store(true, Ordering::SeqCst);
 
         match self.get_tx_state() {
             TransactionState::None => {
@@ -1694,15 +1723,25 @@ impl Connection {
         self.cache_size.store(size, Ordering::SeqCst);
     }
 
-    pub fn get_capture_data_changes(&self) -> std::cell::Ref<'_, CaptureDataChangesMode> {
-        self.capture_data_changes.borrow()
+    pub fn get_capture_data_changes(
+        &self,
+    ) -> parking_lot::RwLockReadGuard<'_, CaptureDataChangesMode> {
+        self.capture_data_changes.read()
     }
     pub fn set_capture_data_changes(&self, opts: CaptureDataChangesMode) {
-        self.capture_data_changes.replace(opts);
+        *self.capture_data_changes.write() = opts;
     }
     pub fn get_page_size(&self) -> PageSize {
         let value = self.page_size.load(Ordering::SeqCst);
         PageSize::new_from_header_u16(value).unwrap_or_default()
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
+
+    pub fn is_query_only(&self) -> bool {
+        self.query_only.load(Ordering::SeqCst)
     }
 
     pub fn get_database_canonical_path(&self) -> String {
@@ -1723,10 +1762,7 @@ impl Connection {
         if index == 0 {
             self.db.is_readonly()
         } else {
-            let db = self
-                .attached_databases
-                .borrow()
-                .get_database_by_index(index);
+            let db = self.attached_databases.read().get_database_by_index(index);
             db.expect("Should never have called this without being sure the database exists")
                 .is_readonly()
         }
@@ -1789,7 +1825,7 @@ impl Connection {
     }
 
     pub fn parse_schema_rows(self: &Arc<Connection>) -> Result<()> {
-        if self.closed.get() {
+        if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
         let rows = self
@@ -1817,7 +1853,7 @@ impl Connection {
     // Clearly there is something to improve here, Vec<Vec<Value>> isn't a couple of tea
     /// Query the current rows/values of `pragma_name`.
     pub fn pragma_query(self: &Arc<Connection>, pragma_name: &str) -> Result<Vec<Vec<Value>>> {
-        if self.closed.get() {
+        if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
         let pragma = format!("PRAGMA {pragma_name}");
@@ -1834,7 +1870,7 @@ impl Connection {
         pragma_name: &str,
         pragma_value: V,
     ) -> Result<Vec<Vec<Value>>> {
-        if self.closed.get() {
+        if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
         let pragma = format!("PRAGMA {pragma_name} = {pragma_value}");
@@ -1861,7 +1897,7 @@ impl Connection {
         pragma_name: &str,
         pragma_value: V,
     ) -> Result<Vec<Vec<Value>>> {
-        if self.closed.get() {
+        if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
         let pragma = format!("PRAGMA {pragma_name}({pragma_value})");
@@ -1898,14 +1934,14 @@ impl Connection {
         if *index < 2 {
             self.pager.read().clone()
         } else {
-            self.attached_databases.borrow().get_pager_by_index(index)
+            self.attached_databases.read().get_pager_by_index(index)
         }
     }
 
     #[cfg(feature = "fs")]
     fn is_attached(&self, alias: &str) -> bool {
         self.attached_databases
-            .borrow()
+            .read()
             .name_to_index
             .contains_key(alias)
     }
@@ -1921,7 +1957,7 @@ impl Connection {
     /// Attach a database file with the given alias name
     #[cfg(feature = "fs")]
     pub(crate) fn attach_database(&self, path: &str, alias: &str) -> Result<()> {
-        if self.closed.get() {
+        if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
 
@@ -1956,16 +1992,14 @@ impl Connection {
         let db = Self::from_uri_attached(path, db_opts, self.db.io.clone())?;
         let pager = Arc::new(db.init_pager(None)?);
 
-        self.attached_databases
-            .borrow_mut()
-            .insert(alias, (db, pager));
+        self.attached_databases.write().insert(alias, (db, pager));
 
         Ok(())
     }
 
     // Detach a database by alias name
     fn detach_database(&self, alias: &str) -> Result<()> {
-        if self.closed.get() {
+        if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
 
@@ -1976,7 +2010,7 @@ impl Connection {
         }
 
         // Remove from attached databases
-        let mut attached_dbs = self.attached_databases.borrow_mut();
+        let mut attached_dbs = self.attached_databases.write();
         if attached_dbs.remove(alias).is_none() {
             return Err(LimboError::InvalidArgument(format!(
                 "no such database: {alias}"
@@ -1988,13 +2022,13 @@ impl Connection {
 
     // Get an attached database by alias name
     fn get_attached_database(&self, alias: &str) -> Option<(usize, Arc<Database>)> {
-        self.attached_databases.borrow().get_database_by_name(alias)
+        self.attached_databases.read().get_database_by_name(alias)
     }
 
     /// List all attached database aliases
     pub fn list_attached_databases(&self) -> Vec<String> {
         self.attached_databases
-            .borrow()
+            .read()
             .name_to_index
             .keys()
             .cloned()
@@ -2050,7 +2084,7 @@ impl Connection {
             }
 
             // Schema not cached, load it lazily from the attached database
-            let attached_dbs = self.attached_databases.borrow();
+            let attached_dbs = self.attached_databases.read();
             let (db, _pager) = attached_dbs
                 .index_to_data
                 .get(&database_id)
@@ -2093,7 +2127,7 @@ impl Connection {
         databases.push((0, "main".to_string(), main_path));
 
         // Add attached databases
-        let attached_dbs = self.attached_databases.borrow();
+        let attached_dbs = self.attached_databases.read();
         for (alias, &seq_number) in attached_dbs.name_to_index.iter() {
             let file_path = if let Some((db, _pager)) = attached_dbs.index_to_data.get(&seq_number)
             {
@@ -2114,27 +2148,29 @@ impl Connection {
     }
 
     pub fn get_query_only(&self) -> bool {
-        self.query_only.get()
+        self.is_query_only()
     }
 
     pub fn set_query_only(&self, value: bool) {
-        self.query_only.set(value);
+        self.query_only.store(value, Ordering::SeqCst);
     }
 
     pub fn get_sync_mode(&self) -> SyncMode {
-        self.sync_mode.get()
+        *self.sync_mode.read()
     }
 
     pub fn set_sync_mode(&self, mode: SyncMode) {
-        self.sync_mode.set(mode);
+        *self.sync_mode.write() = mode;
     }
 
     pub fn get_data_sync_retry(&self) -> bool {
-        self.data_sync_retry.get()
+        self.data_sync_retry
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     pub fn set_data_sync_retry(&self, value: bool) {
-        self.data_sync_retry.set(value);
+        self.data_sync_retry
+            .store(value, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Creates a HashSet of modules that have been loaded
@@ -2144,27 +2180,28 @@ impl Connection {
 
     pub fn set_encryption_key(&self, key: EncryptionKey) -> Result<()> {
         tracing::trace!("setting encryption key for connection");
-        *self.encryption_key.borrow_mut() = Some(key.clone());
+        *self.encryption_key.write() = Some(key.clone());
         self.set_encryption_context()
     }
 
     pub fn set_encryption_cipher(&self, cipher_mode: CipherMode) -> Result<()> {
         tracing::trace!("setting encryption cipher for connection");
-        self.encryption_cipher_mode.replace(Some(cipher_mode));
+        *self.encryption_cipher_mode.write() = Some(cipher_mode);
         self.set_encryption_context()
     }
 
     pub fn get_encryption_cipher_mode(&self) -> Option<CipherMode> {
-        self.encryption_cipher_mode.get()
+        *self.encryption_cipher_mode.read()
     }
 
     // if both key and cipher are set, set encryption context on pager
     fn set_encryption_context(&self) -> Result<()> {
-        let key_ref = self.encryption_key.borrow();
-        let Some(key) = key_ref.as_ref() else {
+        let key_guard = self.encryption_key.read();
+        let Some(key) = key_guard.as_ref() else {
             return Ok(());
         };
-        let Some(cipher_mode) = self.encryption_cipher_mode.get() else {
+        let cipher_guard = self.encryption_cipher_mode.read();
+        let Some(cipher_mode) = *cipher_guard else {
             return Ok(());
         };
         tracing::trace!("setting encryption ctx for connection");
@@ -2194,11 +2231,11 @@ impl Connection {
     ///
     /// This slight api change demonstrated a better throughtput in `perf/throughput/turso` benchmark
     pub fn set_busy_timeout(&self, duration: std::time::Duration) {
-        self.busy_timeout.set(duration);
+        *self.busy_timeout.write() = duration;
     }
 
     pub fn get_busy_timeout(&self) -> std::time::Duration {
-        self.busy_timeout.get()
+        *self.busy_timeout.read()
     }
 
     fn set_tx_state(&self, state: TransactionState) {
@@ -2207,6 +2244,14 @@ impl Connection {
 
     fn get_tx_state(&self) -> TransactionState {
         *self.transaction_state.read()
+    }
+
+    pub(crate) fn get_mv_tx_id(&self) -> Option<u64> {
+        self.mv_tx.read().map(|(tx_id, _)| tx_id)
+    }
+
+    pub(crate) fn get_mv_tx(&self) -> Option<(u64, TransactionMode)> {
+        *self.mv_tx.read()
     }
 }
 
@@ -2331,7 +2376,7 @@ impl Statement {
     }
 
     pub fn set_mv_tx(&mut self, mv_tx: Option<(u64, TransactionMode)>) {
-        self.program.connection.mv_tx.set(mv_tx);
+        *self.program.connection.mv_tx.write() = mv_tx;
     }
 
     pub fn interrupt(&mut self) {
@@ -2380,7 +2425,7 @@ impl Statement {
 
         // Aggregate metrics when statement completes
         if matches!(res, Ok(StepResult::Done)) {
-            let mut conn_metrics = self.program.connection.metrics.borrow_mut();
+            let mut conn_metrics = self.program.connection.metrics.write();
             conn_metrics.record_statement(self.state.metrics.clone());
             self.busy = false;
         } else {
@@ -2389,7 +2434,7 @@ impl Statement {
 
         if matches!(res, Ok(StepResult::Busy)) {
             let now = self.pager.io.now();
-            let max_duration = self.program.connection.busy_timeout.get();
+            let max_duration = *self.program.connection.busy_timeout.read();
             self.busy_timeout = match self.busy_timeout.take() {
                 None => {
                     let mut result = BusyTimeout::new(now);
@@ -2464,6 +2509,7 @@ impl Statement {
                 &self.program.sql,
             )?
         };
+
         // Save parameters before they are reset
         let parameters = std::mem::take(&mut self.state.parameters);
         let (max_registers, cursor_count) = match self.query_mode {
@@ -2479,7 +2525,12 @@ impl Statement {
 
     pub fn run_once(&self) -> Result<()> {
         let res = self.pager.io.step();
-        if self.program.connection.is_nested_stmt.get() {
+        if self
+            .program
+            .connection
+            .is_nested_stmt
+            .load(Ordering::SeqCst)
+        {
             return res;
         }
         if res.is_err() {
@@ -2513,7 +2564,11 @@ impl Statement {
                 let column = &self.program.result_columns.get(idx).expect("No column");
                 match column.name(&self.program.table_references) {
                     Some(name) => Cow::Borrowed(name),
-                    None => Cow::Owned(column.expr.to_string()),
+                    None => {
+                        let tables = [&self.program.table_references];
+                        let ctx = PlanContext(&tables);
+                        Cow::Owned(column.expr.displayer(&ctx).to_string())
+                    }
                 }
             }
             QueryMode::Explain => Cow::Borrowed(EXPLAIN_COLUMNS[idx]),

@@ -196,6 +196,16 @@ pub enum Insn {
         rhs: usize,
         dest: usize,
     },
+    /// Updates the value of register dest_reg to the maximum of its current
+    /// value and the value in src_reg.
+    ///
+    ///    - dest_reg = max(int(dest_reg), int(src_reg))
+    ///
+    /// Both registers are converted to integers before the comparison.
+    MemMax {
+        dest_reg: usize, // P1
+        src_reg: usize,  // P2
+    },
     /// Divide lhs by rhs and store the result in a third register.
     Divide {
         lhs: usize,
@@ -1272,7 +1282,6 @@ impl InsnVariants {
             InsnVariants::CreateBtree => execute::op_create_btree,
             InsnVariants::Destroy => execute::op_destroy,
             InsnVariants::ResetSorter => execute::op_reset_sorter,
-
             InsnVariants::DropTable => execute::op_drop_table,
             InsnVariants::DropView => execute::op_drop_view,
             InsnVariants::Close => execute::op_close,
@@ -1309,6 +1318,7 @@ impl InsnVariants {
             InsnVariants::IfNeg => execute::op_if_neg,
             InsnVariants::Explain => execute::op_noop,
             InsnVariants::OpenDup => execute::op_open_dup,
+            InsnVariants::MemMax => execute::op_mem_max,
             InsnVariants::Sequence => execute::op_sequence,
             InsnVariants::SequenceTest => execute::op_sequence_test,
         }

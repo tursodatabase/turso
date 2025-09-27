@@ -3,7 +3,7 @@ import { Database as NativeDB } from "#index";
 
 class Database extends DatabasePromise {
     constructor(path: string, opts: DatabaseOpts = {}) {
-        super(new NativeDB(path, { tracing: opts.tracing }) as unknown as NativeDatabase, opts)
+        super(new NativeDB(path, opts) as unknown as NativeDatabase)
     }
 }
 
@@ -14,8 +14,10 @@ class Database extends DatabasePromise {
  * @param {Object} opts - Options for database behavior.
  * @returns {Promise<Database>} - A promise that resolves to a Database instance.
  */
-async function connect(path: string, opts: any = {}): Promise<Database> {
-    return new Database(path, opts);
+async function connect(path: string, opts: DatabaseOpts = {}): Promise<Database> {
+    const db = new Database(path, opts);
+    await db.connect();
+    return db;
 }
 
 export { connect, Database, SqliteError }

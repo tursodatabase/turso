@@ -2,11 +2,12 @@ use super::*;
 use crate::io::PlatformIO;
 use crate::mvcc::clock::LocalClock;
 use crate::storage::sqlite3_ondisk::DatabaseHeader;
-use std::cell::RefCell;
+use parking_lot::RwLock;
 
 pub(crate) struct MvccTestDbNoConn {
     pub(crate) db: Option<Arc<Database>>,
     path: Option<String>,
+    log_path: Option<String>,
     // Stored mainly to not drop the temp dir before the test is done.
     _temp_dir: Option<tempfile::TempDir>,
 }
@@ -37,6 +38,7 @@ impl MvccTestDbNoConn {
         Self {
             db: Some(db),
             path: None,
+            log_path: None,
             _temp_dir: None,
         }
     }
@@ -52,9 +54,17 @@ impl MvccTestDbNoConn {
         println!("path: {}", path.as_os_str().to_str().unwrap());
         let db = Database::open_file(io.clone(), path.as_os_str().to_str().unwrap(), true, true)
             .unwrap();
+        let mut log_path = path.clone();
+        let log_path_filename = log_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|s| format!("{s}-lg"))
+            .unwrap();
+        log_path.set_file_name(log_path_filename);
         Self {
             db: Some(db),
             path: Some(path.to_str().unwrap().to_string()),
+            log_path: Some(log_path.to_str().unwrap().to_string()),
             _temp_dir: Some(temp_dir),
         }
     }
@@ -78,6 +88,10 @@ impl MvccTestDbNoConn {
 
     pub fn get_mvcc_store(&self) -> Arc<MvStore<LocalClock>> {
         self.get_db().mv_store.as_ref().unwrap().clone()
+    }
+
+    pub fn get_log_path(&self) -> &str {
+        self.log_path.as_ref().unwrap().as_str()
     }
 }
 
@@ -760,9 +774,7 @@ pub(crate) fn commit_tx(
     conn: &Arc<Connection>,
     tx_id: u64,
 ) -> Result<()> {
-    let mut sm = mv_store
-        .commit_tx(tx_id, conn.pager.read().clone(), conn)
-        .unwrap();
+    let mut sm = mv_store.commit_tx(tx_id, conn).unwrap();
     // TODO: sync IO hack
     loop {
         let res = sm.step(&mv_store)?;
@@ -783,9 +795,7 @@ pub(crate) fn commit_tx_no_conn(
     conn: &Arc<Connection>,
 ) -> Result<(), LimboError> {
     let mv_store = db.get_mvcc_store();
-    let mut sm = mv_store
-        .commit_tx(tx_id, conn.pager.read().clone(), conn)
-        .unwrap();
+    let mut sm = mv_store.commit_tx(tx_id, conn).unwrap();
     // TODO: sync IO hack
     loop {
         let res = sm.step(&mv_store)?;
@@ -1041,7 +1051,7 @@ fn new_tx(tx_id: TxID, begin_ts: u64, state: TransactionState) -> Transaction {
         begin_ts,
         write_set: SkipSet::new(),
         read_set: SkipSet::new(),
-        header: RefCell::new(DatabaseHeader::default()),
+        header: RwLock::new(DatabaseHeader::default()),
     }
 }
 
@@ -1453,7 +1463,7 @@ fn transaction_display() {
         begin_ts,
         write_set,
         read_set,
-        header: RefCell::new(DatabaseHeader::default()),
+        header: RwLock::new(DatabaseHeader::default()),
     };
 
     let expected = "{ state: Preparing, id: 42, begin_ts: 20250914, write_set: [RowID { table_id: 1, row_id: 11 }, RowID { table_id: 1, row_id: 13 }], read_set: [RowID { table_id: 2, row_id: 17 }, RowID { table_id: 2, row_id: 19 }] }";

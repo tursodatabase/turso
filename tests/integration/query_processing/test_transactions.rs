@@ -305,20 +305,6 @@ fn test_mvcc_update_basic() {
 }
 
 #[test]
-fn test_mvcc_begin_concurrent_smoke() {
-    let tmp_db = TempDatabase::new_with_opts(
-        "test_mvcc_begin_concurrent_smoke.db",
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
-    let conn1 = tmp_db.connect_limbo();
-    conn1.execute("BEGIN CONCURRENT").unwrap();
-    conn1
-        .execute("CREATE TABLE test (id INTEGER, value TEXT)")
-        .unwrap();
-    conn1.execute("COMMIT").unwrap();
-}
-
-#[test]
 fn test_mvcc_concurrent_insert_basic() {
     let tmp_db = TempDatabase::new_with_opts(
         "test_mvcc_update_basic.db",
@@ -456,6 +442,101 @@ fn test_mvcc_concurrent_conflicting_update_2() {
         .execute("UPDATE test SET value = 'third' WHERE id BETWEEN 0 AND 10")
         .expect_err("expected error");
     assert!(matches!(err, LimboError::WriteWriteConflict));
+}
+
+#[test]
+fn test_mvcc_checkpoint_works() {
+    let tmp_db = TempDatabase::new_with_opts(
+        "test_mvcc_checkpoint_works.db",
+        turso_core::DatabaseOpts::new().with_mvcc(true),
+    );
+
+    // Create table
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE test (id INTEGER, value TEXT)")
+        .unwrap();
+
+    // Insert rows from multiple connections
+    let mut expected_rows = Vec::new();
+
+    // Create 5 connections, each inserting 20 rows
+    for conn_id in 0..5 {
+        let conn = tmp_db.connect_limbo();
+        conn.execute("BEGIN CONCURRENT").unwrap();
+
+        // Each connection inserts rows with its own pattern
+        for i in 0..20 {
+            let id = conn_id * 100 + i;
+            let value = format!("value_conn{conn_id}_row{i}");
+            conn.execute(format!(
+                "INSERT INTO test (id, value) VALUES ({id}, '{value}')",
+            ))
+            .unwrap();
+            expected_rows.push((id, value));
+        }
+
+        conn.execute("COMMIT").unwrap();
+    }
+
+    // Before checkpoint: assert that the DB file size is exactly 4096, .db-wal size is exactly 32, and there is a nonzero size .db-lg file
+    let db_file_size = std::fs::metadata(&tmp_db.path).unwrap().len();
+    assert!(db_file_size == 4096);
+    let wal_file_size = std::fs::metadata(tmp_db.path.with_extension("db-wal"))
+        .unwrap()
+        .len();
+    assert!(
+        wal_file_size == 0,
+        "wal file size should be 0 bytes, but is {wal_file_size} bytes"
+    );
+    let lg_file_size = std::fs::metadata(tmp_db.path.with_extension("db-lg"))
+        .unwrap()
+        .len();
+    assert!(lg_file_size > 0);
+
+    // Sort expected rows to match ORDER BY id, value
+    expected_rows.sort_by(|a, b| match a.0.cmp(&b.0) {
+        std::cmp::Ordering::Equal => a.1.cmp(&b.1),
+        other => other,
+    });
+
+    // Checkpoint
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    // Verify all rows after reopening database
+    let tmp_db = TempDatabase::new_with_existent(&tmp_db.path, true);
+    let conn = tmp_db.connect_limbo();
+    let stmt = conn
+        .query("SELECT * FROM test ORDER BY id, value")
+        .unwrap()
+        .unwrap();
+    let rows = helper_read_all_rows(stmt);
+
+    // Build expected results
+    let expected: Vec<Vec<Value>> = expected_rows
+        .into_iter()
+        .map(|(id, value)| vec![Value::Integer(id as i64), Value::build_text(value)])
+        .collect();
+
+    assert_eq!(rows, expected);
+
+    // Assert that the db file size is larger than 4096, assert .db-wal size is 32 bytes, assert there is no .db-lg file
+    let db_file_size = std::fs::metadata(&tmp_db.path).unwrap().len();
+    assert!(db_file_size > 4096);
+    assert!(db_file_size % 4096 == 0);
+    let wal_size = std::fs::metadata(tmp_db.path.with_extension("db-wal"))
+        .unwrap()
+        .len();
+    assert!(
+        wal_size == 0,
+        "wal size should be 0 bytes, but is {wal_size} bytes"
+    );
+    let log_size = std::fs::metadata(tmp_db.path.with_extension("db-lg"))
+        .unwrap()
+        .len();
+    assert!(
+        log_size == 0,
+        "log size should be 0 bytes, but is {log_size} bytes"
+    );
 }
 
 fn helper_read_all_rows(mut stmt: turso_core::Statement) -> Vec<Vec<Value>> {

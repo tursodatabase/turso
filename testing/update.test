@@ -378,3 +378,11 @@ do_execsql_test_on_specific_db {:memory:} rowid-update-updates-all-indexes {
 } {2|3|1
 2|3|1
 2|3|1}
+
+# https://github.com/tursodatabase/turso/issues/3276
+do_execsql_test_on_specific_db {:memory:} can-update-rowid-directly {
+    CREATE TABLE test (name TEXT);
+    INSERT INTO test (name) VALUES ('test');
+    UPDATE test SET rowid = 5;
+	SELECT rowid, name from test;
+} {5|test}

@@ -331,7 +331,6 @@ test('concurrent-updates', { timeout: 60000 }, async () => {
     }
     async function pull(db, i) {
         try {
-            console.info('pull', i);
             await db.pull();
         } catch (e) {
             console.error('pull', i, e);
@@ -343,7 +342,6 @@ test('concurrent-updates', { timeout: 60000 }, async () => {
     }
     async function push(db, i) {
         try {
-            console.info('push', i);
             await db.push();
         } catch (e) {
             console.error('push', i, e);

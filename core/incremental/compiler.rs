@@ -368,6 +368,10 @@ impl DbspNode {
     }
 }
 
+/// Version number for the DBSP circuit format
+/// This should be incremented when the circuit structure changes
+pub const DBSP_CIRCUIT_VERSION: u32 = 1;
+
 /// Represents a complete DBSP circuit (DAG of operators)
 #[derive(Debug)]
 pub struct DbspCircuit {
@@ -403,7 +407,7 @@ impl DbspCircuit {
         let empty_schema = Arc::new(LogicalSchema::new(vec![]));
         Self {
             nodes: HashMap::new(),
-            next_id: 0,
+            next_id: 1, // Start from 1 to reserve 0 for metadata
             root: None,
             output_schema: empty_schema,
             commit_state: CommitState::Init,
@@ -1506,7 +1510,7 @@ impl DbspCompiler {
         let io = Arc::new(MemoryIO::new());
         let db = Database::open_file(io, ":memory:", false, false)?;
         let internal_conn = db.connect()?;
-        internal_conn.query_only.set(true);
+        internal_conn.set_query_only(true);
         internal_conn.auto_commit.store(false, Ordering::SeqCst);
 
         // Create temporary symbol table
@@ -1977,6 +1981,7 @@ mod tests {
                 ],
                 has_rowid: true,
                 is_strict: false,
+                has_autoincrement: false,
                 unique_sets: vec![],
             };
             schema.add_btree_table(Arc::new(users_table));
@@ -2029,6 +2034,7 @@ mod tests {
                 ],
                 has_rowid: true,
                 is_strict: false,
+                has_autoincrement: false,
                 unique_sets: vec![],
             };
             schema.add_btree_table(Arc::new(products_table));
@@ -2092,6 +2098,7 @@ mod tests {
                     },
                 ],
                 has_rowid: true,
+                has_autoincrement: false,
                 is_strict: false,
                 unique_sets: vec![],
             };
@@ -2130,6 +2137,7 @@ mod tests {
                 ],
                 has_rowid: true,
                 is_strict: false,
+                has_autoincrement: false,
                 unique_sets: vec![],
             };
             schema.add_btree_table(Arc::new(customers_table));
@@ -2191,6 +2199,7 @@ mod tests {
                 ],
                 has_rowid: true,
                 is_strict: false,
+                has_autoincrement: false,
                 unique_sets: vec![],
             };
             schema.add_btree_table(Arc::new(purchases_table));
@@ -2240,6 +2249,7 @@ mod tests {
                 ],
                 has_rowid: true,
                 is_strict: false,
+                has_autoincrement: false,
                 unique_sets: vec![],
             };
             schema.add_btree_table(Arc::new(vendors_table));
@@ -2276,6 +2286,7 @@ mod tests {
                 ],
                 has_rowid: true,
                 is_strict: false,
+                has_autoincrement: false,
                 unique_sets: vec![],
             };
             schema.add_btree_table(Arc::new(sales_table));

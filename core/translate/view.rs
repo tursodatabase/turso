@@ -5,16 +5,15 @@ use crate::translate::schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEI
 use crate::util::{normalize_ident, PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX};
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{CmpInsFlags, Cookie, Insn, RegisterOrLiteral};
-use crate::{Connection, Result, SymbolTable};
+use crate::{Connection, Result};
 use std::sync::Arc;
 use turso_parser::ast;
 
 pub fn translate_create_materialized_view(
-    schema: &Schema,
     view_name: &str,
+    resolver: &Resolver,
     select_stmt: &ast::Select,
     connection: Arc<Connection>,
-    syms: &SymbolTable,
     mut program: ProgramBuilder,
 ) -> Result<ProgramBuilder> {
     // Check if experimental views are enabled
@@ -28,7 +27,8 @@ pub fn translate_create_materialized_view(
     let normalized_view_name = normalize_ident(view_name);
 
     // Check if view already exists
-    if schema
+    if resolver
+        .schema
         .get_materialized_view(&normalized_view_name)
         .is_some()
     {
@@ -42,7 +42,8 @@ pub fn translate_create_materialized_view(
     // storing invalid view definitions
     use crate::incremental::view::IncrementalView;
     use crate::schema::BTreeTable;
-    let view_column_schema = IncrementalView::validate_and_extract_columns(select_stmt, schema)?;
+    let view_column_schema =
+        IncrementalView::validate_and_extract_columns(select_stmt, resolver.schema)?;
     let view_columns = view_column_schema.flat_columns();
 
     // Reconstruct the SQL string for storage
@@ -76,6 +77,8 @@ pub fn translate_create_materialized_view(
         primary_key_columns: vec![], // Materialized views use implicit rowid
         has_rowid: true,
         is_strict: false,
+        has_autoincrement: false,
+
         unique_sets: vec![],
     });
 
@@ -118,7 +121,7 @@ pub fn translate_create_materialized_view(
     program.preassign_label_to_next_insn(clear_done_label);
 
     // Open cursor to sqlite_schema table
-    let table = schema.get_btree_table(SQLITE_TABLEID).unwrap();
+    let table = resolver.schema.get_btree_table(SQLITE_TABLEID).unwrap();
     let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
     program.emit_insn(Insn::OpenWrite {
         cursor_id: sqlite_schema_cursor_id,
@@ -127,10 +130,9 @@ pub fn translate_create_materialized_view(
     });
 
     // Add the materialized view entry to sqlite_schema
-    let resolver = Resolver::new(schema, syms);
     emit_schema_entry(
         &mut program,
-        &resolver,
+        resolver,
         sqlite_schema_cursor_id,
         None, // cdc_table_cursor_id, no cdc for views
         SchemaEntryType::View,
@@ -141,7 +143,10 @@ pub fn translate_create_materialized_view(
     )?;
 
     // Add the DBSP state table to sqlite_master (required for materialized views)
-    let dbsp_table_name = format!("{DBSP_TABLE_PREFIX}{normalized_view_name}");
+    // Include the version number in the table name
+    use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
+    let dbsp_table_name =
+        format!("{DBSP_TABLE_PREFIX}{DBSP_CIRCUIT_VERSION}_{normalized_view_name}");
     // The element_id column uses SQLite's dynamic typing system to store different value types:
     // - For hash-based operators (joins, filters): stores INTEGER hash values or rowids
     // - For future MIN/MAX operators: stores the actual values being compared (INTEGER, REAL, TEXT, BLOB)
@@ -149,8 +154,8 @@ pub fn translate_create_materialized_view(
     let dbsp_sql = format!(
         "CREATE TABLE {dbsp_table_name} (\
          operator_id INTEGER NOT NULL, \
-         zset_id INTEGER NOT NULL, \
-         element_id NOT NULL, \
+         zset_id BLOB NOT NULL, \
+         element_id BLOB NOT NULL, \
          value BLOB, \
          weight INTEGER NOT NULL, \
          PRIMARY KEY (operator_id, zset_id, element_id)\
@@ -159,7 +164,7 @@ pub fn translate_create_materialized_view(
 
     emit_schema_entry(
         &mut program,
-        &resolver,
+        resolver,
         sqlite_schema_cursor_id,
         None, // cdc_table_cursor_id
         SchemaEntryType::Table,
@@ -185,7 +190,7 @@ pub fn translate_create_materialized_view(
     );
     emit_schema_entry(
         &mut program,
-        &resolver,
+        resolver,
         sqlite_schema_cursor_id,
         None, // cdc_table_cursor_id
         SchemaEntryType::Index,
@@ -206,7 +211,7 @@ pub fn translate_create_materialized_view(
     program.emit_insn(Insn::SetCookie {
         db: 0,
         cookie: Cookie::SchemaVersion,
-        value: (schema.schema_version + 1) as i32,
+        value: (resolver.schema.schema_version + 1) as i32,
         p5: 0,
     });
 
@@ -216,7 +221,7 @@ pub fn translate_create_materialized_view(
         cursors: cursor_info,
     });
 
-    program.epilogue(schema);
+    program.epilogue(resolver.schema);
     Ok(program)
 }
 
@@ -225,19 +230,19 @@ fn create_materialized_view_to_str(view_name: &str, select_stmt: &ast::Select) -
 }
 
 pub fn translate_create_view(
-    schema: &Schema,
     view_name: &str,
+    resolver: &Resolver,
     select_stmt: &ast::Select,
     _columns: &[ast::IndexedColumn],
     _connection: Arc<Connection>,
-    syms: &SymbolTable,
     mut program: ProgramBuilder,
 ) -> Result<ProgramBuilder> {
     let normalized_view_name = normalize_ident(view_name);
 
     // Check if view already exists
-    if schema.get_view(&normalized_view_name).is_some()
-        || schema
+    if resolver.schema.get_view(&normalized_view_name).is_some()
+        || resolver
+            .schema
             .get_materialized_view(&normalized_view_name)
             .is_some()
     {
@@ -250,7 +255,7 @@ pub fn translate_create_view(
     let sql = create_view_to_str(view_name, select_stmt);
 
     // Open cursor to sqlite_schema table
-    let table = schema.get_btree_table(SQLITE_TABLEID).unwrap();
+    let table = resolver.schema.get_btree_table(SQLITE_TABLEID).unwrap();
     let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
     program.emit_insn(Insn::OpenWrite {
         cursor_id: sqlite_schema_cursor_id,
@@ -259,10 +264,9 @@ pub fn translate_create_view(
     });
 
     // Add the view entry to sqlite_schema
-    let resolver = Resolver::new(schema, syms);
     emit_schema_entry(
         &mut program,
-        &resolver,
+        resolver,
         sqlite_schema_cursor_id,
         None, // cdc_table_cursor_id, no cdc for views
         SchemaEntryType::View,
@@ -281,7 +285,7 @@ pub fn translate_create_view(
     program.emit_insn(Insn::SetCookie {
         db: 0,
         cookie: Cookie::SchemaVersion,
-        value: (schema.schema_version + 1) as i32,
+        value: (resolver.schema.schema_version + 1) as i32,
         p5: 0,
     });
 

@@ -11,6 +11,7 @@ use syntect::parsing::SyntaxSet;
 fn main() {
     println!("cargo::rerun-if-changed=SQL.sublime-syntax");
     println!("cargo::rerun-if-changed=build.rs");
+    println!("cargo::rerun-if-changed=manuals");
 
     let out_dir = env::var_os("OUT_DIR").unwrap();
     let syntax =

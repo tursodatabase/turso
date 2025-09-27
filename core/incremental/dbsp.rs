@@ -2,9 +2,120 @@
 // For now, we'll use a basic approach and can expand to full DBSP later
 
 use crate::Value;
-use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
+
+/// A 128-bit hash value implemented as a UUID
+/// We use UUID because it's a standard 128-bit type we already depend on
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Hash128 {
+    // Store as UUID internally for efficient 128-bit representation
+    uuid: uuid::Uuid,
+}
+
+impl Hash128 {
+    /// Create a new 128-bit hash from high and low 64-bit parts
+    pub fn new(high: u64, low: u64) -> Self {
+        // Convert two u64 values to UUID bytes (big-endian)
+        let mut bytes = [0u8; 16];
+        bytes[0..8].copy_from_slice(&high.to_be_bytes());
+        bytes[8..16].copy_from_slice(&low.to_be_bytes());
+        Self {
+            uuid: uuid::Uuid::from_bytes(bytes),
+        }
+    }
+
+    /// Get the low 64 bits as i64 (for when we need a rowid)
+    pub fn as_i64(&self) -> i64 {
+        let bytes = self.uuid.as_bytes();
+        let low = u64::from_be_bytes([
+            bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
+        ]);
+        low as i64
+    }
+
+    /// Compute a 128-bit hash of the given values
+    /// We serialize values to a string representation and use UUID v5 (SHA-1 based)
+    /// to get a deterministic 128-bit hash
+    pub fn hash_values(values: &[Value]) -> Self {
+        // Build a string representation of all values
+        // Use a delimiter that won't appear in normal values
+        let mut s = String::new();
+        for (i, value) in values.iter().enumerate() {
+            if i > 0 {
+                s.push('\x00'); // null byte as delimiter
+            }
+            // Add type prefix to distinguish between types
+            match value {
+                Value::Null => s.push_str("N:"),
+                Value::Integer(n) => {
+                    s.push_str("I:");
+                    s.push_str(&n.to_string());
+                }
+                Value::Float(f) => {
+                    s.push_str("F:");
+                    // Use to_bits to ensure consistent representation
+                    s.push_str(&f.to_bits().to_string());
+                }
+                Value::Text(t) => {
+                    s.push_str("T:");
+                    s.push_str(t.as_str());
+                }
+                Value::Blob(b) => {
+                    s.push_str("B:");
+                    s.push_str(&hex::encode(b));
+                }
+            }
+        }
+
+        Self::hash_str(&s)
+    }
+
+    /// Hash a string value to 128 bits using UUID v5
+    pub fn hash_str(s: &str) -> Self {
+        // Use UUID v5 with a fixed namespace to get deterministic 128-bit hashes
+        // We use the DNS namespace as it's a standard choice
+        let uuid = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, s.as_bytes());
+        Self { uuid }
+    }
+
+    /// Convert to a big-endian byte array for storage
+    pub fn to_blob(self) -> Vec<u8> {
+        self.uuid.as_bytes().to_vec()
+    }
+
+    /// Create from a big-endian byte array
+    pub fn from_blob(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != 16 {
+            return None;
+        }
+
+        let mut uuid_bytes = [0u8; 16];
+        uuid_bytes.copy_from_slice(bytes);
+        Some(Self {
+            uuid: uuid::Uuid::from_bytes(uuid_bytes),
+        })
+    }
+
+    /// Convert to a Value::Blob for storage
+    pub fn to_value(self) -> Value {
+        Value::Blob(self.to_blob())
+    }
+
+    /// Try to extract a Hash128 from a Value
+    pub fn from_value(value: &Value) -> Option<Self> {
+        match value {
+            Value::Blob(b) => Self::from_blob(b),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for Hash128 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.uuid)
+    }
+}
 
 // The DBSP paper uses as a key the whole record, with both the row key and the values.  This is a
 // bit confuses for us in databases, because when you say "key", it is easy to understand that as
@@ -30,7 +141,7 @@ pub struct HashableRow {
     pub values: Vec<Value>,
     // Pre-computed hash: DBSP rows are immutable and frequently hashed during joins,
     // making caching worthwhile despite the memory overhead
-    cached_hash: u64,
+    cached_hash: Hash128,
 }
 
 impl HashableRow {
@@ -43,47 +154,23 @@ impl HashableRow {
         }
     }
 
-    fn compute_hash(rowid: i64, values: &[Value]) -> u64 {
-        let mut hasher = DefaultHasher::new();
-
-        rowid.hash(&mut hasher);
-
-        for value in values {
-            match value {
-                Value::Null => {
-                    0u8.hash(&mut hasher);
-                }
-                Value::Integer(i) => {
-                    1u8.hash(&mut hasher);
-                    i.hash(&mut hasher);
-                }
-                Value::Float(f) => {
-                    2u8.hash(&mut hasher);
-                    f.to_bits().hash(&mut hasher);
-                }
-                Value::Text(s) => {
-                    3u8.hash(&mut hasher);
-                    s.value.hash(&mut hasher);
-                    (s.subtype as u8).hash(&mut hasher);
-                }
-                Value::Blob(b) => {
-                    4u8.hash(&mut hasher);
-                    b.hash(&mut hasher);
-                }
-            }
-        }
-
-        hasher.finish()
+    fn compute_hash(rowid: i64, values: &[Value]) -> Hash128 {
+        // Include rowid in the hash by prepending it to values
+        let mut all_values = Vec::with_capacity(values.len() + 1);
+        all_values.push(Value::Integer(rowid));
+        all_values.extend_from_slice(values);
+        Hash128::hash_values(&all_values)
     }
 
-    pub fn cached_hash(&self) -> u64 {
+    pub fn cached_hash(&self) -> Hash128 {
         self.cached_hash
     }
 }
 
 impl Hash for HashableRow {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.cached_hash.hash(state);
+        // Hash the 128-bit value by hashing both parts
+        self.cached_hash.to_blob().hash(state);
     }
 }
 

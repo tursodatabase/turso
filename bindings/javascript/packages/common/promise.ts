@@ -30,56 +30,33 @@ function createErrorByName(name, message) {
  * Database represents a connection that can prepare and execute SQL statements.
  */
 class Database {
-  db: NativeDatabase;
-  memory: boolean;
+  name: string;
+  readonly: boolean;
   open: boolean;
-  execLock: AsyncLock;
-  private _inTransaction: boolean = false;
-  /**
-   * Creates a new database connection. If the database file pointed to by `path` does not exists, it will be created.
-   *
-   * @constructor
-   * @param {string} path - Path to the database file.
-   * @param {Object} opts - Options for database behavior.
-   * @param {boolean} [opts.readonly=false] - Open the database in read-only mode.
-   * @param {boolean} [opts.fileMustExist=false] - If true, throws if database file does not exist.
-   * @param {number} [opts.timeout=0] - Timeout duration in milliseconds for database operations. Defaults to 0 (no timeout).
-   */
-  constructor(db: NativeDatabase, opts: DatabaseOpts = {}) {
-    opts.readonly = opts.readonly === undefined ? false : opts.readonly;
-    opts.fileMustExist =
-      opts.fileMustExist === undefined ? false : opts.fileMustExist;
-    opts.timeout = opts.timeout === undefined ? 0 : opts.timeout;
+  memory: boolean;
+  inTransaction: boolean;
 
-    this.initialize(db, opts.name, opts.readonly);
-  }
-  static create() {
-    return Object.create(this.prototype);
-  }
-  initialize(db: NativeDatabase, name, readonly) {
+  private db: NativeDatabase;
+  private execLock: AsyncLock;
+  private _inTransaction: boolean = false;
+
+  constructor(db: NativeDatabase) {
     this.db = db;
-    this.memory = db.memory;
     this.execLock = new AsyncLock();
     Object.defineProperties(this, {
-      inTransaction: {
-        get: () => this._inTransaction,
-      },
-      name: {
-        get() {
-          return name;
-        },
-      },
-      readonly: {
-        get() {
-          return readonly;
-        },
-      },
-      open: {
-        get() {
-          return this.db.open;
-        },
-      },
+      name: { get: () => this.db.path },
+      readonly: { get: () => this.db.readonly },
+      open: { get: () => this.db.open },
+      memory: { get: () => this.db.memory },
+      inTransaction: { get: () => this._inTransaction },
     });
+  }
+
+  /**
+   * connect database
+   */
+  async connect() {
+    await this.db.connectAsync();
   }
 
   /**
@@ -88,16 +65,12 @@ class Database {
    * @param {string} sql - The SQL statement string to prepare.
    */
   prepare(sql) {
-    if (!this.open) {
-      throw new TypeError("The database connection is not open");
-    }
-
     if (!sql) {
       throw new RangeError("The supplied SQL string contains no statements");
     }
 
     try {
-      return new Statement(this.db.prepare(sql), this);
+      return new Statement(this.db.prepare(sql), this.db, this.execLock);
     } catch (err) {
       throw convertError(err);
     }
@@ -154,10 +127,13 @@ class Database {
 
     const pragma = `PRAGMA ${source}`;
 
-    const stmt = await this.prepare(pragma);
-    const results = await stmt.all();
-
-    return results;
+    const stmt = this.prepare(pragma);
+    try {
+      const results = await stmt.all();
+      return results;
+    } finally {
+      await stmt.close();
+    }
   }
 
   backup(filename, options) {
@@ -189,20 +165,32 @@ class Database {
   }
 
   /**
-   * Executes a SQL statement.
+   * Executes the given SQL string
+   * Unlike prepared statements, this can execute strings that contain multiple SQL statements
    *
-   * @param {string} sql - The SQL statement string to execute.
+   * @param {string} sql - The string containing SQL statements to execute
    */
   async exec(sql) {
-    if (!this.open) {
-      throw new TypeError("The database connection is not open");
-    }
-
-    const stmt = this.prepare(sql);
+    await this.execLock.acquire();
+    const exec = this.db.executor(sql);
     try {
-      await stmt.run();
+      while (true) {
+        const stepResult = exec.stepSync();
+        if (stepResult === STEP_IO) {
+          await this.db.ioLoopAsync();
+          continue;
+        }
+        if (stepResult === STEP_DONE) {
+          break;
+        }
+        if (stepResult === STEP_ROW) {
+          // For exec(), we don't need the row data, just continue
+          continue;
+        }
+      }
     } finally {
-      stmt.close();
+      exec.reset();
+      this.execLock.release();
     }
   }
 
@@ -234,11 +222,14 @@ class Database {
  * Statement represents a prepared SQL statement that can be executed.
  */
 class Statement {
-  stmt: NativeStatement;
-  db: Database;
-  constructor(stmt, database) {
+  private stmt: NativeStatement;
+  private db: NativeDatabase;
+  private execLock: AsyncLock;
+
+  constructor(stmt: NativeStatement, db: NativeDatabase, execLock: AsyncLock) {
     this.stmt = stmt;
-    this.db = database;
+    this.db = db;
+    this.execLock = execLock;
   }
 
   /**
@@ -296,17 +287,17 @@ class Statement {
    * Executes the SQL statement and returns an info object.
    */
   async run(...bindParameters) {
-    const totalChangesBefore = this.db.db.totalChanges();
+    const totalChangesBefore = this.db.totalChanges();
 
     this.stmt.reset();
     bindParams(this.stmt, bindParameters);
 
-    await this.db.execLock.acquire();
+    await this.execLock.acquire();
     try {
       while (true) {
         const stepResult = await this.stmt.stepSync();
         if (stepResult === STEP_IO) {
-          await this.db.db.ioLoopAsync();
+          await this.db.ioLoopAsync();
           continue;
         }
         if (stepResult === STEP_DONE) {
@@ -318,12 +309,12 @@ class Statement {
         }
       }
 
-      const lastInsertRowid = this.db.db.lastInsertRowid();
-      const changes = this.db.db.totalChanges() === totalChangesBefore ? 0 : this.db.db.changes();
+      const lastInsertRowid = this.db.lastInsertRowid();
+      const changes = this.db.totalChanges() === totalChangesBefore ? 0 : this.db.changes();
 
       return { changes, lastInsertRowid };
     } finally {
-      this.db.execLock.release();
+      this.execLock.release();
     }
   }
 
@@ -336,12 +327,12 @@ class Statement {
     this.stmt.reset();
     bindParams(this.stmt, bindParameters);
 
-    await this.db.execLock.acquire();
+    await this.execLock.acquire();
     try {
       while (true) {
         const stepResult = await this.stmt.stepSync();
         if (stepResult === STEP_IO) {
-          await this.db.db.ioLoopAsync();
+          await this.db.ioLoopAsync();
           continue;
         }
         if (stepResult === STEP_DONE) {
@@ -352,7 +343,7 @@ class Statement {
         }
       }
     } finally {
-      this.db.execLock.release();
+      this.execLock.release();
     }
   }
 
@@ -365,12 +356,12 @@ class Statement {
     this.stmt.reset();
     bindParams(this.stmt, bindParameters);
 
-    await this.db.execLock.acquire();
+    await this.execLock.acquire();
     try {
       while (true) {
         const stepResult = await this.stmt.stepSync();
         if (stepResult === STEP_IO) {
-          await this.db.db.ioLoopAsync();
+          await this.db.ioLoopAsync();
           continue;
         }
         if (stepResult === STEP_DONE) {
@@ -381,7 +372,7 @@ class Statement {
         }
       }
     } finally {
-      this.db.execLock.release();
+      this.execLock.release();
     }
   }
 
@@ -395,12 +386,12 @@ class Statement {
     bindParams(this.stmt, bindParameters);
     const rows: any[] = [];
 
-    await this.db.execLock.acquire();
+    await this.execLock.acquire();
     try {
       while (true) {
         const stepResult = await this.stmt.stepSync();
         if (stepResult === STEP_IO) {
-          await this.db.db.ioLoopAsync();
+          await this.db.ioLoopAsync();
           continue;
         }
         if (stepResult === STEP_DONE) {
@@ -413,7 +404,7 @@ class Statement {
       return rows;
     }
     finally {
-      this.db.execLock.release();
+      this.execLock.release();
     }
   }
 
@@ -444,4 +435,5 @@ class Statement {
     this.stmt.finalize();
   }
 }
+
 export { Database, Statement }

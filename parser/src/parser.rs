@@ -911,7 +911,7 @@ impl<'a> Parser<'a> {
     fn parse_fullname(&mut self, allow_alias: bool) -> Result<QualifiedName> {
         let first_name = self.parse_nm()?;
 
-        let secone_name = if let Some(tok) = self.peek()? {
+        let second_name = if let Some(tok) = self.peek()? {
             if tok.token_type == Some(TK_DOT) {
                 eat_assert!(self, TK_DOT);
                 Some(self.parse_nm()?)
@@ -937,10 +937,10 @@ impl<'a> Parser<'a> {
             None
         };
 
-        if let Some(secone_name) = secone_name {
+        if let Some(second_name) = second_name {
             Ok(QualifiedName {
                 db_name: Some(first_name),
-                name: secone_name,
+                name: second_name,
                 alias: alias_name,
             })
         } else {
@@ -1551,7 +1551,7 @@ impl<'a> Parser<'a> {
                                 b"false" => {
                                     Ok(Box::new(Expr::Literal(Literal::Numeric("0".into()))))
                                 }
-                                _ => return Ok(Box::new(Expr::Id(Name::Ident(s)))),
+                                _ => Ok(Box::new(Expr::Id(Name::Ident(s)))),
                             })
                         }
                         _ => Ok(Box::new(Expr::Id(name))),
@@ -2603,16 +2603,24 @@ impl<'a> Parser<'a> {
             return Ok(None);
         }
 
-        let limit = self.parse_expr(0)?;
-        let offset = match self.peek()? {
+        let expr = self.parse_expr(0)?;
+        let (limit, offset) = match self.peek()? {
             Some(tok) => match tok.token_type.unwrap() {
-                TK_OFFSET | TK_COMMA => {
-                    eat_assert!(self, TK_OFFSET, TK_COMMA);
-                    Some(self.parse_expr(0)?)
+                TK_COMMA => {
+                    eat_assert!(self, TK_COMMA);
+                    let offset = expr;
+                    let limit = self.parse_expr(0)?;
+                    (limit, Some(offset))
                 }
-                _ => None,
+                TK_OFFSET => {
+                    eat_assert!(self, TK_OFFSET);
+                    let limit = expr;
+                    let offset = self.parse_expr(0)?;
+                    (limit, Some(offset))
+                }
+                _ => (expr, None),
             },
-            _ => None,
+            _ => (expr, None),
         };
 
         Ok(Some(Limit {
@@ -7577,8 +7585,8 @@ mod tests {
                     },
                     order_by: vec![],
                     limit: Some(Limit {
-                        expr: Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
-                        offset: Some(Box::new(Expr::Literal(Literal::Numeric("2".to_owned())))),
+                        expr: Box::new(Expr::Literal(Literal::Numeric("2".to_owned()))),
+                        offset: Some(Box::new(Expr::Literal(Literal::Numeric("1".to_owned())))),
                     }),
                 }))],
             ),

@@ -16,7 +16,7 @@ pub mod browser;
 use napi::bindgen_prelude::*;
 use napi::{Env, Task};
 use napi_derive::napi;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::{
     cell::{Cell, RefCell},
     num::NonZeroUsize,
@@ -24,6 +24,7 @@ use std::{
 };
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::fmt::format::FmtSpan;
+use turso_core::storage::database::DatabaseFile;
 
 /// Step result constants
 const STEP_ROW: u32 = 1;
@@ -42,12 +43,19 @@ enum PresentationMode {
 #[napi]
 #[derive(Clone)]
 pub struct Database {
-    _db: Option<Arc<turso_core::Database>>,
-    io: Arc<dyn turso_core::IO>,
-    conn: Option<Arc<turso_core::Connection>>,
+    inner: Option<Arc<DatabaseInner>>,
+}
+
+/// database inner is Send to the worker for initial connection
+/// that's why we use OnceLock here - in order to make DatabaseInner Send and Sync
+pub struct DatabaseInner {
     path: String,
-    is_open: Cell<bool>,
-    default_safe_integers: Cell<bool>,
+    opts: Option<DatabaseOpts>,
+    io: Arc<dyn turso_core::IO>,
+    db: OnceLock<Option<Arc<turso_core::Database>>>,
+    conn: OnceLock<Option<Arc<turso_core::Connection>>>,
+    is_connected: OnceLock<bool>,
+    default_safe_integers: Mutex<bool>,
 }
 
 pub(crate) fn is_memory(path: &str) -> bool {
@@ -55,7 +63,7 @@ pub(crate) fn is_memory(path: &str) -> bool {
 }
 
 static TRACING_INIT: OnceLock<()> = OnceLock::new();
-pub(crate) fn init_tracing(level_filter: Option<String>) {
+pub(crate) fn init_tracing(level_filter: &Option<String>) {
     let Some(level_filter) = level_filter else {
         return;
     };
@@ -77,13 +85,12 @@ pub(crate) fn init_tracing(level_filter: Option<String>) {
     });
 }
 
-pub enum DbTask {
-    Step {
-        stmt: Arc<RefCell<Option<turso_core::Statement>>>,
-    },
-}
-
+// for now we make DbTask unsound as turso_core::Database and turso_core::Connection are not fully thread-safe
 unsafe impl Send for DbTask {}
+
+pub enum DbTask {
+    Connect { db: Arc<DatabaseInner> },
+}
 
 impl Task for DbTask {
     type Output = u32;
@@ -91,7 +98,10 @@ impl Task for DbTask {
 
     fn compute(&mut self) -> Result<Self::Output> {
         match self {
-            DbTask::Step { stmt } => step_sync(stmt),
+            DbTask::Connect { db } => {
+                connect_sync(db)?;
+                Ok(0)
+            }
         }
     }
 
@@ -100,34 +110,103 @@ impl Task for DbTask {
     }
 }
 
+/// Most of the options are aligned with better-sqlite API
+/// (see https://github.com/WiseLibs/better-sqlite3/blob/master/docs/api.md#new-databasepath-options)
 #[napi(object)]
 #[derive(Clone)]
 pub struct DatabaseOpts {
+    pub readonly: Option<bool>,
+    pub timeout: Option<u32>,
+    pub file_must_exist: Option<bool>,
     pub tracing: Option<String>,
 }
 
-fn step_sync(stmt: &Arc<RefCell<Option<turso_core::Statement>>>) -> napi::Result<u32> {
-    let mut stmt_ref = stmt.borrow_mut();
-    let stmt = stmt_ref
-        .as_mut()
-        .ok_or_else(|| Error::new(Status::GenericFailure, "Statement has been finalized"))?;
-
+fn step_sync(stmt: &Arc<RefCell<turso_core::Statement>>) -> napi::Result<u32> {
+    let mut stmt = stmt.borrow_mut();
     match stmt.step() {
         Ok(turso_core::StepResult::Row) => Ok(STEP_ROW),
         Ok(turso_core::StepResult::IO) => Ok(STEP_IO),
         Ok(turso_core::StepResult::Done) => Ok(STEP_DONE),
-        Ok(turso_core::StepResult::Interrupt) => Err(Error::new(
-            Status::GenericFailure,
-            "Statement was interrupted",
-        )),
-        Ok(turso_core::StepResult::Busy) => {
-            Err(Error::new(Status::GenericFailure, "Database is busy"))
+        Ok(turso_core::StepResult::Interrupt) => {
+            Err(create_generic_error("statement was interrupted"))
         }
-        Err(e) => Err(Error::new(
-            Status::GenericFailure,
-            format!("Step failed: {e}"),
-        )),
+        Ok(turso_core::StepResult::Busy) => Err(create_generic_error("database is busy")),
+        Err(e) => Err(to_generic_error("step failed", e)),
     }
+}
+
+fn to_generic_error<E: std::error::Error>(message: &str, e: E) -> napi::Error {
+    Error::new(Status::GenericFailure, format!("{message}: {e}"))
+}
+
+fn to_error<E: std::error::Error>(status: napi::Status, message: &str, e: E) -> napi::Error {
+    Error::new(status, format!("{message}: {e}"))
+}
+
+fn create_generic_error(message: &str) -> napi::Error {
+    Error::new(Status::GenericFailure, message)
+}
+
+fn create_error(status: napi::Status, message: &str) -> napi::Error {
+    Error::new(status, message)
+}
+
+fn connect_sync(db: &DatabaseInner) -> napi::Result<()> {
+    if db.is_connected.get() == Some(&true) {
+        return Ok(());
+    }
+
+    let mut flags = turso_core::OpenFlags::Create;
+    let mut busy_timeout = None;
+    if let Some(opts) = &db.opts {
+        if opts.readonly == Some(true) {
+            flags.set(turso_core::OpenFlags::ReadOnly, true);
+            flags.set(turso_core::OpenFlags::Create, false);
+        }
+        if opts.file_must_exist == Some(true) {
+            flags.set(turso_core::OpenFlags::Create, false);
+        }
+        if let Some(timeout) = opts.timeout {
+            busy_timeout = Some(std::time::Duration::from_millis(timeout as u64));
+        }
+    }
+    tracing::info!("flags: {:?}", flags);
+    let io = &db.io;
+    let file = io
+        .open_file(&db.path, flags, false)
+        .map_err(|e| to_generic_error("failed to open file", e))?;
+
+    let db_file = Arc::new(DatabaseFile::new(file));
+    let db_core = turso_core::Database::open_with_flags(
+        io.clone(),
+        &db.path,
+        db_file,
+        flags,
+        turso_core::DatabaseOpts::new()
+            .with_mvcc(false)
+            .with_indexes(true),
+        None,
+    )
+    .map_err(|e| to_generic_error("failed to open database", e))?;
+
+    let conn = db_core
+        .connect()
+        .map_err(|e| to_generic_error("failed to connect", e))?;
+
+    if let Some(busy_timeout) = busy_timeout {
+        conn.set_busy_timeout(busy_timeout);
+    }
+
+    db.is_connected
+        .set(true)
+        .map_err(|_| create_generic_error("db already connected, API misuse"))?;
+    db.db
+        .set(Some(db_core))
+        .map_err(|_| create_generic_error("db already connected, API misuse"))?;
+    db.conn
+        .set(Some(conn))
+        .map_err(|_| create_generic_error("db already connected, API misuse"))?;
+    Ok(())
 }
 
 #[napi]
@@ -137,102 +216,122 @@ impl Database {
     /// # Arguments
     /// * `path` - The path to the database file.
     #[napi(constructor)]
-    pub fn new_napi(path: String, opts: Option<DatabaseOpts>) -> Result<Self> {
-        Self::new(path, opts)
-    }
-
-    pub fn new(path: String, opts: Option<DatabaseOpts>) -> Result<Self> {
+    pub fn new(path: String, opts: Option<DatabaseOpts>) -> napi::Result<Self> {
         let io: Arc<dyn turso_core::IO> = if is_memory(&path) {
             Arc::new(turso_core::MemoryIO::new())
         } else {
             #[cfg(not(feature = "browser"))]
             {
-                Arc::new(turso_core::PlatformIO::new().map_err(|e| {
-                    Error::new(Status::GenericFailure, format!("Failed to create IO: {e}"))
-                })?)
+                Arc::new(
+                    turso_core::PlatformIO::new()
+                        .map_err(|e| to_generic_error("failed to create IO", e))?,
+                )
             }
             #[cfg(feature = "browser")]
             {
-                return Err(napi::Error::new(
-                    napi::Status::GenericFailure,
-                    "FS-backed db must be initialized through connectDbAsync function in the browser",
-                ));
+                browser::opfs()
             }
         };
-        Self::new_io(path, io, opts)
+        Self::new_with_io(path, io, opts)
     }
 
-    pub fn new_io(
+    pub fn new_with_io(
         path: String,
         io: Arc<dyn turso_core::IO>,
         opts: Option<DatabaseOpts>,
-    ) -> Result<Self> {
-        if let Some(opts) = opts {
-            init_tracing(opts.tracing);
+    ) -> napi::Result<Self> {
+        if let Some(opts) = &opts {
+            init_tracing(&opts.tracing);
         }
-
-        let file = io
-            .open_file(&path, turso_core::OpenFlags::Create, false)
-            .map_err(|e| Error::new(Status::GenericFailure, format!("Failed to open file: {e}")))?;
-
-        let db_file = Arc::new(DatabaseFile::new(file));
-        let db =
-            turso_core::Database::open(io.clone(), &path, db_file, false, true).map_err(|e| {
-                Error::new(
-                    Status::GenericFailure,
-                    format!("Failed to open database: {e}"),
-                )
-            })?;
-
-        let conn = db
-            .connect()
-            .map_err(|e| Error::new(Status::GenericFailure, format!("Failed to connect: {e}")))?;
-
-        Ok(Self::create(Some(db), io, conn, path))
+        Ok(Self {
+            #[allow(clippy::arc_with_non_send_sync)]
+            inner: Some(Arc::new(DatabaseInner {
+                path,
+                opts,
+                io,
+                db: OnceLock::new(),
+                conn: OnceLock::new(),
+                is_connected: OnceLock::new(),
+                default_safe_integers: Mutex::new(false),
+            })),
+        })
     }
 
-    pub fn create(
-        db: Option<Arc<turso_core::Database>>,
-        io: Arc<dyn turso_core::IO>,
-        conn: Arc<turso_core::Connection>,
-        path: String,
-    ) -> Self {
-        Database {
-            _db: db,
-            io,
-            conn: Some(conn),
-            path,
-            is_open: Cell::new(true),
-            default_safe_integers: Cell::new(false),
-        }
+    pub fn set_connected(&self, conn: Arc<turso_core::Connection>) -> napi::Result<()> {
+        let inner = self.inner()?;
+        inner
+            .db
+            .set(None)
+            .map_err(|_| create_generic_error("database was already connected"))?;
+
+        inner
+            .conn
+            .set(Some(conn))
+            .map_err(|_| create_generic_error("database was already connected"))?;
+
+        inner
+            .is_connected
+            .set(true)
+            .map_err(|_| create_generic_error("database was already connected"))?;
+
+        Ok(())
+    }
+
+    fn inner(&self) -> napi::Result<&Arc<DatabaseInner>> {
+        let Some(inner) = &self.inner else {
+            return Err(create_generic_error("database must be connected"));
+        };
+        Ok(inner)
+    }
+
+    /// Connect the database synchronously
+    /// This method is idempotent and can be called multiple times safely until the database will be closed
+    #[napi]
+    pub fn connect_sync(&self) -> napi::Result<()> {
+        connect_sync(self.inner()?)
+    }
+
+    /// Connect the database asynchronously
+    /// This method is idempotent and can be called multiple times safely until the database will be closed
+    #[napi(ts_return_type = "Promise<void>")]
+    pub fn connect_async(&self) -> napi::Result<AsyncTask<DbTask>> {
+        Ok(AsyncTask::new(DbTask::Connect {
+            db: self.inner()?.clone(),
+        }))
     }
 
     fn conn(&self) -> Result<Arc<turso_core::Connection>> {
-        let Some(conn) = self.conn.as_ref() else {
-            return Err(napi::Error::new(
-                napi::Status::GenericFailure,
-                "connection is not set",
-            ));
+        let Some(Some(conn)) = self.inner()?.conn.get() else {
+            return Err(create_generic_error("database must be connected"));
         };
         Ok(conn.clone())
     }
 
-    /// Returns whether the database is in memory-only mode.
+    /// Returns whether the database is in readonly-only mode.
     #[napi(getter)]
-    pub fn memory(&self) -> bool {
-        is_memory(&self.path)
+    pub fn readonly(&self) -> napi::Result<bool> {
+        Ok(self.conn()?.is_readonly(0))
     }
 
     /// Returns whether the database is in memory-only mode.
     #[napi(getter)]
-    pub fn path(&self) -> String {
-        self.path.clone()
+    pub fn memory(&self) -> napi::Result<bool> {
+        Ok(is_memory(&self.inner()?.path))
+    }
+
+    /// Returns whether the database is in memory-only mode.
+    #[napi(getter)]
+    pub fn path(&self) -> napi::Result<String> {
+        Ok(self.inner()?.path.clone())
     }
 
     /// Returns whether the database connection is open.
     #[napi(getter)]
-    pub fn open(&self) -> bool {
-        self.is_open.get()
+    pub fn open(&self) -> napi::Result<bool> {
+        if self.inner.is_none() {
+            return Ok(false);
+        }
+        Ok(self.inner()?.is_connected.get() == Some(&true))
     }
 
     /// Prepares a statement for execution.
@@ -245,20 +344,30 @@ impl Database {
     ///
     /// A `Statement` instance.
     #[napi]
-    pub fn prepare(&self, sql: String) -> Result<Statement> {
+    pub fn prepare(&self, sql: String) -> napi::Result<Statement> {
         let stmt = self
             .conn()?
             .prepare(&sql)
-            .map_err(|e| Error::new(Status::GenericFailure, format!("{e}")))?;
+            .map_err(|e| to_generic_error("prepare failed", e))?;
         let column_names: Vec<std::ffi::CString> = (0..stmt.num_columns())
             .map(|i| std::ffi::CString::new(stmt.get_column_name(i).to_string()).unwrap())
             .collect();
         Ok(Statement {
             #[allow(clippy::arc_with_non_send_sync)]
-            stmt: Arc::new(RefCell::new(Some(stmt))),
+            stmt: Some(Arc::new(RefCell::new(stmt))),
             column_names,
             mode: RefCell::new(PresentationMode::Expanded),
-            safe_integers: Cell::new(self.default_safe_integers.get()),
+            safe_integers: Cell::new(*self.inner()?.default_safe_integers.lock().unwrap()),
+        })
+    }
+
+    #[napi]
+    pub fn executor(&self, sql: String) -> napi::Result<BatchExecutor> {
+        Ok(BatchExecutor {
+            conn: Some(self.conn()?.clone()),
+            sql,
+            position: 0,
+            stmt: None,
         })
     }
 
@@ -268,7 +377,7 @@ impl Database {
     ///
     /// The rowid of the last row inserted.
     #[napi]
-    pub fn last_insert_rowid(&self) -> Result<i64> {
+    pub fn last_insert_rowid(&self) -> napi::Result<i64> {
         Ok(self.conn()?.last_insert_rowid())
     }
 
@@ -278,7 +387,7 @@ impl Database {
     ///
     /// The number of changes made by the last statement.
     #[napi]
-    pub fn changes(&self) -> Result<i64> {
+    pub fn changes(&self) -> napi::Result<i64> {
         Ok(self.conn()?.changes())
     }
 
@@ -288,7 +397,7 @@ impl Database {
     ///
     /// The total number of changes made by all statements.
     #[napi]
-    pub fn total_changes(&self) -> Result<i64> {
+    pub fn total_changes(&self) -> napi::Result<i64> {
         Ok(self.conn()?.total_changes())
     }
 
@@ -298,10 +407,8 @@ impl Database {
     ///
     /// `Ok(())` if the database is closed successfully.
     #[napi]
-    pub fn close(&mut self) -> Result<()> {
-        self.is_open.set(false);
-        let _ = self.conn.take().unwrap();
-        let _ = self._db.take();
+    pub fn close(&mut self) -> napi::Result<()> {
+        let _ = self.inner.take();
         Ok(())
     }
 
@@ -311,31 +418,77 @@ impl Database {
     ///
     /// * `toggle` - Whether to use safe integers by default.
     #[napi(js_name = "defaultSafeIntegers")]
-    pub fn default_safe_integers(&self, toggle: Option<bool>) {
-        self.default_safe_integers.set(toggle.unwrap_or(true));
+    pub fn default_safe_integers(&self, toggle: Option<bool>) -> napi::Result<()> {
+        *self.inner()?.default_safe_integers.lock().unwrap() = toggle.unwrap_or(true);
+        Ok(())
     }
 
     /// Runs the I/O loop synchronously.
     #[napi]
-    pub fn io_loop_sync(&self) -> Result<()> {
-        self.io
-            .step()
-            .map_err(|e| Error::new(Status::GenericFailure, format!("IO error: {e}")))?;
+    pub fn io_loop_sync(&self) -> napi::Result<()> {
+        let io = &self.inner()?.io;
+        io.step().map_err(|e| to_generic_error("IO error", e))?;
         Ok(())
     }
 
     /// Runs the I/O loop asynchronously, returning a Promise.
     #[napi(ts_return_type = "Promise<void>")]
-    pub fn io_loop_async(&self) -> AsyncTask<IoLoopTask> {
-        let io = self.io.clone();
-        AsyncTask::new(IoLoopTask { io })
+    pub fn io_loop_async(&self) -> napi::Result<AsyncTask<IoLoopTask>> {
+        let io = self.inner()?.io.clone();
+        Ok(AsyncTask::new(IoLoopTask { io }))
+    }
+}
+
+#[napi]
+pub struct BatchExecutor {
+    conn: Option<Arc<turso_core::Connection>>,
+    sql: String,
+    position: usize,
+    stmt: Option<Arc<RefCell<turso_core::Statement>>>,
+}
+
+#[napi]
+impl BatchExecutor {
+    #[napi]
+    pub fn step_sync(&mut self) -> Result<u32> {
+        loop {
+            if self.stmt.is_none() && self.position >= self.sql.len() {
+                return Ok(STEP_DONE);
+            }
+            if self.stmt.is_none() {
+                let conn = self.conn.as_ref().unwrap();
+                match conn.consume_stmt(&self.sql[self.position..]) {
+                    #[allow(clippy::arc_with_non_send_sync)]
+                    Ok(Some((stmt, offset))) => {
+                        self.position += offset;
+                        self.stmt = Some(Arc::new(RefCell::new(stmt)));
+                    }
+                    Ok(None) => return Ok(STEP_DONE),
+                    Err(err) => return Err(to_generic_error("failed to consume stmt", err)),
+                }
+            }
+            let stmt = self.stmt.as_ref().unwrap();
+            match step_sync(stmt) {
+                Ok(STEP_DONE) => {
+                    let _ = self.stmt.take();
+                    continue;
+                }
+                result => return result,
+            }
+        }
+    }
+
+    #[napi]
+    pub fn reset(&mut self) {
+        let _ = self.conn.take();
+        let _ = self.stmt.take();
     }
 }
 
 /// A prepared statement.
 #[napi]
 pub struct Statement {
-    stmt: Arc<RefCell<Option<turso_core::Statement>>>,
+    stmt: Option<Arc<RefCell<turso_core::Statement>>>,
     column_names: Vec<std::ffi::CString>,
     mode: RefCell<PresentationMode>,
     safe_integers: Cell<bool>,
@@ -343,24 +496,21 @@ pub struct Statement {
 
 #[napi]
 impl Statement {
+    pub fn stmt(&self) -> napi::Result<&Arc<RefCell<turso_core::Statement>>> {
+        self.stmt
+            .as_ref()
+            .ok_or_else(|| create_generic_error("statement has been finalized"))
+    }
     #[napi]
     pub fn reset(&self) -> Result<()> {
-        let mut stmt = self.stmt.borrow_mut();
-        let stmt = stmt
-            .as_mut()
-            .ok_or_else(|| Error::new(Status::GenericFailure, "Statement has been finalized"))?;
-        stmt.reset();
+        self.stmt()?.borrow_mut().reset();
         Ok(())
     }
 
     /// Returns the number of parameters in the statement.
     #[napi]
     pub fn parameter_count(&self) -> Result<u32> {
-        let stmt = self.stmt.borrow();
-        let stmt = stmt
-            .as_ref()
-            .ok_or_else(|| Error::new(Status::GenericFailure, "Statement has been finalized"))?;
-        Ok(stmt.parameters_count() as u32)
+        Ok(self.stmt()?.borrow().parameters_count() as u32)
     }
 
     /// Returns the name of a parameter at a specific 1-based index.
@@ -370,15 +520,11 @@ impl Statement {
     /// * `index` - The 1-based parameter index.
     #[napi]
     pub fn parameter_name(&self, index: u32) -> Result<Option<String>> {
-        let stmt = self.stmt.borrow();
-        let stmt = stmt
-            .as_ref()
-            .ok_or_else(|| Error::new(Status::GenericFailure, "Statement has been finalized"))?;
-
         let non_zero_idx = NonZeroUsize::new(index as usize).ok_or_else(|| {
-            Error::new(Status::InvalidArg, "Parameter index must be greater than 0")
+            create_error(Status::InvalidArg, "parameter index must be greater than 0")
         })?;
 
+        let stmt = self.stmt()?.borrow();
         Ok(stmt.parameters().name(non_zero_idx).map(|s| s.to_string()))
     }
 
@@ -391,13 +537,8 @@ impl Statement {
     /// * `value` - The value to bind.
     #[napi]
     pub fn bind_at(&self, index: u32, value: Unknown) -> Result<()> {
-        let mut stmt = self.stmt.borrow_mut();
-        let stmt = stmt
-            .as_mut()
-            .ok_or_else(|| Error::new(Status::GenericFailure, "Statement has been finalized"))?;
-
         let non_zero_idx = NonZeroUsize::new(index as usize).ok_or_else(|| {
-            Error::new(Status::InvalidArg, "Parameter index must be greater than 0")
+            create_error(Status::InvalidArg, "parameter index must be greater than 0")
         })?;
         let value_type = value.get_type()?;
         let turso_value = match value_type {
@@ -412,12 +553,9 @@ impl Statement {
             }
             ValueType::BigInt => {
                 let bigint_str = value.coerce_to_string()?.into_utf8()?.as_str()?.to_owned();
-                let bigint_value = bigint_str.parse::<i64>().map_err(|e| {
-                    Error::new(
-                        Status::NumberExpected,
-                        format!("Failed to parse BigInt: {e}"),
-                    )
-                })?;
+                let bigint_value = bigint_str
+                    .parse::<i64>()
+                    .map_err(|e| to_error(Status::NumberExpected, "failed to parse BigInt", e))?;
                 turso_core::Value::Integer(bigint_value)
             }
             ValueType::String => {
@@ -450,7 +588,7 @@ impl Statement {
             }
         };
 
-        stmt.bind_at(non_zero_idx, turso_value);
+        self.stmt()?.borrow_mut().bind_at(non_zero_idx, turso_value);
         Ok(())
     }
 
@@ -458,29 +596,16 @@ impl Statement {
     /// 1 = Row available, 2 = Done, 3 = I/O needed
     #[napi]
     pub fn step_sync(&self) -> Result<u32> {
-        step_sync(&self.stmt)
-    }
-
-    /// Step the statement and return result code (executed on the background thread):
-    /// 1 = Row available, 2 = Done, 3 = I/O needed
-    #[napi(ts_return_type = "Promise<number>")]
-    pub fn step_async(&self) -> Result<AsyncTask<DbTask>> {
-        Ok(AsyncTask::new(DbTask::Step {
-            stmt: self.stmt.clone(),
-        }))
+        step_sync(self.stmt()?)
     }
 
     /// Get the current row data according to the presentation mode
     #[napi]
     pub fn row<'env>(&self, env: &'env Env) -> Result<Unknown<'env>> {
-        let stmt_ref = self.stmt.borrow();
-        let stmt = stmt_ref
-            .as_ref()
-            .ok_or_else(|| Error::new(Status::GenericFailure, "Statement has been finalized"))?;
-
+        let stmt = self.stmt()?.borrow();
         let row_data = stmt
             .row()
-            .ok_or_else(|| Error::new(Status::GenericFailure, "No row data available"))?;
+            .ok_or_else(|| create_generic_error("no row data available"))?;
 
         let mode = self.mode.borrow();
         let safe_integers = self.safe_integers.get();
@@ -499,9 +624,8 @@ impl Statement {
                         .get_values()
                         .enumerate()
                         .next()
-                        .ok_or(napi::Error::new(
-                            napi::Status::GenericFailure,
-                            "Pluck mode requires at least one column in the result",
+                        .ok_or(create_generic_error(
+                            "pluck mode requires at least one column in the result",
                         ))?;
                 to_js_value(env, value, safe_integers)?
             }
@@ -560,10 +684,7 @@ impl Statement {
     /// Get column information for the statement
     #[napi(ts_return_type = "Promise<any>")]
     pub fn columns<'env>(&self, env: &'env Env) -> Result<Array<'env>> {
-        let stmt_ref = self.stmt.borrow();
-        let stmt = stmt_ref
-            .as_ref()
-            .ok_or_else(|| Error::new(Status::GenericFailure, "Statement has been finalized"))?;
+        let stmt = self.stmt()?.borrow();
 
         let column_count = stmt.num_columns();
         let mut js_array = env.create_array(column_count as u32)?;
@@ -595,20 +716,15 @@ impl Statement {
 
     /// Finalizes the statement.
     #[napi]
-    pub fn finalize(&self) -> Result<()> {
-        match self.stmt.try_borrow_mut() {
-            Ok(mut stmt) => {
-                stmt.take();
-            }
-            Err(err) => tracing::error!("borrow error: {:?}", err),
-        }
+    pub fn finalize(&mut self) -> Result<()> {
+        let _ = self.stmt.take();
         Ok(())
     }
 }
 
 /// Async task for running the I/O loop.
 pub struct IoLoopTask {
-    // this field is set in the turso-sync-engine package
+    // this field is public because it is also set in the sync package
     pub io: Arc<dyn turso_core::IO>,
 }
 
@@ -617,9 +733,9 @@ impl Task for IoLoopTask {
     type JsValue = ();
 
     fn compute(&mut self) -> napi::Result<Self::Output> {
-        self.io.step().map_err(|e| {
-            napi::Error::new(napi::Status::GenericFailure, format!("IO error: {e}"))
-        })?;
+        self.io
+            .step()
+            .map_err(|e| to_generic_error("IO error", e))?;
         Ok(())
     }
 
@@ -659,81 +775,5 @@ fn to_js_value<'a>(
                 ToNapiValue::into_unknown(buffer, env)
             }
         }
-    }
-}
-
-struct DatabaseFile {
-    file: Arc<dyn turso_core::File>,
-}
-
-unsafe impl Send for DatabaseFile {}
-unsafe impl Sync for DatabaseFile {}
-
-impl DatabaseFile {
-    pub fn new(file: Arc<dyn turso_core::File>) -> Self {
-        Self { file }
-    }
-}
-
-impl turso_core::DatabaseStorage for DatabaseFile {
-    fn read_header(&self, c: turso_core::Completion) -> turso_core::Result<turso_core::Completion> {
-        self.file.pread(0, c)
-    }
-    fn read_page(
-        &self,
-        page_idx: usize,
-        _io_ctx: &turso_core::IOContext,
-        c: turso_core::Completion,
-    ) -> turso_core::Result<turso_core::Completion> {
-        let r = c.as_read();
-        let size = r.buf().len();
-        assert!(page_idx > 0);
-        if !(512..=65536).contains(&size) || size & (size - 1) != 0 {
-            return Err(turso_core::LimboError::NotADB);
-        }
-        let pos = (page_idx as u64 - 1) * size as u64;
-        self.file.pread(pos, c)
-    }
-
-    fn write_page(
-        &self,
-        page_idx: usize,
-        buffer: Arc<turso_core::Buffer>,
-        _io_ctx: &turso_core::IOContext,
-        c: turso_core::Completion,
-    ) -> turso_core::Result<turso_core::Completion> {
-        let size = buffer.len();
-        let pos = (page_idx as u64 - 1) * size as u64;
-        self.file.pwrite(pos, buffer, c)
-    }
-
-    fn write_pages(
-        &self,
-        first_page_idx: usize,
-        page_size: usize,
-        buffers: Vec<Arc<turso_core::Buffer>>,
-        _io_ctx: &turso_core::IOContext,
-        c: turso_core::Completion,
-    ) -> turso_core::Result<turso_core::Completion> {
-        let pos = first_page_idx.saturating_sub(1) as u64 * page_size as u64;
-        let c = self.file.pwritev(pos, buffers, c)?;
-        Ok(c)
-    }
-
-    fn sync(&self, c: turso_core::Completion) -> turso_core::Result<turso_core::Completion> {
-        self.file.sync(c)
-    }
-
-    fn size(&self) -> turso_core::Result<u64> {
-        self.file.size()
-    }
-
-    fn truncate(
-        &self,
-        len: usize,
-        c: turso_core::Completion,
-    ) -> turso_core::Result<turso_core::Completion> {
-        let c = self.file.truncate(len as u64, c)?;
-        Ok(c)
     }
 }

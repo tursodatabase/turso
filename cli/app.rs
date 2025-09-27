@@ -10,6 +10,7 @@ use crate::{
         get_io, get_writer, ApplyWriter, DbLocation, NoopProgress, OutputMode, ProgressSink,
         Settings, StderrProgress,
     },
+    manual,
     opcodes_dictionary::OPCODE_DESCRIPTIONS,
     HISTORY_FILE,
 };
@@ -255,6 +256,12 @@ impl Limbo {
         if !quiet {
             self.writeln_fmt(format_args!("Turso v{}", env!("CARGO_PKG_VERSION")))?;
             self.writeln("Enter \".help\" for usage hints.")?;
+
+            // Add random feature hint
+            if let Some(hint) = manual::get_random_feature_hint() {
+                self.writeln(&hint)?;
+            }
+
             self.writeln(
                 "This software is ALPHA, only use for development, testing, and experimentation.",
             )?;
@@ -323,14 +330,14 @@ impl Limbo {
 
         // Display all metrics
         let output = {
-            let metrics = self.conn.metrics.borrow();
+            let metrics = self.conn.metrics.read();
             format!("{metrics}")
         };
 
         self.writeln(output)?;
 
         if args.reset {
-            self.conn.metrics.borrow_mut().reset();
+            self.conn.metrics.write().reset();
             self.writeln("Statistics reset.")?;
         }
 
@@ -475,7 +482,7 @@ impl Limbo {
         // Display stats if enabled
         if self.opts.stats {
             let stats_output = {
-                let metrics = self.conn.metrics.borrow();
+                let metrics = self.conn.metrics.read();
                 metrics
                     .last_statement
                     .as_ref()
@@ -729,6 +736,12 @@ impl Limbo {
                 }
                 Command::Clone(args) => {
                     if let Err(e) = self.clone_database(&args.output_file) {
+                        let _ = self.writeln(e.to_string());
+                    }
+                }
+                Command::Manual(args) => {
+                    let w = self.writer.as_mut().unwrap();
+                    if let Err(e) = manual::display_manual(args.page.as_deref(), w) {
                         let _ = self.writeln(e.to_string());
                     }
                 }
@@ -1104,6 +1117,17 @@ impl Limbo {
         db_display_name: &str,
         table_name: &str,
     ) -> anyhow::Result<bool> {
+        // Yeah, sqlite also has this hardcoded: https://github.com/sqlite/sqlite/blob/31efe5a0f2f80a263457a1fc6524783c0c45769b/src/shell.c.in#L10765
+        match table_name {
+            "sqlite_master" | "sqlite_schema" | "sqlite_temp_master" | "sqlite_temp_schema" => {
+                let schema = format!(
+                                    "CREATE TABLE {table_name} (\n type text,\n name text,\n tbl_name text,\n rootpage integer,\n sql text\n);",
+                                );
+                let _ = self.writeln(&schema);
+                return Ok(true);
+            }
+            _ => {}
+        }
         let sql = format!(
             "SELECT sql, type, name FROM {db_prefix}.sqlite_schema WHERE type IN ('table', 'index', 'view') AND (tbl_name = '{table_name}' OR name = '{table_name}') AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '__turso_internal_%' ORDER BY CASE type WHEN 'table' THEN 1 WHEN 'view' THEN 2 WHEN 'index' THEN 3 END, rowid"
         );
@@ -1185,26 +1209,14 @@ impl Limbo {
                     };
 
                 // Query only the specific table in the specific database
-                let found = if target_db == "main" {
-                    self.query_one_table_schema("main", "main", table_name)?
+                if target_db == "main" {
+                    self.query_one_table_schema("main", "main", table_name)?;
                 } else {
                     // Check if the database is attached
                     let attached_databases = self.conn.list_attached_databases();
                     if attached_databases.contains(&target_db.to_string()) {
-                        self.query_one_table_schema(target_db, target_db, table_name)?
-                    } else {
-                        false
+                        self.query_one_table_schema(target_db, target_db, table_name)?;
                     }
-                };
-
-                if !found {
-                    let table_display = if target_db == "main" {
-                        table_name.to_string()
-                    } else {
-                        format!("{target_db}.{table_name}")
-                    };
-                    let _ = self
-                        .writeln_fmt(format_args!("-- Error: Table '{table_display}' not found."));
                 }
             }
             None => {

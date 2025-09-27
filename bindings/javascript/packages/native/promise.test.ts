@@ -1,6 +1,6 @@
 import { unlinkSync } from "node:fs";
 import { expect, test } from 'vitest'
-import { connect } from './promise.js'
+import { Database, connect } from './promise.js'
 import { sql } from 'drizzle-orm';
 import { drizzle } from 'drizzle-orm/better-sqlite3';
 
@@ -29,6 +29,78 @@ test('in-memory-db-async', async () => {
     const stmt = db.prepare("SELECT * FROM t WHERE x % 2 = ?");
     const rows = await stmt.all([1]);
     expect(rows).toEqual([{ x: 1 }, { x: 3 }]);
+})
+
+test('exec multiple statements', async () => {
+    const db = await connect(":memory:");
+    await db.exec("CREATE TABLE t(x); INSERT INTO t VALUES (1); INSERT INTO t VALUES (2)");
+    const stmt = db.prepare("SELECT * FROM t");
+    const rows = await stmt.all();
+    expect(rows).toEqual([{ x: 1 }, { x: 2 }]);
+})
+
+test('readonly-db', async () => {
+    const path = `test-${(Math.random() * 10000) | 0}.db`;
+    try {
+        {
+            const rw = await connect(path);
+            await rw.exec("CREATE TABLE t(x)");
+            await rw.exec("INSERT INTO t VALUES (1)");
+            rw.close();
+        }
+        {
+            const ro = await connect(path, { readonly: true });
+            await expect(async () => await ro.exec("INSERT INTO t VALUES (2)")).rejects.toThrowError(/Resource is read-only/g);
+            expect(await ro.prepare("SELECT * FROM t").all()).toEqual([{ x: 1 }])
+            ro.close();
+        }
+    } finally {
+        unlinkSync(path);
+        unlinkSync(`${path}-wal`);
+    }
+})
+
+test('file-must-exist', async () => {
+    const path = `test-${(Math.random() * 10000) | 0}.db`;
+    await expect(async () => await connect(path, { fileMustExist: true })).rejects.toThrowError(/failed to open file/);
+})
+
+test('explicit connect', async () => {
+    const db = new Database(':memory:');
+    expect(() => db.prepare("SELECT 1")).toThrowError(/database must be connected/g);
+    await db.connect();
+    expect(await db.prepare("SELECT 1 as x").all()).toEqual([{ x: 1 }]);
+})
+
+test('avg-bug', async () => {
+    const db = await connect(':memory:');
+    const create = db.prepare(`create table "aggregate_table" (
+        "id" integer primary key autoincrement not null,
+        "name" text not null,
+        "a" integer,
+        "b" integer,
+        "c" integer,
+        "null_only" integer
+    );`);
+
+    await create.run();
+    const insert = db.prepare(
+        `insert into "aggregate_table" ("id", "name", "a", "b", "c", "null_only") values (null, ?, ?, ?, ?, null), (null, ?, ?, ?, ?, null), (null, ?, ?, ?, ?, null), (null, ?, ?, ?, ?, null), (null, ?, ?, ?, ?, null), (null, ?, ?, ?, ?, null), (null, ?, ?, ?, ?, null);`,
+    );
+
+    await insert.run(
+        'value 1', 5, 10, 20,
+        'value 1', 5, 20, 30,
+        'value 2', 10, 50, 60,
+        'value 3', 20, 20, null,
+        'value 4', null, 90, 120,
+        'value 5', 80, 10, null,
+        'value 6', null, null, 150,
+    );
+
+    expect(await db.prepare(`select avg("a") from "aggregate_table";`).get()).toEqual({ 'avg (aggregate_table.a)': 24 });
+    expect(await db.prepare(`select avg("null_only") from "aggregate_table";`).get()).toEqual({ 'avg (aggregate_table.null_only)': null });
+    expect(await db.prepare(`select avg(distinct "b") from "aggregate_table";`).get()).toEqual({ 'avg (DISTINCT aggregate_table.b)': 42.5 });
 })
 
 test('on-disk db', async () => {

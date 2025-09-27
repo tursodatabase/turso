@@ -45,3 +45,22 @@ do_execsql_test select-offset-subquery {
 5|Edward|15
 4|Jennifer|33
 3|Tommy|18}
+
+do_execsql_test_on_specific_db {:memory:} select-limit-comma-offset-equivalence {
+    CREATE TABLE nums (x INTEGER);
+    INSERT INTO nums VALUES (1),(2),(3),(4),(5),(6),(7),(8),(9),(10);
+    SELECT x FROM nums ORDER BY x LIMIT 3 OFFSET 2;
+    SELECT x FROM nums ORDER BY x LIMIT 2,3;
+} {3
+4
+5
+3
+4
+5}
+
+# https://github.com/tursodatabase/turso/issues/3300
+do_execsql_test_on_specific_db {:memory:} select-ungrouped-aggregate-with-offset-limit {
+    CREATE TABLE t(a INTEGER);
+    INSERT INTO t VALUES (1),(2),(3),(4),(5),(6),(7),(8),(9),(10);
+    SELECT COUNT(a) FROM t LIMIT 1 OFFSET 1;
+} {}

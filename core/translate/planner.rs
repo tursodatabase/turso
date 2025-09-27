@@ -9,21 +9,25 @@ use super::{
         ResultSetColumn, Scan, TableReferences, WhereTerm,
     },
     select::prepare_select_plan,
-    SymbolTable,
 };
-use crate::translate::expr::WalkControl;
-use crate::translate::plan::{Window, WindowFunction};
+use crate::translate::{
+    emitter::Resolver,
+    expr::{BindingBehavior, WalkControl},
+};
 use crate::{
     ast::Limit,
     function::Func,
-    schema::{Schema, Table},
+    schema::Table,
     util::{exprs_are_equivalent, normalize_ident},
-    vdbe::builder::TableRefIdCounter,
     Result,
 };
 use crate::{
     function::{AggFunc, ExtFunc},
     translate::expr::{bind_and_rewrite_expr, ParamState},
+};
+use crate::{
+    translate::plan::{Window, WindowFunction},
+    vdbe::builder::ProgramBuilder,
 };
 use turso_parser::ast::Literal::Null;
 use turso_parser::ast::{
@@ -51,9 +55,8 @@ pub const ROWID_STRS: [&str; 3] = ["rowid", "_rowid_", "oid"];
 /// - `Err(..)` if an invalid function usage is detected (e.g., window
 ///   function encountered while `windows` is `None`).
 pub fn resolve_window_and_aggregate_functions(
-    schema: &Schema,
-    syms: &SymbolTable,
     top_level_expr: &Expr,
+    resolver: &Resolver,
     aggs: &mut Vec<Aggregate>,
     mut windows: Option<&mut Vec<Window>>,
 ) -> Result<bool> {
@@ -80,7 +83,7 @@ pub fn resolve_window_and_aggregate_functions(
                 let args_count = args.len();
                 let distinctness = Distinctness::from_ast(distinctness.as_ref());
 
-                if !schema.indexes_enabled() && distinctness.is_distinct() {
+                if !resolver.schema.indexes_enabled() && distinctness.is_distinct() {
                     crate::bail_parse_error!(
                         "SELECT with DISTINCT is not allowed without indexes enabled"
                     );
@@ -102,7 +105,10 @@ pub fn resolve_window_and_aggregate_functions(
                         return Ok(WalkControl::SkipChildren);
                     }
                     Err(e) => {
-                        if let Some(f) = syms.resolve_function(name.as_str(), args_count) {
+                        if let Some(f) = resolver
+                            .symbol_table
+                            .resolve_function(name.as_str(), args_count)
+                        {
                             let func = AggFunc::External(f.func.clone().into());
                             if let ExtFunc::Aggregate { .. } = f.as_ref().func {
                                 if let Some(over_clause) = filter_over.over_clause.as_ref() {
@@ -263,24 +269,21 @@ fn add_aggregate_if_not_exists(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn parse_from_clause_table(
-    schema: &Schema,
     table: ast::SelectTable,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
     table_references: &mut TableReferences,
     vtab_predicates: &mut Vec<Expr>,
     ctes: &mut Vec<JoinedTable>,
-    syms: &SymbolTable,
-    table_ref_counter: &mut TableRefIdCounter,
     connection: &Arc<crate::Connection>,
 ) -> Result<()> {
     match table {
         ast::SelectTable::Table(qualified_name, maybe_alias, _) => parse_table(
-            schema,
-            syms,
             table_references,
+            resolver,
+            program,
             ctes,
-            table_ref_counter,
             vtab_predicates,
             &qualified_name,
             maybe_alias.as_ref(),
@@ -289,11 +292,10 @@ fn parse_from_clause_table(
         ),
         ast::SelectTable::Select(subselect, maybe_alias) => {
             let Plan::Select(subplan) = prepare_select_plan(
-                schema,
                 subselect,
-                syms,
+                resolver,
+                program,
                 table_references.outer_query_refs(),
-                table_ref_counter,
                 QueryDestination::placeholder_for_subquery(),
                 connection,
             )?
@@ -312,16 +314,15 @@ fn parse_from_clause_table(
                 identifier,
                 subplan,
                 None,
-                table_ref_counter.next(),
+                program.table_reference_counter.next(),
             ));
             Ok(())
         }
         ast::SelectTable::TableCall(qualified_name, args, maybe_alias) => parse_table(
-            schema,
-            syms,
             table_references,
+            resolver,
+            program,
             ctes,
-            table_ref_counter,
             vtab_predicates,
             &qualified_name,
             maybe_alias.as_ref(),
@@ -334,11 +335,10 @@ fn parse_from_clause_table(
 
 #[allow(clippy::too_many_arguments)]
 fn parse_table(
-    schema: &Schema,
-    syms: &SymbolTable,
     table_references: &mut TableReferences,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
     ctes: &mut Vec<JoinedTable>,
-    table_ref_counter: &mut TableRefIdCounter,
     vtab_predicates: &mut Vec<Expr>,
     qualified_name: &QualifiedName,
     maybe_alias: Option<&As>,
@@ -380,7 +380,7 @@ fn parse_table(
                 ast::As::Elided(id) => id,
             })
             .map(|a| normalize_ident(a.as_str()));
-        let internal_id = table_ref_counter.next();
+        let internal_id = program.table_reference_counter.next();
         let tbl_ref = if let Table::Virtual(tbl) = table.as_ref() {
             transform_args_into_where_terms(args, internal_id, vtab_predicates, table.as_ref())?;
             Table::Virtual(tbl.clone())
@@ -418,13 +418,12 @@ fn parse_table(
 
         // Recursively call parse_from_clause_table with the view as a SELECT
         return parse_from_clause_table(
-            schema,
             ast::SelectTable::Select(*subselect.clone(), view_alias),
+            resolver,
+            program,
             table_references,
             vtab_predicates,
             ctes,
-            syms,
-            table_ref_counter,
             connection,
         );
     }
@@ -433,6 +432,20 @@ fn parse_table(
         schema.get_materialized_view(table_name.as_str())
     });
     if let Some(view) = view {
+        // First check if the DBSP state table exists with the correct version
+        let has_compatible_state = connection.with_schema(database_id, |schema| {
+            schema.has_compatible_dbsp_state_table(table_name.as_str())
+        });
+
+        if !has_compatible_state {
+            use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
+            return Err(crate::LimboError::InternalError(format!(
+                "Materialized view '{table_name}' has an incompatible version. \n\
+                 The current version is {DBSP_CIRCUIT_VERSION}, but the view was created with a different version. \n\
+                 Please DROP and recreate the view to use it."
+            )));
+        }
+
         // Check if this materialized view has persistent storage
         let view_guard = view.lock().unwrap();
         let root_page = view_guard.get_root_page();
@@ -453,6 +466,8 @@ fn parse_table(
             primary_key_columns: Vec::new(),
             has_rowid: true,
             is_strict: false,
+            has_autoincrement: false,
+
             unique_sets: vec![],
         });
         drop(view_guard);
@@ -471,7 +486,7 @@ fn parse_table(
             }),
             table: Table::BTree(btree_table),
             identifier: alias.unwrap_or(normalized_qualified_name),
-            internal_id: table_ref_counter.next(),
+            internal_id: program.table_reference_counter.next(),
             join_info: None,
             col_used_mask: ColumnUsedMask::default(),
             database_id,
@@ -494,13 +509,31 @@ fn parse_table(
                 op: Operation::default_scan_for(&outer_ref.table),
                 table: outer_ref.table.clone(),
                 identifier: outer_ref.identifier.clone(),
-                internal_id: table_ref_counter.next(),
+                internal_id: program.table_reference_counter.next(),
                 join_info: None,
                 col_used_mask: ColumnUsedMask::default(),
                 database_id,
             });
             return Ok(());
         }
+    }
+
+    // Check if this is an incompatible view
+    let is_incompatible = connection.with_schema(database_id, |schema| {
+        schema
+            .incompatible_views
+            .contains(&normalized_qualified_name)
+    });
+
+    if is_incompatible {
+        use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
+        crate::bail_parse_error!(
+            "Materialized view '{}' has an incompatible version. \n\
+             The view was created with a different DBSP version than the current version ({}). \n\
+             Please DROP and recreate the view to use it.",
+            normalized_qualified_name,
+            DBSP_CIRCUIT_VERSION
+        );
     }
 
     crate::bail_parse_error!("no such table: {}", normalized_qualified_name);
@@ -553,16 +586,14 @@ fn transform_args_into_where_terms(
 
 #[allow(clippy::too_many_arguments)]
 pub fn parse_from(
-    schema: &Schema,
     mut from: Option<FromClause>,
-    syms: &SymbolTable,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
     with: Option<With>,
     out_where_clause: &mut Vec<WhereTerm>,
     vtab_predicates: &mut Vec<Expr>,
     table_references: &mut TableReferences,
-    table_ref_counter: &mut TableRefIdCounter,
     connection: &Arc<crate::Connection>,
-    param_ctx: &mut ParamState,
 ) -> Result<()> {
     if from.is_none() {
         return Ok(());
@@ -586,7 +617,7 @@ pub fn parse_from(
             // TODO: sqlite actually allows overriding a catalog table with a CTE.
             // We should carry over the 'Scope' struct to all of our identifier resolution.
             let cte_name_normalized = normalize_ident(cte.tbl_name.as_str());
-            if schema.get_table(&cte_name_normalized).is_some() {
+            if resolver.schema.get_table(&cte_name_normalized).is_some() {
                 crate::bail_parse_error!(
                     "CTE name {} conflicts with catalog table name",
                     cte.tbl_name.as_str()
@@ -616,11 +647,10 @@ pub fn parse_from(
 
             // CTE can refer to other CTEs that came before it, plus any schema tables or tables in the outer scope.
             let cte_plan = prepare_select_plan(
-                schema,
                 cte.select,
-                syms,
+                resolver,
+                program,
                 &outer_query_refs_for_cte,
-                table_ref_counter,
                 QueryDestination::placeholder_for_subquery(),
                 connection,
             )?;
@@ -631,7 +661,7 @@ pub fn parse_from(
                 cte_name_normalized,
                 cte_plan,
                 None,
-                table_ref_counter.next(),
+                program.table_reference_counter.next(),
             ));
         }
     }
@@ -640,28 +670,25 @@ pub fn parse_from(
     let select_owned = from_owned.select;
     let joins_owned = from_owned.joins;
     parse_from_clause_table(
-        schema,
         *select_owned,
+        resolver,
+        program,
         table_references,
         vtab_predicates,
         &mut ctes_as_subqueries,
-        syms,
-        table_ref_counter,
         connection,
     )?;
 
     for join in joins_owned.into_iter() {
         parse_join(
-            schema,
             join,
-            syms,
+            resolver,
+            program,
             &mut ctes_as_subqueries,
             out_where_clause,
             vtab_predicates,
             table_references,
-            table_ref_counter,
             connection,
-            param_ctx,
         )?;
     }
 
@@ -686,6 +713,7 @@ pub fn parse_where(
                 result_columns,
                 connection,
                 param_ctx,
+                BindingBehavior::TryCanonicalColumnsFirst,
             )?;
         }
         Ok(())
@@ -870,16 +898,14 @@ pub fn determine_where_to_eval_expr(
 
 #[allow(clippy::too_many_arguments)]
 fn parse_join(
-    schema: &Schema,
     join: ast::JoinedSelectTable,
-    syms: &SymbolTable,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
     ctes: &mut Vec<JoinedTable>,
     out_where_clause: &mut Vec<WhereTerm>,
     vtab_predicates: &mut Vec<Expr>,
     table_references: &mut TableReferences,
-    table_ref_counter: &mut TableRefIdCounter,
     connection: &Arc<crate::Connection>,
-    param_ctx: &mut ParamState,
 ) -> Result<()> {
     let ast::JoinedSelectTable {
         operator: join_operator,
@@ -888,13 +914,12 @@ fn parse_join(
     } = join;
 
     parse_from_clause_table(
-        schema,
         table.as_ref().clone(),
+        resolver,
+        program,
         table_references,
         vtab_predicates,
         ctes,
-        syms,
-        table_ref_counter,
         connection,
     )?;
 
@@ -972,7 +997,8 @@ fn parse_join(
                         Some(table_references),
                         None,
                         connection,
-                        param_ctx,
+                        &mut program.param_ctx,
+                        BindingBehavior::TryResultColumnsFirst,
                     )?;
                 }
             }
@@ -1117,9 +1143,23 @@ pub fn parse_limit(
     connection: &std::sync::Arc<crate::Connection>,
     param_ctx: &mut ParamState,
 ) -> Result<(Option<Box<Expr>>, Option<Box<Expr>>)> {
-    bind_and_rewrite_expr(&mut limit.expr, None, None, connection, param_ctx)?;
+    bind_and_rewrite_expr(
+        &mut limit.expr,
+        None,
+        None,
+        connection,
+        param_ctx,
+        BindingBehavior::TryResultColumnsFirst,
+    )?;
     if let Some(ref mut off_expr) = limit.offset {
-        bind_and_rewrite_expr(off_expr, None, None, connection, param_ctx)?;
+        bind_and_rewrite_expr(
+            off_expr,
+            None,
+            None,
+            connection,
+            param_ctx,
+            BindingBehavior::TryResultColumnsFirst,
+        )?;
     }
     Ok((Some(limit.expr.clone()), limit.offset.clone()))
 }

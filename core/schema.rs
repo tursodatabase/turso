@@ -1,6 +1,8 @@
 use crate::function::Func;
 use crate::incremental::view::IncrementalView;
-use crate::translate::expr::{bind_and_rewrite_expr, walk_expr, ParamState, WalkControl};
+use crate::translate::expr::{
+    bind_and_rewrite_expr, walk_expr, BindingBehavior, ParamState, WalkControl,
+};
 use crate::translate::planner::ROWID_STRS;
 use parking_lot::RwLock;
 
@@ -41,7 +43,13 @@ use turso_parser::{
 
 const SCHEMA_TABLE_NAME: &str = "sqlite_schema";
 const SCHEMA_TABLE_NAME_ALT: &str = "sqlite_master";
-pub const DBSP_TABLE_PREFIX: &str = "__turso_internal_dbsp_state_";
+pub const DBSP_TABLE_PREFIX: &str = "__turso_internal_dbsp_state_v";
+
+/// Used to refer to the implicit rowid column in tables without an alias during UPDATE
+pub const ROWID_SENTINEL: usize = usize::MAX;
+
+/// Internal table prefixes that should be protected from CREATE/DROP
+pub const RESERVED_TABLE_PREFIXES: [&str; 2] = ["sqlite_", "__turso_internal_"];
 
 /// Check if a table name refers to a system table that should be protected from direct writes
 pub fn is_system_table(table_name: &str) -> bool {
@@ -72,6 +80,9 @@ pub struct Schema {
 
     /// Mapping from table names to the materialized views that depend on them
     pub table_to_materialized_views: HashMap<String, Vec<String>>,
+
+    /// Track views that exist but have incompatible versions
+    pub incompatible_views: HashSet<String>,
 }
 
 impl Schema {
@@ -95,6 +106,7 @@ impl Schema {
         let incremental_views = HashMap::new();
         let views: ViewsMap = HashMap::new();
         let table_to_materialized_views: HashMap<String, Vec<String>> = HashMap::new();
+        let incompatible_views = HashSet::new();
         Self {
             tables,
             materialized_view_names,
@@ -106,6 +118,7 @@ impl Schema {
             indexes_enabled,
             schema_version: 0,
             table_to_materialized_views,
+            incompatible_views,
         }
     }
 
@@ -135,9 +148,37 @@ impl Schema {
         self.incremental_views.get(&name).cloned()
     }
 
+    /// Check if DBSP state table exists with the current version
+    pub fn has_compatible_dbsp_state_table(&self, view_name: &str) -> bool {
+        use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
+        let view_name = normalize_ident(view_name);
+        let expected_table_name = format!("{DBSP_TABLE_PREFIX}{DBSP_CIRCUIT_VERSION}_{view_name}");
+
+        // Check if a table with the expected versioned name exists
+        self.tables.contains_key(&expected_table_name)
+    }
+
     pub fn is_materialized_view(&self, name: &str) -> bool {
         let name = normalize_ident(name);
         self.materialized_view_names.contains(&name)
+    }
+
+    /// Check if a table has any incompatible dependent materialized views
+    pub fn has_incompatible_dependent_views(&self, table_name: &str) -> Vec<String> {
+        let table_name = normalize_ident(table_name);
+
+        // Get all materialized views that depend on this table
+        let dependent_views = self
+            .table_to_materialized_views
+            .get(&table_name)
+            .cloned()
+            .unwrap_or_default();
+
+        // Filter to only incompatible views
+        dependent_views
+            .into_iter()
+            .filter(|view_name| self.incompatible_views.contains(view_name))
+            .collect()
     }
 
     pub fn remove_view(&mut self, name: &str) -> Result<()> {
@@ -514,12 +555,21 @@ impl Schema {
         dbsp_state_index_roots: std::collections::HashMap<String, usize>,
     ) -> Result<()> {
         for (view_name, (sql, main_root)) in materialized_view_info {
-            // Look up the DBSP state root for this view - must exist for materialized views
-            let dbsp_state_root = dbsp_state_roots.get(&view_name).ok_or_else(|| {
-                LimboError::InternalError(format!(
-                    "Materialized view {view_name} is missing its DBSP state table"
-                ))
-            })?;
+            // Look up the DBSP state root for this view
+            // If missing, it means version mismatch - skip this view
+            // Check if we have a compatible DBSP state root
+            let dbsp_state_root = if let Some(&root) = dbsp_state_roots.get(&view_name) {
+                root
+            } else {
+                tracing::warn!(
+                    "Materialized view '{}' has incompatible version or missing DBSP state table",
+                    view_name
+                );
+                // Track this as an incompatible view
+                self.incompatible_views.insert(view_name.clone());
+                // Use a dummy root page - the view won't be usable anyway
+                0
+            };
 
             // Look up the DBSP state index root (may not exist for older schemas)
             let dbsp_state_index_root =
@@ -529,7 +579,7 @@ impl Schema {
                 &sql,
                 self,
                 main_root,
-                *dbsp_state_root,
+                dbsp_state_root,
                 dbsp_state_index_root,
             )?;
             let referenced_tables = incremental_view.get_referenced_table_names();
@@ -542,12 +592,17 @@ impl Schema {
                 primary_key_columns: Vec::new(),
                 has_rowid: true,
                 is_strict: false,
+                has_autoincrement: false,
+
                 unique_sets: vec![],
             })));
 
-            self.add_materialized_view(incremental_view, table, sql);
+            // Only add to schema if compatible
+            if !self.incompatible_views.contains(&view_name) {
+                self.add_materialized_view(incremental_view, table, sql);
+            }
 
-            // Register dependencies
+            // Register dependencies regardless of compatibility
             for table_name in referenced_tables {
                 self.add_materialized_view_dependency(&table_name, &view_name);
             }
@@ -599,13 +654,33 @@ impl Schema {
 
                     // Check if this is a DBSP state table
                     if table.name.starts_with(DBSP_TABLE_PREFIX) {
-                        // Extract the view name from __turso_internal_dbsp_state_<viewname>
-                        let view_name = table
-                            .name
-                            .strip_prefix(DBSP_TABLE_PREFIX)
-                            .unwrap()
-                            .to_string();
-                        dbsp_state_roots.insert(view_name, root_page as usize);
+                        // Extract version and view name from __turso_internal_dbsp_state_v<version>_<viewname>
+                        let suffix = table.name.strip_prefix(DBSP_TABLE_PREFIX).unwrap();
+
+                        // Parse version and view name (format: "<version>_<viewname>")
+                        if let Some(underscore_pos) = suffix.find('_') {
+                            let version_str = &suffix[..underscore_pos];
+                            let view_name = &suffix[underscore_pos + 1..];
+
+                            // Check version compatibility
+                            if let Ok(stored_version) = version_str.parse::<u32>() {
+                                use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
+                                if stored_version == DBSP_CIRCUIT_VERSION {
+                                    // Version matches, store the root page
+                                    dbsp_state_roots
+                                        .insert(view_name.to_string(), root_page as usize);
+                                } else {
+                                    // Version mismatch - DO NOT insert into dbsp_state_roots
+                                    // This will cause populate_materialized_views to skip this view
+                                    tracing::warn!(
+                                        "Skipping materialized view '{}' - has version {} but current version is {}. DROP and recreate the view to use it.",
+                                        view_name, stored_version, DBSP_CIRCUIT_VERSION
+                                    );
+                                    // We can't track incompatible views here since we're in handle_schema_row
+                                    // which doesn't have mutable access to self
+                                }
+                            }
+                        }
                     }
 
                     if let Some(mv_store) = mv_store {
@@ -633,12 +708,23 @@ impl Schema {
 
                         // Check if this is an index for a DBSP state table
                         if table_name.starts_with(DBSP_TABLE_PREFIX) {
-                            // Extract the view name from __turso_internal_dbsp_state_<viewname>
-                            let view_name = table_name
-                                .strip_prefix(DBSP_TABLE_PREFIX)
-                                .unwrap()
-                                .to_string();
-                            dbsp_state_index_roots.insert(view_name, root_page as usize);
+                            // Extract version and view name from __turso_internal_dbsp_state_v<version>_<viewname>
+                            let suffix = table_name.strip_prefix(DBSP_TABLE_PREFIX).unwrap();
+
+                            // Parse version and view name (format: "<version>_<viewname>")
+                            if let Some(underscore_pos) = suffix.find('_') {
+                                let version_str = &suffix[..underscore_pos];
+                                let view_name = &suffix[underscore_pos + 1..];
+
+                                // Only store index root if version matches
+                                if let Ok(stored_version) = version_str.parse::<u32>() {
+                                    use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
+                                    if stored_version == DBSP_CIRCUIT_VERSION {
+                                        dbsp_state_index_roots
+                                            .insert(view_name.to_string(), root_page as usize);
+                                    }
+                                }
+                            }
                         } else {
                             match automatic_indices.entry(table_name) {
                                 std::collections::hash_map::Entry::Vacant(e) => {
@@ -765,6 +851,7 @@ impl Clone for Schema {
             .map(|(name, view)| (name.clone(), view.clone()))
             .collect();
         let views = self.views.clone();
+        let incompatible_views = self.incompatible_views.clone();
         Self {
             tables,
             materialized_view_names,
@@ -776,6 +863,7 @@ impl Clone for Schema {
             indexes_enabled: self.indexes_enabled,
             schema_version: self.schema_version,
             table_to_materialized_views: self.table_to_materialized_views.clone(),
+            incompatible_views,
         }
     }
 }
@@ -880,6 +968,7 @@ pub struct BTreeTable {
     pub columns: Vec<Column>,
     pub has_rowid: bool,
     pub is_strict: bool,
+    pub has_autoincrement: bool,
     pub unique_sets: Vec<UniqueSet>,
 }
 
@@ -1014,6 +1103,7 @@ pub fn create_table(
     let table_name = normalize_ident(tbl_name);
     trace!("Creating table {}", table_name);
     let mut has_rowid = true;
+    let mut has_autoincrement = false;
     let mut primary_key_columns = vec![];
     let mut cols = vec![];
     let is_strict: bool;
@@ -1026,7 +1116,22 @@ pub fn create_table(
         } => {
             is_strict = options.contains(TableOptions::STRICT);
             for c in constraints {
-                if let ast::TableConstraint::PrimaryKey { columns, .. } = &c.constraint {
+                if let ast::TableConstraint::PrimaryKey {
+                    columns,
+                    auto_increment,
+                    ..
+                } = &c.constraint
+                {
+                    if !primary_key_columns.is_empty() {
+                        crate::bail_parse_error!(
+                            "table \"{}\" has more than one primary key",
+                            tbl_name
+                        );
+                    }
+                    if *auto_increment {
+                        has_autoincrement = true;
+                    }
+
                     for column in columns {
                         let col_name = match column.expr.as_ref() {
                             Expr::Id(id) => normalize_ident(id.as_str()),
@@ -1106,8 +1211,21 @@ pub fn create_table(
                 let mut collation = None;
                 for c_def in constraints {
                     match c_def.constraint {
-                        ast::ColumnConstraint::PrimaryKey { order: o, .. } => {
+                        ast::ColumnConstraint::PrimaryKey {
+                            order: o,
+                            auto_increment,
+                            ..
+                        } => {
+                            if !primary_key_columns.is_empty() {
+                                crate::bail_parse_error!(
+                                    "table \"{}\" has more than one primary key",
+                                    tbl_name
+                                );
+                            }
                             primary_key = true;
+                            if auto_increment {
+                                has_autoincrement = true;
+                            }
                             if let Some(o) = o {
                                 order = o;
                             }
@@ -1175,6 +1293,21 @@ pub fn create_table(
         }
     }
 
+    if has_autoincrement {
+        // only allow integers
+        if primary_key_columns.len() != 1 {
+            crate::bail_parse_error!("AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY");
+        }
+        let pk_col_name = &primary_key_columns[0].0;
+        let pk_col = cols.iter().find(|c| c.name.as_deref() == Some(pk_col_name));
+
+        if let Some(col) = pk_col {
+            if col.ty != Type::Integer {
+                crate::bail_parse_error!("AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY");
+            }
+        }
+    }
+
     for col in cols.iter() {
         if col.is_rowid_alias {
             // Unique sets are used for creating automatic indexes. An index is not created for a rowid alias PRIMARY KEY.
@@ -1195,6 +1328,7 @@ pub fn create_table(
         name: table_name,
         has_rowid,
         primary_key_columns,
+        has_autoincrement,
         columns: cols,
         is_strict,
         unique_sets: {
@@ -1340,7 +1474,8 @@ impl From<&ColumnDefinition> for Column {
 ///
 /// Note that the order of the rules for determining column affinity is important. A column whose declared type is "CHARINT" will match both rules 1 and 2 but the first rule takes precedence and so the column affinity will be INTEGER.
 pub fn affinity(datatype: &str) -> Affinity {
-    // Note: callers of this function must ensure that the datatype is uppercase.
+    let datatype = datatype.to_ascii_uppercase();
+
     // Rule 1: INT -> INTEGER affinity
     if datatype.contains("INT") {
         return Affinity::Integer;
@@ -1522,6 +1657,7 @@ pub fn sqlite_schema_table() -> BTreeTable {
         name: "sqlite_schema".to_string(),
         has_rowid: true,
         is_strict: false,
+        has_autoincrement: false,
         primary_key_columns: vec![],
         columns: vec![
             Column {
@@ -1852,7 +1988,15 @@ impl Index {
         };
         let mut params = ParamState::disallow();
         let mut expr = where_clause.clone();
-        bind_and_rewrite_expr(&mut expr, table_refs, None, connection, &mut params).ok()?;
+        bind_and_rewrite_expr(
+            &mut expr,
+            table_refs,
+            None,
+            connection,
+            &mut params,
+            BindingBehavior::ResultColumnsNotAllowed,
+        )
+        .ok()?;
         Some(*expr)
     }
 }
@@ -1940,13 +2084,12 @@ mod tests {
     }
 
     #[test]
-    pub fn test_column_is_rowid_alias_inline_composite_primary_key() -> Result<()> {
+    pub fn test_multiple_pk_forbidden() -> Result<()> {
         let sql = r#"CREATE TABLE t1 (a INTEGER PRIMARY KEY, b TEXT PRIMARY KEY);"#;
-        let table = BTreeTable::from_sql(sql, 0)?;
-        let column = table.get_column("a").unwrap().1;
+        let table = BTreeTable::from_sql(sql, 0);
+        let error = table.unwrap_err();
         assert!(
-            !table.column_is_rowid_alias(column),
-            "column 'a´ shouldn't be a rowid alias because table has composite primary key"
+            matches!(error, LimboError::ParseError(e) if e.contains("table \"t1\" has more than one primary key"))
         );
         Ok(())
     }
@@ -1982,22 +2125,12 @@ mod tests {
     }
 
     #[test]
-    pub fn test_primary_key_inline_multiple() -> Result<()> {
+    pub fn test_primary_key_inline_multiple_forbidden() -> Result<()> {
         let sql = r#"CREATE TABLE t1 (a INTEGER PRIMARY KEY, b TEXT PRIMARY KEY, c REAL);"#;
-        let table = BTreeTable::from_sql(sql, 0)?;
-        let column = table.get_column("a").unwrap().1;
-        assert!(column.primary_key, "column 'a' should be a primary key");
-        let column = table.get_column("b").unwrap().1;
-        assert!(column.primary_key, "column 'b' shouldn be a primary key");
-        let column = table.get_column("c").unwrap().1;
-        assert!(!column.primary_key, "column 'c' shouldn't be a primary key");
-        assert_eq!(
-            vec![
-                ("a".to_string(), SortOrder::Asc),
-                ("b".to_string(), SortOrder::Asc)
-            ],
-            table.primary_key_columns,
-            "primary key column names should be ['a', 'b']"
+        let table = BTreeTable::from_sql(sql, 0);
+        let error = table.unwrap_err();
+        assert!(
+            matches!(error, LimboError::ParseError(e) if e.contains("table \"t1\" has more than one primary key"))
         );
         Ok(())
     }
@@ -2186,6 +2319,7 @@ mod tests {
             name: "t1".to_string(),
             has_rowid: true,
             is_strict: false,
+            has_autoincrement: false,
             primary_key_columns: vec![("nonexistent".to_string(), SortOrder::Asc)],
             columns: vec![Column {
                 name: Some("a".to_string()),

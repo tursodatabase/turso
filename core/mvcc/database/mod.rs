@@ -8,6 +8,7 @@ use crate::storage::btree::BTreeKey;
 use crate::storage::btree::CursorValidState;
 use crate::storage::sqlite3_ondisk::DatabaseHeader;
 use crate::storage::wal::TursoRwLock;
+use crate::turso_assert;
 use crate::types::IOCompletions;
 use crate::types::IOResult;
 use crate::types::ImmutableRecord;
@@ -19,8 +20,6 @@ use crate::Result;
 use crate::{Connection, Pager};
 use crossbeam_skiplist::{SkipMap, SkipSet};
 use parking_lot::RwLock;
-use std::cell::RefCell;
-use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::Debug;
 use std::marker::PhantomData;
@@ -29,6 +28,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tracing::instrument;
 use tracing::Level;
+
+pub mod checkpoint_state_machine;
+pub use checkpoint_state_machine::{CheckpointState, CheckpointStateMachine};
 
 #[cfg(test)]
 pub mod tests;
@@ -118,7 +120,7 @@ pub struct Transaction {
     /// The transaction read set.
     read_set: SkipSet<RowID>,
     /// The transaction header.
-    header: RefCell<DatabaseHeader>,
+    header: RwLock<DatabaseHeader>,
 }
 
 impl Transaction {
@@ -129,7 +131,7 @@ impl Transaction {
             begin_ts,
             write_set: SkipSet::new(),
             read_set: SkipSet::new(),
-            header: RefCell::new(header),
+            header: RwLock::new(header),
         }
     }
 
@@ -263,41 +265,11 @@ impl AtomicTransactionState {
 #[derive(Debug)]
 pub enum CommitState {
     Initial,
-    BeginPagerTxn {
-        end_ts: u64,
-    },
-    WriteRow {
-        end_ts: u64,
-        write_set_index: usize,
-        requires_seek: bool,
-    },
-    WriteRowStateMachine {
-        end_ts: u64,
-        write_set_index: usize,
-    },
-    DeleteRowStateMachine {
-        end_ts: u64,
-        write_set_index: usize,
-    },
-    CommitPagerTxn {
-        end_ts: u64,
-    },
-    Commit {
-        end_ts: u64,
-    },
-    BeginCommitLogicalLog {
-        end_ts: u64,
-        log_record: LogRecord,
-    },
-    EndCommitLogicalLog {
-        end_ts: u64,
-    },
-    SyncLogicalLog {
-        end_ts: u64,
-    },
-    CommitEnd {
-        end_ts: u64,
-    },
+    Commit { end_ts: u64 },
+    BeginCommitLogicalLog { end_ts: u64, log_record: LogRecord },
+    EndCommitLogicalLog { end_ts: u64 },
+    SyncLogicalLog { end_ts: u64 },
+    CommitEnd { end_ts: u64 },
 }
 
 #[derive(Debug)]
@@ -312,21 +284,17 @@ pub enum WriteRowState {
 #[derive(Debug)]
 struct CommitCoordinator {
     pager_commit_lock: Arc<TursoRwLock>,
-    commits_waiting: Arc<AtomicU64>,
 }
 
 pub struct CommitStateMachine<Clock: LogicalClock> {
     state: CommitState,
     is_finalized: bool,
-    pager: Arc<Pager>,
+    did_commit_schema_change: bool,
     tx_id: TxID,
     connection: Arc<Connection>,
     /// Write set sorted by table id and row id
     write_set: Vec<RowID>,
-    write_row_state_machine: Option<StateMachine<WriteRowStateMachine>>,
-    delete_row_state_machine: Option<StateMachine<DeleteRowStateMachine>>,
     commit_coordinator: Arc<CommitCoordinator>,
-    cursors: HashMap<u64, Arc<RwLock<BTreeCursor>>>,
     header: Arc<RwLock<Option<DatabaseHeader>>>,
     _phantom: PhantomData<Clock>,
 }
@@ -366,7 +334,6 @@ pub struct DeleteRowStateMachine {
 impl<Clock: LogicalClock> CommitStateMachine<Clock> {
     fn new(
         state: CommitState,
-        pager: Arc<Pager>,
         tx_id: TxID,
         connection: Arc<Connection>,
         commit_coordinator: Arc<CommitCoordinator>,
@@ -375,45 +342,14 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
         Self {
             state,
             is_finalized: false,
-            pager,
+            did_commit_schema_change: false,
             tx_id,
             connection,
             write_set: Vec::new(),
-            write_row_state_machine: None,
-            delete_row_state_machine: None,
             commit_coordinator,
-            cursors: HashMap::new(),
             header,
             _phantom: PhantomData,
         }
-    }
-
-    /// We need to update pager's header to account for changes made by other transactions.
-    fn update_pager_header(&self, mvcc_store: &MvStore<Clock>) -> Result<()> {
-        let header = self.header.read();
-        let last_commited_header = header.as_ref().expect("Header not found");
-        self.pager.io.block(|| self.pager.maybe_allocate_page1())?;
-        let _ = self.pager.io.block(|| {
-            self.pager.with_header_mut(|header_in_pager| {
-                let header_in_transaction = mvcc_store.get_transaction_database_header(&self.tx_id);
-                tracing::debug!("update header here {}", header_in_transaction.schema_cookie);
-                // database_size should only be updated in each commit so it should be safe to assume correct database_size is in last_commited_header
-                header_in_pager.database_size = last_commited_header.database_size;
-                if header_in_transaction.schema_cookie < last_commited_header.schema_cookie {
-                    tracing::error!("txn's schema cookie went back in time, aborting");
-                    return Err(LimboError::SchemaUpdated);
-                }
-
-                assert!(
-                    header_in_transaction.schema_cookie >= last_commited_header.schema_cookie,
-                    "txn's schema cookie went back in time"
-                );
-                header_in_pager.schema_cookie = header_in_transaction.schema_cookie;
-                // TODO: deal with other fields
-                Ok(())
-            })
-        })?;
-        Ok(())
     }
 }
 
@@ -455,6 +391,16 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                         assert_eq!(tx.state, TransactionState::Active);
                     }
                 }
+
+                if mvcc_store
+                    .last_committed_schema_change_ts
+                    .load(Ordering::Acquire)
+                    > tx.begin_ts
+                {
+                    // Schema changes made after the transaction began always cause a [SchemaUpdated] error and the tx must abort.
+                    return Err(LimboError::SchemaUpdated);
+                }
+
                 tx.state.store(TransactionState::Preparing);
                 tracing::trace!("prepare_tx(tx_id={})", self.tx_id);
 
@@ -542,244 +488,12 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                         mvcc_store.release_exclusive_tx(&self.tx_id);
                         self.commit_coordinator.pager_commit_lock.unlock();
                     }
+                    mvcc_store.remove_tx(self.tx_id);
                     self.finalize(mvcc_store)?;
                     return Ok(TransitionResult::Done(()));
                 }
                 self.state = CommitState::Commit { end_ts };
                 Ok(TransitionResult::Continue)
-            }
-            CommitState::BeginPagerTxn { end_ts } => {
-                // FIXME: how do we deal with multiple concurrent writes?
-                // WAL requires a txn to be written sequentially. Either we:
-                // 1. Wait for currently writer to finish before second txn starts.
-                // 2. Choose a txn to write depending on some heuristics like amount of frames will be written.
-                // 3. ..
-
-                // If this is the exclusive transaction, we already acquired a write transaction
-                // on the pager in begin_exclusive_tx() and don't need to acquire it.
-                if mvcc_store.is_exclusive_tx(&self.tx_id) {
-                    self.update_pager_header(mvcc_store)?;
-                    self.state = CommitState::WriteRow {
-                        end_ts: *end_ts,
-                        write_set_index: 0,
-                        requires_seek: true,
-                    };
-                    return Ok(TransitionResult::Continue);
-                } else if mvcc_store.has_exclusive_tx() {
-                    // There is an exclusive transaction holding the write lock. We must abort.
-                    return Err(LimboError::WriteWriteConflict);
-                }
-                // Currently txns are queued without any heuristics whasoever. This is important because
-                // we need to ensure writes to disk happen sequentially.
-                // * We don't want txns to write to WAL in parallel.
-                // * We don't want BTree modifications to happen in parallel.
-                // If any of these were to happen, we would find ourselves in a bad corruption situation.
-
-                // NOTE: since we are blocking for `begin_write_tx` we do not care about re-entrancy right now.
-                let locked = self.commit_coordinator.pager_commit_lock.write();
-                if !locked {
-                    self.commit_coordinator
-                        .commits_waiting
-                        .fetch_add(1, Ordering::SeqCst);
-                    // FIXME: IOCompletions still needs a yield variant...
-                    return Ok(TransitionResult::Io(crate::types::IOCompletions::Single(
-                        Completion::new_dummy(),
-                    )));
-                }
-
-                self.update_pager_header(mvcc_store)?;
-
-                {
-                    let mut wal = self.pager.wal.as_ref().unwrap().borrow_mut();
-                    // we need to update the max frame to the latest shared max frame in order to avoid snapshot staleness
-                    wal.update_max_frame();
-                }
-
-                // We started a pager read transaction at the beginning of the MV transaction, because
-                // any reads we do from the database file and WAL must uphold snapshot isolation.
-                // However, now we must end and immediately restart the read transaction before committing.
-                // This is because other transactions may have committed writes to the DB file or WAL,
-                // and our pager must read in those changes when applying our writes; otherwise we would overwrite
-                // the changes from the previous committed transactions.
-                //
-                // Note that this would be incredibly unsafe in the regular transaction model, but in MVCC we trust
-                // the MV-store to uphold the guarantee that no write-write conflicts happened.
-                self.pager.end_read_tx().expect("end_read_tx cannot fail");
-                let result = self.pager.begin_read_tx();
-                if let Err(LimboError::Busy) = result {
-                    // We cannot obtain a WAL read lock due to contention, so we must abort.
-                    self.commit_coordinator.pager_commit_lock.unlock();
-                    return Err(LimboError::WriteWriteConflict);
-                }
-                result?;
-                let result = self.pager.io.block(|| self.pager.begin_write_tx());
-                if let Err(LimboError::Busy) = result {
-                    // There is a non-CONCURRENT transaction holding the write lock. We must abort.
-                    self.commit_coordinator.pager_commit_lock.unlock();
-                    return Err(LimboError::WriteWriteConflict);
-                }
-                result?;
-                self.state = CommitState::WriteRow {
-                    end_ts: *end_ts,
-                    write_set_index: 0,
-                    requires_seek: true,
-                };
-                return Ok(TransitionResult::Continue);
-            }
-            CommitState::WriteRow {
-                end_ts,
-                write_set_index,
-                requires_seek,
-            } => {
-                if *write_set_index == self.write_set.len() {
-                    self.state = CommitState::CommitPagerTxn { end_ts: *end_ts };
-                    return Ok(TransitionResult::Continue);
-                }
-                let id = &self.write_set[*write_set_index];
-                if let Some(row_versions) = mvcc_store.rows.get(id) {
-                    let row_versions = row_versions.value().read();
-                    // Find rows that were written by this transaction.
-                    // Hekaton uses oldest-to-newest order for row versions, so we reverse iterate to find the newest one
-                    // this transaction changed.
-                    for row_version in row_versions.iter().rev() {
-                        if let TxTimestampOrID::TxID(row_tx_id) = row_version.begin {
-                            if row_tx_id == self.tx_id {
-                                let cursor = if let Some(cursor) = self.cursors.get(&id.table_id) {
-                                    cursor.clone()
-                                } else {
-                                    let cursor = BTreeCursor::new_table(
-                                        None, // Write directly to B-tree
-                                        self.pager.clone(),
-                                        id.table_id as usize,
-                                        row_version.row.column_count,
-                                    );
-                                    let cursor = Arc::new(RwLock::new(cursor));
-                                    self.cursors.insert(id.table_id, cursor.clone());
-                                    cursor
-                                };
-                                let state_machine = mvcc_store.write_row_to_pager(
-                                    &row_version.row,
-                                    cursor,
-                                    *requires_seek,
-                                )?;
-                                self.write_row_state_machine = Some(state_machine);
-
-                                self.state = CommitState::WriteRowStateMachine {
-                                    end_ts: *end_ts,
-                                    write_set_index: *write_set_index,
-                                };
-                                break;
-                            }
-                        }
-                        if let Some(TxTimestampOrID::TxID(row_tx_id)) = row_version.end {
-                            if row_tx_id == self.tx_id {
-                                let column_count = row_version.row.column_count;
-                                let cursor = if let Some(cursor) = self.cursors.get(&id.table_id) {
-                                    cursor.clone()
-                                } else {
-                                    let cursor = BTreeCursor::new_table(
-                                        None, // Write directly to B-tree
-                                        self.pager.clone(),
-                                        id.table_id as usize,
-                                        column_count,
-                                    );
-                                    let cursor = Arc::new(RwLock::new(cursor));
-                                    self.cursors.insert(id.table_id, cursor.clone());
-                                    cursor
-                                };
-                                let state_machine =
-                                    mvcc_store.delete_row_from_pager(row_version.row.id, cursor)?;
-                                self.delete_row_state_machine = Some(state_machine);
-                                self.state = CommitState::DeleteRowStateMachine {
-                                    end_ts: *end_ts,
-                                    write_set_index: *write_set_index,
-                                };
-                                break;
-                            }
-                        }
-                    }
-                }
-                Ok(TransitionResult::Continue)
-            }
-
-            CommitState::WriteRowStateMachine {
-                end_ts,
-                write_set_index,
-            } => {
-                let write_row_state_machine = self.write_row_state_machine.as_mut().unwrap();
-                match write_row_state_machine.step(&())? {
-                    IOResult::IO(io) => return Ok(TransitionResult::Io(io)),
-                    IOResult::Done(_) => {
-                        let requires_seek = {
-                            if let Some(next_id) = self.write_set.get(*write_set_index + 1) {
-                                let current_id = &self.write_set[*write_set_index];
-                                if current_id.table_id == next_id.table_id
-                                    && current_id.row_id + 1 == next_id.row_id
-                                {
-                                    // simple optimizaiton for sequential inserts with inceasing by 1 ids
-                                    // we should probably just check record in next row and see if it requires seek
-                                    false
-                                } else {
-                                    true
-                                }
-                            } else {
-                                false
-                            }
-                        };
-                        self.state = CommitState::WriteRow {
-                            end_ts: *end_ts,
-                            write_set_index: *write_set_index + 1,
-                            requires_seek,
-                        };
-                        return Ok(TransitionResult::Continue);
-                    }
-                }
-            }
-            CommitState::DeleteRowStateMachine {
-                end_ts,
-                write_set_index,
-            } => {
-                let delete_row_state_machine = self.delete_row_state_machine.as_mut().unwrap();
-                match delete_row_state_machine.step(&())? {
-                    IOResult::IO(io) => return Ok(TransitionResult::Io(io)),
-                    IOResult::Done(_) => {
-                        self.state = CommitState::WriteRow {
-                            end_ts: *end_ts,
-                            write_set_index: *write_set_index + 1,
-                            requires_seek: true,
-                        };
-                        return Ok(TransitionResult::Continue);
-                    }
-                }
-            }
-            CommitState::CommitPagerTxn { end_ts } => {
-                // Write committed data to pager for persistence
-                // Flush dirty pages to WAL - this is critical for data persistence
-                // Similar to what step_end_write_txn does for legacy transactions
-
-                let result = self
-                    .pager
-                    .end_tx(
-                        false, // rollback = false since we're committing
-                        &self.connection,
-                    )
-                    .map_err(|e| LimboError::InternalError(e.to_string()))
-                    .unwrap();
-                match result {
-                    IOResult::Done(_) => {
-                        // FIXME: hack for now to keep database header updated for pager commit
-                        let tx = mvcc_store.txs.get(&self.tx_id).unwrap();
-                        let tx_unlocked = tx.value();
-                        self.header.write().replace(*tx_unlocked.header.borrow());
-                        self.commit_coordinator.pager_commit_lock.unlock();
-                        // TODO: here mark we are ready for a batch
-                        self.state = CommitState::Commit { end_ts: *end_ts };
-                        return Ok(TransitionResult::Continue);
-                    }
-                    IOResult::IO(io) => {
-                        return Ok(TransitionResult::Io(io));
-                    }
-                }
             }
             CommitState::Commit { end_ts } => {
                 let mut log_record = LogRecord::new(*end_ts);
@@ -800,6 +514,10 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                                         &mut log_record.row_versions,
                                         row_version.clone(),
                                     ); // FIXME: optimize cloning out
+
+                                    if row_version.row.id.table_id == 1 {
+                                        self.did_commit_schema_change = true;
+                                    }
                                 }
                             }
                             if let Some(TxTimestampOrID::TxID(id)) = row_version.end {
@@ -811,6 +529,10 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                                         &mut log_record.row_versions,
                                         row_version.clone(),
                                     ); // FIXME: optimize cloning out
+
+                                    if row_version.row.id.table_id == 1 {
+                                        self.did_commit_schema_change = true;
+                                    }
                                 }
                             }
                         }
@@ -864,17 +586,14 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
             }
             CommitState::EndCommitLogicalLog { end_ts } => {
                 let connection = self.connection.clone();
-                let schema_did_change = match connection.get_tx_state() {
-                    crate::TransactionState::Write { schema_did_change } => schema_did_change,
-                    _ => false,
-                };
+                let schema_did_change = self.did_commit_schema_change;
                 if schema_did_change {
                     let schema = connection.schema.read().clone();
                     connection.db.update_schema_if_newer(schema)?;
                 }
                 let tx = mvcc_store.txs.get(&self.tx_id).unwrap();
                 let tx_unlocked = tx.value();
-                self.header.write().replace(*tx_unlocked.header.borrow());
+                self.header.write().replace(*tx_unlocked.header.read());
                 tracing::trace!("end_commit_logical_log(tx_id={})", self.tx_id);
                 self.commit_coordinator.pager_commit_lock.unlock();
                 self.state = CommitState::CommitEnd { end_ts: *end_ts };
@@ -886,6 +605,20 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 tx_unlocked
                     .state
                     .store(TransactionState::Committed(*end_ts));
+                mvcc_store
+                    .global_header
+                    .write()
+                    .replace(*tx_unlocked.header.read());
+
+                mvcc_store
+                    .last_committed_tx_ts
+                    .store(*end_ts, Ordering::Release);
+                if self.did_commit_schema_change {
+                    mvcc_store
+                        .last_committed_schema_change_ts
+                        .store(*end_ts, Ordering::Release);
+                }
+
                 // We have now updated all the versions with a reference to the
                 // transaction ID to a timestamp and can, therefore, remove the
                 // transaction. Please note that when we move to lockless, the
@@ -1091,6 +824,7 @@ pub struct MvStore<Clock: LogicalClock> {
     txs: SkipMap<TxID, Transaction>,
     tx_ids: AtomicU64,
     next_rowid: AtomicU64,
+    next_table_id: AtomicU64,
     clock: Clock,
     storage: Storage,
     loaded_tables: RwLock<HashSet<u64>>,
@@ -1111,6 +845,16 @@ pub struct MvStore<Clock: LogicalClock> {
     /// - Immediately TRUNCATE checkpoint the WAL into the database file.
     /// - Release the blocking_checkpoint_lock.
     blocking_checkpoint_lock: Arc<TursoRwLock>,
+    /// The highest transaction ID that has been checkpointed.
+    /// Used to skip checkpointing transactions that have already been checkpointed.
+    checkpointed_txid_max: AtomicU64,
+    /// The timestamp of the last committed schema change.
+    /// Schema changes always cause a [SchemaUpdated] error.
+    last_committed_schema_change_ts: AtomicU64,
+    /// The timestamp of the last committed transaction.
+    /// If there are two concurrent BEGIN (non-CONCURRENT) transactions, and one tries to promote
+    /// to exclusive, it will abort if another transaction committed after its begin timestamp.
+    last_committed_tx_ts: AtomicU64,
 }
 
 impl<Clock: LogicalClock> MvStore<Clock> {
@@ -1121,17 +865,28 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             txs: SkipMap::new(),
             tx_ids: AtomicU64::new(1), // let's reserve transaction 0 for special purposes
             next_rowid: AtomicU64::new(0), // TODO: determine this from B-Tree
+            next_table_id: AtomicU64::new(2), // table id 1 / root page 1 is always sqlite_schema.
             clock,
             storage,
             loaded_tables: RwLock::new(HashSet::new()),
             exclusive_tx: RwLock::new(None),
             commit_coordinator: Arc::new(CommitCoordinator {
                 pager_commit_lock: Arc::new(TursoRwLock::new()),
-                commits_waiting: Arc::new(AtomicU64::new(0)),
             }),
             global_header: Arc::new(RwLock::new(None)),
             blocking_checkpoint_lock: Arc::new(TursoRwLock::new()),
+            checkpointed_txid_max: AtomicU64::new(0),
+            last_committed_schema_change_ts: AtomicU64::new(0),
+            last_committed_tx_ts: AtomicU64::new(0),
         }
+    }
+
+    /// MVCC does not use the pager/btree cursors to create pages until checkpoint.
+    /// This method is used to assign root page numbers when Insn::CreateBtree is used.
+    /// NOTE: during MVCC recovery (not implemented yet), [MvStore::next_table_id] must be
+    /// initialized to the current highest table id / root page number.
+    pub fn get_next_table_id(&self) -> u64 {
+        self.next_table_id.fetch_add(1, Ordering::SeqCst)
     }
 
     pub fn get_next_rowid(&self) -> i64 {
@@ -1475,6 +1230,22 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         self.blocking_checkpoint_lock.unlock();
     }
 
+    /// Begins a loading transaction
+    ///
+    /// A loading transaction is one that happens while trying recover from a logical log file.
+    /// This transaction will be stored on tx_id = 0.
+    pub fn begin_load_tx(&self, pager: Arc<Pager>) -> Result<()> {
+        let tx_id = 0;
+        let begin_ts = self.get_timestamp();
+
+        let header = self.get_new_transaction_database_header(&pager);
+        let tx = Transaction::new(tx_id, begin_ts, header);
+        tracing::trace!("begin_load_tx(tx_id={tx_id})");
+        self.txs.insert(tx_id, tx);
+
+        Ok(())
+    }
+
     fn get_new_transaction_database_header(&self, pager: &Arc<Pager>) -> DatabaseHeader {
         if self.global_header.read().is_none() {
             pager.io.block(|| pager.maybe_allocate_page1()).unwrap();
@@ -1502,7 +1273,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             .get(tx_id)
             .expect("transaction not found when trying to get header");
         let header = tx.value();
-        let header = header.header.borrow();
+        let header = header.header.read();
         tracing::debug!("get_transaction_database_header read: header={:?}", header);
         *header
     }
@@ -1514,7 +1285,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         if let Some(tx_id) = tx_id {
             let tx = self.txs.get(tx_id).unwrap();
             let header = tx.value();
-            let header = header.header.borrow();
+            let header = header.header.read();
             tracing::debug!("with_header read: header={:?}", header);
             Ok(f(&header))
         } else {
@@ -1531,7 +1302,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         if let Some(tx_id) = tx_id {
             let tx = self.txs.get(tx_id).unwrap();
             let header = tx.value();
-            let mut header = header.header.borrow_mut();
+            let mut header = header.header.write();
             tracing::debug!("with_header_mut read: header={:?}", header);
             Ok(f(&mut header))
         } else {
@@ -1554,19 +1325,55 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     pub fn commit_tx(
         &self,
         tx_id: TxID,
-        pager: Arc<Pager>,
         connection: &Arc<Connection>,
     ) -> Result<StateMachine<CommitStateMachine<Clock>>> {
         let state_machine: StateMachine<CommitStateMachine<Clock>> =
             StateMachine::<CommitStateMachine<Clock>>::new(CommitStateMachine::new(
                 CommitState::Initial,
-                pager,
                 tx_id,
                 connection.clone(),
                 self.commit_coordinator.clone(),
                 self.global_header.clone(),
             ));
         Ok(state_machine)
+    }
+
+    /// Commits a load transaction that is running while recovering from a logical log file.
+    /// This will simply mark timestamps of row version correctly so they are now visible to new
+    /// transactions.
+    pub fn commit_load_tx(&self, tx_id: TxID) {
+        let end_ts = self.get_timestamp();
+        let tx = self.txs.get(&tx_id).unwrap();
+        let tx = tx.value();
+        for rowid in &tx.write_set {
+            let rowid = rowid.value();
+            if let Some(row_versions) = self.rows.get(rowid) {
+                let mut row_versions = row_versions.value().write();
+                // Find rows that were written by this transaction.
+                // Hekaton uses oldest-to-newest order for row versions, so we reverse iterate to find the newest one
+                // this transaction changed.
+                for row_version in row_versions.iter_mut().rev() {
+                    if let TxTimestampOrID::TxID(id) = row_version.begin {
+                        turso_assert!(
+                            id == tx_id,
+                            "only one tx(0) should exist on loading logical log"
+                        );
+                        // New version is valid STARTING FROM committing transaction's end timestamp
+                        // See diagram on page 299: https://www.cs.cmu.edu/~15721-f24/papers/Hekaton.pdf
+                        row_version.begin = TxTimestampOrID::Timestamp(end_ts);
+                    }
+                    if let Some(TxTimestampOrID::TxID(id)) = row_version.end {
+                        turso_assert!(
+                            id == tx_id,
+                            "only one tx(0) should exist on loading logical log"
+                        );
+                        // Old version is valid UNTIL committing transaction's end timestamp
+                        // See diagram on page 299: https://www.cs.cmu.edu/~15721-f24/papers/Hekaton.pdf
+                        row_version.end = Some(TxTimestampOrID::Timestamp(end_ts));
+                    }
+                }
+            }
+        }
     }
 
     /// Rolls back a transaction with the specified ID.
@@ -1585,7 +1392,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     ) -> Result<()> {
         let tx_unlocked = self.txs.get(&tx_id).unwrap();
         let tx = tx_unlocked.value();
-        connection.mv_tx.set(None);
+        *connection.mv_tx.write() = None;
         assert!(tx.state == TransactionState::Active || tx.state == TransactionState::Preparing);
         tx.state.store(TransactionState::Aborted);
         tracing::trace!("abort(tx_id={})", tx_id);
@@ -1613,6 +1420,13 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             }
         }
 
+        if connection.schema.read().schema_version
+            > connection.db.schema.lock().unwrap().schema_version
+        {
+            // Connection made schema changes during tx and rolled back -> revert connection-local schema.
+            *connection.schema.write() = connection.db.clone_schema()?;
+        }
+
         let tx = tx_unlocked.value();
         tx.state.store(TransactionState::Terminated);
         tracing::trace!("terminate(tx_id={})", tx_id);
@@ -1624,7 +1438,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     }
 
     /// Returns true if the given transaction is the exclusive transaction.
-    fn is_exclusive_tx(&self, tx_id: &TxID) -> bool {
+    pub fn is_exclusive_tx(&self, tx_id: &TxID) -> bool {
         self.exclusive_tx.read().as_ref() == Some(tx_id)
     }
 
@@ -1635,6 +1449,14 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
     /// Acquires the exclusive transaction lock to the given transaction ID.
     fn acquire_exclusive_tx(&self, tx_id: &TxID) -> Result<()> {
+        if let Some(tx) = self.txs.get(tx_id) {
+            let tx = tx.value();
+            if tx.begin_ts < self.last_committed_tx_ts.load(Ordering::Acquire) {
+                // Another transaction committed after this transaction's begin timestamp, do not allow exclusive lock.
+                // This mimics regular (non-CONCURRENT) sqlite transaction behavior.
+                return Err(LimboError::Busy);
+            }
+        }
         let mut exclusive_tx = self.exclusive_tx.write();
         if exclusive_tx.is_some() {
             // Another transaction already holds the exclusive lock
@@ -1820,7 +1642,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         // Then, scan the disk B-tree to find existing rows
         self.scan_load_table(table_id, pager)?;
 
-        self.loaded_tables.write().insert(table_id);
+        self.mark_table_as_loaded(table_id);
 
         Ok(())
     }

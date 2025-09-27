@@ -4,7 +4,7 @@ use turso_parser::ast;
 
 use crate::{
     bail_parse_error,
-    schema::{BTreeTable, Schema},
+    schema::BTreeTable,
     storage::pager::CreateBTreeFlags,
     translate::{
         emitter::Resolver,
@@ -15,20 +15,19 @@ use crate::{
         builder::{CursorType, ProgramBuilder},
         insn::{Insn, RegisterOrLiteral},
     },
-    Result, SymbolTable,
+    Result,
 };
 
 pub fn translate_analyze(
     target_opt: Option<ast::QualifiedName>,
-    schema: &Schema,
-    syms: &SymbolTable,
+    resolver: &Resolver,
     mut program: ProgramBuilder,
 ) -> Result<ProgramBuilder> {
     let Some(target) = target_opt else {
         bail_parse_error!("ANALYZE with no target is not supported");
     };
     let normalized = normalize_ident(target.name.as_str());
-    let Some(target_schema) = schema.get_table(&normalized) else {
+    let Some(target_schema) = resolver.schema.get_table(&normalized) else {
         bail_parse_error!("ANALYZE <schema_name> is not supported");
     };
     let Some(target_btree) = target_schema.btree() else {
@@ -48,7 +47,7 @@ pub fn translate_analyze(
     let sqlite_stat1_btreetable: Arc<BTreeTable>;
     let sqlite_stat1_source: RegisterOrLiteral<_>;
 
-    if let Some(sqlite_stat1) = schema.get_btree_table("sqlite_stat1") {
+    if let Some(sqlite_stat1) = resolver.schema.get_btree_table("sqlite_stat1") {
         sqlite_stat1_btreetable = sqlite_stat1.clone();
         sqlite_stat1_source = RegisterOrLiteral::Literal(sqlite_stat1.root_page);
         // sqlite_stat1 already exists, so we need to remove the row
@@ -131,7 +130,7 @@ pub fn translate_analyze(
         sqlite_stat1_btreetable = Arc::new(BTreeTable::from_sql(sql, 0)?);
         sqlite_stat1_source = RegisterOrLiteral::Register(table_root_reg);
 
-        let table = schema.get_btree_table(SQLITE_TABLEID).unwrap();
+        let table = resolver.schema.get_btree_table(SQLITE_TABLEID).unwrap();
         let sqlite_schema_cursor_id =
             program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
         program.emit_insn(Insn::OpenWrite {
@@ -140,11 +139,10 @@ pub fn translate_analyze(
             db: 0,
         });
 
-        let resolver = Resolver::new(schema, syms);
         // Add the table entry to sqlite_schema
         emit_schema_entry(
             &mut program,
-            &resolver,
+            resolver,
             sqlite_schema_cursor_id,
             None,
             SchemaEntryType::Table,

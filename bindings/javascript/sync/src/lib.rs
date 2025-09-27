@@ -6,13 +6,12 @@ pub mod js_protocol_io;
 
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex, OnceLock, RwLock, RwLockReadGuard},
+    sync::{Arc, Mutex, RwLock, RwLockReadGuard},
 };
 
 use napi::bindgen_prelude::{AsyncTask, Either5, Null};
 use napi_derive::napi;
-use tracing_subscriber::{filter::LevelFilter, fmt::format::FmtSpan};
-use turso_node::IoLoopTask;
+use turso_node::{DatabaseOpts, IoLoopTask};
 use turso_sync_engine::{
     database_sync_engine::{DatabaseSyncEngine, DatabaseSyncEngineOpts},
     types::{Coro, DatabaseChangeType, DatabaseSyncEngineProtocolVersion},
@@ -22,11 +21,6 @@ use crate::{
     generator::{GeneratorHolder, GeneratorResponse, SyncEngineChanges},
     js_protocol_io::{JsProtocolIo, JsProtocolRequestBytes},
 };
-
-#[napi(object)]
-pub struct DatabaseOpts {
-    pub path: String,
-}
 
 #[napi]
 pub struct SyncEngine {
@@ -40,17 +34,17 @@ pub struct SyncEngine {
     io: Option<Arc<dyn turso_core::IO>>,
     protocol: Option<Arc<JsProtocolIo>>,
     sync_engine: Arc<RwLock<Option<DatabaseSyncEngine<JsProtocolIo>>>>,
-    opened: Arc<Mutex<Option<turso_node::Database>>>,
+    db: Arc<Mutex<turso_node::Database>>,
 }
 
-#[napi]
+#[napi(string_enum = "lowercase")]
 pub enum DatabaseChangeTypeJs {
     Insert,
     Update,
     Delete,
 }
 
-#[napi]
+#[napi(string_enum = "lowercase")]
 pub enum SyncEngineProtocolVersion {
     Legacy,
     V1,
@@ -131,31 +125,10 @@ pub struct SyncEngineOpts {
     pub protocol_version: Option<SyncEngineProtocolVersion>,
 }
 
-static TRACING_INIT: OnceLock<()> = OnceLock::new();
-pub fn init_tracing(level_filter: LevelFilter) {
-    TRACING_INIT.get_or_init(|| {
-        tracing_subscriber::fmt()
-            .with_ansi(false)
-            .with_thread_ids(true)
-            .with_span_events(FmtSpan::ACTIVE)
-            .with_max_level(level_filter)
-            .init();
-    });
-}
-
 #[napi]
 impl SyncEngine {
     #[napi(constructor)]
     pub fn new(opts: SyncEngineOpts) -> napi::Result<Self> {
-        // helpful for local debugging
-        match opts.tracing.as_deref() {
-            Some("error") => init_tracing(LevelFilter::ERROR),
-            Some("warn") => init_tracing(LevelFilter::WARN),
-            Some("info") => init_tracing(LevelFilter::INFO),
-            Some("debug") => init_tracing(LevelFilter::DEBUG),
-            Some("trace") => init_tracing(LevelFilter::TRACE),
-            _ => {}
-        }
         let is_memory = opts.path == ":memory:";
         let io: Arc<dyn turso_core::IO> = if is_memory {
             Arc::new(turso_core::MemoryIO::new())
@@ -174,6 +147,17 @@ impl SyncEngine {
                 turso_node::browser::opfs()
             }
         };
+        #[allow(clippy::arc_with_non_send_sync)]
+        let db = Arc::new(Mutex::new(turso_node::Database::new_with_io(
+            opts.path.clone(),
+            io.clone(),
+            Some(DatabaseOpts {
+                file_must_exist: None,
+                readonly: None,
+                timeout: None,
+                tracing: opts.tracing.clone(),
+            }),
+        )?));
         Ok(SyncEngine {
             path: opts.path,
             client_name: opts.client_name.unwrap_or("turso-sync-js".to_string()),
@@ -188,7 +172,7 @@ impl SyncEngine {
             io: Some(io),
             protocol: Some(Arc::new(JsProtocolIo::default())),
             #[allow(clippy::arc_with_non_send_sync)]
-            opened: Arc::new(Mutex::new(None)),
+            db,
             protocol_version: match opts.protocol_version {
                 Some(SyncEngineProtocolVersion::Legacy) | None => {
                     DatabaseSyncEngineProtocolVersion::Legacy
@@ -199,7 +183,7 @@ impl SyncEngine {
     }
 
     #[napi]
-    pub fn init(&mut self) -> napi::Result<GeneratorHolder> {
+    pub fn connect(&mut self) -> napi::Result<GeneratorHolder> {
         let opts = DatabaseSyncEngineOpts {
             client_name: self.client_name.clone(),
             wal_pull_batch_size: self.wal_pull_batch_size as u64,
@@ -212,17 +196,21 @@ impl SyncEngine {
         let io = self.io()?;
         let protocol = self.protocol()?;
         let sync_engine = self.sync_engine.clone();
-        let opened = self.opened.clone();
+        let db = self.db.clone();
         let path = self.path.clone();
         let generator = genawaiter::sync::Gen::new(|coro| async move {
             let coro = Coro::new((), coro);
             let initialized =
                 DatabaseSyncEngine::new(&coro, io.clone(), protocol, &path, opts).await?;
             let connection = initialized.connect_rw(&coro).await?;
-            let db = turso_node::Database::create(None, io.clone(), connection, path);
 
+            db.lock().unwrap().set_connected(connection).map_err(|e| {
+                turso_sync_engine::errors::Error::DatabaseSyncEngineError(format!(
+                    "failed to connect sync engine: {e}"
+                ))
+            })?;
             *sync_engine.write().unwrap() = Some(initialized);
-            *opened.lock().unwrap() = Some(db);
+
             Ok(())
         });
         Ok(GeneratorHolder {
@@ -314,21 +302,14 @@ impl SyncEngine {
     }
 
     #[napi]
-    pub fn open(&self) -> napi::Result<turso_node::Database> {
-        let opened = self.opened.lock().unwrap();
-        let Some(opened) = opened.as_ref() else {
-            return Err(napi::Error::new(
-                napi::Status::GenericFailure,
-                "sync_engine must be initialized".to_string(),
-            ));
-        };
-        Ok(opened.clone())
+    pub fn db(&self) -> napi::Result<turso_node::Database> {
+        Ok(self.db.lock().unwrap().clone())
     }
 
     #[napi]
     pub fn close(&mut self) {
         let _ = self.sync_engine.write().unwrap().take();
-        let _ = self.opened.lock().unwrap().take().unwrap();
+        let _ = self.db.lock().unwrap().close();
         let _ = self.io.take();
         let _ = self.protocol.take();
     }

@@ -500,7 +500,7 @@ pub fn str_to_i64(input: impl AsRef<str>) -> Option<i64> {
     )
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum StrToF64 {
     Fractional(NonNan),
     Decimal(NonNan),

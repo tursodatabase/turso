@@ -1,18 +1,20 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use crate::schema::{BTreeTable, Column, Type};
-use crate::translate::expr::{bind_and_rewrite_expr, walk_expr, ParamState, WalkControl};
+use crate::schema::{BTreeTable, Column, Type, ROWID_SENTINEL};
+use crate::translate::emitter::Resolver;
+use crate::translate::expr::{
+    bind_and_rewrite_expr, walk_expr, BindingBehavior, ParamState, WalkControl,
+};
 use crate::translate::optimizer::optimize_select_plan;
 use crate::translate::plan::{Operation, QueryDestination, Scan, Search, SelectPlan};
-use crate::translate::planner::parse_limit;
+use crate::translate::planner::{parse_limit, ROWID_STRS};
 use crate::vdbe::builder::CursorType;
 use crate::{
     bail_parse_error,
     schema::{Schema, Table},
     util::normalize_ident,
     vdbe::builder::{ProgramBuilder, ProgramBuilderOpts},
-    SymbolTable,
 };
 use turso_parser::ast::{self, Expr, Indexed, SortOrder};
 
@@ -54,34 +56,32 @@ addr  opcode         p1    p2    p3    p4             p5  comment
 18    Goto           0     1     0                    0
 */
 pub fn translate_update(
-    schema: &Schema,
     body: &mut ast::Update,
-    syms: &SymbolTable,
+    resolver: &Resolver,
     mut program: ProgramBuilder,
     connection: &Arc<crate::Connection>,
 ) -> crate::Result<ProgramBuilder> {
-    let mut plan = prepare_update_plan(&mut program, schema, body, connection, false)?;
-    optimize_plan(&mut plan, schema)?;
+    let mut plan = prepare_update_plan(&mut program, resolver.schema, body, connection, false)?;
+    optimize_plan(&mut plan, resolver.schema)?;
     let opts = ProgramBuilderOpts {
         num_cursors: 1,
         approx_num_insns: 20,
         approx_num_labels: 4,
     };
     program.extend(&opts);
-    emit_program(connection, &mut program, plan, schema, syms, |_| {})?;
+    emit_program(connection, resolver, &mut program, plan, |_| {})?;
     Ok(program)
 }
 
 pub fn translate_update_for_schema_change(
-    schema: &Schema,
     body: &mut ast::Update,
-    syms: &SymbolTable,
+    resolver: &Resolver,
     mut program: ProgramBuilder,
     connection: &Arc<crate::Connection>,
     ddl_query: &str,
     after: impl FnOnce(&mut ProgramBuilder),
 ) -> crate::Result<ProgramBuilder> {
-    let mut plan = prepare_update_plan(&mut program, schema, body, connection, true)?;
+    let mut plan = prepare_update_plan(&mut program, resolver.schema, body, connection, true)?;
 
     if let Plan::Update(plan) = &mut plan {
         if program.capture_data_changes_mode().has_updates() {
@@ -89,14 +89,14 @@ pub fn translate_update_for_schema_change(
         }
     }
 
-    optimize_plan(&mut plan, schema)?;
+    optimize_plan(&mut plan, resolver.schema)?;
     let opts = ProgramBuilderOpts {
         num_cursors: 1,
         approx_num_insns: 20,
         approx_num_labels: 4,
     };
     program.extend(&opts);
-    emit_program(connection, &mut program, plan, schema, syms, after)?;
+    emit_program(connection, resolver, &mut program, plan, after)?;
     Ok(program)
 }
 
@@ -120,6 +120,11 @@ pub fn prepare_update_plan(
     {
         bail_parse_error!("INDEXED BY clause is not supported in UPDATE");
     }
+
+    if !body.order_by.is_empty() {
+        bail_parse_error!("ORDER BY is not supported in UPDATE");
+    }
+
     let table_name = &body.tbl_name.name;
 
     // Check if this is a system table that should be protected from direct writes
@@ -143,6 +148,20 @@ pub fn prepare_update_plan(
     // Check if this is a materialized view
     if schema.is_materialized_view(table_name.as_str()) {
         bail_parse_error!("cannot modify materialized view {}", table_name);
+    }
+
+    // Check if this table has any incompatible dependent views
+    let incompatible_views = schema.has_incompatible_dependent_views(table_name.as_str());
+    if !incompatible_views.is_empty() {
+        use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
+        bail_parse_error!(
+            "Cannot UPDATE table '{}' because it has incompatible dependent materialized view(s): {}. \n\
+             These views were created with a different DBSP version than the current version ({}). \n\
+             Please DROP and recreate the view(s) before modifying this table.",
+            table_name,
+            incompatible_views.join(", "),
+            DBSP_CIRCUIT_VERSION
+        );
     }
 
     let table_name = table.get_name();
@@ -180,7 +199,6 @@ pub fn prepare_update_plan(
         .collect();
 
     let mut set_clauses = Vec::with_capacity(body.sets.len());
-    let mut param_idx = ParamState::default();
 
     // Process each SET assignment and map column names to expressions
     // e.g the statement `SET x = 1, y = 2, z = 3` has 3 set assigments
@@ -190,7 +208,8 @@ pub fn prepare_update_plan(
             Some(&mut table_references),
             None,
             connection,
-            &mut param_idx,
+            &mut program.param_ctx,
+            BindingBehavior::ResultColumnsNotAllowed,
         )?;
 
         let values = match set.expr.as_ref() {
@@ -206,18 +225,39 @@ pub fn prepare_update_plan(
             );
         }
 
-        // Map each column to its corresponding expression
         for (col_name, expr) in set.col_names.iter().zip(values.iter()) {
             let ident = normalize_ident(col_name.as_str());
-            let col_index = match column_lookup.get(&ident) {
-                Some(idx) => idx,
-                None => bail_parse_error!("no such column: {}", ident),
-            };
 
-            // Update existing entry or add new one
-            match set_clauses.iter_mut().find(|(idx, _)| idx == col_index) {
-                Some((_, existing_expr)) => *existing_expr = expr.clone(),
-                None => set_clauses.push((*col_index, expr.clone())),
+            // Check if this is the 'rowid' keyword
+            if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(&ident)) {
+                // Find the rowid alias column if it exists
+                if let Some((idx, _col)) = table
+                    .columns()
+                    .iter()
+                    .enumerate()
+                    .find(|(_, c)| c.is_rowid_alias)
+                {
+                    // Use the rowid alias column index
+                    match set_clauses.iter_mut().find(|(i, _)| i == &idx) {
+                        Some((_, existing_expr)) => *existing_expr = expr.clone(),
+                        None => set_clauses.push((idx, expr.clone())),
+                    }
+                } else {
+                    // No rowid alias, use sentinel value for actual rowid
+                    match set_clauses.iter_mut().find(|(i, _)| *i == ROWID_SENTINEL) {
+                        Some((_, existing_expr)) => *existing_expr = expr.clone(),
+                        None => set_clauses.push((ROWID_SENTINEL, expr.clone())),
+                    }
+                }
+            } else {
+                let col_index = match column_lookup.get(&ident) {
+                    Some(idx) => idx,
+                    None => bail_parse_error!("no such column: {}", ident),
+                };
+                match set_clauses.iter_mut().find(|(idx, _)| idx == col_index) {
+                    Some((_, existing_expr)) => *existing_expr = expr.clone(),
+                    None => set_clauses.push((*col_index, expr.clone())),
+                }
             }
         }
     }
@@ -228,7 +268,6 @@ pub fn prepare_update_plan(
         body.tbl_name.name.as_str(),
         program,
         connection,
-        &mut param_idx,
     )?;
 
     let order_by = body
@@ -240,7 +279,8 @@ pub fn prepare_update_plan(
                 Some(&mut table_references),
                 Some(&result_columns),
                 connection,
-                &mut param_idx,
+                &mut program.param_ctx,
+                BindingBehavior::ResultColumnsNotAllowed,
             );
             (o.expr.clone(), o.order.unwrap_or(SortOrder::Asc))
         })
@@ -253,10 +293,11 @@ pub fn prepare_update_plan(
     let columns = table.columns();
 
     let rowid_alias_used = set_clauses.iter().fold(false, |accum, (idx, _)| {
-        accum || columns[*idx].is_rowid_alias
+        accum || (*idx != ROWID_SENTINEL && columns[*idx].is_rowid_alias)
     });
+    let direct_rowid_update = set_clauses.iter().any(|(idx, _)| *idx == ROWID_SENTINEL);
 
-    let (ephemeral_plan, mut where_clause) = if rowid_alias_used {
+    let (ephemeral_plan, mut where_clause) = if rowid_alias_used || direct_rowid_update {
         let mut where_clause = vec![];
         let internal_id = program.table_reference_counter.next();
 
@@ -282,13 +323,14 @@ pub fn prepare_update_plan(
             Some(&result_columns),
             &mut where_clause,
             connection,
-            &mut param_idx,
+            &mut program.param_ctx,
         )?;
 
         let table = Arc::new(BTreeTable {
             root_page: 0, // Not relevant for ephemeral table definition
             name: "ephemeral_scratch".to_string(),
             has_rowid: true,
+            has_autoincrement: false,
             primary_key_columns: vec![],
             columns: vec![Column {
                 name: Some("rowid".to_string()),
@@ -359,13 +401,13 @@ pub fn prepare_update_plan(
             Some(&result_columns),
             &mut where_clause,
             connection,
-            &mut param_idx,
+            &mut program.param_ctx,
         )?;
     };
 
     // Parse the LIMIT/OFFSET clause
     let (limit, offset) = body.limit.as_mut().map_or(Ok((None, None)), |l| {
-        parse_limit(l, connection, &mut param_idx)
+        parse_limit(l, connection, &mut program.param_ctx)
     })?;
 
     // Check what indexes will need to be updated by checking set_clauses and see
@@ -374,7 +416,7 @@ pub fn prepare_update_plan(
     let updated_cols: HashSet<usize> = set_clauses.iter().map(|(i, _)| *i).collect();
     let rowid_alias_used = set_clauses
         .iter()
-        .any(|(idx, _)| columns[*idx].is_rowid_alias);
+        .any(|(idx, _)| *idx == ROWID_SENTINEL || columns[*idx].is_rowid_alias);
     let indexes_to_update = if rowid_alias_used {
         // If the rowid alias is used in the SET clause, we need to update all indexes
         indexes.cloned().collect()
@@ -400,6 +442,7 @@ pub fn prepare_update_plan(
                             None,
                             connection,
                             &mut param,
+                            BindingBehavior::ResultColumnsNotAllowed,
                         )
                         .ok()?;
                         let cols_used = collect_cols_used_in_expr(&where_copy);

@@ -5,7 +5,7 @@ use super::plan::{
 };
 use crate::schema::Table;
 use crate::translate::emitter::Resolver;
-use crate::translate::expr::{bind_and_rewrite_expr, ParamState};
+use crate::translate::expr::{bind_and_rewrite_expr, BindingBehavior, ParamState};
 use crate::translate::group_by::compute_group_by_sort_order;
 use crate::translate::optimizer::optimize_plan;
 use crate::translate::plan::{GroupBy, Plan, ResultSetColumn, SelectPlan};
@@ -15,10 +15,10 @@ use crate::translate::planner::{
 };
 use crate::translate::window::plan_windows;
 use crate::util::normalize_ident;
-use crate::vdbe::builder::{ProgramBuilderOpts, TableRefIdCounter};
+use crate::vdbe::builder::ProgramBuilderOpts;
 use crate::vdbe::insn::Insn;
-use crate::{schema::Schema, vdbe::builder::ProgramBuilder, Result};
-use crate::{Connection, SymbolTable};
+use crate::Connection;
+use crate::{vdbe::builder::ProgramBuilder, Result};
 use std::sync::Arc;
 use turso_parser::ast::ResultColumn;
 use turso_parser::ast::{self, CompoundSelect, Expr};
@@ -29,23 +29,21 @@ pub struct TranslateSelectResult {
 }
 
 pub fn translate_select(
-    schema: &Schema,
     select: ast::Select,
-    syms: &SymbolTable,
+    resolver: &Resolver,
     mut program: ProgramBuilder,
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
 ) -> Result<TranslateSelectResult> {
     let mut select_plan = prepare_select_plan(
-        schema,
         select,
-        syms,
+        resolver,
+        &mut program,
         &[],
-        &mut program.table_reference_counter,
         query_destination,
         connection,
     )?;
-    optimize_plan(&mut select_plan, schema)?;
+    optimize_plan(&mut select_plan, resolver.schema)?;
     let num_result_cols;
     let opts = match &select_plan {
         Plan::Select(select) => {
@@ -84,7 +82,7 @@ pub fn translate_select(
     };
 
     program.extend(&opts);
-    emit_program(connection, &mut program, select_plan, schema, syms, |_| {})?;
+    emit_program(connection, resolver, &mut program, select_plan, |_| {})?;
     Ok(TranslateSelectResult {
         program,
         num_result_cols,
@@ -92,60 +90,52 @@ pub fn translate_select(
 }
 
 pub fn prepare_select_plan(
-    schema: &Schema,
     select: ast::Select,
-    syms: &SymbolTable,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
     outer_query_refs: &[OuterQueryReference],
-    table_ref_counter: &mut TableRefIdCounter,
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
 ) -> Result<Plan> {
     let compounds = select.body.compounds;
-    let mut param_ctx = ParamState::default();
     match compounds.is_empty() {
         true => Ok(Plan::Select(prepare_one_select_plan(
-            schema,
             select.body.select,
+            resolver,
+            program,
             select.limit,
             select.order_by,
             select.with,
-            syms,
             outer_query_refs,
-            table_ref_counter,
             query_destination,
             connection,
-            &mut param_ctx,
         )?)),
         false => {
             let mut last = prepare_one_select_plan(
-                schema,
                 select.body.select,
+                resolver,
+                program,
                 None,
                 vec![],
                 None,
-                syms,
                 outer_query_refs,
-                table_ref_counter,
                 query_destination.clone(),
                 connection,
-                &mut param_ctx,
             )?;
 
             let mut left = Vec::with_capacity(compounds.len());
             for CompoundSelect { select, operator } in compounds {
                 left.push((last, operator));
                 last = prepare_one_select_plan(
-                    schema,
                     select,
+                    resolver,
+                    program,
                     None,
                     vec![],
                     None,
-                    syms,
                     outer_query_refs,
-                    table_ref_counter,
                     query_destination.clone(),
                     connection,
-                    &mut param_ctx,
                 )?;
             }
 
@@ -157,7 +147,7 @@ pub fn prepare_select_plan(
                 }
             }
             let (limit, offset) = select.limit.map_or(Ok((None, None)), |mut l| {
-                parse_limit(&mut l, connection, &mut param_ctx)
+                parse_limit(&mut l, connection, &mut program.param_ctx)
             })?;
 
             // FIXME: handle ORDER BY for compound selects
@@ -181,17 +171,15 @@ pub fn prepare_select_plan(
 
 #[allow(clippy::too_many_arguments)]
 fn prepare_one_select_plan(
-    schema: &Schema,
     select: ast::OneSelect,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
     limit: Option<ast::Limit>,
     order_by: Vec<ast::SortedColumn>,
     with: Option<ast::With>,
-    syms: &SymbolTable,
     outer_query_refs: &[OuterQueryReference],
-    table_ref_counter: &mut TableRefIdCounter,
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
-    param_ctx: &mut ParamState,
 ) -> Result<SelectPlan> {
     match select {
         ast::OneSelect::Select {
@@ -203,7 +191,7 @@ fn prepare_one_select_plan(
             window_clause,
             ..
         } => {
-            if !schema.indexes_enabled() && distinctness.is_some() {
+            if !resolver.schema.indexes_enabled() && distinctness.is_some() {
                 crate::bail_parse_error!(
                     "SELECT with DISTINCT is not allowed without indexes enabled"
                 );
@@ -229,16 +217,14 @@ fn prepare_one_select_plan(
 
             // Parse the FROM clause into a vec of TableReferences. Fold all the join conditions expressions into the WHERE clause.
             parse_from(
-                schema,
                 from,
-                syms,
+                resolver,
+                program,
                 with,
                 &mut where_predicates,
                 &mut vtab_predicates,
                 &mut table_references,
-                table_ref_counter,
                 connection,
-                param_ctx,
             )?;
 
             // Preallocate space for the result columns
@@ -301,7 +287,8 @@ fn prepare_one_select_plan(
                         Some(&mut plan.table_references),
                         None,
                         connection,
-                        param_ctx,
+                        &mut program.param_ctx,
+                        BindingBehavior::ResultColumnsNotAllowed,
                     )?;
                 }
                 for (expr, _) in window.order_by.iter_mut() {
@@ -310,7 +297,8 @@ fn prepare_one_select_plan(
                         Some(&mut plan.table_references),
                         None,
                         connection,
-                        param_ctx,
+                        &mut program.param_ctx,
+                        BindingBehavior::ResultColumnsNotAllowed,
                     )?;
                 }
 
@@ -372,12 +360,12 @@ fn prepare_one_select_plan(
                             Some(&mut plan.table_references),
                             None,
                             connection,
-                            param_ctx,
+                            &mut program.param_ctx,
+                            BindingBehavior::ResultColumnsNotAllowed,
                         )?;
                         let contains_aggregates = resolve_window_and_aggregate_functions(
-                            schema,
-                            syms,
                             expr,
+                            resolver,
                             &mut aggregate_expressions,
                             Some(&mut windows),
                         )?;
@@ -400,7 +388,7 @@ fn prepare_one_select_plan(
                 &mut vtab_predicates,
                 &mut plan,
                 connection,
-                param_ctx,
+                &mut program.param_ctx,
             )?;
 
             // Parse the actual WHERE clause and add its conditions to the plan WHERE clause that already contains the join conditions.
@@ -410,7 +398,7 @@ fn prepare_one_select_plan(
                 Some(&plan.result_columns),
                 &mut plan.where_clause,
                 connection,
-                param_ctx,
+                &mut program.param_ctx,
             )?;
 
             if let Some(mut group_by) = group_by {
@@ -421,7 +409,8 @@ fn prepare_one_select_plan(
                         Some(&mut plan.table_references),
                         Some(&plan.result_columns),
                         connection,
-                        param_ctx,
+                        &mut program.param_ctx,
+                        BindingBehavior::TryResultColumnsFirst,
                     )?;
                 }
 
@@ -437,12 +426,12 @@ fn prepare_one_select_plan(
                                 Some(&mut plan.table_references),
                                 Some(&plan.result_columns),
                                 connection,
-                                param_ctx,
+                                &mut program.param_ctx,
+                                BindingBehavior::TryResultColumnsFirst,
                             )?;
                             let contains_aggregates = resolve_window_and_aggregate_functions(
-                                schema,
-                                syms,
                                 expr,
+                                resolver,
                                 &mut aggregate_expressions,
                                 None,
                             )?;
@@ -476,12 +465,12 @@ fn prepare_one_select_plan(
                     Some(&mut plan.table_references),
                     Some(&plan.result_columns),
                     connection,
-                    param_ctx,
+                    &mut program.param_ctx,
+                    BindingBehavior::TryResultColumnsFirst,
                 )?;
                 resolve_window_and_aggregate_functions(
-                    schema,
-                    syms,
                     &o.expr,
+                    resolver,
                     &mut plan.aggregates,
                     Some(&mut windows),
                 )?;
@@ -496,23 +485,34 @@ fn prepare_one_select_plan(
                     &group_by.exprs,
                     &plan.order_by,
                     &plan.aggregates,
-                    &Resolver::new(schema, syms),
+                    resolver,
                 ));
             }
 
             // Parse the LIMIT/OFFSET clause
             (plan.limit, plan.offset) = limit.map_or(Ok((None, None)), |mut l| {
-                parse_limit(&mut l, connection, param_ctx)
+                parse_limit(&mut l, connection, &mut program.param_ctx)
             })?;
 
             if !windows.is_empty() {
-                plan_windows(schema, syms, &mut plan, table_ref_counter, &mut windows)?;
+                plan_windows(
+                    &mut plan,
+                    resolver,
+                    &mut program.table_reference_counter,
+                    &mut windows,
+                )?;
             }
 
             // Return the unoptimized query plan
             Ok(plan)
         }
         ast::OneSelect::Values(values) => {
+            if !order_by.is_empty() {
+                crate::bail_parse_error!("ORDER BY clause is not allowed with VALUES clause");
+            }
+            if limit.is_some() {
+                crate::bail_parse_error!("LIMIT clause is not allowed with VALUES clause");
+            }
             let len = values[0].len();
             let mut result_columns = Vec::with_capacity(len);
             for i in 0..len {
@@ -561,6 +561,7 @@ fn add_vtab_predicates_to_where_clause(
             Some(&plan.result_columns),
             connection,
             param_ctx,
+            BindingBehavior::TryCanonicalColumnsFirst,
         )?;
     }
     for expr in vtab_predicates.drain(..) {

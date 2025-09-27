@@ -1,5 +1,5 @@
 import { expect, test } from 'vitest'
-import { connect } from './promise-default.js'
+import { connect, Database } from './promise-default.js'
 
 test('in-memory db', async () => {
     const db = await connect(":memory:");
@@ -8,6 +8,13 @@ test('in-memory db', async () => {
     const stmt = db.prepare("SELECT * FROM t WHERE x % 2 = ?");
     const rows = await stmt.all([1]);
     expect(rows).toEqual([{ x: 1 }, { x: 3 }]);
+})
+
+test('explicit connect', async () => {
+    const db = new Database(':memory:');
+    expect(() => db.prepare("SELECT 1")).toThrowError(/database must be connected/g);
+    await db.connect();
+    expect(await db.prepare("SELECT 1 as x").all()).toEqual([{ x: 1 }]);
 })
 
 test('on-disk db large inserts', async () => {
