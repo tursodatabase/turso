@@ -1233,7 +1233,11 @@ pub fn create_table(
                         ast::ColumnConstraint::NotNull { nullable, .. } => {
                             notnull = !nullable;
                         }
-                        ast::ColumnConstraint::Default(ref expr) => default = Some(expr),
+                        ast::ColumnConstraint::Default(ref expr) => {
+                            default = Some(
+                                translate_ident_to_string_literal(expr).unwrap_or(expr.clone()),
+                            );
+                        }
                         // TODO: for now we don't check Resolve type of unique
                         ast::ColumnConstraint::Unique(on_conflict) => {
                             if on_conflict.is_some() {
@@ -1268,7 +1272,7 @@ pub fn create_table(
                     primary_key,
                     is_rowid_alias: typename_exactly_integer && primary_key,
                     notnull,
-                    default: default.cloned(),
+                    default,
                     unique,
                     collation,
                     hidden: false,
@@ -1359,6 +1363,19 @@ pub fn create_table(
     })
 }
 
+pub fn translate_ident_to_string_literal(expr: &Expr) -> Option<Box<Expr>> {
+    match expr {
+        // SQLite treats a bare identifier as a string literal in DEFAULT clause
+        Expr::Name(Name::Ident(str)) | Expr::Id(Name::Ident(str)) => {
+            Some(Box::new(Expr::Literal(Literal::String(format!("'{str}'")))))
+        }
+        Expr::Name(Name::Quoted(str)) | Expr::Id(Name::Quoted(str)) => Some(Box::new(
+            Expr::Literal(Literal::String(format!("'{}'", normalize_ident(str)))),
+        )),
+        _ => None,
+    }
+}
+
 pub fn _build_pseudo_table(columns: &[ResultColumn]) -> PseudoCursorType {
     let table = PseudoCursorType::new();
     for column in columns {
@@ -1415,7 +1432,8 @@ impl From<&ColumnDefinition> for Column {
                 ast::ColumnConstraint::NotNull { .. } => notnull = true,
                 ast::ColumnConstraint::Unique(..) => unique = true,
                 ast::ColumnConstraint::Default(expr) => {
-                    default.replace(expr.clone());
+                    default
+                        .replace(translate_ident_to_string_literal(expr).unwrap_or(expr.clone()));
                 }
                 ast::ColumnConstraint::Collate { collation_name } => {
                     collation.replace(
