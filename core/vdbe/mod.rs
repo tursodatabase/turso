@@ -263,6 +263,9 @@ pub struct Row {
     count: usize,
 }
 
+unsafe impl Send for Row {}
+unsafe impl Sync for Row {}
+
 /// The program state describes the environment in which the program executes.
 pub struct ProgramState {
     pub io_completions: Option<IOCompletions>,
