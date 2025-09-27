@@ -4,11 +4,13 @@ use rand::{Rng, RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use sql_generation::{
     generation::{Arbitrary, GenerationContext, Opts},
-    model::query::{
-        create::Create, create_index::CreateIndex, delete::Delete, drop_index::DropIndex,
-        insert::Insert, select::Select, update::Update,
+    model::{
+        query::{
+            create::Create, create_index::CreateIndex, delete::Delete, drop_index::DropIndex,
+            insert::Insert, select::Select, update::Update,
+        },
+        table::{Column, ColumnType, SimValue, Table},
     },
-    model::table::{Column, ColumnType, Table},
 };
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -602,6 +604,11 @@ fn file_size_soft_limit_exceeded(
 }
 
 impl GenerationContext for SimulatorContext {
+    fn values(&self) -> &Vec<SimValue> {
+        // We don't store any memorized values in this simulator
+        todo!()
+    }
+
     fn tables(&self) -> &Vec<Table> {
         &self.tables
     }

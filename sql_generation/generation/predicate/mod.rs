@@ -28,19 +28,13 @@ impl<A: AsRef<[SimValue]>, T: TableContext> ArbitraryFrom<(&T, A, bool)> for Sim
     ) -> Self {
         let row = row.as_ref();
         // Pick an operator
-        let choice = rng.random_range(0..2);
+        let choice = rng.random::<bool>();
         // Pick an operator
-        match predicate_value {
-            true => match choice {
-                0 => SimplePredicate::true_binary(rng, context, table, row),
-                1 => SimplePredicate::true_unary(rng, context, table, row),
-                _ => unreachable!(),
-            },
-            false => match choice {
-                0 => SimplePredicate::false_binary(rng, context, table, row),
-                1 => SimplePredicate::false_unary(rng, context, table, row),
-                _ => unreachable!(),
-            },
+        match (predicate_value, choice) {
+            (true, true) => SimplePredicate::true_binary(rng, context, table, row),
+            (true, false) => SimplePredicate::true_unary(rng, context, table, row),
+            (false, true) => SimplePredicate::false_binary(rng, context, table, row),
+            (false, false) => SimplePredicate::false_unary(rng, context, table, row),
         }
     }
 }
@@ -72,15 +66,15 @@ impl<T: TableContext> ArbitraryFrom<(&T, bool)> for Predicate {
     }
 }
 
-impl ArbitraryFrom<(&str, &SimValue)> for Predicate {
-    fn arbitrary_from<R: Rng, C: GenerationContext>(
-        rng: &mut R,
-        context: &C,
-        (column_name, value): (&str, &SimValue),
-    ) -> Self {
-        Predicate::from_column_binary(rng, context, column_name, value)
-    }
-}
+// impl ArbitraryFrom<(&str, &SimValue)> for Predicate {
+//     fn arbitrary_from<R: Rng, C: GenerationContext>(
+//         rng: &mut R,
+//         context: &C,
+//         (column_name, value): (&str, &SimValue),
+//     ) -> Self {
+//         Predicate::from_column_binary(rng, context, column_name, value)
+//     }
+// }
 
 impl ArbitraryFrom<(&Table, &Vec<SimValue>)> for Predicate {
     fn arbitrary_from<R: Rng, C: GenerationContext>(
@@ -90,7 +84,7 @@ impl ArbitraryFrom<(&Table, &Vec<SimValue>)> for Predicate {
     ) -> Self {
         // We want to produce a predicate that is true for the row
         // We can do this by creating several predicates that
-        // are true, some that are false, combiend them in ways that correspond to the creation of a true predicate
+        // are true, some that are false, combine them in ways that correspond to the creation of a true predicate
 
         // Produce some true and false predicates
         let mut true_predicates = (1..=rng.random_range(1..=4))

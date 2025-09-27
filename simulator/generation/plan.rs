@@ -121,13 +121,18 @@ impl InteractionPlan {
                     let _ = plan[j].split_off(k);
                     break;
                 }
-                log::error!("Comparing '{}' with '{}'", interactions[i], plan[j][k]);
+                log::error!(
+                    "[{}]: Comparing '{}' with '{}'",
+                    interactions[i].contains(plan[j][k].to_string().as_str()),
+                    interactions[i],
+                    plan[j][k],
+                );
                 if interactions[i].contains(plan[j][k].to_string().as_str()) {
                     i += 1;
                     k += 1;
                 } else {
                     plan[j].remove(k);
-                    panic!("Comparing '{}' with '{}'", interactions[i], plan[j][k]);
+                    // panic!("Comparing '{}' with '{}'", interactions[i], plan[j][k]);
                 }
             }
 
@@ -551,7 +556,7 @@ impl Display for InteractionPlan {
                     writeln!(f, "-- end testing '{name}'")?;
                 }
                 InteractionsType::Fault(fault) => {
-                    writeln!(f, "-- FAULT '{fault}'")?;
+                    writeln!(f, "-- FAULT '{fault}';")?;
                 }
                 InteractionsType::Query(query) => {
                     writeln!(f, "{query}; -- {}", interactions.connection_index)?;
@@ -637,6 +642,75 @@ impl Assertion {
             name,
         }
     }
+
+    pub fn table_exists(table_name: &str) -> Self {
+        let name = format!("table_exists({})", table_name);
+        let table_name = table_name.to_string();
+        Self::new(name, move |_, env| {
+            if env
+                .connection_context(0)
+                .tables()
+                .iter()
+                .any(|t| t.name == table_name)
+            {
+                Ok(Ok(()))
+            } else {
+                Ok(Err(format!("Table '{}' does not exist", table_name)))
+            }
+        })
+    }
+
+    pub fn expect_error(err_str: &str, reason: &str) -> Self {
+        let name = format!("expect_error({}, {})", err_str, reason);
+        let err_str = err_str.to_string();
+        let reason = reason.to_string();
+        Self::new(name, move |stack, _| {
+            if let Some(Err(e)) = stack.last() {
+                if e.to_string().contains(&err_str) {
+                    Ok(Ok(()))
+                } else {
+                    Ok(Err(format!(
+                        "Expected error containing '{}' due to {}, but got '{}'",
+                        err_str, reason, e
+                    )))
+                }
+            } else {
+                Ok(Err(format!(
+                    "Expected error containing '{}' due to {}, but got no error",
+                    err_str, reason
+                )))
+            }
+        })
+    }
+
+    pub fn compare_result_length(other: usize, op: &str, reason: &str) -> Self {
+        let name = format!("compare_result_length({}, {}, {})", other, op, reason);
+        let other = other.clone();
+        let op = op.to_string();
+        let reason = reason.to_string();
+        Self::new(name, move |stack, _| {
+            let len = stack.last().unwrap().clone()?.len();
+            let result = match op.as_str() {
+                "=" => len == other,
+                "!=" => len != other,
+                "<" => len < other,
+                "<=" => len <= other,
+                ">" => len > other,
+                ">=" => len >= other,
+                _ => {
+                    return Ok(Err(format!("Unknown comparison operator '{}'", op)));
+                }
+            };
+            if result {
+                Ok(Ok(()))
+            } else {
+                Ok(Err(format!(
+                    "Comparison for {} failed: {:?} {} {:?}",
+                    reason, len, op, other
+                )))
+            }
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -715,8 +789,8 @@ impl Display for Interaction {
 impl Display for InteractionType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Query(query) => write!(f, "{query}"),
-            Self::Assumption(assumption) => write!(f, "-- ASSUME {}", assumption.name),
+            Self::Query(query) => write!(f, "{query};"),
+            Self::Assumption(assumption) => write!(f, "-- ASSUME {};", assumption.name),
             Self::Assertion(assertion) => {
                 write!(f, "-- ASSERT {};", assertion.name)
             }
@@ -726,7 +800,7 @@ impl Display for InteractionType {
                 writeln!(f, "{query};")?;
                 write!(f, "{query};")
             }
-            Self::FaultyQuery(query) => write!(f, "{query}; -- FAULTY QUERY"),
+            Self::FaultyQuery(query) => write!(f, "{query}; -- FAULTY QUERY;"),
         }
     }
 }

@@ -9,10 +9,11 @@ use rand::distr::weighted::WeightedIndex;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::model::table::Table;
+use crate::model::table::{SimValue, Table};
 
 /// Trait used to provide context to generation functions
 pub trait GenerationContext {
+    fn values(&self) -> &Vec<SimValue>;
     fn tables(&self) -> &Vec<Table>;
     fn opts(&self) -> &Opts;
 }

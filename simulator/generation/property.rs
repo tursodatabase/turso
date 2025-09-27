@@ -304,17 +304,7 @@ impl Property {
             }
             Property::ReadYourUpdatesBack { update, select } => {
                 let table = update.table().to_string();
-                let assumption = InteractionType::Assumption(Assertion::new(
-                    format!("table {} exists", table.clone()),
-                    move |_: &Vec<ResultSet>, env: &mut SimulatorEnv| {
-                        let conn_tables = env.get_conn_tables(connection_index);
-                        if conn_tables.iter().any(|t| t.name == table.clone()) {
-                            Ok(Ok(()))
-                        } else {
-                            Ok(Err(format!("table {} does not exist", table.clone())))
-                        }
-                    },
-                ));
+                let assumption = InteractionType::Assumption(Assertion::table_exists(&table));
 
                 let update_interaction = InteractionType::Query(Query::Update(update.clone()));
                 let select_interaction = InteractionType::Query(Query::Select(select.clone()));
@@ -380,20 +370,7 @@ impl Property {
                 let row = values[*row_index].clone();
 
                 // Assume that the table exists
-                let assumption = InteractionType::Assumption(Assertion::new(
-                    format!("table {} exists", insert.table()),
-                    {
-                        let table_name = table.clone();
-                        move |_: &Vec<ResultSet>, env: &mut SimulatorEnv| {
-                            let conn_tables = env.get_conn_tables(connection_index);
-                            if conn_tables.iter().any(|t| t.name == table_name) {
-                                Ok(Ok(()))
-                            } else {
-                                Ok(Err(format!("table {table_name} does not exist")))
-                            }
-                        }
-                    },
-                ));
+                let assumption = InteractionType::Assumption(Assertion::table_exists(&table));
 
                 let assertion = InteractionType::Assertion(Assertion::new(
                     format!(
@@ -469,22 +446,10 @@ impl Property {
 
                 let table_name = create.table.name.clone();
 
-                let assertion = InteractionType::Assertion(Assertion::new("creating two tables with the name should result in a failure for the second query"
-                                    .to_string(), move |stack: &Vec<ResultSet>, env| {
-                                let last = stack.last().unwrap();
-                                match last {
-                                    Ok(success) => Ok(Err(format!("expected table creation to fail but it succeeded: {success:?}"))),
-                                    Err(e) => {
-                                        if e.to_string().to_lowercase().contains(&format!("table {table_name} already exists")) {
-                                             // On error we rollback the transaction if there is any active here
-                                            env.rollback_conn(connection_index);
-                                            Ok(Ok(()))
-                                        } else {
-                                            Ok(Err(format!("expected table already exists error, got: {e}")))
-                                        }
-                                    }
-                                }
-                            }) );
+                let assertion = InteractionType::Assertion(Assertion::expect_error(
+                    &format!("table {table_name} already exists"),
+                    "creating two tables with the name should result in a failure for the second query",
+                ));
 
                 let mut interactions = Vec::new();
                 interactions.push(Interaction::new(connection_index, assumption));
@@ -534,25 +499,10 @@ impl Property {
                     .limit
                     .expect("Property::SelectLimit without a LIMIT clause");
 
-                let assertion = InteractionType::Assertion(Assertion::new(
-                    "select query should respect the limit clause".to_string(),
-                    move |stack: &Vec<ResultSet>, _| {
-                        let last = stack.last().unwrap();
-                        match last {
-                            Ok(rows) => {
-                                if limit >= rows.len() {
-                                    Ok(Ok(()))
-                                } else {
-                                    Ok(Err(format!(
-                                        "limit {} violated: got {} rows",
-                                        limit,
-                                        rows.len()
-                                    )))
-                                }
-                            }
-                            Err(_) => Ok(Ok(())),
-                        }
-                    },
+                let assertion = InteractionType::Assertion(Assertion::compare_result_length(
+                    limit,
+                    "<=",
+                    "select query should respect the limit clause",
                 ));
 
                 vec![

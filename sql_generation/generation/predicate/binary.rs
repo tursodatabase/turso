@@ -16,44 +16,6 @@ use crate::{
 };
 
 impl Predicate {
-    /// Generate an [ast::Expr::Binary] [Predicate] from a column and [SimValue]
-    pub fn from_column_binary<R: rand::Rng, C: GenerationContext>(
-        rng: &mut R,
-        context: &C,
-        column_name: &str,
-        value: &SimValue,
-    ) -> Predicate {
-        let expr = one_of(
-            vec![
-                Box::new(|_| {
-                    Expr::Binary(
-                        Box::new(Expr::Id(ast::Name::exact(column_name.to_string()))),
-                        ast::Operator::Equals,
-                        Box::new(Expr::Literal(value.into())),
-                    )
-                }),
-                Box::new(|rng| {
-                    let gt_value = GTValue::arbitrary_from(rng, context, value).0;
-                    Expr::Binary(
-                        Box::new(Expr::Id(ast::Name::exact(column_name.to_string()))),
-                        ast::Operator::Greater,
-                        Box::new(Expr::Literal(gt_value.into())),
-                    )
-                }),
-                Box::new(|rng| {
-                    let lt_value = LTValue::arbitrary_from(rng, context, value).0;
-                    Expr::Binary(
-                        Box::new(Expr::Id(ast::Name::exact(column_name.to_string()))),
-                        ast::Operator::Less,
-                        Box::new(Expr::Literal(lt_value.into())),
-                    )
-                }),
-            ],
-            rng,
-        );
-        Predicate(expr)
-    }
-
     /// Produces a true [ast::Expr::Binary] [Predicate] that is true for the provided row in the given table
     pub fn true_binary<R: rand::Rng, C: GenerationContext>(
         rng: &mut R,

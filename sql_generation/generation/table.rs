@@ -95,15 +95,46 @@ impl ArbitraryFrom<&Vec<&SimValue>> for SimValue {
 impl ArbitraryFrom<&ColumnType> for SimValue {
     fn arbitrary_from<R: Rng, C: GenerationContext>(
         rng: &mut R,
-        _context: &C,
+        context: &C,
         column_type: &ColumnType,
     ) -> Self {
+        // 5%: Null
+        if rng.random_bool(0.05) {
+            return SimValue(Value::Null);
+        }
+        // 10%: Pick a random type
+        let column_type = if rng.random_bool(0.1) {
+            ColumnType::arbitrary(rng, context)
+        } else {
+            column_type.clone()
+        };
+        // 40%: Use a memorized value
+        if rng.random_bool(0.9) {
+            if let Some(mem_value) = context
+                .values()
+                .iter()
+                .filter(|v| match (&v.0, &column_type) {
+                    (Value::Integer(_), ColumnType::Integer) => true,
+                    (Value::Float(_), ColumnType::Float) => true,
+                    (Value::Text(_), ColumnType::Text) => true,
+                    (Value::Blob(_), ColumnType::Blob) => true,
+                    _ => false,
+                })
+                .collect::<Vec<_>>()
+                .first()
+            {
+                println!("Reusing memorized value: {}", mem_value.0);
+                return SimValue(mem_value.0.clone());
+            }
+        }
+
         let value = match column_type {
             ColumnType::Integer => Value::Integer(rng.random_range(i64::MIN..i64::MAX)),
             ColumnType::Float => Value::Float(rng.random_range(-1e10..1e10)),
             ColumnType::Text => Value::build_text(gen_random_text(rng)),
             ColumnType::Blob => Value::Blob(gen_random_text(rng).as_bytes().to_vec()),
         };
+
         SimValue(value)
     }
 }

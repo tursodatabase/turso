@@ -282,16 +282,13 @@ fn limbo_integrity_check(conn: &Arc<Connection>) -> Result<()> {
     Ok(())
 }
 
+#[instrument(skip(env, interaction, stack), fields(seed = %env.opts.seed, interaction = %interaction))]
 fn execute_interaction_rusqlite(
     env: &mut SimulatorEnv,
     interaction: &Interaction,
     stack: &mut Vec<ResultSet>,
 ) -> turso_core::Result<ExecutionContinuation> {
-    tracing::trace!(
-        "execute_interaction_rusqlite(connection_index={}, interaction={})",
-        interaction.connection_index,
-        interaction
-    );
+    tracing::info!("");
     let SimConnection::SQLiteConnection(conn) = &mut env.connections[interaction.connection_index]
     else {
         unreachable!()

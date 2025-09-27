@@ -11,7 +11,7 @@ use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use sql_generation::generation::GenerationContext;
 use sql_generation::model::query::transaction::Rollback;
-use sql_generation::model::table::Table;
+use sql_generation::model::table::{SimValue, Table};
 use turso_core::Database;
 
 use crate::generation::Shadow;
@@ -156,7 +156,8 @@ pub(crate) struct SimulatorEnv {
     pub(crate) type_: SimulationType,
     pub(crate) phase: SimulationPhase,
     pub memory_io: bool,
-
+    /// Values that have been memorized during the simulation
+    pub memorized_values: Vec<SimValue>,
     /// If connection state is None, means we are not in a transaction
     pub connection_tables: Vec<Option<TransactionTables>>,
     /// Bit map indicating whether a connection has executed a query that is not transaction related
@@ -191,6 +192,7 @@ impl SimulatorEnv {
             connection_tables: self.connection_tables.clone(),
             connection_last_query: self.connection_last_query,
             committed_tables: self.committed_tables.clone(),
+            memorized_values: self.memorized_values.clone(),
         }
     }
 
@@ -400,6 +402,7 @@ impl SimulatorEnv {
             paths,
             rng,
             seed,
+            memorized_values: Vec::new(),
             io,
             db: Some(db),
             type_: simulation_type,
@@ -455,9 +458,13 @@ impl SimulatorEnv {
         struct ConnectionGenContext<'a> {
             tables: &'a Vec<sql_generation::model::table::Table>,
             opts: &'a sql_generation::generation::Opts,
+            values: &'a Vec<sql_generation::model::table::SimValue>,
         }
 
         impl<'a> GenerationContext for ConnectionGenContext<'a> {
+            fn values(&self) -> &Vec<sql_generation::model::table::SimValue> {
+                self.values
+            }
             fn tables(&self) -> &Vec<sql_generation::model::table::Table> {
                 self.tables
             }
@@ -472,6 +479,7 @@ impl SimulatorEnv {
         ConnectionGenContext {
             opts: &self.profile.query.gen_opts,
             tables,
+            values: &self.memorized_values,
         }
     }
 
