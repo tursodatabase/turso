@@ -210,3 +210,21 @@ sim-schema:
 	mkdir -p  simulator/configs/custom
 	cargo run -p limbo_sim -- print-schema > simulator/configs/custom/profile-schema.json
 
+fuzz-bigass-db:
+ifndef SEED
+	$(error SEED is required. Usage: make fuzz-bigass-db SEED=12345)
+endif
+	@echo "Generating test databases with seed $(SEED)..."
+	SEED=$(SEED) DB_PATH="testing-turso-$(SEED).db" uv run testing/gen-bigass-database.py
+	sleep 1
+	sqlite3 "testing-turso-$(SEED).db" '.clone testing-sqlite-$(SEED).db'
+	sleep 1
+	@echo "Running fuzzing tests..."
+	if ! SEED=$(SEED) cargo test -- --ignored large_database_fuzz; then \
+		echo "Test failed, dumping databases..."; \
+		sqlite3 "testing-turso-$(SEED).db" .dump > "turso-$(SEED).sql"; \
+		sqlite3 "testing-sqlite-$(SEED).db" .dump > "sqlite-$(SEED).sql"; \
+		diff -u "sqlite-$(SEED).sql" "turso-$(SEED).sql" > "diff-$(SEED).txt" || true; \
+		echo "db files have been .dump'd and the diff has been saved to diff-$(SEED).txt"; \
+		exit 1; \
+	fi
