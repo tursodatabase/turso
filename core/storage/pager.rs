@@ -1737,7 +1737,7 @@ impl Pager {
                 page.clear_dirty();
             }
         }
-        cache.clear().expect("Failed to clear page cache");
+        cache.clear(true).expect("Failed to clear page cache");
     }
 
     /// Checkpoint in Truncate mode and delete the WAL file. This method is _only_ to be called
@@ -1842,7 +1842,7 @@ impl Pager {
         // TODO: only clear cache of things that are really invalidated
         self.page_cache
             .write()
-            .clear()
+            .clear(false)
             .map_err(|e| LimboError::InternalError(format!("Failed to clear page cache: {e:?}")))?;
         Ok(IOResult::Done(()))
     }

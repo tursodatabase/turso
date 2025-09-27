@@ -133,16 +133,6 @@ impl MemorySimFile {
     fn insert_op(&self, op: OperationType) {
         // FIXME: currently avoid any fsync faults until we correctly define the expected behaviour in the simulator
         let fault = self.fault.get() && !matches!(op, OperationType::Sync { .. });
-        if fault {
-            let mut io_tracker = self.io_tracker.borrow_mut();
-            match &op {
-                OperationType::Read { .. } => io_tracker.pread_faults += 1,
-                OperationType::Write { .. } => io_tracker.pwrite_faults += 1,
-                OperationType::WriteV { .. } => io_tracker.pwritev_faults += 1,
-                OperationType::Sync { .. } => io_tracker.sync_faults += 1,
-                OperationType::Truncate { .. } => io_tracker.truncate_faults += 1,
-            }
-        }
 
         self.callbacks.lock().push(Operation {
             time: self.generate_latency(),
@@ -150,6 +140,17 @@ impl MemorySimFile {
             fault,
             fd: self.fd.clone(),
         });
+    }
+
+    pub fn update_fault_stats(&self, op: &OperationType) {
+        let mut io_tracker = self.io_tracker.borrow_mut();
+        match op {
+            OperationType::Read { .. } => io_tracker.pread_faults += 1,
+            OperationType::Write { .. } => io_tracker.pwrite_faults += 1,
+            OperationType::WriteV { .. } => io_tracker.pwritev_faults += 1,
+            OperationType::Sync { .. } => io_tracker.sync_faults += 1,
+            OperationType::Truncate { .. } => io_tracker.truncate_faults += 1,
+        }
     }
 
     pub fn write_buf(&self, buf: &[u8], offset: usize) -> usize {

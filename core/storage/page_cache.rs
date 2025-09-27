@@ -527,7 +527,7 @@ impl PageCache {
         Ok(())
     }
 
-    pub fn clear(&mut self) -> Result<(), CacheError> {
+    pub fn clear(&mut self, clear_dirty: bool) -> Result<(), CacheError> {
         if self.map.len() == 0 {
             // Fast path: nothing to do.
             self.clock_hand = NULL;
@@ -537,7 +537,7 @@ impl PageCache {
         for node in self.map.iter() {
             let e = &self.entries[node.slot_index];
             if let Some(ref p) = e.page {
-                if p.is_dirty() {
+                if p.is_dirty() && !clear_dirty {
                     return Err(CacheError::Dirty { pgno: p.get().id });
                 }
             }
@@ -1157,7 +1157,7 @@ mod tests {
         let key1 = insert_page(&mut cache, 1);
         let key2 = insert_page(&mut cache, 2);
 
-        assert!(cache.clear().is_ok());
+        assert!(cache.clear(false).is_ok());
         assert!(cache.get(&key1).unwrap().is_none());
         assert!(cache.get(&key2).unwrap().is_none());
         assert_eq!(cache.len(), 0);
@@ -1446,7 +1446,7 @@ mod tests {
                 cache.insert(key, page).unwrap();
             }
 
-            cache.clear().unwrap();
+            cache.clear(false).unwrap();
             drop(cache);
         }
 
@@ -1536,7 +1536,7 @@ mod tests {
         for i in 1..=3 {
             let _ = insert_page(&mut c, i);
         }
-        c.clear().unwrap();
+        c.clear(false).unwrap();
         // No elements; insert should not rely on stale hand
         let _ = insert_page(&mut c, 10);
 
