@@ -4,7 +4,7 @@ use std::cell::{Cell, RefCell};
 use std::cmp::{Eq, Ord, Ordering, PartialEq, PartialOrd, Reverse};
 use std::collections::BinaryHeap;
 use std::rc::Rc;
-use std::sync::{Arc, RwLock};
+use std::sync::{atomic, Arc, RwLock};
 use tempfile;
 
 use crate::types::IOCompletions;
@@ -396,7 +396,7 @@ struct SortedChunk {
     /// The read buffer.
     buffer: Arc<RwLock<Vec<u8>>>,
     /// The current length of the buffer.
-    buffer_len: Rc<Cell<usize>>,
+    buffer_len: Arc<atomic::AtomicUsize>,
     /// The records decoded from the chunk file.
     records: Vec<ImmutableRecord>,
     /// The current IO state of the chunk.
@@ -414,7 +414,7 @@ impl SortedChunk {
             start_offset: start_offset as u64,
             chunk_size: 0,
             buffer: Arc::new(RwLock::new(vec![0; buffer_size])),
-            buffer_len: Rc::new(Cell::new(0)),
+            buffer_len: Arc::new(atomic::AtomicUsize::new(0)),
             records: Vec::new(),
             io_state: Rc::new(Cell::new(SortedChunkIOState::None)),
             total_bytes_read: Rc::new(Cell::new(0)),
@@ -422,11 +422,19 @@ impl SortedChunk {
         }
     }
 
+    fn buffer_len(&self) -> usize {
+        self.buffer_len.load(atomic::Ordering::SeqCst)
+    }
+
+    fn set_buffer_len(&self, len: usize) {
+        self.buffer_len.store(len, atomic::Ordering::SeqCst);
+    }
+
     fn next(&mut self) -> Result<IOResult<Option<ImmutableRecord>>> {
         loop {
             match self.next_state {
                 NextState::Start => {
-                    let mut buffer_len = self.buffer_len.get();
+                    let mut buffer_len = self.buffer_len();
                     if self.records.is_empty() && buffer_len == 0 {
                         return Ok(IOResult::Done(None));
                     }
@@ -474,7 +482,7 @@ impl SortedChunk {
                         } else {
                             buffer_len = 0;
                         }
-                        self.buffer_len.set(buffer_len);
+                        self.set_buffer_len(buffer_len);
 
                         self.records.reverse();
                     }
@@ -503,7 +511,7 @@ impl SortedChunk {
     fn read(&mut self) -> Result<Completion> {
         self.io_state.set(SortedChunkIOState::WaitingForRead);
 
-        let read_buffer_size = self.buffer.read().unwrap().len() - self.buffer_len.get();
+        let read_buffer_size = self.buffer.read().unwrap().len() - self.buffer_len();
         let read_buffer_size = read_buffer_size.min(self.chunk_size - self.total_bytes_read.get());
 
         let read_buffer = Buffer::new_temporary(read_buffer_size);
@@ -529,13 +537,13 @@ impl SortedChunk {
 
             let mut stored_buf_ref = stored_buffer_copy.write().unwrap();
             let stored_buf = stored_buf_ref.as_mut_slice();
-            let mut stored_buf_len = stored_buffer_len_copy.get();
+            let mut stored_buf_len = stored_buffer_len_copy.load(atomic::Ordering::SeqCst);
 
             stored_buf[stored_buf_len..stored_buf_len + bytes_read]
                 .copy_from_slice(&read_buf[..bytes_read]);
             stored_buf_len += bytes_read;
 
-            stored_buffer_len_copy.set(stored_buf_len);
+            stored_buffer_len_copy.store(stored_buf_len, atomic::Ordering::SeqCst);
             total_bytes_read_copy.set(total_bytes_read_copy.get() + bytes_read);
         });
 
