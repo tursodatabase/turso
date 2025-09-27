@@ -976,15 +976,11 @@ impl BTreeTable {
     pub fn get_rowid_alias_column(&self) -> Option<(usize, &Column)> {
         if self.primary_key_columns.len() == 1 {
             let (idx, col) = self.get_column(&self.primary_key_columns[0].0)?;
-            if self.column_is_rowid_alias(col) {
+            if col.is_rowid_alias {
                 return Some((idx, col));
             }
         }
         None
-    }
-
-    pub fn column_is_rowid_alias(&self, col: &Column) -> bool {
-        col.is_rowid_alias
     }
 
     /// Returns the column position and column for a given column name.
@@ -2027,7 +2023,7 @@ mod tests {
         let table = BTreeTable::from_sql(sql, 0)?;
         let column = table.get_column("a").unwrap().1;
         assert!(
-            !table.column_is_rowid_alias(column),
+            !column.is_rowid_alias,
             "column 'a´ has type different than INTEGER so can't be a rowid alias"
         );
         Ok(())
@@ -2038,10 +2034,7 @@ mod tests {
         let sql = r#"CREATE TABLE t1 (a INTEGER PRIMARY KEY, b TEXT);"#;
         let table = BTreeTable::from_sql(sql, 0)?;
         let column = table.get_column("a").unwrap().1;
-        assert!(
-            table.column_is_rowid_alias(column),
-            "column 'a´ should be a rowid alias"
-        );
+        assert!(column.is_rowid_alias, "column 'a´ should be a rowid alias");
         Ok(())
     }
 
@@ -2051,10 +2044,7 @@ mod tests {
         let sql = r#"CREATE TABLE t1 (a INTEGER, b TEXT, PRIMARY KEY(a));"#;
         let table = BTreeTable::from_sql(sql, 0)?;
         let column = table.get_column("a").unwrap().1;
-        assert!(
-            table.column_is_rowid_alias(column),
-            "column 'a´ should be a rowid alias"
-        );
+        assert!(column.is_rowid_alias, "column 'a´ should be a rowid alias");
         Ok(())
     }
 
@@ -2065,7 +2055,7 @@ mod tests {
         let table = BTreeTable::from_sql(sql, 0)?;
         let column = table.get_column("a").unwrap().1;
         assert!(
-            !table.column_is_rowid_alias(column),
+            !column.is_rowid_alias,
             "column 'a´ shouldn't be a rowid alias because table has no rowid"
         );
         Ok(())
@@ -2077,7 +2067,7 @@ mod tests {
         let table = BTreeTable::from_sql(sql, 0)?;
         let column = table.get_column("a").unwrap().1;
         assert!(
-            !table.column_is_rowid_alias(column),
+            !column.is_rowid_alias,
             "column 'a´ shouldn't be a rowid alias because table has no rowid"
         );
         Ok(())
@@ -2100,7 +2090,7 @@ mod tests {
         let table = BTreeTable::from_sql(sql, 0)?;
         let column = table.get_column("a").unwrap().1;
         assert!(
-            !table.column_is_rowid_alias(column),
+            !column.is_rowid_alias,
             "column 'a´ shouldn't be a rowid alias because table has composite primary key"
         );
         Ok(())

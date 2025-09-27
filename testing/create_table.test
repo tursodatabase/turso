@@ -45,3 +45,11 @@ do_execsql_test_in_memory_any_error create_table_column_and_table_primary_keys {
 do_execsql_test_in_memory_any_error create_table_multiple_table_primary_keys {
     CREATE TABLE t(a,b,c,d,primary key(a,b), primary key(c,d));
 }
+
+# https://github.com/tursodatabase/turso/issues/3282
+do_execsql_test_on_specific_db {:memory:} col-named-rowid {
+  create table t(rowid, a);
+  insert into t values (1,2), (2,3), (3,4);
+  update t set rowid = 1; -- should allow regular update and not throw unique constraint
+  select count(*) from t where rowid = 1;
+} {3}
