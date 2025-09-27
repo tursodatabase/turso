@@ -9,7 +9,7 @@ use tracing::{instrument, Level};
 use parking_lot::RwLock;
 use std::fmt::{Debug, Formatter};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::{cell::Cell, fmt, rc::Rc, sync::Arc};
+use std::{cell::Cell, fmt, sync::Arc};
 
 use super::buffer_pool::BufferPool;
 use super::pager::{PageRef, Pager};
@@ -561,7 +561,7 @@ pub struct WalFile {
     io: Arc<dyn IO>,
     buffer_pool: Arc<BufferPool>,
 
-    syncing: Rc<Cell<bool>>,
+    syncing: Arc<AtomicBool>,
 
     shared: Arc<RwLock<WalFileShared>>,
     ongoing_checkpoint: OngoingCheckpoint,
@@ -593,7 +593,7 @@ pub struct WalFile {
 impl fmt::Debug for WalFile {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("WalFile")
-            .field("syncing", &self.syncing.get())
+            .field("syncing", &self.syncing.load(Ordering::SeqCst))
             .field("page_size", &self.page_size())
             .field("shared", &self.shared)
             .field("ongoing_checkpoint", &self.ongoing_checkpoint)
@@ -1310,10 +1310,10 @@ impl Wal for WalFile {
         let syncing = self.syncing.clone();
         let completion = Completion::new_sync(move |_| {
             tracing::debug!("wal_sync finish");
-            syncing.set(false);
+            syncing.store(false, Ordering::SeqCst);
         });
         let shared = self.get_shared();
-        self.syncing.set(true);
+        self.syncing.store(true, Ordering::SeqCst);
         assert!(shared.enabled.load(Ordering::SeqCst), "WAL must be enabled");
         let file = shared.file.as_ref().unwrap();
         let c = file.sync(completion)?;
@@ -1322,7 +1322,7 @@ impl Wal for WalFile {
 
     // Currently used for assertion purposes
     fn is_syncing(&self) -> bool {
-        self.syncing.get()
+        self.syncing.load(Ordering::SeqCst)
     }
 
     fn get_max_frame_in_wal(&self) -> u64 {
@@ -1616,7 +1616,7 @@ impl WalFile {
             checkpoint_threshold: 1000,
             buffer_pool,
             checkpoint_seq: AtomicU32::new(0),
-            syncing: Rc::new(Cell::new(false)),
+            syncing: Arc::new(AtomicBool::new(false)),
             min_frame: 0,
             max_frame_read_lock_index: NO_LOCK_HELD.into(),
             last_checksum,
@@ -1695,7 +1695,7 @@ impl WalFile {
     fn reset_internal_states(&mut self) {
         self.max_frame_read_lock_index.set(NO_LOCK_HELD);
         self.ongoing_checkpoint.reset();
-        self.syncing.set(false);
+        self.syncing.store(false, Ordering::SeqCst);
     }
 
     /// the WAL file has been truncated and we are writing the first
