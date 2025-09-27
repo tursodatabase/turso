@@ -124,9 +124,8 @@ fn effective_collation_for_index_col(idx_col: &IndexColumn, table: &Table) -> St
         .unwrap_or_else(|| "binary".to_string())
 }
 
-/// Match ON CONFLICT target to the PRIMARY KEY, if any.
-/// If no target is specified, it is an automatic match for PRIMARY KEY
-pub fn upsert_matches_pk(upsert: &Upsert, table: &Table) -> bool {
+/// Match ON CONFLICT target to the PRIMARY KEY/rowid alias.
+pub fn upsert_matches_rowid_alias(upsert: &Upsert, table: &Table) -> bool {
     let Some(t) = upsert.index.as_ref() else {
         // omitted target matches everything, CatchAll handled elsewhere
         return false;
@@ -302,7 +301,7 @@ pub fn resolve_upsert_target(
     }
 
     // Targeted: must match PK, only if PK is a rowid alias
-    if upsert_matches_pk(upsert, table) {
+    if upsert_matches_rowid_alias(upsert, table) {
         return Ok(ResolvedUpsertTarget::PrimaryKey);
     }
 
