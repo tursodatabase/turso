@@ -338,8 +338,7 @@ fn test_corruption_associated_data_bytes() -> anyhow::Result<()> {
 
             assert!(
                 should_panic.is_err(),
-                "should panic when accessing encrypted DB with corrupted associated data at position {}",
-                corrupt_pos
+                "should panic when accessing encrypted DB with corrupted associated data at position {corrupt_pos}",
             );
         }
     }
@@ -364,18 +363,12 @@ fn test_turso_header_structure() -> anyhow::Result<()> {
             assert_eq!(
                 &header[0..5],
                 b"Turso",
-                "Magic bytes should be 'Turso' for {}",
-                description
+                "Magic bytes should be 'Turso' for {description}"
             );
-            assert_eq!(
-                header[5], 0x00,
-                "Version should be 0x00 for {}",
-                description
-            );
+            assert_eq!(header[5], 0x00, "Version should be 0x00 for {description}");
             assert_eq!(
                 header[6], expected_cipher_id,
-                "Cipher ID should be {} for {}",
-                expected_cipher_id, description
+                "Cipher ID should be {expected_cipher_id} for {description}"
             );
 
             // the unused bytes should be zeroed
@@ -445,12 +438,8 @@ fn test_turso_header_structure() -> anyhow::Result<()> {
 
         {
             let conn = tmp_db.connect_limbo();
-            run_query(&tmp_db, &conn, &format!("PRAGMA hexkey = '{}';", hexkey))?;
-            run_query(
-                &tmp_db,
-                &conn,
-                &format!("PRAGMA cipher = '{}';", cipher_name),
-            )?;
+            run_query(&tmp_db, &conn, &format!("PRAGMA hexkey = '{hexkey}';"))?;
+            run_query(&tmp_db, &conn, &format!("PRAGMA cipher = '{cipher_name}';"))?;
             run_query(
                 &tmp_db,
                 &conn,
@@ -459,7 +448,7 @@ fn test_turso_header_structure() -> anyhow::Result<()> {
             do_flush(&conn, &tmp_db)?;
         }
 
-        verify_header(&db_path.to_str().unwrap(), expected_id, description)?;
+        verify_header(db_path.to_str().unwrap(), expected_id, description)?;
     }
     Ok(())
 }

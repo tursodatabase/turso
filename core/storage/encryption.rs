@@ -63,7 +63,7 @@ use turso_macros::match_ignore_ascii_case;
 ///                            ↓
 ///        Turso Encrypted Header: "Turso" + Version + Cipher ID + Unused
 /// ```
-
+///
 /// constants used for the Turso page header in the encrypted dbs.
 const TURSO_HEADER_PREFIX: &[u8] = b"Turso";
 const TURSO_VERSION: u8 = 0x00;
@@ -552,8 +552,7 @@ impl EncryptionContext {
         let version = header[5];
         if version != TURSO_VERSION {
             return Err(LimboError::InternalError(format!(
-                "Unsupported Turso header version: expected {}, got {}",
-                TURSO_VERSION, version
+                "Unsupported Turso header version: expected {TURSO_VERSION}, got {version}"
             )));
         }
 
@@ -984,9 +983,7 @@ mod tests {
         page[..SQLITE_HEADER.len()].copy_from_slice(SQLITE_HEADER);
         let mut rng = rand::thread_rng();
         // 48 is the max reserved bytes we might need for metadata with any cipher
-        for i in SQLITE_HEADER.len()..DEFAULT_ENCRYPTED_PAGE_SIZE - 48 {
-            page[i] = rng.gen();
-        }
+        rng.fill(&mut page[SQLITE_HEADER.len()..DEFAULT_ENCRYPTED_PAGE_SIZE - 48]);
         page
     }
 
