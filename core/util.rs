@@ -1105,6 +1105,8 @@ pub fn extract_view_columns(
     let mut tables = Vec::new();
     let mut columns = Vec::new();
     let mut column_name_counts: HashMap<String, usize> = HashMap::new();
+    // Track USING columns for each table to handle deduplication
+    let mut table_using_columns: Vec<Vec<String>> = Vec::new();
 
     // Navigate to the first SELECT in the statement
     if let ast::OneSelect::Select {
@@ -1131,13 +1133,15 @@ pub fn extract_view_columns(
                             ast::As::Elided(name) => normalize_ident(name.as_str()),
                         }),
                     });
+                    // First table has no USING clause
+                    table_using_columns.push(Vec::new());
                 }
                 _ => {
                     // Handle other types like subqueries if needed
                 }
             }
 
-            // Add tables from JOINs
+            // Add tables from JOINs and track USING columns
             for join in &from.joins {
                 match join.table.as_ref() {
                     ast::SelectTable::Table(qualified_name, alias, _) => {
@@ -1154,6 +1158,18 @@ pub fn extract_view_columns(
                                 ast::As::Elided(name) => normalize_ident(name.as_str()),
                             }),
                         });
+
+                        // Extract USING columns for this join
+                        let using_cols =
+                            if let Some(ast::JoinConstraint::Using(ref names)) = join.constraint {
+                                names
+                                    .iter()
+                                    .map(|name| normalize_ident(name.as_str()))
+                                    .collect()
+                            } else {
+                                Vec::new()
+                            };
+                        table_using_columns.push(using_cols);
                     }
                     _ => {
                         // Handle other types like subqueries if needed
@@ -1223,9 +1239,24 @@ pub fn extract_view_columns(
                     // For SELECT *, expand to all columns from all tables
                     for (table_idx, table) in tables.iter().enumerate() {
                         if let Some(table_obj) = schema.get_table(&table.name) {
+                            // Get the USING columns for this table (if it's part of a JOIN USING)
+                            let using_cols = table_using_columns
+                                .get(table_idx)
+                                .map(|v| v.as_slice())
+                                .unwrap_or(&[]);
+
                             for table_column in table_obj.columns() {
                                 let col_name =
                                     table_column.name.clone().unwrap_or_else(|| "?".to_string());
+
+                                // Skip columns that are in the USING clause for this table
+                                // (they should only appear once, from the left table)
+                                if using_cols
+                                    .iter()
+                                    .any(|using_col| using_col.eq_ignore_ascii_case(&col_name))
+                                {
+                                    continue;
+                                }
 
                                 // Handle duplicate column names by adding suffix
                                 let final_name =
@@ -1280,9 +1311,24 @@ pub fn extract_view_columns(
                     let table_name_str = normalize_ident(table_ref.as_str());
                     if let Some(table_idx) = find_table_index(&table_name_str) {
                         if let Some(table) = schema.get_table(&tables[table_idx].name) {
+                            // Get the USING columns for this table (if it's part of a JOIN USING)
+                            let using_cols = table_using_columns
+                                .get(table_idx)
+                                .map(|v| v.as_slice())
+                                .unwrap_or(&[]);
+
                             for table_column in table.columns() {
                                 let col_name =
                                     table_column.name.clone().unwrap_or_else(|| "?".to_string());
+
+                                // Skip columns that are in the USING clause for this table
+                                // (they should only appear once, from the left table)
+                                if using_cols
+                                    .iter()
+                                    .any(|using_col| using_col.eq_ignore_ascii_case(&col_name))
+                                {
+                                    continue;
+                                }
 
                                 // Handle duplicate column names by adding suffix
                                 let final_name =

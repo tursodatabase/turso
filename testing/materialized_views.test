@@ -896,6 +896,56 @@ Orwell|1984|1949
 Asimov|Foundation|1951
 Herbert|Dune|1965}
 
+# Test: JOIN USING column deduplication
+do_execsql_test_on_specific_db {:memory:} matview-join-using-deduplication {
+    CREATE TABLE t(a INTEGER);
+    CREATE TABLE u(a INTEGER);
+    CREATE TABLE v(a INTEGER);
+    INSERT INTO t VALUES (1), (2), (3), (4), (5);
+    INSERT INTO u VALUES (1), (2), (3), (4), (5);
+    INSERT INTO v VALUES (1), (2), (3), (4), (5);
+
+    -- Test JOIN USING with materialized view
+    -- Should only have one 'a' column, not three
+    CREATE MATERIALIZED VIEW tuv AS
+        SELECT * FROM t JOIN u USING (a) JOIN v USING (a);
+
+    -- Verify column count and data
+    SELECT * FROM tuv ORDER BY a;
+} {1
+2
+3
+4
+5}
+
+do_execsql_test_on_specific_db {:memory:} matview-join-using-column-info {
+    CREATE TABLE t1(a INTEGER, b INTEGER);
+    CREATE TABLE t2(a INTEGER, c INTEGER);
+    INSERT INTO t1 VALUES (1, 10), (2, 20), (3, 30);
+    INSERT INTO t2 VALUES (1, 100), (2, 200), (3, 300);
+
+    CREATE MATERIALIZED VIEW t1t2 AS
+        SELECT * FROM t1 JOIN t2 USING (a);
+
+    SELECT * FROM t1t2 ORDER BY a;
+} {1|10|100
+2|20|200
+3|30|300}
+
+do_execsql_test_on_specific_db {:memory:} matview-three-table-join-using {
+    CREATE TABLE t(a INTEGER, b INTEGER);
+    CREATE TABLE u(a INTEGER, c INTEGER);
+    CREATE TABLE v(a INTEGER, d INTEGER);
+    INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);
+    INSERT INTO u VALUES (1, 100), (2, 200), (3, 300);
+    INSERT INTO v VALUES (1, 1000), (2, 2000), (3, 3000);
+
+    CREATE MATERIALIZED VIEW tuv AS SELECT * FROM t JOIN u USING (a) JOIN v USING (a);
+    SELECT * FROM tuv ORDER BY a;
+} {1|10|100|1000
+2|20|200|2000
+3|30|300|3000}
+
 # Test 6: Modifying only one table in transaction
 do_execsql_test_on_specific_db {:memory:} matview-join-single-table-modified {
     CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT, active INTEGER);

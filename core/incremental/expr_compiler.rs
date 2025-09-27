@@ -112,7 +112,15 @@ impl TrivialExpression {
     /// Automatically promotes integers to floats when mixing types in arithmetic
     pub fn evaluate(&self, values: &[Value]) -> Value {
         match self {
-            TrivialExpression::Column(idx) => values.get(*idx).cloned().unwrap_or(Value::Null),
+            TrivialExpression::Column(idx) => {
+                assert!(
+                    *idx < values.len(),
+                    "Column index {} is out of bounds for input with {} values",
+                    idx,
+                    values.len()
+                );
+                values[*idx].clone()
+            }
             TrivialExpression::Immediate(val) => val.clone(),
             TrivialExpression::Binary { left, op, right } => {
                 let left_val = left.evaluate(values);

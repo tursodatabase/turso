@@ -2727,6 +2727,7 @@ mod tests {
                 AggregateFunction::Max(1), // name is at index 1
             ],
             vec!["id".to_string(), "name".to_string()],
+            vec![], // No USING columns
         );
 
         // Initial data with text values
@@ -2935,6 +2936,7 @@ mod tests {
             vec![0],
             vec!["customer_id".to_string(), "amount".to_string()],
             vec!["id".to_string(), "name".to_string()],
+            vec![], // No USING columns
         )
         .unwrap();
 
@@ -3033,6 +3035,7 @@ mod tests {
             vec![0],
             vec!["customer_id".to_string(), "amount".to_string()],
             vec!["id".to_string(), "name".to_string()],
+            vec![], // No USING columns
         )
         .unwrap();
 
@@ -3128,6 +3131,7 @@ mod tests {
                 "amount".to_string(),
             ],
             vec!["id".to_string(), "name".to_string()],
+            vec![], // No USING columns
         )
         .unwrap();
 
@@ -3265,6 +3269,7 @@ mod tests {
                 "price".to_string(),
             ],
             vec!["id".to_string(), "category_name".to_string()],
+            vec![], // No USING columns
         )
         .unwrap();
 
@@ -3382,6 +3387,7 @@ mod tests {
                 "amount".to_string(),
             ],
             vec!["id".to_string(), "name".to_string()],
+            vec![], // No USING columns
         )
         .unwrap();
 
@@ -3501,6 +3507,7 @@ mod tests {
             vec![0],
             vec!["key".to_string(), "val_left".to_string()],
             vec!["key".to_string(), "val_right".to_string()],
+            vec![], // No USING columns
         )
         .unwrap();
 
@@ -3568,10 +3575,12 @@ mod tests {
             vec![0], // Join on first column (id)
             vec![0], // Join on first column (user_id)
             vec!["id".to_string(), "name".to_string()],
+            vec![], // No USING columns
             vec![
                 "user_id".to_string(),
                 "product_id".to_string(),
                 "quantity".to_string(),
+                vec![], // No USING columns
             ],
         )
         .unwrap();

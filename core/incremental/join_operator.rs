@@ -137,6 +137,16 @@ fn read_next_join_row(
     Ok(IOResult::Done(None))
 }
 
+#[derive(Debug)]
+struct JoinProcessParams<'a> {
+    left_key_indices: &'a [usize],
+    right_key_indices: &'a [usize],
+    left_storage_id: i64,
+    right_storage_id: i64,
+    right_columns: &'a [String],
+    using_columns: &'a [String],
+}
+
 // Join-specific eval states
 #[derive(Debug)]
 pub enum JoinEvalState {
@@ -167,11 +177,28 @@ impl JoinEvalState {
         left_weight: i64,
         right_row: &HashableRow,
         right_weight: i64,
+        right_columns: &[String],
+        using_columns: &[String],
         output: &mut Delta,
     ) {
         // Combine the rows
         let mut combined_values = left_row.values.clone();
-        combined_values.extend(right_row.values.clone());
+
+        // For the right row, skip columns that are in the USING clause
+        for (idx, value) in right_row.values.iter().enumerate() {
+            if idx < right_columns.len() {
+                let col_name = &right_columns[idx];
+                // Skip this column if it's in the USING list
+                if using_columns
+                    .iter()
+                    .any(|using_col| using_col.eq_ignore_ascii_case(col_name))
+                {
+                    continue;
+                }
+            }
+            combined_values.push(value.clone());
+        }
+
         // Use hash of combined values as synthetic rowid
         let temp_row = HashableRow::new(0, combined_values.clone());
         let joined_rowid = temp_row.cached_hash().as_i64();
@@ -185,10 +212,7 @@ impl JoinEvalState {
     fn process_join_state(
         &mut self,
         cursors: &mut DbspStateCursors,
-        left_key_indices: &[usize],
-        right_key_indices: &[usize],
-        left_storage_id: i64,
-        right_storage_id: i64,
+        params: &JoinProcessParams,
     ) -> Result<IOResult<Delta>> {
         loop {
             match self {
@@ -217,14 +241,15 @@ impl JoinEvalState {
                     } else {
                         let (left_row, left_weight) = &deltas.left.changes[*current_idx];
                         // Extract join key using provided indices
-                        let key_values: Vec<Value> = left_key_indices
+                        let key_values: Vec<Value> = params
+                            .left_key_indices
                             .iter()
                             .map(|&idx| left_row.values.get(idx).cloned().unwrap_or(Value::Null))
                             .collect();
                         let left_key = HashableRow::new(0, key_values);
 
                         let next_row = return_if_io!(read_next_join_row(
-                            right_storage_id,
+                            params.right_storage_id,
                             &left_key,
                             *last_row_scanned,
                             cursors
@@ -236,6 +261,8 @@ impl JoinEvalState {
                                     (*left_weight) as i64,
                                     &right_row,
                                     right_weight as i64,
+                                    params.right_columns,
+                                    params.using_columns,
                                     output,
                                 );
                                 // Continue scanning with this left row
@@ -271,14 +298,15 @@ impl JoinEvalState {
                     } else {
                         let (right_row, right_weight) = &deltas.right.changes[*current_idx];
                         // Extract join key using provided indices
-                        let key_values: Vec<Value> = right_key_indices
+                        let key_values: Vec<Value> = params
+                            .right_key_indices
                             .iter()
                             .map(|&idx| right_row.values.get(idx).cloned().unwrap_or(Value::Null))
                             .collect();
                         let right_key = HashableRow::new(0, key_values);
 
                         let next_row = return_if_io!(read_next_join_row(
-                            left_storage_id,
+                            params.left_storage_id,
                             &right_key,
                             *last_row_scanned,
                             cursors
@@ -290,6 +318,8 @@ impl JoinEvalState {
                                     left_weight as i64,
                                     right_row,
                                     (*right_weight) as i64,
+                                    params.right_columns,
+                                    params.using_columns,
                                     output,
                                 );
                                 // Continue scanning with this right row
@@ -357,6 +387,8 @@ pub struct JoinOperator {
     left_columns: Vec<String>,
     /// Column names from right input
     right_columns: Vec<String>,
+    /// USING column names (to be excluded from right table in output)
+    using_columns: Vec<String>,
     /// Tracker for computation statistics
     tracker: Option<Arc<Mutex<ComputationTracker>>>,
 
@@ -371,6 +403,7 @@ impl JoinOperator {
         right_key_indices: Vec<usize>,
         left_columns: Vec<String>,
         right_columns: Vec<String>,
+        using_columns: Vec<String>,
     ) -> Result<Self> {
         // Check for unsupported join types
         match join_type {
@@ -404,6 +437,7 @@ impl JoinOperator {
             right_key_indices,
             left_columns,
             right_columns,
+            using_columns,
             tracker: None,
             commit_state: JoinCommitState::Idle,
         };
@@ -462,13 +496,17 @@ impl JoinOperator {
     ) -> Result<IOResult<Delta>> {
         // Get the join state out of the enum
         match state {
-            EvalState::Join(js) => js.process_join_state(
-                cursors,
-                &self.left_key_indices,
-                &self.right_key_indices,
-                self.left_storage_id(),
-                self.right_storage_id(),
-            ),
+            EvalState::Join(js) => {
+                let params = JoinProcessParams {
+                    left_key_indices: &self.left_key_indices,
+                    right_key_indices: &self.right_key_indices,
+                    left_storage_id: self.left_storage_id(),
+                    right_storage_id: self.right_storage_id(),
+                    right_columns: &self.right_columns,
+                    using_columns: &self.using_columns,
+                };
+                js.process_join_state(cursors, &params)
+            }
             _ => panic!("process_join_state called with non-join state"),
         }
     }
@@ -501,9 +539,22 @@ impl JoinOperator {
                                     tracker.lock().unwrap().record_join_lookup();
                                 }
 
-                                // Combine the rows
+                                // Combine the rows, skipping USING columns from right
                                 let mut combined_values = left_row.values.clone();
-                                combined_values.extend(right_row.values.clone());
+
+                                // For the right row, skip columns that are in the USING clause
+                                for (idx, value) in right_row.values.iter().enumerate() {
+                                    if idx < self.right_columns.len() {
+                                        let col_name = &self.right_columns[idx];
+                                        // Skip this column if it's in the USING list
+                                        if self.using_columns.iter().any(|using_col| {
+                                            using_col.eq_ignore_ascii_case(col_name)
+                                        }) {
+                                            continue;
+                                        }
+                                    }
+                                    combined_values.push(value.clone());
+                                }
 
                                 // Create the joined row with a unique rowid
                                 // Use hash of the combined values to ensure uniqueness
