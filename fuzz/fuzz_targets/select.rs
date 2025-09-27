@@ -127,7 +127,9 @@ fn do_fuzz(input: Input) -> Result<Corpus, Box<dyn Error>> {
     db.execute("CREATE TABLE a (x, y, z);");
 
     for insert in input.inserts {
-        db.sqlite.execute("INSERT INTO a VALUES (?, ?, ?)", insert.clone()).unwrap();
+        db.sqlite
+            .execute("INSERT INTO a VALUES (?, ?, ?)", insert.clone())
+            .unwrap();
 
         let mut stmt = db.turso.prepare("INSERT INTO a VALUES (?, ?, ?)").unwrap();
         stmt.bind_at(NonZero::new(1).unwrap(), insert.0.into());

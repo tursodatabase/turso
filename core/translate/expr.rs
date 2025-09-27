@@ -3800,8 +3800,8 @@ pub fn get_expr_affinity(
         }
         ast::Expr::Collate(expr, _) => get_expr_affinity(expr, referenced_tables),
         // Literals have NO affinity in SQLite!
-        ast::Expr::Literal(_) => Affinity::Blob, // No affinity!
-        _ => Affinity::Blob,                     // This may need to change. For now this works.
+        ast::Expr::Literal(_) => Affinity::None, // No affinity!
+        _ => Affinity::None,                     // This may need to change. For now this works.
     }
 }
 
@@ -3810,41 +3810,19 @@ pub fn comparison_affinity(
     rhs_expr: &ast::Expr,
     referenced_tables: Option<&TableReferences>,
 ) -> Affinity {
-    let mut aff = get_expr_affinity(lhs_expr, referenced_tables);
+    let lhs = get_expr_affinity(lhs_expr, referenced_tables);
+    let rhs = get_expr_affinity(rhs_expr, referenced_tables);
 
-    aff = compare_affinity(rhs_expr, aff, referenced_tables);
-
-    // If no affinity determined (both operands are literals), default to BLOB
-    if !aff.has_affinity() {
-        Affinity::Blob
-    } else {
-        aff
-    }
-}
-
-pub fn compare_affinity(
-    expr: &ast::Expr,
-    other_affinity: Affinity,
-    referenced_tables: Option<&TableReferences>,
-) -> Affinity {
-    let expr_affinity = get_expr_affinity(expr, referenced_tables);
-
-    if expr_affinity.has_affinity() && other_affinity.has_affinity() {
-        // Both sides have affinity - use numeric if either is numeric
-        if expr_affinity.is_numeric() || other_affinity.is_numeric() {
+    if lhs.has_affinity() && rhs.has_affinity() {
+        if lhs.is_numeric() || rhs.is_numeric() {
             Affinity::Numeric
         } else {
             Affinity::Blob
         }
+    } else if lhs.has_affinity() {
+        lhs
     } else {
-        // One or both sides have no affinity - use the one that does, or Blob if neither
-        if expr_affinity.has_affinity() {
-            expr_affinity
-        } else if other_affinity.has_affinity() {
-            other_affinity
-        } else {
-            Affinity::Blob
-        }
+        rhs
     }
 }
 
