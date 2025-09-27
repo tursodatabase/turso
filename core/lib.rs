@@ -64,12 +64,10 @@ use parking_lot::RwLock;
 use schema::Schema;
 use std::{
     borrow::Cow,
-    cell::RefCell,
     collections::HashMap,
     fmt::{self, Display},
     num::NonZero,
     ops::Deref,
-    rc::Rc,
     sync::{
         atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU16, AtomicUsize, Ordering},
         Arc, LazyLock, Mutex, Weak,
@@ -656,7 +654,7 @@ impl Database {
             }
 
             let db_state = self.db_state.clone();
-            let wal = Rc::new(RefCell::new(WalFile::new(
+            let wal = Arc::new(Mutex::new(WalFile::new(
                 self.io.clone(),
                 self.shared_wal.clone(),
                 buffer_pool.clone(),
@@ -717,7 +715,7 @@ impl Database {
             shared_wal.create(file)?;
         }
 
-        let wal = Rc::new(RefCell::new(WalFile::new(
+        let wal = Arc::new(Mutex::new(WalFile::new(
             self.io.clone(),
             self.shared_wal.clone(),
             buffer_pool,
@@ -1626,7 +1624,7 @@ impl Connection {
             self.auto_commit.store(true, Ordering::SeqCst);
             self.set_tx_state(TransactionState::None);
             {
-                let wal = wal.borrow_mut();
+                let wal = wal.lock().unwrap();
                 wal.end_write_tx();
                 wal.end_read_tx();
             }
