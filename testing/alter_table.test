@@ -210,4 +210,4 @@ do_execsql_test_on_specific_db {:memory:} alter-table-add-notnull-col {
     CREATE TABLE t (a);
 	ALTER TABLE t ADD b NOT NULL;
 	SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 't';
-} {{CREATE TABLE t (a, b NOT NULL);}}
+} {{CREATE TABLE t (a, b NOT NULL)}}
