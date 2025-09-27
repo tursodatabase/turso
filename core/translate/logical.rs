@@ -346,6 +346,11 @@ pub enum LogicalExpr {
         escape: Option<char>,
         negated: bool,
     },
+    /// CAST expression
+    Cast {
+        expr: Box<LogicalExpr>,
+        type_name: Option<ast::Type>,
+    },
 }
 
 /// Column reference
@@ -1772,6 +1777,14 @@ impl<'a> LogicalPlanBuilder<'a> {
                 // Multiple expressions in parentheses is unusual but handle it
                 // by building the first one (SQLite behavior)
                 self.build_expr(&exprs[0], _schema)
+            }
+
+            ast::Expr::Cast { expr, type_name } => {
+                let inner = self.build_expr(expr, _schema)?;
+                Ok(LogicalExpr::Cast {
+                    expr: Box::new(inner),
+                    type_name: type_name.clone(),
+                })
             }
 
             _ => Err(LimboError::ParseError(format!(
