@@ -14,6 +14,7 @@ use crate::types::IOResult;
 use crate::types::ImmutableRecord;
 use crate::types::SeekResult;
 use crate::Completion;
+use crate::File;
 use crate::IOExt;
 use crate::LimboError;
 use crate::Result;
@@ -31,6 +32,9 @@ use tracing::Level;
 
 pub mod checkpoint_state_machine;
 pub use checkpoint_state_machine::{CheckpointState, CheckpointStateMachine};
+
+use super::persistent_storage::logical_log::StreamingLogicalLogReader;
+use super::persistent_storage::logical_log::StreamingResult;
 
 #[cfg(test)]
 pub mod tests;
@@ -855,6 +859,10 @@ pub struct MvStore<Clock: LogicalClock> {
     /// If there are two concurrent BEGIN (non-CONCURRENT) transactions, and one tries to promote
     /// to exclusive, it will abort if another transaction committed after its begin timestamp.
     last_committed_tx_ts: AtomicU64,
+
+    /// Lock used while recovering a logical log file. We don't want multiple connections trying to
+    /// load the file.
+    recover_lock: RwLock<()>,
 }
 
 impl<Clock: LogicalClock> MvStore<Clock> {
@@ -878,6 +886,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             checkpointed_txid_max: AtomicU64::new(0),
             last_committed_schema_change_ts: AtomicU64::new(0),
             last_committed_tx_ts: AtomicU64::new(0),
+            recover_lock: RwLock::new(()),
         }
     }
 
@@ -1241,6 +1250,10 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         let header = self.get_new_transaction_database_header(&pager);
         let tx = Transaction::new(tx_id, begin_ts, header);
         tracing::trace!("begin_load_tx(tx_id={tx_id})");
+        assert!(
+            !self.txs.contains_key(&tx_id),
+            "somehow we tried to call begin_load_tx twice"
+        );
         self.txs.insert(tx_id, tx);
 
         Ok(())
@@ -1738,6 +1751,52 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             .map(|entry| Some(entry.key().row_id))
             .unwrap_or(None);
         last_rowid
+    }
+
+    pub fn needs_recover(&self) -> bool {
+        self.storage.needs_recover()
+    }
+
+    pub fn mark_recovered(&self) {
+        self.storage.mark_recovered();
+    }
+
+    pub fn get_logical_log_file(&self) -> Arc<dyn File> {
+        self.storage.get_logical_log_file()
+    }
+
+    pub fn recover_logical_log(&self, io: &Arc<dyn crate::IO>, pager: &Arc<Pager>) -> Result<()> {
+        // Get lock, if we don't get it we will wait until recover finishes in another connection
+        // and then return.
+        let _recover_guard = self.recover_lock.write();
+        if !self.storage.needs_recover() {
+            // another connection completed recover
+            return Ok(());
+        }
+        let file = self.get_logical_log_file();
+        let mut reader = StreamingLogicalLogReader::new(file.clone());
+
+        let c = reader.read_header()?;
+        io.wait_for_completion(c)?;
+        let tx_id = 0;
+        self.begin_load_tx(pager.clone())?;
+        loop {
+            match reader.next_record(io).unwrap() {
+                StreamingResult::InsertRow { row, rowid } => {
+                    tracing::trace!("read {rowid:?}");
+                    self.insert(tx_id, row)?;
+                }
+                StreamingResult::DeleteRow { rowid } => {
+                    self.delete(tx_id, rowid)?;
+                }
+                StreamingResult::Eof => {
+                    break;
+                }
+            }
+        }
+        self.commit_load_tx(tx_id);
+        self.mark_recovered();
+        Ok(())
     }
 }
 
