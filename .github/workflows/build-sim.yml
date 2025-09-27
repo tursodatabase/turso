@@ -25,6 +25,7 @@ env:
 jobs:
   deploy:
     runs-on: blacksmith
+    timeout-minutes: 30
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
