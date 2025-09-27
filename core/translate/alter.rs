@@ -80,6 +80,16 @@ pub fn translate_alter_table(
                 LimboError::ParseError(format!("no such column: \"{column_name}\""))
             })?;
 
+            // Column cannot be dropped if:
+            // The column is a PRIMARY KEY or part of one.
+            // The column has a UNIQUE constraint.
+            // The column is indexed.
+            // The column is named in the WHERE clause of a partial index.
+            // The column is named in a table or column CHECK constraint not associated with the column being dropped.
+            // The column is used in a foreign key constraint.
+            // The column is used in the expression of a generated column.
+            // The column appears in a trigger or view.
+
             if column.primary_key {
                 return Err(LimboError::ParseError(format!(
                     "cannot drop column \"{column_name}\": PRIMARY KEY"
