@@ -1033,6 +1033,9 @@ impl BTreeTable {
                 sql.push(' ');
                 sql.push_str(&column.ty_str);
             }
+            if column.notnull {
+                sql.push_str(" NOT NULL");
+            }
 
             if column.unique {
                 sql.push_str(" UNIQUE");
