@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="turso.png" alt="Turso Database" width="800"/>
+  <img src="assets/turso.png" alt="Turso Database" width="800"/>
   <h1 align="center">Turso Database</h1>
 </p>
 
