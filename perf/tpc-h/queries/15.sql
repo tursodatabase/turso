@@ -7,8 +7,8 @@ create view revenue0 (supplier_no, total_revenue) as
 	from
 		lineitem
 	where
-		l_shipdate >= cast('1993-01-01' as datetime)
-		and l_shipdate < cast('1993-04-01' as datetime) -- modified not to include cast({'month': 3} as interval)
+		l_shipdate >= '1993-01-01'
+		and l_shipdate < '1993-04-01' -- modified not to include cast({'month': 3} as interval)
 	group by
 		l_suppkey;
 

@@ -29,7 +29,7 @@ from
 			and r_name = 'ASIA'
 			and s_nationkey = n2.n_nationkey
 			and o_orderdate between
-				cast('1995-01-01' as datetime) and cast('1996-12-31' as datetime)
+				'1995-01-01' and '1996-12-31'
 			and p_type = 'PROMO BRUSHED COPPER'
 	) as all_nations
 group by
