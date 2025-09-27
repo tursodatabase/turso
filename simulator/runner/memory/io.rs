@@ -1,10 +1,9 @@
-use std::cell::{Cell, RefCell};
-use std::sync::Arc;
-
 use indexmap::IndexMap;
 use parking_lot::Mutex;
 use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
+use std::cell::{Cell, RefCell};
+use std::sync::Arc;
 use turso_core::{Clock, Completion, IO, Instant, OpenFlags, Result};
 
 use crate::runner::SimIO;
@@ -23,11 +22,13 @@ pub enum OperationType {
         buffer: Arc<turso_core::Buffer>,
         completion: Completion,
         offset: usize,
+        short_write: bool,
     },
     WriteV {
         buffers: Vec<Arc<turso_core::Buffer>>,
         completion: Completion,
         offset: usize,
+        short_write: bool,
     },
     Sync {
         completion: Completion,
@@ -78,15 +79,17 @@ impl Operation {
                 buffer,
                 completion,
                 offset,
+                short_write,
             } => {
                 let file = files.get(fd.as_str()).unwrap();
-                let buf_size = file.write_buf(buffer.as_slice(), offset);
+                let buf_size = file.write_buf(buffer.as_slice(), offset, short_write);
                 completion.complete(buf_size as i32);
             }
             OperationType::WriteV {
                 buffers,
                 completion,
                 offset,
+                short_write,
             } => {
                 if buffers.is_empty() {
                     return;
@@ -94,7 +97,7 @@ impl Operation {
                 let file = files.get(fd.as_str()).unwrap();
                 let mut pos = offset;
                 let written = buffers.into_iter().fold(0, |written, buffer| {
-                    let buf_size = file.write_buf(buffer.as_slice(), pos);
+                    let buf_size = file.write_buf(buffer.as_slice(), pos, short_write);
                     pos += buf_size;
                     written + buf_size
                 });
@@ -161,6 +164,15 @@ impl MemorySimIO {
 }
 
 impl SimIO for MemorySimIO {
+    fn inject_short_write(&self, short_write: bool) {
+        for file in self.files.borrow().values() {
+            file.inject_short_write(short_write);
+        }
+        if short_write {
+            tracing::debug!("short write injected");
+        }
+    }
+
     fn inject_fault(&self, fault: bool) {
         for file in self.files.borrow().values() {
             file.inject_fault(fault);
