@@ -21,7 +21,7 @@ use crate::{
             emit_returning_results, translate_expr, translate_expr_no_constant_opt, walk_expr_mut,
             NoConstantOptReason, ReturningValueRegisters,
         },
-        insert::{Insertion, ROWID_COLUMN},
+        insert::Insertion,
         plan::ResultSetColumn,
     },
     util::normalize_ident,
@@ -124,25 +124,25 @@ fn effective_collation_for_index_col(idx_col: &IndexColumn, table: &Table) -> St
         .unwrap_or_else(|| "binary".to_string())
 }
 
-/// Match ON CONFLICT target to the PRIMARY KEY, if any.
-/// If no target is specified, it is an automatic match for PRIMARY KEY
-pub fn upsert_matches_pk(upsert: &Upsert, table: &Table) -> bool {
+/// Match ON CONFLICT target to the PRIMARY KEY/rowid alias.
+pub fn upsert_matches_rowid_alias(upsert: &Upsert, table: &Table) -> bool {
     let Some(t) = upsert.index.as_ref() else {
-        // Omitted target is automatic
-        return true;
+        // omitted target matches everything, CatchAll handled elsewhere
+        return false;
     };
-    if !t.targets.len().eq(&1) {
+    if t.targets.len() != 1 {
         return false;
     }
-    let pk = table
-        .columns()
-        .iter()
-        .find(|c| c.is_rowid_alias || c.primary_key)
-        .unwrap_or(ROWID_COLUMN);
-    extract_target_key(&t.targets[0].expr).is_some_and(|tk| {
-        tk.col_name
-            .eq_ignore_ascii_case(pk.name.as_ref().unwrap_or(&String::new()))
-    })
+    // Only treat as PK if the PK is the rowid alias (INTEGER PRIMARY KEY)
+    let pk = table.columns().iter().find(|c| c.is_rowid_alias);
+    if let Some(pkcol) = pk {
+        extract_target_key(&t.targets[0].expr).is_some_and(|tk| {
+            tk.col_name
+                .eq_ignore_ascii_case(pkcol.name.as_ref().unwrap_or(&String::new()))
+        })
+    } else {
+        false
+    }
 }
 
 /// Returns array of chaned column indicies and whether rowid was changed.
@@ -300,17 +300,17 @@ pub fn resolve_upsert_target(
         return Ok(ResolvedUpsertTarget::CatchAll);
     }
 
-    // Targeted: must match PK or a non-partial UNIQUE index.
-    if upsert_matches_pk(upsert, table) {
+    // Targeted: must match PK, only if PK is a rowid alias
+    if upsert_matches_rowid_alias(upsert, table) {
         return Ok(ResolvedUpsertTarget::PrimaryKey);
     }
 
+    // Otherwise match a UNIQUE index, also covering non-rowid PRIMARY KEYs
     for idx in schema.get_indices(table.get_name()) {
         if idx.unique && upsert_matches_index(upsert, idx, table) {
             return Ok(ResolvedUpsertTarget::Index(Arc::clone(idx)));
         }
     }
-    // Match SQLite’s error text:
     crate::bail_parse_error!(
         "ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint"
     );
