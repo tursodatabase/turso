@@ -1428,3 +1428,170 @@ do_execsql_test_on_specific_db {:memory:} matview-union-all-text-filter {
 2
 3
 4}
+
+# Test BETWEEN in WHERE clause
+do_execsql_test_on_specific_db {:memory:} matview-between-filter {
+    CREATE TABLE products(id INTEGER PRIMARY KEY, name TEXT, price INTEGER);
+    INSERT INTO products VALUES
+        (1, 'Cheap', 10),
+        (2, 'Mid1', 50),
+        (3, 'Mid2', 75),
+        (4, 'Expensive', 150);
+
+    CREATE MATERIALIZED VIEW mid_range AS
+        SELECT id, name, price FROM products WHERE price BETWEEN 40 AND 100;
+
+    SELECT * FROM mid_range ORDER BY id;
+} {2|Mid1|50
+3|Mid2|75}
+
+# Test IN list in WHERE clause
+do_execsql_test_on_specific_db {:memory:} matview-in-filter {
+    CREATE TABLE orders(id INTEGER PRIMARY KEY, customer TEXT, status TEXT);
+    INSERT INTO orders VALUES
+        (1, 'Alice', 'shipped'),
+        (2, 'Bob', 'pending'),
+        (3, 'Charlie', 'delivered'),
+        (4, 'David', 'cancelled'),
+        (5, 'Eve', 'shipped');
+
+    CREATE MATERIALIZED VIEW active_orders AS
+        SELECT id, customer FROM orders WHERE status IN ('pending', 'shipped');
+
+    SELECT * FROM active_orders ORDER BY id;
+} {1|Alice
+2|Bob
+5|Eve}
+
+# Test CAST with TEXT in WHERE clause
+do_execsql_test_on_specific_db {:memory:} matview-cast-text {
+    CREATE TABLE records(id INTEGER PRIMARY KEY, code TEXT);
+    INSERT INTO records VALUES
+        (1, 'A100'),
+        (2, 'B200'),
+        (3, 'A300');
+
+    CREATE MATERIALIZED VIEW filtered AS
+        SELECT id FROM records WHERE code < CAST('B' AS TEXT);
+
+    SELECT * FROM filtered ORDER BY id;
+} {1
+3}
+
+# Test BETWEEN and IN together
+do_execsql_test_on_specific_db {:memory:} matview-between-and-in {
+    CREATE TABLE inventory(id INTEGER PRIMARY KEY, product TEXT, quantity INTEGER, location TEXT);
+    INSERT INTO inventory VALUES
+        (1, 'Widget', 50, 'WH1'),
+        (2, 'Gadget', 30, 'WH2'),
+        (3, 'Tool', 80, 'WH1'),
+        (4, 'Part', 15, 'WH3'),
+        (5, 'Device', 45, 'WH2');
+
+    CREATE MATERIALIZED VIEW wh1_wh2_medium_stock AS
+        SELECT id, product, quantity
+        FROM inventory
+        WHERE quantity BETWEEN 25 AND 60
+          AND location IN ('WH1', 'WH2');
+
+    SELECT * FROM wh1_wh2_medium_stock ORDER BY id;
+} {1|Widget|50
+2|Gadget|30
+5|Device|45}
+
+# Test complex OR conditions with IN
+do_execsql_test_on_specific_db {:memory:} matview-complex-or-with-in {
+    CREATE TABLE shipments(id INTEGER PRIMARY KEY, size INTEGER, mode TEXT, priority TEXT);
+    INSERT INTO shipments VALUES
+        (1, 5, 'AIR', 'high'),
+        (2, 15, 'TRUCK', 'normal'),
+        (3, 8, 'AIR', 'normal'),
+        (4, 20, 'SHIP', 'low'),
+        (5, 12, 'AIR_REG', 'high');
+
+    CREATE MATERIALIZED VIEW express_shipments AS
+        SELECT id, size, mode
+        FROM shipments
+        WHERE (size BETWEEN 5 AND 10 AND mode IN ('AIR', 'AIR_REG'))
+           OR priority = 'high';
+
+    SELECT * FROM express_shipments ORDER BY id;
+} {1|5|AIR
+3|8|AIR
+5|12|AIR_REG}
+
+# Test join with BETWEEN in WHERE
+do_execsql_test_on_specific_db {:memory:} matview-join-with-between {
+    CREATE TABLE parts(id INTEGER PRIMARY KEY, size INTEGER);
+    CREATE TABLE suppliers(id INTEGER PRIMARY KEY, part_id INTEGER, price INTEGER);
+
+    INSERT INTO parts VALUES (1, 5), (2, 10), (3, 20);
+    INSERT INTO suppliers VALUES (1, 1, 100), (2, 2, 150), (3, 3, 200);
+
+    CREATE MATERIALIZED VIEW medium_parts AS
+        SELECT p.id, p.size, s.price
+        FROM parts p
+        JOIN suppliers s ON p.id = s.part_id
+        WHERE p.size BETWEEN 8 AND 15;
+
+    SELECT * FROM medium_parts ORDER BY id;
+} {2|10|150}
+
+# Test join with IN in WHERE
+do_execsql_test_on_specific_db {:memory:} matview-join-with-in {
+    CREATE TABLE customers(id INTEGER PRIMARY KEY, region TEXT);
+    CREATE TABLE orders(id INTEGER PRIMARY KEY, customer_id INTEGER, amount INTEGER);
+
+    INSERT INTO customers VALUES (1, 'USA'), (2, 'Canada'), (3, 'UK'), (4, 'Mexico');
+    INSERT INTO orders VALUES (1, 1, 100), (2, 2, 200), (3, 3, 150), (4, 4, 300);
+
+    CREATE MATERIALIZED VIEW north_america_orders AS
+        SELECT c.region, o.amount
+        FROM customers c
+        JOIN orders o ON c.id = o.customer_id
+        WHERE c.region IN ('USA', 'Canada', 'Mexico');
+
+    SELECT * FROM north_america_orders ORDER BY region, amount;
+} {Canada|200
+Mexico|300
+USA|100}
+
+# Test incremental maintenance with BETWEEN
+do_execsql_test_on_specific_db {:memory:} matview-between-incremental {
+    CREATE TABLE items(id INTEGER PRIMARY KEY, value INTEGER);
+    INSERT INTO items VALUES (1, 5), (2, 15);
+
+    CREATE MATERIALIZED VIEW mid_values AS
+        SELECT id, value FROM items WHERE value BETWEEN 10 AND 20;
+
+    SELECT COUNT(*) FROM mid_values;
+
+    INSERT INTO items VALUES (3, 12), (4, 25);
+    SELECT * FROM mid_values ORDER BY id;
+
+    UPDATE items SET value = 30 WHERE id = 2;
+    SELECT * FROM mid_values ORDER BY id;
+} {1
+2|15
+3|12
+3|12}
+
+# Test incremental maintenance with IN
+do_execsql_test_on_specific_db {:memory:} matview-in-incremental {
+    CREATE TABLE logs(id INTEGER PRIMARY KEY, level TEXT, message TEXT);
+    INSERT INTO logs VALUES (1, 'INFO', 'start'), (2, 'DEBUG', 'test');
+
+    CREATE MATERIALIZED VIEW important_logs AS
+        SELECT id, level, message FROM logs WHERE level IN ('ERROR', 'WARN', 'INFO');
+
+    SELECT COUNT(*) FROM important_logs;
+
+    INSERT INTO logs VALUES (3, 'ERROR', 'fail'), (4, 'TRACE', 'detail');
+    SELECT * FROM important_logs ORDER BY id;
+
+    DELETE FROM logs WHERE id = 1;
+    SELECT * FROM important_logs ORDER BY id;
+} {1
+1|INFO|start
+3|ERROR|fail
+3|ERROR|fail}
