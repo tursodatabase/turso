@@ -4,7 +4,7 @@ use std::cell::{Cell, RefCell};
 use std::cmp::{Eq, Ord, Ordering, PartialEq, PartialOrd, Reverse};
 use std::collections::BinaryHeap;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use tempfile;
 
 use crate::types::IOCompletions;
@@ -394,7 +394,7 @@ struct SortedChunk {
     /// The size of this chunk file in bytes.
     chunk_size: usize,
     /// The read buffer.
-    buffer: Rc<RefCell<Vec<u8>>>,
+    buffer: Arc<RwLock<Vec<u8>>>,
     /// The current length of the buffer.
     buffer_len: Rc<Cell<usize>>,
     /// The records decoded from the chunk file.
@@ -413,7 +413,7 @@ impl SortedChunk {
             file,
             start_offset: start_offset as u64,
             chunk_size: 0,
-            buffer: Rc::new(RefCell::new(vec![0; buffer_size])),
+            buffer: Arc::new(RwLock::new(vec![0; buffer_size])),
             buffer_len: Rc::new(Cell::new(0)),
             records: Vec::new(),
             io_state: Rc::new(Cell::new(SortedChunkIOState::None)),
@@ -432,7 +432,7 @@ impl SortedChunk {
                     }
 
                     if self.records.is_empty() {
-                        let mut buffer_ref = self.buffer.borrow_mut();
+                        let mut buffer_ref = self.buffer.write().unwrap();
                         let buffer = buffer_ref.as_mut_slice();
                         let mut buffer_offset = 0;
                         while buffer_offset < buffer_len {
@@ -503,7 +503,7 @@ impl SortedChunk {
     fn read(&mut self) -> Result<Completion> {
         self.io_state.set(SortedChunkIOState::WaitingForRead);
 
-        let read_buffer_size = self.buffer.borrow().len() - self.buffer_len.get();
+        let read_buffer_size = self.buffer.read().unwrap().len() - self.buffer_len.get();
         let read_buffer_size = read_buffer_size.min(self.chunk_size - self.total_bytes_read.get());
 
         let read_buffer = Buffer::new_temporary(read_buffer_size);
@@ -527,7 +527,7 @@ impl SortedChunk {
             }
             chunk_io_state_copy.set(SortedChunkIOState::ReadComplete);
 
-            let mut stored_buf_ref = stored_buffer_copy.borrow_mut();
+            let mut stored_buf_ref = stored_buffer_copy.write().unwrap();
             let stored_buf = stored_buf_ref.as_mut_slice();
             let mut stored_buf_len = stored_buffer_len_copy.get();
 
