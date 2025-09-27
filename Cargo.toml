@@ -19,6 +19,7 @@ members = [
     "extensions/percentile",
     "extensions/regexp",
     "extensions/tests",
+    "extensions/fuzzy",
     "macros",
     "simulator",
     "sqlite3",
@@ -62,6 +63,7 @@ limbo_regexp = { path = "extensions/regexp", version = "0.2.0-pre.9" }
 turso_sqlite3_parser = { path = "vendored/sqlite3-parser", version = "0.2.0-pre.9" }
 limbo_uuid = { path = "extensions/uuid", version = "0.2.0-pre.9" }
 turso_parser = { path = "parser", version = "0.2.0-pre.9" }
+limbo_fuzzy = { path = "extensions/fuzzy", version = "0.2.0-pre.9" }
 sql_generation = { path = "sql_generation" }
 strum = { version = "0.26", features = ["derive"] }
 strum_macros = "0.26"
