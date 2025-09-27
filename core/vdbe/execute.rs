@@ -7883,11 +7883,13 @@ pub fn op_drop_column(
 
     let conn = program.connection.clone();
 
+    let normalized_table_name = normalize_ident(table.as_str());
+
     let column_name = {
         let schema = conn.schema.read();
         let table = schema
             .tables
-            .get(table)
+            .get(&normalized_table_name)
             .expect("table being ALTERed should be in schema");
         table
             .get_column_at(*column_index)
@@ -7901,7 +7903,7 @@ pub fn op_drop_column(
     conn.with_schema_mut(|schema| {
         let table = schema
             .tables
-            .get_mut(table)
+            .get_mut(&normalized_table_name)
             .expect("table being renamed should be in schema");
 
         let table = Arc::make_mut(table);
@@ -7915,7 +7917,7 @@ pub fn op_drop_column(
     });
 
     let schema = conn.schema.read();
-    if let Some(indexes) = schema.indexes.get(table) {
+    if let Some(indexes) = schema.indexes.get(&normalized_table_name) {
         for index in indexes {
             if index
                 .columns
@@ -7998,7 +8000,7 @@ pub fn op_alter_column(
         let schema = conn.schema.read();
         let table = schema
             .tables
-            .get(table_name)
+            .get(&normalized_table_name)
             .expect("table being ALTERed should be in schema");
         table
             .get_column_at(*column_index)
