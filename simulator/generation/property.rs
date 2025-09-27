@@ -27,7 +27,7 @@ use super::plan::{Assertion, Interaction, InteractionStats, ResultSet};
 /// Properties are representations of executable specifications
 /// about the database behavior.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) enum Property {
+pub enum Property {
     /// Insert-Select is a property in which the inserted row
     /// must be in the resulting rows of a select query that has a
     /// where clause that matches the inserted row.
@@ -190,6 +190,10 @@ pub(crate) enum Property {
         query: Query,
         tables: Vec<String>,
     },
+    /// Property used to subsititute a property with its queries only
+    Queries {
+        queries: Vec<Query>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -213,8 +217,27 @@ impl Property {
             Property::FsyncNoWait { .. } => "FsyncNoWait",
             Property::FaultyQuery { .. } => "FaultyQuery",
             Property::UNIONAllPreservesCardinality { .. } => "UNION-All-Preserves-Cardinality",
+            Property::Queries { .. } => "Queries",
         }
     }
+
+    pub fn get_extensional_queries(&mut self) -> Option<&mut Vec<Query>> {
+        match self {
+            Property::InsertValuesSelect { queries, .. }
+            | Property::DoubleCreateFailure { queries, .. }
+            | Property::DeleteSelect { queries, .. }
+            | Property::DropSelect { queries, .. }
+            | Property::Queries { queries } => Some(queries),
+            Property::FsyncNoWait { .. } | Property::FaultyQuery { .. } => None,
+            Property::SelectLimit { .. }
+            | Property::SelectSelectOptimizer { .. }
+            | Property::WhereTrueFalseNull { .. }
+            | Property::UNIONAllPreservesCardinality { .. }
+            | Property::ReadYourUpdatesBack { .. }
+            | Property::TableHasExpectedContent { .. } => None,
+        }
+    }
+
     /// interactions construct a list of interactions, which is an executable representation of the property.
     /// the requirement of property -> vec<interaction> conversion emerges from the need to serialize the property,
     /// and `interaction` cannot be serialized directly.
@@ -447,12 +470,14 @@ impl Property {
                 let table_name = create.table.name.clone();
 
                 let assertion = InteractionType::Assertion(Assertion::new("creating two tables with the name should result in a failure for the second query"
-                                    .to_string(), move |stack: &Vec<ResultSet>, _| {
+                                    .to_string(), move |stack: &Vec<ResultSet>, env| {
                                 let last = stack.last().unwrap();
                                 match last {
                                     Ok(success) => Ok(Err(format!("expected table creation to fail but it succeeded: {success:?}"))),
                                     Err(e) => {
                                         if e.to_string().to_lowercase().contains(&format!("table {table_name} already exists")) {
+                                             // On error we rollback the transaction if there is any active here
+                                            env.rollback_conn(connection_index);
                                             Ok(Ok(()))
                                         } else {
                                             Ok(Err(format!("expected table already exists error, got: {e}")))
@@ -470,7 +495,7 @@ impl Property {
                         .into_iter()
                         .map(|q| Interaction::new(connection_index, InteractionType::Query(q))),
                 );
-                interactions.push(Interaction::new(connection_index, cq2));
+                interactions.push(Interaction::new_ignore_error(connection_index, cq2));
                 interactions.push(Interaction::new(connection_index, assertion));
 
                 interactions
@@ -804,6 +829,9 @@ impl Property {
                                 // We cannot make any assumptions about the error content; all we are about is, if the statement errored,
                                 // we don't shadow the results into the simulator env, i.e. we assume whatever the statement did was rolled back.
                                 tracing::error!("Fault injection produced error: {err}");
+
+                                // On error we rollback the transaction if there is any active here
+                                env.rollback_conn(connection_index);
                                 Ok(Ok(()))
                             }
                         }
@@ -1023,6 +1051,11 @@ impl Property {
                     )),
                 ].into_iter().map(|i| Interaction::new(connection_index, i)).collect()
             }
+            Property::Queries { queries } => queries
+                .clone()
+                .into_iter()
+                .map(|query| Interaction::new(connection_index, InteractionType::Query(query)))
+                .collect(),
         }
     }
 }
@@ -1159,6 +1192,7 @@ fn property_insert_values_select<R: rand::Rng>(
     rng: &mut R,
     remaining: &Remaining,
     ctx: &impl GenerationContext,
+    mvcc: bool,
 ) -> Property {
     // Get a random table
     let table = pick(ctx.tables(), rng);
@@ -1178,7 +1212,7 @@ fn property_insert_values_select<R: rand::Rng>(
     };
 
     // Choose if we want queries to be executed in an interactive transaction
-    let interactive = if rng.random_bool(0.5) {
+    let interactive = if !mvcc && rng.random_bool(0.5) {
         Some(InteractiveQueryInfo {
             start_with_immediate: rng.random_bool(0.5),
             end_with_commit: rng.random_bool(0.5),
@@ -1536,7 +1570,14 @@ impl ArbitraryFrom<(&SimulatorEnv, &InteractionStats)> for Property {
                 } else {
                     0
                 },
-                Box::new(|rng: &mut R| property_insert_values_select(rng, &remaining_, conn_ctx)),
+                Box::new(|rng: &mut R| {
+                    property_insert_values_select(
+                        rng,
+                        &remaining_,
+                        conn_ctx,
+                        env.profile.experimental_mvcc,
+                    )
+                }),
             ),
             (
                 remaining_.select.max(1),
