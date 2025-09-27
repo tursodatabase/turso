@@ -12,6 +12,58 @@ use aes_gcm::{
 };
 use turso_macros::match_ignore_ascii_case;
 
+/// Encryption Scheme
+/// We support two major algorithms: AEGIS, AES GCM. These algorithms picked so that they also do
+/// verification of the ciphertext, so we don't need to implement. That is if the page is corrupted
+/// (or tampered), then we will know if we got garbage bytes post decryption.
+///
+/// We perform encryption at the page level, i.e., each page is encrypted and decrypted individually.
+/// We store the nonce and tag (or the verification bits) in the page itself.  We also generate a
+/// random nonce every time we encrypt a page.
+///
+/// Example: Assume the page size is 4096 bytes and we use AEGIS 256. So we reserve the last 48 bytes
+/// for the nonce (32 bytes) and tag (16 bytes).
+///
+/// ```ignore
+///             Unencrypted Page              Encrypted Page
+///             ┌───────────────┐            ┌───────────────┐
+///             │               │            │               │
+///             │ Page Content  │            │   Encrypted   │
+///             │ (4068 bytes)  │  ────────► │    Content    │
+///             │               │            │ (4068 bytes)  │
+///             ├───────────────┤            ├───────────────┤
+///             │   Reserved    │            │    Tag (32)   │
+///             │  (48 bytes)   │            ├───────────────┤
+///             │   [empty]     │            │   Nonce (12)  │
+///             └───────────────┘            └───────────────┘
+///                4096 bytes                   4096 bytes
+/// ```
+///
+/// The above applies to all the pages except Page 1. The page 1 contains the SQLite header (the
+/// first 100 bytes). Specifically, the bytes 16 to 24 contain metadata which is required to
+/// initialise the connection, which happens before we can setup the encryption context. So, we
+/// don't encrypt the header but instead use the header data as additional data (AD) for the
+/// encryption of the rest of the page. This provides us protection against tampering and
+/// corruption for the unencrypted portion.
+///
+/// On disk, the encrypted page 1 contains special bytes replacing the SQLite's magic bytes (the
+/// first 16 bytes):
+///
+/// ```ignore
+///                    Turso Header (16 bytes)
+///        ┌─────────┬───────┬────────┬──────────────────┐
+///        │         │       │        │                  │
+///        │  Turso  │Version│ Cipher │     Unused       │
+///        │  (5)    │ (1)   │  (1)   │    (9 bytes)     │
+///        │         │       │        │                  │
+///        └─────────┴───────┴────────┴──────────────────┘
+///         0-4      5       6        7-15
+///
+///        Standard SQLite Header: "SQLite format 3\0" (16 bytes)
+///                            ↓
+///        Turso Encrypted Header: "Turso" + Version + Cipher ID + Unused
+/// ```
+
 /// constants used for the Turso page header in the encrypted dbs.
 const TURSO_HEADER_PREFIX: &[u8] = b"Turso";
 const TURSO_VERSION: u8 = 0x00;
