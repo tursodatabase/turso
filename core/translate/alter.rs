@@ -1,10 +1,17 @@
 use std::sync::Arc;
-use turso_parser::{ast, parser::Parser};
+use turso_parser::{
+    ast::{self, TableInternalId},
+    parser::Parser,
+};
 
 use crate::{
     function::{AlterTableFunc, Func},
-    schema::Column,
-    translate::emitter::Resolver,
+    schema::{Column, Table},
+    translate::{
+        emitter::Resolver,
+        expr::{walk_expr, WalkControl},
+        plan::{ColumnUsedMask, OuterQueryReference, TableReferences},
+    },
     util::normalize_ident,
     vdbe::{
         builder::{CursorType, ProgramBuilder},
@@ -34,7 +41,9 @@ pub fn translate_alter_table(
         crate::bail_parse_error!("table {} may not be modified", table_name);
     }
 
-    if resolver.schema.table_has_indexes(table_name) && !resolver.schema.indexes_enabled() {
+    let table_indexes = resolver.schema.get_indices(table_name).collect::<Vec<_>>();
+
+    if !table_indexes.is_empty() && !resolver.schema.indexes_enabled() {
         // Let's disable altering a table with indices altogether instead of checking column by
         // column to be extra safe.
         crate::bail_parse_error!(
@@ -107,6 +116,65 @@ pub fn translate_alter_table(
                     "cannot drop column \"{column_name}\": UNIQUE"
                 )));
             }
+
+            for index in table_indexes.iter() {
+                // Referenced in regular index
+                if index
+                    .columns
+                    .iter()
+                    .any(|col| col.pos_in_table == dropped_index)
+                {
+                    return Err(LimboError::ParseError(format!(
+                        "cannot drop column \"{column_name}\": indexed"
+                    )));
+                }
+                // Referenced in partial index
+                if index.where_clause.is_some() {
+                    let mut table_references = TableReferences::new(
+                        vec![],
+                        vec![OuterQueryReference {
+                            identifier: table_name.to_string(),
+                            internal_id: TableInternalId::from(0),
+                            table: Table::BTree(Arc::new(btree.clone())),
+                            col_used_mask: ColumnUsedMask::default(),
+                        }],
+                    );
+                    let where_copy = index
+                        .bind_where_expr(Some(&mut table_references), connection)
+                        .expect("where clause to exist");
+                    let mut column_referenced = false;
+                    walk_expr(
+                        &where_copy,
+                        &mut |e: &ast::Expr| -> crate::Result<WalkControl> {
+                            if let ast::Expr::Column {
+                                table,
+                                column: column_index,
+                                ..
+                            } = e
+                            {
+                                if *table == TableInternalId::from(0)
+                                    && *column_index == dropped_index
+                                {
+                                    column_referenced = true;
+                                    return Ok(WalkControl::SkipChildren);
+                                }
+                            }
+                            Ok(WalkControl::Continue)
+                        },
+                    )?;
+                    if column_referenced {
+                        return Err(LimboError::ParseError(format!(
+                            "cannot drop column \"{column_name}\": indexed"
+                        )));
+                    }
+                }
+            }
+
+            // TODO: check usage in CHECK constraint when implemented
+            // TODO: check usage in foreign key constraint when implemented
+            // TODO: check usage in generated column when implemented
+
+            // References in VIEWs are checked in the VDBE layer op_drop_column instruction.
 
             btree.columns.remove(dropped_index);
 
