@@ -32,7 +32,7 @@ pub fn emit_select_result(
     limit_ctx: Option<LimitCtx>,
 ) -> Result<()> {
     if let (Some(jump_to), Some(_)) = (offset_jump_to, label_on_limit_reached) {
-        emit_offset(program, plan, jump_to, reg_offset, resolver);
+        emit_offset(program, jump_to, reg_offset);
     }
 
     let start_reg = reg_result_cols_start;
@@ -162,39 +162,12 @@ pub fn emit_result_row_and_limit(
     Ok(())
 }
 
-pub fn emit_offset(
-    program: &mut ProgramBuilder,
-    plan: &SelectPlan,
-    jump_to: BranchOffset,
-    reg_offset: Option<usize>,
-    resolver: &Resolver,
-) {
-    let Some(offset_expr) = &plan.offset else {
+pub fn emit_offset(program: &mut ProgramBuilder, jump_to: BranchOffset, reg_offset: Option<usize>) {
+    let Some(reg_offset) = &reg_offset else {
         return;
     };
-
-    if let Some(val) = try_fold_expr_to_i64(offset_expr) {
-        if val > 0 {
-            program.add_comment(program.offset(), "OFFSET const");
-            program.emit_insn(Insn::IfPos {
-                reg: reg_offset.expect("reg_offset must be Some"),
-                target_pc: jump_to,
-                decrement_by: 1,
-            });
-        }
-        return;
-    }
-
-    let r = reg_offset.expect("reg_offset must be Some");
-
-    program.add_comment(program.offset(), "OFFSET expr");
-
-    _ = translate_expr(program, None, offset_expr, r, resolver);
-
-    program.emit_insn(Insn::MustBeInt { reg: r });
-
     program.emit_insn(Insn::IfPos {
-        reg: r,
+        reg: *reg_offset,
         target_pc: jump_to,
         decrement_by: 1,
     });

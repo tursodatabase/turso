@@ -34,7 +34,7 @@ fn emit_values_when_single_row(
     t_ctx: &TranslateCtx,
 ) -> Result<usize> {
     let end_label = program.allocate_label();
-    emit_offset(program, plan, end_label, t_ctx.reg_offset, &t_ctx.resolver);
+    emit_offset(program, end_label, t_ctx.reg_offset);
     let first_row = &plan.values[0];
     let row_len = first_row.len();
     let start_reg = program.alloc_registers(row_len);
@@ -87,7 +87,7 @@ fn emit_toplevel_values(
     });
 
     let goto_label = program.allocate_label();
-    emit_offset(program, plan, goto_label, t_ctx.reg_offset, &t_ctx.resolver);
+    emit_offset(program, goto_label, t_ctx.reg_offset);
     let row_len = plan.values[0].len();
     let copy_start_reg = program.alloc_registers(row_len);
     for i in 0..row_len {
