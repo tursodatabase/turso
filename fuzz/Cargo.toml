@@ -28,5 +28,9 @@ name = "expression"
 path = "fuzz_targets/expression.rs"
 
 [[bin]]
+name = "select"
+path = "fuzz_targets/select.rs"
+
+[[bin]]
 name = "cast_real"
 path = "fuzz_targets/cast_real.rs"

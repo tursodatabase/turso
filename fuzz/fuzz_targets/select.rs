@@ -5,8 +5,44 @@ use std::{error::Error, num::NonZero, sync::Arc};
 use arbitrary::Arbitrary;
 use libfuzzer_sys::{fuzz_target, Corpus};
 
+#[macro_use]
 mod common;
 use common::*;
+use turso_core::StepResult;
+
+str_enum! {
+    pub enum Table {
+        A => "a",
+    }
+}
+
+str_enum! {
+    pub enum Column {
+        X => "x",
+        Y => "y",
+        Z => "z",
+    }
+}
+
+#[derive(Debug)]
+struct Input {
+    inserts: Vec<(Value, Value, Value)>,
+    expr: Expr,
+}
+
+impl<'a> Arbitrary<'a> for Input {
+    fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
+        let mut inserts = vec![];
+        for _ in 0..u.int_in_range(0..=20)? {
+            inserts.push(u.arbitrary::<(Value, Value, Value)>()?);
+        }
+
+        Ok(Self {
+            inserts,
+            expr: u.arbitrary()?,
+        })
+    }
+}
 
 #[derive(Debug, Arbitrary)]
 pub enum Expr {
@@ -16,6 +52,7 @@ pub enum Expr {
     Cast(Box<Expr>, CastType),
     UnaryFunc(UnaryFunc, Box<Expr>),
     BinaryFunc(BinaryFunc, Box<Expr>, Box<Expr>),
+    Reference(Table, Column),
 }
 
 impl Expr {
@@ -74,59 +111,43 @@ impl Expr {
                     depth: expr.depth + 1,
                 }
             }
+            Expr::Reference(table, column) => Output {
+                query: format!("{table}.{column}"),
+                parameters: vec![],
+                depth: 0,
+            },
         }
     }
 }
 
-fn do_fuzz(expr: Expr) -> Result<Corpus, Box<dyn Error>> {
-    let expr = expr.lower();
-    let sql = format!("SELECT {}", expr.query);
+fn do_fuzz(input: Input) -> Result<Corpus, Box<dyn Error>> {
+    // dbg!(&input);
+    let db = FuzzDatabase::new();
+
+    db.execute("CREATE TABLE a (x, y, z);");
+
+    for insert in input.inserts {
+        db.sqlite.execute("INSERT INTO a VALUES (?, ?, ?)", insert.clone()).unwrap();
+
+        let mut stmt = db.turso.prepare("INSERT INTO a VALUES (?, ?, ?)").unwrap();
+        stmt.bind_at(NonZero::new(1).unwrap(), insert.0.into());
+        stmt.bind_at(NonZero::new(2).unwrap(), insert.1.into());
+        stmt.bind_at(NonZero::new(3).unwrap(), insert.2.into());
+        assert!(matches!(stmt.step().unwrap(), StepResult::Done));
+    }
+
+    let expr = input.expr.lower();
 
     // FIX: `turso_core::translate::expr::translate_expr` causes a overflow if this is any higher.
     if expr.depth > 100 {
         return Ok(Corpus::Reject);
     }
 
-    let expected = {
-        let conn = rusqlite::Connection::open_in_memory()?;
-        conn.query_row(
-            &sql,
-            rusqlite::params_from_iter(expr.parameters.iter()),
-            |row| row.get::<_, Value>(0),
-        )?
-    };
+    let sql = format!("SELECT {} FROM a", expr.query);
 
-    let found = 'value: {
-        let io = Arc::new(turso_core::MemoryIO::new());
-        let db = turso_core::Database::open_file(io.clone(), ":memory:", false, true)?;
-        let conn = db.connect()?;
-
-        let mut stmt = conn.prepare(sql)?;
-        for (idx, value) in expr.parameters.iter().enumerate() {
-            stmt.bind_at(NonZero::new(idx + 1).unwrap(), value.clone().into())
-        }
-        loop {
-            use turso_core::StepResult;
-            match stmt.step()? {
-                StepResult::IO => stmt.run_once()?,
-                StepResult::Row => {
-                    let row = stmt.row().unwrap();
-                    assert_eq!(row.len(), 1, "expr: {:?}", expr);
-                    break 'value row.get_value(0).clone();
-                }
-                _ => unreachable!(),
-            }
-        }
-    };
-
-    assert_eq!(
-        turso_core::Value::from(Value::from(expected.clone())),
-        found.clone(),
-        "with expression {:?}",
-        expr,
-    );
+    db.assert(&sql, &expr.parameters);
 
     Ok(Corpus::Keep)
 }
 
-fuzz_target!(|expr: Expr| -> Corpus { do_fuzz(expr).unwrap_or(Corpus::Keep) });
+fuzz_target!(|input: Input| -> Corpus { do_fuzz(input).unwrap_or(Corpus::Keep) });
