@@ -7883,6 +7883,21 @@ pub fn op_drop_column(
 
     let conn = program.connection.clone();
 
+    let column_name = {
+        let schema = conn.schema.read();
+        let table = schema
+            .tables
+            .get(table)
+            .expect("table being ALTERed should be in schema");
+        table
+            .get_column_at(*column_index)
+            .expect("column being ALTERed should be in schema")
+            .name
+            .as_ref()
+            .expect("column being ALTERed should be named")
+            .clone()
+    };
+
     conn.with_schema_mut(|schema| {
         let table = schema
             .tables
@@ -7898,6 +7913,21 @@ pub fn op_drop_column(
         let btree = Arc::make_mut(btree);
         btree.columns.remove(*column_index)
     });
+
+    let schema = conn.schema.read();
+    if let Some(indexes) = schema.indexes.get(table) {
+        for index in indexes {
+            if index
+                .columns
+                .iter()
+                .any(|column| column.pos_in_table == *column_index)
+            {
+                return Err(LimboError::ParseError(format!(
+                    "cannot drop column \"{column_name}\": indexed"
+                )));
+            }
+        }
+    }
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
