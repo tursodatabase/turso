@@ -392,7 +392,7 @@ fn update_pragma(
                 Expr::Literal(Literal::Numeric(n)) => !matches!(n.as_str(), "0"),
                 _ => false,
             };
-            connection.set_foreign_keys(enabled);
+            connection.set_foreign_keys_enabled(enabled);
             Ok((program, TransactionMode::None))
         }
     }
@@ -705,7 +705,7 @@ fn query_pragma(
             Ok((program, TransactionMode::None))
         }
         PragmaName::ForeignKeys => {
-            let enabled = connection.get_foreign_keys();
+            let enabled = connection.foreign_keys_enabled();
             let register = program.alloc_register();
             program.emit_int(enabled as i64, register);
             program.emit_result_row(register, 1);

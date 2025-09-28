@@ -302,7 +302,8 @@ pub struct ProgramState {
     op_checkpoint_state: OpCheckpointState,
     /// State machine for committing view deltas with I/O handling
     view_delta_state: ViewDeltaCommitState,
-    fk_constraint_counter: isize,
+    fk_scope_counter: isize,
+    fk_deferred_violations: isize,
 }
 
 impl ProgramState {
@@ -347,7 +348,8 @@ impl ProgramState {
             op_transaction_state: OpTransactionState::Start,
             op_checkpoint_state: OpCheckpointState::StartCheckpoint,
             view_delta_state: ViewDeltaCommitState::NotStarted,
-            fk_constraint_counter: 0,
+            fk_scope_counter: 0,
+            fk_deferred_violations: 0,
         }
     }
 

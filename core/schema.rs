@@ -35,7 +35,7 @@ use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::Mutex;
 use tracing::trace;
-use turso_parser::ast::{self, ColumnDefinition, Expr, Literal, SortOrder, TableOptions};
+use turso_parser::ast::{self, ColumnDefinition, Expr, Literal, RefAct, SortOrder, TableOptions};
 use turso_parser::{
     ast::{Cmd, CreateTableBody, ResultColumn, Stmt},
     parser::Parser,
@@ -244,9 +244,94 @@ impl Schema {
         self.views.get(&name)
     }
 
-    pub fn add_btree_table(&mut self, table: Arc<BTreeTable>) {
+    pub fn add_btree_table(&mut self, table: Arc<BTreeTable>) -> Result<()> {
         let name = normalize_ident(&table.name);
+        for key in &table.foreign_keys {
+            let Some(parent) = self.get_btree_table(&key.parent_table) else {
+                return Err(LimboError::ParseError(format!(
+                    "Foreign key references missing table {}",
+                    key.parent_table
+                )));
+            };
+
+            // resolve parent key columns: explicit or parent's PK
+            let parent_cols: Vec<String> = if key.parent_columns.is_empty() {
+                if parent.primary_key_columns.is_empty() {
+                    return Err(LimboError::ParseError(format!(
+                        "Foreign key references {} without explicit columns, \
+                 but {} has no PRIMARY KEY",
+                        key.parent_table, key.parent_table
+                    )));
+                }
+                parent
+                    .primary_key_columns
+                    .iter()
+                    .map(|(n, _)| normalize_ident(n))
+                    .collect()
+            } else {
+                key.parent_columns
+                    .iter()
+                    .map(|c| normalize_ident(c))
+                    .collect()
+            };
+
+            // arity must match
+            if parent_cols.len() != key.child_columns.len() {
+                return Err(LimboError::ParseError(format!(
+                    "Foreign key column count mismatch: child {:?} vs parent {:?}",
+                    key.child_columns, parent_cols
+                )));
+            }
+
+            // ensure each named parent column exists
+            for col in &parent_cols {
+                if parent.get_column(col).is_none() && !col.eq_ignore_ascii_case("rowid") {
+                    return Err(LimboError::ParseError(format!(
+                        "Foreign key references missing column {}.{}",
+                        key.parent_table, col
+                    )));
+                }
+            }
+
+            // ensure child columns exist on *this* table
+            for col in &key.child_columns {
+                if table.get_column(col).is_none() && !col.eq_ignore_ascii_case("rowid") {
+                    return Err(LimboError::ParseError(format!(
+                        "Foreign key child column not found: {}.{}",
+                        table.name, col
+                    )));
+                }
+            }
+
+            // ensure parent side is UNIQUE or PRIMARY KEY
+            // SQLite requires the parent key to be UNIQUE or PK. If not, you can either:
+            let parent_is_unique = if parent_cols.len() == parent.primary_key_columns.len()
+                && parent_cols
+                    .iter()
+                    .zip(&parent.primary_key_columns)
+                    .all(|(a, (b, _))| a.eq_ignore_ascii_case(b))
+            {
+                true
+            } else {
+                self.get_indices(&parent.name).any(|idx| {
+                    idx.unique
+                        && idx.columns.len() == parent_cols.len()
+                        && idx
+                            .columns
+                            .iter()
+                            .zip(&parent_cols)
+                            .all(|(ic, pc)| ic.name.eq_ignore_ascii_case(pc))
+                })
+            };
+            if !parent_is_unique {
+                return Err(LimboError::ParseError(format!(
+                    "Foreign key references {}({:?}) which is not UNIQUE or PRIMARY KEY",
+                    key.parent_table, parent_cols
+                )));
+            }
+        }
         self.tables.insert(name, Table::BTree(table).into());
+        Ok(())
     }
 
     pub fn add_virtual_table(&mut self, table: Arc<VirtualTable>) {
@@ -337,6 +422,31 @@ impl Schema {
 
     pub fn indexes_enabled(&self) -> bool {
         self.indexes_enabled
+    }
+
+    pub fn get_foreign_keys_for_table(&self, table_name: &str) -> Vec<Arc<ForeignKey>> {
+        self.get_table(table_name)
+            .and_then(|t| t.btree())
+            .map(|t| t.foreign_keys.clone())
+            .unwrap_or_default()
+    }
+
+    /// Get foreign keys where this table is the parent (referenced by other tables)
+    pub fn get_referencing_foreign_keys(
+        &self,
+        parent_table: &str,
+    ) -> Vec<(String, Arc<ForeignKey>)> {
+        let mut refs = Vec::new();
+        for table in self.tables.values() {
+            if let Table::BTree(btree) = table.deref() {
+                for fk in &btree.foreign_keys {
+                    if fk.parent_table == parent_table {
+                        refs.push((btree.name.as_str().to_string(), fk.clone()));
+                    }
+                }
+            }
+        }
+        refs
     }
 
     /// Update [Schema] by scanning the first root page (sqlite_schema)
@@ -592,6 +702,7 @@ impl Schema {
                 has_rowid: true,
                 is_strict: false,
                 has_autoincrement: false,
+                foreign_keys: vec![],
 
                 unique_sets: vec![],
             })));
@@ -678,7 +789,10 @@ impl Schema {
                         }
                     }
 
-                    self.add_btree_table(Arc::new(table));
+                    if let Some(mv_store) = mv_store {
+                        mv_store.mark_table_as_loaded(root_page);
+                    }
+                    self.add_btree_table(Arc::new(table))?;
                 }
             }
             "index" => {
@@ -962,6 +1076,7 @@ pub struct BTreeTable {
     pub is_strict: bool,
     pub has_autoincrement: bool,
     pub unique_sets: Vec<UniqueSet>,
+    pub foreign_keys: Vec<Arc<ForeignKey>>,
 }
 
 impl BTreeTable {
@@ -1092,6 +1207,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
     let mut has_rowid = true;
     let mut has_autoincrement = false;
     let mut primary_key_columns = vec![];
+    let mut foreign_keys = vec![];
     let mut cols = vec![];
     let is_strict: bool;
     let mut unique_sets: Vec<UniqueSet> = vec![];
@@ -1205,7 +1321,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                 let mut unique = false;
                 let mut collation = None;
                 for c_def in constraints {
-                    match c_def.constraint {
+                    match &c_def.constraint {
                         ast::ColumnConstraint::PrimaryKey {
                             order: o,
                             auto_increment,
@@ -1218,11 +1334,11 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                                 );
                             }
                             primary_key = true;
-                            if auto_increment {
+                            if *auto_increment {
                                 has_autoincrement = true;
                             }
                             if let Some(o) = o {
-                                order = o;
+                                order = *o;
                             }
                             unique_sets.push(UniqueSet {
                                 columns: vec![(name.clone(), order)],
@@ -1250,6 +1366,55 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                         }
                         ast::ColumnConstraint::Collate { ref collation_name } => {
                             collation = Some(CollationSeq::new(collation_name.as_str())?);
+                        }
+                        ast::ColumnConstraint::ForeignKey {
+                            clause,
+                            defer_clause,
+                        } => {
+                            let fk = ForeignKey {
+                                parent_table: clause.tbl_name.to_string(),
+                                parent_columns: clause
+                                    .columns
+                                    .iter()
+                                    .map(|c| c.col_name.as_str().to_string())
+                                    .collect(),
+                                on_delete: clause
+                                    .args
+                                    .iter()
+                                    .find_map(|arg| {
+                                        if let ast::RefArg::OnDelete(act) = arg {
+                                            Some(*act)
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .unwrap_or(RefAct::NoAction),
+                                on_insert: clause
+                                    .args
+                                    .iter()
+                                    .find_map(|arg| {
+                                        if let ast::RefArg::OnInsert(act) = arg {
+                                            Some(*act)
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .unwrap_or(RefAct::NoAction),
+                                on_update: clause
+                                    .args
+                                    .iter()
+                                    .find_map(|arg| {
+                                        if let ast::RefArg::OnUpdate(act) = arg {
+                                            Some(*act)
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .unwrap_or(RefAct::NoAction),
+                                child_columns: vec![name.clone()],
+                                deferred: defer_clause.is_some(),
+                            };
+                            foreign_keys.push(Arc::new(fk));
                         }
                         _ => {}
                     }
@@ -1330,6 +1495,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
         has_autoincrement,
         columns: cols,
         is_strict,
+        foreign_keys,
         unique_sets: {
             // If there are any unique sets that have identical column names in the same order (even if they are PRIMARY KEY and UNIQUE and have different sort orders), remove the duplicates.
             // Examples:
@@ -1385,6 +1551,21 @@ pub fn _build_pseudo_table(columns: &[ResultColumn]) -> PseudoCursorType {
         }
     }
     table
+}
+
+#[derive(Debug, Clone)]
+pub struct ForeignKey {
+    /// Columns in this table
+    pub child_columns: Vec<String>,
+    /// Referenced table
+    pub parent_table: String,
+    /// Referenced columns
+    pub parent_columns: Vec<String>,
+    pub on_delete: RefAct,
+    pub on_update: RefAct,
+    pub on_insert: RefAct,
+    /// DEFERRABLE INITIALLY DEFERRED
+    pub deferred: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1728,6 +1909,7 @@ pub fn sqlite_schema_table() -> BTreeTable {
                 hidden: false,
             },
         ],
+        foreign_keys: vec![],
         unique_sets: vec![],
     }
 }

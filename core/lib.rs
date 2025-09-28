@@ -1521,10 +1521,10 @@ impl Connection {
         Ok(db)
     }
 
-    pub fn set_foreign_keys(&self, enable: bool) {
+    pub fn set_foreign_keys_enabled(&self, enable: bool) {
         self.fk_pragma.store(enable, Ordering::Release);
     }
-    pub fn get_foreign_keys(&self) -> bool {
+    pub fn foreign_keys_enabled(&self) -> bool {
         self.fk_pragma.load(Ordering::Acquire)
     }
 
