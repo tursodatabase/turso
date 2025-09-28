@@ -3679,13 +3679,17 @@ pub fn op_agg_step(
                                 match acc_i.checked_add(i) {
                                     Some(sum) => *acc = Value::Integer(sum),
                                     None => {
-                                        // Overflow -> switch to float with KBN summation
-                                        let acc_f = *acc_i as f64;
-                                        *acc = Value::Float(acc_f);
-                                        sum_state.approx = true;
-                                        sum_state.ovrfl = true;
+                                        if matches!(func, AggFunc::Total) {
+                                            // Total() never throw an integer overflow -> switch to float with KBN summation
+                                            let acc_f = *acc_i as f64;
+                                            *acc = Value::Float(acc_f);
+                                            sum_state.approx = true;
+                                            sum_state.ovrfl = true;
 
-                                        apply_kbn_step_int(acc, i, sum_state);
+                                            apply_kbn_step_int(acc, i, sum_state);
+                                        } else {
+                                            return Err(LimboError::IntegerOverflow);
+                                        }
                                     }
                                 }
                             }
