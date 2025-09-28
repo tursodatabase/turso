@@ -65,11 +65,11 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
                     return Err(LimboError::InvalidArgument("not enough arguments".into()));
                 }
                 let value = &values[args_index].get_value();
-             match value {
-                    Value::Integer(i) => result.push_str(&format!("{}", i)),
+                match value {
+                    Value::Integer(i) => result.push_str(&format!("{i}")),
                     Value::Float(f) => {
                         let truncated_val = *f as i64;
-                        result.push_str(&format!("{}", truncated_val));
+                        result.push_str(&format!("{truncated_val}"));
                     }
                     _ => result.push('0'),
                 }
@@ -314,8 +314,7 @@ mod tests {
                 vec![text("Number: %d"), text("not a number")],
                 text("Number: 0"),
             ),
-
-             (
+            (
                 vec![text("Truncated float: %d"), float(3.9)],
                 text("Truncated float: 3"),
             ),
