@@ -29,8 +29,8 @@ use turso_macros::match_ignore_ascii_case;
 ///             ┌───────────────┐            ┌───────────────┐
 ///             │               │            │               │
 ///             │ Page Content  │            │   Encrypted   │
-///             │ (4068 bytes)  │  ────────► │    Content    │
-///             │               │            │ (4068 bytes)  │
+///             │ (4048 bytes)  │  ────────► │    Content    │
+///             │               │            │ (4048 bytes)  │
 ///             ├───────────────┤            ├───────────────┤
 ///             │   Reserved    │            │    Tag (32)   │
 ///             │  (48 bytes)   │            ├───────────────┤
@@ -67,6 +67,8 @@ use turso_macros::match_ignore_ascii_case;
 /// constants used for the Turso page header in the encrypted dbs.
 const TURSO_HEADER_PREFIX: &[u8] = b"Turso";
 const TURSO_VERSION: u8 = 0x00;
+const VERSION_OFFSET: usize = 5;
+const CIPHER_OFFSET: usize = 6;
 const TURSO_HEADER_SIZE: usize = 16;
 const SQLITE_HEADER: &[u8] = b"SQLite format 3\0";
 
@@ -526,10 +528,10 @@ impl EncryptionContext {
         header[..TURSO_HEADER_PREFIX.len()].copy_from_slice(TURSO_HEADER_PREFIX);
 
         // version byte (1 byte)
-        header[5] = TURSO_VERSION;
+        header[VERSION_OFFSET] = TURSO_VERSION;
 
         // cipher identifier (1 byte)
-        header[6] = self.cipher_mode.cipher_id();
+        header[CIPHER_OFFSET] = self.cipher_mode.cipher_id();
 
         // remaining unused 9 bytes
         header
@@ -549,14 +551,14 @@ impl EncryptionContext {
             ));
         }
 
-        let version = header[5];
+        let version = header[VERSION_OFFSET];
         if version != TURSO_VERSION {
             return Err(LimboError::InternalError(format!(
                 "Unsupported Turso header version: expected {TURSO_VERSION}, got {version}"
             )));
         }
 
-        let cipher_id = header[6];
+        let cipher_id = header[CIPHER_OFFSET];
         let header_cipher = CipherMode::from_cipher_id(cipher_id)?;
         if header_cipher != self.cipher_mode {
             return Err(LimboError::InternalError(format!(
@@ -568,6 +570,14 @@ impl EncryptionContext {
             )));
         }
 
+        if header[CIPHER_OFFSET + 1..TURSO_HEADER_SIZE]
+            .iter()
+            .any(|&b| b != 0)
+        {
+            return Err(LimboError::InternalError(
+                "Invalid Turso header: unused bytes must be zero".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -676,7 +686,7 @@ impl EncryptionContext {
 
         // since this is page 1, this must have header
         turso_assert!(
-            &page[..SQLITE_HEADER.len()] == SQLITE_HEADER,
+            page.starts_with(SQLITE_HEADER),
             "Page 1 must start with SQLite header"
         );
 
@@ -686,6 +696,10 @@ impl EncryptionContext {
         #[cfg(debug_assertions)]
         {
             use crate::turso_assert;
+            // In debug builds, ensure that the reserved bytes are zeroed out. So even when we are
+            // reusing a page from buffer pool, we zero out in debug build so that we can be
+            // sure that b tree layer is not writing any data into the reserved space.
+            // We avoid calling `memset` in release builds for performance reasons.
             let reserved_bytes_zeroed = reserved_bytes.iter().all(|&b| b == 0);
             turso_assert!(
                 reserved_bytes_zeroed,
