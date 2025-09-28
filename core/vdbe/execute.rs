@@ -1,5 +1,5 @@
 #![allow(unused_variables)]
-use crate::error::SQLITE_CONSTRAINT_UNIQUE;
+use crate::error::{SQLITE_CONSTRAINT_FOREIGNKEY, SQLITE_CONSTRAINT_UNIQUE};
 use crate::function::AlterTableFunc;
 use crate::mvcc::database::CheckpointStateMachine;
 use crate::numeric::{NullableInteger, Numeric};
@@ -2155,6 +2155,9 @@ pub fn halt(
             return Err(LimboError::Constraint(format!(
                 "UNIQUE constraint failed: {description} (19)"
             )));
+        }
+        SQLITE_CONSTRAINT_FOREIGNKEY => {
+            return Err(LimboError::Constraint(format!("{description} (19)")));
         }
         _ => {
             return Err(LimboError::Constraint(format!(
@@ -8287,17 +8290,34 @@ pub fn op_fk_counter(
         FkCounter {
             increment_value,
             check_abort,
+            is_scope,
         },
         insn
     );
-    state.fk_constraint_counter = state.fk_constraint_counter.saturating_add(*increment_value);
+    if *is_scope {
+        // Adjust FK scope depth
+        state.fk_scope_counter = state.fk_scope_counter.saturating_add(*increment_value);
 
-    // If check_abort is true and counter is negative, abort with constraint error
-    // This shouldn't happen in well-formed bytecode but acts as a safety check
-    if *check_abort && state.fk_constraint_counter < 0 {
-        return Err(LimboError::Constraint(
-            "FOREIGN KEY constraint failed".into(),
-        ));
+        // raise if there were deferred violations in this statement.
+        if *check_abort {
+            if state.fk_scope_counter < 0 {
+                return Err(LimboError::Constraint(
+                    "FOREIGN KEY constraint failed".into(),
+                ));
+            }
+            if state.fk_scope_counter == 0 && state.fk_deferred_violations > 0 {
+                // Clear violations for safety, a new statement will re-open scope.
+                state.fk_deferred_violations = 0;
+                return Err(LimboError::Constraint(
+                    "FOREIGN KEY constraint failed".into(),
+                ));
+            }
+        }
+    } else {
+        // Adjust deferred violations counter
+        state.fk_deferred_violations = state
+            .fk_deferred_violations
+            .saturating_add(*increment_value);
     }
 
     state.pc += 1;
@@ -8317,13 +8337,15 @@ pub fn op_fk_if_zero(
     // Jump if any:
     // Foreign keys are disabled globally
     // p1 is true AND deferred constraint counter is zero
-    //  p1 is false AND deferred constraint counter is non-zero
+    // p1 is false AND deferred constraint counter is non-zero
+    let scope_zero = state.fk_scope_counter == 0;
+
     let should_jump = if !fk_enabled {
         true
     } else if *if_zero {
-        state.fk_constraint_counter == 0
+        scope_zero
     } else {
-        state.fk_constraint_counter != 0
+        !scope_zero
     };
 
     if should_jump {

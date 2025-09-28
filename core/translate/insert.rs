@@ -83,6 +83,11 @@ pub fn translate_insert(
         );
     }
     let table_name = &tbl_name.name;
+    let has_child_fks = connection.foreign_keys_enabled()
+        && !resolver
+            .schema
+            .get_foreign_keys_for_table(table_name.as_str())
+            .is_empty();
 
     // Check if this is a system table that should be protected from direct writes
     if crate::schema::is_system_table(table_name.as_str()) {
@@ -222,6 +227,8 @@ pub fn translate_insert(
     let halt_label = program.allocate_label();
     let loop_start_label = program.allocate_label();
     let row_done_label = program.allocate_label();
+    let stmt_epilogue = program.allocate_label();
+    let mut select_exhausted_label: Option<BranchOffset> = None;
 
     let cdc_table = prepare_cdc_if_necessary(&mut program, resolver.schema, table.get_name())?;
 
@@ -233,6 +240,14 @@ pub fn translate_insert(
         &mut program,
         connection,
     )?;
+
+    if has_child_fks {
+        program.emit_insn(Insn::FkCounter {
+            increment_value: 1,
+            check_abort: false,
+            is_scope: true,
+        });
+    }
 
     let mut yield_reg_opt = None;
     let mut temp_table_ctx = None;
@@ -254,11 +269,11 @@ pub fn translate_insert(
                     jump_on_definition: jump_on_definition_label,
                     start_offset: start_offset_label,
                 });
-
                 program.preassign_label_to_next_insn(start_offset_label);
 
                 let query_destination = QueryDestination::CoroutineYield {
                     yield_reg,
+                    // keep implementation_start as halt_label (producer internals)
                     coroutine_implementation_start: halt_label,
                 };
                 program.incr_nesting();
@@ -298,18 +313,14 @@ pub fn translate_insert(
                     });
 
                     // Main loop
-                    // FIXME: rollback is not implemented. E.g. if you insert 2 rows and one fails to unique constraint violation,
-                    // the other row will still be inserted.
                     program.preassign_label_to_next_insn(loop_start_label);
-
                     let yield_label = program.allocate_label();
-
                     program.emit_insn(Insn::Yield {
                         yield_reg,
-                        end_offset: yield_label,
+                        end_offset: yield_label, // stays local, we’ll route at loop end
                     });
-                    let record_reg = program.alloc_register();
 
+                    let record_reg = program.alloc_register();
                     let affinity_str = if columns.is_empty() {
                         btree_table
                             .columns
@@ -352,7 +363,6 @@ pub fn translate_insert(
                         rowid_reg,
                         prev_largest_reg: 0,
                     });
-
                     program.emit_insn(Insn::Insert {
                         cursor: temp_cursor_id,
                         key_reg: rowid_reg,
@@ -361,12 +371,10 @@ pub fn translate_insert(
                         flag: InsertFlags::new().require_seek(),
                         table_name: "".to_string(),
                     });
-
                     // loop back
                     program.emit_insn(Insn::Goto {
                         target_pc: loop_start_label,
                     });
-
                     program.preassign_label_to_next_insn(yield_label);
 
                     program.emit_insn(Insn::OpenWrite {
@@ -381,13 +389,14 @@ pub fn translate_insert(
                         db: 0,
                     });
 
-                    // Main loop
-                    // FIXME: rollback is not implemented. E.g. if you insert 2 rows and one fails to unique constraint violation,
-                    // the other row will still be inserted.
                     program.preassign_label_to_next_insn(loop_start_label);
+
+                    // on EOF, jump to select_exhausted to check FK constraints
+                    let select_exhausted = program.allocate_label();
+                    select_exhausted_label = Some(select_exhausted);
                     program.emit_insn(Insn::Yield {
                         yield_reg,
-                        end_offset: halt_label,
+                        end_offset: select_exhausted,
                     });
                 }
 
@@ -1033,6 +1042,9 @@ pub fn translate_insert(
             }
         }
     }
+    if has_child_fks {
+        emit_fk_checks_for_insert(&mut program, resolver, &insertion, table_name.as_str())?;
+    }
 
     program.emit_insn(Insn::Insert {
         cursor: cursor_id,
@@ -1154,15 +1166,38 @@ pub fn translate_insert(
             program.emit_insn(Insn::Close {
                 cursor_id: temp_table_ctx.cursor_id,
             });
+            program.emit_insn(Insn::Goto {
+                target_pc: stmt_epilogue,
+            });
         } else {
             // For multiple rows which not require a temp table, loop back
             program.resolve_label(row_done_label, program.offset());
             program.emit_insn(Insn::Goto {
                 target_pc: loop_start_label,
             });
+            if let Some(sel_eof) = select_exhausted_label {
+                program.preassign_label_to_next_insn(sel_eof);
+                program.emit_insn(Insn::Goto {
+                    target_pc: stmt_epilogue,
+                });
+            }
         }
     } else {
         program.resolve_label(row_done_label, program.offset());
+        // single-row falls through to epilogue
+        program.emit_insn(Insn::Goto {
+            target_pc: stmt_epilogue,
+        });
+    }
+
+    program.preassign_label_to_next_insn(stmt_epilogue);
+    if has_child_fks {
+        // close FK scope and surface deferred violations
+        program.emit_insn(Insn::FkCounter {
+            increment_value: -1,
+            check_abort: true,
+            is_scope: true,
+        });
     }
 
     program.resolve_label(halt_label, program.offset());
@@ -1855,5 +1890,198 @@ fn emit_update_sqlite_sequence(
 
     program.preassign_label_to_next_insn(end_update_label);
 
+    Ok(())
+}
+
+/// Emit child->parent foreign key checks for an INSERT, for the current row
+fn emit_fk_checks_for_insert(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    insertion: &Insertion,
+    table_name: &str,
+) -> Result<()> {
+    let after_all = program.allocate_label();
+    program.emit_insn(Insn::FkIfZero {
+        target_pc: after_all,
+        if_zero: true,
+    });
+
+    // Iterate child FKs declared on this table
+    for fk in resolver.schema.get_foreign_keys_for_table(table_name) {
+        let fk_ok = program.allocate_label();
+
+        // If any child column is NULL, skip this FK
+        for child_col in &fk.child_columns {
+            let mapping = insertion
+                .get_col_mapping_by_name(child_col)
+                .ok_or_else(|| {
+                    crate::LimboError::InternalError(format!("FK column {child_col} not found"))
+                })?;
+            let src = if mapping.column.is_rowid_alias {
+                insertion.key_register()
+            } else {
+                mapping.register
+            };
+            program.emit_insn(Insn::IsNull {
+                reg: src,
+                target_pc: fk_ok,
+            });
+        }
+
+        // Parent lookup: rowid path or unique-index path
+        let parent_tbl = resolver.schema.get_table(&fk.parent_table).ok_or_else(|| {
+            crate::LimboError::InternalError(format!("Parent table {} not found", fk.parent_table))
+        })?;
+
+        let uses_rowid = {
+            // If single parent column equals rowid or aliases rowid
+            fk.parent_columns.len() == 1 && {
+                let parent_col = fk.parent_columns[0].as_str();
+                parent_col.eq_ignore_ascii_case("rowid")
+                    || parent_tbl.columns().iter().any(|c| {
+                        c.is_rowid_alias
+                            && c.name
+                                .as_ref()
+                                .is_some_and(|n| n.eq_ignore_ascii_case(parent_col))
+                    })
+            }
+        };
+
+        if uses_rowid {
+            // Simple rowid probe on parent table
+            let parent_bt = parent_tbl.btree().ok_or_else(|| {
+                crate::LimboError::InternalError("Parent table is not a BTree".into())
+            })?;
+            let pcur = program.alloc_cursor_id(CursorType::BTreeTable(parent_bt.clone()));
+            program.emit_insn(Insn::OpenRead {
+                cursor_id: pcur,
+                root_page: parent_bt.root_page,
+                db: 0,
+            });
+
+            // Child value register
+            let cm = insertion
+                .get_col_mapping_by_name(&fk.child_columns[0])
+                .ok_or_else(|| {
+                    crate::LimboError::InternalError("FK child column not found".into())
+                })?;
+            let val_reg = if cm.column.is_rowid_alias {
+                insertion.key_register()
+            } else {
+                cm.register
+            };
+
+            let violation = program.allocate_label();
+            // NotExists: jump to violation if missing in parent
+            program.emit_insn(Insn::NotExists {
+                cursor: pcur,
+                rowid_reg: val_reg,
+                target_pc: violation,
+            });
+            // OK
+            program.emit_insn(Insn::Close { cursor_id: pcur });
+            program.emit_insn(Insn::Goto { target_pc: fk_ok });
+
+            // Violation
+            program.preassign_label_to_next_insn(violation);
+            program.emit_insn(Insn::Close { cursor_id: pcur });
+
+            // Deferred vs immediate
+            if fk.deferred {
+                program.emit_insn(Insn::FkCounter {
+                    increment_value: 1,
+                    check_abort: false,
+                    is_scope: false,
+                });
+            } else {
+                program.emit_insn(Insn::Halt {
+                    err_code: crate::error::SQLITE_CONSTRAINT_FOREIGNKEY,
+                    description: "FOREIGN KEY constraint failed".to_string(),
+                });
+            }
+        } else {
+            // Multi-column (or non-rowid) parent, we have to match a UNIQUE index with
+            // the exact column set and order
+            let parent_idx = resolver
+                .schema
+                .get_indices(&fk.parent_table)
+                .find(|idx| {
+                    idx.unique
+                        && idx.columns.len() == fk.parent_columns.len()
+                        && idx
+                            .columns
+                            .iter()
+                            .zip(fk.parent_columns.iter())
+                            .all(|(ic, pc)| ic.name.eq_ignore_ascii_case(pc))
+                })
+                .ok_or_else(|| {
+                    crate::LimboError::InternalError(format!(
+                        "No UNIQUE index on parent {}({:?}) for FK",
+                        fk.parent_table, fk.parent_columns
+                    ))
+                })?;
+
+            let icur = program.alloc_cursor_id(CursorType::BTreeIndex(parent_idx.clone()));
+            program.emit_insn(Insn::OpenRead {
+                cursor_id: icur,
+                root_page: parent_idx.root_page,
+                db: 0,
+            });
+
+            // Build packed search key registers from the *child* values
+            let n = fk.child_columns.len();
+            let start = program.alloc_registers(n);
+            for (i, child_col) in fk.child_columns.iter().enumerate() {
+                let cm = insertion
+                    .get_col_mapping_by_name(child_col)
+                    .ok_or_else(|| {
+                        crate::LimboError::InternalError(format!("Column {child_col} not found"))
+                    })?;
+                let src = if cm.column.is_rowid_alias {
+                    insertion.key_register()
+                } else {
+                    cm.register
+                };
+                program.emit_insn(Insn::Copy {
+                    src_reg: src,
+                    dst_reg: start + i,
+                    extra_amount: 0,
+                });
+            }
+
+            let found = program.allocate_label();
+            program.emit_insn(Insn::Found {
+                cursor_id: icur,
+                target_pc: found,
+                record_reg: start,
+                num_regs: n,
+            });
+
+            // Violation path
+            program.emit_insn(Insn::Close { cursor_id: icur });
+            if fk.deferred {
+                program.emit_insn(Insn::FkCounter {
+                    increment_value: 1,
+                    check_abort: false,
+                    is_scope: false,
+                });
+            } else {
+                program.emit_insn(Insn::Halt {
+                    err_code: crate::error::SQLITE_CONSTRAINT_FOREIGNKEY,
+                    description: "FOREIGN KEY constraint failed".to_string(),
+                });
+            }
+            program.emit_insn(Insn::Goto { target_pc: fk_ok });
+
+            // Found OK
+            program.preassign_label_to_next_insn(found);
+            program.emit_insn(Insn::Close { cursor_id: icur });
+        }
+
+        // Done with this FK
+        program.preassign_label_to_next_insn(fk_ok);
+    }
+
+    program.resolve_label(after_all, program.offset());
     Ok(())
 }

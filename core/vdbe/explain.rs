@@ -1804,11 +1804,11 @@ pub fn insn_to_row(
             0,
             String::new(),
         ),
-        Insn::FkCounter{check_abort, increment_value} => (
+        Insn::FkCounter{check_abort, increment_value, is_scope } => (
         "FkCounter",
             *check_abort as i32,
             *increment_value as i32,
-            0,
+            *is_scope as i32,
             Value::build_text(""),
             0,
             String::new(),

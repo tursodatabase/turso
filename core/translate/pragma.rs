@@ -389,7 +389,14 @@ fn update_pragma(
         }
         PragmaName::ForeignKeys => {
             let enabled = match &value {
-                Expr::Literal(Literal::Keyword(name)) | Expr::Id(name) => {
+                Expr::Id(name) | Expr::Name(name) => {
+                    let name_str = name.as_str().as_bytes();
+                    match_ignore_ascii_case!(match name_str {
+                        b"ON" | b"TRUE" | b"YES" | b"1" => true,
+                        _ => false,
+                    })
+                }
+                Expr::Literal(Literal::Keyword(name) | Literal::String(name)) => {
                     let name_bytes = name.as_bytes();
                     match_ignore_ascii_case!(match name_bytes {
                         b"ON" | b"TRUE" | b"YES" | b"1" => true,
@@ -399,7 +406,7 @@ fn update_pragma(
                 Expr::Literal(Literal::Numeric(n)) => !matches!(n.as_str(), "0"),
                 _ => false,
             };
-            connection.set_foreign_keys(enabled);
+            connection.set_foreign_keys_enabled(enabled);
             Ok((program, TransactionMode::None))
         }
     }

@@ -63,17 +63,16 @@ pub use io::{
 };
 use parking_lot::RwLock;
 use schema::Schema;
-use std::cell::Cell;
 use std::{
     borrow::Cow,
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::HashMap,
     fmt::{self, Display},
     num::NonZero,
     ops::Deref,
     rc::Rc,
     sync::{
-        atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU16, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, AtomicUsize, Ordering},
         Arc, LazyLock, Mutex, Weak,
     },
     time::Duration,
@@ -583,6 +582,7 @@ impl Database {
             data_sync_retry: AtomicBool::new(false),
             busy_timeout: RwLock::new(Duration::new(0, 0)),
             is_mvcc_bootstrap_connection: AtomicBool::new(is_mvcc_bootstrap_connection),
+            fk_pragma: AtomicBool::new(false),
         });
         self.n_connections
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -1100,6 +1100,7 @@ pub struct Connection {
     busy_timeout: RwLock<std::time::Duration>,
     /// Whether this is an internal connection used for MVCC bootstrap
     is_mvcc_bootstrap_connection: AtomicBool,
+    fk_pragma: AtomicBool,
 }
 
 impl Drop for Connection {
@@ -1530,6 +1531,21 @@ impl Connection {
             std::fs::set_permissions(&opts.path, perms.permissions())?;
         }
         Ok(db)
+    }
+
+    pub fn set_foreign_keys_enabled(&self, enable: bool) {
+        self.fk_pragma.store(enable, Ordering::Release);
+    }
+    pub fn foreign_keys_enabled(&self) -> bool {
+        self.fk_pragma.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn clear_deferred_foreign_key_violations(&self) -> isize {
+        self.fk_deferred_violations.swap(0, Ordering::Release)
+    }
+
+    pub(crate) fn get_deferred_foreign_key_violations(&self) -> isize {
+        self.fk_deferred_violations.load(Ordering::Acquire)
     }
 
     pub fn maybe_update_schema(&self) {

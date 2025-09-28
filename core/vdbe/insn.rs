@@ -1175,6 +1175,7 @@ pub enum Insn {
     FkCounter {
         check_abort: bool,
         increment_value: isize,
+        is_scope: bool,
     },
     // This opcode tests if a foreign key constraint-counter is currently zero. If so, jump to instruction P2. Otherwise, fall through to the next instruction.
     // If P1 is non-zero, then the jump is taken if the database constraint-counter is zero (the one that counts deferred constraint violations).

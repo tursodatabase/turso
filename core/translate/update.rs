@@ -353,6 +353,7 @@ pub fn prepare_update_plan(
             }],
             is_strict: false,
             unique_sets: vec![],
+            foreign_keys: vec![],
         });
 
         let temp_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
