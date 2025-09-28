@@ -104,7 +104,7 @@ jobs:
 
   tpc-h-criterion:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     env:
       DB_FILE: "perf/tpc-h/TPC-H.db"
     steps:
