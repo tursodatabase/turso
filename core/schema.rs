@@ -35,7 +35,9 @@ use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::Mutex;
 use tracing::trace;
-use turso_parser::ast::{self, ColumnDefinition, Expr, Literal, RefAct, SortOrder, TableOptions};
+use turso_parser::ast::{
+    self, ColumnDefinition, Expr, InitDeferredPred, Literal, RefAct, SortOrder, TableOptions,
+};
 use turso_parser::{
     ast::{Cmd, CreateTableBody, ResultColumn, Stmt},
     parser::Parser,
@@ -244,92 +246,16 @@ impl Schema {
         self.views.get(&name)
     }
 
-    pub fn add_btree_table(&mut self, table: Arc<BTreeTable>) -> Result<()> {
+    pub fn add_btree_table(&mut self, mut table: Arc<BTreeTable>) -> Result<()> {
         let name = normalize_ident(&table.name);
-        for key in &table.foreign_keys {
-            let Some(parent) = self.get_btree_table(&key.parent_table) else {
-                return Err(LimboError::ParseError(format!(
-                    "Foreign key references missing table {}",
-                    key.parent_table
-                )));
-            };
+        let mut resolved_fks: Vec<Arc<ForeignKey>> = Vec::with_capacity(table.foreign_keys.len());
+        // when we built the BTreeTable from SQL, we didn't have access to the Schema to validate
+        // any FK relationships, so we do that now
+        self.validate_and_normalize_btree_foreign_keys(&table, &mut resolved_fks)?;
 
-            // resolve parent key columns: explicit or parent's PK
-            let parent_cols: Vec<String> = if key.parent_columns.is_empty() {
-                if parent.primary_key_columns.is_empty() {
-                    return Err(LimboError::ParseError(format!(
-                        "Foreign key references {} without explicit columns, \
-                 but {} has no PRIMARY KEY",
-                        key.parent_table, key.parent_table
-                    )));
-                }
-                parent
-                    .primary_key_columns
-                    .iter()
-                    .map(|(n, _)| normalize_ident(n))
-                    .collect()
-            } else {
-                key.parent_columns
-                    .iter()
-                    .map(|c| normalize_ident(c))
-                    .collect()
-            };
-
-            // arity must match
-            if parent_cols.len() != key.child_columns.len() {
-                return Err(LimboError::ParseError(format!(
-                    "Foreign key column count mismatch: child {:?} vs parent {:?}",
-                    key.child_columns, parent_cols
-                )));
-            }
-
-            // ensure each named parent column exists
-            for col in &parent_cols {
-                if parent.get_column(col).is_none() && !col.eq_ignore_ascii_case("rowid") {
-                    return Err(LimboError::ParseError(format!(
-                        "Foreign key references missing column {}.{}",
-                        key.parent_table, col
-                    )));
-                }
-            }
-
-            // ensure child columns exist on *this* table
-            for col in &key.child_columns {
-                if table.get_column(col).is_none() && !col.eq_ignore_ascii_case("rowid") {
-                    return Err(LimboError::ParseError(format!(
-                        "Foreign key child column not found: {}.{}",
-                        table.name, col
-                    )));
-                }
-            }
-
-            // ensure parent side is UNIQUE or PRIMARY KEY
-            // SQLite requires the parent key to be UNIQUE or PK. If not, you can either:
-            let parent_is_unique = if parent_cols.len() == parent.primary_key_columns.len()
-                && parent_cols
-                    .iter()
-                    .zip(&parent.primary_key_columns)
-                    .all(|(a, (b, _))| a.eq_ignore_ascii_case(b))
-            {
-                true
-            } else {
-                self.get_indices(&parent.name).any(|idx| {
-                    idx.unique
-                        && idx.columns.len() == parent_cols.len()
-                        && idx
-                            .columns
-                            .iter()
-                            .zip(&parent_cols)
-                            .all(|(ic, pc)| ic.name.eq_ignore_ascii_case(pc))
-                })
-            };
-            if !parent_is_unique {
-                return Err(LimboError::ParseError(format!(
-                    "Foreign key references {}({:?}) which is not UNIQUE or PRIMARY KEY",
-                    key.parent_table, parent_cols
-                )));
-            }
-        }
+        // there should only be 1 reference to the table so Arc::make_mut shouldnt copy
+        let t = Arc::make_mut(&mut table);
+        t.foreign_keys = resolved_fks;
         self.tables.insert(name, Table::BTree(table).into());
         Ok(())
     }
@@ -906,6 +832,114 @@ impl Schema {
 
         Ok(())
     }
+
+    fn validate_and_normalize_btree_foreign_keys(
+        &self,
+        table: &Arc<BTreeTable>,
+        resolved_fks: &mut Vec<Arc<ForeignKey>>,
+    ) -> Result<()> {
+        for key in &table.foreign_keys {
+            let Some(parent) = self.get_btree_table(&key.parent_table) else {
+                return Err(LimboError::ParseError(format!(
+                    "Foreign key references missing table {}",
+                    key.parent_table
+                )));
+            };
+
+            let child_cols: Vec<String> = key
+                .child_columns
+                .iter()
+                .map(|c| normalize_ident(c))
+                .collect();
+            for c in &child_cols {
+                if table.get_column(c).is_none() && !c.eq_ignore_ascii_case("rowid") {
+                    return Err(LimboError::ParseError(format!(
+                        "Foreign key child column not found: {}.{}",
+                        table.name, c
+                    )));
+                }
+            }
+
+            // Resolve parent cols:
+            // if explicitly listed, we normalize them
+            // else, we default to parent's PRIMARY KEY columns.
+            // if parent has no declared PK, SQLite defaults to single "rowid"
+            let parent_cols: Vec<String> = if key.parent_columns.is_empty() {
+                if !parent.primary_key_columns.is_empty() {
+                    parent
+                        .primary_key_columns
+                        .iter()
+                        .map(|(n, _)| normalize_ident(n))
+                        .collect()
+                } else {
+                    vec!["rowid".to_string()]
+                }
+            } else {
+                key.parent_columns
+                    .iter()
+                    .map(|c| normalize_ident(c))
+                    .collect()
+            };
+
+            if parent_cols.len() != child_cols.len() {
+                return Err(LimboError::ParseError(format!(
+                    "Foreign key column count mismatch: child {child_cols:?} vs parent {parent_cols:?}",
+                )));
+            }
+
+            // Ensure each parent col exists
+            for col in &parent_cols {
+                if !col.eq_ignore_ascii_case("rowid") && parent.get_column(col).is_none() {
+                    return Err(LimboError::ParseError(format!(
+                        "Foreign key references missing column {}.{col}",
+                        key.parent_table
+                    )));
+                }
+            }
+
+            // Parent side must be UNIQUE/PK, rowid counts as unique
+            let parent_is_pk = !parent.primary_key_columns.is_empty()
+                && parent_cols.len() == parent.primary_key_columns.len()
+                && parent_cols
+                    .iter()
+                    .zip(&parent.primary_key_columns)
+                    .all(|(a, (b, _))| a.eq_ignore_ascii_case(b));
+
+            let parent_is_rowid =
+                parent_cols.len() == 1 && parent_cols[0].eq_ignore_ascii_case("rowid");
+
+            let parent_is_unique = parent_is_pk
+                || parent_is_rowid
+                || self.get_indices(&parent.name).any(|idx| {
+                    idx.unique
+                        && idx.columns.len() == parent_cols.len()
+                        && idx
+                            .columns
+                            .iter()
+                            .zip(&parent_cols)
+                            .all(|(ic, pc)| ic.name.eq_ignore_ascii_case(pc))
+                });
+
+            if !parent_is_unique {
+                return Err(LimboError::ParseError(format!(
+                    "Foreign key references {}({:?}) which is not UNIQUE or PRIMARY KEY",
+                    key.parent_table, parent_cols
+                )));
+            }
+
+            let resolved = ForeignKey {
+                parent_table: normalize_ident(&key.parent_table),
+                parent_columns: parent_cols,
+                child_columns: child_cols,
+                on_delete: key.on_delete,
+                on_update: key.on_update,
+                on_insert: key.on_insert,
+                deferred: key.deferred,
+            };
+            resolved_fks.push(Arc::new(resolved));
+        }
+        Ok(())
+    }
 }
 
 impl Clone for Schema {
@@ -1281,6 +1315,85 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                         is_primary_key: false,
                     };
                     unique_sets.push(unique_set);
+                } else if let ast::TableConstraint::ForeignKey {
+                    columns,
+                    clause,
+                    deref_clause,
+                } = &c.constraint
+                {
+                    let child_columns: Vec<String> = columns
+                        .iter()
+                        .map(|ic| normalize_ident(ic.col_name.as_str()))
+                        .collect();
+
+                    // derive parent columns: explicit or default to parent PK
+                    let parent_table = normalize_ident(clause.tbl_name.as_str());
+                    let parent_columns: Vec<String> = clause
+                        .columns
+                        .iter()
+                        .map(|ic| normalize_ident(ic.col_name.as_str()))
+                        .collect();
+
+                    // arity check
+                    if child_columns.len() != parent_columns.len() {
+                        crate::bail_parse_error!(
+                            "foreign key on \"{}\" has {} child column(s) but {} parent column(s)",
+                            tbl_name,
+                            child_columns.len(),
+                            parent_columns.len()
+                        );
+                    }
+                    // deferrable semantics
+                    let deferred = match deref_clause {
+                        Some(d) => {
+                            d.deferrable
+                                && matches!(
+                                    d.init_deferred,
+                                    Some(InitDeferredPred::InitiallyDeferred)
+                                )
+                        }
+                        None => false, // NOT DEFERRABLE INITIALLY IMMEDIATE by default
+                    };
+                    let fk = ForeignKey {
+                        parent_table,
+                        parent_columns,
+                        child_columns,
+                        on_delete: clause
+                            .args
+                            .iter()
+                            .find_map(|a| {
+                                if let ast::RefArg::OnDelete(x) = a {
+                                    Some(*x)
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or(RefAct::NoAction),
+                        on_insert: clause
+                            .args
+                            .iter()
+                            .find_map(|a| {
+                                if let ast::RefArg::OnInsert(x) = a {
+                                    Some(*x)
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or(RefAct::NoAction),
+                        on_update: clause
+                            .args
+                            .iter()
+                            .find_map(|a| {
+                                if let ast::RefArg::OnUpdate(x) = a {
+                                    Some(*x)
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or(RefAct::NoAction),
+                        deferred,
+                    };
+                    foreign_keys.push(Arc::new(fk));
                 }
             }
             for ast::ColumnDefinition {
