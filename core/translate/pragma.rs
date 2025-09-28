@@ -378,6 +378,23 @@ fn update_pragma(
             connection.set_data_sync_retry(retry_enabled);
             Ok((program, TransactionMode::None))
         }
+        PragmaName::ForeignKeys => {
+            let enabled = match value {
+                Expr::Literal(Literal::Keyword(name))
+                | Expr::Name(Name::Ident(name))
+                | Expr::Id(Name::Ident(name)) => {
+                    let name_bytes = name.as_bytes();
+                    match_ignore_ascii_case!(match name_bytes {
+                        b"ON" | b"TRUE" | b"YES" | b"1" => true,
+                        _ => false,
+                    })
+                }
+                Expr::Literal(Literal::Numeric(n)) => !matches!(n.as_str(), "0"),
+                _ => false,
+            };
+            connection.set_foreign_keys(enabled);
+            Ok((program, TransactionMode::None))
+        }
     }
 }
 
@@ -683,6 +700,14 @@ fn query_pragma(
             let retry_enabled = connection.get_data_sync_retry();
             let register = program.alloc_register();
             program.emit_int(retry_enabled as i64, register);
+            program.emit_result_row(register, 1);
+            program.add_pragma_result_column(pragma.to_string());
+            Ok((program, TransactionMode::None))
+        }
+        PragmaName::ForeignKeys => {
+            let enabled = connection.get_foreign_keys();
+            let register = program.alloc_register();
+            program.emit_int(enabled as i64, register);
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
             Ok((program, TransactionMode::None))
