@@ -313,6 +313,7 @@ pub struct ProgramState {
     /// This is used when statement in auto-commit mode reseted after previous uncomplete execution - in which case we may need to rollback transaction started on previous attempt
     /// Note, that MVCC transactions are always explicit - so they do not update auto_txn_cleanup marker
     pub(crate) auto_txn_cleanup: TxnCleanup,
+    fk_constraint_counter: isize,
 }
 
 impl ProgramState {
@@ -359,6 +360,7 @@ impl ProgramState {
             op_checkpoint_state: OpCheckpointState::StartCheckpoint,
             view_delta_state: ViewDeltaCommitState::NotStarted,
             auto_txn_cleanup: TxnCleanup::None,
+            fk_constraint_counter: 0,
         }
     }
 

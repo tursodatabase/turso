@@ -8276,6 +8276,65 @@ fn handle_text_sum(acc: &mut Value, sum_state: &mut SumAggState, parsed_number: 
     }
 }
 
+pub fn op_fk_counter(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+    mv_store: Option<&Arc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        FkCounter {
+            increment_value,
+            check_abort,
+        },
+        insn
+    );
+    state.fk_constraint_counter = state.fk_constraint_counter.saturating_add(*increment_value);
+
+    // If check_abort is true and counter is negative, abort with constraint error
+    // This shouldn't happen in well-formed bytecode but acts as a safety check
+    if *check_abort && state.fk_constraint_counter < 0 {
+        return Err(LimboError::Constraint(
+            "FOREIGN KEY constraint failed".into(),
+        ));
+    }
+
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_fk_if_zero(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+    _mv_store: Option<&Arc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(FkIfZero { target_pc, if_zero }, insn);
+    let fk_enabled = program.connection.foreign_keys_enabled();
+
+    // Jump if any:
+    // Foreign keys are disabled globally
+    // p1 is true AND deferred constraint counter is zero
+    //  p1 is false AND deferred constraint counter is non-zero
+    let should_jump = if !fk_enabled {
+        true
+    } else if *if_zero {
+        state.fk_constraint_counter == 0
+    } else {
+        state.fk_constraint_counter != 0
+    };
+
+    if should_jump {
+        state.pc = target_pc.as_offset_int();
+    } else {
+        state.pc += 1;
+    }
+
+    Ok(InsnFunctionStepResult::Step)
+}
+
 mod cmath {
     extern "C" {
         pub fn exp(x: f64) -> f64;

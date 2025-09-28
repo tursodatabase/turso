@@ -1169,6 +1169,20 @@ pub enum Insn {
         p2: Option<usize>, // P2: address of parent explain instruction
         detail: String,    // P4: detail text
     },
+    // Increment a "constraint counter" by P2 (P2 may be negative or positive).
+    // If P1 is non-zero, the database constraint counter is incremented (deferred foreign key constraints).
+    // Otherwise, if P1 is zero, the statement counter is incremented (immediate foreign key constraints).
+    FkCounter {
+        check_abort: bool,
+        increment_value: isize,
+    },
+    // This opcode tests if a foreign key constraint-counter is currently zero. If so, jump to instruction P2. Otherwise, fall through to the next instruction.
+    // If P1 is non-zero, then the jump is taken if the database constraint-counter is zero (the one that counts deferred constraint violations).
+    // If P1 is zero, the jump is taken if the statement constraint-counter is zero (immediate foreign key constraint violations).
+    FkIfZero {
+        if_zero: bool,
+        target_pc: BranchOffset,
+    },
 }
 
 const fn get_insn_virtual_table() -> [InsnFunction; InsnVariants::COUNT] {
@@ -1335,6 +1349,8 @@ impl InsnVariants {
             InsnVariants::MemMax => execute::op_mem_max,
             InsnVariants::Sequence => execute::op_sequence,
             InsnVariants::SequenceTest => execute::op_sequence_test,
+            InsnVariants::FkCounter => execute::op_fk_counter,
+            InsnVariants::FkIfZero => execute::op_fk_if_zero,
         }
     }
 }
