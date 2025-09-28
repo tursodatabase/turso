@@ -293,7 +293,6 @@ macro_rules! define_aes_gcm_cipher {
         }
 
         impl $struct_name {
-            const TAG_SIZE: usize = 16;
             const NONCE_SIZE: usize = 12;
 
             fn new(key: &EncryptionKey) -> Result<Self> {
@@ -305,7 +304,7 @@ macro_rules! define_aes_gcm_cipher {
                 })
             }
 
-            fn encrypt(&self, plaintext: &[u8], ad: &[u8]) -> Result<(Vec<u8>, [u8; 12])> {
+            fn encrypt(&self, plaintext: &[u8], ad: &[u8]) -> Result<(Vec<u8>, [u8; Self::NONCE_SIZE])> {
                 let nonce = <$cipher_type>::generate_nonce(&mut OsRng);
                 let ciphertext = self.cipher.encrypt(&nonce, aes_gcm::aead::Payload {
                     msg: plaintext,
@@ -313,12 +312,12 @@ macro_rules! define_aes_gcm_cipher {
                 }).map_err(|e| {
                     LimboError::InternalError(format!("{} encryption failed: {e:?}", $name))
                 })?;
-                let mut nonce_array = [0u8; 12];
+                let mut nonce_array = [0u8; Self::NONCE_SIZE];
                 nonce_array.copy_from_slice(&nonce);
                 Ok((ciphertext, nonce_array))
             }
 
-            fn decrypt(&self, ciphertext: &[u8], nonce: &[u8; 12], ad: &[u8]) -> Result<Vec<u8>> {
+            fn decrypt(&self, ciphertext: &[u8], nonce: &[u8; Self::NONCE_SIZE], ad: &[u8]) -> Result<Vec<u8>> {
                 let nonce = Nonce::from_slice(nonce);
                 self.cipher
                     .decrypt(nonce, aes_gcm::aead::Payload {
