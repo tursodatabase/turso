@@ -2688,11 +2688,11 @@ impl<'a> Parser<'a> {
         let columns = self.parse_eid_list(false)?;
         peek_expect!(self, TK_REFERENCES);
         let clause = self.parse_foreign_key_clause()?;
-        let deref_clause = self.parse_defer_subclause()?;
+        let defer_clause = self.parse_defer_subclause()?;
         Ok(TableConstraint::ForeignKey {
             columns,
             clause,
-            deref_clause,
+            defer_clause,
         })
     }
 
@@ -3300,10 +3300,10 @@ impl<'a> Parser<'a> {
 
     fn parse_reference_column_constraint(&mut self) -> Result<ColumnConstraint> {
         let clause = self.parse_foreign_key_clause()?;
-        let deref_clause = self.parse_defer_subclause()?;
+        let defer_clause = self.parse_defer_subclause()?;
         Ok(ColumnConstraint::ForeignKey {
             clause,
-            deref_clause,
+            defer_clause,
         })
     }
 
@@ -9420,7 +9420,7 @@ mod tests {
                                         columns: vec![],
                                         args: vec![]
                                     },
-                                    deref_clause: None
+                                    defer_clause: None
                                 },
                             },
                         ],
@@ -9460,7 +9460,7 @@ mod tests {
                                             RefArg::OnInsert(RefAct::SetNull),
                                         ]
                                     },
-                                    deref_clause: None
+                                    defer_clause: None
                                 },
                             },
                         ],
@@ -9500,7 +9500,7 @@ mod tests {
                                             RefArg::OnUpdate(RefAct::SetNull),
                                         ]
                                     },
-                                    deref_clause: None
+                                    defer_clause: None
                                 },
                             },
                         ],
@@ -9540,7 +9540,7 @@ mod tests {
                                             RefArg::OnDelete(RefAct::SetNull),
                                         ]
                                     },
-                                    deref_clause: None
+                                    defer_clause: None
                                 },
                             },
                         ],
@@ -9580,7 +9580,7 @@ mod tests {
                                             RefArg::OnDelete(RefAct::SetDefault),
                                         ]
                                     },
-                                    deref_clause: None
+                                    defer_clause: None
                                 },
                             },
                         ],
@@ -9620,7 +9620,7 @@ mod tests {
                                             RefArg::OnDelete(RefAct::Cascade),
                                         ]
                                     },
-                                    deref_clause: None
+                                    defer_clause: None
                                 },
                             },
                         ],
@@ -9660,7 +9660,7 @@ mod tests {
                                             RefArg::OnDelete(RefAct::Restrict),
                                         ]
                                     },
-                                    deref_clause: None
+                                    defer_clause: None
                                 },
                             },
                         ],
@@ -9700,7 +9700,7 @@ mod tests {
                                             RefArg::OnDelete(RefAct::NoAction),
                                         ]
                                     },
-                                    deref_clause: None
+                                    defer_clause: None
                                 },
                             },
                         ],
@@ -9726,7 +9726,7 @@ mod tests {
                                         columns: vec![],
                                         args: vec![]
                                     },
-                                    deref_clause: Some(DeferSubclause {
+                                    defer_clause: Some(DeferSubclause {
                                         deferrable: true,
                                         init_deferred: None,
                                     })
@@ -9755,7 +9755,7 @@ mod tests {
                                         columns: vec![],
                                         args: vec![]
                                     },
-                                    deref_clause: Some(DeferSubclause {
+                                    defer_clause: Some(DeferSubclause {
                                         deferrable: false,
                                         init_deferred: Some(InitDeferredPred::InitiallyImmediate),
                                     })
@@ -9784,7 +9784,7 @@ mod tests {
                                         columns: vec![],
                                         args: vec![]
                                     },
-                                    deref_clause: Some(DeferSubclause {
+                                    defer_clause: Some(DeferSubclause {
                                         deferrable: false,
                                         init_deferred: Some(InitDeferredPred::InitiallyDeferred),
                                     })
@@ -9813,7 +9813,7 @@ mod tests {
                                         columns: vec![],
                                         args: vec![]
                                     },
-                                    deref_clause: Some(DeferSubclause {
+                                    defer_clause: Some(DeferSubclause {
                                         deferrable: false,
                                         init_deferred: Some(InitDeferredPred::InitiallyDeferred),
                                     })
@@ -10207,7 +10207,7 @@ mod tests {
                                         ],
                                         args: vec![],
                                     },
-                                    deref_clause: None,
+                                    defer_clause: None,
                                 },
                             },
                             NamedTableConstraint {
