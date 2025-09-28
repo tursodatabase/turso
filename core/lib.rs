@@ -564,6 +564,7 @@ impl Database {
             data_sync_retry: AtomicBool::new(false),
             busy_timeout: RwLock::new(Duration::new(0, 0)),
             is_mvcc_bootstrap_connection: AtomicBool::new(is_mvcc_bootstrap_connection),
+            fk_pragma: AtomicBool::new(false),
         });
         self.n_connections
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -1080,8 +1081,13 @@ pub struct Connection {
     /// User defined max accumulated Busy timeout duration
     /// Default is 0 (no timeout)
     busy_timeout: RwLock<std::time::Duration>,
+<<<<<<< HEAD
     /// Whether this is an internal connection used for MVCC bootstrap
     is_mvcc_bootstrap_connection: AtomicBool,
+||||||| parent of 21e8ccda6 (Add field on connection to activate foreign key)
+=======
+    fk_pragma: AtomicBool,
+>>>>>>> 21e8ccda6 (Add field on connection to activate foreign key)
 }
 
 impl Drop for Connection {
@@ -1513,6 +1519,13 @@ impl Connection {
             std::fs::set_permissions(&opts.path, perms.permissions())?;
         }
         Ok(db)
+    }
+
+    pub fn set_foreign_keys(&self, enable: bool) {
+        self.fk_pragma.store(enable, Ordering::Release);
+    }
+    pub fn get_foreign_keys(&self) -> bool {
+        self.fk_pragma.load(Ordering::Acquire)
     }
 
     pub fn maybe_update_schema(&self) -> Result<()> {
