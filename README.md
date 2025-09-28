@@ -218,7 +218,7 @@ The Turso CLI includes a built-in [Model Context Protocol (MCP)](https://modelco
 Start the MCP server with:
 
 ```shell
-tursodb path/to/your/database.db --mcp
+tursodb your_database.db --mcp
 ```
 
 ### Configuration
