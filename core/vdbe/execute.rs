@@ -3698,6 +3698,7 @@ pub fn op_agg_step(
                         Value::Float(f) => match acc {
                             Value::Null => {
                                 *acc = Value::Float(f);
+                                sum_state.approx = true;
                             }
                             Value::Integer(i) => {
                                 let i_f = *i as f64;
@@ -3711,11 +3712,18 @@ pub fn op_agg_step(
                             }
                             _ => unreachable!(),
                         },
-
-                        _ => {
-                            //  If any input to sum() is neither an integer nor a NULL, then sum() returns a float
-                            // https://sqlite.org/lang_aggfunc.html
-                            sum_state.approx = true;
+                        Value::Text(t) => {
+                            let s = t.as_str();
+                            let (_, parsed_number) = try_for_float(s);
+                            handle_text_sum(acc, sum_state, parsed_number);
+                        }
+                        Value::Blob(b) => {
+                            if let Ok(s) = std::str::from_utf8(&b) {
+                                let (_, parsed_number) = try_for_float(s);
+                                handle_text_sum(acc, sum_state, parsed_number);
+                            } else {
+                                handle_text_sum(acc, sum_state, ParsedNumber::None);
+                            }
                         }
                     }
                 }
@@ -8101,6 +8109,51 @@ pub fn op_if_neg(
     }
 
     Ok(InsnFunctionStepResult::Step)
+}
+
+fn handle_text_sum(acc: &mut Value, sum_state: &mut SumAggState, parsed_number: ParsedNumber) {
+    match parsed_number {
+        ParsedNumber::Integer(i) => match acc {
+            Value::Null => {
+                *acc = Value::Integer(i);
+            }
+            Value::Integer(acc_i) => match acc_i.checked_add(i) {
+                Some(sum) => *acc = Value::Integer(sum),
+                None => {
+                    let acc_f = *acc_i as f64;
+                    *acc = Value::Float(acc_f);
+                    sum_state.approx = true;
+                    sum_state.ovrfl = true;
+                    apply_kbn_step_int(acc, i, sum_state);
+                }
+            },
+            Value::Float(_) => {
+                apply_kbn_step_int(acc, i, sum_state);
+            }
+            _ => unreachable!(),
+        },
+        ParsedNumber::Float(f) => {
+            if !sum_state.approx {
+                if let Value::Integer(current_sum) = *acc {
+                    *acc = Value::Float(current_sum as f64);
+                } else if matches!(*acc, Value::Null) {
+                    *acc = Value::Float(0.0);
+                }
+                sum_state.approx = true;
+            }
+            apply_kbn_step(acc, f, sum_state);
+        }
+        ParsedNumber::None => {
+            if !sum_state.approx {
+                if let Value::Integer(current_sum) = *acc {
+                    *acc = Value::Float(current_sum as f64);
+                } else if matches!(*acc, Value::Null) {
+                    *acc = Value::Float(0.0);
+                }
+                sum_state.approx = true;
+            }
+        }
+    }
 }
 
 mod cmath {

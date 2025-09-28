@@ -944,6 +944,40 @@ do_execsql_test length-999123 {
   select length('a' || char(0) || 'b');
 } {1}
 
+# refer https://github.com/tursodatabase/turso/issues/3285
+do_execsql_test sum-1 {
+  select sum('1'+'2');
+} {3}
+
+do_execsql_test sum-2 {
+  select sum('a1'+'a2');
+} {0}
+
+do_execsql_test sum-3 {
+  select sum('11a'+'21a2');
+} {32}
+
+do_execsql_test sum-4 {
+  select sum('?.a'+'a2');
+} {0}
+
+do_execsql_test sum-5 {
+  select sum('1*2a'+'a2');
+} {1}
+
+do_execsql_test sum-6 {
+  select sum('1+2a'+'a2');
+} {1}
+
+do_execsql_test sum-7 {
+  select sum('1-2a'+'a2');
+} {1}
+
+do_execsql_test sum-8 {
+  select sum('1.2a'+'a2');
+} {1.2}
+
+
 # TODO: sqlite seems not enable soundex() by default unless build it with SQLITE_SOUNDEX enabled.
 # do_execsql_test soundex-text {
 #  select soundex('Pfister'), soundex('husobee'), soundex('Tymczak'), soundex('Ashcraft'), soundex('Robert'), soundex('Rupert'), soundex('Rubin'), soundex('Kant'), soundex('Knuth'), soundex('x'), soundex('');
