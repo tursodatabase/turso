@@ -34,7 +34,6 @@ COPY ./sync ./sync/
 COPY ./testing/sqlite_test_ext ./testing/sqlite_test_ext/
 COPY ./testing/unreliable-libc ./testing/unreliable-libc/
 COPY ./tests ./tests/
-COPY ./vendored ./vendored/
 COPY ./whopper ./whopper/
 RUN cargo chef prepare --bin turso_stress --recipe-path recipe.json
 
@@ -77,7 +76,6 @@ COPY --from=planner /app/sync ./sync/
 COPY --from=planner /app/testing/sqlite_test_ext ./testing/sqlite_test_ext/
 COPY --from=planner /app/testing/unreliable-libc ./testing/unreliable-libc/
 COPY --from=planner /app/tests ./tests/
-COPY --from=planner /app/vendored ./vendored/
 COPY --from=planner /app/whopper ./whopper/
 
 RUN if [ "$antithesis" = "true" ]; then \
