@@ -426,7 +426,7 @@ pub fn translate_insert(
                 program.alloc_cursor_id(CursorType::BTreeIndex(idx.clone())),
             )
         })
-        .collect::<Vec<(&String, usize, usize)>>();
+        .collect::<Vec<(&String, i64, usize)>>();
 
     let insertion = build_insertion(&mut program, &table, &columns, num_values)?;
 

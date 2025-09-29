@@ -131,7 +131,7 @@ pub const PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX: &str = "sqlite_autoindex_";
 /// CREATE INDEX idx ON table_name(sql)
 pub struct UnparsedFromSqlIndex {
     pub table_name: String,
-    pub root_page: usize,
+    pub root_page: i64,
     pub sql: String,
 }
 
@@ -151,13 +151,13 @@ pub fn parse_schema_rows(
     let mut automatic_indices = std::collections::HashMap::with_capacity(10);
 
     // Store DBSP state table root pages: view_name -> dbsp_state_root_page
-    let mut dbsp_state_roots: std::collections::HashMap<String, usize> =
+    let mut dbsp_state_roots: std::collections::HashMap<String, i64> =
         std::collections::HashMap::new();
     // Store DBSP state table index root pages: view_name -> dbsp_state_index_root_page
-    let mut dbsp_state_index_roots: std::collections::HashMap<String, usize> =
+    let mut dbsp_state_index_roots: std::collections::HashMap<String, i64> =
         std::collections::HashMap::new();
     // Store materialized view info (SQL and root page) for later creation
-    let mut materialized_view_info: std::collections::HashMap<String, (String, usize)> =
+    let mut materialized_view_info: std::collections::HashMap<String, (String, i64)> =
         std::collections::HashMap::new();
     loop {
         match rows.step()? {

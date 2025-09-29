@@ -329,7 +329,7 @@ impl StreamingLogicalLogReader {
                         self.state = StreamingState::NeedTransactionStart;
                         continue;
                     }
-                    let table_id = self.consume_u64(io)?;
+                    let table_id = self.consume_u64(io)? as i64;
                     let record_type = self.consume_u8(io)?;
                     let _payload_size = self.consume_u64(io)?;
                     let mut bytes_read_on_row = 17; // table_id, record_type and payload_size

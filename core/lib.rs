@@ -1522,8 +1522,7 @@ impl Connection {
         frame_watermark: Option<u64>,
     ) -> Result<bool> {
         let pager = self.pager.read();
-        let (page_ref, c) = match pager.read_page_no_cache(page_idx as usize, frame_watermark, true)
-        {
+        let (page_ref, c) = match pager.read_page_no_cache(page_idx as i64, frame_watermark, true) {
             Ok(result) => result,
             // on windows, zero read will trigger UnexpectedEof
             #[cfg(target_os = "windows")]

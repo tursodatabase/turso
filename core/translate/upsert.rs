@@ -348,7 +348,7 @@ pub fn emit_upsert(
     set_pairs: &mut [(usize, Box<ast::Expr>)],
     where_clause: &mut Option<Box<ast::Expr>>,
     resolver: &Resolver,
-    idx_cursors: &[(&String, usize, usize)],
+    idx_cursors: &[(&String, i64, usize)],
     returning: &mut [ResultSetColumn],
     cdc_cursor_id: Option<usize>,
     row_done_label: BranchOffset,

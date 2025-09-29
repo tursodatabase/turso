@@ -346,7 +346,7 @@ enum JoinCommitState {
 #[derive(Debug)]
 pub struct JoinOperator {
     /// Unique operator ID for indexing in persistent storage
-    operator_id: usize,
+    operator_id: i64,
     /// Type of join to perform
     join_type: JoinType,
     /// Column indices for extracting join keys from left input
@@ -365,7 +365,7 @@ pub struct JoinOperator {
 
 impl JoinOperator {
     pub fn new(
-        operator_id: usize,
+        operator_id: i64,
         join_type: JoinType,
         left_key_indices: Vec<usize>,
         right_key_indices: Vec<usize>,

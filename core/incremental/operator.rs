@@ -38,7 +38,7 @@ impl DbspStateCursors {
 
 /// Create an index definition for the DBSP state table
 /// This defines the primary key index on (operator_id, zset_id, element_id)
-pub fn create_dbsp_state_index(root_page: usize) -> Index {
+pub fn create_dbsp_state_index(root_page: i64) -> Index {
     Index {
         name: "dbsp_state_pk".to_string(),
         table_name: "dbsp_state".to_string(),
@@ -79,11 +79,11 @@ pub fn create_dbsp_state_index(root_page: usize) -> Index {
 /// - Bits 16-63 (48 bits): operator_id
 /// - Bits 2-15 (14 bits): column_index (supports up to 16,384 columns)
 /// - Bits 0-1 (2 bits): operation type (AGG_TYPE_REGULAR, AGG_TYPE_MINMAX, etc.)
-pub fn generate_storage_id(operator_id: usize, column_index: usize, op_type: u8) -> i64 {
+pub fn generate_storage_id(operator_id: i64, column_index: usize, op_type: u8) -> i64 {
     assert!(op_type <= 3, "Invalid operation type");
     assert!(column_index < 16384, "Column index too large");
 
-    ((operator_id as i64) << 16) | ((column_index as i64) << 2) | (op_type as i64)
+    ((operator_id) << 16) | ((column_index as i64) << 2) | (op_type as i64)
 }
 
 // Generic eval state that delegates to operator-specific states
@@ -262,7 +262,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     /// Create a test pager for operator tests with both table and index
-    fn create_test_pager() -> (std::sync::Arc<crate::Pager>, usize, usize) {
+    fn create_test_pager() -> (std::sync::Arc<crate::Pager>, i64, i64) {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db = Database::open_file(io.clone(), ":memory:", false, false).unwrap();
         let conn = db.connect().unwrap();
@@ -277,14 +277,14 @@ mod tests {
             .io
             .block(|| pager.btree_create(&CreateBTreeFlags::new_table()))
             .expect("Failed to create BTree for aggregate state table")
-            as usize;
+            as i64;
 
         // Create a BTree for the index
         let index_root_page_id = pager
             .io
             .block(|| pager.btree_create(&CreateBTreeFlags::new_index()))
             .expect("Failed to create BTree for aggregate state index")
-            as usize;
+            as i64;
 
         (pager, table_root_page_id, index_root_page_id)
     }

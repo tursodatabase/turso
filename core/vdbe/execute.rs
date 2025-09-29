@@ -1037,13 +1037,14 @@ pub fn op_open_read(
 
     let (_, cursor_type) = program.cursor_ref.get(*cursor_id).unwrap();
     let mv_cursor = if let Some(tx_id) = program.connection.get_mv_tx_id() {
-        let table_id = *root_page as u64;
+        let table_id = *root_page;
         let mv_store = mv_store.unwrap().clone();
         let mv_cursor = Arc::new(RwLock::new(
             MvCursor::new(mv_store, tx_id, table_id, pager.clone()).unwrap(),
         ));
         Some(mv_cursor)
     } else {
+        assert!(*root_page >= 0, "");
         None
     };
     let cursors = &mut state.cursors;
@@ -2241,6 +2242,7 @@ pub fn op_transaction_inner(
         },
         insn
     );
+    tracing::info!("op_transaction: mv_store.is_some()={}", mv_store.is_some());
     let pager = program.get_pager_from_database_index(db);
     loop {
         match state.op_transaction_state {
@@ -6594,9 +6596,9 @@ pub fn op_open_write(
     let pager = program.get_pager_from_database_index(db);
 
     let root_page = match root_page {
-        RegisterOrLiteral::Literal(lit) => *lit as u64,
+        RegisterOrLiteral::Literal(lit) => *lit,
         RegisterOrLiteral::Register(reg) => match &state.registers[*reg].get_value() {
-            Value::Integer(val) => *val as u64,
+            Value::Integer(val) => *val,
             _ => {
                 return Err(LimboError::InternalError(
                     "OpenWrite: the value in root_page is not an integer".into(),
@@ -6605,7 +6607,7 @@ pub fn op_open_write(
         },
     };
 
-    const SQLITE_SCHEMA_ROOT_PAGE: u64 = 1;
+    const SQLITE_SCHEMA_ROOT_PAGE: i64 = 1;
 
     if root_page == SQLITE_SCHEMA_ROOT_PAGE {
         if let Some(mv_store) = mv_store {
@@ -6648,7 +6650,7 @@ pub fn op_open_write(
         let cursor = BTreeCursor::new_index(
             mv_cursor,
             pager.clone(),
-            root_page as usize,
+            root_page,
             index.as_ref(),
             num_columns,
         );
@@ -6665,8 +6667,7 @@ pub fn op_open_write(
             ),
         };
 
-        let cursor =
-            BTreeCursor::new_table(mv_cursor, pager.clone(), root_page as usize, num_columns);
+        let cursor = BTreeCursor::new_table(mv_cursor, pager.clone(), root_page, num_columns);
         cursors
             .get_mut(*cursor_id)
             .unwrap()
@@ -7399,11 +7400,11 @@ pub fn op_open_ephemeral(
             } else {
                 &CreateBTreeFlags::new_index()
             };
-            let root_page = return_if_io!(pager.btree_create(flag));
+            let root_page = return_if_io!(pager.btree_create(flag)) as i64;
 
             let (_, cursor_type) = program.cursor_ref.get(cursor_id).unwrap();
             let mv_cursor = if let Some(tx_id) = program.connection.get_mv_tx_id() {
-                let table_id = root_page as u64;
+                let table_id = root_page;
                 let mv_store = mv_store.unwrap().clone();
                 let mv_cursor = Arc::new(RwLock::new(
                     MvCursor::new(mv_store.clone(), tx_id, table_id, pager.clone()).unwrap(),
@@ -7420,15 +7421,9 @@ pub fn op_open_ephemeral(
             };
 
             let cursor = if let CursorType::BTreeIndex(index) = cursor_type {
-                BTreeCursor::new_index(
-                    mv_cursor,
-                    pager.clone(),
-                    root_page as usize,
-                    index,
-                    num_columns,
-                )
+                BTreeCursor::new_index(mv_cursor, pager.clone(), root_page, index, num_columns)
             } else {
-                BTreeCursor::new_table(mv_cursor, pager.clone(), root_page as usize, num_columns)
+                BTreeCursor::new_table(mv_cursor, pager.clone(), root_page, num_columns)
             };
             state.op_open_ephemeral_state = OpOpenEphemeralState::Rewind {
                 cursor: Box::new(cursor),
@@ -7508,7 +7503,7 @@ pub fn op_open_dup(
     let pager = &original_cursor.pager;
 
     let mv_cursor = if let Some(tx_id) = program.connection.get_mv_tx_id() {
-        let table_id = root_page as u64;
+        let table_id = root_page;
         let mv_store = mv_store.unwrap().clone();
         let mv_cursor = Arc::new(RwLock::new(MvCursor::new(
             mv_store,
@@ -7744,7 +7739,7 @@ pub fn op_integrity_check(
                         .get()));
                 integrity_check_state.set_expected_freelist_count(expected_freelist_count as usize);
                 integrity_check_state.start(
-                    freelist_trunk_page as usize,
+                    freelist_trunk_page as i64,
                     PageCategory::FreeListTrunk,
                     &mut errors,
                 );

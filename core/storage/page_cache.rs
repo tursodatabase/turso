@@ -299,17 +299,17 @@ impl PageCache {
             .clone();
         if entry.is_locked() {
             return Err(CacheError::Locked {
-                pgno: entry.get().id,
+                pgno: entry.get().id as usize,
             });
         }
         if entry.is_dirty() {
             return Err(CacheError::Dirty {
-                pgno: entry.get().id,
+                pgno: entry.get().id as usize,
             });
         }
         if entry.is_pinned() {
             return Err(CacheError::Pinned {
-                pgno: entry.get().id,
+                pgno: entry.get().id as usize,
             });
         }
         if clean_page {
@@ -538,7 +538,9 @@ impl PageCache {
             let e = &self.entries[node.slot_index];
             if let Some(ref p) = e.page {
                 if p.is_dirty() {
-                    return Err(CacheError::Dirty { pgno: p.get().id });
+                    return Err(CacheError::Dirty {
+                        pgno: p.get().id as usize,
+                    });
                 }
             }
         }
@@ -870,7 +872,7 @@ mod tests {
     }
 
     pub fn page_with_content(page_id: usize) -> PageRef {
-        let page = Arc::new(Page::new(page_id));
+        let page = Arc::new(Page::new(page_id as i64));
         {
             let buffer = crate::Buffer::new_temporary(4096);
             let page_content = PageContent {
@@ -1325,7 +1327,7 @@ mod tests {
                     let id_page = rng.next_u64() % max_pages;
                     let key = PageCacheKey::new(id_page as usize);
                     #[allow(clippy::arc_with_non_send_sync)]
-                    let page = Arc::new(Page::new(id_page as usize));
+                    let page = Arc::new(Page::new(id_page as i64));
 
                     if cache.peek(&key, false).is_some() {
                         continue; // Skip duplicate page ids
@@ -1370,8 +1372,8 @@ mod tests {
             // Verify all pages in reference_map are in cache
             for (key, page) in &reference_map {
                 let cached_page = cache.peek(key, false).expect("Page should be in cache");
-                assert_eq!(cached_page.get().id, key.0);
-                assert_eq!(page.get().id, key.0);
+                assert_eq!(cached_page.get().id, key.0 as i64);
+                assert_eq!(page.get().id, key.0 as i64);
             }
         }
     }

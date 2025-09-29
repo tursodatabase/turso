@@ -123,12 +123,12 @@ pub enum CompletionError {
     #[error("Completion was aborted")]
     Aborted,
     #[error("Decryption failed for page={page_idx}")]
-    DecryptionError { page_idx: usize },
+    DecryptionError { page_idx: i64 },
     #[error("I/O error: partial write")]
     ShortWrite,
     #[error("Checksum mismatch on page {page_id}: expected {expected}, got {actual}")]
     ChecksumMismatch {
-        page_id: usize,
+        page_id: i64,
         expected: u64,
         actual: u64,
     },

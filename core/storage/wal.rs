@@ -1104,7 +1104,7 @@ impl Wal for WalFile {
                 "read({bytes_read}) less than expected({buf_len}): frame_id={frame_id}"
             );
             let cloned = frame.clone();
-            finish_read_page(page.get().id, buf, cloned);
+            finish_read_page(page.get().id as usize, buf, cloned);
             let epoch = shared_file.read().epoch.load(Ordering::Acquire);
             frame.set_wal_tag(frame_id, epoch);
         });
@@ -1129,7 +1129,7 @@ impl Wal for WalFile {
             offset + WAL_FRAME_HEADER_SIZE as u64,
             buffer_pool,
             complete,
-            page_idx,
+            page_idx as usize,
             &self.io_ctx.read(),
         )
     }
@@ -1166,7 +1166,7 @@ impl Wal for WalFile {
             let (header, raw_page) = sqlite3_ondisk::parse_wal_frame_header(frame_ref);
 
             if let Some(ctx) = encryption_ctx.clone() {
-                match ctx.decrypt_page(raw_page, header.page_number as usize) {
+                match ctx.decrypt_page(raw_page, header.page_number as i64) {
                     Ok(decrypted_data) => {
                         turso_assert!(
                             (frame_len - WAL_FRAME_HEADER_SIZE) == decrypted_data.len(),

@@ -207,7 +207,7 @@ pub struct IncrementalView {
     #[cfg_attr(not(test), allow(dead_code))]
     pub tracker: Arc<Mutex<ComputationTracker>>,
     // Root page of the btree storing the materialized state (0 for unmaterialized)
-    root_page: usize,
+    root_page: i64,
 }
 
 impl IncrementalView {
@@ -215,9 +215,9 @@ impl IncrementalView {
     fn try_compile_circuit(
         select: &ast::Select,
         schema: &Schema,
-        main_data_root: usize,
-        internal_state_root: usize,
-        internal_state_index_root: usize,
+        main_data_root: i64,
+        internal_state_root: i64,
+        internal_state_index_root: i64,
     ) -> Result<DbspCircuit> {
         // Build the logical plan from the SELECT statement
         let mut builder = LogicalPlanBuilder::new(schema);
@@ -275,9 +275,9 @@ impl IncrementalView {
     pub fn from_sql(
         sql: &str,
         schema: &Schema,
-        main_data_root: usize,
-        internal_state_root: usize,
-        internal_state_index_root: usize,
+        main_data_root: i64,
+        internal_state_root: i64,
+        internal_state_index_root: i64,
     ) -> Result<Self> {
         let mut parser = Parser::new(sql.as_bytes());
         let cmd = parser.next_cmd()?;
@@ -306,9 +306,9 @@ impl IncrementalView {
         view_name: ast::QualifiedName,
         select: ast::Select,
         schema: &Schema,
-        main_data_root: usize,
-        internal_state_root: usize,
-        internal_state_index_root: usize,
+        main_data_root: i64,
+        internal_state_root: i64,
+        internal_state_index_root: i64,
     ) -> Result<Self> {
         let name = view_name.name.as_str().to_string();
 
@@ -353,9 +353,9 @@ impl IncrementalView {
         table_conditions: HashMap<String, Vec<Option<ast::Expr>>>,
         column_schema: ViewColumnSchema,
         schema: &Schema,
-        main_data_root: usize,
-        internal_state_root: usize,
-        internal_state_index_root: usize,
+        main_data_root: i64,
+        internal_state_root: i64,
+        internal_state_index_root: i64,
     ) -> Result<Self> {
         // Create the tracker that will be shared by all operators
         let tracker = Arc::new(Mutex::new(ComputationTracker::new()));
@@ -403,7 +403,7 @@ impl IncrementalView {
     }
 
     /// Get the root page for this materialized view's btree
-    pub fn get_root_page(&self) -> usize {
+    pub fn get_root_page(&self) -> i64 {
         self.root_page
     }
 

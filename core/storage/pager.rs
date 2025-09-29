@@ -124,7 +124,7 @@ impl HeaderRefMut {
 pub struct PageInner {
     pub flags: AtomicUsize,
     pub contents: Option<PageContent>,
-    pub id: usize,
+    pub id: i64,
     /// If >0, the page is pinned and not eligible for eviction from the page cache.
     /// The reason this is a counter is that multiple nested code paths may signal that
     /// a page must not be evicted from the page cache, so even if an inner code path
@@ -185,7 +185,7 @@ const PAGE_DIRTY: usize = 0b1000;
 const PAGE_LOADED: usize = 0b10000;
 
 impl Page {
-    pub fn new(id: usize) -> Self {
+    pub fn new(id: i64) -> Self {
         Self {
             inner: UnsafeCell::new(PageInner {
                 flags: AtomicUsize::new(0),
@@ -712,7 +712,7 @@ impl Pager {
                         ptrmap_pg_no
                     );
 
-                    let (ptrmap_page, c) = self.read_page(ptrmap_pg_no as usize)?;
+                    let (ptrmap_page, c) = self.read_page(ptrmap_pg_no as i64)?;
                     self.vacuum_state.write().ptrmap_get_state = PtrMapGetState::Deserialize {
                         ptrmap_page,
                         offset_in_ptrmap_page,
@@ -819,7 +819,7 @@ impl Pager {
                         offset_in_ptrmap_page
                     );
 
-                    let (ptrmap_page, c) = self.read_page(ptrmap_pg_no as usize)?;
+                    let (ptrmap_page, c) = self.read_page(ptrmap_pg_no as i64)?;
                     self.vacuum_state.write().ptrmap_put_state = PtrMapPutState::Deserialize {
                         ptrmap_page,
                         offset_in_ptrmap_page,
@@ -1177,10 +1177,11 @@ impl Pager {
     #[tracing::instrument(skip_all, level = Level::DEBUG)]
     pub fn read_page_no_cache(
         &self,
-        page_idx: usize,
+        page_idx: i64,
         frame_watermark: Option<u64>,
         allow_empty_read: bool,
     ) -> Result<(PageRef, Completion)> {
+        assert!(page_idx >= 0);
         tracing::trace!("read_page_no_cache(page_idx = {})", page_idx);
         let page = Arc::new(Page::new(page_idx));
         let io_ctx = self.io_ctx.read();
@@ -1191,7 +1192,7 @@ impl Pager {
             );
 
             page.set_locked();
-            let c = self.begin_read_disk_page(page_idx, page.clone(), allow_empty_read, &io_ctx)?;
+            let c = self.begin_read_disk_page(page_idx as usize, page.clone(), allow_empty_read, &io_ctx)?;
             return Ok((page, c));
         };
 
@@ -1204,16 +1205,18 @@ impl Pager {
             return Ok((page, c));
         }
 
-        let c = self.begin_read_disk_page(page_idx, page.clone(), allow_empty_read, &io_ctx)?;
+        let c =
+            self.begin_read_disk_page(page_idx as usize, page.clone(), allow_empty_read, &io_ctx)?;
         Ok((page, c))
     }
 
     /// Reads a page from the database.
     #[tracing::instrument(skip_all, level = Level::DEBUG)]
-    pub fn read_page(&self, page_idx: usize) -> Result<(PageRef, Option<Completion>)> {
+    pub fn read_page(&self, page_idx: i64) -> Result<(PageRef, Option<Completion>)> {
+        assert!(page_idx >= 0, "pages in pager should be positive, negative might indicate unallocated pages from mvcc or any other nasty bug");
         tracing::trace!("read_page(page_idx = {})", page_idx);
         let mut page_cache = self.page_cache.write();
-        let page_key = PageCacheKey::new(page_idx);
+        let page_key = PageCacheKey::new(page_idx as usize);
         if let Some(page) = page_cache.get(&page_key)? {
             tracing::trace!("read_page(page_idx = {}) = cached", page_idx);
             turso_assert!(
@@ -1229,7 +1232,7 @@ impl Pager {
             "attempted to read page {page_idx} but got page {}",
             page.get().id
         );
-        self.cache_insert(page_idx, page.clone(), &mut page_cache)?;
+        self.cache_insert(page_idx as usize, page.clone(), &mut page_cache)?;
         Ok((page, Some(c)))
     }
 
@@ -1313,7 +1316,7 @@ impl Pager {
     pub fn add_dirty(&self, page: &Page) {
         // TODO: check duplicates?
         let mut dirty_pages = self.dirty_pages.write();
-        dirty_pages.insert(page.get().id);
+        dirty_pages.insert(page.get().id as usize);
         page.set_dirty();
     }
 
@@ -1663,7 +1666,7 @@ impl Pager {
                 let content = page.get_contents();
                 content.as_ptr().copy_from_slice(raw_page);
                 turso_assert!(
-                    page.get().id == header.page_number as usize,
+                    page.get().id == header.page_number as i64,
                     "page has unexpected id"
                 );
             }
@@ -1868,7 +1871,7 @@ impl Pager {
     // Providing a page is optional, if provided it will be used to avoid reading the page from disk.
     // This is implemented in accordance with sqlite freepage2() function.
     #[instrument(skip_all, level = Level::DEBUG)]
-    pub fn free_page(&self, mut page: Option<PageRef>, page_id: usize) -> Result<IOResult<()>> {
+    pub fn free_page(&self, mut page: Option<PageRef>, page_id: i64) -> Result<IOResult<()>> {
         tracing::trace!("free_page(page_id={})", page_id);
         const TRUNK_PAGE_HEADER_SIZE: usize = 8;
         const LEAF_ENTRY_SIZE: usize = 4;
@@ -1885,7 +1888,7 @@ impl Pager {
         loop {
             match &mut *state {
                 FreePageState::Start => {
-                    if page_id < 2 || page_id > header.database_size.get() as usize {
+                    if page_id < 2 || page_id as usize > header.database_size.get() as usize {
                         return Err(LimboError::Corrupt(format!(
                             "Invalid page number {page_id} for free operation"
                         )));
@@ -1923,7 +1926,7 @@ impl Pager {
                 }
                 FreePageState::AddToTrunk { page } => {
                     let trunk_page_id = header.freelist_trunk_page.get();
-                    let (trunk_page, c) = self.read_page(trunk_page_id as usize)?;
+                    let (trunk_page, c) = self.read_page(trunk_page_id as i64)?;
                     if let Some(c) = c {
                         if !c.is_completed() {
                             io_yield_one!(c);
@@ -1941,7 +1944,7 @@ impl Pager {
 
                     if number_of_leaf_pages < max_free_list_entries as u32 {
                         turso_assert!(
-                            trunk_page.get().id == trunk_page_id as usize,
+                            trunk_page.get().id == trunk_page_id as i64,
                             "trunk page has unexpected id"
                         );
                         self.add_dirty(&trunk_page);
@@ -2041,7 +2044,7 @@ impl Pager {
             AllocatePage1State::Writing { page } => {
                 turso_assert!(page.is_loaded(), "page should be loaded");
                 tracing::trace!("allocate_page1(Writing done)");
-                let page_key = PageCacheKey::new(page.get().id);
+                let page_key = PageCacheKey::new(page.get().id as usize);
                 let mut cache = self.page_cache.write();
                 cache.insert(page_key, page.clone()).map_err(|e| {
                     LimboError::InternalError(format!("Failed to insert page 1 into cache: {e:?}"))
@@ -2103,10 +2106,9 @@ impl Pager {
                         {
                             // we will allocate a ptrmap page, so increment size
                             new_db_size += 1;
-                            let page =
-                                allocate_new_page(new_db_size as usize, &self.buffer_pool, 0);
+                            let page = allocate_new_page(new_db_size as i64, &self.buffer_pool, 0);
                             self.add_dirty(&page);
-                            let page_key = PageCacheKey::new(page.get().id);
+                            let page_key = PageCacheKey::new(page.get().id as usize);
                             let mut cache = self.page_cache.write();
                             cache.insert(page_key, page.clone())?;
                         }
@@ -2119,7 +2121,7 @@ impl Pager {
                         };
                         continue;
                     }
-                    let (trunk_page, c) = self.read_page(first_freelist_trunk_page_id as usize)?;
+                    let (trunk_page, c) = self.read_page(first_freelist_trunk_page_id as i64)?;
                     *state = AllocatePageState::SearchAvailableFreeListLeaf {
                         trunk_page,
                         current_db_size: new_db_size,
@@ -2149,7 +2151,7 @@ impl Pager {
                         let page_contents = trunk_page.get_contents();
                         let next_leaf_page_id =
                             page_contents.read_u32_no_offset(FREELIST_TRUNK_OFFSET_FIRST_LEAF);
-                        let (leaf_page, c) = self.read_page(next_leaf_page_id as usize)?;
+                        let (leaf_page, c) = self.read_page(next_leaf_page_id as i64)?;
 
                         turso_assert!(
                             number_of_freelist_leaves > 0,
@@ -2189,7 +2191,7 @@ impl Pager {
                         trunk_page.get().id
                     );
                     trunk_page.get_contents().as_ptr().fill(0);
-                    let page_key = PageCacheKey::new(trunk_page.get().id);
+                    let page_key = PageCacheKey::new(trunk_page.get().id as usize);
                     {
                         let page_cache = self.page_cache.read();
                         turso_assert!(
@@ -2221,7 +2223,7 @@ impl Pager {
                         leaf_page.get().id
                     );
                     leaf_page.get_contents().as_ptr().fill(0);
-                    let page_key = PageCacheKey::new(leaf_page.get().id);
+                    let page_key = PageCacheKey::new(leaf_page.get().id as usize);
                     {
                         let page_cache = self.page_cache.read();
                         turso_assert!(
@@ -2270,12 +2272,12 @@ impl Pager {
                     }
 
                     // FIXME: should reserve page cache entry before modifying the database
-                    let page = allocate_new_page(new_db_size as usize, &self.buffer_pool, 0);
+                    let page = allocate_new_page(new_db_size as i64, &self.buffer_pool, 0);
                     {
                         // setup page and add to cache
                         self.add_dirty(&page);
 
-                        let page_key = PageCacheKey::new(page.get().id);
+                        let page_key = PageCacheKey::new(page.get().id as usize);
                         {
                             // Run in separate block to avoid deadlock on page cache write lock
                             let mut cache = self.page_cache.write();
@@ -2292,11 +2294,11 @@ impl Pager {
 
     pub fn update_dirty_loaded_page_in_cache(
         &self,
-        id: usize,
+        id: i64,
         page: PageRef,
     ) -> Result<(), LimboError> {
         let mut cache = self.page_cache.write();
-        let page_key = PageCacheKey::new(id);
+        let page_key = PageCacheKey::new(id as usize);
 
         // FIXME: use specific page key for writer instead of max frame, this will make readers not conflict
         assert!(page.is_dirty());
@@ -2406,7 +2408,7 @@ impl Pager {
     }
 }
 
-pub fn allocate_new_page(page_id: usize, buffer_pool: &Arc<BufferPool>, offset: usize) -> PageRef {
+pub fn allocate_new_page(page_id: i64, buffer_pool: &Arc<BufferPool>, offset: usize) -> PageRef {
     let page = Arc::new(Page::new(page_id));
     {
         let buffer = buffer_pool.get_page();
@@ -2774,7 +2776,7 @@ mod ptrmap_tests {
         assert_eq!(expected_ptrmap_pg_no, FIRST_PTRMAP_PAGE_NO);
 
         //  Ensure the pointer map page ref is created and loadable via the pager
-        let ptrmap_page_ref = pager.read_page(expected_ptrmap_pg_no as usize);
+        let ptrmap_page_ref = pager.read_page(expected_ptrmap_pg_no as i64);
         assert!(ptrmap_page_ref.is_ok());
 
         //  Ensure that the database header size is correctly reflected

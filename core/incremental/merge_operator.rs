@@ -28,7 +28,7 @@ pub enum UnionMode {
 /// Handles both recursive CTEs and UNION/UNION ALL operations
 #[derive(Debug)]
 pub struct MergeOperator {
-    operator_id: usize,
+    operator_id: i64,
     union_mode: UnionMode,
     /// For UNION: tracks seen value hashes with their assigned rowids
     /// For UNION ALL: tracks (source_id, original_rowid) -> assigned_rowid mappings
@@ -39,7 +39,7 @@ pub struct MergeOperator {
 
 impl MergeOperator {
     /// Create a new merge operator with specified union mode
-    pub fn new(operator_id: usize, mode: UnionMode) -> Self {
+    pub fn new(operator_id: i64, mode: UnionMode) -> Self {
         Self {
             operator_id,
             union_mode: mode,
