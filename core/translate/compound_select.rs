@@ -1,5 +1,5 @@
 use crate::schema::{Index, IndexColumn, Schema};
-use crate::translate::emitter::{emit_query, LimitCtx, Resolver, TranslateCtx};
+use crate::translate::emitter::{emit_query, init_limit, LimitCtx, Resolver, TranslateCtx};
 use crate::translate::expr::translate_expr;
 use crate::translate::plan::{Plan, QueryDestination, SelectPlan};
 use crate::translate::result_row::try_fold_expr_to_i64;
@@ -133,6 +133,14 @@ fn emit_compound_select(
         unreachable!()
     };
 
+    let compound_select_end = program.allocate_label();
+    if let Some(limit_ctx) = &limit_ctx {
+        program.emit_insn(Insn::IfNot {
+            reg: limit_ctx.reg_limit,
+            target_pc: compound_select_end,
+            jump_if_null: false,
+        });
+    }
     let mut right_most_ctx = TranslateCtx::new(
         program,
         schema,
@@ -358,6 +366,8 @@ fn emit_compound_select(
             program.pop_current_parent_explain();
         }
     }
+
+    program.preassign_label_to_next_insn(compound_select_end);
 
     Ok(())
 }
