@@ -476,6 +476,14 @@ impl Database {
                     // a warning to the user to load the module
                     eprintln!("Warning: {e}");
                 }
+
+                if db.mvcc_enabled() && !schema.indexes.is_empty() {
+                    return Err(LimboError::ParseError(
+                        "Database contains indexes which are not supported when MVCC is enabled."
+                            .to_string(),
+                    ));
+                }
+
                 Ok(())
             })?;
         }
@@ -826,6 +834,10 @@ impl Database {
 
     pub fn experimental_strict_enabled(&self) -> bool {
         self.opts.enable_strict
+    }
+
+    pub fn mvcc_enabled(&self) -> bool {
+        self.opts.enable_mvcc
     }
 }
 
@@ -1901,6 +1913,10 @@ impl Connection {
 
     pub fn experimental_strict_enabled(&self) -> bool {
         self.db.experimental_strict_enabled()
+    }
+
+    pub fn mvcc_enabled(&self) -> bool {
+        self.db.mvcc_enabled()
     }
 
     /// Query the current value(s) of `pragma_name` associated to
