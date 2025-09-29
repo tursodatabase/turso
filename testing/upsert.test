@@ -337,6 +337,14 @@ do_execsql_test_on_specific_db {:memory:} upsert-doubly-qualified-target {
     SELECT * FROM dq;
 } {1|new}
 
+# https://github.com/tursodatabase/turso/issues/3384
+do_execsql_test_on_specific_db {:memory:} upsert-non-rowid-pk-target {
+	create table phonebook(name text primary key, phonenumber text, validDate date);
+	insert into phonebook values ('Alice','704-545-3333','2018-10-10');
+	insert into phonebook values ('Alice','704-111-1111','2018-10-20') on conflict (name) do update set phonenumber=excluded.phonenumber, validDate=excluded.validDate;
+    SELECT phonenumber, validDate FROM phonebook;
+} {704-111-1111|2018-10-20}
+
 
 # TODO: uncomment these when we support collations in indexes 
 # (right now it errors on Parse Error: cannot use expressions in CREATE INDEX)
