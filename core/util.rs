@@ -112,16 +112,9 @@ const QUOTE_PAIRS: &[(char, char)] = &[
 ];
 
 pub fn normalize_ident(identifier: &str) -> String {
-    let quote_pair = QUOTE_PAIRS
-        .iter()
-        .find(|&(start, end)| identifier.starts_with(*start) && identifier.ends_with(*end));
-
-    if let Some(&(_, _)) = quote_pair {
-        &identifier[1..identifier.len() - 1]
-    } else {
-        identifier
-    }
-    .to_lowercase()
+    // quotes normalization already happened in the parser layer (see Name ast node implementation)
+    // so, we only need to convert identifier string to lowercase
+    identifier.to_lowercase().to_lowercase()
 }
 
 pub const PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX: &str = "sqlite_autoindex_";
