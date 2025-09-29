@@ -63,10 +63,12 @@ use execute::{
 use explain::{insn_to_row_with_comment, EXPLAIN_COLUMNS, EXPLAIN_QUERY_PLAN_COLUMNS};
 use regex::Regex;
 use std::{
-    cell::Cell,
     collections::HashMap,
     num::NonZero,
-    sync::{atomic::Ordering, Arc},
+    sync::{
+        atomic::{AtomicI64, Ordering},
+        Arc,
+    },
 };
 use tracing::{instrument, Level};
 
@@ -492,7 +494,7 @@ pub struct Program {
     pub comments: Vec<(InsnReference, &'static str)>,
     pub parameters: crate::parameters::Parameters,
     pub connection: Arc<Connection>,
-    pub n_change: Cell<i64>,
+    pub n_change: AtomicI64,
     pub change_cnt_on: bool,
     pub result_columns: Vec<ResultSetColumn>,
     pub table_references: TableReferences,
@@ -898,7 +900,8 @@ impl Program {
                 }
             } else {
                 if self.change_cnt_on {
-                    self.connection.set_changes(self.n_change.get());
+                    self.connection
+                        .set_changes(self.n_change.load(Ordering::SeqCst));
                 }
                 Ok(IOResult::Done(()))
             }
@@ -917,7 +920,8 @@ impl Program {
         match cacheflush_status {
             IOResult::Done(_) => {
                 if self.change_cnt_on {
-                    self.connection.set_changes(self.n_change.get());
+                    self.connection
+                        .set_changes(self.n_change.load(Ordering::SeqCst));
                 }
                 connection.set_tx_state(TransactionState::None);
                 *commit_state = CommitState::Ready;

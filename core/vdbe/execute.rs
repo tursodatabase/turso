@@ -5729,8 +5729,9 @@ pub fn op_insert(
                 if let Some(rowid) = maybe_rowid {
                     program.connection.update_last_rowid(rowid);
 
-                    let prev_changes = program.n_change.get();
-                    program.n_change.set(prev_changes + 1);
+                    program
+                        .n_change
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 }
                 let schema = program.connection.schema.read();
                 let dependent_views = schema.get_dependent_materialized_views(table_name);
@@ -5946,8 +5947,9 @@ pub fn op_delete(
     }
 
     state.op_delete_state.sub_state = OpDeleteSubState::MaybeCaptureRecord;
-    let prev_changes = program.n_change.get();
-    program.n_change.set(prev_changes + 1);
+    program
+        .n_change
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }

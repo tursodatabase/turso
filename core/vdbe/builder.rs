@@ -1,4 +1,7 @@
-use std::{cell::Cell, cmp::Ordering, sync::Arc};
+use std::{
+    cmp::Ordering,
+    sync::{atomic::AtomicI64, Arc},
+};
 
 use tracing::{instrument, Level};
 use turso_parser::ast::{self, TableInternalId};
@@ -1002,7 +1005,7 @@ impl ProgramBuilder {
             comments: self.comments,
             connection,
             parameters: self.parameters,
-            n_change: Cell::new(0),
+            n_change: AtomicI64::new(0),
             change_cnt_on,
             result_columns: self.result_columns,
             table_references: self.table_references,
