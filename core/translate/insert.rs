@@ -83,11 +83,13 @@ pub fn translate_insert(
         );
     }
     let table_name = &tbl_name.name;
-    let has_child_fks = connection.foreign_keys_enabled()
+    let fk_enabled = connection.foreign_keys_enabled();
+    let has_child_fks = fk_enabled
         && !resolver
             .schema
             .get_foreign_keys_for_table(table_name.as_str())
             .is_empty();
+    let has_parent_fks = fk_enabled && resolver.schema.any_incoming_fk_to(table_name.as_str());
 
     // Check if this is a system table that should be protected from direct writes
     if crate::schema::is_system_table(table_name.as_str()) {
@@ -241,7 +243,7 @@ pub fn translate_insert(
         connection,
     )?;
 
-    if has_child_fks {
+    if has_child_fks || has_parent_fks {
         program.emit_insn(Insn::FkCounter {
             increment_value: 1,
             check_abort: false,
@@ -1042,7 +1044,7 @@ pub fn translate_insert(
             }
         }
     }
-    if has_child_fks {
+    if has_child_fks || has_parent_fks {
         emit_fk_checks_for_insert(&mut program, resolver, &insertion, table_name.as_str())?;
     }
 
@@ -1144,6 +1146,7 @@ pub fn translate_insert(
                 &mut result_columns,
                 cdc_table.as_ref().map(|c| c.0),
                 row_done_label,
+                connection,
             )?;
         } else {
             // UpsertDo::Nothing case
