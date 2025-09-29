@@ -8188,6 +8188,22 @@ mod cmath {
     }
 }
 
+enum TrimType {
+    All,
+    Left,
+    Right,
+}
+
+impl TrimType {
+    fn trim<'a>(&self, text: &'a str, pattern: &[char]) -> &'a str {
+        match self {
+            TrimType::All => text.trim_matches(pattern),
+            TrimType::Right => text.trim_end_matches(pattern),
+            TrimType::Left => text.trim_start_matches(pattern),
+        }
+    }
+}
+
 impl Value {
     pub fn exec_lower(&self) -> Option<Self> {
         self.cast_text()
@@ -8569,48 +8585,30 @@ impl Value {
         Value::Float(f)
     }
 
-    // Implements TRIM pattern matching.
-    pub fn exec_trim(&self, pattern: Option<&Value>) -> Value {
+    fn _exec_trim(&self, pattern: Option<&Value>, trim_type: TrimType) -> Value {
         match (self, pattern) {
-            (reg, Some(pattern)) => match reg {
-                Value::Text(_) | Value::Integer(_) | Value::Float(_) => {
-                    let pattern_chars: Vec<char> = pattern.to_string().chars().collect();
-                    Value::build_text(reg.to_string().trim_matches(&pattern_chars[..]))
-                }
-                _ => reg.to_owned(),
-            },
-            (Value::Text(t), None) => Value::build_text(t.as_str().trim()),
-            (reg, _) => reg.to_owned(),
-        }
-    }
-    // Implements RTRIM pattern matching.
-    pub fn exec_rtrim(&self, pattern: Option<&Value>) -> Value {
-        match (self, pattern) {
-            (reg, Some(pattern)) => match reg {
-                Value::Text(_) | Value::Integer(_) | Value::Float(_) => {
-                    let pattern_chars: Vec<char> = pattern.to_string().chars().collect();
-                    Value::build_text(reg.to_string().trim_end_matches(&pattern_chars[..]))
-                }
-                _ => reg.to_owned(),
-            },
-            (Value::Text(t), None) => Value::build_text(t.as_str().trim_end()),
+            (Value::Text(_) | Value::Integer(_) | Value::Float(_), Some(pattern)) => {
+                let pattern_chars: Vec<char> = pattern.to_string().chars().collect();
+                let text = self.to_string();
+                Value::build_text(trim_type.trim(&text, &pattern_chars))
+            }
+            (Value::Text(t), None) => Value::build_text(trim_type.trim(t.as_str(), &[' '])),
             (reg, _) => reg.to_owned(),
         }
     }
 
+    // Implements TRIM pattern matching.
+    pub fn exec_trim(&self, pattern: Option<&Value>) -> Value {
+        self._exec_trim(pattern, TrimType::All)
+    }
+    // Implements RTRIM pattern matching.
+    pub fn exec_rtrim(&self, pattern: Option<&Value>) -> Value {
+        self._exec_trim(pattern, TrimType::Right)
+    }
+
     // Implements LTRIM pattern matching.
     pub fn exec_ltrim(&self, pattern: Option<&Value>) -> Value {
-        match (self, pattern) {
-            (reg, Some(pattern)) => match reg {
-                Value::Text(_) | Value::Integer(_) | Value::Float(_) => {
-                    let pattern_chars: Vec<char> = pattern.to_string().chars().collect();
-                    Value::build_text(reg.to_string().trim_start_matches(&pattern_chars[..]))
-                }
-                _ => reg.to_owned(),
-            },
-            (Value::Text(t), None) => Value::build_text(t.as_str().trim_start()),
-            (reg, _) => reg.to_owned(),
-        }
+        self._exec_trim(pattern, TrimType::Left)
     }
 
     pub fn exec_zeroblob(&self) -> Value {
@@ -10204,6 +10202,14 @@ mod tests {
         let pattern_str = Value::build_text("Bob and");
         let expected_str = Value::build_text("Alice");
         assert_eq!(input_str.exec_trim(Some(&pattern_str)), expected_str);
+
+        let input_str = Value::build_text("\ta");
+        let expected_str = Value::build_text("\ta");
+        assert_eq!(input_str.exec_trim(None), expected_str);
+
+        let input_str = Value::build_text("\na");
+        let expected_str = Value::build_text("\na");
+        assert_eq!(input_str.exec_trim(None), expected_str);
     }
 
     #[test]
