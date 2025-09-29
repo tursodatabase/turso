@@ -6,7 +6,7 @@ export default defineConfig({
   },
   resolve: {
     alias: {
-      '@tursodatabase/database-wasm32-wasi': '../../turso.wasi-browser.js'
+      '@tursodatabase/database-wasm32-wasi': '../../turso.wasi-wasm.js'
     },
   },
   server: {

@@ -23,7 +23,7 @@ This package is the Turso embedded database library for JavaScript in Node.
 - **SQLite compatible:** SQLite query language and file format support ([status](https://github.com/tursodatabase/turso/blob/main/COMPAT.md)).
 - **In-process**: No network overhead, runs directly in your Node.js process
 - **TypeScript support**: Full TypeScript definitions included
-- **Cross-platform**: Supports Linux (x86 and arm64), macOS, Windows (browser is supported in the separate package `@tursodatabase/database-browser` package)
+- **Cross-platform**: Supports Linux (x86 and arm64), macOS, Windows (browser is supported in the separate package `@tursodatabase/database-wasm` package)
 
 ## Installation
 

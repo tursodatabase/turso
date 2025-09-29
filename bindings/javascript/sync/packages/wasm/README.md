@@ -1,5 +1,5 @@
 <p align="center">
-  <h1 align="center">Turso Database for JavaScript in Node</h1>
+  <h1 align="center">Turso Database for JavaScript in Browser</h1>
 </p>
 
 <p align="center">
@@ -14,7 +14,7 @@
 
 ## About
 
-This package is the Turso embedded database library for JavaScript in Node.
+This package is the Turso embedded database library for JavaScript in Browser.
 
 > **⚠️ Warning:** This software is ALPHA, only use for development, testing, and experimentation. We are working to make it production ready, but do not use it for critical data right now.
 
@@ -23,12 +23,11 @@ This package is the Turso embedded database library for JavaScript in Node.
 - **SQLite compatible:** SQLite query language and file format support ([status](https://github.com/tursodatabase/turso/blob/main/COMPAT.md)).
 - **In-process**: No network overhead, runs directly in your Node.js process
 - **TypeScript support**: Full TypeScript definitions included
-- **Cross-platform**: Supports Linux (x86 and arm64), macOS, Windows (browser is supported in the separate package `@tursodatabase/database-wasm` package)
 
 ## Installation
 
 ```bash
-npm install @tursodatabase/database
+npm install @tursodatabase/database-wasm
 ```
 
 ## Getting Started
@@ -36,7 +35,7 @@ npm install @tursodatabase/database
 ### In-Memory Database
 
 ```javascript
-import { connect } from '@tursodatabase/database';
+import { connect } from '@tursodatabase/database-wasm';
 
 // Create an in-memory database
 const db = await connect(':memory:');
@@ -61,7 +60,7 @@ console.log(users);
 ### File-Based Database
 
 ```javascript
-import { connect } from '@tursodatabase/database';
+import { connect } from '@tursodatabase/database-wasm';
 
 // Create or open a database file
 const db = await connect('my-database.db');
@@ -86,7 +85,7 @@ console.log(`Inserted post with ID: ${result.lastInsertRowid}`);
 ### Transactions
 
 ```javascript
-import { connect } from '@tursodatabase/database';
+import { connect } from '@tursodatabase/database-wasm';
 
 const db = await connect('transactions.db');
 
