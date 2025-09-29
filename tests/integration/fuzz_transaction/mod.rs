@@ -1,8 +1,10 @@
 use rand::seq::IndexedRandom;
 use rand::Rng;
-use rand_chacha::{rand_core::SeedableRng, ChaCha8Rng};
+use rand_chacha::ChaCha8Rng;
 use std::collections::BTreeMap;
 use turso::{Builder, Value};
+
+use crate::common::rng_from_time_or_env;
 
 // In-memory representation of the database state
 #[derive(Debug, Clone, PartialEq)]
@@ -465,21 +467,6 @@ impl std::fmt::Display for Operation {
             Operation::AlterTable { op } => write!(f, "ALTER TABLE test_table {op}"),
         }
     }
-}
-
-fn rng_from_time_or_env() -> (ChaCha8Rng, u64) {
-    let seed = std::env::var("SEED").map_or(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis(),
-        |v| {
-            v.parse()
-                .expect("Failed to parse SEED environment variable as u64")
-        },
-    );
-    let rng = ChaCha8Rng::seed_from_u64(seed as u64);
-    (rng, seed as u64)
 }
 
 #[tokio::test]

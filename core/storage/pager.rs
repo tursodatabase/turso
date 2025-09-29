@@ -35,11 +35,11 @@ use crate::storage::encryption::{CipherMode, EncryptionContext, EncryptionKey};
 const DEFAULT_MAX_PAGE_COUNT: u32 = 0xfffffffe;
 const RESERVED_SPACE_NOT_SET: u16 = u16::MAX;
 
-#[cfg(test)]
+#[cfg(feature = "test_helper")]
 /// Used for testing purposes to change the position of the PENDING BYTE
 static PENDING_BYTE: AtomicU32 = AtomicU32::new(0x40000000);
 
-#[cfg(not(test))]
+#[cfg(not(feature = "test_helper"))]
 /// Byte offset that signifies the start of the ignored page - 1 GB mark
 const PENDING_BYTE: u32 = 0x40000000;
 
@@ -659,18 +659,18 @@ impl Pager {
         })
     }
 
-    #[cfg(test)]
+    #[cfg(feature = "test_helper")]
     pub fn get_pending_byte() -> u32 {
         PENDING_BYTE.load(Ordering::Relaxed)
     }
 
-    #[cfg(test)]
+    #[cfg(feature = "test_helper")]
     /// Used in testing to allow for pending byte pages in smaller dbs
     pub fn set_pending_byte(val: u32) {
         PENDING_BYTE.store(val, Ordering::Relaxed);
     }
 
-    #[cfg(not(test))]
+    #[cfg(not(feature = "test_helper"))]
     pub const fn get_pending_byte() -> u32 {
         PENDING_BYTE
     }
@@ -2323,10 +2323,10 @@ impl Pager {
                 AllocatePageState::AllocateNewPage { current_db_size } => {
                     let mut new_db_size = *current_db_size + 1;
 
-                    // if new_db_size is reaches the pending page, we need to allocate a new one
+                    // if new_db_size reaches the pending page, we need to allocate a new one
                     if new_db_size == self.pending_byte_page_id() {
                         let richard_hipp_special_page =
-                            allocate_new_page(new_db_size as usize, &self.buffer_pool, 0);
+                            allocate_new_page(new_db_size as i64, &self.buffer_pool, 0);
                         self.add_dirty(&richard_hipp_special_page);
                         let page_key = PageCacheKey::new(richard_hipp_special_page.get().id);
                         {

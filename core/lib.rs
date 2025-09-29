@@ -847,6 +847,16 @@ impl Database {
     pub fn mvcc_enabled(&self) -> bool {
         self.opts.enable_mvcc
     }
+
+    #[cfg(feature = "test_helper")]
+    pub fn set_pending_byte(val: u32) {
+        Pager::set_pending_byte(val);
+    }
+
+    #[cfg(feature = "test_helper")]
+    pub fn get_pending_byte() -> u32 {
+        Pager::get_pending_byte()
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
