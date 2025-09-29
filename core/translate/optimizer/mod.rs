@@ -709,7 +709,7 @@ impl Optimizable for ast::Expr {
             Expr::FunctionCallStar { .. } => false,
             Expr::Id(id) => {
                 // If we got here with an id, this has to be double-quotes identifier
-                assert!(id.is_double_quoted());
+                assert!(id.quoted_with('"'));
                 true
             }
             Expr::Column { .. } => false,

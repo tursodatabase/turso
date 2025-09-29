@@ -21,7 +21,7 @@ use crate::{
         insn::{IdxInsertFlags, Insn, RegisterOrLiteral},
     },
 };
-use turso_parser::ast::{self, Expr, SortOrder, SortedColumn};
+use turso_parser::ast::{Expr, Name, SortOrder, SortedColumn};
 
 use super::schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
 
@@ -29,13 +29,18 @@ use super::schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
 pub fn translate_create_index(
     unique_if_not_exists: (bool, bool),
     resolver: &Resolver,
-    idx_name: &str,
-    tbl_name: &str,
+    idx_name: &Name,
+    tbl_name: &Name,
     columns: &[SortedColumn],
     mut program: ProgramBuilder,
     connection: &Arc<crate::Connection>,
     where_clause: Option<Box<Expr>>,
 ) -> crate::Result<ProgramBuilder> {
+    let original_idx_name = idx_name;
+    let original_tbl_name = tbl_name;
+    let idx_name = normalize_ident(idx_name.as_str());
+    let tbl_name = normalize_ident(tbl_name.as_str());
+
     if tbl_name.eq_ignore_ascii_case("sqlite_sequence") {
         crate::bail_parse_error!("table sqlite_sequence may not be indexed");
     }
@@ -44,10 +49,6 @@ pub fn translate_create_index(
             "CREATE INDEX is disabled by default. Run with `--experimental-indexes` to enable this feature."
         );
     }
-    let original_idx_name = idx_name;
-    let original_tbl_name = tbl_name;
-    let idx_name = normalize_ident(idx_name);
-    let tbl_name = normalize_ident(tbl_name);
     if RESERVED_TABLE_PREFIXES
         .iter()
         .any(|prefix| idx_name.starts_with(prefix))
@@ -172,8 +173,8 @@ pub fn translate_create_index(
         db: 0,
     });
     let sql = create_idx_stmt_to_sql(
-        original_tbl_name,
-        original_idx_name,
+        &original_tbl_name.as_ident(),
+        &original_idx_name.as_ident(),
         unique_if_not_exists,
         original_columns,
         &idx.where_clause.clone(),
@@ -348,16 +349,13 @@ fn resolve_sorted_columns<'a>(
 ) -> crate::Result<Vec<((usize, &'a Column), SortOrder)>> {
     let mut resolved = Vec::with_capacity(cols.len());
     for sc in cols {
-        let ident = normalize_ident(match sc.expr.as_ref() {
+        let ident = match sc.expr.as_ref() {
             // SQLite supports indexes on arbitrary expressions, but we don't (yet).
             // See "How to use indexes on expressions" in https://www.sqlite.org/expridx.html
-            Expr::Id(ast::Name::Ident(col_name))
-            | Expr::Id(ast::Name::Quoted(col_name))
-            | Expr::Name(ast::Name::Ident(col_name))
-            | Expr::Name(ast::Name::Quoted(col_name)) => col_name,
+            Expr::Id(col_name) | Expr::Name(col_name) => col_name.as_str(),
             _ => crate::bail_parse_error!("Error: cannot use expressions in CREATE INDEX"),
-        });
-        let Some(col) = table.get_column(&ident) else {
+        };
+        let Some(col) = table.get_column(ident) else {
             crate::bail_parse_error!(
                 "Error: column '{ident}' does not exist in table '{}'",
                 table.name
@@ -393,13 +391,10 @@ fn create_idx_stmt_to_sql(
             sql.push_str(", ");
         }
         let col_ident = match col.expr.as_ref() {
-            Expr::Id(ast::Name::Ident(col_name))
-            | Expr::Id(ast::Name::Quoted(col_name))
-            | Expr::Name(ast::Name::Ident(col_name))
-            | Expr::Name(ast::Name::Quoted(col_name)) => col_name,
+            Expr::Id(name) | Expr::Name(name) => name.as_ident(),
             _ => unreachable!("expressions in CREATE INDEX should have been rejected earlier"),
         };
-        sql.push_str(col_ident);
+        sql.push_str(&col_ident);
         if col.order.unwrap_or(SortOrder::Asc) == SortOrder::Desc {
             sql.push_str(" DESC");
         }

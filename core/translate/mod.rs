@@ -161,8 +161,8 @@ pub fn translate_inner(
         } => translate_create_index(
             (unique, if_not_exists),
             resolver,
-            idx_name.name.as_str(),
-            tbl_name.as_str(),
+            &idx_name.name,
+            &tbl_name,
             &columns,
             program,
             connection,
@@ -189,7 +189,7 @@ pub fn translate_inner(
             columns,
             ..
         } => view::translate_create_view(
-            view_name.name.as_str(),
+            &view_name.name,
             resolver,
             &select,
             &columns,
@@ -199,7 +199,7 @@ pub fn translate_inner(
         ast::Stmt::CreateMaterializedView {
             view_name, select, ..
         } => view::translate_create_materialized_view(
-            view_name.name.as_str(),
+            &view_name.name,
             resolver,
             &select,
             connection.clone(),

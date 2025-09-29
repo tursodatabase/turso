@@ -98,17 +98,16 @@ pub fn expr_to_value<T: TableContext>(
     table: &T,
 ) -> Option<SimValue> {
     match expr {
-        ast::Expr::DoublyQualified(_, _, ast::Name::Ident(col_name))
-        | ast::Expr::DoublyQualified(_, _, ast::Name::Quoted(col_name))
-        | ast::Expr::Qualified(_, ast::Name::Ident(col_name))
-        | ast::Expr::Qualified(_, ast::Name::Quoted(col_name))
-        | ast::Expr::Id(ast::Name::Ident(col_name)) => {
+        ast::Expr::DoublyQualified(_, _, col_name)
+        | ast::Expr::Qualified(_, col_name)
+        | ast::Expr::Id(col_name) => {
             let columns = table.columns().collect::<Vec<_>>();
+            let col_name = col_name.as_str();
             assert_eq!(row.len(), columns.len());
             columns
                 .iter()
                 .zip(row.iter())
-                .find(|(column, _)| column.column.name == *col_name)
+                .find(|(column, _)| column.column.name == col_name)
                 .map(|(_, value)| value)
                 .cloned()
         }

@@ -1827,7 +1827,7 @@ fn rewrite_where_for_update_registers(
                     }
                 }
             }
-            Expr::Id(ast::Name::Ident(name)) | Expr::Id(ast::Name::Quoted(name)) => {
+            Expr::Id(name) => {
                 let normalized = normalize_ident(name.as_str());
                 if ROWID_STRS
                     .iter()

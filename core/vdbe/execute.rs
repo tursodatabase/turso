@@ -73,7 +73,7 @@ use super::{
 };
 use parking_lot::RwLock;
 use rand::{thread_rng, Rng};
-use turso_parser::ast;
+use turso_parser::ast::{self, Name};
 use turso_parser::parser::Parser;
 
 use super::{
@@ -5232,7 +5232,7 @@ pub fn op_function(
 
                                 Some(
                                     ast::Stmt::CreateIndex {
-                                        tbl_name: ast::Name::new(original_rename_to),
+                                        tbl_name: ast::Name::exact(original_rename_to.to_string()),
                                         unique,
                                         if_not_exists,
                                         idx_name,
@@ -5258,7 +5258,7 @@ pub fn op_function(
                                     ast::Stmt::CreateTable {
                                         tbl_name: ast::QualifiedName {
                                             db_name: None,
-                                            name: ast::Name::new(original_rename_to),
+                                            name: ast::Name::exact(original_rename_to.to_string()),
                                             alias: None,
                                         },
                                         temporary,
@@ -5330,11 +5330,12 @@ pub fn op_function(
 
                                 for column in &mut columns {
                                     match column.expr.as_mut() {
-                                        ast::Expr::Id(ast::Name::Ident(id))
-                                        | ast::Expr::Id(ast::Name::Quoted(id))
-                                            if normalize_ident(id) == rename_from =>
+                                        ast::Expr::Id(id)
+                                            if normalize_ident(id.as_str()) == rename_from =>
                                         {
-                                            *id = column_def.col_name.as_str().to_owned();
+                                            *id = Name::exact(
+                                                column_def.col_name.as_str().to_owned(),
+                                            );
                                         }
                                         _ => {}
                                     }
@@ -5374,7 +5375,7 @@ pub fn op_function(
                                 let column = columns
                                     .iter_mut()
                                     .find(|column| {
-                                        column.col_name == ast::Name::new(original_rename_from)
+                                        column.col_name.as_str() == original_rename_from.as_str()
                                     })
                                     .expect("column being renamed should be present");
 

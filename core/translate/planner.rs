@@ -958,7 +958,7 @@ fn parse_join(
             {
                 for left_col in left_table.columns().iter().filter(|col| !col.hidden) {
                     if left_col.name == right_col.name {
-                        distinct_names.push(ast::Name::new(
+                        distinct_names.push(ast::Name::exact(
                             left_col.name.clone().expect("column name is None"),
                         ));
                         found_match = true;

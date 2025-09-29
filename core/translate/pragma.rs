@@ -4,7 +4,7 @@
 use chrono::Datelike;
 use std::sync::Arc;
 use turso_macros::match_ignore_ascii_case;
-use turso_parser::ast::{self, ColumnDefinition, Expr, Literal, Name};
+use turso_parser::ast::{self, ColumnDefinition, Expr, Literal};
 use turso_parser::ast::{PragmaName, QualifiedName};
 
 use super::integrity_check::translate_integrity_check;
@@ -293,7 +293,7 @@ fn update_pragma(
                     program = translate_create_table(
                         QualifiedName {
                             db_name: None,
-                            name: ast::Name::new(table),
+                            name: ast::Name::exact(table.to_string()),
                             alias: None,
                         },
                         resolver,
@@ -611,9 +611,12 @@ fn query_pragma(
             if let Some(value_expr) = value {
                 let is_query_only = match value_expr {
                     ast::Expr::Literal(Literal::Numeric(i)) => i.parse::<i64>().unwrap() != 0,
-                    ast::Expr::Literal(Literal::String(ref s))
-                    | ast::Expr::Name(Name::Ident(ref s)) => {
-                        let s = s.as_bytes();
+                    ast::Expr::Literal(Literal::String(..)) | ast::Expr::Name(..) => {
+                        let s = match &value_expr {
+                            ast::Expr::Literal(Literal::String(s)) => s.as_bytes(),
+                            ast::Expr::Name(n) => n.as_str().as_bytes(),
+                            _ => unreachable!(),
+                        };
                         match_ignore_ascii_case!(match s {
                             b"1" | b"on" | b"true" => true,
                             _ => false,
@@ -794,7 +797,7 @@ pub const TURSO_CDC_DEFAULT_TABLE_NAME: &str = "turso_cdc";
 fn turso_cdc_table_columns() -> Vec<ColumnDefinition> {
     vec![
         ast::ColumnDefinition {
-            col_name: ast::Name::new("change_id"),
+            col_name: ast::Name::exact("change_id".to_string()),
             col_type: Some(ast::Type {
                 name: "INTEGER".to_string(),
                 size: None,
@@ -809,7 +812,7 @@ fn turso_cdc_table_columns() -> Vec<ColumnDefinition> {
             }],
         },
         ast::ColumnDefinition {
-            col_name: ast::Name::new("change_time"),
+            col_name: ast::Name::exact("change_time".to_string()),
             col_type: Some(ast::Type {
                 name: "INTEGER".to_string(),
                 size: None,
@@ -817,7 +820,7 @@ fn turso_cdc_table_columns() -> Vec<ColumnDefinition> {
             constraints: vec![],
         },
         ast::ColumnDefinition {
-            col_name: ast::Name::new("change_type"),
+            col_name: ast::Name::exact("change_type".to_string()),
             col_type: Some(ast::Type {
                 name: "INTEGER".to_string(),
                 size: None,
@@ -825,7 +828,7 @@ fn turso_cdc_table_columns() -> Vec<ColumnDefinition> {
             constraints: vec![],
         },
         ast::ColumnDefinition {
-            col_name: ast::Name::new("table_name"),
+            col_name: ast::Name::exact("table_name".to_string()),
             col_type: Some(ast::Type {
                 name: "TEXT".to_string(),
                 size: None,
@@ -833,12 +836,12 @@ fn turso_cdc_table_columns() -> Vec<ColumnDefinition> {
             constraints: vec![],
         },
         ast::ColumnDefinition {
-            col_name: ast::Name::new("id"),
+            col_name: ast::Name::exact("id".to_string()),
             col_type: None,
             constraints: vec![],
         },
         ast::ColumnDefinition {
-            col_name: ast::Name::new("before"),
+            col_name: ast::Name::exact("before".to_string()),
             col_type: Some(ast::Type {
                 name: "BLOB".to_string(),
                 size: None,
@@ -846,7 +849,7 @@ fn turso_cdc_table_columns() -> Vec<ColumnDefinition> {
             constraints: vec![],
         },
         ast::ColumnDefinition {
-            col_name: ast::Name::new("after"),
+            col_name: ast::Name::exact("after".to_string()),
             col_type: Some(ast::Type {
                 name: "BLOB".to_string(),
                 size: None,
@@ -854,7 +857,7 @@ fn turso_cdc_table_columns() -> Vec<ColumnDefinition> {
             constraints: vec![],
         },
         ast::ColumnDefinition {
-            col_name: ast::Name::new("updates"),
+            col_name: ast::Name::exact("updates".to_string()),
             col_type: Some(ast::Type {
                 name: "BLOB".to_string(),
                 size: None,

@@ -416,7 +416,7 @@ fn collect_autoindexes(
 
 fn create_table_body_to_str(tbl_name: &ast::QualifiedName, body: &ast::CreateTableBody) -> String {
     let mut sql = String::new();
-    sql.push_str(format!("CREATE TABLE {} {}", tbl_name.name.as_str(), body).as_str());
+    sql.push_str(format!("CREATE TABLE {} {}", tbl_name.name.as_ident(), body).as_str());
     match body {
         ast::CreateTableBody::ColumnsAndConstraints {
             columns: _,
@@ -457,15 +457,15 @@ fn create_vtable_body_to_str(vtab: &ast::CreateVirtualTable, module: Arc<VTabImp
     };
     format!(
         "CREATE VIRTUAL TABLE {} {} USING {}{}\n /*{}{}*/",
-        vtab.tbl_name.name.as_str(),
+        vtab.tbl_name.name.as_ident(),
         if_not_exists,
-        vtab.module_name.as_str(),
+        vtab.module_name.as_ident(),
         if args.is_empty() {
             String::new()
         } else {
             format!("({args})")
         },
-        vtab.tbl_name.name.as_str(),
+        vtab.tbl_name.name.as_ident(),
         vtab_args
     )
 }

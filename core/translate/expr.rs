@@ -1826,7 +1826,7 @@ pub fn translate_expr(
         ast::Expr::Id(id) => {
             // Treat double-quoted identifiers as string literals (SQLite compatibility)
             program.emit_insn(Insn::String8 {
-                value: sanitize_double_quoted_string(id.as_str()),
+                value: id.as_str().to_string(),
                 dest: target_register,
             });
             Ok(target_register)
@@ -3008,12 +3008,6 @@ pub fn sanitize_string(input: &str) -> String {
     inner.replace("''", "'")
 }
 
-/// Sanitizes a double-quoted string literal by removing double quotes at front and back
-/// and unescaping double quotes
-pub fn sanitize_double_quoted_string(input: &str) -> String {
-    input[1..input.len() - 1].replace("\"\"", "\"").to_string()
-}
-
 /// Returns the components of a binary expression
 /// e.g. t.x = 5 -> Some((t.x, =, 5))
 pub fn as_binary_components(
@@ -3289,7 +3283,7 @@ pub enum BindingBehavior {
 
 /// Rewrite ast::Expr in place, binding Column references/rewriting Expr::Id -> Expr::Column
 /// using the provided TableReferences, and replacing anonymous parameters with internal named
-/// ones, as well as normalizing any DoublyQualified/Qualified quoted identifiers.
+/// ones
 pub fn bind_and_rewrite_expr<'a>(
     top_level_expr: &mut ast::Expr,
     mut referenced_tables: Option<&'a mut TableReferences>,
@@ -3312,13 +3306,6 @@ pub fn bind_and_rewrite_expr<'a>(
                         PARAM_PREFIX, param_state.next_param_idx
                     ));
                     param_state.next_param_idx += 1;
-                }
-                ast::Expr::Qualified(ast::Name::Quoted(ns), ast::Name::Quoted(c))
-                | ast::Expr::DoublyQualified(_, ast::Name::Quoted(ns), ast::Name::Quoted(c)) => {
-                    *expr = ast::Expr::Qualified(
-                        ast::Name::Ident(normalize_ident(ns.as_str())),
-                        ast::Name::Ident(normalize_ident(c.as_str())),
-                    );
                 }
                 ast::Expr::Between {
                     lhs,
@@ -3470,9 +3457,9 @@ pub fn bind_and_rewrite_expr<'a>(
 
                         // SQLite behavior: Only double-quoted identifiers get fallback to string literals
                         // Single quotes are handled as literals earlier, unquoted identifiers must resolve to columns
-                        if id.is_double_quoted() {
+                        if id.quoted_with('"') {
                             // Convert failed double-quoted identifier to string literal
-                            *expr = Expr::Literal(ast::Literal::String(id.as_str().to_string()));
+                            *expr = Expr::Literal(ast::Literal::String(id.as_literal()));
                             return Ok(WalkControl::Continue);
                         } else {
                             // Unquoted identifiers must resolve to columns - no fallback
@@ -3480,6 +3467,7 @@ pub fn bind_and_rewrite_expr<'a>(
                         }
                     }
                     Expr::Qualified(tbl, id) => {
+                        tracing::debug!("bind_and_rewrite_expr({:?}, {:?})", tbl, id);
                         let normalized_table_name = normalize_ident(tbl.as_str());
                         let matching_tbl = referenced_tables
                             .find_table_and_internal_id_by_identifier(&normalized_table_name);
@@ -3508,6 +3496,7 @@ pub fn bind_and_rewrite_expr<'a>(
                             column: col_idx,
                             is_rowid_alias: col.is_rowid_alias,
                         };
+                        tracing::debug!("rewritten to column");
                         referenced_tables.mark_column_used(tbl_id, col_idx);
                         return Ok(WalkControl::Continue);
                     }
@@ -4150,7 +4139,7 @@ fn determine_column_alias(
 ) -> Option<String> {
     // First check for explicit alias
     if let Some(As::As(name)) = explicit_alias {
-        return Some(name.to_string());
+        return Some(name.as_str().to_string());
     }
 
     // For ROWID expressions, use "rowid" as the alias

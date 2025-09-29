@@ -150,9 +150,9 @@ pub fn translate_insert(
                 for expr in values_expr.iter_mut().flat_map(|v| v.iter_mut()) {
                     match expr.as_mut() {
                         Expr::Id(name) => {
-                            if name.is_double_quoted() {
+                            if name.quoted_with('"') {
                                 *expr =
-                                    Expr::Literal(ast::Literal::String(name.to_string())).into();
+                                    Expr::Literal(ast::Literal::String(name.as_literal())).into();
                             } else {
                                 // an INSERT INTO ... VALUES (...) cannot reference columns
                                 crate::bail_parse_error!("no such column: {name}");
@@ -1746,7 +1746,7 @@ pub fn rewrite_partial_index_where(
         &mut |e: &mut ast::Expr| -> crate::Result<WalkControl> {
             match e {
                 // NOTE: should not have ANY Expr::Columns bound to the expr
-                Expr::Id(ast::Name::Ident(name)) | Expr::Id(ast::Name::Quoted(name)) => {
+                Expr::Id(name) => {
                     let normalized = normalize_ident(name.as_str());
                     if let Some(reg) = col_reg(&normalized) {
                         *e = Expr::Register(reg);
