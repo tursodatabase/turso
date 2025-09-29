@@ -1192,7 +1192,12 @@ impl Pager {
             );
 
             page.set_locked();
-            let c = self.begin_read_disk_page(page_idx as usize, page.clone(), allow_empty_read, &io_ctx)?;
+            let c = self.begin_read_disk_page(
+                page_idx as usize,
+                page.clone(),
+                allow_empty_read,
+                &io_ctx,
+            )?;
             return Ok((page, c));
         };
 
