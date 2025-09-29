@@ -248,18 +248,19 @@ pub fn emit_query<'a>(
     plan: &'a mut SelectPlan,
     t_ctx: &mut TranslateCtx<'a>,
 ) -> Result<usize> {
+    let after_main_loop_label = program.allocate_label();
+    t_ctx.label_main_loop_end = Some(after_main_loop_label);
+
+    init_limit(program, t_ctx, &plan.limit, &plan.offset);
+
     if !plan.values.is_empty() {
         let reg_result_cols_start = emit_values(program, plan, t_ctx)?;
+        program.preassign_label_to_next_insn(after_main_loop_label);
         return Ok(reg_result_cols_start);
     }
 
     // Emit subqueries first so the results can be read in the main query loop.
     emit_subqueries(program, t_ctx, &mut plan.table_references)?;
-
-    let after_main_loop_label = program.allocate_label();
-    t_ctx.label_main_loop_end = Some(after_main_loop_label);
-
-    init_limit(program, t_ctx, &plan.limit, &plan.offset);
 
     // No rows will be read from source table loops if there is a constant false condition eg. WHERE 0
     // however an aggregation might still happen,
