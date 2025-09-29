@@ -72,6 +72,25 @@ test('explicit connect', async () => {
     expect(await db.prepare("SELECT 1 as x").all()).toEqual([{ x: 1 }]);
 })
 
+test('zero-limit-bug', async () => {
+    const db = await connect(':memory:');
+    const create = db.prepare(`CREATE TABLE users (name TEXT NOT NULL);`);
+    await create.run();
+
+    const insert = db.prepare(
+        `insert into "users" values (?), (?), (?);`,
+    );
+    await insert.run('John', 'Jane', 'Jack');
+
+    const stmt1 = db.prepare(`select * from "users" limit ?;`);
+    expect(await stmt1.all(0)).toEqual([]);
+    let rows = [{ name: 'John' }, { name: 'Jane' }, { name: 'Jack' }, { name: 'John' }, { name: 'Jane' }, { name: 'Jack' }];
+    for (const limit of [0, 1, 2, 3, 4, 5, 6, 7]) {
+        const stmt2 = db.prepare(`select * from "users" union all select * from "users" limit ?;`);
+        expect(await stmt2.all(limit)).toEqual(rows.slice(0, Math.min(limit, 6)));
+    }
+})
+
 test('avg-bug', async () => {
     const db = await connect(':memory:');
     const create = db.prepare(`create table "aggregate_table" (

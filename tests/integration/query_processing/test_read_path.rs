@@ -792,29 +792,38 @@ fn test_offset_limit_bind() -> anyhow::Result<()> {
 
     conn.execute("INSERT INTO test VALUES (5), (4), (3), (2), (1)")?;
 
-    let mut stmt = conn.prepare("SELECT * FROM test LIMIT ? OFFSET ?")?;
-    stmt.bind_at(1.try_into()?, Value::Integer(2));
-    stmt.bind_at(2.try_into()?, Value::Integer(1));
+    for (limit, offset, expected) in [
+        (
+            2,
+            1,
+            vec![
+                vec![turso_core::Value::Integer(4)],
+                vec![turso_core::Value::Integer(3)],
+            ],
+        ),
+        (0, 0, vec![]),
+        (1, 0, vec![vec![turso_core::Value::Integer(5)]]),
+        (0, 1, vec![]),
+        (1, 1, vec![vec![turso_core::Value::Integer(4)]]),
+    ] {
+        let mut stmt = conn.prepare("SELECT * FROM test LIMIT ? OFFSET ?")?;
+        stmt.bind_at(1.try_into()?, Value::Integer(limit));
+        stmt.bind_at(2.try_into()?, Value::Integer(offset));
 
-    let mut rows = Vec::new();
-    loop {
-        match stmt.step()? {
-            StepResult::Row => {
-                let row = stmt.row().unwrap();
-                rows.push(row.get_values().cloned().collect::<Vec<_>>());
+        let mut rows = Vec::new();
+        loop {
+            match stmt.step()? {
+                StepResult::Row => {
+                    let row = stmt.row().unwrap();
+                    rows.push(row.get_values().cloned().collect::<Vec<_>>());
+                }
+                StepResult::IO => stmt.run_once()?,
+                _ => break,
             }
-            StepResult::IO => stmt.run_once()?,
-            _ => break,
         }
-    }
 
-    assert_eq!(
-        rows,
-        vec![
-            vec![turso_core::Value::Integer(4)],
-            vec![turso_core::Value::Integer(3)]
-        ]
-    );
+        assert_eq!(rows, expected);
+    }
 
     Ok(())
 }
