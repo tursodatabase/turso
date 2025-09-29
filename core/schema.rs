@@ -2855,6 +2855,7 @@ mod tests {
                 hidden: false,
             }],
             unique_sets: vec![],
+            foreign_keys: vec![],
         };
 
         let result =

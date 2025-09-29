@@ -1411,6 +1411,7 @@ mod tests {
             has_rowid: true,
             is_strict: false,
             unique_sets: vec![],
+            foreign_keys: vec![],
             has_autoincrement: false,
         };
 
@@ -1460,6 +1461,7 @@ mod tests {
             has_rowid: true,
             is_strict: false,
             has_autoincrement: false,
+            foreign_keys: vec![],
             unique_sets: vec![],
         };
 
@@ -1509,6 +1511,7 @@ mod tests {
             has_rowid: true,
             is_strict: false,
             has_autoincrement: false,
+            foreign_keys: vec![],
             unique_sets: vec![],
         };
 
@@ -1558,13 +1561,22 @@ mod tests {
             has_rowid: true, // Has implicit rowid but no alias
             is_strict: false,
             has_autoincrement: false,
+            foreign_keys: vec![],
             unique_sets: vec![],
         };
 
-        schema.add_btree_table(Arc::new(customers_table));
-        schema.add_btree_table(Arc::new(orders_table));
-        schema.add_btree_table(Arc::new(products_table));
-        schema.add_btree_table(Arc::new(logs_table));
+        schema
+            .add_btree_table(Arc::new(customers_table))
+            .expect("failed to add table");
+        schema
+            .add_btree_table(Arc::new(orders_table))
+            .expect("failed to add table");
+        schema
+            .add_btree_table(Arc::new(products_table))
+            .expect("failed to add table");
+        schema
+            .add_btree_table(Arc::new(logs_table))
+            .expect("failed to add table");
         schema
     }
 

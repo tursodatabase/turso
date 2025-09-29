@@ -2220,8 +2220,11 @@ mod tests {
                 is_strict: false,
                 has_autoincrement: false,
                 unique_sets: vec![],
+                foreign_keys: vec![],
             };
-            schema.add_btree_table(Arc::new(users_table));
+            schema
+                .add_btree_table(Arc::new(users_table))
+                .expect("Failed to add users table");
 
             // Add products table for join tests
             let products_table = BTreeTable {
@@ -2273,8 +2276,11 @@ mod tests {
                 is_strict: false,
                 has_autoincrement: false,
                 unique_sets: vec![],
+                foreign_keys: vec![],
             };
-            schema.add_btree_table(Arc::new(products_table));
+            schema
+                .add_btree_table(Arc::new(products_table))
+                .expect("failed to add products table");
 
             // Add orders table for join tests
             let orders_table = BTreeTable {
@@ -2338,8 +2344,11 @@ mod tests {
                 has_autoincrement: false,
                 is_strict: false,
                 unique_sets: vec![],
+                foreign_keys: vec![],
             };
-            schema.add_btree_table(Arc::new(orders_table));
+            schema
+                .add_btree_table(Arc::new(orders_table))
+                .expect("failed to add orders table");
 
             // Add customers table with id and name for testing column ambiguity
             let customers_table = BTreeTable {
@@ -2376,8 +2385,11 @@ mod tests {
                 is_strict: false,
                 has_autoincrement: false,
                 unique_sets: vec![],
+                foreign_keys: vec![],
             };
-            schema.add_btree_table(Arc::new(customers_table));
+            schema
+                .add_btree_table(Arc::new(customers_table))
+                .expect("failed to add customers table");
 
             // Add purchases table (junction table for three-way join)
             let purchases_table = BTreeTable {
@@ -2438,8 +2450,11 @@ mod tests {
                 is_strict: false,
                 has_autoincrement: false,
                 unique_sets: vec![],
+                foreign_keys: vec![],
             };
-            schema.add_btree_table(Arc::new(purchases_table));
+            schema
+                .add_btree_table(Arc::new(purchases_table))
+                .expect("failed to add purchases table");
 
             // Add vendors table with id, name, and price (ambiguous columns with customers)
             let vendors_table = BTreeTable {
@@ -2488,8 +2503,11 @@ mod tests {
                 is_strict: false,
                 has_autoincrement: false,
                 unique_sets: vec![],
+                foreign_keys: vec![],
             };
-            schema.add_btree_table(Arc::new(vendors_table));
+            schema
+                .add_btree_table(Arc::new(vendors_table))
+                .expect("failed to add vendors table");
 
             let sales_table = BTreeTable {
                 name: "sales".to_string(),
@@ -2525,8 +2543,11 @@ mod tests {
                 is_strict: false,
                 has_autoincrement: false,
                 unique_sets: vec![],
+                foreign_keys: vec![],
             };
-            schema.add_btree_table(Arc::new(sales_table));
+            schema
+                .add_btree_table(Arc::new(sales_table))
+                .expect("failed to add sales table");
 
             schema
         }};
