@@ -940,6 +940,159 @@ impl Schema {
         }
         Ok(())
     }
+
+    pub fn incoming_fks_to(&self, table_name: &str) -> Vec<IncomingFkRef> {
+        let target = normalize_ident(table_name);
+        let mut out = vec![];
+
+        // Resolve the parent table once
+        let parent_tbl = self
+            .get_btree_table(&target)
+            .expect("incoming_fks_to: parent table must exist");
+
+        // Precompute helper to find parent unique index (if not rowid)
+        let find_parent_unique = |cols: &Vec<String>| -> Option<Arc<Index>> {
+            // If matches PK exactly, we don't need a secondary index probe
+            let matches_pk = !parent_tbl.primary_key_columns.is_empty()
+                && parent_tbl.primary_key_columns.len() == cols.len()
+                && parent_tbl
+                    .primary_key_columns
+                    .iter()
+                    .zip(cols.iter())
+                    .all(|((n, _ord), c)| n.eq_ignore_ascii_case(c));
+
+            if matches_pk {
+                return None; // parent lookup will be by rowid or table probe
+            }
+
+            self.get_indices(&parent_tbl.name)
+                .find(|idx| {
+                    idx.unique
+                        && idx.columns.len() == cols.len()
+                        && idx
+                            .columns
+                            .iter()
+                            .zip(cols.iter())
+                            .all(|(ic, pc)| ic.name.eq_ignore_ascii_case(pc))
+                })
+                .cloned()
+        };
+
+        for t in self.tables.values() {
+            let Some(child) = t.btree() else {
+                continue;
+            };
+
+            for fk in &child.foreign_keys {
+                if normalize_ident(&fk.parent_table) != target {
+                    continue;
+                }
+
+                // Resolve + normalize columns
+                let child_cols: Vec<String> = fk
+                    .child_columns
+                    .iter()
+                    .map(|c| normalize_ident(c))
+                    .collect();
+
+                // If no explicit parent columns were given, they were validated in add_btree_table()
+                // to match the parent's PK. We resolve them the same way here.
+                let parent_cols: Vec<String> = if fk.parent_columns.is_empty() {
+                    parent_tbl
+                        .primary_key_columns
+                        .iter()
+                        .map(|(n, _)| normalize_ident(n))
+                        .collect()
+                } else {
+                    fk.parent_columns
+                        .iter()
+                        .map(|c| normalize_ident(c))
+                        .collect()
+                };
+
+                // Child positions
+                let child_pos: Vec<usize> = child_cols
+                    .iter()
+                    .map(|cname| {
+                        child.get_column(cname).map(|(i, _)| i).unwrap_or_else(|| {
+                            panic!(
+                                "incoming_fks_to: child col {}.{} missing",
+                                child.name, cname
+                            )
+                        })
+                    })
+                    .collect();
+
+                let parent_pos: Vec<usize> = parent_cols
+                    .iter()
+                    .map(|cname| {
+                        // Allow "rowid" sentinel; return 0 but it won't be used when parent_uses_rowid == true
+                        parent_tbl
+                            .get_column(cname)
+                            .map(|(i, _)| i)
+                            .or_else(|| {
+                                if cname.eq_ignore_ascii_case("rowid") {
+                                    Some(0)
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or_else(|| {
+                                panic!(
+                                    "incoming_fks_to: parent col {}.{} missing",
+                                    parent_tbl.name, cname
+                                )
+                            })
+                    })
+                    .collect();
+
+                // Detect parent rowid usage (single-column and rowid/alias)
+                let parent_uses_rowid = parent_cols.len() == 1 && {
+                    let c = parent_cols[0].as_str();
+                    c.eq_ignore_ascii_case("rowid")
+                        || parent_tbl.columns.iter().any(|col| {
+                            col.is_rowid_alias
+                                && col
+                                    .name
+                                    .as_deref()
+                                    .is_some_and(|n| n.eq_ignore_ascii_case(c))
+                        })
+                };
+
+                let parent_unique_index = if parent_uses_rowid {
+                    None
+                } else {
+                    Some(
+                        find_parent_unique(&parent_cols)
+                            .expect("incoming_fks_to: validated parent uniqueness must resolve"),
+                    )
+                };
+
+                out.push(IncomingFkRef {
+                    child_table: Arc::clone(&child),
+                    fk: Arc::clone(fk),
+                    parent_cols,
+                    child_cols,
+                    child_pos,
+                    parent_pos,
+                    parent_uses_rowid,
+                    parent_unique_index,
+                });
+            }
+        }
+        out
+    }
+
+    pub fn any_incoming_fk_to(&self, table_name: &str) -> bool {
+        self.tables.values().any(|t| {
+            let Some(bt) = t.btree() else {
+                return false;
+            };
+            bt.foreign_keys
+                .iter()
+                .any(|fk| fk.parent_table == table_name)
+        })
+    }
 }
 
 impl Clone for Schema {
@@ -1318,7 +1471,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                 } else if let ast::TableConstraint::ForeignKey {
                     columns,
                     clause,
-                    deref_clause,
+                    defer_clause,
                 } = &c.constraint
                 {
                     let child_columns: Vec<String> = columns
@@ -1344,7 +1497,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                         );
                     }
                     // deferrable semantics
-                    let deferred = match deref_clause {
+                    let deferred = match defer_clause {
                         Some(d) => {
                             d.deferrable
                                 && matches!(
@@ -1679,6 +1832,78 @@ pub struct ForeignKey {
     pub on_insert: RefAct,
     /// DEFERRABLE INITIALLY DEFERRED
     pub deferred: bool,
+}
+
+/// A single foreign key where `parent_table == target`.
+#[derive(Clone)]
+pub struct IncomingFkRef {
+    /// Child table that owns the FK.
+    pub child_table: Arc<BTreeTable>,
+    /// The FK as declared on the child table.
+    pub fk: Arc<ForeignKey>,
+
+    /// Resolved, normalized column names.
+    pub parent_cols: Vec<String>,
+    pub child_cols: Vec<String>,
+
+    /// Column positions in the child/parent tables (pos_in_table)
+    pub child_pos: Vec<usize>,
+    pub parent_pos: Vec<usize>,
+
+    /// If the parent key is rowid or a rowid-alias (single-column only)
+    pub parent_uses_rowid: bool,
+    /// For non-rowid parents: the UNIQUE index that enforces the parent key.
+    /// (None when `parent_uses_rowid == true`.)
+    pub parent_unique_index: Option<Arc<Index>>,
+}
+
+impl IncomingFkRef {
+    /// Returns if any referenced parent column can change when these column positions are updated.
+    pub fn parent_key_may_change(
+        &self,
+        updated_parent_positions: &HashSet<usize>,
+        parent_tbl: &BTreeTable,
+    ) -> bool {
+        if self.parent_uses_rowid {
+            // parent rowid changes if the parent's rowid or alias is updated
+            if let Some((idx, _)) = parent_tbl
+                .columns
+                .iter()
+                .enumerate()
+                .find(|(_, c)| c.is_rowid_alias)
+            {
+                return updated_parent_positions.contains(&idx);
+            }
+            // Without a rowid alias, a direct rowid update is represented separately with ROWID_SENTINEL
+            return true;
+        }
+        self.parent_pos
+            .iter()
+            .any(|p| updated_parent_positions.contains(p))
+    }
+
+    /// Returns if any child column of this FK is in `updated_child_positions`
+    pub fn child_key_changed(
+        &self,
+        updated_child_positions: &HashSet<usize>,
+        child_tbl: &BTreeTable,
+    ) -> bool {
+        if self
+            .child_pos
+            .iter()
+            .any(|p| updated_child_positions.contains(p))
+        {
+            return true;
+        }
+        // special case: if FK uses a rowid alias on child, and rowid changed
+        if self.child_cols.len() == 1 {
+            let (i, col) = child_tbl.get_column(&self.child_cols[0]).unwrap();
+            if col.is_rowid_alias && updated_child_positions.contains(&i) {
+                return true;
+            }
+        }
+        false
+    }
 }
 
 #[derive(Debug, Clone)]
