@@ -714,10 +714,6 @@ impl Schema {
                             }
                         }
                     }
-
-                    if let Some(mv_store) = mv_store {
-                        mv_store.mark_table_as_loaded(root_page);
-                    }
                     self.add_btree_table(Arc::new(table))?;
                 }
             }

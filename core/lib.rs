@@ -1081,13 +1081,9 @@ pub struct Connection {
     /// User defined max accumulated Busy timeout duration
     /// Default is 0 (no timeout)
     busy_timeout: RwLock<std::time::Duration>,
-<<<<<<< HEAD
     /// Whether this is an internal connection used for MVCC bootstrap
     is_mvcc_bootstrap_connection: AtomicBool,
-||||||| parent of 21e8ccda6 (Add field on connection to activate foreign key)
-=======
     fk_pragma: AtomicBool,
->>>>>>> 21e8ccda6 (Add field on connection to activate foreign key)
 }
 
 impl Drop for Connection {
