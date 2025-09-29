@@ -395,31 +395,6 @@ impl Schema {
         self.indexes_enabled
     }
 
-    pub fn get_foreign_keys_for_table(&self, table_name: &str) -> Vec<Arc<ForeignKey>> {
-        self.get_table(table_name)
-            .and_then(|t| t.btree())
-            .map(|t| t.foreign_keys.clone())
-            .unwrap_or_default()
-    }
-
-    /// Get foreign keys where this table is the parent (referenced by other tables)
-    pub fn get_referencing_foreign_keys(
-        &self,
-        parent_table: &str,
-    ) -> Vec<(String, Arc<ForeignKey>)> {
-        let mut refs = Vec::new();
-        for table in self.tables.values() {
-            if let Table::BTree(btree) = table.deref() {
-                for fk in &btree.foreign_keys {
-                    if fk.parent_table == parent_table {
-                        refs.push((btree.name.as_str().to_string(), fk.clone()));
-                    }
-                }
-            }
-        }
-        refs
-    }
-
     /// Update [Schema] by scanning the first root page (sqlite_schema)
     pub fn make_from_btree(
         &mut self,
@@ -871,11 +846,9 @@ impl Schema {
         Ok(())
     }
 
-    pub fn incoming_fks_to(&self, table_name: &str) -> Vec<IncomingFkRef> {
+    pub fn incoming_fks_to(&self, table_name: &str) -> Vec<ResolvedFkRef> {
         let target = normalize_ident(table_name);
         let mut out = vec![];
-
-        // Resolve the parent table once
         let parent_tbl = self
             .get_btree_table(&target)
             .expect("incoming_fks_to: parent table must exist");
@@ -995,7 +968,7 @@ impl Schema {
                     find_parent_unique(&parent_cols)
                 };
 
-                out.push(IncomingFkRef {
+                out.push(ResolvedFkRef {
                     child_table: Arc::clone(&child),
                     fk: Arc::clone(fk),
                     parent_cols,
@@ -1010,6 +983,117 @@ impl Schema {
         out
     }
 
+    pub fn outgoing_fks_of(&self, child_table: &str) -> Vec<ResolvedFkRef> {
+        let child_name = normalize_ident(child_table);
+        let Some(child) = self.get_btree_table(&child_name) else {
+            return vec![];
+        };
+
+        // Helper to find the UNIQUE/index on the parent that matches the resolved parent cols
+        let find_parent_unique =
+            |parent_tbl: &BTreeTable, cols: &Vec<String>| -> Option<Arc<Index>> {
+                let matches_pk = !parent_tbl.primary_key_columns.is_empty()
+                    && parent_tbl.primary_key_columns.len() == cols.len()
+                    && parent_tbl
+                        .primary_key_columns
+                        .iter()
+                        .zip(cols.iter())
+                        .all(|((n, _), c)| n.eq_ignore_ascii_case(c));
+                if matches_pk {
+                    return None;
+                }
+                self.get_indices(&parent_tbl.name)
+                    .find(|idx| {
+                        idx.unique
+                            && idx.columns.len() == cols.len()
+                            && idx
+                                .columns
+                                .iter()
+                                .zip(cols.iter())
+                                .all(|(ic, pc)| ic.name.eq_ignore_ascii_case(pc))
+                    })
+                    .cloned()
+            };
+
+        let mut out = Vec::new();
+        for fk in &child.foreign_keys {
+            let parent_name = normalize_ident(&fk.parent_table);
+            let Some(parent_tbl) = self.get_btree_table(&parent_name) else {
+                continue;
+            };
+
+            // Normalize columns (same rules you used in validation)
+            let child_cols: Vec<String> = fk
+                .child_columns
+                .iter()
+                .map(|s| normalize_ident(s))
+                .collect();
+            let parent_cols: Vec<String> = if fk.parent_columns.is_empty() {
+                if !parent_tbl.primary_key_columns.is_empty() {
+                    parent_tbl
+                        .primary_key_columns
+                        .iter()
+                        .map(|(n, _)| normalize_ident(n))
+                        .collect()
+                } else {
+                    vec!["rowid".to_string()]
+                }
+            } else {
+                fk.parent_columns
+                    .iter()
+                    .map(|s| normalize_ident(s))
+                    .collect()
+            };
+
+            // Positions
+            let child_pos: Vec<usize> = child_cols
+                .iter()
+                .map(|c| child.get_column(c).expect("child col missing").0)
+                .collect();
+            let parent_pos: Vec<usize> = parent_cols
+                .iter()
+                .map(|c| {
+                    parent_tbl
+                        .get_column(c)
+                        .map(|(i, _)| i)
+                        .or_else(|| c.eq_ignore_ascii_case("rowid").then_some(0))
+                        .expect("parent col missing")
+                })
+                .collect();
+
+            // Parent uses rowid?
+            let parent_uses_rowid = parent_cols.len() == 1 && {
+                let c = parent_cols[0].as_str();
+                c.eq_ignore_ascii_case("rowid")
+                    || parent_tbl.columns.iter().any(|col| {
+                        col.is_rowid_alias
+                            && col
+                                .name
+                                .as_deref()
+                                .is_some_and(|n| n.eq_ignore_ascii_case(c))
+                    })
+            };
+
+            let parent_unique_index = if parent_uses_rowid {
+                None
+            } else {
+                find_parent_unique(&parent_tbl, &parent_cols)
+            };
+
+            out.push(ResolvedFkRef {
+                child_table: Arc::clone(&child),
+                fk: Arc::clone(fk),
+                parent_cols,
+                child_cols,
+                child_pos,
+                parent_pos,
+                parent_uses_rowid,
+                parent_unique_index,
+            });
+        }
+        out
+    }
+
     pub fn any_incoming_fk_to(&self, table_name: &str) -> bool {
         self.tables.values().any(|t| {
             let Some(bt) = t.btree() else {
@@ -1019,6 +1103,37 @@ impl Schema {
                 .iter()
                 .any(|fk| fk.parent_table == table_name)
         })
+    }
+
+    /// Returns if this table declares any outgoing FKs (is a child of some parent)
+    pub fn has_child_fks(&self, table_name: &str) -> bool {
+        self.get_table(table_name)
+            .and_then(|t| t.btree())
+            .is_some_and(|t| !t.foreign_keys.is_empty())
+    }
+
+    /// Return the *declared* (unresolved) FKs for a table. Callers that need
+    /// positions/rowid/unique info should use `incoming_fks_to` instead.
+    pub fn get_fks_for_table(&self, table_name: &str) -> Vec<Arc<ForeignKey>> {
+        self.get_table(table_name)
+            .and_then(|t| t.btree())
+            .map(|t| t.foreign_keys.clone())
+            .unwrap_or_default()
+    }
+
+    /// Return pairs of (child_table_name, FK) for FKs that reference `parent_table`
+    pub fn get_referencing_fks(&self, parent_table: &str) -> Vec<(String, Arc<ForeignKey>)> {
+        let mut refs = Vec::new();
+        for table in self.tables.values() {
+            if let Table::BTree(btree) = table.deref() {
+                for fk in &btree.foreign_keys {
+                    if fk.parent_table == parent_table {
+                        refs.push((btree.name.as_str().to_string(), fk.clone()));
+                    }
+                }
+            }
+        }
+        refs
     }
 }
 
@@ -1752,11 +1867,11 @@ pub fn _build_pseudo_table(columns: &[ResultColumn]) -> PseudoCursorType {
 
 #[derive(Debug, Clone)]
 pub struct ForeignKey {
-    /// Columns in this table
+    /// Columns in this table (child side)
     pub child_columns: Vec<String>,
-    /// Referenced table
+    /// Referenced (parent) table
     pub parent_table: String,
-    /// Referenced columns
+    /// Parent-side referenced columns
     pub parent_columns: Vec<String>,
     pub on_delete: RefAct,
     pub on_update: RefAct,
@@ -1765,9 +1880,9 @@ pub struct ForeignKey {
     pub deferred: bool,
 }
 
-/// A single foreign key where `parent_table == target`.
+/// A single resolved foreign key where `parent_table == target`.
 #[derive(Clone, Debug)]
-pub struct IncomingFkRef {
+pub struct ResolvedFkRef {
     /// Child table that owns the FK.
     pub child_table: Arc<BTreeTable>,
     /// The FK as declared on the child table.
@@ -1788,7 +1903,7 @@ pub struct IncomingFkRef {
     pub parent_unique_index: Option<Arc<Index>>,
 }
 
-impl IncomingFkRef {
+impl ResolvedFkRef {
     /// Returns if any referenced parent column can change when these column positions are updated.
     pub fn parent_key_may_change(
         &self,

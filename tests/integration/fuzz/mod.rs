@@ -3,12 +3,11 @@ pub mod grammar_generator;
 #[cfg(test)]
 mod tests {
     use rand::seq::{IndexedRandom, SliceRandom};
-    use std::collections::HashSet;
-    use turso_core::DatabaseOpts;
-
     use rand::{Rng, SeedableRng};
     use rand_chacha::ChaCha8Rng;
     use rusqlite::{params, types::Value};
+    use std::{collections::HashSet, io::Write};
+    use turso_core::DatabaseOpts;
 
     use crate::{
         common::{
@@ -646,6 +645,422 @@ mod tests {
                     "Different results! limbo: {:?}, sqlite: {:?}, seed: {}, query: {}, table def: {}",
                     limbo_rows, sqlite_rows, seed, query, table_defs[i]
                 );
+
+                }
+            }
+        }
+    }
+
+    pub fn fk_single_pk_mutation_fuzz() {
+        let _ = env_logger::try_init();
+        let (mut rng, seed) = rng_from_time();
+        println!("fk_single_pk_mutation_fuzz seed: {seed}");
+
+        const OUTER_ITERS: usize = 50;
+        const INNER_ITERS: usize = 200;
+
+        for outer in 0..OUTER_ITERS {
+            println!("fk_single_pk_mutation_fuzz {}/{}", outer + 1, OUTER_ITERS);
+
+            let limbo_db = TempDatabase::new_empty(true);
+            let sqlite_db = TempDatabase::new_empty(true);
+            let limbo = limbo_db.connect_limbo();
+            let sqlite = rusqlite::Connection::open(sqlite_db.path.clone()).unwrap();
+
+            // Statement log for this iteration
+            let mut stmts: Vec<String> = Vec::new();
+            let mut log_and_exec = |sql: &str| {
+                stmts.push(sql.to_string());
+                sql.to_string()
+            };
+
+            // Enable FKs in both engines
+            let s = log_and_exec("PRAGMA foreign_keys=ON");
+            limbo_exec_rows(&limbo_db, &limbo, &s);
+            sqlite.execute(&s, params![]).unwrap();
+
+            // DDL
+            let s = log_and_exec("CREATE TABLE p(id INTEGER PRIMARY KEY, a INT, b INT)");
+            limbo_exec_rows(&limbo_db, &limbo, &s);
+            sqlite.execute(&s, params![]).unwrap();
+
+            let s = log_and_exec(
+            "CREATE TABLE c(id INTEGER PRIMARY KEY, x INT, y INT, FOREIGN KEY(x) REFERENCES p(id))",
+        );
+            limbo_exec_rows(&limbo_db, &limbo, &s);
+            sqlite.execute(&s, params![]).unwrap();
+
+            // Seed parent
+            let n_par = rng.random_range(5..=40);
+            let mut used_ids = std::collections::HashSet::new();
+            for _ in 0..n_par {
+                let mut id;
+                loop {
+                    id = rng.random_range(1..=200) as i64;
+                    if used_ids.insert(id) {
+                        break;
+                    }
+                }
+                let a = rng.random_range(-5..=25);
+                let b = rng.random_range(-5..=25);
+                let stmt = log_and_exec(&format!("INSERT INTO p VALUES ({id}, {a}, {b})"));
+                limbo_exec_rows(&limbo_db, &limbo, &stmt);
+                sqlite.execute(&stmt, params![]).unwrap();
+            }
+
+            // Seed child
+            let n_child = rng.random_range(5..=80);
+            for i in 0..n_child {
+                let id = 1000 + i as i64;
+                let x = if rng.random_bool(0.8) {
+                    *used_ids.iter().choose(&mut rng).unwrap()
+                } else {
+                    rng.random_range(1..=220) as i64
+                };
+                let y = rng.random_range(-10..=10);
+                let stmt = log_and_exec(&format!("INSERT INTO c VALUES ({id}, {x}, {y})"));
+                match (
+                    sqlite.execute(&stmt, params![]),
+                    limbo_exec_rows_fallible(&limbo_db, &limbo, &stmt),
+                ) {
+                    (Ok(_), Ok(_)) => {}
+                    (Err(_), Err(_)) => {}
+                    (x, y) => {
+                        eprintln!("\n=== FK fuzz failure (seeding mismatch) ===");
+                        eprintln!("seed: {seed}, outer: {}", outer + 1);
+                        eprintln!("sqlite: {x:?}, limbo: {y:?}");
+                        eprintln!("last stmt: {stmt}");
+                        eprintln!("--- replay statements ({}) ---", stmts.len());
+                        for (i, s) in stmts.iter().enumerate() {
+                            eprintln!("{:04}: {};", i + 1, s);
+                        }
+                        panic!("Seeding child insert mismatch");
+                    }
+                }
+            }
+
+            // Mutations
+            for _ in 0..INNER_ITERS {
+                let action = rng.random_range(0..6);
+                let stmt = match action {
+                    // Parent INSERT
+                    0 => {
+                        let mut id;
+                        let mut tries = 0;
+                        loop {
+                            id = rng.random_range(1..=250) as i64;
+                            if !used_ids.contains(&id) || tries > 10 {
+                                break;
+                            }
+                            tries += 1;
+                        }
+                        let a = rng.random_range(-5..=25);
+                        let b = rng.random_range(-5..=25);
+                        format!("INSERT INTO p VALUES({id}, {a}, {b})")
+                    }
+                    // Parent UPDATE
+                    1 => {
+                        if rng.random_bool(0.5) {
+                            let old = rng.random_range(1..=250);
+                            let new_id = rng.random_range(1..=260);
+                            format!("UPDATE p SET id={new_id} WHERE id={old}")
+                        } else {
+                            let a = rng.random_range(-5..=25);
+                            let b = rng.random_range(-5..=25);
+                            let tgt = rng.random_range(1..=260);
+                            format!("UPDATE p SET a={a}, b={b} WHERE id={tgt}")
+                        }
+                    }
+                    // Parent DELETE
+                    2 => {
+                        let del_id = rng.random_range(1..=260);
+                        format!("DELETE FROM p WHERE id={del_id}")
+                    }
+                    // Child INSERT
+                    3 => {
+                        let id = rng.random_range(1000..=2000);
+                        let x = if rng.random_bool(0.7) {
+                            if let Some(p) = used_ids.iter().choose(&mut rng) {
+                                *p
+                            } else {
+                                rng.random_range(1..=260) as i64
+                            }
+                        } else {
+                            rng.random_range(1..=260) as i64
+                        };
+                        let y = rng.random_range(-10..=10);
+                        format!("INSERT INTO c VALUES({id}, {x}, {y})")
+                    }
+                    // Child UPDATE
+                    4 => {
+                        let pick = rng.random_range(1000..=2000);
+                        if rng.random_bool(0.6) {
+                            let new_x = if rng.random_bool(0.7) {
+                                if let Some(p) = used_ids.iter().choose(&mut rng) {
+                                    *p
+                                } else {
+                                    rng.random_range(1..=260) as i64
+                                }
+                            } else {
+                                rng.random_range(1..=260) as i64
+                            };
+                            format!("UPDATE c SET x={new_x} WHERE id={pick}")
+                        } else {
+                            let new_y = rng.random_range(-10..=10);
+                            format!("UPDATE c SET y={new_y} WHERE id={pick}")
+                        }
+                    }
+                    // Child DELETE
+                    _ => {
+                        let pick = rng.random_range(1000..=2000);
+                        format!("DELETE FROM c WHERE id={pick}")
+                    }
+                };
+
+                let stmt = log_and_exec(&stmt);
+
+                let sres = sqlite.execute(&stmt, params![]);
+                let lres = limbo_exec_rows_fallible(&limbo_db, &limbo, &stmt);
+
+                match (sres, lres) {
+                    (Ok(_), Ok(_)) => {
+                        if stmt.starts_with("INSERT INTO p VALUES(") {
+                            if let Some(tok) = stmt.split_whitespace().nth(4) {
+                                if let Some(idtok) = tok.split(['(', ',']).nth(1) {
+                                    if let Ok(idnum) = idtok.parse::<i64>() {
+                                        used_ids.insert(idnum);
+                                    }
+                                }
+                            }
+                        }
+                        let sp = sqlite_exec_rows(&sqlite, "SELECT id,a,b FROM p ORDER BY id");
+                        let sc = sqlite_exec_rows(&sqlite, "SELECT id,x,y FROM c ORDER BY id");
+                        let lp =
+                            limbo_exec_rows(&limbo_db, &limbo, "SELECT id,a,b FROM p ORDER BY id");
+                        let lc =
+                            limbo_exec_rows(&limbo_db, &limbo, "SELECT id,x,y FROM c ORDER BY id");
+
+                        if sp != lp || sc != lc {
+                            eprintln!("\n=== FK fuzz failure (state mismatch) ===");
+                            eprintln!("seed: {seed}, outer: {}", outer + 1);
+                            eprintln!("last stmt: {stmt}");
+                            eprintln!("sqlite p: {sp:?}\nsqlite c: {sc:?}");
+                            eprintln!("limbo  p: {lp:?}\nlimbo  c: {lc:?}");
+                            eprintln!("--- replay statements ({}) ---", stmts.len());
+                            for (i, s) in stmts.iter().enumerate() {
+                                eprintln!("{:04}: {};", i + 1, s);
+                            }
+                            panic!("State mismatch");
+                        }
+                    }
+                    (Err(_), Err(_)) => { /* parity OK */ }
+                    (ok_sqlite, ok_limbo) => {
+                        eprintln!("\n=== FK fuzz failure (outcome mismatch) ===");
+                        eprintln!("seed: {seed}, outer: {}", outer + 1);
+                        eprintln!("sqlite: {ok_sqlite:?}, limbo: {ok_limbo:?}");
+                        eprintln!("last stmt: {stmt}");
+                        // dump final states to help decide who is right
+                        let sp = sqlite_exec_rows(&sqlite, "SELECT id,a,b FROM p ORDER BY id");
+                        let sc = sqlite_exec_rows(&sqlite, "SELECT id,x,y FROM c ORDER BY id");
+                        let lp =
+                            limbo_exec_rows(&limbo_db, &limbo, "SELECT id,a,b FROM p ORDER BY id");
+                        let lc =
+                            limbo_exec_rows(&limbo_db, &limbo, "SELECT id,x,y FROM c ORDER BY id");
+                        eprintln!("sqlite p: {sp:?}\nsqlite c: {sc:?}");
+                        eprintln!("turso p: {lp:?}\nturso c: {lc:?}");
+                        eprintln!(
+                            "--- writing ({}) statements to fk_fuzz_statements.sql ---",
+                            stmts.len()
+                        );
+                        let mut file = std::fs::File::create("fk_fuzz_statements.sql").unwrap();
+                        for s in stmts.iter() {
+                            let _ = file.write_fmt(format_args!("{s};\n"));
+                        }
+                        file.flush().unwrap();
+                        panic!("DML outcome mismatch, statements written to tests/fk_fuzz_statements.sql");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore] // TODO: un-ignore when UNIQUE constraints are fixed
+    pub fn fk_composite_pk_mutation_fuzz() {
+        let _ = env_logger::try_init();
+        let (mut rng, seed) = rng_from_time();
+        println!("fk_composite_pk_mutation_fuzz seed: {seed}");
+
+        const OUTER_ITERS: usize = 30;
+        const INNER_ITERS: usize = 200;
+
+        for outer in 0..OUTER_ITERS {
+            println!(
+                "fk_composite_pk_mutation_fuzz {}/{}",
+                outer + 1,
+                OUTER_ITERS
+            );
+
+            let limbo_db = TempDatabase::new_empty(true);
+            let sqlite_db = TempDatabase::new_empty(true);
+            let limbo = limbo_db.connect_limbo();
+            let sqlite = rusqlite::Connection::open(sqlite_db.path.clone()).unwrap();
+
+            let mut stmts: Vec<String> = Vec::new();
+            let mut log_and_exec = |sql: &str| {
+                stmts.push(sql.to_string());
+                sql.to_string()
+            };
+
+            // Enable FKs in both engines
+            let _ = log_and_exec("PRAGMA foreign_keys=ON");
+            limbo_exec_rows(&limbo_db, &limbo, "PRAGMA foreign_keys=ON");
+            sqlite.execute("PRAGMA foreign_keys=ON", params![]).unwrap();
+
+            // Parent PK is composite (a,b). Child references (x,y) -> (a,b).
+            let s = log_and_exec(
+                "CREATE TABLE p(a INT NOT NULL, b INT NOT NULL, v INT, PRIMARY KEY(a,b))",
+            );
+            limbo_exec_rows(&limbo_db, &limbo, &s);
+            sqlite.execute(&s, params![]).unwrap();
+
+            let s = log_and_exec(
+                "CREATE TABLE c(id INTEGER PRIMARY KEY, x INT, y INT, w INT, \
+             FOREIGN KEY(x,y) REFERENCES p(a,b))",
+            );
+            limbo_exec_rows(&limbo_db, &limbo, &s);
+            sqlite.execute(&s, params![]).unwrap();
+
+            // Seed parent: small grid of (a,b)
+            let mut pairs: Vec<(i64, i64)> = Vec::new();
+            for _ in 0..rng.random_range(5..=25) {
+                let a = rng.random_range(-3..=6);
+                let b = rng.random_range(-3..=6);
+                if !pairs.contains(&(a, b)) {
+                    pairs.push((a, b));
+                    let v = rng.random_range(0..=20);
+                    let stmt = log_and_exec(&format!("INSERT INTO p VALUES({a},{b},{v})"));
+                    limbo_exec_rows(&limbo_db, &limbo, &stmt);
+                    sqlite.execute(&stmt, params![]).unwrap();
+                }
+            }
+
+            // Seed child rows, 70% chance to reference existing (a,b)
+            for i in 0..rng.random_range(5..=60) {
+                let id = 5000 + i as i64;
+                let (x, y) = if rng.random_bool(0.7) {
+                    *pairs.choose(&mut rng).unwrap_or(&(0, 0))
+                } else {
+                    (rng.random_range(-4..=7), rng.random_range(-4..=7))
+                };
+                let w = rng.random_range(-10..=10);
+                let stmt = log_and_exec(&format!("INSERT INTO c VALUES({id}, {x}, {y}, {w})"));
+                let _ = sqlite.execute(&stmt, params![]);
+                let _ = limbo_exec_rows_fallible(&limbo_db, &limbo, &stmt);
+            }
+
+            for _ in 0..INNER_ITERS {
+                let op = rng.random_range(0..6);
+                let stmt = log_and_exec(&match op {
+                    // INSERT parent
+                    0 => {
+                        let a = rng.random_range(-4..=8);
+                        let b = rng.random_range(-4..=8);
+                        let v = rng.random_range(0..=20);
+                        format!("INSERT INTO p VALUES({a},{b},{v})")
+                    }
+                    // UPDATE parent composite key (a,b)
+                    1 => {
+                        let a_old = rng.random_range(-4..=8);
+                        let b_old = rng.random_range(-4..=8);
+                        let a_new = rng.random_range(-4..=8);
+                        let b_new = rng.random_range(-4..=8);
+                        format!("UPDATE p SET a={a_new}, b={b_new} WHERE a={a_old} AND b={b_old}")
+                    }
+                    // DELETE parent
+                    2 => {
+                        let a = rng.random_range(-4..=8);
+                        let b = rng.random_range(-4..=8);
+                        format!("DELETE FROM p WHERE a={a} AND b={b}")
+                    }
+                    // INSERT child
+                    3 => {
+                        let id = rng.random_range(5000..=7000);
+                        let (x, y) = if rng.random_bool(0.7) {
+                            *pairs.choose(&mut rng).unwrap_or(&(0, 0))
+                        } else {
+                            (rng.random_range(-4..=8), rng.random_range(-4..=8))
+                        };
+                        let w = rng.random_range(-10..=10);
+                        format!("INSERT INTO c VALUES({id},{x},{y},{w})")
+                    }
+                    // UPDATE child FK columns (x,y)
+                    4 => {
+                        let id = rng.random_range(5000..=7000);
+                        let (x, y) = if rng.random_bool(0.7) {
+                            *pairs.choose(&mut rng).unwrap_or(&(0, 0))
+                        } else {
+                            (rng.random_range(-4..=8), rng.random_range(-4..=8))
+                        };
+                        format!("UPDATE c SET x={x}, y={y} WHERE id={id}")
+                    }
+                    // DELETE child
+                    _ => {
+                        let id = rng.random_range(5000..=7000);
+                        format!("DELETE FROM c WHERE id={id}")
+                    }
+                });
+
+                let sres = sqlite.execute(&stmt, params![]);
+                let lres = limbo_exec_rows_fallible(&limbo_db, &limbo, &stmt);
+
+                match (sres, lres) {
+                    (Ok(_), Ok(_)) => {
+                        // Compare canonical states
+                        let sp = sqlite_exec_rows(&sqlite, "SELECT a,b,v FROM p ORDER BY a,b,v");
+                        let sc = sqlite_exec_rows(&sqlite, "SELECT id,x,y,w FROM c ORDER BY id");
+                        let lp = limbo_exec_rows(
+                            &limbo_db,
+                            &limbo,
+                            "SELECT a,b,v FROM p ORDER BY a,b,v",
+                        );
+                        let lc = limbo_exec_rows(
+                            &limbo_db,
+                            &limbo,
+                            "SELECT id,x,y,w FROM c ORDER BY id",
+                        );
+                        assert_eq!(sp, lp, "seed {seed}, stmt {stmt}");
+                        assert_eq!(sc, lc, "seed {seed}, stmt {stmt}");
+                    }
+                    (Err(_), Err(_)) => { /* both errored -> parity OK */ }
+                    (ok_s, ok_l) => {
+                        eprintln!(
+                            "Mismatch sqlite={ok_s:?}, limbo={ok_l:?}, stmt={stmt}, seed={seed}"
+                        );
+                        let sp = sqlite_exec_rows(&sqlite, "SELECT a,b,v FROM p ORDER BY a,b,v");
+                        let sc = sqlite_exec_rows(&sqlite, "SELECT id,x,y,w FROM c ORDER BY id");
+                        let lp = limbo_exec_rows(
+                            &limbo_db,
+                            &limbo,
+                            "SELECT a,b,v FROM p ORDER BY a,b,v",
+                        );
+                        let lc = limbo_exec_rows(
+                            &limbo_db,
+                            &limbo,
+                            "SELECT id,x,y,w FROM c ORDER BY id",
+                        );
+                        eprintln!(
+                            "sqlite p={sp:?}\nsqlite c={sc:?}\nlimbo p={lp:?}\nlimbo c={lc:?}"
+                        );
+                        let mut file =
+                            std::fs::File::create("fk_composite_fuzz_statements.sql").unwrap();
+                        for s in stmts.iter() {
+                            let _ = writeln!(&file, "{s};");
+                        }
+                        file.flush().unwrap();
+                        panic!("DML outcome mismatch, sql file written to tests/fk_composite_fuzz_statements.sql");
+                    }
+                }
             }
         }
     }

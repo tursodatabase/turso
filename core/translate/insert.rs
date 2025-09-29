@@ -87,7 +87,7 @@ pub fn translate_insert(
     let has_child_fks = fk_enabled
         && !resolver
             .schema
-            .get_foreign_keys_for_table(table_name.as_str())
+            .get_fks_for_table(table_name.as_str())
             .is_empty();
     let has_parent_fks = fk_enabled && resolver.schema.any_incoming_fk_to(table_name.as_str());
 
@@ -1146,7 +1146,6 @@ pub fn translate_insert(
                 &mut result_columns,
                 cdc_table.as_ref().map(|c| c.0),
                 row_done_label,
-                connection,
             )?;
         } else {
             // UpsertDo::Nothing case
@@ -1910,7 +1909,7 @@ fn emit_fk_checks_for_insert(
     });
 
     // Iterate child FKs declared on this table
-    for fk in resolver.schema.get_foreign_keys_for_table(table_name) {
+    for fk in resolver.schema.get_fks_for_table(table_name) {
         let fk_ok = program.allocate_label();
 
         // If any child column is NULL, skip this FK

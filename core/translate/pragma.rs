@@ -4,7 +4,7 @@
 use chrono::Datelike;
 use std::sync::Arc;
 use turso_macros::match_ignore_ascii_case;
-use turso_parser::ast::{self, ColumnDefinition, Expr, Literal, Name};
+use turso_parser::ast::{self, ColumnDefinition, Expr, Literal};
 use turso_parser::ast::{PragmaName, QualifiedName};
 
 use super::integrity_check::translate_integrity_check;
@@ -388,10 +388,10 @@ fn update_pragma(
             Ok((program, TransactionMode::None))
         }
         PragmaName::ForeignKeys => {
-            let enabled = match &value {
-                Expr::Id(name) | Expr::Name(name) => {
-                    let name_str = name.as_str().as_bytes();
-                    match_ignore_ascii_case!(match name_str {
+            let enabled = match value {
+                Expr::Name(name) | Expr::Id(name) => {
+                    let name_bytes = name.as_str().as_bytes();
+                    match_ignore_ascii_case!(match name_bytes {
                         b"ON" | b"TRUE" | b"YES" | b"1" => true,
                         _ => false,
                     })
