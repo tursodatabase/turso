@@ -1712,7 +1712,9 @@ pub fn op_column(
 
                             match serial_type {
                                 // NULL
-                                0 => break 'ifnull,
+                                0 => {
+                                    state.registers[*dest] = Register::Value(Value::Null);
+                                }
                                 // I8
                                 1 => {
                                     state.registers[*dest] =

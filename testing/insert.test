@@ -641,3 +641,12 @@ do_execsql_test_on_specific_db {:memory:} default-values-population {
     SELECT * FROM t;
 } {1|666|
 2|666|}
+
+do_execsql_test_on_specific_db {:memory:} set-explicit-null-default-value {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x DEFAULT 1);
+    INSERT INTO t(id, x) VALUES (1, 2);
+    SELECT * FROM t;
+    UPDATE t SET x = NULL WHERE id = 1;
+    SELECT * FROM t;
+} {1|2
+1|}
