@@ -1595,3 +1595,20 @@ do_execsql_test_on_specific_db {:memory:} matview-in-incremental {
 1|INFO|start
 3|ERROR|fail
 3|ERROR|fail}
+
+# Test join with swapped column order in ON clause
+do_execsql_test_on_specific_db {:memory:} matview-join-swapped-columns {
+    CREATE TABLE employees(id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE departments(emp_id INTEGER PRIMARY KEY, dept_name TEXT);
+
+    INSERT INTO employees VALUES (1, 'Alice'), (2, 'Bob');
+    INSERT INTO departments VALUES (1, 'Engineering'), (2, 'Sales');
+
+    CREATE MATERIALIZED VIEW emp_dept AS
+        SELECT e.name, d.dept_name
+        FROM employees e
+        JOIN departments d ON d.emp_id = e.id;
+
+    SELECT * FROM emp_dept ORDER BY name;
+} {Alice|Engineering
+Bob|Sales}
