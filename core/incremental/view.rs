@@ -8,7 +8,6 @@ use crate::types::{IOResult, Value};
 use crate::util::{extract_view_columns, ViewColumnSchema};
 use crate::{return_if_io, LimboError, Pager, Result, Statement};
 use parking_lot::RwLock;
-use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::{Arc, Mutex};
@@ -72,54 +71,54 @@ impl fmt::Debug for PopulateState {
 }
 
 /// Per-connection transaction state for incremental views
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 pub struct ViewTransactionState {
     // Per-table deltas for uncommitted changes
     // Maps table_name -> Delta for that table
-    // Using RefCell for interior mutability
-    table_deltas: RefCell<HashMap<String, Delta>>,
+    // Using RwLock for interior mutability
+    table_deltas: RwLock<HashMap<String, Delta>>,
 }
 
 impl ViewTransactionState {
     /// Create a new transaction state
     pub fn new() -> Self {
         Self {
-            table_deltas: RefCell::new(HashMap::new()),
+            table_deltas: RwLock::new(HashMap::new()),
         }
     }
 
     /// Insert a row into the delta for a specific table
     pub fn insert(&self, table_name: &str, key: i64, values: Vec<Value>) {
-        let mut deltas = self.table_deltas.borrow_mut();
+        let mut deltas = self.table_deltas.write();
         let delta = deltas.entry(table_name.to_string()).or_default();
         delta.insert(key, values);
     }
 
     /// Delete a row from the delta for a specific table
     pub fn delete(&self, table_name: &str, key: i64, values: Vec<Value>) {
-        let mut deltas = self.table_deltas.borrow_mut();
+        let mut deltas = self.table_deltas.write();
         let delta = deltas.entry(table_name.to_string()).or_default();
         delta.delete(key, values);
     }
 
     /// Clear all changes in the delta
     pub fn clear(&self) {
-        self.table_deltas.borrow_mut().clear();
+        self.table_deltas.write().clear();
     }
 
     /// Get deltas organized by table
     pub fn get_table_deltas(&self) -> HashMap<String, Delta> {
-        self.table_deltas.borrow().clone()
+        self.table_deltas.read().clone()
     }
 
     /// Check if the delta is empty
     pub fn is_empty(&self) -> bool {
-        self.table_deltas.borrow().values().all(|d| d.is_empty())
+        self.table_deltas.read().values().all(|d| d.is_empty())
     }
 
     /// Returns how many elements exist in the delta.
     pub fn len(&self) -> usize {
-        self.table_deltas.borrow().values().map(|d| d.len()).sum()
+        self.table_deltas.read().values().map(|d| d.len()).sum()
     }
 }
 
