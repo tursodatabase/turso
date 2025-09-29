@@ -1346,9 +1346,8 @@ pub mod tests {
     #[test]
     fn test_normalize_ident() {
         assert_eq!(normalize_ident("foo"), "foo");
-        assert_eq!(normalize_ident("`foo`"), "foo");
-        assert_eq!(normalize_ident("[foo]"), "foo");
-        assert_eq!(normalize_ident("\"foo\""), "foo");
+        assert_eq!(normalize_ident("FOO"), "foo");
+        assert_eq!(normalize_ident("ὈΔΥΣΣΕΎΣ"), "ὀδυσσεύς");
     }
 
     #[test]

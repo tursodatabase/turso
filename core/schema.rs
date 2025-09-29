@@ -25,8 +25,8 @@ use crate::util::{
     module_args_from_sql, module_name_from_sql, type_from_name, IOExt, UnparsedFromSqlIndex,
 };
 use crate::{
-    contains_ignore_ascii_case, eq_ignore_ascii_case, match_ignore_ascii_case, Connection,
-    LimboError, MvCursor, MvStore, Pager, RefValue, SymbolTable, VirtualTable,
+    bail_parse_error, contains_ignore_ascii_case, eq_ignore_ascii_case, match_ignore_ascii_case,
+    Connection, LimboError, MvCursor, MvStore, Pager, RefValue, SymbolTable, VirtualTable,
 };
 use crate::{util::normalize_ident, Result};
 use core::fmt;
@@ -1137,8 +1137,8 @@ pub fn create_table(
                             Expr::Literal(Literal::String(value)) => {
                                 value.trim_matches('\'').to_owned()
                             }
-                            _ => {
-                                todo!("Unsupported primary key expression");
+                            expr => {
+                                bail_parse_error!("unsupported primary key expression: {}", expr)
                             }
                         };
                         primary_key_columns
@@ -1156,16 +1156,24 @@ pub fn create_table(
                     if conflict_clause.is_some() {
                         unimplemented!("ON CONFLICT not implemented");
                     }
+                    let mut unique_columns = Vec::with_capacity(columns.len());
+                    for column in columns {
+                        match column.expr.as_ref() {
+                            Expr::Id(id) => unique_columns.push((
+                                id.as_str().to_string(),
+                                column.order.unwrap_or(SortOrder::Asc),
+                            )),
+                            Expr::Literal(Literal::String(value)) => unique_columns.push((
+                                value.trim_matches('\'').to_owned(),
+                                column.order.unwrap_or(SortOrder::Asc),
+                            )),
+                            expr => {
+                                bail_parse_error!("unsupported unique key expression: {}", expr)
+                            }
+                        }
+                    }
                     let unique_set = UniqueSet {
-                        columns: columns
-                            .iter()
-                            .map(|column| {
-                                (
-                                    column.expr.as_ref().to_string(),
-                                    column.order.unwrap_or(SortOrder::Asc),
-                                )
-                            })
-                            .collect(),
+                        columns: unique_columns,
                         is_primary_key: false,
                     };
                     unique_sets.push(unique_set);
@@ -1785,7 +1793,10 @@ impl Index {
                 let index_name = normalize_ident(idx_name.name.as_str());
                 let mut index_columns = Vec::with_capacity(columns.len());
                 for col in columns.into_iter() {
-                    let name = normalize_ident(&col.expr.to_string());
+                    let name = normalize_ident(match col.expr.as_ref() {
+                        Expr::Id(col_name) | Expr::Name(col_name) => col_name.as_str(),
+                        _ => crate::bail_parse_error!("cannot use expressions in CREATE INDEX"),
+                    });
                     let Some((pos_in_table, _)) = table.get_column(&name) else {
                         return Err(crate::LimboError::InternalError(format!(
                             "Column {} is in index {} but not found in table {}",
