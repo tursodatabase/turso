@@ -71,6 +71,14 @@ impl MvccTestDbNoConn {
 
     /// Restarts the database, make sure there is no connection to the database open before calling this!
     pub fn restart(&mut self) {
+        // First let's clear any entries in database manager in order to force restart.
+        // If not, we will load the same database instance again.
+        {
+            let mut manager = DATABASE_MANAGER.lock().unwrap();
+            manager.clear();
+        }
+
+        // Now open again.
         let io = Arc::new(PlatformIO::new().unwrap());
         let path = self.path.as_ref().unwrap();
         let db = Database::open_file(io.clone(), path, true, true).unwrap();
@@ -705,10 +713,10 @@ fn test_future_row() {
 use crate::mvcc::cursor::MvccLazyCursor;
 use crate::mvcc::database::{MvStore, Row, RowID};
 use crate::types::Text;
-use crate::RefValue;
 use crate::Value;
 use crate::{Database, StepResult};
 use crate::{MemoryIO, Statement};
+use crate::{RefValue, DATABASE_MANAGER};
 
 // Simple atomic clock implementation for testing
 

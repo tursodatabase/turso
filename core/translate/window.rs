@@ -1,4 +1,4 @@
-use crate::schema::{BTreeTable, Schema, Table};
+use crate::schema::{BTreeTable, Table};
 use crate::translate::aggregation::{translate_aggregation_step, AggArgumentSource};
 use crate::translate::emitter::{Resolver, TranslateCtx};
 use crate::translate::expr::{walk_expr, walk_expr_mut, WalkControl};
@@ -13,7 +13,6 @@ use crate::util::exprs_are_equivalent;
 use crate::vdbe::builder::{CursorType, ProgramBuilder, TableRefIdCounter};
 use crate::vdbe::insn::{InsertFlags, Insn};
 use crate::vdbe::{BranchOffset, CursorID};
-use crate::SymbolTable;
 use std::mem;
 use std::sync::Arc;
 use turso_parser::ast::Name;
@@ -22,8 +21,7 @@ use turso_parser::ast::{Expr, FunctionTail, Literal, Over, SortOrder, TableInter
 const SUBQUERY_DATABASE_ID: usize = 0;
 
 struct WindowSubqueryContext<'a> {
-    schema: &'a Schema,
-    syms: &'a SymbolTable,
+    resolver: &'a Resolver<'a>,
     subquery_order_by: &'a mut Vec<(Box<Expr>, SortOrder)>,
     subquery_result_columns: &'a mut Vec<ResultSetColumn>,
     subquery_id: &'a TableInternalId,
@@ -82,9 +80,8 @@ struct WindowSubqueryContext<'a> {
 /// );
 /// ```
 pub fn plan_windows(
-    schema: &Schema,
-    syms: &SymbolTable,
     plan: &mut SelectPlan,
+    resolver: &Resolver,
     table_ref_counter: &mut TableRefIdCounter,
     windows: &mut Vec<Window>,
 ) -> crate::Result<()> {
@@ -99,13 +96,12 @@ pub fn plan_windows(
         );
     }
 
-    prepare_window_subquery(schema, syms, plan, table_ref_counter, windows, 0)
+    prepare_window_subquery(plan, resolver, table_ref_counter, windows, 0)
 }
 
 fn prepare_window_subquery(
-    schema: &Schema,
-    syms: &SymbolTable,
     outer_plan: &mut SelectPlan,
+    resolver: &Resolver,
     table_ref_counter: &mut TableRefIdCounter,
     windows: &mut Vec<Window>,
     processed_window_count: usize,
@@ -139,8 +135,7 @@ fn prepare_window_subquery(
     }
 
     let mut ctx = WindowSubqueryContext {
-        schema,
-        syms,
+        resolver,
         subquery_order_by: &mut subquery_order_by,
         subquery_result_columns: &mut subquery_result_columns,
         subquery_id: &subquery_id,
@@ -213,9 +208,8 @@ fn prepare_window_subquery(
     };
 
     prepare_window_subquery(
-        schema,
-        syms,
         &mut inner_plan,
+        resolver,
         table_ref_counter,
         windows,
         processed_window_count + 1,
@@ -250,13 +244,8 @@ fn append_order_by(
     ctx.subquery_order_by
         .push((Box::new(expr.clone()), *sort_order));
 
-    let contains_aggregates = resolve_window_and_aggregate_functions(
-        ctx.schema,
-        ctx.syms,
-        expr,
-        &mut plan.aggregates,
-        None,
-    )?;
+    let contains_aggregates =
+        resolve_window_and_aggregate_functions(expr, ctx.resolver, &mut plan.aggregates, None)?;
     rewrite_expr_as_subquery_column(expr, ctx, contains_aggregates);
     Ok(())
 }
@@ -352,9 +341,8 @@ fn rewrite_expr_referencing_current_window(
             filter_over,
         } => {
             for arg in args.iter_mut() {
-                let contains_aggregates = resolve_window_and_aggregate_functions(
-                    ctx.schema, ctx.syms, arg, aggregates, None,
-                )?;
+                let contains_aggregates =
+                    resolve_window_and_aggregate_functions(arg, ctx.resolver, aggregates, None)?;
                 rewrite_expr_as_subquery_column(arg, ctx, contains_aggregates);
             }
             assert!(

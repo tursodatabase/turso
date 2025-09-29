@@ -15,12 +15,12 @@ use crate::storage::pager::AutoVacuumMode;
 use crate::storage::pager::Pager;
 use crate::storage::sqlite3_ondisk::CacheSize;
 use crate::storage::wal::CheckpointMode;
-use crate::translate::emitter::TransactionMode;
+use crate::translate::emitter::{Resolver, TransactionMode};
 use crate::translate::schema::translate_create_table;
 use crate::util::{normalize_ident, parse_signed_number, parse_string, IOExt as _};
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
 use crate::vdbe::insn::{Cookie, Insn};
-use crate::{bail_parse_error, CaptureDataChangesMode, LimboError, SymbolTable, Value};
+use crate::{bail_parse_error, CaptureDataChangesMode, LimboError, Value};
 use std::str::FromStr;
 use strum::IntoEnumIterator;
 
@@ -32,10 +32,8 @@ fn list_pragmas(program: &mut ProgramBuilder) {
     program.add_pragma_result_column("pragma_list".into());
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn translate_pragma(
-    schema: &Schema,
-    syms: &SymbolTable,
+    resolver: &Resolver,
     name: &ast::QualifiedName,
     body: Option<ast::PragmaBody>,
     pager: Arc<Pager>,
@@ -60,12 +58,17 @@ pub fn translate_pragma(
     };
 
     let (mut program, mode) = match body {
-        None => query_pragma(pragma, schema, None, pager, connection, program)?,
+        None => query_pragma(pragma, resolver.schema, None, pager, connection, program)?,
         Some(ast::PragmaBody::Equals(value) | ast::PragmaBody::Call(value)) => match pragma {
-            PragmaName::TableInfo => {
-                query_pragma(pragma, schema, Some(*value), pager, connection, program)?
-            }
-            _ => update_pragma(pragma, schema, syms, *value, pager, connection, program)?,
+            PragmaName::TableInfo => query_pragma(
+                pragma,
+                resolver.schema,
+                Some(*value),
+                pager,
+                connection,
+                program,
+            )?,
+            _ => update_pragma(pragma, resolver, *value, pager, connection, program)?,
         },
     };
     match mode {
@@ -86,8 +89,7 @@ pub fn translate_pragma(
 
 fn update_pragma(
     pragma: PragmaName,
-    schema: &Schema,
-    syms: &SymbolTable,
+    resolver: &Resolver,
     value: ast::Expr,
     pager: Arc<Pager>,
     connection: Arc<crate::Connection>,
@@ -154,7 +156,7 @@ fn update_pragma(
         PragmaName::LegacyFileFormat => Ok((program, TransactionMode::None)),
         PragmaName::WalCheckpoint => query_pragma(
             PragmaName::WalCheckpoint,
-            schema,
+            resolver.schema,
             Some(value),
             pager,
             connection,
@@ -163,7 +165,7 @@ fn update_pragma(
         PragmaName::ModuleList => Ok((program, TransactionMode::None)),
         PragmaName::PageCount => query_pragma(
             PragmaName::PageCount,
-            schema,
+            resolver.schema,
             None,
             pager,
             connection,
@@ -287,13 +289,14 @@ fn update_pragma(
             // but for now, let's keep it as is...
             let opts = CaptureDataChangesMode::parse(&value)?;
             if let Some(table) = &opts.table() {
-                if schema.get_table(table).is_none() {
+                if resolver.schema.get_table(table).is_none() {
                     program = translate_create_table(
                         QualifiedName {
                             db_name: None,
                             name: ast::Name::exact(table.to_string()),
                             alias: None,
                         },
+                        resolver,
                         false,
                         true, // if_not_exists
                         ast::CreateTableBody::ColumnsAndConstraints {
@@ -301,8 +304,6 @@ fn update_pragma(
                             constraints: vec![],
                             options: ast::TableOptions::NONE,
                         },
-                        schema,
-                        syms,
                         program,
                         &connection,
                     )?;
@@ -314,7 +315,7 @@ fn update_pragma(
         PragmaName::DatabaseList => unreachable!("database_list cannot be set"),
         PragmaName::QueryOnly => query_pragma(
             PragmaName::QueryOnly,
-            schema,
+            resolver.schema,
             Some(value),
             pager,
             connection,
@@ -322,7 +323,7 @@ fn update_pragma(
         ),
         PragmaName::FreelistCount => query_pragma(
             PragmaName::FreelistCount,
-            schema,
+            resolver.schema,
             Some(value),
             pager,
             connection,

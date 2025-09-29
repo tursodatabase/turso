@@ -40,6 +40,7 @@ pub mod numeric;
 mod numeric;
 
 use crate::storage::checksum::CHECKSUM_REQUIRED_RESERVED_BYTES;
+use crate::translate::display::PlanContext;
 use crate::translate::pragma::TURSO_CDC_DEFAULT_TABLE_NAME;
 #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
 use crate::types::{WalFrameInfo, WalState};
@@ -91,6 +92,7 @@ pub use storage::{
 };
 use tracing::{instrument, Level};
 use turso_macros::match_ignore_ascii_case;
+use turso_parser::ast::fmt::ToTokens;
 use turso_parser::{ast, ast::Cmd, parser::Parser};
 use types::IOResult;
 pub use types::RefValue;
@@ -403,7 +405,8 @@ impl Database {
         let mv_store = if opts.enable_mvcc {
             let file = io.open_file(&format!("{path}-lg"), OpenFlags::default(), false)?;
             let storage = mvcc::persistent_storage::Storage::new(file);
-            Some(Arc::new(MvStore::new(mvcc::LocalClock::new(), storage)))
+            let mv_store = MvStore::new(mvcc::LocalClock::new(), storage);
+            Some(Arc::new(mv_store))
         } else {
             None
         };
@@ -482,6 +485,11 @@ impl Database {
     #[instrument(skip_all, level = Level::INFO)]
     pub fn connect(self: &Arc<Database>) -> Result<Arc<Connection>> {
         let pager = self.init_pager(None)?;
+        let pager = Arc::new(pager);
+
+        if self.mv_store.is_some() {
+            self.maybe_recover_logical_log(pager.clone())?;
+        }
 
         let page_size = pager.get_page_size_unchecked();
 
@@ -492,7 +500,7 @@ impl Database {
             .get();
         let conn = Arc::new(Connection {
             db: self.clone(),
-            pager: RwLock::new(Arc::new(pager)),
+            pager: RwLock::new(pager),
             schema: RwLock::new(
                 self.schema
                     .lock()
@@ -530,6 +538,17 @@ impl Database {
         // add built-in extensions symbols to the connection to prevent having to load each time
         conn.syms.write().extend(&builtin_syms);
         Ok(conn)
+    }
+
+    pub fn maybe_recover_logical_log(self: &Arc<Database>, pager: Arc<Pager>) -> Result<()> {
+        let Some(mv_store) = self.mv_store.clone() else {
+            panic!("tryign to recover logical log without mvcc");
+        };
+        if !mv_store.needs_recover() {
+            return Ok(());
+        }
+
+        mv_store.recover_logical_log(&self.io, &pager)
     }
 
     pub fn is_readonly(&self) -> bool {
@@ -2562,7 +2581,11 @@ impl Statement {
                 let column = &self.program.result_columns.get(idx).expect("No column");
                 match column.name(&self.program.table_references) {
                     Some(name) => Cow::Borrowed(name),
-                    None => Cow::Owned(column.expr.to_string()),
+                    None => {
+                        let tables = [&self.program.table_references];
+                        let ctx = PlanContext(&tables);
+                        Cow::Owned(column.expr.displayer(&ctx).to_string())
+                    }
                 }
             }
             QueryMode::Explain => Cow::Borrowed(EXPLAIN_COLUMNS[idx]),

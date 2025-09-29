@@ -3637,17 +3637,21 @@ pub fn op_agg_step(
     match func {
         AggFunc::Avg => {
             let col = state.registers[*col].clone();
-            let Register::Aggregate(agg) = state.registers[*acc_reg].borrow_mut() else {
-                panic!(
-                    "Unexpected value {:?} in AggStep at register {}",
-                    state.registers[*acc_reg], *acc_reg
-                );
-            };
-            let AggContext::Avg(acc, count) = agg.borrow_mut() else {
-                unreachable!();
-            };
-            *acc = acc.exec_add(col.get_value());
-            *count += 1;
+            // > The avg() function returns the average value of all non-NULL X within a group
+            // https://sqlite.org/lang_aggfunc.html#avg
+            if !col.is_null() {
+                let Register::Aggregate(agg) = state.registers[*acc_reg].borrow_mut() else {
+                    panic!(
+                        "Unexpected value {:?} in AggStep at register {}",
+                        state.registers[*acc_reg], *acc_reg
+                    );
+                };
+                let AggContext::Avg(acc, count) = agg.borrow_mut() else {
+                    unreachable!();
+                };
+                *acc = acc.exec_add(col.get_value());
+                *count += 1;
+            }
         }
         AggFunc::Sum | AggFunc::Total => {
             let col = state.registers[*col].clone();
@@ -3915,7 +3919,11 @@ pub fn op_agg_final(
                 let AggContext::Avg(acc, count) = agg else {
                     unreachable!();
                 };
-                let acc = acc.clone() / count.clone();
+                let acc = if count.as_int() == Some(0) {
+                    Value::Null
+                } else {
+                    acc.clone() / count.clone()
+                };
                 state.registers[dest_reg] = Register::Value(acc);
             }
             AggFunc::Sum => {
@@ -7876,10 +7884,27 @@ pub fn op_drop_column(
 
     let conn = program.connection.clone();
 
+    let normalized_table_name = normalize_ident(table.as_str());
+
+    let column_name = {
+        let schema = conn.schema.read();
+        let table = schema
+            .tables
+            .get(&normalized_table_name)
+            .expect("table being ALTERed should be in schema");
+        table
+            .get_column_at(*column_index)
+            .expect("column being ALTERed should be in schema")
+            .name
+            .as_ref()
+            .expect("column being ALTERed should be named")
+            .clone()
+    };
+
     conn.with_schema_mut(|schema| {
         let table = schema
             .tables
-            .get_mut(table)
+            .get_mut(&normalized_table_name)
             .expect("table being renamed should be in schema");
 
         let table = Arc::make_mut(table);
@@ -7891,6 +7916,31 @@ pub fn op_drop_column(
         let btree = Arc::make_mut(btree);
         btree.columns.remove(*column_index)
     });
+
+    let schema = conn.schema.read();
+    if let Some(indexes) = schema.indexes.get(&normalized_table_name) {
+        for index in indexes {
+            if index
+                .columns
+                .iter()
+                .any(|column| column.pos_in_table == *column_index)
+            {
+                return Err(LimboError::ParseError(format!(
+                    "cannot drop column \"{column_name}\": indexed"
+                )));
+            }
+        }
+    }
+
+    for (view_name, view) in schema.views.iter() {
+        let view_select_sql = format!("SELECT * FROM {view_name}");
+        conn.prepare(view_select_sql.as_str()).map_err(|e| {
+            LimboError::ParseError(format!(
+                "cannot drop column \"{}\": referenced in VIEW {view_name}: {}",
+                column_name, view.sql,
+            ))
+        })?;
+    }
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -7947,6 +7997,20 @@ pub fn op_alter_column(
     let conn = program.connection.clone();
 
     let normalized_table_name = normalize_ident(table_name.as_str());
+    let old_column_name = {
+        let schema = conn.schema.read();
+        let table = schema
+            .tables
+            .get(&normalized_table_name)
+            .expect("table being ALTERed should be in schema");
+        table
+            .get_column_at(*column_index)
+            .expect("column being ALTERed should be in schema")
+            .name
+            .as_ref()
+            .expect("column being ALTERed should be named")
+            .clone()
+    };
     let new_column = crate::schema::Column::from(definition);
 
     conn.with_schema_mut(|schema| {
@@ -7987,6 +8051,27 @@ pub fn op_alter_column(
             *column = new_column;
         }
     });
+
+    let schema = conn.schema.read();
+    if *rename {
+        let table = schema
+            .tables
+            .get(&normalized_table_name)
+            .expect("table being ALTERed should be in schema");
+        let column = table
+            .get_column_at(*column_index)
+            .expect("column being ALTERed should be in schema");
+        for (view_name, view) in schema.views.iter() {
+            let view_select_sql = format!("SELECT * FROM {view_name}");
+            // FIXME: this should rewrite the view to reference the new column name
+            conn.prepare(view_select_sql.as_str()).map_err(|e| {
+                LimboError::ParseError(format!(
+                    "cannot rename column \"{}\": referenced in VIEW {view_name}: {}",
+                    old_column_name, view.sql,
+                ))
+            })?;
+        }
+    }
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -8054,8 +8139,12 @@ impl Value {
     pub fn exec_length(&self) -> Self {
         match self {
             Value::Text(t) => {
-                // Count Unicode scalar values (characters)
-                Value::Integer(t.as_str().chars().count() as i64)
+                let s = t.as_str();
+                let len_before_null = s.find('\0').map_or_else(
+                    || s.chars().count(),
+                    |null_pos| s[..null_pos].chars().count(),
+                );
+                Value::Integer(len_before_null as i64)
             }
             Value::Integer(_) | Value::Float(_) => {
                 // For numbers, SQLite returns the length of the string representation

@@ -1638,6 +1638,106 @@ impl DbspCompiler {
                     },
                 })
             }
+            LogicalExpr::Between {
+                expr,
+                low,
+                high,
+                negated,
+            } => {
+                // BETWEEN x AND y is rewritten as (expr >= x AND expr <= y)
+                // NOT BETWEEN x AND y is rewritten as (expr < x OR expr > y)
+                let expr_ast = Self::logical_to_ast_expr_with_schema(expr, schema)?;
+                let low_ast = Self::logical_to_ast_expr_with_schema(low, schema)?;
+                let high_ast = Self::logical_to_ast_expr_with_schema(high, schema)?;
+
+                if *negated {
+                    // NOT BETWEEN: (expr < low OR expr > high)
+                    Ok(ast::Expr::Binary(
+                        Box::new(ast::Expr::Binary(
+                            Box::new(expr_ast.clone()),
+                            ast::Operator::Less,
+                            Box::new(low_ast),
+                        )),
+                        ast::Operator::Or,
+                        Box::new(ast::Expr::Binary(
+                            Box::new(expr_ast),
+                            ast::Operator::Greater,
+                            Box::new(high_ast),
+                        )),
+                    ))
+                } else {
+                    // BETWEEN: (expr >= low AND expr <= high)
+                    Ok(ast::Expr::Binary(
+                        Box::new(ast::Expr::Binary(
+                            Box::new(expr_ast.clone()),
+                            ast::Operator::GreaterEquals,
+                            Box::new(low_ast),
+                        )),
+                        ast::Operator::And,
+                        Box::new(ast::Expr::Binary(
+                            Box::new(expr_ast),
+                            ast::Operator::LessEquals,
+                            Box::new(high_ast),
+                        )),
+                    ))
+                }
+            }
+            LogicalExpr::InList {
+                expr,
+                list,
+                negated,
+            } => {
+                let lhs = Box::new(Self::logical_to_ast_expr_with_schema(expr, schema)?);
+                let values: Result<Vec<_>> = list
+                    .iter()
+                    .map(|item| {
+                        let ast_expr = Self::logical_to_ast_expr_with_schema(item, schema)?;
+                        Ok(Box::new(ast_expr))
+                    })
+                    .collect();
+                Ok(ast::Expr::InList {
+                    lhs,
+                    not: *negated,
+                    rhs: values?,
+                })
+            }
+            LogicalExpr::Like {
+                expr,
+                pattern,
+                escape,
+                negated,
+            } => {
+                let lhs = Box::new(Self::logical_to_ast_expr_with_schema(expr, schema)?);
+                let rhs = Box::new(Self::logical_to_ast_expr_with_schema(pattern, schema)?);
+                let escape_expr = escape
+                    .map(|c| Box::new(ast::Expr::Literal(ast::Literal::String(c.to_string()))));
+                Ok(ast::Expr::Like {
+                    lhs,
+                    not: *negated,
+                    op: ast::LikeOperator::Like,
+                    rhs,
+                    escape: escape_expr,
+                })
+            }
+            LogicalExpr::IsNull { expr, negated } => {
+                let inner_expr = Box::new(Self::logical_to_ast_expr_with_schema(expr, schema)?);
+                if *negated {
+                    // IS NOT NULL needs to be represented differently
+                    Ok(ast::Expr::Unary(
+                        ast::UnaryOperator::Not,
+                        Box::new(ast::Expr::IsNull(inner_expr)),
+                    ))
+                } else {
+                    Ok(ast::Expr::IsNull(inner_expr))
+                }
+            }
+            LogicalExpr::Cast { expr, type_name } => {
+                let inner_expr = Box::new(Self::logical_to_ast_expr_with_schema(expr, schema)?);
+                Ok(ast::Expr::Cast {
+                    expr: inner_expr,
+                    type_name: type_name.clone(),
+                })
+            }
             _ => Err(LimboError::ParseError(format!(
                 "Cannot convert LogicalExpr to AST Expr: {expr:?}"
             ))),
@@ -1648,21 +1748,55 @@ impl DbspCompiler {
     fn predicate_needs_projection(expr: &LogicalExpr) -> bool {
         match expr {
             LogicalExpr::BinaryExpr { left, op, right } => {
+                // Only these specific simple patterns DON'T need projection
                 match (left.as_ref(), right.as_ref()) {
-                    // Simple column to literal - OK
-                    (LogicalExpr::Column(_), LogicalExpr::Literal(_)) => false,
-                    // Simple column to column - OK
-                    (LogicalExpr::Column(_), LogicalExpr::Column(_)) => false,
+                    // Simple column to literal comparisons
+                    (LogicalExpr::Column(_), LogicalExpr::Literal(_))
+                        if matches!(
+                            op,
+                            BinaryOperator::Equals
+                                | BinaryOperator::NotEquals
+                                | BinaryOperator::Greater
+                                | BinaryOperator::GreaterEquals
+                                | BinaryOperator::Less
+                                | BinaryOperator::LessEquals
+                        ) =>
+                    {
+                        false
+                    }
+
+                    // Simple column to column comparisons
+                    (LogicalExpr::Column(_), LogicalExpr::Column(_))
+                        if matches!(
+                            op,
+                            BinaryOperator::Equals
+                                | BinaryOperator::NotEquals
+                                | BinaryOperator::Greater
+                                | BinaryOperator::GreaterEquals
+                                | BinaryOperator::Less
+                                | BinaryOperator::LessEquals
+                        ) =>
+                    {
+                        false
+                    }
+
                     // AND/OR of simple expressions - check recursively
                     _ if matches!(op, BinaryOperator::And | BinaryOperator::Or) => {
                         Self::predicate_needs_projection(left)
                             || Self::predicate_needs_projection(right)
                     }
-                    // Any other pattern needs projection
+
+                    // Everything else needs projection
                     _ => true,
                 }
             }
-            _ => false,
+            // These simple cases don't need projection
+            LogicalExpr::Column(_) | LogicalExpr::Literal(_) => false,
+
+            // Default: assume we need projection for safety
+            // This includes: Between, InList, Like, IsNull, Cast, ScalarFunction, Case,
+            // InSubquery, Exists, ScalarSubquery, and any future expression types
+            _ => true,
         }
     }
 
@@ -1684,7 +1818,7 @@ impl DbspCompiler {
                     return Ok(expr.clone());
                 }
 
-                // For expressions like (age * 2) > 30, we want to extract (age * 2)
+                // For comparison expressions, check if we need to extract a subexpression
                 if matches!(
                     op,
                     BinaryOperator::Greater
@@ -1694,17 +1828,30 @@ impl DbspCompiler {
                         | BinaryOperator::Equals
                         | BinaryOperator::NotEquals
                 ) {
-                    // Return the left side if it's not a simple column
-                    if !matches!(left.as_ref(), LogicalExpr::Column(_)) {
-                        Ok((**left).clone())
-                    } else {
-                        // Must be the whole expression then
-                        Ok(expr.clone())
+                    // If the left side is complex (not a column), extract it
+                    if !matches!(
+                        left.as_ref(),
+                        LogicalExpr::Column(_) | LogicalExpr::Literal(_)
+                    ) {
+                        return Ok((**left).clone());
                     }
+                    // If the right side is complex (not a literal), extract it
+                    if !matches!(
+                        right.as_ref(),
+                        LogicalExpr::Column(_) | LogicalExpr::Literal(_)
+                    ) {
+                        return Ok((**right).clone());
+                    }
+                    // Both sides are simple but the expression as a whole might need projection
+                    // (e.g., for arithmetic operations)
+                    Ok(expr.clone())
                 } else {
+                    // For other binary operators (arithmetic, etc.), return the whole expression
                     Ok(expr.clone())
                 }
             }
+            // For non-binary expressions (BETWEEN, IN, LIKE, functions, etc.),
+            // we need to compute the whole expression as a boolean
             _ => Ok(expr.clone()),
         }
     }
@@ -1729,19 +1876,60 @@ impl DbspCompiler {
 
                 // Check if this is a complex comparison that needs replacement
                 if Self::predicate_needs_projection(expr) {
-                    // Replace the complex expression (left side) with the temp column
-                    return Ok(LogicalExpr::BinaryExpr {
-                        left: Box::new(LogicalExpr::Column(Column {
-                            name: temp_column_name.to_string(),
-                            table: None,
-                        })),
-                        op: *op,
-                        right: right.clone(),
-                    });
+                    // Determine which side is complex and needs replacement
+                    let left_is_simple = matches!(
+                        left.as_ref(),
+                        LogicalExpr::Column(_) | LogicalExpr::Literal(_)
+                    );
+                    let right_is_simple = matches!(
+                        right.as_ref(),
+                        LogicalExpr::Column(_) | LogicalExpr::Literal(_)
+                    );
+
+                    if !left_is_simple {
+                        // Left side is complex - replace it with temp column
+                        return Ok(LogicalExpr::BinaryExpr {
+                            left: Box::new(LogicalExpr::Column(Column {
+                                name: temp_column_name.to_string(),
+                                table: None,
+                            })),
+                            op: *op,
+                            right: right.clone(),
+                        });
+                    } else if !right_is_simple {
+                        // Right side is complex - replace it with temp column
+                        return Ok(LogicalExpr::BinaryExpr {
+                            left: left.clone(),
+                            op: *op,
+                            right: Box::new(LogicalExpr::Column(Column {
+                                name: temp_column_name.to_string(),
+                                table: None,
+                            })),
+                        });
+                    } else {
+                        // Both sides are simple, but the expression as a whole needs projection
+                        // This shouldn't happen normally, but keep the expression as-is
+                        return Ok(expr.clone());
+                    }
                 }
 
                 // Simple comparison - keep as is
                 Ok(expr.clone())
+            }
+            // For non-binary expressions that need projection (BETWEEN, IN, etc.),
+            // replace the whole expression with a column reference to the temp column
+            // The temp column will hold the boolean result of evaluating the expression
+            _ if Self::predicate_needs_projection(expr) => {
+                // The complex expression result is in the temp column
+                // We need to check if it's true (non-zero)
+                Ok(LogicalExpr::BinaryExpr {
+                    left: Box::new(LogicalExpr::Column(Column {
+                        name: temp_column_name.to_string(),
+                        table: None,
+                    })),
+                    op: BinaryOperator::Equals,
+                    right: Box::new(LogicalExpr::Literal(Value::Integer(1))), // true = 1 in SQL
+                })
             }
             _ => Ok(expr.clone()),
         }

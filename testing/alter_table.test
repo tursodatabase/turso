@@ -204,3 +204,10 @@ do_execsql_test_on_specific_db {:memory:} alter-table-rename-to-quoted-identifie
     "CREATE INDEX idx ON \"t t\" (\"b b\")"
     "2"
 }
+
+# https://github.com/tursodatabase/turso/issues/3391
+do_execsql_test_on_specific_db {:memory:} alter-table-add-notnull-col {
+    CREATE TABLE t (a);
+	ALTER TABLE t ADD b NOT NULL;
+	SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 't';
+} {{CREATE TABLE t (a, b NOT NULL)}}

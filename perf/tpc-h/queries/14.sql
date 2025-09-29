@@ -9,5 +9,5 @@ from
 	part
 where
 	l_partkey = p_partkey
-	and l_shipdate >= cast('1994-03-01' as datetime)
-	and l_shipdate < cast('1994-04-01' as datetime); -- modified not to include cast({'month': 1} as interval)
+	and l_shipdate >= '1994-03-01'
+	and l_shipdate < '1994-04-01'; -- modified not to include cast({'month': 1} as interval)

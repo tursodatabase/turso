@@ -1,5 +1,5 @@
 import { DatabasePromise } from "@tursodatabase/database-common"
-import { ProtocolIo, run, DatabaseOpts as SyncDatabaseOpts, RunOpts, DatabaseRowMutation, DatabaseRowStatement, DatabaseRowTransformResult, DatabaseStats, SyncEngineGuards } from "@tursodatabase/sync-common";
+import { ProtocolIo, run, DatabaseOpts, EncryptionOpts, RunOpts, DatabaseRowMutation, DatabaseRowStatement, DatabaseRowTransformResult, DatabaseStats, SyncEngineGuards } from "@tursodatabase/sync-common";
 import { SyncEngine, SyncEngineProtocolVersion } from "#index";
 import { promises } from "node:fs";
 
@@ -44,7 +44,7 @@ class Database extends DatabasePromise {
     #engine: any;
     #io: ProtocolIo;
     #guards: SyncEngineGuards
-    constructor(opts: SyncDatabaseOpts) {
+    constructor(opts: DatabaseOpts) {
         const engine = new SyncEngine({
             path: opts.path,
             clientName: opts.clientName,
@@ -58,10 +58,16 @@ class Database extends DatabasePromise {
 
         let headers = typeof opts.authToken === "function" ? () => ({
             ...(opts.authToken != null && { "Authorization": `Bearer ${(opts.authToken as any)()}` }),
-            ...(opts.encryptionKey != null && { "x-turso-encryption-key": opts.encryptionKey })
+            ...(opts.encryption != null && {
+                "x-turso-encryption-key": opts.encryption.key,
+                "x-turso-encryption-cipher": opts.encryption.cipher,
+            })
         }) : {
             ...(opts.authToken != null && { "Authorization": `Bearer ${opts.authToken}` }),
-            ...(opts.encryptionKey != null && { "x-turso-encryption-key": opts.encryptionKey })
+            ...(opts.encryption != null && {
+                "x-turso-encryption-key": opts.encryption.key,
+                "x-turso-encryption-cipher": opts.encryption.cipher,
+            })
         };
         this.#runOpts = {
             url: opts.url,
@@ -81,7 +87,7 @@ class Database extends DatabasePromise {
     }
     /**
      * pull new changes from the remote database
-     * if {@link SyncDatabaseOpts.longPollTimeoutMs} is set - then server will hold the connection open until either new changes will appear in the database or timeout occurs.
+     * if {@link DatabaseOpts.longPollTimeoutMs} is set - then server will hold the connection open until either new changes will appear in the database or timeout occurs.
      * @returns true if new changes were pulled from the remote
      */
     async pull() {
@@ -94,7 +100,7 @@ class Database extends DatabasePromise {
     }
     /**
      * push new local changes to the remote database
-     * if {@link SyncDatabaseOpts.transform} is set - then provided callback will be called for every mutation before sending it to the remote
+     * if {@link DatabaseOpts.transform} is set - then provided callback will be called for every mutation before sending it to the remote
      */
     async push() {
         await this.#guards.push(async () => await run(this.#runOpts, this.#io, this.#engine, this.#engine.push()));
@@ -125,10 +131,11 @@ class Database extends DatabasePromise {
  * @param {Object} opts - Options for database behavior.
  * @returns {Promise<Database>} - A promise that resolves to a Database instance.
  */
-async function connect(opts: SyncDatabaseOpts): Promise<Database> {
+async function connect(opts: DatabaseOpts): Promise<Database> {
     const db = new Database(opts);
     await db.connect();
     return db;
 }
 
-export { connect, Database, DatabaseRowMutation, DatabaseRowStatement, DatabaseRowTransformResult }
+export { connect, Database }
+export type { DatabaseOpts, EncryptionOpts, DatabaseRowMutation, DatabaseRowStatement, DatabaseRowTransformResult }

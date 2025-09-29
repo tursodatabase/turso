@@ -1,23 +1,30 @@
 use std::sync::Arc;
-use turso_parser::{ast, parser::Parser};
+use turso_parser::{
+    ast::{self, TableInternalId},
+    parser::Parser,
+};
 
 use crate::{
     function::{AlterTableFunc, Func},
-    schema::{Column, Schema},
+    schema::{Column, Table},
+    translate::{
+        emitter::Resolver,
+        expr::{walk_expr, WalkControl},
+        plan::{ColumnUsedMask, OuterQueryReference, TableReferences},
+    },
     util::normalize_ident,
     vdbe::{
         builder::{CursorType, ProgramBuilder},
         insn::{Cookie, Insn, RegisterOrLiteral},
     },
-    LimboError, Result, SymbolTable,
+    LimboError, Result,
 };
 
 use super::{schema::SQLITE_TABLEID, update::translate_update_for_schema_change};
 
 pub fn translate_alter_table(
     alter: ast::AlterTable,
-    syms: &SymbolTable,
-    schema: &Schema,
+    resolver: &Resolver,
     mut program: ProgramBuilder,
     connection: &Arc<crate::Connection>,
     input: &str,
@@ -34,7 +41,9 @@ pub fn translate_alter_table(
         crate::bail_parse_error!("table {} may not be modified", table_name);
     }
 
-    if schema.table_has_indexes(table_name) && !schema.indexes_enabled() {
+    let table_indexes = resolver.schema.get_indices(table_name).collect::<Vec<_>>();
+
+    if !table_indexes.is_empty() && !resolver.schema.indexes_enabled() {
         // Let's disable altering a table with indices altogether instead of checking column by
         // column to be extra safe.
         crate::bail_parse_error!(
@@ -42,14 +51,18 @@ pub fn translate_alter_table(
         );
     }
 
-    let Some(original_btree) = schema.get_table(table_name).and_then(|table| table.btree()) else {
+    let Some(original_btree) = resolver
+        .schema
+        .get_table(table_name)
+        .and_then(|table| table.btree())
+    else {
         return Err(LimboError::ParseError(format!(
             "no such table: {table_name}"
         )));
     };
 
     // Check if this table has dependent materialized views
-    let dependent_views = schema.get_dependent_materialized_views(table_name);
+    let dependent_views = resolver.schema.get_dependent_materialized_views(table_name);
     if !dependent_views.is_empty() {
         return Err(LimboError::ParseError(format!(
             "cannot alter table \"{table_name}\": it has dependent materialized view(s): {}",
@@ -76,6 +89,16 @@ pub fn translate_alter_table(
                 LimboError::ParseError(format!("no such column: \"{column_name}\""))
             })?;
 
+            // Column cannot be dropped if:
+            // The column is a PRIMARY KEY or part of one.
+            // The column has a UNIQUE constraint.
+            // The column is indexed.
+            // The column is named in the WHERE clause of a partial index.
+            // The column is named in a table or column CHECK constraint not associated with the column being dropped.
+            // The column is used in a foreign key constraint.
+            // The column is used in the expression of a generated column.
+            // The column appears in a trigger or view.
+
             if column.primary_key {
                 return Err(LimboError::ParseError(format!(
                     "cannot drop column \"{column_name}\": PRIMARY KEY"
@@ -93,6 +116,65 @@ pub fn translate_alter_table(
                     "cannot drop column \"{column_name}\": UNIQUE"
                 )));
             }
+
+            for index in table_indexes.iter() {
+                // Referenced in regular index
+                if index
+                    .columns
+                    .iter()
+                    .any(|col| col.pos_in_table == dropped_index)
+                {
+                    return Err(LimboError::ParseError(format!(
+                        "cannot drop column \"{column_name}\": indexed"
+                    )));
+                }
+                // Referenced in partial index
+                if index.where_clause.is_some() {
+                    let mut table_references = TableReferences::new(
+                        vec![],
+                        vec![OuterQueryReference {
+                            identifier: table_name.to_string(),
+                            internal_id: TableInternalId::from(0),
+                            table: Table::BTree(Arc::new(btree.clone())),
+                            col_used_mask: ColumnUsedMask::default(),
+                        }],
+                    );
+                    let where_copy = index
+                        .bind_where_expr(Some(&mut table_references), connection)
+                        .expect("where clause to exist");
+                    let mut column_referenced = false;
+                    walk_expr(
+                        &where_copy,
+                        &mut |e: &ast::Expr| -> crate::Result<WalkControl> {
+                            if let ast::Expr::Column {
+                                table,
+                                column: column_index,
+                                ..
+                            } = e
+                            {
+                                if *table == TableInternalId::from(0)
+                                    && *column_index == dropped_index
+                                {
+                                    column_referenced = true;
+                                    return Ok(WalkControl::SkipChildren);
+                                }
+                            }
+                            Ok(WalkControl::Continue)
+                        },
+                    )?;
+                    if column_referenced {
+                        return Err(LimboError::ParseError(format!(
+                            "cannot drop column \"{column_name}\": indexed"
+                        )));
+                    }
+                }
+            }
+
+            // TODO: check usage in CHECK constraint when implemented
+            // TODO: check usage in foreign key constraint when implemented
+            // TODO: check usage in generated column when implemented
+
+            // References in VIEWs are checked in the VDBE layer op_drop_column instruction.
 
             btree.columns.remove(dropped_index);
 
@@ -113,9 +195,8 @@ pub fn translate_alter_table(
             };
 
             translate_update_for_schema_change(
-                schema,
                 &mut update,
-                syms,
+                resolver,
                 program,
                 connection,
                 input,
@@ -175,7 +256,7 @@ pub fn translate_alter_table(
                     program.emit_insn(Insn::SetCookie {
                         db: 0,
                         cookie: Cookie::SchemaVersion,
-                        value: schema.schema_version as i32 + 1,
+                        value: resolver.schema.schema_version as i32 + 1,
                         p5: 0,
                     });
 
@@ -242,9 +323,8 @@ pub fn translate_alter_table(
             };
 
             translate_update_for_schema_change(
-                schema,
                 &mut update,
-                syms,
+                resolver,
                 program,
                 connection,
                 input,
@@ -252,7 +332,7 @@ pub fn translate_alter_table(
                     program.emit_insn(Insn::SetCookie {
                         db: 0,
                         cookie: Cookie::SchemaVersion,
-                        value: schema.schema_version as i32 + 1,
+                        value: resolver.schema.schema_version as i32 + 1,
                         p5: 0,
                     });
                     program.emit_insn(Insn::AddColumn {
@@ -265,8 +345,9 @@ pub fn translate_alter_table(
         ast::AlterTableBody::RenameTo(new_name) => {
             let new_name = new_name.as_str();
 
-            if schema.get_table(new_name).is_some()
-                || schema
+            if resolver.schema.get_table(new_name).is_some()
+                || resolver
+                    .schema
                     .indexes
                     .values()
                     .flatten()
@@ -277,7 +358,8 @@ pub fn translate_alter_table(
                 )));
             };
 
-            let sqlite_schema = schema
+            let sqlite_schema = resolver
+                .schema
                 .get_btree_table(SQLITE_TABLEID)
                 .expect("sqlite_schema should be on schema");
 
@@ -339,7 +421,7 @@ pub fn translate_alter_table(
             program.emit_insn(Insn::SetCookie {
                 db: 0,
                 cookie: Cookie::SchemaVersion,
-                value: schema.schema_version as i32 + 1,
+                value: resolver.schema.schema_version as i32 + 1,
                 p5: 0,
             });
 
@@ -412,7 +494,8 @@ pub fn translate_alter_table(
                 ));
             }
 
-            let sqlite_schema = schema
+            let sqlite_schema = resolver
+                .schema
                 .get_btree_table(SQLITE_TABLEID)
                 .expect("sqlite_schema should be on schema");
 
@@ -481,7 +564,7 @@ pub fn translate_alter_table(
             program.emit_insn(Insn::SetCookie {
                 db: 0,
                 cookie: Cookie::SchemaVersion,
-                value: schema.schema_version as i32 + 1,
+                value: resolver.schema.schema_version as i32 + 1,
                 p5: 0,
             });
             program.emit_insn(Insn::AlterColumn {

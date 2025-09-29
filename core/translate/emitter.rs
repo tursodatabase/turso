@@ -208,35 +208,29 @@ pub enum TransactionMode {
 #[instrument(skip_all, level = Level::DEBUG)]
 pub fn emit_program(
     connection: &Arc<Connection>,
+    resolver: &Resolver,
     program: &mut ProgramBuilder,
     plan: Plan,
-    schema: &Schema,
-    syms: &SymbolTable,
     after: impl FnOnce(&mut ProgramBuilder),
 ) -> Result<()> {
     match plan {
-        Plan::Select(plan) => emit_program_for_select(program, plan, schema, syms),
-        Plan::Delete(plan) => emit_program_for_delete(connection, program, plan, schema, syms),
-        Plan::Update(plan) => {
-            emit_program_for_update(connection, program, plan, schema, syms, after)
-        }
-        Plan::CompoundSelect { .. } => {
-            emit_program_for_compound_select(program, plan, schema, syms)
-        }
+        Plan::Select(plan) => emit_program_for_select(program, resolver, plan),
+        Plan::Delete(plan) => emit_program_for_delete(connection, resolver, program, plan),
+        Plan::Update(plan) => emit_program_for_update(connection, resolver, program, plan, after),
+        Plan::CompoundSelect { .. } => emit_program_for_compound_select(program, resolver, plan),
     }
 }
 
 #[instrument(skip_all, level = Level::DEBUG)]
 fn emit_program_for_select(
     program: &mut ProgramBuilder,
+    resolver: &Resolver,
     mut plan: SelectPlan,
-    schema: &Schema,
-    syms: &SymbolTable,
 ) -> Result<()> {
     let mut t_ctx = TranslateCtx::new(
         program,
-        schema,
-        syms,
+        resolver.schema,
+        resolver.symbol_table,
         plan.table_references.joined_tables().len(),
     );
 
@@ -419,15 +413,14 @@ pub fn emit_query<'a>(
 #[instrument(skip_all, level = Level::DEBUG)]
 fn emit_program_for_delete(
     connection: &Arc<Connection>,
+    resolver: &Resolver,
     program: &mut ProgramBuilder,
     mut plan: DeletePlan,
-    schema: &Schema,
-    syms: &SymbolTable,
 ) -> Result<()> {
     let mut t_ctx = TranslateCtx::new(
         program,
-        schema,
-        syms,
+        resolver.schema,
+        resolver.symbol_table,
         plan.table_references.joined_tables().len(),
     );
 
@@ -715,16 +708,15 @@ fn emit_delete_insns(
 #[instrument(skip_all, level = Level::DEBUG)]
 fn emit_program_for_update(
     connection: &Arc<Connection>,
+    resolver: &Resolver,
     program: &mut ProgramBuilder,
     mut plan: UpdatePlan,
-    schema: &Schema,
-    syms: &SymbolTable,
     after: impl FnOnce(&mut ProgramBuilder),
 ) -> Result<()> {
     let mut t_ctx = TranslateCtx::new(
         program,
-        schema,
-        syms,
+        resolver.schema,
+        resolver.symbol_table,
         plan.table_references.joined_tables().len(),
     );
 
@@ -759,7 +751,7 @@ fn emit_program_for_update(
             is_table: true,
         });
         program.incr_nesting();
-        emit_program_for_select(program, ephemeral_plan, schema, syms)?;
+        emit_program_for_select(program, resolver, ephemeral_plan)?;
         program.decr_nesting();
     }
 

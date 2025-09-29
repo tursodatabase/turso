@@ -30,8 +30,8 @@ where
 				where
 					l_partkey = ps_partkey
 					and l_suppkey = ps_suppkey
-					and l_shipdate >= cast('1994-01-01' as datetime)
-					and l_shipdate < cast('1995-01-01' as datetime) -- modified not to include cast({'year': 1} as interval)
+					and l_shipdate >= '1994-01-01'
+					and l_shipdate < '1995-01-01' -- modified not to include cast({'year': 1} as interval)
 			)
 	)
 	and s_nationkey = n_nationkey

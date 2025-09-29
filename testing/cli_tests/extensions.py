@@ -560,6 +560,122 @@ def test_ipaddr():
     )
     limbo.quit()
 
+def validate_fuzzy_leven(a):
+    return a == "3"
+
+def validate_fuzzy_damlev1(a):
+    return a == "2"
+
+def validate_fuzzy_damlev2(a):
+    return a == "1"
+
+def validate_fuzzy_editdist1(a):
+    return a == "225"
+
+def validate_fuzzy_editdist2(a):
+    return a == "110"
+
+def validate_fuzzy_jarowin(a):
+    return a == "0.907142857142857"
+
+def validate_fuzzy_osadist(a):
+    return a == "3"
+
+def validate_fuzzy_soundex(a):
+    return a == "A250"
+
+def validate_fuzzy_phonetic(a):
+    return a == "ABACAMA"
+
+def validate_fuzzy_caver(a):
+    return a == "AWSM111111"
+
+def validate_fuzzy_rsoundex(a):
+    return a == "A03080"
+
+def validate_fuzzy_translit1(a):
+    return a == "oh my ?"
+
+def validate_fuzzy_translit2(a):
+    return a == "privet"
+
+def validate_fuzzy_script(a):
+    return a == "160"
+
+def test_fuzzy():
+    limbo = TestTursoShell()
+    ext_path = "./target/debug/liblimbo_fuzzy"
+    limbo.run_test_fn(
+        "SELECT fuzzy_leven('awesome', 'aewsme');",
+        lambda res: "error: no such function: " in res,
+        "fuzzy levenshtein function returns null when ext not loaded",
+    )
+    limbo.execute_dot(f".load {ext_path}")
+    limbo.run_test_fn(
+        "SELECT fuzzy_leven('awesome', 'aewsme');",
+        validate_fuzzy_leven,
+        "fuzzy levenshtein function works",
+    )
+    limbo.run_test_fn(
+        "SELECT fuzzy_damlev('awesome', 'aewsme');",
+        validate_fuzzy_damlev1,
+        "fuzzy damerau levenshtein1 function works",
+    )
+    limbo.run_test_fn(
+        "SELECT fuzzy_damlev('Something', 'Smoething');",
+        validate_fuzzy_damlev2,
+        "fuzzy damerau levenshtein2 function works",
+    )
+    limbo.run_test_fn(
+        "SELECT fuzzy_editdist('abc', 'ca');",
+        validate_fuzzy_editdist1,
+        "fuzzy editdist1 function works",
+    )
+    limbo.run_test_fn(
+        "SELECT fuzzy_editdist('abc', 'acb');",
+        validate_fuzzy_editdist2,
+        "fuzzy editdist2 function works",
+    )
+    limbo.run_test_fn(
+        "SELECT fuzzy_jarowin('awesome', 'aewsme');",
+        validate_fuzzy_jarowin,
+        "fuzzy jarowin function works",
+    )
+    limbo.run_test_fn(
+        "SELECT fuzzy_osadist('awesome', 'aewsme');",
+        validate_fuzzy_osadist,
+        "fuzzy osadist function works",
+    )
+    limbo.run_test_fn(
+        "SELECT fuzzy_phonetic('awesome');",
+        validate_fuzzy_phonetic,
+        "fuzzy phonetic function works",
+    )
+    limbo.run_test_fn(
+        "SELECT fuzzy_caver('awesome');",
+        validate_fuzzy_caver,
+        "fuzzy caver function works",
+    )
+    limbo.run_test_fn(
+        "SELECT fuzzy_rsoundex('awesome');",
+        validate_fuzzy_rsoundex,
+        "fuzzy rsoundex function works",
+    )
+    limbo.run_test_fn(
+        "SELECT fuzzy_translit('oh my 😅');",
+        validate_fuzzy_translit1,
+        "fuzzy translit1 function works",
+    )
+    limbo.run_test_fn(
+        "SELECT fuzzy_translit('привет');",
+        validate_fuzzy_translit2,
+        "fuzzy translit2 function works",
+    )
+    limbo.run_test_fn(
+        "SELECT fuzzy_script('داناوانب');",
+        validate_fuzzy_script,
+        "fuzzy script function works",
+    )
 
 def test_vfs():
     limbo = TestTursoShell()
@@ -822,6 +938,7 @@ def main():
         test_kv()
         test_csv()
         test_tablestats()
+        test_fuzzy()
     except Exception as e:
         console.error(f"Test FAILED: {e}")
         cleanup()

@@ -1154,7 +1154,7 @@ pub enum ColumnConstraint {
         /// clause
         clause: ForeignKeyClause,
         /// `DEFERRABLE`
-        deref_clause: Option<DeferSubclause>,
+        defer_clause: Option<DeferSubclause>,
     },
     /// `GENERATED`
     Generated {
@@ -1206,7 +1206,7 @@ pub enum TableConstraint {
         /// `REFERENCES`
         clause: ForeignKeyClause,
         /// `DEFERRABLE`
-        deref_clause: Option<DeferSubclause>,
+        defer_clause: Option<DeferSubclause>,
     },
 }
 

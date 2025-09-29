@@ -12,6 +12,7 @@ env:
 jobs:
   bench:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v3
       - uses: useblacksmith/setup-node@v5
@@ -55,6 +56,7 @@ jobs:
 
   clickbench:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v3
       - uses: useblacksmith/setup-node@v5
@@ -102,6 +104,7 @@ jobs:
 
   tpc-h-criterion:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     env:
       DB_FILE: "perf/tpc-h/TPC-H.db"
     steps:
@@ -156,6 +159,7 @@ jobs:
 
   tpc-h:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v3
       - name: TPC-H
@@ -163,6 +167,7 @@ jobs:
 
   vfs-bench-compile:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v3
       - uses: useblacksmith/rust-cache@v3
