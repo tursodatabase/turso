@@ -1,5 +1,5 @@
 use crate::schema::{Index, IndexColumn, Schema};
-use crate::translate::emitter::{emit_query, init_limit, LimitCtx, Resolver, TranslateCtx};
+use crate::translate::emitter::{emit_query, LimitCtx, Resolver, TranslateCtx};
 use crate::translate::expr::translate_expr;
 use crate::translate::plan::{Plan, QueryDestination, SelectPlan};
 use crate::translate::result_row::try_fold_expr_to_i64;
