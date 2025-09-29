@@ -1,0 +1,194 @@
+#!/usr/bin/env tclsh
+
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+source $testdir/sqlite3/tester.tcl
+
+do_execsql_test_on_specific_db {:memory:} fk-basic-ok {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT);
+    CREATE TABLE t2 (id INTEGER PRIMARY KEY, tid REFERENCES t(id));
+    INSERT INTO t VALUES (1,'x'),(2,'y');
+    INSERT INTO t2 VALUES (10,1),(11,NULL);    -- NULL child ok
+    SELECT id,tid FROM t2 ORDER BY id;
+} {10|1
+11|}
+
+do_execsql_test_in_memory_any_error fk-insert-child-missing-parent {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT);
+    CREATE TABLE t2 (id INTEGER PRIMARY KEY, tid REFERENCES t(id));
+    INSERT INTO t2 VALUES (20,99);
+}
+
+do_execsql_test_in_memory_any_error fk-update-child-to-missing-parent {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT);
+    CREATE TABLE t2 (id INTEGER PRIMARY KEY, tid REFERENCES t(id));
+    INSERT INTO t VALUES (1,'x');
+    INSERT INTO t2 VALUES (10,1);
+    UPDATE t2 SET tid = 42 WHERE id = 10;      -- now missing
+}
+
+do_execsql_test_on_specific_db {:memory:} fk-update-child-to-null-ok {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t (id INTEGER PRIMARY KEY);
+    CREATE TABLE t2 (id INTEGER PRIMARY KEY, tid REFERENCES t(id));
+    INSERT INTO t VALUES (1);
+    INSERT INTO t2 VALUES (7,1);
+    UPDATE t2 SET tid = NULL WHERE id = 7;
+    SELECT id, tid FROM t2;
+} {7|}
+
+do_execsql_test_in_memory_any_error fk-delete-parent-blocked {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT);
+    CREATE TABLE t2 (id INTEGER PRIMARY KEY, tid REFERENCES t(id));
+    INSERT INTO t VALUES (1,'x'),(2,'y');
+    INSERT INTO t2 VALUES (10,2);
+    DELETE FROM t WHERE id=2;
+}
+
+do_execsql_test_on_specific_db {:memory:} fk-delete-parent-ok-when-no-child {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT);
+    CREATE TABLE t2 (id INTEGER PRIMARY KEY, tid REFERENCES t(id));
+    INSERT INTO t VALUES (1,'x'),(2,'y');
+    INSERT INTO t2 VALUES (10,1);
+    DELETE FROM t WHERE id=2;
+    SELECT id FROM t ORDER BY id;
+} {1}
+
+
+do_execsql_test_on_specific_db {:memory:} fk-composite-pk-ok {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(
+      a INT NOT NULL,
+      b INT NOT NULL,
+      PRIMARY KEY(a,b)
+    );
+    CREATE TABLE c(
+      id INT PRIMARY KEY,
+      x INT, y INT,
+      FOREIGN KEY(x,y) REFERENCES p(a,b)
+    );
+    INSERT INTO p VALUES (1,1),(1,2);
+    INSERT INTO c VALUES (10,1,1),(11,1,2),(12,NULL,2);  -- NULL in child allowed
+    SELECT id,x,y FROM c ORDER BY id;
+} {10|1|1
+11|1|2
+12||2}
+
+do_execsql_test_in_memory_any_error fk-composite-pk-missing {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(
+      a INT NOT NULL,
+      b INT NOT NULL,
+      PRIMARY KEY(a,b)
+    );
+    CREATE TABLE c(
+      id INT PRIMARY KEY,
+      x INT, y INT,
+      FOREIGN KEY(x,y) REFERENCES p(a,b)
+    );
+    INSERT INTO p VALUES (1,1);
+    INSERT INTO c VALUES (20,1,2);             -- (1,2) missing
+}
+
+do_execsql_test_in_memory_any_error fk-composite-update-child-missing {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(a INT NOT NULL, b INT NOT NULL, PRIMARY KEY(a,b));
+    CREATE TABLE c(id INT PRIMARY KEY, x INT, y INT,
+                   FOREIGN KEY(x,y) REFERENCES p(a,b));
+    INSERT INTO p VALUES (1,1),(2,2);
+    INSERT INTO c VALUES (5,1,1);
+    UPDATE c SET x=2,y=3 WHERE id=5;
+}
+
+do_execsql_test_on_specific_db {:memory:} fk-composite-unique-ok {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(u TEXT, v TEXT, pad INT, UNIQUE(u,v));
+    CREATE TABLE child(id INT PRIMARY KEY, cu TEXT, cv TEXT,
+                       FOREIGN KEY(cu,cv) REFERENCES parent(u,v));
+    INSERT INTO parent VALUES ('A','B',0),('A','C',0);
+    INSERT INTO child  VALUES (1,'A','B');
+    SELECT id, cu, cv FROM child ORDER BY id;
+} {1|A|B}
+
+do_execsql_test_in_memory_any_error fk-composite-unique-missing {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(u TEXT, v TEXT, pad INT, UNIQUE(u,v));
+    CREATE TABLE child(id INT PRIMARY KEY, cu TEXT, cv TEXT,
+                       FOREIGN KEY(cu,cv) REFERENCES parent(u,v));
+    INSERT INTO parent VALUES ('A','B',0);
+    INSERT INTO child  VALUES (2,'A','X');     -- no ('A','X') in parent
+}
+
+do_execsql_test_on_specific_db {:memory:} fk-rowid-alias-parent-ok {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT);
+    CREATE TABLE c(cid INTEGER PRIMARY KEY, rid REFERENCES t(rowid));
+    INSERT INTO t VALUES (100,'x');
+    INSERT INTO c VALUES (1, 100);
+    SELECT cid, rid FROM c;
+} {1|100}
+
+do_execsql_test_in_memory_any_error fk-rowid-alias-parent-missing {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT);
+    CREATE TABLE c(cid INTEGER PRIMARY KEY, rid REFERENCES t(rowid));
+    INSERT INTO c VALUES (1, 9999);
+}
+
+do_execsql_test_on_specific_db {:memory:} fk-update-child-noop-ok {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid REFERENCES p(id));
+    INSERT INTO p VALUES (1);
+    INSERT INTO c VALUES (10,1);
+    UPDATE c SET id = id WHERE id = 10;        -- no FK column touched
+    SELECT id, pid FROM c;
+} {10|1}
+
+do_execsql_test_in_memory_any_error fk-delete-parent-composite-scan {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(a INT NOT NULL, b INT NOT NULL, PRIMARY KEY(a,b));
+    CREATE TABLE c(id INT PRIMARY KEY, x INT, y INT,
+                   FOREIGN KEY(x,y) REFERENCES p(a,b));
+    INSERT INTO p VALUES (1,2),(2,3);
+    INSERT INTO c VALUES (7,2,3);
+    DELETE FROM p WHERE a=2 AND b=3;
+}
+
+do_execsql_test_on_specific_db {:memory:} fk-update-child-to-existing-ok {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY);
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, tid REFERENCES t(id));
+    INSERT INTO t VALUES (1),(2);
+    INSERT INTO t2 VALUES (9,1);
+    UPDATE t2 SET tid = 2 WHERE id = 9;
+    SELECT id, tid FROM t2;
+} {9|2}
+
+do_execsql_test_on_specific_db {:memory:} fk-composite-pk-delete-ok {
+  PRAGMA foreign_keys=ON;
+  CREATE TABLE p(a INT NOT NULL, b INT NOT NULL, PRIMARY KEY(a,b));
+  CREATE TABLE c(id INT PRIMARY KEY, x INT, y INT,
+                 FOREIGN KEY(x,y) REFERENCES p(a,b));
+  INSERT INTO p VALUES (1,2),(2,3);
+  INSERT INTO c VALUES (7,2,3);
+  -- Deleting a non-referenced parent tuple is OK
+  DELETE FROM p WHERE a=1 AND b=2;
+  SELECT a,b FROM p ORDER BY a,b;
+} {2|3}
+
+do_execsql_test_in_memory_any_error fk-composite-pk-delete-violate {
+  PRAGMA foreign_keys=ON;
+  CREATE TABLE p(a INT NOT NULL, b INT NOT NULL, PRIMARY KEY(a,b));
+  CREATE TABLE c(id INT PRIMARY KEY, x INT, y INT,
+                 FOREIGN KEY(x,y) REFERENCES p(a,b));
+  INSERT INTO p VALUES (2,3);
+  INSERT INTO c VALUES (7,2,3);
+  -- Deleting the referenced tuple should fail
+  DELETE FROM p WHERE a=2 AND b=3;
+}
