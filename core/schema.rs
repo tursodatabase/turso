@@ -950,7 +950,7 @@ impl Schema {
             .get_btree_table(&target)
             .expect("incoming_fks_to: parent table must exist");
 
-        // Precompute helper to find parent unique index (if not rowid)
+        // Precompute helper to find parent unique index, if it's not the rowid
         let find_parent_unique = |cols: &Vec<String>| -> Option<Arc<Index>> {
             // If matches PK exactly, we don't need a secondary index probe
             let matches_pk = !parent_tbl.primary_key_columns.is_empty()
@@ -962,7 +962,7 @@ impl Schema {
                     .all(|((n, _ord), c)| n.eq_ignore_ascii_case(c));
 
             if matches_pk {
-                return None; // parent lookup will be by rowid or table probe
+                return None;
             }
 
             self.get_indices(&parent_tbl.name)
@@ -1039,8 +1039,8 @@ impl Schema {
                             })
                             .unwrap_or_else(|| {
                                 panic!(
-                                    "incoming_fks_to: parent col {}.{} missing",
-                                    parent_tbl.name, cname
+                                    "incoming_fks_to: parent col {}.{cname} missing",
+                                    parent_tbl.name
                                 )
                             })
                     })
@@ -1062,10 +1062,7 @@ impl Schema {
                 let parent_unique_index = if parent_uses_rowid {
                     None
                 } else {
-                    Some(
-                        find_parent_unique(&parent_cols)
-                            .expect("incoming_fks_to: validated parent uniqueness must resolve"),
-                    )
+                    find_parent_unique(&parent_cols)
                 };
 
                 out.push(IncomingFkRef {
@@ -1835,7 +1832,7 @@ pub struct ForeignKey {
 }
 
 /// A single foreign key where `parent_table == target`.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct IncomingFkRef {
     /// Child table that owns the FK.
     pub child_table: Arc<BTreeTable>,
