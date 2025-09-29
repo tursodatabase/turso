@@ -123,6 +123,7 @@ pub struct ProgramBuilder {
     /// Current parent explain address, if any.
     current_parent_explain_idx: Option<usize>,
     pub param_ctx: ParamState,
+    pub(crate) reg_result_cols_start: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -209,6 +210,7 @@ impl ProgramBuilder {
             query_mode,
             current_parent_explain_idx: None,
             param_ctx: ParamState::default(),
+            reg_result_cols_start: None,
         }
     }
 

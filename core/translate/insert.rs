@@ -332,7 +332,7 @@ pub fn translate_insert(
                     };
 
                     program.emit_insn(Insn::MakeRecord {
-                        start_reg: yield_reg + 1,
+                        start_reg: program.reg_result_cols_start.unwrap_or(yield_reg + 1),
                         count: result.num_result_cols,
                         dest_reg: record_reg,
                         index_name: None,
@@ -434,10 +434,13 @@ pub fn translate_insert(
     let conflict_rowid_reg = program.alloc_register();
 
     if inserting_multiple_rows {
+        let select_result_start_reg = program
+            .reg_result_cols_start
+            .unwrap_or(yield_reg_opt.unwrap() + 1);
         translate_rows_multiple(
             &mut program,
             &insertion,
-            yield_reg_opt.unwrap() + 1,
+            select_result_start_reg,
             resolver,
             &temp_table_ctx,
         )?;

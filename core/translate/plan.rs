@@ -719,8 +719,16 @@ impl TableReferences {
     }
 
     pub fn contains_table(&self, table: &Table) -> bool {
-        self.joined_tables.iter().any(|t| t.table == *table)
-            || self.outer_query_refs.iter().any(|t| t.table == *table)
+        self.joined_tables
+            .iter()
+            .map(|t| &t.table)
+            .chain(self.outer_query_refs.iter().map(|t| &t.table))
+            .any(|t| match t {
+                Table::FromClauseSubquery(subquery_table) => {
+                    subquery_table.plan.table_references.contains_table(table)
+                }
+                _ => t == table,
+            })
     }
 
     pub fn extend(&mut self, other: TableReferences) {
