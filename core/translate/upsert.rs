@@ -274,7 +274,7 @@ pub fn upsert_matches_index(upsert: &Upsert, index: &Index, table: &Table) -> bo
     idx_cols.is_empty()
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum ResolvedUpsertTarget {
     // ON CONFLICT DO
     CatchAll,
