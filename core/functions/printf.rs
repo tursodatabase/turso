@@ -66,10 +66,10 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
                 }
                 let value = &values[args_index].get_value();
                 match value {
-                    Value::Integer(i) => result.push_str(&format!("{i}")),
+                    Value::Integer(i) => result.push_str(&i.to_string()),
                     Value::Float(f) => {
                         let truncated_val = *f as i64;
-                        result.push_str(&format!("{truncated_val}"));
+                        result.push_str(&truncated_val.to_string());
                     }
                     _ => result.push('0'),
                 }
