@@ -79,7 +79,7 @@ pub struct CheckpointStateMachine<Clock: LogicalClock> {
     /// State machine for deleting rows from the B-tree
     delete_row_state_machine: Option<StateMachine<DeleteRowStateMachine>>,
     /// Cursors for the B-trees
-    cursors: HashMap<u64, Arc<RwLock<BTreeCursor>>>,
+    cursors: HashMap<i64, Arc<RwLock<BTreeCursor>>>,
     /// Result of the checkpoint
     checkpoint_result: Option<CheckpointResult>,
 }
@@ -88,8 +88,8 @@ pub struct CheckpointStateMachine<Clock: LogicalClock> {
 /// Special writes for CREATE TABLE / DROP TABLE ops.
 /// These are used to create/destroy B-trees during pager ops.
 pub enum SpecialWrite {
-    BTreeCreate { root_page: u64 },
-    BTreeDestroy { root_page: u64, num_columns: usize },
+    BTreeCreate { root_page: i64 },
+    BTreeDestroy { root_page: i64, num_columns: usize },
 }
 
 impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
@@ -167,7 +167,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                                 record_cursor.get_value(&row_data, 3)
                             );
                         };
-                        root_page as u64
+                        root_page
                     };
 
                     max_timestamp = max_timestamp.max(current_version_ts);
@@ -315,10 +315,11 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 if let Some(special_write) = special_write {
                     match special_write {
                         SpecialWrite::BTreeCreate { root_page } => {
-                            let created_root_page = self.pager.io.block(|| {
-                                self.pager.btree_create(&CreateBTreeFlags::new_table())
-                            })?;
-                            assert_eq!(created_root_page as u64, root_page, "Created root page does not match expected root page: {created_root_page} != {root_page}");
+                            let created_root_page =
+                                self.pager.io.block(|| {
+                                    self.pager.btree_create(&CreateBTreeFlags::new_table())
+                                })? as i64;
+                            assert_eq!(created_root_page , root_page, "Created root page does not match expected root page: {created_root_page} != {root_page}");
                         }
                         SpecialWrite::BTreeDestroy {
                             root_page,
@@ -330,7 +331,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                                 let cursor = BTreeCursor::new_table(
                                     None,
                                     self.pager.clone(),
-                                    root_page as usize,
+                                    root_page,
                                     num_columns,
                                 );
                                 let cursor = Arc::new(RwLock::new(cursor));
@@ -350,7 +351,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                     let cursor = BTreeCursor::new_table(
                         None, // Write directly to B-tree
                         self.pager.clone(),
-                        table_id as usize,
+                        table_id,
                         num_columns,
                     );
                     let cursor = Arc::new(RwLock::new(cursor));

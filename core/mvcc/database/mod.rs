@@ -42,12 +42,12 @@ pub mod tests;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RowID {
     /// The table ID. Analogous to table's root page number.
-    pub table_id: u64,
+    pub table_id: i64,
     pub row_id: i64,
 }
 
 impl RowID {
-    pub fn new(table_id: u64, row_id: i64) -> Self {
+    pub fn new(table_id: i64, row_id: i64) -> Self {
         Self { table_id, row_id }
     }
 }
@@ -831,7 +831,7 @@ pub struct MvStore<Clock: LogicalClock> {
     next_table_id: AtomicU64,
     clock: Clock,
     storage: Storage,
-    loaded_tables: RwLock<HashSet<u64>>,
+    loaded_tables: RwLock<HashSet<i64>>,
 
     /// The transaction ID of a transaction that has acquired an exclusive write lock, if any.
     ///
@@ -1060,7 +1060,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
     pub fn get_row_id_range(
         &self,
-        table_id: u64,
+        table_id: i64,
         start: i64,
         bucket: &mut Vec<RowID>,
         max_items: u64,
@@ -1090,7 +1090,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
     pub fn get_next_row_id_for_table(
         &self,
-        table_id: u64,
+        table_id: i64,
         start: i64,
         tx_id: TxID,
     ) -> Option<RowID> {
@@ -1644,7 +1644,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     ///
     /// # Arguments
     ///
-    pub fn maybe_initialize_table(&self, table_id: u64, pager: Arc<Pager>) -> Result<()> {
+    pub fn maybe_initialize_table(&self, table_id: i64, pager: Arc<Pager>) -> Result<()> {
         tracing::trace!("scan_row_ids_for_table(table_id={})", table_id);
 
         // First, check if the table is already loaded.
@@ -1661,15 +1661,15 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     }
 
     // Mark table as loaded
-    pub fn mark_table_as_loaded(&self, table_id: u64) {
+    pub fn mark_table_as_loaded(&self, table_id: i64) {
         self.loaded_tables.write().insert(table_id);
     }
 
     /// Scans the table and inserts the rows into the database.
     ///
     /// This is initialization step for a table, where we still don't have any rows so we need to insert them if there are.
-    fn scan_load_table(&self, table_id: u64, pager: Arc<Pager>) -> Result<()> {
-        let root_page = table_id as usize;
+    fn scan_load_table(&self, table_id: i64, pager: Arc<Pager>) -> Result<()> {
+        let root_page = table_id;
         let mut cursor = BTreeCursor::new_table(
             None, // No MVCC cursor for scanning
             pager.clone(),
@@ -1741,7 +1741,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         Ok(())
     }
 
-    pub fn get_last_rowid(&self, table_id: u64) -> Option<i64> {
+    pub fn get_last_rowid(&self, table_id: i64) -> Option<i64> {
         let last_rowid = self
             .rows
             .upper_bound(Bound::Included(&RowID {

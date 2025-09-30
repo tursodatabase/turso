@@ -20,7 +20,7 @@ enum CursorPosition {
 pub struct MvccLazyCursor<Clock: LogicalClock> {
     pub db: Arc<MvStore<Clock>>,
     current_pos: CursorPosition,
-    table_id: u64,
+    table_id: i64,
     tx_id: u64,
 }
 
@@ -28,7 +28,7 @@ impl<Clock: LogicalClock> MvccLazyCursor<Clock> {
     pub fn new(
         db: Arc<MvStore<Clock>>,
         tx_id: u64,
-        table_id: u64,
+        table_id: i64,
         pager: Arc<Pager>,
     ) -> Result<MvccLazyCursor<Clock>> {
         db.maybe_initialize_table(table_id, pager)?;

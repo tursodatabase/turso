@@ -125,7 +125,7 @@ pub fn translate_create_materialized_view(
     let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
     program.emit_insn(Insn::OpenWrite {
         cursor_id: sqlite_schema_cursor_id,
-        root_page: 1usize.into(),
+        root_page: 1i64.into(),
         db: 0,
     });
 
@@ -262,7 +262,7 @@ pub fn translate_create_view(
     let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
     program.emit_insn(Insn::OpenWrite {
         cursor_id: sqlite_schema_cursor_id,
-        root_page: 1usize.into(),
+        root_page: 1i64.into(),
         db: 0,
     });
 
@@ -343,7 +343,7 @@ pub fn translate_drop_view(
         program.alloc_cursor_id(CursorType::BTreeTable(schema_table.clone()));
     program.emit_insn(Insn::OpenWrite {
         cursor_id: sqlite_schema_cursor_id,
-        root_page: 1usize.into(),
+        root_page: 1i64.into(),
         db: 0,
     });
 

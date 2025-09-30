@@ -103,7 +103,7 @@ impl MvccTestDbNoConn {
     }
 }
 
-pub(crate) fn generate_simple_string_row(table_id: u64, id: i64, data: &str) -> Row {
+pub(crate) fn generate_simple_string_row(table_id: i64, id: i64, data: &str) -> Row {
     let record = ImmutableRecord::from_values(&[Value::Text(Text::new(data))], 1);
     Row {
         id: RowID {

@@ -164,7 +164,7 @@ impl BranchOffset {
 
 pub type CursorID = usize;
 
-pub type PageIdx = usize;
+pub type PageIdx = i64;
 
 // Index of insn in list of insns
 type InsnReference = u32;

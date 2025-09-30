@@ -208,7 +208,7 @@ pub enum ExecuteState {
     /// Processing multiple inputs (for recursive node processing)
     ProcessingInputs {
         /// Collection of (node_id, state) pairs to process
-        input_states: Vec<(usize, ExecuteState)>,
+        input_states: Vec<(i64, ExecuteState)>,
         /// Current index being processed
         current_index: usize,
         /// Collected deltas from processed inputs
@@ -320,11 +320,11 @@ pub enum DbspExpr {
 /// A node in the DBSP circuit DAG
 pub struct DbspNode {
     /// Unique identifier for this node
-    pub id: usize,
+    pub id: i64,
     /// The operator metadata
     pub operator: DbspOperator,
     /// Input nodes (edges in the DAG)
-    pub inputs: Vec<usize>,
+    pub inputs: Vec<i64>,
     /// The actual executable operator
     pub executable: Box<dyn IncrementalOperator>,
 }
@@ -376,11 +376,11 @@ pub const DBSP_CIRCUIT_VERSION: u32 = 1;
 #[derive(Debug)]
 pub struct DbspCircuit {
     /// All nodes in the circuit, indexed by their ID
-    pub(super) nodes: HashMap<usize, DbspNode>,
+    pub(super) nodes: HashMap<i64, DbspNode>,
     /// Counter for generating unique node IDs
-    next_id: usize,
+    next_id: i64,
     /// Root node ID (the final output)
-    pub(super) root: Option<usize>,
+    pub(super) root: Option<i64>,
     /// Output schema of the circuit (schema of the root node)
     pub(super) output_schema: SchemaRef,
 
@@ -388,20 +388,20 @@ pub struct DbspCircuit {
     commit_state: CommitState,
 
     /// Root page for the main materialized view data
-    pub(super) main_data_root: usize,
+    pub(super) main_data_root: i64,
     /// Root page for internal DBSP state table
-    pub(super) internal_state_root: usize,
+    pub(super) internal_state_root: i64,
     /// Root page for the DBSP state table's primary key index
-    pub(super) internal_state_index_root: usize,
+    pub(super) internal_state_index_root: i64,
 }
 
 impl DbspCircuit {
     /// Create a new empty circuit with initial empty schema
     /// The actual output schema will be set when the root node is established
     pub fn new(
-        main_data_root: usize,
-        internal_state_root: usize,
-        internal_state_index_root: usize,
+        main_data_root: i64,
+        internal_state_root: i64,
+        internal_state_index_root: i64,
     ) -> Self {
         // Start with an empty schema - will be updated when root is set
         let empty_schema = Arc::new(LogicalSchema::new(vec![]));
@@ -418,7 +418,7 @@ impl DbspCircuit {
     }
 
     /// Set the root node and update the output schema
-    fn set_root(&mut self, root_id: usize, schema: SchemaRef) {
+    fn set_root(&mut self, root_id: i64, schema: SchemaRef) {
         self.root = Some(root_id);
         self.output_schema = schema;
     }
@@ -428,9 +428,9 @@ impl DbspCircuit {
     fn add_node(
         &mut self,
         operator: DbspOperator,
-        inputs: Vec<usize>,
+        inputs: Vec<i64>,
         executable: Box<dyn IncrementalOperator>,
-    ) -> usize {
+    ) -> i64 {
         let id = self.next_id;
         self.next_id += 1;
 
@@ -655,7 +655,7 @@ impl DbspCircuit {
     /// Execute a specific node in the circuit
     fn execute_node(
         &mut self,
-        node_id: usize,
+        node_id: i64,
         pager: Arc<Pager>,
         execute_state: &mut ExecuteState,
         commit_operators: bool,
@@ -688,7 +688,7 @@ impl DbspCircuit {
                             let input_data = std::mem::take(input_data);
                             let input_node_ids = node.inputs.clone();
 
-                            let input_states: Vec<(usize, ExecuteState)> = input_node_ids
+                            let input_states: Vec<(i64, ExecuteState)> = input_node_ids
                                 .iter()
                                 .map(|&input_id| {
                                     (
@@ -783,7 +783,7 @@ impl Display for DbspCircuit {
 }
 
 impl DbspCircuit {
-    fn fmt_node(&self, f: &mut Formatter, node_id: usize, depth: usize) -> fmt::Result {
+    fn fmt_node(&self, f: &mut Formatter, node_id: i64, depth: usize) -> fmt::Result {
         let indent = "  ".repeat(depth);
         if let Some(node) = self.nodes.get(&node_id) {
             match &node.operator {
@@ -838,9 +838,9 @@ pub struct DbspCompiler {
 impl DbspCompiler {
     /// Create a new DBSP compiler
     pub fn new(
-        main_data_root: usize,
-        internal_state_root: usize,
-        internal_state_index_root: usize,
+        main_data_root: i64,
+        internal_state_root: i64,
+        internal_state_index_root: i64,
     ) -> Self {
         Self {
             circuit: DbspCircuit::new(
@@ -916,7 +916,7 @@ impl DbspCompiler {
     }
 
     /// Recursively compile a logical plan node
-    fn compile_plan(&mut self, plan: &LogicalPlan) -> Result<usize> {
+    fn compile_plan(&mut self, plan: &LogicalPlan) -> Result<i64> {
         match plan {
             LogicalPlan::Projection(proj) => {
                 // Compile the input first
@@ -1452,7 +1452,7 @@ impl DbspCompiler {
     }
 
     /// Compile a UNION operator
-    fn compile_union(&mut self, union: &crate::translate::logical::Union) -> Result<usize> {
+    fn compile_union(&mut self, union: &crate::translate::logical::Union) -> Result<i64> {
         if union.inputs.len() != 2 {
             return Err(LimboError::ParseError(format!(
                 "UNION requires exactly 2 inputs, got {}",
@@ -2532,7 +2532,7 @@ mod tests {
         }};
     }
 
-    fn setup_btree_for_circuit() -> (Arc<Pager>, usize, usize, usize) {
+    fn setup_btree_for_circuit() -> (Arc<Pager>, i64, i64, i64) {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db = Database::open_file(io.clone(), ":memory:", false, false).unwrap();
         let conn = db.connect().unwrap();
@@ -2543,17 +2543,17 @@ mod tests {
         let main_root_page = pager
             .io
             .block(|| pager.btree_create(&CreateBTreeFlags::new_table()))
-            .unwrap() as usize;
+            .unwrap() as i64;
 
         let dbsp_state_page = pager
             .io
             .block(|| pager.btree_create(&CreateBTreeFlags::new_table()))
-            .unwrap() as usize;
+            .unwrap() as i64;
 
         let dbsp_state_index_page = pager
             .io
             .block(|| pager.btree_create(&CreateBTreeFlags::new_index()))
-            .unwrap() as usize;
+            .unwrap() as i64;
 
         (
             pager,
