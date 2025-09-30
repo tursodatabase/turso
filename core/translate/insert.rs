@@ -23,7 +23,7 @@ use crate::translate::upsert::{
 };
 use crate::util::normalize_ident;
 use crate::vdbe::builder::ProgramBuilderOpts;
-use crate::vdbe::insn::{CmpInsFlags, IdxInsertFlags, InsertFlags, RegisterOrLiteral};
+use crate::vdbe::insn::{IdxInsertFlags, InsertFlags, RegisterOrLiteral};
 use crate::vdbe::BranchOffset;
 use crate::{
     schema::{Column, Schema},
@@ -137,7 +137,7 @@ pub fn translate_insert(
     let root_page = btree_table.root_page;
 
     let mut values: Option<Vec<Box<Expr>>> = None;
-    let mut upsert_actions: Vec<(ResolvedUpsertTarget, Box<Upsert>)> = Vec::new();
+    let mut upsert_actions: Vec<(ResolvedUpsertTarget, BranchOffset, Box<Upsert>)> = Vec::new();
     let upsert_matched_idx_reg = program.alloc_register();
 
     let mut inserting_multiple_rows = false;
@@ -210,6 +210,7 @@ pub fn translate_insert(
             upsert_actions.push((
                 // resolve the constrained target for UPSERT in the chain
                 resolve_upsert_target(resolver.schema, &table, &upsert)?,
+                program.allocate_label(),
                 upsert,
             ));
             *upsert_opt = next;
@@ -432,7 +433,6 @@ pub fn translate_insert(
 
     let insertion = build_insertion(&mut program, &table, &columns, num_values)?;
 
-    let upsert_entry = program.allocate_label();
     let conflict_rowid_reg = program.alloc_register();
 
     if inserting_multiple_rows {
@@ -641,7 +641,7 @@ pub fn translate_insert(
         // Conflict on rowid: attempt to route through UPSERT if it targets the PK, otherwise raise constraint.
         // emit Halt for every case *except* when upsert handles the conflict
         'emit_halt: {
-            for (i, (target, _)) in upsert_actions.iter().enumerate() {
+            for (i, (target, label, _)) in upsert_actions.iter().enumerate() {
                 match target {
                     ResolvedUpsertTarget::CatchAll | ResolvedUpsertTarget::PrimaryKey => {
                         program.emit_int(i as i64, upsert_matched_idx_reg);
@@ -651,9 +651,7 @@ pub fn translate_insert(
                             dst_reg: conflict_rowid_reg,
                             extra_amount: 0,
                         });
-                        program.emit_insn(Insn::Goto {
-                            target_pc: upsert_entry,
-                        });
+                        program.emit_insn(Insn::Goto { target_pc: *label });
                         break 'emit_halt;
                     }
                     _ => {}
@@ -779,7 +777,7 @@ pub fn translate_insert(
                 });
 
                 // Conflict detected, figure out if this UPSERT handles the conflict
-                for (i, (target, upsert)) in upsert_actions.iter().enumerate() {
+                for (i, (target, label, upsert)) in upsert_actions.iter().enumerate() {
                     match target {
                         ResolvedUpsertTarget::CatchAll => {}
                         ResolvedUpsertTarget::Index(tgt) if Arc::ptr_eq(tgt, index) => {}
@@ -799,9 +797,7 @@ pub fn translate_insert(
                                 cursor_id: idx_cursor_id,
                                 dest: conflict_rowid_reg,
                             });
-                            program.emit_insn(Insn::Goto {
-                                target_pc: upsert_entry,
-                            });
+                            program.emit_insn(Insn::Goto { target_pc: *label });
                         }
                     }
                     break;
@@ -1081,10 +1077,7 @@ pub fn translate_insert(
         target_pc: row_done_label,
     });
 
-    let mut upsert_action_labels = Vec::new();
-    for (_, mut upsert) in upsert_actions {
-        let label = program.allocate_label();
-        upsert_action_labels.push(label);
+    for (_, label, mut upsert) in upsert_actions {
         program.preassign_label_to_next_insn(label);
 
         if let UpsertDo::Set {
@@ -1115,24 +1108,6 @@ pub fn translate_insert(
                 target_pc: row_done_label,
             });
         }
-    }
-
-    // Normal INSERT path is done above
-    // Any conflict routed to UPSERT jumps past all that to here:
-    program.preassign_label_to_next_insn(upsert_entry);
-
-    for (i, label) in upsert_action_labels.iter().enumerate() {
-        let upsert_action_id = program.alloc_register();
-        program.emit_int(i as i64, upsert_action_id);
-        program.mark_last_insn_constant();
-
-        program.emit_insn(Insn::Eq {
-            lhs: upsert_matched_idx_reg,
-            rhs: upsert_action_id,
-            target_pc: *label,
-            flags: CmpInsFlags::default(),
-            collation: None,
-        });
     }
 
     if inserting_multiple_rows {
