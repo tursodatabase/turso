@@ -672,12 +672,12 @@ mod tests {
 
     #[test]
     pub fn partial_index_mutation_and_upsert_fuzz() {
-        index_mutation_upsert_fuzz(1.0, 1);
+        index_mutation_upsert_fuzz(1.0, 4);
     }
 
     #[test]
     pub fn simple_index_mutation_and_upsert_fuzz() {
-        index_mutation_upsert_fuzz(0.0, 0);
+        index_mutation_upsert_fuzz(0.0, 4);
     }
 
     fn index_mutation_upsert_fuzz(partial_index_prob: f64, conflict_chain_max_len: u32) {
