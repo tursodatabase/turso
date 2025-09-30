@@ -741,7 +741,7 @@ mod tests {
 
             // Mutations
             for _ in 0..INNER_ITERS {
-                let action = rng.random_range(0..6);
+                let action = rng.random_range(0..8);
                 let stmt = match action {
                     // Parent INSERT
                     0 => {
@@ -808,6 +808,56 @@ mod tests {
                         } else {
                             let new_y = rng.random_range(-10..=10);
                             format!("UPDATE c SET y={new_y} WHERE id={pick}")
+                        }
+                    }
+                    5 => {
+                        // UPSERT parent
+                        let pick = rng.random_range(1..=250);
+                        if rng.random_bool(0.5) {
+                            let a = rng.random_range(-5..=25);
+                            let b = rng.random_range(-5..=25);
+                            format!(
+                                "INSERT INTO p VALUES({pick}, {a}, {b}) \
+                             ON CONFLICT(id) DO UPDATE SET a=excluded.a, b=excluded.b"
+                            )
+                        } else {
+                            let a = rng.random_range(-5..=25);
+                            let b = rng.random_range(-5..=25);
+                            format!(
+                                "INSERT INTO p VALUES({pick}, {a}, {b}) \
+                             ON CONFLICT(id) DO NOTHING"
+                            )
+                        }
+                    }
+                    6 => {
+                        // UPSERT child
+                        let pick = rng.random_range(1000..=2000);
+                        if rng.random_bool(0.5) {
+                            let x = if rng.random_bool(0.7) {
+                                if let Some(p) = used_ids.iter().choose(&mut rng) {
+                                    *p
+                                } else {
+                                    rng.random_range(1..=260) as i64
+                                }
+                            } else {
+                                rng.random_range(1..=260) as i64
+                            };
+                            format!(
+                                "INSERT INTO c VALUES({pick}, {x}, 0) ON CONFLICT(id) DO UPDATE SET x=excluded.x"
+                            )
+                        } else {
+                            let x = if rng.random_bool(0.7) {
+                                if let Some(p) = used_ids.iter().choose(&mut rng) {
+                                    *p
+                                } else {
+                                    rng.random_range(1..=260) as i64
+                                }
+                            } else {
+                                rng.random_range(1..=260) as i64
+                            };
+                            format!(
+                                "INSERT INTO c VALUES({pick}, {x}, 0) ON CONFLICT(id) DO NOTHING"
+                            )
                         }
                     }
                     // Child DELETE
@@ -960,7 +1010,7 @@ mod tests {
             }
 
             for _ in 0..INNER_ITERS {
-                let op = rng.random_range(0..6);
+                let op = rng.random_range(0..7);
                 let stmt = log_and_exec(&match op {
                     // INSERT parent
                     0 => {
@@ -1003,6 +1053,37 @@ mod tests {
                             (rng.random_range(-4..=8), rng.random_range(-4..=8))
                         };
                         format!("UPDATE c SET x={x}, y={y} WHERE id={id}")
+                    }
+                    5 => {
+                        // UPSERT parent
+                        if rng.random_bool(0.5) {
+                            let a = rng.random_range(-4..=8);
+                            let b = rng.random_range(-4..=8);
+                            let v = rng.random_range(0..=20);
+                            format!(
+                                "INSERT INTO p VALUES({a},{b},{v}) ON CONFLICT(a,b) DO UPDATE SET v=excluded.v"
+                            )
+                        } else {
+                            let a = rng.random_range(-4..=8);
+                            let b = rng.random_range(-4..=8);
+                            format!(
+                                "INSERT INTO p VALUES({a},{b},{}) ON CONFLICT(a,b) DO NOTHING",
+                                rng.random_range(0..=20)
+                            )
+                        }
+                    }
+                    6 => {
+                        // UPSERT child
+                        let id = rng.random_range(5000..=7000);
+                        let (x, y) = if rng.random_bool(0.7) {
+                            *pairs.choose(&mut rng).unwrap_or(&(0, 0))
+                        } else {
+                            (rng.random_range(-4..=8), rng.random_range(-4..=8))
+                        };
+                        format!(
+                            "INSERT INTO c VALUES({id},{x},{y},{}) ON CONFLICT(id) DO UPDATE SET x=excluded.x, y=excluded.y",
+                            rng.random_range(-10..=10)
+                        )
                     }
                     // DELETE child
                     _ => {
