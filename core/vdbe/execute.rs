@@ -8352,12 +8352,12 @@ impl Value {
     }
 
     pub fn exec_substring(
-        str_value: &Value,
+        value: &Value,
         start_value: &Value,
         length_value: Option<&Value>,
     ) -> Value {
-        if let (Value::Text(str), Value::Integer(start)) = (str_value, start_value) {
-            let str_len = str.as_str().len() as i64;
+        if let (Some(str), Value::Integer(start)) = (value.cast_text(), start_value) {
+            let str_len = str.len() as i64;
 
             // The left-most character of X is number 1.
             // If Y is negative then the first character of the substring is found by counting from the right rather than the left.
