@@ -1,5 +1,5 @@
 #![allow(unused_variables, dead_code)]
-use crate::{turso_assert, LimboError, Result};
+use crate::{LimboError, Result};
 use aegis::aegis128l::Aegis128L;
 use aegis::aegis128x2::Aegis128X2;
 use aegis::aegis128x4::Aegis128X4;
@@ -685,7 +685,7 @@ impl EncryptionContext {
         );
 
         // since this is page 1, this must have header
-        turso_assert!(
+        crate::turso_assert!(
             page.starts_with(SQLITE_HEADER),
             "Page 1 must start with SQLite header"
         );
