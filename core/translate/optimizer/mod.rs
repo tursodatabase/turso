@@ -707,11 +707,7 @@ impl Optimizable for ast::Expr {
                 func.is_deterministic() && args.iter().all(|arg| arg.is_constant(resolver))
             }
             Expr::FunctionCallStar { .. } => false,
-            Expr::Id(id) => {
-                // If we got here with an id, this has to be double-quotes identifier
-                assert!(id.quoted_with('"'));
-                true
-            }
+            Expr::Id(_) => true,
             Expr::Column { .. } => false,
             Expr::RowId { .. } => false,
             Expr::InList { lhs, rhs, .. } => {
