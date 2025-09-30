@@ -46,15 +46,49 @@ pub mod tests;
 /// Sentinel value for `MvStore::exclusive_tx` indicating no exclusive transaction is active.
 const NO_EXCLUSIVE_TX: u64 = 0;
 
+/// A table ID for MVCC.
+/// MVCC table IDs are always negative. Their corresponding rootpage entry in sqlite_schema
+/// is the same negative value if the table has not been checkpointed yet. Otherwise, the root page
+/// will be positive and corresponds to the actual physical page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(transparent)]
+pub struct MVTableId(i64);
+
+impl MVTableId {
+    pub fn new(value: i64) -> Self {
+        assert!(value < 0, "MVCC table IDs are always negative");
+        Self(value)
+    }
+}
+
+impl From<i64> for MVTableId {
+    fn from(value: i64) -> Self {
+        assert!(value < 0, "MVCC table IDs are always negative");
+        Self(value)
+    }
+}
+
+impl From<MVTableId> for i64 {
+    fn from(value: MVTableId) -> Self {
+        value.0
+    }
+}
+
+impl std::fmt::Display for MVTableId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "MVTableId({})", self.0)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RowID {
     /// The table ID. Analogous to table's root page number.
-    pub table_id: i64,
+    pub table_id: MVTableId,
     pub row_id: i64,
 }
 
 impl RowID {
-    pub fn new(table_id: i64, row_id: i64) -> Self {
+    pub fn new(table_id: MVTableId, row_id: i64) -> Self {
         Self { table_id, row_id }
     }
 }
@@ -828,7 +862,7 @@ impl DeleteRowStateMachine {
     }
 }
 
-pub const SQLITE_SCHEMA_MVCC_TABLE_ID: i64 = -1;
+pub const SQLITE_SCHEMA_MVCC_TABLE_ID: MVTableId = MVTableId(-1);
 
 /// A multi-version concurrency control database.
 #[derive(Debug)]
@@ -845,14 +879,14 @@ pub struct MvStore<Clock: LogicalClock> {
     /// Hence, we store the mapping here.
     /// The value is Option because tables created in an MVCC commit that have not
     /// been checkpointed yet have no real root page assigned yet.
-    pub table_id_to_rootpage: SkipMap<i64, Option<u64>>,
+    pub table_id_to_rootpage: SkipMap<MVTableId, Option<u64>>,
     txs: SkipMap<TxID, Transaction>,
     tx_ids: AtomicU64,
     next_rowid: AtomicU64,
     next_table_id: AtomicI64,
     clock: Clock,
     storage: Storage,
-    loaded_tables: RwLock<HashSet<i64>>,
+    loaded_tables: RwLock<HashSet<MVTableId>>,
 
     /// The transaction ID of a transaction that has acquired an exclusive write lock, if any.
     ///
@@ -912,10 +946,10 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     /// Get the table ID from the root page.
     /// If the root page is negative, it is a non-checkpointed table and the table ID and root page are both the same negative value.
     /// If the root page is positive, it is a checkpointed table and there should be a corresponding table ID.
-    pub fn get_table_id_from_root_page(&self, root_page: i64) -> i64 {
+    pub fn get_table_id_from_root_page(&self, root_page: i64) -> MVTableId {
         if root_page < 0 {
             // Not checkpointed table - table ID and root_page are both the same negative value
-            root_page
+            root_page.into()
         } else {
             // Root page is positive: it is a checkpointed table and there should be a corresponding table ID
             let root_page = root_page as u64;
@@ -931,14 +965,15 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
     /// Insert a table ID and root page mapping.
     /// Root page must be positive here, because we only invoke this method with Some() for checkpointed tables.
-    pub fn insert_table_id_to_rootpage(&self, table_id: i64, root_page: Option<u64>) {
+    pub fn insert_table_id_to_rootpage(&self, table_id: MVTableId, root_page: Option<u64>) {
         self.table_id_to_rootpage.insert(table_id, root_page);
-        let minimum = if let Some(root_page) = root_page {
+        let minimum: i64 = if let Some(root_page) = root_page {
             // On recovery, we assign table_id = -root_page. Let's make sure we don't get any clashes between checkpointed and non-checkpointed tables
             // E.g. if we checkpoint a table that has physical root page 7, let's require the next table_id to be less than -7 (or if table_id is already smaller, then smaller than that.)
-            table_id.min(-(root_page as i64))
+            let root_page_as_table_id = MVTableId::from(-(root_page as i64));
+            table_id.min(root_page_as_table_id).into()
         } else {
-            table_id
+            table_id.into()
         };
         if minimum < self.next_table_id.load(Ordering::SeqCst) {
             self.next_table_id.store(minimum - 1, Ordering::SeqCst);
@@ -965,7 +1000,8 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             .collect::<Vec<u64>>();
         // Map all existing checkpointed root pages to table ids so that if root_page=R, table_id=-R
         for root_page in sqlite_schema_root_pages.iter() {
-            self.insert_table_id_to_rootpage(-(*root_page as i64), Some(*root_page));
+            let root_page_as_table_id = MVTableId::from(-(*root_page as i64));
+            self.insert_table_id_to_rootpage(root_page_as_table_id, Some(*root_page));
         }
 
         if !self.maybe_recover_logical_log(bootstrap_conn.pager.read().clone())? {
@@ -1152,7 +1188,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
     pub fn get_row_id_range(
         &self,
-        table_id: i64,
+        table_id: MVTableId,
         start: i64,
         bucket: &mut Vec<RowID>,
         max_items: u64,
@@ -1182,7 +1218,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
     pub fn get_next_row_id_for_table(
         &self,
-        table_id: i64,
+        table_id: MVTableId,
         start: i64,
         tx_id: TxID,
     ) -> Option<RowID> {
@@ -1744,11 +1780,21 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     ///
     /// # Arguments
     ///
-    pub fn maybe_initialize_table(&self, table_id: i64, pager: Arc<Pager>) -> Result<()> {
+    pub fn maybe_initialize_table(&self, table_id: MVTableId, pager: Arc<Pager>) -> Result<()> {
         tracing::trace!("scan_row_ids_for_table(table_id={})", table_id);
 
         // First, check if the table is already loaded.
         if self.loaded_tables.read().contains(&table_id) {
+            return Ok(());
+        }
+
+        if !self
+            .table_id_to_rootpage
+            .get(&table_id)
+            .is_some_and(|entry| entry.value().is_some())
+        {
+            // Not a checkpointed table; doesn't need to be initialized
+            self.mark_table_as_loaded(table_id);
             return Ok(());
         }
 
@@ -1761,19 +1807,21 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     }
 
     // Mark table as loaded
-    pub fn mark_table_as_loaded(&self, table_id: i64) {
+    pub fn mark_table_as_loaded(&self, table_id: MVTableId) {
         self.loaded_tables.write().insert(table_id);
     }
 
     /// Scans the table and inserts the rows into the database.
     ///
     /// This is initialization step for a table, where we still don't have any rows so we need to insert them if there are.
-    fn scan_load_table(&self, table_id: i64, pager: Arc<Pager>) -> Result<()> {
+    fn scan_load_table(&self, table_id: MVTableId, pager: Arc<Pager>) -> Result<()> {
         let entry = self
             .table_id_to_rootpage
             .get(&table_id)
-            .expect("Table ID does not have a root page");
-        let root_page = entry.value().expect("Table ID does not have a root page");
+            .unwrap_or_else(|| panic!("Table ID does not have a root page: {table_id}"));
+        let root_page = entry
+            .value()
+            .unwrap_or_else(|| panic!("Table ID does not have a root page: {table_id}"));
         let mut cursor = BTreeCursor::new_table(
             None, // No MVCC cursor for scanning
             pager.clone(),
@@ -1845,7 +1893,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         Ok(())
     }
 
-    pub fn get_last_rowid(&self, table_id: i64) -> Option<i64> {
+    pub fn get_last_rowid(&self, table_id: MVTableId) -> Option<i64> {
         let last_rowid = self
             .rows
             .upper_bound(Bound::Included(&RowID {

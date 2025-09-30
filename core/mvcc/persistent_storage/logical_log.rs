@@ -2,7 +2,7 @@
 #![allow(dead_code)]
 use crate::{
     io::ReadComplete,
-    mvcc::database::{LogRecord, Row, RowID, RowVersion},
+    mvcc::database::{LogRecord, MVTableId, Row, RowID, RowVersion},
     storage::sqlite3_ondisk::{read_varint, write_varint_to_vec},
     turso_assert,
     types::{IOCompletions, ImmutableRecord},
@@ -106,7 +106,8 @@ impl LogRecordType {
     /// * Data size -> varint
     /// * Data -> [u8] (data size length)
     fn serialize(&self, buffer: &mut Vec<u8>, row_version: &RowVersion) {
-        buffer.extend_from_slice(&row_version.row.id.table_id.to_be_bytes());
+        let table_id_i64: i64 = row_version.row.id.table_id.into();
+        buffer.extend_from_slice(&table_id_i64.to_be_bytes());
         buffer.extend_from_slice(&self.as_u8().to_be_bytes());
         let size_before_payload = buffer.len();
         match self {
@@ -315,7 +316,7 @@ impl StreamingLogicalLogReader {
                         self.state = StreamingState::NeedTransactionStart;
                         continue;
                     }
-                    let table_id = self.consume_u64(io)? as i64;
+                    let table_id = MVTableId::from(self.consume_u64(io)? as i64);
                     let record_type = self.consume_u8(io)?;
                     let _payload_size = self.consume_u64(io)?;
                     let mut bytes_read_on_row = 17; // table_id, record_type and payload_size

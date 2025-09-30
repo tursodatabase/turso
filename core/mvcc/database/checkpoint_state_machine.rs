@@ -1,6 +1,6 @@
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{
-    DeleteRowStateMachine, MvStore, RowVersion, TxTimestampOrID, WriteRowStateMachine,
+    DeleteRowStateMachine, MVTableId, MvStore, RowVersion, TxTimestampOrID, WriteRowStateMachine,
     SQLITE_SCHEMA_MVCC_TABLE_ID,
 };
 use crate::state_machine::{StateMachine, StateTransition, TransitionResult};
@@ -84,7 +84,7 @@ pub struct CheckpointStateMachine<Clock: LogicalClock> {
     /// Cursors for the B-trees
     cursors: HashMap<u64, Arc<RwLock<BTreeCursor>>>,
     /// Tables that were destroyed in this checkpoint
-    destroyed_tables: HashSet<i64>,
+    destroyed_tables: HashSet<MVTableId>,
     /// Result of the checkpoint
     checkpoint_result: Option<CheckpointResult>,
 }
@@ -94,10 +94,10 @@ pub struct CheckpointStateMachine<Clock: LogicalClock> {
 /// These are used to create/destroy B-trees during pager ops.
 pub enum SpecialWrite {
     BTreeCreate {
-        table_id: i64,
+        table_id: MVTableId,
     },
     BTreeDestroy {
-        table_id: i64,
+        table_id: MVTableId,
         root_page: u64,
         num_columns: usize,
     },
@@ -231,7 +231,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                         } else if is_create_of_table {
                             let table_id =
                                 get_table_id_or_root_page_from_sqlite_schema(&version.row.data);
-                            assert!(table_id < 0, "table_id is negative integer");
+                            let table_id = MVTableId::from(table_id);
                             Some(SpecialWrite::BTreeCreate { table_id })
                         } else {
                             None
