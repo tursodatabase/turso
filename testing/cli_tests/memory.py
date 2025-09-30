@@ -12,7 +12,7 @@ def validate_with_expected(result: str, expected: str):
 
 
 def stub_memory_test(
-    limbo: TestTursoShell,
+    turso: TestTursoShell,
     name: str,
     blob_size: int = 1024**2,
     vals: int = 100,
@@ -50,10 +50,10 @@ def stub_memory_test(
     big_stmt = "".join(big_stmt)
     expected = "\n".join(expected)
 
-    limbo.run_test_fn(big_stmt, lambda res: validate_with_expected(res, expected), name)
+    turso.run_test_fn(big_stmt, lambda res: validate_with_expected(res, expected), name)
 
 
-# TODO no delete tests for now because of limbo outputs some debug information on delete
+# TODO no delete tests for now because of turso outputs some debug information on delete
 def memory_tests() -> list[dict]:
     tests = []
 
@@ -106,8 +106,8 @@ def main():
     # TODO see how to parallelize this loop with different subprocesses
     for test in tests:
         try:
-            with TestTursoShell("") as limbo:
-                stub_memory_test(limbo, **test)
+            with TestTursoShell("") as turso:
+                stub_memory_test(turso, **test)
         except Exception as e:
             console.error(f"Test FAILED: {e}")
             exit(1)
